@@ -4,6 +4,7 @@ set -euo pipefail
 build_workflow=".github/workflows/build.yml"
 docker_workflow=".github/workflows/docker.yml"
 helm_workflow=".github/workflows/helm-package.yml"
+package_workflow=".github/workflows/package.yml"
 release_script="scripts/release/create_or_update_release.sh"
 
 # shellcheck source=scripts/release/create_or_update_release.sh
@@ -138,6 +139,8 @@ for block in "$tag_branch_tail" "$post_strategy"; do
 done
 require_line "$build_workflow" "          if [[ \"\$BUILD_TYPE\" == \"release\" ]] || [[ \"\$BUILD_TYPE\" == \"prerelease\" ]]; then" "latest artifact guard"
 require_line "$build_workflow" "        if: needs.build-check.outputs.should_publish == 'true' && env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')" "R2 publication guard"
+require_line "$package_workflow" "            if [[ \"\$TAG\" =~ ^\${semver_core}(-\${prerelease_id})?-preview\\.(0|[1-9][0-9]*)$ ]]; then" "stable and prerelease preview package classification"
+require_line "$package_workflow" "        if: needs.resolve.outputs.build_type != 'preview' && env.R2_ACCESS_KEY_ID != ''" "preview packages must not publish to R2"
 release_guard="needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')"
 for job in create-release upload-release-assets publish-release; do
   require_job_if "$build_workflow" "$job" "    if: $release_guard"

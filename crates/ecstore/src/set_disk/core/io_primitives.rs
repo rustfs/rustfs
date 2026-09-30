@@ -6527,7 +6527,15 @@ impl SetDisks {
 
         let disks = self.get_disks_internal().await;
 
-        // Phase 1: classify every online disk. A directory that holds object
+        // An unresolved slot may hold the only copy of readable object
+        // metadata or uncommitted data under this prefix. Do not classify or
+        // remove orphan residue from the online subset while any drive is
+        // unavailable.
+        if disks.iter().any(Option::is_none) {
+            return Ok(false);
+        }
+
+        // Phase 1: classify every disk. A directory that holds object
         // data or uncommitted residue on ANY disk blocks itself and its
         // ancestors on every disk, so a degraded/healable object is never
         // destroyed; purgeable subtrees beside it are still reclaimed.
@@ -6579,6 +6587,47 @@ impl SetDisks {
         }
 
         Ok(purged)
+    }
+
+    /// Reclaim metadata-less directory trees discovered by a recursive empty
+    /// bucket listing. The initial directory read fails closed if any slot is
+    /// unavailable; per-prefix purges then reuse the full cross-disk scan.
+    pub(crate) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
+        let disks = self.get_disks_internal().await;
+        if disks.is_empty() || disks.iter().any(Option::is_none) {
+            return false;
+        }
+
+        let mut prefixes = HashSet::new();
+        for disk in disks.iter().flatten() {
+            let entries = match disk.list_dir("", bucket, "", 0).await {
+                Ok(entries) => entries,
+                Err(_) => return false,
+            };
+            prefixes.extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.ends_with(SLASH_SEPARATOR) && is_safe_orphan_dir_entry(entry)),
+            );
+        }
+
+        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
+        prefixes.sort_unstable();
+        let mut purged = false;
+        for prefix in prefixes {
+            match self.purge_orphan_dir_object(bucket, &prefix).await {
+                Ok(prefix_purged) => purged |= prefix_purged,
+                Err(_) => return false,
+            }
+        }
+        purged
+    }
+
+    /// Orphan cleanup must not infer a complete scan from only the online
+    /// subset of a set's disks.
+    pub(crate) async fn orphan_purge_has_complete_disk_set(&self) -> bool {
+        let disks = self.get_disks_internal().await;
+        !disks.is_empty() && disks.iter().all(Option::is_some)
     }
 
     fn orphan_purge_in_backoff(&self, key: &str) -> bool {

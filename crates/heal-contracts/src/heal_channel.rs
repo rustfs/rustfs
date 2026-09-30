@@ -361,6 +361,9 @@ pub struct HealChannelRequest {
     pub object_prefix: Option<String>,
     /// Object version ID (optional)
     pub object_version_id: Option<String>,
+    /// Bucket incarnation observed by the object write that produced a local
+    /// durable partial-write responsibility.
+    pub expected_bucket_incarnation_id: Option<Uuid>,
     /// Force start heal
     pub force_start: bool,
     /// Priority
@@ -598,6 +601,7 @@ pub fn create_heal_request(
         bucket,
         object_prefix,
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index: None,
@@ -630,6 +634,7 @@ pub fn create_heal_request_with_options(
         bucket,
         object_prefix,
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index,
@@ -661,6 +666,7 @@ fn create_auto_heal_disk_request(set_disk_id: String, priority: Option<HealChann
         disk: Some(set_disk_id),
         heal_endpoints: Vec::new(),
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start: false,
         priority: priority.unwrap_or(HealChannelPriority::Low),
         pool_index: None,

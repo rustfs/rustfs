@@ -13426,24 +13426,24 @@ mod test {
         );
     }
 
-    /// A writer that stalls on every write, standing in for a slow listing
-    /// consumer (quorum merge, a lagging peer drive).
+    /// A writer that advances paused time on every write, standing in for a
+    /// slow listing consumer without depending on host scheduling.
     struct SlowWriter {
         delay: Duration,
-        sleep: Option<Pin<Box<Sleep>>>,
+        advance: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     }
 
     impl AsyncWrite for SlowWriter {
         fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-            if self.sleep.is_none() {
+            if self.advance.is_none() {
                 let delay = self.delay;
-                self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                self.advance = Some(Box::pin(tokio::time::advance(delay)));
             }
 
-            let sleep = self.sleep.as_mut().expect("sleep was just installed");
-            match sleep.as_mut().poll(cx) {
+            let advance = self.advance.as_mut().expect("clock advance was just installed");
+            match advance.as_mut().poll(cx) {
                 Poll::Ready(()) => {
-                    self.sleep = None;
+                    self.advance = None;
                     Poll::Ready(Ok(buf.len()))
                 }
                 Poll::Pending => Poll::Pending,
@@ -13478,6 +13478,7 @@ mod test {
 
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.wait_for_startup_cleanup().await;
 
         let stall = Duration::from_millis(300);
         let write_delay = Duration::from_millis(150);
@@ -13491,12 +13492,21 @@ mod test {
 
         let mut writer = SlowWriter {
             delay: write_delay,
-            sleep: None,
+            advance: None,
         };
 
-        let started = std::time::Instant::now();
+        // A live blocking task inhibits Tokio's automatic clock advance while
+        // real filesystem reads are pending. Only consumer writes advance time.
+        let (clock_guard_tx, clock_guard_rx) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || clock_guard_rx.recv());
+        tokio::time::pause();
+        let started = Instant::now();
         let result = disk.walk_dir(opts, &mut writer).await;
         let elapsed = started.elapsed();
+        drop(clock_guard_tx);
+        let _ = clock_guard
+            .await
+            .expect("clock guard should exit after its sender is dropped");
 
         assert!(result.is_ok(), "a walk making steady progress must not time out, got {result:?}");
         assert!(

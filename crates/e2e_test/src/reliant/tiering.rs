@@ -1056,7 +1056,17 @@ async fn test_hermetic_transition_restore_failure_expiry_and_retry() -> TestResu
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_ILM_DEBUG_DAY_SECS", "5")]).await?;
+    // Revisit the restored key every cycle; the default 16-cycle sampling is
+    // independent of the accelerated lifecycle clock used by this fixture.
+    start_tier_source(
+        &mut hot,
+        &[
+            ("RUSTFS_SCANNER_CYCLE", "1"),
+            ("RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES", "1"),
+            ("RUSTFS_ILM_DEBUG_DAY_SECS", "5"),
+        ],
+    )
+    .await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
