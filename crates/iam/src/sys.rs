@@ -1412,13 +1412,37 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> bool {
-        match &prepared.mode {
+        self.try_eval_prepared(prepared, args).await.unwrap_or(false)
+    }
+
+    /// Preserve resource lookup errors for callers that otherwise fall back to
+    /// bucket policies on an IAM denial. An error must not become an implicit deny.
+    pub async fn try_eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> Result<bool> {
+        Ok(match &prepared.mode {
             PreparedIamMode::Opa => {
                 let Some(opa_enable) = Self::get_policy_plugin_client().await else {
                     tracing::warn!("eval_prepared: OPA mode requested but plugin is unavailable");
-                    return false;
+                    return Ok(false);
                 };
-                opa_enable.is_allowed(args).await
+                // Conditions may originate in headers, claims or another resource's
+                // authorization. Only the addressed bucket supplies this namespace.
+                let mut conditions = args.conditions.clone();
+                conditions.retain(|key, _| {
+                    let namespace = key.split('/').next().unwrap_or_default();
+                    !namespace.eq_ignore_ascii_case("ExistingBucketTag")
+                        && !namespace.eq_ignore_ascii_case("s3:ExistingBucketTag")
+                });
+                if !args.bucket.is_empty() {
+                    for (key, value) in self.store.api.load_bucket_tags(args.bucket).await? {
+                        conditions.insert(format!("ExistingBucketTag/{key}"), vec![value]);
+                    }
+                }
+                opa_enable
+                    .is_allowed(&Args {
+                        conditions: &conditions,
+                        ..args.clone()
+                    })
+                    .await
             }
             PreparedIamMode::Owner => true,
             PreparedIamMode::Deny => false,
@@ -1430,7 +1454,7 @@ impl<T: Store> IamSys<T> {
             } => {
                 let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
                 if let Some(ok) = session_ok {
-                    return ok && (*is_owner || combined_policy.is_allowed(args).await);
+                    return Ok(ok && (*is_owner || combined_policy.is_allowed(args).await));
                 }
                 *is_owner || combined_policy.is_allowed(args).await
             }
@@ -1460,13 +1484,13 @@ impl<T: Store> IamSys<T> {
                     PreparedServicePolicyMode::SessionBound => {
                         let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
                         if let Some(ok) = session_ok {
-                            return ok && parent_allowed;
+                            return Ok(ok && parent_allowed);
                         }
                         parent_allowed
                     }
                 }
             }
-        }
+        })
     }
 
     async fn prepare_regular_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
@@ -2185,6 +2209,121 @@ mod tests {
         assert!(matches!(state, PolicyPluginState::Failed));
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn opa_bucket_tags_replace_untrusted_conditions_and_lookup_errors_deny() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind OPA input receiver");
+        let url = format!("http://{}/decision", listener.local_addr().expect("receiver address"));
+        let receiver = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept OPA request");
+                let mut stream = BufReader::new(stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.expect("read HTTP header") > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().expect("HTTP body length"));
+                    }
+                }
+                let mut body = vec![0; length.expect("OPA JSON has a content length")];
+                stream.read_exact(&mut body).await.expect("read complete OPA body");
+                payloads.push(serde_json::from_slice::<serde_json::Value>(&body).expect("OPA JSON"));
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":true}")
+                    .await
+                    .expect("send decision");
+            }
+            payloads
+        });
+        let (outcomes, error, denied) = temp_env::async_with_vars(
+            [
+                ("NO_PROXY", Some("127.0.0.1,localhost")),
+                ("no_proxy", Some("127.0.0.1,localhost")),
+            ],
+            async {
+                let store = StsTestMockStore::new(true);
+                let iam = IamSys::new(IamCache::new(store.clone()).await.expect("initialize IAM cache"));
+                let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+                IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+                    url,
+                    auth_token: String::new(),
+                }))
+                .await;
+                let groups = None;
+                let claims = HashMap::new();
+                let conditions = HashMap::from([
+                    ("userid".to_string(), vec!["tag-user".to_string()]),
+                    ("ExistingBucketTag/Department".to_string(), vec!["forged".to_string()]),
+                    ("existingbuckettag/department".to_string(), vec!["forged".to_string()]),
+                    ("S3:EXISTINGBUCKETTAG/role".to_string(), vec!["forged".to_string()]),
+                ]);
+                let mut args = Args {
+                    account: "tag-user",
+                    groups: &groups,
+                    claims: &claims,
+                    conditions: &conditions,
+                    action: Action::S3Action(S3Action::GetBucketLocationAction),
+                    bucket: "finance",
+                    object: "",
+                    is_owner: false,
+                    deny_only: false,
+                };
+                let mut outcomes = Vec::new();
+                for (bucket, tags) in [
+                    (
+                        "finance",
+                        Ok(HashMap::from([
+                            ("Department".to_string(), "Finance".to_string()),
+                            ("note".to_string(), String::new()),
+                        ])),
+                    ),
+                    ("untagged", Ok(HashMap::new())),
+                    ("", Err(Error::other("bucketless decisions must not read metadata"))),
+                ] {
+                    args.bucket = bucket;
+                    *store.bucket_tags.lock().expect("tag state") = tags;
+                    outcomes.push(iam.is_allowed(&args).await);
+                }
+                args.bucket = "unavailable";
+                let prepared = iam.prepare_auth(&args).await;
+                let error = iam.try_eval_prepared(&prepared, &args).await;
+                let denied = !iam.eval_prepared(&prepared, &args).await;
+                *get_policy_plugin_state().write().await = previous;
+                (outcomes, error, denied)
+            },
+        )
+        .await;
+        assert_eq!(outcomes, [true, true, true]);
+        assert!(
+            matches!(error, Err(Error::Io(_))),
+            "lookup failure must remain an error, not an implicit denial"
+        );
+        assert!(denied, "boolean IAM callers must fail closed on lookup errors");
+        let payloads = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
+            .await
+            .expect("OPA input deadline")
+            .expect("input receiver");
+        assert_eq!(
+            payloads[0]["input"]["context"]["conditions"],
+            serde_json::json!({
+                "userid": ["tag-user"], "ExistingBucketTag/Department": ["Finance"], "ExistingBucketTag/note": [""]
+            })
+        );
+        for payload in &payloads[1..] {
+            assert_eq!(payload["input"]["context"]["conditions"], serde_json::json!({"userid": ["tag-user"]}));
+        }
+    }
+
     const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";
     const CUSTOM_STS_CLAIM_BUCKET: &str = "claim-bucket";
     const CUSTOM_STS_CLAIM_POLICY_JSON: &str = r#"{
@@ -2203,6 +2342,7 @@ mod tests {
     struct StsTestMockStore {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
+        bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
@@ -2219,6 +2359,7 @@ mod tests {
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
+                bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
                 fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2242,6 +2383,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Store for StsTestMockStore {
+        async fn load_bucket_tags(&self, _bucket: &str) -> Result<HashMap<String, String>> {
+            self.bucket_tags.lock().expect("tag state").clone()
+        }
+
         fn has_watcher(&self) -> bool {
             false
         }
