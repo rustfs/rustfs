@@ -3800,7 +3800,7 @@ mod usage_store;
 
 use activity::*;
 use backlog::*;
-pub use backlog::{ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState};
+pub use backlog::{ScannerPauseBacklogReplicaId, ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState};
 use cycle_state::*;
 use leadership::*;
 pub(crate) use usage_store::RootPublicationProof;
