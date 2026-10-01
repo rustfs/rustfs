@@ -2417,9 +2417,9 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                 }
             }
             Entry::Vacant(candidate) => {
-                if preserve_unknown_dirty_usage(&mut existing, snapshot_position, usage_updated_at) {
-                    candidate.insert(existing);
-                } else if existing.authoritative && existing.usage_updated_at > usage_updated_at {
+                if preserve_unknown_dirty_usage(&mut existing, snapshot_position, usage_updated_at)
+                    || (existing.authoritative && existing.usage_updated_at > usage_updated_at)
+                {
                     candidate.insert(existing);
                 } else if existing.authoritative && existing.dirty && !reconciled_dirty_usage {
                     let mut preserved = existing;
