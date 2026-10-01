@@ -202,3 +202,48 @@ async fn deep_compacted_budget_preserves_partial_checkpoint() {
     })
     .await;
 }
+
+#[tokio::test]
+#[serial]
+async fn large_prefix_resumes_after_budget_across_cycles_and_leaders() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for index in 0..DATA_SCANNER_COMPACT_AT_FOLDERS {
+        write_checkpoint_object(&root, &format!("prefix/{index:04}"), &[(None, 1)]).await;
+    }
+    write_checkpoint_object(&root, "z-last", &[(None, 1)]).await;
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    let store = FixtureStore::new();
+    let mut cache = DataUsageCache::default();
+    let mut previous = 0;
+    for round in 0..8 {
+        cache.prepare_bucket_checkpoint("bucket", 11 + round, 7 + round, SOURCE, PLAN, identity);
+        cache.info.skip_healing = true;
+        let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 1000).await;
+        let (scanned, complete) = match outcome {
+            ScannerDiskScanOutcome::Complete(cache) => (cache, true),
+            ScannerDiskScanOutcome::Partial(cache) => (cache, false),
+            ScannerDiskScanOutcome::NamespaceNotFound(_) => panic!("fixture namespace exists"),
+        };
+        cache = save_reload(&store, &scanned).await;
+        let total = cache.checked_flatten("bucket").expect("saved bucket coverage");
+        assert!(total.objects > previous, "round {round}: large-prefix coverage must advance after reload");
+        if complete {
+            let expected = DATA_SCANNER_COMPACT_AT_FOLDERS + 1;
+            assert_eq!(total.objects, expected);
+            assert_eq!(total.size, expected);
+            assert_eq!(cache.find("bucket/z-last").map(|entry| entry.objects), Some(1));
+            assert!(cache.info.snapshot_complete);
+            return;
+        }
+        assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+        assert!(!cache.info.snapshot_complete);
+        previous = total.objects;
+    }
+    panic!("large prefix must finish within repeated bounded scans");
+}
