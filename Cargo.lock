@@ -772,6 +772,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-recursion"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-rs"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9786,6 +9797,7 @@ version = "1.0.1"
 dependencies = [
  "arc-swap",
  "async-channel",
+ "async-recursion",
  "async-trait",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -10750,6 +10762,7 @@ dependencies = [
 name = "rustfs-s3select-query"
 version = "1.0.1"
 dependencies = [
+ "async-recursion",
  "async-trait",
  "bytes",
  "datafusion",
@@ -14062,9 +14075,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.4"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
+checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
 dependencies = [
  "proc-macro2",
  "quote",

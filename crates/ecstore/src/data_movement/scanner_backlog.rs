@@ -306,7 +306,7 @@ pub mod test_util {
         let Some(fault) = fault else { return Ok(None) };
         if fault
             .remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
             != Ok(1)
         {
             return Ok(None);

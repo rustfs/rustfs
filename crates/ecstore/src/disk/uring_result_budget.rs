@@ -73,7 +73,7 @@ impl ProcessResultBudget {
         }
         inner
             .available
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
             .map(|_| {
                 Some(ResultBudgetReservation {
                     inner: Arc::clone(inner),

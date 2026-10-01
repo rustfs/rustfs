@@ -208,6 +208,7 @@ aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a",
 urlencoding = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 shadow-rs = { workspace = true, default-features = false }
+async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
