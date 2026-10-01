@@ -2125,7 +2125,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         if object_parts.len() > ret.parts.len() {
             ret.is_truncated = true;
-            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num).unwrap_or_default();
+            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num);
         }
 
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
