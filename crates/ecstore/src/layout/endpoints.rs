@@ -1001,11 +1001,7 @@ fn parse_explicit_local_endpoint_host(raw: &str) -> Result<Host<String>> {
 
     let host = Host::parse(raw).map_err(|_| invalid())?;
     let host = match host {
-        Host::Domain(domain) => Host::Domain(
-            domain_without_optional_trailing_dot(&domain)
-                .ok_or_else(invalid)?
-                .to_string(),
-        ),
+        Host::Domain(domain) => Host::Domain(domain_without_optional_trailing_dot(&domain).ok_or_else(invalid)?.to_string()),
         host => host,
     };
     if matches!(&host, Host::Domain(domain) if domain.contains('*'))

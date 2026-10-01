@@ -14,7 +14,6 @@
 
 use std::{convert::Infallible, ops::ControlFlow};
 
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::sql::{
     planner::{IdentNormalizer, SqlToRel},
@@ -58,7 +57,6 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
     }
 
     /// Generate a logical plan from an  Extent SQL statement
-    #[async_recursion]
     pub(crate) async fn statement_to_plan(&self, statement: ExtStatement, session: &SessionCtx) -> QueryResult<Plan> {
         match statement {
             ExtStatement::SqlStatement(stmt) => self.df_sql_to_plan(*stmt, session).await,
