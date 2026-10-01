@@ -396,7 +396,7 @@ impl InstanceContext {
     pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
         let counted = self
             .namespace_commits
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
             .is_ok();
         if counted {
             self.advance_namespace_commit_generation();
@@ -412,7 +412,7 @@ impl InstanceContext {
     fn advance_namespace_commit_generation(&self) {
         let _ = self
             .namespace_commit_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| Some(generation.saturating_add(1)));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| Some(generation.saturating_add(1)));
     }
 
     pub(crate) fn namespace_commit_generation(&self) -> u64 {
