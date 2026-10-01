@@ -243,8 +243,6 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH: &str = "put_ob
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK: &str = "put_object_quota_begin_metadata_lock";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP: &str = "put_object_quota_begin_cache_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ: &str = "put_object_quota_begin_config_read";
-pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ_COUNTERFACTUAL_SKIP: &str =
-    "put_object_quota_begin_config_read_counterfactual_skip";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT: &str = "put_object_quota_begin_safe_no_quota_cache_hit";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK: &str = "put_object_quota_begin_lock_lost_check";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE: &str = "put_object_quota_begin_policy_evaluate";
@@ -2370,6 +2368,49 @@ pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Op
 }
 
 #[inline(always)]
+pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
+}
+
+/// Observe a future's latency and wakeup behavior only while detailed PUT
+/// attribution is enabled. The disabled path awaits the original future
+/// directly, so normal remote mutation RPCs do not gain a polling wrapper.
+pub async fn observe_put_stage_future<F>(
+    future: F,
+    duration_stage: &'static str,
+    pending_count_stage: &'static str,
+    first_pending_to_ready_stage: &'static str,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    if !put_stage_metrics_enabled() {
+        return future.await;
+    }
+
+    let duration_started = put_stage_timer();
+    let mut first_pending_at = None;
+    let mut pending_count = 0_u64;
+    let mut future = std::pin::pin!(future);
+    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+        std::task::Poll::Pending => {
+            pending_count = pending_count.saturating_add(1);
+            first_pending_at.get_or_insert_with(std::time::Instant::now);
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    record_put_object_stage_duration_from(duration_stage, duration_started);
+    record_put_object_stage_count(pending_count_stage, pending_count);
+    record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
+    output
+}
+
+#[inline(always)]
 pub fn record_put_object_quota_cache_decision(decision: &'static str, reason: &'static str) {
     if !put_stage_metrics_enabled() {
         return;
@@ -3514,7 +3555,6 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ,
-            PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ_COUNTERFACTUAL_SKIP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
@@ -3603,11 +3643,9 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
-            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REQUEST_SCOPE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL,
-            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_FIRST_PENDING_TO_READY,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_INTO_INNER,
@@ -3672,6 +3710,12 @@ mod tests {
                 && !stage.contains('{')
         }));
 
+        let count_stages = [
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
+        ];
+        assert_eq!(count_stages.iter().copied().collect::<HashSet<_>>().len(), count_stages.len());
+
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
@@ -3679,16 +3723,25 @@ mod tests {
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
+            for stage in count_stages {
+                record_put_object_stage_count(stage, 1);
+            }
             set_put_stage_metrics_enabled(true);
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
+            for stage in count_stages {
+                record_put_object_stage_count(stage, 1);
+            }
             set_put_stage_metrics_enabled(false);
         });
 
-        let recorded = snapshotter
-            .snapshot()
-            .into_vec()
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_object_stage_count"),
+            Some(u64::try_from(count_stages.len()).expect("count stage length fits u64")),
+        );
+        let recorded = rows
             .into_iter()
             .filter(|(composite, _, _, _)| {
                 composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
@@ -3781,6 +3834,63 @@ mod tests {
             ("budget".to_string(), PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS.to_string()),
             ("outcome".to_string(), PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED.to_string()),
         ])));
+    }
+
+    #[test]
+    fn put_stage_future_observer_preserves_outputs_and_counts_pending() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime for observer test");
+        let duration_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT;
+        let count_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT;
+        let pending_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY;
+
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            let output = runtime.block_on(observe_put_stage_future(
+                std::future::ready(42),
+                duration_stage,
+                count_stage,
+                pending_stage,
+            ));
+            assert_eq!(output, 42, "disabled observer must preserve the future output");
+        });
+        assert!(snapshotter.snapshot().into_vec().is_empty(), "disabled observer must emit no metrics");
+
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(true);
+            let mut pending = 2;
+            let future = std::future::poll_fn(|cx| {
+                if pending > 0 {
+                    pending -= 1;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(Err::<(), _>("original error"))
+                }
+            });
+            let output = runtime.block_on(observe_put_stage_future(future, duration_stage, count_stage, pending_stage));
+            set_put_stage_metrics_enabled(false);
+            assert_eq!(output, Err("original error"), "enabled observer must preserve errors");
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_s3_put_object_stage_count"), Some(2));
+        let count_labels = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_s3_put_object_stage_count")
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(count_labels, vec![count_stage.to_string()]);
+        let durations = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_s3_put_object_stage_duration_ms")
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<HashSet<_>>();
+        assert_eq!(durations, HashSet::from([duration_stage.to_string(), pending_stage.to_string()]));
     }
 
     #[test]

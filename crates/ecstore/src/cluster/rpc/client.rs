@@ -42,7 +42,6 @@ use std::{
     pin::Pin,
     sync::{LazyLock, Mutex},
     task::{Context, Poll},
-    time::Instant,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tower::Service;
@@ -363,34 +362,6 @@ fn rename_data_grpc_stage(path: &str) -> bool {
     )
 }
 
-async fn observe_put_stage_future<F, T>(
-    future: F,
-    duration_stage: &'static str,
-    pending_count_stage: &'static str,
-    first_pending_to_ready_stage: &'static str,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    let duration_started = rustfs_io_metrics::put_stage_timer();
-    let mut first_pending_at = None;
-    let mut pending_count = 0usize;
-    let mut future = std::pin::pin!(future);
-    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
-        Poll::Ready(output) => Poll::Ready(output),
-        Poll::Pending => {
-            pending_count = pending_count.saturating_add(1);
-            first_pending_at.get_or_insert_with(Instant::now);
-            Poll::Pending
-        }
-    })
-    .await;
-    rustfs_io_metrics::record_put_object_stage_duration_from(duration_stage, duration_started);
-    rustfs_io_metrics::record_put_object_stage_duration(pending_count_stage, pending_count as f64);
-    rustfs_io_metrics::record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
-    output
-}
-
 impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ReplayScopeChannel<S>
 where
     S: Service<HttpRequest<ReqBody>, Response = HttpResponse<ResBody>>,
@@ -457,7 +428,7 @@ where
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = if observe_rename_data {
-                observe_put_stage_future(
+                rustfs_io_metrics::observe_put_stage_future(
                     future,
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL,
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,

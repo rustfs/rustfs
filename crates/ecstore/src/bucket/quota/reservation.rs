@@ -41,7 +41,6 @@ const EVENT_QUOTA_LEDGER_SETTLEMENT: &str = "quota_ledger_settlement";
 const EVENT_QUOTA_ADMISSION: &str = "quota_admission";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
-const QUOTA_CONFIG_READ_COUNTERFACTUAL_ENV: &str = "RUSTFS_QUOTA_BEGIN_ASSUME_NO_QUOTA_COUNTERFACTUAL";
 const SAFE_NO_QUOTA_CACHE_FAST_PATH_ENV: &str = "RUSTFS_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_FAST_PATH";
 
 #[cfg(any(test, feature = "test-util"))]
@@ -562,28 +561,6 @@ pub(crate) async fn begin(
             set_index: Some(set_index),
         });
     }
-    if quota_config_read_counterfactual_enabled() {
-        let counterfactual_skip_started = rustfs_io_metrics::put_stage_timer();
-        rustfs_io_metrics::record_put_object_stage_duration_from(
-            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ_COUNTERFACTUAL_SKIP,
-            counterfactual_skip_started,
-        );
-        return Ok(QuotaContext {
-            store: None,
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            ledger_object: ledger_object(bucket),
-            bucket_incarnation: None,
-            quota_revision: None,
-            quota_limit: None,
-            capability_proof: None,
-            snapshot_admission: None,
-            legacy_data_movement: false,
-            metadata_guard: Some(metadata_guard),
-            pool_index: Some(pool_index),
-            set_index: Some(set_index),
-        });
-    }
     let config_read_started = rustfs_io_metrics::put_stage_timer();
     let (quota, bucket_incarnation, quota_revision) =
         metadata_sys::get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await?;
@@ -712,16 +689,6 @@ pub(crate) async fn begin(
         metadata_guard: Some(metadata_guard),
         pool_index: Some(pool_index),
         set_index: Some(set_index),
-    })
-}
-
-fn quota_config_read_counterfactual_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(QUOTA_CONFIG_READ_COUNTERFACTUAL_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
     })
 }
 
