@@ -181,6 +181,12 @@ Historically the KV2 and Local backends sealed only the DEK plaintext; the `encr
 
 Rollout constraint: reading bound envelopes needs no switch, but **a node that predates the field cannot open them** — its unwrap runs without the additional data and fails authentication. The switch defaults off (`ENV_KMS_ENVELOPE_AAD` in `crates/kms/src/config.rs`); enable it only after every node runs a release that understands `context_binding`, mirroring the `RUSTFS_ENCRYPTION_FRAME_V2` rollout. With the switch on, a rewrap sweep upgrades unbound envelopes to the bound format (converging to zero writes on re-run); a bound envelope never regresses to the unbound shape, and an envelope carrying an unrecognized `context_binding` value is refused rather than decrypted without its binding.
 
+### Location entry in the encryption context
+
+Every SSE-S3 and SSE-KMS data key is wrapped under an encryption context that includes the entry `{"<bucket>": "<bucket>/<object>"}`. Only the client-supplied part of the context (`x-amz-server-side-encryption-context`) is stored with the object; the location entry is rebuilt from the object's current location on every read, so a data key does not open at another location. How strongly that is enforced depends on the backend, as described above.
+
+A client context entry whose key equals the bucket name would replace the location entry, so SSE-KMS writes refuse it with `400 InvalidArgument`. Other keys, including the names of other buckets, are accepted. Objects that an earlier release stored with such an entry remain readable. Builds with the `rio-v2` feature additionally bind each object key to its location when sealing it.
+
 ### Guarantees that hold only once every node is upgraded
 
 These are properties of builds from `1.0.0-rc.1` onward; a single older node removes them for the whole cluster.
