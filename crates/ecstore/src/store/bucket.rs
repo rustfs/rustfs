@@ -1664,8 +1664,8 @@ mod tests {
             .await
             .expect("create tagged bucket");
         let original = store.get_bucket_metadata(bucket).await.expect("read bucket metadata");
-        let cases: &[(&[u8], Option<HashMap<String, String>>)] = &[
-            (b"", Some(HashMap::new())),
+        let cases = &[
+            (b"".as_slice(), Some(HashMap::new())),
             (b"<Tagging><TagSet/></Tagging>", Some(HashMap::new())),
             (
                 b"<Tagging><TagSet><Tag><Key>Department</Key><Value>Finance</Value></Tag><Tag><Key>note</Key><Value></Value></Tag></TagSet></Tagging>",
