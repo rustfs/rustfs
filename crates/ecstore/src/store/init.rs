@@ -4362,7 +4362,7 @@ mod tests {
             // successful attempts. Only injected faults spend this global budget.
             // A real failure may consume an attempt, so preserve the final chance.
             faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
                     (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
                         .then_some(faults.saturating_add(1))
                 })
