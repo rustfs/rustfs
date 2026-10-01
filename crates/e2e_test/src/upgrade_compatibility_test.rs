@@ -52,6 +52,9 @@ const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
 const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
 const MIXED_NODE_COUNT: usize = 4;
 const UPGRADE_READINESS_BODY: &[u8] = b"upgrade write readiness";
+// Written by the "previous-seed" readiness probe through node 0 before any
+// current binary starts; every later phase must still read it.
+const PREVIOUS_RELEASE_SEED_KEY: &str = ".upgrade-readiness/previous-seed/node-0";
 const MULTIPART_WORKERS: usize = 16;
 const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
 // Peers keep a restarted node's drive in Suspect/Returning for roughly
@@ -68,6 +71,7 @@ const CONFIG_REPLICA_BUCKET: &str = "upgrade-config-replica";
 const ROLLBACK_BUCKET: &str = "rollback-config-data";
 const ROLLBACK_REPLICA_BUCKET: &str = "rollback-config-replica";
 const BUCKET_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+const QUOTA_USAGE_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const LIFECYCLE_RULE_ID: &str = "upgrade-expire-logs";
 const LIFECYCLE_PREFIX: &str = "logs/";
 const LIFECYCLE_DAYS: i32 = 30;
@@ -425,6 +429,11 @@ async fn exercise_mixed_cluster(
     let multipart_keys = write_multipart_load(&clients, phase).await?;
     let expected_count = multipart_keys.len() + 2;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
+            "{phase}: the {label} node must retain the previous-release seed"
+        );
         wait_for_phase_listing(
             client,
             phase,
@@ -523,9 +532,7 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     wait_for_upgrade_write_readiness(&clients, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
-            read_object(client, MIXED_BUCKET, ".upgrade-readiness/previous-seed/node-0", None)
-                .await?
-                .1,
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
             UPGRADE_READINESS_BODY,
             "previous-release node {reader} must retain the seed across its rolling restart"
         );
@@ -935,6 +942,11 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     cluster.start_node_from_binary(3, &current_binary).await?;
 
     for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
+            "current node {node_idx} must retain the previous-release seed"
+        );
         for phase in ["one-current-node", "one-previous-node"] {
             wait_for_phase_listing(
                 client,
@@ -962,7 +974,8 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
                 "assertions": [
                     "current node reads objects written through previous-release client",
                     "previous-release node reads objects written through current client",
-                    "all nodes list every mixed-version object after homogeneous-current convergence"
+                    "all nodes list every mixed-version object after homogeneous-current convergence",
+                    "the previous-release seed survives the baseline restart and every upgrade phase"
                 ],
             }),
         )?;
@@ -1067,12 +1080,23 @@ async fn put_object_through_quota_warmup(client: &Client, bucket: &str, key: &st
 
 async fn get_bucket_quota(env: &RustFSTestEnvironment, bucket: &str) -> Result<Option<u64>, BoxError> {
     let path = format!("/rustfs/admin/v3/quota/{bucket}");
-    let (status, response) = admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key).await?;
-    if status != StatusCode::OK {
-        return Err(format!("reading the quota of {bucket} failed: {status} {response}").into());
+    let deadline = Instant::now() + QUOTA_USAGE_READINESS_TIMEOUT;
+    loop {
+        let (status, response) = tokio::time::timeout_at(
+            deadline,
+            admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key),
+        )
+        .await
+        .map_err(|_| format!("reading the quota of {bucket} exceeded the usage-readiness timeout"))??;
+        if status == StatusCode::OK {
+            let quota: serde_json::Value = serde_json::from_str(&response)?;
+            return Ok(quota.get("quota").and_then(serde_json::Value::as_u64));
+        }
+        if status != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
+            return Err(format!("reading the quota of {bucket} failed: {status} {response}").into());
+        }
+        sleep(Duration::from_millis(500)).await;
     }
-    let quota: serde_json::Value = serde_json::from_str(&response)?;
-    Ok(quota.get("quota").and_then(serde_json::Value::as_u64))
 }
 
 /// `GET /rustfs/admin/v3/list-remote-targets?bucket=...`.

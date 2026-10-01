@@ -1450,8 +1450,11 @@ mod tests {
             cluster.set_env("RUSTFS_HEAL_PAGE_PARALLEL_ENABLE", "false");
         }
         // Keep every node's Heal runtime enabled for normal disk registration.
-        let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG")
-            .unwrap_or_else(|_| "rustfs::heal::task=info,rustfs=error".to_string());
+        // Capture durable handoff and marker cleanup failures during shutdown.
+        let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG").unwrap_or_else(|_| {
+            "rustfs::heal::task=info,rustfs::heal::manager=info,rustfs::main::handle_shutdown=info,rustfs_heal::heal=warn,rustfs=error"
+                .to_string()
+        });
         cluster.set_env("RUST_LOG", server_rust_log);
         let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| {
             // Keep explicit directories compatible and isolate parallel suite captures.

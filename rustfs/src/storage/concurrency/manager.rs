@@ -787,6 +787,15 @@ impl ConcurrencyManager {
             .await
     }
 
+    /// Admit a server-side multipart copy through the shared write pool.
+    ///
+    /// Source length is not authoritative until metadata is validated, but
+    /// admission must precede source readers and lifecycle locks. Use the
+    /// existing unknown-length weight and bounded multipart wait queue.
+    pub async fn admit_multipart_copy(&self) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.admit_multipart_part(-1).await
+    }
+
     // ============================================
     // Adaptive I/O Strategy Methods
     // ============================================
@@ -1845,6 +1854,24 @@ mod integration_tests {
             ],
             || ForegroundWriteAdmissionPolicy::from_env(disk_read_limit),
         )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multipart_copy_admission_uses_unknown_size_weight_and_shared_pool() {
+        for (configured_limit, expected_weight) in [(None, 8), (Some("1"), 1)] {
+            let mut manager = ConcurrencyManager::new();
+            manager.foreground_write_admission_policy = automatic_write_policy(configured_limit, 64);
+            let copy = manager.admit_multipart_copy().await.expect("copy admission should succeed");
+            assert!(matches!(copy, ForegroundWriteAdmission::Admitted(_)));
+            assert_eq!(manager.put_object_admission_snapshot().active, Some(expected_weight));
+            if configured_limit.is_some() {
+                let part = manager.admit_put_object(-1).await.expect("shared gate remains open");
+                assert!(matches!(part, ForegroundWriteAdmission::Rejected));
+            }
+            drop(copy);
+            assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+        }
     }
 
     #[tokio::test(start_paused = true)]

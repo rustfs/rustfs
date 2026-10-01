@@ -1350,6 +1350,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1414,6 +1416,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1427,6 +1431,11 @@ mod prepared_get_object_metadata_tests {
                     .expect("late parity should restore the exact GET body");
                 assert_eq!(restored, payload);
                 assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 7);
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_READ_VERSION, order[3]),
+                    1,
+                    "the omitted parity disk must only be read by the late metadata refresh"
+                );
             },
         )
         .await;
@@ -1491,6 +1500,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
