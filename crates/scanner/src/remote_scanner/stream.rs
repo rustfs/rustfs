@@ -840,6 +840,7 @@ async fn scan_and_persist_local_bucket(
                 }
                 match persist_scanner_checkpoint(
                     set.clone(),
+                    store.clone(),
                     ScannerCheckpointPersistContext {
                         ctx: &scan_ctx,
                         expected_publication_epoch,
