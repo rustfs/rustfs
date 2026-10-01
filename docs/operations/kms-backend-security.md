@@ -137,6 +137,8 @@ This release reports rather than refuses, because flipping straight to a rejecti
 - `RUSTFS_SSE_C_REQUIRE_TLS=true` (default `false`) refuses those requests now, with the same `400 InvalidRequest` wording AWS uses. Confirm the counter reads zero before enabling it.
 - The default is expected to flip in a later release.
 
+The guard covers both the object's own SSE-C headers and the `x-amz-copy-source-server-side-encryption-customer-*` headers that `CopyObject` and `UploadPartCopy` use to read an SSE-C source: either set carries a customer key.
+
 The verdict is per connection: a listener that terminates TLS satisfies it, and so does an `https` protocol forwarded by a proxy the trusted-proxy configuration accepts. A direct plaintext client asserts nothing, and a forwarded protocol from an untrusted peer is not consulted.
 
 ## Object ciphertext format: what the v1 frame layout does and does not authenticate
