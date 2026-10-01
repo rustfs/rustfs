@@ -33,6 +33,9 @@ expansion, rebalance, decommission, heal, drive replacement, restart
 recovery, and the `rc` CLI mapping), start with
 [Cluster and erasure-coding lifecycle operations](operations/cluster-lifecycle-operations.md).
 
+For concurrent bucket creation and deletion, see
+[Bucket operation admission](operations/bucket-operation-admission.md).
+
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
