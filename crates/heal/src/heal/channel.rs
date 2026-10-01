@@ -766,6 +766,9 @@ impl HealChannelProcessor {
         let mut heal_request = HealRequest::new(heal_type, options, priority);
         heal_request.id = request.id;
         heal_request.source = request.source;
+        if request.source == HealRequestSource::Mrf {
+            heal_request.expected_mrf_bucket_incarnation_id = request.expected_bucket_incarnation_id;
+        }
         heal_request.heal_endpoints = request.heal_endpoints;
         // force_start controls admission/queue semantics only. Do not reinterpret it as
         // destructive heal options: admin clients commonly pass forceStart=true together
@@ -1143,6 +1146,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
@@ -1176,6 +1180,7 @@ mod tests {
             bucket: String::new(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
@@ -1209,6 +1214,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: Some("test-object".to_string()),
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
@@ -1234,6 +1240,27 @@ mod tests {
         assert!(heal_request.options.remove_corrupted);
         assert!(heal_request.options.recreate_missing);
         assert!(heal_request.options.no_lock);
+    }
+
+    #[tokio::test]
+    async fn test_convert_mrf_fallback_preserves_source_bucket_incarnation() {
+        let incarnation = uuid::Uuid::new_v4();
+        let processor = HealChannelProcessor::new(create_test_heal_manager());
+        let request = HealChannelRequest {
+            id: "mrf-fallback".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("test-object".to_string()),
+            expected_bucket_incarnation_id: Some(incarnation),
+            source: HealRequestSource::Mrf,
+            ..Default::default()
+        };
+
+        let heal_request = processor
+            .convert_to_heal_request(request)
+            .expect("MRF fallback request converts");
+
+        assert_eq!(heal_request.source, HealRequestSource::Mrf);
+        assert_eq!(heal_request.expected_mrf_bucket_incarnation_id, Some(incarnation));
     }
 
     #[tokio::test]
@@ -1263,6 +1290,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: Some("test-object".to_string()),
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Low,
@@ -1301,6 +1329,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 object_prefix: Some("test-object".to_string()),
                 object_version_id: None,
+                expected_bucket_incarnation_id: None,
                 disk: None,
                 heal_endpoints: Vec::new(),
                 priority: HealChannelPriority::Normal,
@@ -1341,6 +1370,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 object_prefix: Some("test-object".to_string()),
                 object_version_id: None,
+                expected_bucket_incarnation_id: None,
                 disk: None,
                 heal_endpoints: Vec::new(),
                 priority: HealChannelPriority::Normal,
@@ -1374,6 +1404,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: Some("logs/".to_string()),
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::High,
@@ -1410,6 +1441,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: Some("pool_0_set_1".to_string()),
             heal_endpoints: vec!["http://node0:9000/drive1".to_string()],
             priority: HealChannelPriority::Critical,
@@ -1445,6 +1477,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: Some("invalid-disk-id".to_string()),
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
@@ -1484,6 +1517,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 object_prefix: None,
                 object_version_id: None,
+                expected_bucket_incarnation_id: None,
                 disk: None,
                 heal_endpoints: Vec::new(),
                 priority: channel_priority,
@@ -1516,6 +1550,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
@@ -1550,6 +1585,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             object_prefix: Some("".to_string()), // Empty prefix should be treated as bucket heal
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,
@@ -1588,6 +1624,7 @@ mod tests {
             bucket: "bucket".to_string(),
             object_prefix: Some("object".to_string()),
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: None,
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Low,
@@ -2006,6 +2043,7 @@ mod tests {
             bucket: "bucket".to_string(),
             object_prefix: None,
             object_version_id: None,
+            expected_bucket_incarnation_id: None,
             disk: Some("invalid".to_string()),
             heal_endpoints: Vec::new(),
             priority: HealChannelPriority::Normal,

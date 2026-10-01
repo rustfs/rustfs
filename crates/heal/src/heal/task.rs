@@ -323,6 +323,10 @@ pub struct HealRequest {
     pub heal_type: HealType,
     /// Admission identity for an explicit administrator bucket heal. Never rebound on replay.
     pub bucket_incarnation_id: Option<Uuid>,
+    /// Source bucket generation captured for a durable MRF object repair.
+    /// Unlike the admin admission fence above, this must survive queueing and
+    /// retries so execution cannot target a later bucket incarnation.
+    pub expected_mrf_bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority
@@ -351,6 +355,7 @@ impl HealRequest {
             id: Uuid::new_v4().to_string(),
             heal_type,
             bucket_incarnation_id: None,
+            expected_mrf_bucket_incarnation_id: None,
             options,
             priority,
             source: HealRequestSource::Internal,
@@ -417,6 +422,7 @@ pub struct HealTask {
     /// Heal type
     pub heal_type: HealType,
     pub bucket_incarnation_id: Option<Uuid>,
+    pub expected_mrf_bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority inherited from the request
@@ -494,6 +500,7 @@ impl HealTask {
             id: request.id,
             heal_type: request.heal_type,
             bucket_incarnation_id: request.bucket_incarnation_id,
+            expected_mrf_bucket_incarnation_id: request.expected_mrf_bucket_incarnation_id,
             options: request.options,
             priority: request.priority,
             source: request.source,
@@ -530,6 +537,7 @@ impl HealTask {
             id: self.id.clone(),
             heal_type: self.heal_type.clone(),
             bucket_incarnation_id: self.bucket_incarnation_id,
+            expected_mrf_bucket_incarnation_id: self.expected_mrf_bucket_incarnation_id,
             options: self.options.clone(),
             priority: self.priority,
             source: self.source,
