@@ -71,7 +71,7 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream};
 use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
@@ -6798,93 +6798,88 @@ impl LocalDisk {
     }
 
     #[tracing::instrument(name = "delete_file", level = "trace", skip_all)]
-    #[async_recursion::async_recursion]
-    async fn delete_file_with_namespace_owner(
-        &self,
-        base_path: &PathBuf,
-        delete_path: &PathBuf,
+    fn delete_file_with_namespace_owner<'a>(
+        &'a self,
+        base_path: &'a PathBuf,
+        delete_path: &'a PathBuf,
         recursive: bool,
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<()> {
-        // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
-        if is_root_path(base_path) || is_root_path(delete_path) {
-            // debug!("delete_file skip {:?}", &delete_path);
-            return Ok(());
-        }
+            if is_root_path(base_path) || is_root_path(delete_path) {
+                // debug!("delete_file skip {:?}", &delete_path);
+                return Ok(());
+            }
 
-        if !delete_path.starts_with(base_path) || base_path == delete_path {
-            // debug!("delete_file skip {:?}", &delete_path);
-            return Ok(());
-        }
+            if !delete_path.starts_with(base_path) || base_path == delete_path {
+                // debug!("delete_file skip {:?}", &delete_path);
+                return Ok(());
+            }
 
-        if recursive {
-            self.move_to_trash_with_namespace_owner(delete_path, recursive, immediate_purge, namespace_owner.clone())
-                .await?;
-        } else if delete_path.is_dir() {
-            // debug!("delete_file remove_dir {:?}", &delete_path);
-            if let Err(err) = os::remove_dir_with_owner(delete_path, namespace_owner.clone()).await {
-                // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
-                // A missing or still-populated directory is benign here; see
-                // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
-                // convention, rustfs/rustfs#4978).
-                if is_dir_not_empty_error(&err) {
-                    // A populated directory keeps its ancestors populated; no further pruning is needed.
-                    return Ok(());
+            if recursive {
+                self.move_to_trash_with_namespace_owner(delete_path, recursive, immediate_purge, namespace_owner.clone())
+                    .await?;
+            } else if delete_path.is_dir() {
+                // debug!("delete_file remove_dir {:?}", &delete_path);
+                if let Err(err) = os::remove_dir_with_owner(delete_path, namespace_owner.clone()).await {
+                    // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
+                    // A missing or still-populated directory is benign here; see
+                    // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
+                    // convention, rustfs/rustfs#4978).
+                    if is_dir_not_empty_error(&err) {
+                        // A populated directory keeps its ancestors populated; no further pruning is needed.
+                        return Ok(());
+                    }
+                    if !is_benign_object_rmdir_error(&err) {
+                        warn!(
+                            event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?delete_path,
+                            operation = "remove_dir",
+                            error_kind = %err.kind(),
+                            "Disk local delete failed"
+                        );
+                        return Err(Error::other(FileAccessDeniedWithContext {
+                            path: delete_path.clone(),
+                            source: err,
+                        }));
+                    }
                 }
-                if !is_benign_object_rmdir_error(&err) {
-                    warn!(
-                        event = EVENT_DISK_LOCAL_DELETE_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = ?delete_path,
-                        operation = "remove_dir",
-                        error_kind = %err.kind(),
-                        "Disk local delete failed"
-                    );
-                    return Err(Error::other(FileAccessDeniedWithContext {
-                        path: delete_path.clone(),
-                        source: err,
-                    }));
+                // debug!("delete_file remove_dir done {:?}", &delete_path);
+            } else if let Err(err) = os::remove_file_with_owner(delete_path, namespace_owner.clone()).await {
+                // debug!("remove_file err {:?} when {:?}", &err, &delete_path);
+                match err.kind() {
+                    ErrorKind::NotFound => (),
+                    _ => {
+                        warn!(
+                            event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?delete_path,
+                            operation = "remove_file",
+                            error = ?err,
+                            "Disk local delete failed"
+                        );
+                        return Err(Error::other(FileAccessDeniedWithContext {
+                            path: delete_path.clone(),
+                            source: err,
+                        }));
+                    }
                 }
             }
-            // debug!("delete_file remove_dir done {:?}", &delete_path);
-        } else if let Err(err) = os::remove_file_with_owner(delete_path, namespace_owner.clone()).await {
-            // debug!("remove_file err {:?} when {:?}", &err, &delete_path);
-            match err.kind() {
-                ErrorKind::NotFound => (),
-                _ => {
-                    warn!(
-                        event = EVENT_DISK_LOCAL_DELETE_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = ?delete_path,
-                        operation = "remove_file",
-                        error = ?err,
-                        "Disk local delete failed"
-                    );
-                    return Err(Error::other(FileAccessDeniedWithContext {
-                        path: delete_path.clone(),
-                        source: err,
-                    }));
-                }
+
+            if let Some(dir_path) = delete_path.parent() {
+                self.delete_file_with_namespace_owner(base_path, &PathBuf::from(dir_path), false, false, namespace_owner.clone())
+                    .await?;
             }
-        }
 
-        if let Some(dir_path) = delete_path.parent() {
-            Box::pin(self.delete_file_with_namespace_owner(
-                base_path,
-                &PathBuf::from(dir_path),
-                false,
-                false,
-                namespace_owner.clone(),
-            ))
-            .await?;
-        }
-
-        // debug!("delete_file done {:?}", &delete_path);
-        Ok(())
+            // debug!("delete_file done {:?}", &delete_path);
+            Ok(())
+        })
     }
 
     /// read xl.meta raw data
@@ -7952,270 +7947,466 @@ impl LocalDisk {
         Err(DiskError::FileCorrupt)
     }
 
-    #[async_recursion::async_recursion]
     #[allow(clippy::too_many_arguments)]
-    async fn scan_dir<W>(
-        &self,
+    fn scan_dir<'a, W>(
+        &'a self,
         mut current: String,
         mut prefix: String,
-        opts: &WalkDirOptions,
-        out: &mut MetacacheWriter<W>,
-        objs_returned: &mut i32,
+        opts: &'a WalkDirOptions,
+        out: &'a mut MetacacheWriter<W>,
+        objs_returned: &'a mut i32,
         skip_current_dir_object: bool,
         multipart_dir_to_skip: Option<HashSet<String>>,
-    ) -> Result<bool>
+    ) -> BoxFuture<'a, Result<bool>>
     where
-        W: AsyncWrite + Unpin + Send,
+        W: AsyncWrite + Unpin + Send + 'a,
     {
-        // The part of forward_to below this directory, taken before `current`
-        // loses its trailing slash.
-        let forward_rest = opts
-            .forward_to
-            .as_ref()
-            .and_then(|v| v.strip_prefix(&current))
-            .map(str::to_owned);
-        let forward = {
-            forward_rest.as_deref().map(|forward| {
-                if let Some(idx) = forward.find('/') {
-                    forward[..idx].to_owned()
-                } else {
-                    forward.to_owned()
-                }
-            })
-        };
+        Box::pin(async move {
+            // The part of forward_to below this directory, taken before `current`
+            // loses its trailing slash.
+            let forward_rest = opts
+                .forward_to
+                .as_ref()
+                .and_then(|v| v.strip_prefix(&current))
+                .map(str::to_owned);
+            let forward = {
+                forward_rest.as_deref().map(|forward| {
+                    if let Some(idx) = forward.find('/') {
+                        forward[..idx].to_owned()
+                    } else {
+                        forward.to_owned()
+                    }
+                })
+            };
 
-        if opts.limit > 0 && *objs_returned >= opts.limit {
-            return Ok(true);
-        }
-
-        // TODO(backlog): add directory listing lock to prevent concurrent enumeration
-
-        let stall = opts.stall_timeout_duration();
-
-        // Keep the existing in-memory sort contract, but bound each directory-entry
-        // read rather than treating the whole enumeration as one stalled disk
-        // operation. Object listing keeps using per-entry stall deadlines through
-        // `read_dir_entries_with_walk_stall` so wide prefixes can still be handled
-        // as a single logical read in API semantics.
-        let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let dir_path_abs = self.io_get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
-        let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
-            Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
-                let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
-                if let Err(access_err) = cached_access(&volume_dir).await {
-                    Err(to_access_error(access_err, DiskError::VolumeAccessDenied).into())
-                } else {
-                    Err(err)
-                }
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(true);
             }
-            result => result,
-        };
-        if let Some(started) = read_dir_started {
-            rustfs_io_metrics::record_list_objects_local_read_dir(rustfs_io_metrics::ListObjectsLocalReadDirObservation {
-                outcome: if read_dir_result.is_ok() {
-                    rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK
-                } else {
-                    rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR
-                },
-                requested_count: -1,
-                returned_entries: read_dir_result.as_ref().map_or(0, Vec::len),
-                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
-                is_root: current.trim_matches('/').is_empty(),
-                has_filter_prefix: !prefix.is_empty(),
-                has_forward: forward.is_some(),
-            });
-        }
 
-        let mut entries = match read_dir_result {
-            Ok(res) => res,
-            Err(e) => {
-                if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    error!(
-                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = %current,
-                        operation = "list_dir",
-                        error = ?e,
-                        "Disk local scan failed"
-                    );
-                    return Err(e);
+            // TODO(backlog): add directory listing lock to prevent concurrent enumeration
+
+            let stall = opts.stall_timeout_duration();
+
+            // Keep the existing in-memory sort contract, but bound each directory-entry
+            // read rather than treating the whole enumeration as one stalled disk
+            // operation. Object listing keeps using per-entry stall deadlines through
+            // `read_dir_entries_with_walk_stall` so wide prefixes can still be handled
+            // as a single logical read in API semantics.
+            let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let dir_path_abs = self.io_get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
+            let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
+                Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
+                    let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
+                    if let Err(access_err) = cached_access(&volume_dir).await {
+                        Err(to_access_error(access_err, DiskError::VolumeAccessDenied).into())
+                    } else {
+                        Err(err)
+                    }
                 }
+                result => result,
+            };
+            if let Some(started) = read_dir_started {
+                rustfs_io_metrics::record_list_objects_local_read_dir(rustfs_io_metrics::ListObjectsLocalReadDirObservation {
+                    outcome: if read_dir_result.is_ok() {
+                        rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK
+                    } else {
+                        rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR
+                    },
+                    requested_count: -1,
+                    returned_entries: read_dir_result.as_ref().map_or(0, Vec::len),
+                    duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    is_root: current.trim_matches('/').is_empty(),
+                    has_filter_prefix: !prefix.is_empty(),
+                    has_forward: forward.is_some(),
+                });
+            }
 
-                if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
-                    return Err(DiskError::FileNotFound);
+            let mut entries = match read_dir_result {
+                Ok(res) => res,
+                Err(e) => {
+                    if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
+                        error!(
+                            event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = %current,
+                            operation = "list_dir",
+                            error = ?e,
+                            "Disk local scan failed"
+                        );
+                        return Err(e);
+                    }
+
+                    if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
+                        return Err(DiskError::FileNotFound);
+                    }
+
+                    return Ok(false);
                 }
+            };
 
+            if entries.is_empty() {
                 return Ok(false);
             }
-        };
 
-        if entries.is_empty() {
-            return Ok(false);
-        }
+            current = current.trim_matches('/').to_owned();
 
-        current = current.trim_matches('/').to_owned();
+            let bucket = opts.bucket.as_str();
 
-        let bucket = opts.bucket.as_str();
+            let mut dir_objes = HashSet::new();
 
-        let mut dir_objes = HashSet::new();
-
-        // First-level filtering
-        for item in entries.iter_mut() {
-            let entry = item.clone();
-            // check limit
-            if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(true);
-            }
-            // check multipart dir
-            if skip_current_dir_object
-                && let Some(ref dir_to_skip) = multipart_dir_to_skip
-                && dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR))
-            {
-                *item = "".to_owned();
-                continue;
-            }
-            // check prefix
-            if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
-                *item = "".to_owned();
-                continue;
-            }
-
-            if let Some(forward) = &forward
-                && &entry < forward
-            {
-                *item = "".to_owned();
-                continue;
-            }
-
-            if entry.ends_with(SLASH_SEPARATOR) {
-                if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                    let entry = format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
-                    dir_objes.insert(entry.clone());
-                    *item = entry;
+            // First-level filtering
+            for item in entries.iter_mut() {
+                let entry = item.clone();
+                // check limit
+                if opts.limit > 0 && *objs_returned >= opts.limit {
+                    return Ok(true);
+                }
+                // check multipart dir
+                if skip_current_dir_object
+                    && let Some(ref dir_to_skip) = multipart_dir_to_skip
+                    && dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR))
+                {
+                    *item = "".to_owned();
+                    continue;
+                }
+                // check prefix
+                if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
+                    *item = "".to_owned();
                     continue;
                 }
 
-                *item = entry.trim_end_matches(SLASH_SEPARATOR).to_owned();
-                continue;
-            }
-
-            *item = "".to_owned();
-
-            if entry.ends_with(STORAGE_FORMAT_FILE) {
-                if skip_current_dir_object {
+                if let Some(forward) = &forward
+                    && &entry < forward
+                {
+                    *item = "".to_owned();
                     continue;
                 }
 
-                let metadata =
-                    with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", current, entry).as_str())).await?;
+                if entry.ends_with(SLASH_SEPARATOR) {
+                    if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
+                        let entry =
+                            format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
+                        dir_objes.insert(entry.clone());
+                        *item = entry;
+                        continue;
+                    }
 
-                let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
-                let name = entry.trim_end_matches(SLASH_SEPARATOR);
-                let name = decode_dir_object(format!("{}/{}", current, name).as_str());
-
-                if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
-                    *objs_returned += 1;
+                    *item = entry.trim_end_matches(SLASH_SEPARATOR).to_owned();
+                    continue;
                 }
 
-                write_metacache_obj(
-                    out,
-                    &MetaCacheEntry {
-                        name: name.clone(),
-                        metadata: metadata.to_vec(),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+                *item = "".to_owned();
 
-                continue;
+                if entry.ends_with(STORAGE_FORMAT_FILE) {
+                    if skip_current_dir_object {
+                        continue;
+                    }
+
+                    let metadata =
+                        with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", current, entry).as_str()))
+                            .await?;
+
+                    let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
+                    let name = entry.trim_end_matches(SLASH_SEPARATOR);
+                    let name = decode_dir_object(format!("{}/{}", current, name).as_str());
+
+                    if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                        *objs_returned += 1;
+                    }
+
+                    write_metacache_obj(
+                        out,
+                        &MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: metadata.to_vec(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+
+                    continue;
+                }
             }
-        }
 
-        entries.sort();
+            entries.sort();
 
-        // Every entry left here is a directory. Compare it as the key prefix it
-        // stands for, slash included: "s-x" sorts after "s" as a name, but all
-        // of "s-x/..." sorts before "s/..." ('-' < '/'), so a scan resuming
-        // inside "s/" has to leave "s-x" out even though it comes later.
-        if let Some(forward) = forward_rest.as_deref() {
-            entries.retain(|entry| {
-                if entry.is_empty() {
-                    return true;
-                }
-                let key = if entry.ends_with(SLASH_SEPARATOR) {
-                    std::borrow::Cow::Borrowed(entry.as_str())
-                } else {
-                    std::borrow::Cow::Owned(format!("{entry}{SLASH_SEPARATOR}"))
-                };
-                key.as_ref() >= forward || forward.starts_with(key.as_ref())
-            });
-        }
+            // Every entry left here is a directory. Compare it as the key prefix it
+            // stands for, slash included: "s-x" sorts after "s" as a name, but all
+            // of "s-x/..." sorts before "s/..." ('-' < '/'), so a scan resuming
+            // inside "s/" has to leave "s-x" out even though it comes later.
+            if let Some(forward) = forward_rest.as_deref() {
+                entries.retain(|entry| {
+                    if entry.is_empty() {
+                        return true;
+                    }
+                    let key = if entry.ends_with(SLASH_SEPARATOR) {
+                        std::borrow::Cow::Borrowed(entry.as_str())
+                    } else {
+                        std::borrow::Cow::Owned(format!("{entry}{SLASH_SEPARATOR}"))
+                    };
+                    key.as_ref() >= forward || forward.starts_with(key.as_ref())
+                });
+            }
 
-        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
-        // Explicit directory markers and real directories can resolve to the same logical path.
-        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>, bool)>,
-                            dir_name: String,
-                            skip_object: bool,
-                            dir_to_skip: Option<HashSet<String>>,
-                            scan_required: bool| {
-            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip, existing_scan_required)) =
-                dir_stack.last_mut()
-                && *last_dir_name == dir_name
-            {
-                *existing_skip_object |= skip_object;
-                *existing_scan_required |= scan_required;
-                if let Some(existing_dir_to_skip) = existing_dir_to_skip {
-                    if let Some(new_dir_to_skip) = &dir_to_skip {
-                        existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
+            let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
+            // Explicit directory markers and real directories can resolve to the same logical path.
+            let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>, bool)>,
+                                dir_name: String,
+                                skip_object: bool,
+                                dir_to_skip: Option<HashSet<String>>,
+                                scan_required: bool| {
+                if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip, existing_scan_required)) =
+                    dir_stack.last_mut()
+                    && *last_dir_name == dir_name
+                {
+                    *existing_skip_object |= skip_object;
+                    *existing_scan_required |= scan_required;
+                    if let Some(existing_dir_to_skip) = existing_dir_to_skip {
+                        if let Some(new_dir_to_skip) = &dir_to_skip {
+                            existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
+                        }
+                    } else {
+                        *existing_dir_to_skip = dir_to_skip;
                     }
                 } else {
-                    *existing_dir_to_skip = dir_to_skip;
+                    dir_stack.push((dir_name, skip_object, dir_to_skip, scan_required));
                 }
-            } else {
-                dir_stack.push((dir_name, skip_object, dir_to_skip, scan_required));
-            }
-        };
-        prefix = "".to_owned();
+            };
+            prefix = "".to_owned();
 
-        for entry in entries.iter() {
-            if entry.is_empty() {
-                continue;
-            }
+            for entry in entries.iter() {
+                if entry.is_empty() {
+                    continue;
+                }
 
-            if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(true);
-            }
-
-            let name = path_join_buf(&[current.as_str(), entry.as_str()]);
-
-            while let Some((last_name, _, _, _)) = dir_stack.last()
-                && *last_name < name
-            {
-                // A prior iteration of this same loop may have just recursed
-                // into a pending subdirectory and hit the page limit there.
-                // Popping and recursing into another one anyway would still
-                // scan (and emit entries for) a directory beyond where the
-                // page was supposed to stop - stop draining the stack the
-                // moment the limit is reached, same as the check below this
-                // loop guards against for the current entry itself.
                 if opts.limit > 0 && *objs_returned >= opts.limit {
                     return Ok(true);
                 }
 
-                let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
+                let name = path_join_buf(&[current.as_str(), entry.as_str()]);
+
+                while let Some((last_name, _, _, _)) = dir_stack.last()
+                    && *last_name < name
+                {
+                    // A prior iteration of this same loop may have just recursed
+                    // into a pending subdirectory and hit the page limit there.
+                    // Popping and recursing into another one anyway would still
+                    // scan (and emit entries for) a directory beyond where the
+                    // page was supposed to stop - stop draining the stack the
+                    // moment the limit is reached, same as the check below this
+                    // loop guards against for the current entry itself.
+                    if opts.limit > 0 && *objs_returned >= opts.limit {
+                        return Ok(true);
+                    }
+
+                    let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
+                    write_metacache_obj(
+                        out,
+                        &MetaCacheEntry {
+                            name: pop.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+
+                    let scan_path = pop.clone();
+                    if opts.recursive && scan_required {
+                        match self
+                            .scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)
+                            .await
+                        {
+                            Ok(true) => return Ok(true),
+                            Ok(false) => {}
+                            Err(er) => {
+                                if !er.is_metacache_output_stream_closed() {
+                                    error!(
+                                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                        path = %scan_path,
+                                        operation = "scan_dir",
+                                        error = ?er,
+                                        "Disk local scan failed"
+                                    );
+                                }
+                                return Err(er);
+                            }
+                        }
+                    }
+                }
+
+                // The while-loop above may have just recursed into a pending
+                // subdirectory and hit the page limit there. `name` sorts after
+                // that subdirectory's entries, so emitting it now would hand the
+                // caller a continuation marker past the subdirectory's unscanned
+                // tail, permanently skipping those keys on the next page instead
+                // of just deferring them to it.
+                if opts.limit > 0 && *objs_returned >= opts.limit {
+                    return Ok(true);
+                }
+
+                let mut meta = MetaCacheEntry {
+                    name,
+                    ..Default::default()
+                };
+
+                let mut is_dir_obj = false;
+
+                if let Some(_dir) = dir_objes.get(entry) {
+                    is_dir_obj = true;
+                    meta.name
+                        .truncate(meta.name.len() - meta.name.chars().last().expect("operation should succeed").len_utf8());
+                    meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
+                }
+
+                let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
+                let metadata_read = if opts.recursive && !is_dir_obj {
+                    with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &meta.name))
+                        .await
+                        .map(|read| {
+                            (
+                                Bytes::from(read.bytes),
+                                read.file_meta,
+                                Some(read.data_dirs),
+                                read.has_namespace_child_candidate,
+                            )
+                        })
+                } else {
+                    with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str()))
+                        .await
+                        .map(|metadata| (metadata, None, None, true))
+                };
+
+                match metadata_read {
+                    Ok((res, prefetched_file_meta, prefetched_data_dirs, has_namespace_child_candidate)) => {
+                        if is_dir_obj {
+                            meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
+                            meta.name.push_str(SLASH_SEPARATOR);
+                        }
+
+                        meta.metadata = res.to_vec();
+
+                        write_metacache_obj(out, &meta).await?;
+
+                        let file_meta = match prefetched_file_meta {
+                            Some(file_meta) => Some(file_meta),
+                            None if opts.limit > 0 || opts.recursive || !is_dir_obj => FileMeta::load(&res).ok(),
+                            None => None,
+                        };
+
+                        if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
+                            *objs_returned += 1;
+                        }
+
+                        let dir_to_skip = if let Some(data_dirs) = prefetched_data_dirs {
+                            data_dirs
+                        } else {
+                            let mut data_dirs_to_skip = HashSet::new();
+                            if let Some(file_meta) = file_meta.as_ref()
+                                && let Ok(data_dirs) = file_meta.get_data_dirs()
+                            {
+                                for data_dir in data_dirs.iter().flatten() {
+                                    data_dirs_to_skip.insert(data_dir.to_string());
+                                }
+                            }
+                            data_dirs_to_skip
+                        };
+
+                        if opts.recursive {
+                            let mut dir_name = meta.name.clone();
+                            if !dir_name.ends_with(SLASH_SEPARATOR) {
+                                dir_name.push_str(SLASH_SEPARATOR);
+                            }
+                            schedule_dir(
+                                &mut dir_stack,
+                                dir_name,
+                                true,
+                                if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
+                                has_namespace_child_candidate,
+                            );
+                        } else if !is_dir_obj
+                            && self
+                                .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted, stall)
+                                .await?
+                        {
+                            // A plain object `a` shares its backing directory with any
+                            // children `a/...`, and non-recursive walks never descend into
+                            // it — so the prefix `a/` must be produced here or delimiter
+                            // listings lose the CommonPrefix (backlog#1042). Dir-marker
+                            // objects are excluded: their logical children live in a
+                            // separate real directory entry handled above.
+                            let mut dir_name = meta.name.clone();
+                            dir_name.push_str(SLASH_SEPARATOR);
+                            schedule_dir(&mut dir_stack, dir_name, true, None, true);
+                        }
+                    }
+                    Err(err) => {
+                        if err == Error::FileNotFound || err == Error::IsNotRegular {
+                            // NOT an object, append to stack (with slash)
+                            // If dirObject, but no metadata (which is unexpected) we skip it.
+                            if !is_dir_obj
+                                && !with_walk_stall_deadline(
+                                    stall,
+                                    is_empty_dir(self.io_get_object_path(&opts.bucket, &meta.name)?),
+                                )
+                                .await?
+                            {
+                                meta.name.push_str(SLASH_SEPARATOR);
+                                // Conservative listings verify physical prefixes. Never-versioned
+                                // buckets use the bounded fast path, which only has to rule out
+                                // the data dirs a deleted version leaves behind; an empty listing
+                                // of such a prefix then reclaims committed residue.
+                                let listable = if opts.recursive || opts.incl_deleted {
+                                    true
+                                } else if opts.skip_hidden_prefix_check {
+                                    !self.directory_is_delete_residue(&opts.bucket, &meta.name, stall).await?
+                                } else {
+                                    self.directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
+                                        .await?
+                                };
+                                if listable {
+                                    schedule_dir(&mut dir_stack, meta.name, false, None, true);
+                                }
+                            }
+
+                            continue;
+                        }
+
+                        error!(
+                            event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = %fname,
+                            operation = "read_metadata",
+                            error = ?err,
+                            "Disk local scan failed"
+                        );
+                        return Err(err);
+                    }
+                };
+            }
+
+            while let Some((dir, skip_object, dir_to_skip, scan_required)) = dir_stack.pop() {
+                if opts.limit > 0 && *objs_returned >= opts.limit {
+                    return Ok(true);
+                }
+
                 write_metacache_obj(
                     out,
                     &MetaCacheEntry {
-                        name: pop.clone(),
+                        name: dir.clone(),
                         ..Default::default()
                     },
                 )
                 .await?;
 
-                let scan_path = pop.clone();
+                let scan_path = dir.clone();
                 if opts.recursive && scan_required {
-                    match Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await {
+                    match self
+                        .scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)
+                        .await
+                    {
                         Ok(true) => return Ok(true),
                         Ok(false) => {}
                         Err(er) => {
@@ -8227,7 +8418,7 @@ impl LocalDisk {
                                     path = %scan_path,
                                     operation = "scan_dir",
                                     error = ?er,
-                                    "Disk local scan failed"
+                                    "Disk local recursive scan failed"
                                 );
                             }
                             return Err(er);
@@ -8236,192 +8427,8 @@ impl LocalDisk {
                 }
             }
 
-            // The while-loop above may have just recursed into a pending
-            // subdirectory and hit the page limit there. `name` sorts after
-            // that subdirectory's entries, so emitting it now would hand the
-            // caller a continuation marker past the subdirectory's unscanned
-            // tail, permanently skipping those keys on the next page instead
-            // of just deferring them to it.
-            if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(true);
-            }
-
-            let mut meta = MetaCacheEntry {
-                name,
-                ..Default::default()
-            };
-
-            let mut is_dir_obj = false;
-
-            if let Some(_dir) = dir_objes.get(entry) {
-                is_dir_obj = true;
-                meta.name
-                    .truncate(meta.name.len() - meta.name.chars().last().expect("operation should succeed").len_utf8());
-                meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
-            }
-
-            let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
-            let metadata_read = if opts.recursive && !is_dir_obj {
-                with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &meta.name))
-                    .await
-                    .map(|read| {
-                        (
-                            Bytes::from(read.bytes),
-                            read.file_meta,
-                            Some(read.data_dirs),
-                            read.has_namespace_child_candidate,
-                        )
-                    })
-            } else {
-                with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str()))
-                    .await
-                    .map(|metadata| (metadata, None, None, true))
-            };
-
-            match metadata_read {
-                Ok((res, prefetched_file_meta, prefetched_data_dirs, has_namespace_child_candidate)) => {
-                    if is_dir_obj {
-                        meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
-                        meta.name.push_str(SLASH_SEPARATOR);
-                    }
-
-                    meta.metadata = res.to_vec();
-
-                    write_metacache_obj(out, &meta).await?;
-
-                    let file_meta = match prefetched_file_meta {
-                        Some(file_meta) => Some(file_meta),
-                        None if opts.limit > 0 || opts.recursive || !is_dir_obj => FileMeta::load(&res).ok(),
-                        None => None,
-                    };
-
-                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
-                        *objs_returned += 1;
-                    }
-
-                    let dir_to_skip = if let Some(data_dirs) = prefetched_data_dirs {
-                        data_dirs
-                    } else {
-                        let mut data_dirs_to_skip = HashSet::new();
-                        if let Some(file_meta) = file_meta.as_ref()
-                            && let Ok(data_dirs) = file_meta.get_data_dirs()
-                        {
-                            for data_dir in data_dirs.iter().flatten() {
-                                data_dirs_to_skip.insert(data_dir.to_string());
-                            }
-                        }
-                        data_dirs_to_skip
-                    };
-
-                    if opts.recursive {
-                        let mut dir_name = meta.name.clone();
-                        if !dir_name.ends_with(SLASH_SEPARATOR) {
-                            dir_name.push_str(SLASH_SEPARATOR);
-                        }
-                        schedule_dir(
-                            &mut dir_stack,
-                            dir_name,
-                            true,
-                            if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
-                            has_namespace_child_candidate,
-                        );
-                    } else if !is_dir_obj
-                        && self
-                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted, stall)
-                            .await?
-                    {
-                        // A plain object `a` shares its backing directory with any
-                        // children `a/...`, and non-recursive walks never descend into
-                        // it — so the prefix `a/` must be produced here or delimiter
-                        // listings lose the CommonPrefix (backlog#1042). Dir-marker
-                        // objects are excluded: their logical children live in a
-                        // separate real directory entry handled above.
-                        let mut dir_name = meta.name.clone();
-                        dir_name.push_str(SLASH_SEPARATOR);
-                        schedule_dir(&mut dir_stack, dir_name, true, None, true);
-                    }
-                }
-                Err(err) => {
-                    if err == Error::FileNotFound || err == Error::IsNotRegular {
-                        // NOT an object, append to stack (with slash)
-                        // If dirObject, but no metadata (which is unexpected) we skip it.
-                        if !is_dir_obj
-                            && !with_walk_stall_deadline(stall, is_empty_dir(self.io_get_object_path(&opts.bucket, &meta.name)?))
-                                .await?
-                        {
-                            meta.name.push_str(SLASH_SEPARATOR);
-                            // Conservative listings verify physical prefixes. Never-versioned
-                            // buckets use the bounded fast path, which only has to rule out
-                            // the data dirs a deleted version leaves behind; an empty listing
-                            // of such a prefix then reclaims committed residue.
-                            let listable = if opts.recursive || opts.incl_deleted {
-                                true
-                            } else if opts.skip_hidden_prefix_check {
-                                !self.directory_is_delete_residue(&opts.bucket, &meta.name, stall).await?
-                            } else {
-                                self.directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
-                                    .await?
-                            };
-                            if listable {
-                                schedule_dir(&mut dir_stack, meta.name, false, None, true);
-                            }
-                        }
-
-                        continue;
-                    }
-
-                    error!(
-                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = %fname,
-                        operation = "read_metadata",
-                        error = ?err,
-                        "Disk local scan failed"
-                    );
-                    return Err(err);
-                }
-            };
-        }
-
-        while let Some((dir, skip_object, dir_to_skip, scan_required)) = dir_stack.pop() {
-            if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(true);
-            }
-
-            write_metacache_obj(
-                out,
-                &MetaCacheEntry {
-                    name: dir.clone(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-            let scan_path = dir.clone();
-            if opts.recursive && scan_required {
-                match Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await {
-                    Ok(true) => return Ok(true),
-                    Ok(false) => {}
-                    Err(er) => {
-                        if !er.is_metacache_output_stream_closed() {
-                            error!(
-                                event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                                path = %scan_path,
-                                operation = "scan_dir",
-                                error = ?er,
-                                "Disk local recursive scan failed"
-                            );
-                        }
-                        return Err(er);
-                    }
-                }
-            }
-        }
-
-        Ok(false)
+            Ok(false)
+        })
     }
 
     /// Whether the backing directory of plain object `object_name` also holds

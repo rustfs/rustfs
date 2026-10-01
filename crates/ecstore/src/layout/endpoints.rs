@@ -908,7 +908,7 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
         return Err(invalid());
     }
 
-    let (scheme, remainder) = raw.split_once("://").ok_or_else(&invalid)?;
+    let (scheme, remainder) = raw.split_once("://").ok_or_else(invalid)?;
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err(invalid());
     }
@@ -916,17 +916,17 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
         .split('/')
         .next()
         .filter(|authority| !authority.is_empty())
-        .ok_or_else(&invalid)?;
+        .ok_or_else(invalid)?;
     if authority.contains('@') {
         return Err(invalid());
     }
 
     let port = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (_, suffix) = bracketed.split_once(']').ok_or_else(&invalid)?;
+        let (_, suffix) = bracketed.split_once(']').ok_or_else(invalid)?;
         if suffix.is_empty() {
             return Ok(None);
         }
-        suffix.strip_prefix(':').ok_or_else(&invalid)?
+        suffix.strip_prefix(':').ok_or_else(invalid)?
     } else if let Some((_, port)) = authority.rsplit_once(':') {
         port
     } else {
@@ -1001,11 +1001,7 @@ fn parse_explicit_local_endpoint_host(raw: &str) -> Result<Host<String>> {
 
     let host = Host::parse(raw).map_err(|_| invalid())?;
     let host = match host {
-        Host::Domain(domain) => Host::Domain(
-            domain_without_optional_trailing_dot(&domain)
-                .ok_or_else(&invalid)?
-                .to_string(),
-        ),
+        Host::Domain(domain) => Host::Domain(domain_without_optional_trailing_dot(&domain).ok_or_else(invalid)?.to_string()),
         host => host,
     };
     if matches!(&host, Host::Domain(domain) if domain.contains('*'))
