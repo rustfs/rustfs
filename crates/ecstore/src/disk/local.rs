@@ -6798,7 +6798,7 @@ impl LocalDisk {
     }
 
     #[tracing::instrument(name = "delete_file", level = "trace", skip_all)]
-    #[async_recursion::async_recursion]
+    
     async fn delete_file_with_namespace_owner(
         &self,
         base_path: &PathBuf,

@@ -12976,7 +12976,7 @@ impl ECStore {
                 .targets
                 .iter()
                 .find(|target| target.pool_index == permitted_target_pool_index)
-                .and_then(&candidate)
+                .and_then(candidate)
             {
                 return Ok(pool_index);
             }
