@@ -266,7 +266,6 @@ class RuntimeDeps:
     botocore_config: Any
     botocore_credentials: Any
     botocore_auth: Any
-    botocore_s3_auth: Any
     botocore_awsrequest: Any
     pyarrow: Any
     load_catalog: Any
@@ -472,13 +471,13 @@ def load_runtime_deps() -> RuntimeDeps:
         pyarrow = None
         missing.append("pyarrow")
     try:
-        from botocore.auth import S3SigV4Auth, SigV4Auth
+        from botocore.auth import SigV4Auth
         from botocore.awsrequest import AWSRequest
         from botocore.exceptions import ClientError
         from botocore.config import Config
         from botocore.credentials import Credentials
     except ModuleNotFoundError:
-        ClientError = Config = Credentials = S3SigV4Auth = SigV4Auth = AWSRequest = None
+        ClientError = Config = Credentials = SigV4Auth = AWSRequest = None
         missing.append("botocore")
     try:
         from pyiceberg.catalog import load_catalog
@@ -499,7 +498,6 @@ def load_runtime_deps() -> RuntimeDeps:
         botocore_config=Config,
         botocore_credentials=Credentials,
         botocore_auth=SigV4Auth,
-        botocore_s3_auth=S3SigV4Auth,
         botocore_awsrequest=AWSRequest,
         pyarrow=pyarrow,
         load_catalog=load_catalog,
@@ -535,8 +533,7 @@ def unsigned_ssl_context(insecure: bool) -> ssl.SSLContext | None:
 
 def sign_rest_request(args: argparse.Namespace, deps: RuntimeDeps, request: Any) -> None:
     credentials = deps.botocore_credentials(args.access_key, args.secret_key)
-    signer = deps.botocore_s3_auth if args.profile in RUSTFS_PROFILES else deps.botocore_auth
-    signer(credentials, args.rest_signing_name, args.region).add_auth(request)
+    deps.botocore_auth(credentials, args.rest_signing_name, args.region).add_auth(request)
 
 
 def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

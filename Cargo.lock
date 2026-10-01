@@ -11280,8 +11280,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "030a43692a1fd97bbd2c594eeaad8f5c1e452a9d29ad6a3eebce1650937c4a77"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11291,7 +11290,6 @@ dependencies = [
  "bytes",
  "bytestring",
  "cfg-if",
- "chrono",
  "crc-fast",
  "futures",
  "hex-simd",
@@ -11339,8 +11337,7 @@ dependencies = [
 [[package]]
 name = "s3s-multipart"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a543079d42c20c81781b7e31704ecacd64b0e3819b2384db5bf4869abf6c6f01"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -11353,8 +11350,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918b207c39474baef4774355100e712dfea46020e3289ddd5b4bc6e21927b826"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.21",
@@ -11363,8 +11359,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0979baf8cdf30e38bdfba8e58ee2776d78e55bb3bd3d1f3502f917829da79933"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11377,8 +11372,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330996b9a24804b3df4ad37e62e7817968857d99cf6029c21512b6b64b97f645"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "arrayvec",
  "base64-simd",
@@ -11390,6 +11384,7 @@ dependencies = [
  "sha2 0.11.0",
  "smallvec",
  "std-next",
+ "subtle",
  "thiserror 2.0.21",
  "zeroize",
 ]
