@@ -985,6 +985,19 @@ impl PreparedGetObjectReader {
         reader.body_source = crate::object_api::GetObjectBodySource::HookMissed;
         Ok(ECStore::attach_read_lock_guard(reader, self.read_lock_guard))
     }
+
+    /// Open the prepared source with bounded copy prefetch and request-owned
+    /// cancellation, including cancellation during reader construction.
+    pub async fn into_reader_for_copy(self) -> Result<(GetObjectReader, tokio_util::sync::DropGuard)> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let reader = crate::set_disk::with_get_object_read_cancellation(
+            cancellation,
+            crate::set_disk::with_get_object_read_policy(crate::set_disk::GetObjectReadPolicy::CopySource, self.into_reader()),
+        )
+        .await?;
+        Ok((reader, guard))
+    }
 }
 
 struct LockGuardedReader {
