@@ -71,7 +71,7 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
         owner: Some(owner),
         initiator: Some(initiator),
         is_truncated: Some(res.is_truncated),
-        next_part_number_marker: res.next_part_number_marker.try_into().ok(),
+        next_part_number_marker: res.next_part_number_marker.and_then(|v| v.try_into().ok()),
         max_parts: res.max_parts.try_into().ok(),
         part_number_marker: res.part_number_marker.try_into().ok(),
         storage_class: Some(
@@ -228,7 +228,7 @@ mod tests {
             upload_id: "upload-a".to_string(),
             storage_class: "STANDARD".to_string(),
             part_number_marker: 1,
-            next_part_number_marker: 2,
+            next_part_number_marker: Some(2),
             max_parts: 1000,
             is_truncated: true,
             parts: vec![PartInfo {
@@ -374,7 +374,7 @@ mod tests {
         let input = ListPartsInfo {
             storage_class: "STANDARD_IA".to_string(),
             part_number_marker: usize::MAX,
-            next_part_number_marker: usize::MAX,
+            next_part_number_marker: Some(usize::MAX),
             max_parts: usize::MAX,
             parts: vec![PartInfo {
                 part_num: usize::MAX,
