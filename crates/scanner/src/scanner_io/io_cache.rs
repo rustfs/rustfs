@@ -658,13 +658,11 @@ impl ScannerIOCache for SetDisks {
         let mut futs = Vec::new();
 
         let bucket_rx_mutex: Arc<Mutex<mpsc::Receiver<BucketInfo>>> = Arc::new(Mutex::new(bucket_rx));
-        let bucket_retry_generations = Arc::new(StdMutex::new(HashMap::<String, u64>::new()));
         let remaining_bucket_work = Arc::new(AtomicUsize::new(buckets.len()));
         let bucket_work_complete = CancellationToken::new();
         for (disk, worker_mode) in workers {
             let service_cohort_clone = service_cohort.clone();
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
-            let bucket_retry_generations_clone = bucket_retry_generations.clone();
             let bucket_tx_clone = bucket_tx.clone();
             let remaining_bucket_work_clone = remaining_bucket_work.clone();
             let bucket_work_complete_clone = bucket_work_complete.clone();
@@ -717,15 +715,6 @@ impl ScannerIOCache for SetDisks {
                     };
                     let mut work_guard =
                         BucketWorkGuard::new(remaining_bucket_work_clone.clone(), bucket_work_complete_clone.clone());
-                    let retry_generation = {
-                        let mut generations = bucket_retry_generations_clone
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let next = generations.entry(bucket.name.clone()).or_default();
-                        let generation = *next;
-                        *next = next.saturating_add(1);
-                        generation
-                    };
                     // Prefix hints are process-local. Never hand one to a
                     // remote or legacy-coordinator disk path.
                     let prefix_scan_scope = disk.is_local().then(|| scope_clone.prefix_scope_for(&bucket.name)).flatten();
@@ -990,7 +979,6 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
-                    let owner_trace = ScannerCacheOwnerTraceGuard::new(&cache_name, source);
 
                     let mut cache = DataUsageCache::default();
                     let mut revisions = match cache.load_with_revisions(store_clone_clone.clone(), &cache_name).await {
@@ -1214,13 +1202,6 @@ impl ScannerIOCache for SetDisks {
                                         expected_publication_epoch: expected_publication_epoch_clone,
                                         cycle: want_cycle,
                                         leader_epoch,
-                                        scanner_kind: "local_coordinator",
-                                        bucket: &bucket.name,
-                                        source,
-                                        disk_location: format!("disk-{:?}", disk.get_disk_location().disk_idx),
-                                        session_id: remote_session_id,
-                                        retry_generation: Some(retry_generation),
-                                        another_local_owner: owner_trace.another_local_owner_now(),
                                     },
                                     cache_name.as_str(),
                                     &checkpoint,

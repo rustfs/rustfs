@@ -15,21 +15,6 @@
 use super::*;
 use std::sync::Arc;
 
-static CACHE_WRITE_TRACE_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn trace_cache_save_path(path: &str) -> bool {
-    let Ok(bucket) = std::env::var("RUSTFS_SCANNER_CHECKPOINT_TRACE_BUCKET") else {
-        return false;
-    };
-    !bucket.is_empty()
-        && path.contains(&format!("/{bucket}/{DATA_USAGE_CACHE_NAME}"))
-        && CACHE_WRITE_TRACE_EVENTS
-            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |count| {
-                (count < 128).then_some(count + 1)
-            })
-            .is_ok()
-}
-
 #[derive(Debug)]
 struct CachePublicationAdmissionUnavailable;
 
@@ -508,22 +493,6 @@ impl DataUsageCache {
             let buf_clone = buf.to_vec();
             let revision = revision.clone();
             async move {
-                let trace_save = trace_cache_save_path(&path_clone);
-                let conditional = revision.is_some();
-                if trace_save {
-                    debug!(
-                        target: "rustfs::scanner::data_usage",
-                        event = EVENT_SCANNER_CACHE_SAVE_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_CACHE,
-                        state = "cache_write_begin",
-                        cache_path = %path_clone,
-                        expected_revision = ?revision,
-                        expected_publication_epoch = ?expected_epoch,
-                        operation = if conditional { "conditional_put" } else { "unconditional_put" },
-                        "Scanner cache revision transition diagnostic"
-                    );
-                }
                 let publication_admission = match expected_epoch {
                     Some(expected_epoch) => scanner_publication_admission_for_epoch(store_clone.clone(), expected_epoch).await,
                     None => store_clone.scanner_data_usage_publication_admission().await,
@@ -535,45 +504,10 @@ impl DataUsageCache {
                         cache_publication_admission_unavailable()
                     });
                 };
-                let write_result = if let Some(revision) = revision {
-                    save_config_with_preconditions(store_clone.clone(), &path_clone, buf_clone, revision.preconditions())
-                        .await
-                        .map(|info| info.etag)
+                if let Some(revision) = revision {
+                    save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
                 } else {
-                    save_config(store_clone.clone(), &path_clone, buf_clone).await.map(|()| None)
-                };
-                if trace_save && write_result.is_err() {
-                    debug!(
-                        target: "rustfs::scanner::data_usage",
-                        event = EVENT_SCANNER_CACHE_SAVE_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_CACHE,
-                        state = "cache_write_rejected",
-                        cache_path = %path_clone,
-                        operation = if conditional { "conditional_put" } else { "unconditional_put" },
-                        error = ?write_result.as_ref().err(),
-                        "Scanner cache revision transition diagnostic"
-                    );
-                }
-                let returned_revision = write_result?;
-                drop(_publication_admission);
-                if trace_save {
-                    // The persistence API returns no revision. A fresh read is
-                    // diagnostic only; the caller still performs its own CAS
-                    // revision refresh and handles read failure normally.
-                    let observed_revision = read_config_revision(store_clone, &path_clone).await;
-                    debug!(
-                        target: "rustfs::scanner::data_usage",
-                        event = EVENT_SCANNER_CACHE_SAVE_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_CACHE,
-                        state = "cache_write_committed",
-                        cache_path = %path_clone,
-                        operation = if conditional { "conditional_put" } else { "unconditional_put" },
-                        returned_revision = ?returned_revision,
-                        observed_revision = ?observed_revision,
-                        "Scanner cache revision transition diagnostic"
-                    );
+                    save_config(store_clone, &path_clone, buf_clone).await?;
                 }
                 Ok::<(), StorageError>(())
             }

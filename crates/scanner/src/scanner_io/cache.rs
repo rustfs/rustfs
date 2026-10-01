@@ -36,113 +36,9 @@ pub(crate) struct ScannerCheckpointPersistContext<'a> {
     pub(crate) expected_publication_epoch: u64,
     pub(crate) cycle: u64,
     pub(crate) leader_epoch: u64,
-    pub(crate) scanner_kind: &'static str,
-    pub(crate) bucket: &'a str,
-    pub(crate) source: DataUsageCacheSource,
-    pub(crate) disk_location: String,
-    pub(crate) session_id: uuid::Uuid,
-    pub(crate) retry_generation: Option<u64>,
-    pub(crate) another_local_owner: bool,
-}
-
-fn checkpoint_trace(
-    context: &ScannerCheckpointPersistContext<'_>,
-    cache_name: &str,
-    state: &'static str,
-    revisions: &DataUsageCacheRevisions,
-    detail: &str,
-) {
-    // This diagnostic is deliberately opt-in and limited to one bucket. It
-    // avoids turning a checkpoint-heavy scan into an unbounded log stream.
-    if std::env::var("RUSTFS_SCANNER_CHECKPOINT_TRACE_BUCKET").ok().as_deref() != Some(context.bucket) {
-        return;
-    }
-    if CHECKPOINT_TRACE_EVENTS
-        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |count| {
-            (count < 256).then_some(count + 1)
-        })
-        .is_err()
-    {
-        return;
-    }
-    debug!(
-        target: "rustfs::scanner::io",
-        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-        component = LOG_COMPONENT_SCANNER,
-        subsystem = LOG_SUBSYSTEM_IO,
-        state,
-        scanner_kind = context.scanner_kind,
-        cycle = context.cycle,
-        bucket = context.bucket,
-        cache_name,
-        pool = context.source.pool_index,
-        set = context.source.set_index,
-        disk_location = %context.disk_location,
-        session_id = %context.session_id,
-        retry_generation = context.retry_generation,
-        another_local_owner = context.another_local_owner,
-        leader_epoch = context.leader_epoch,
-        publication_epoch = context.expected_publication_epoch,
-        lock_resource = %scanner_cache_lock_resource(cache_name, context.source),
-        cache_revisions = ?revisions,
-        detail,
-        "Scanner checkpoint fence diagnostic"
-    );
 }
 
 const CHECKPOINT_FOREGROUND_QUIET_WAIT: Duration = Duration::from_secs(1);
-
-static ACTIVE_CACHE_OWNERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-static CHECKPOINT_TRACE_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Process-local overlap evidence. The distributed namespace lock remains the
-/// authoritative cross-process ownership fence.
-pub(crate) struct ScannerCacheOwnerTraceGuard {
-    resource: Option<String>,
-}
-
-impl ScannerCacheOwnerTraceGuard {
-    pub(crate) fn new(cache_name: &str, source: DataUsageCacheSource) -> Self {
-        let traced_bucket = std::env::var("RUSTFS_SCANNER_CHECKPOINT_TRACE_BUCKET").ok();
-        if !traced_bucket
-            .as_deref()
-            .is_some_and(|bucket| !bucket.is_empty() && cache_name.starts_with(&format!("{bucket}/")))
-        {
-            return Self { resource: None };
-        }
-        let resource = scanner_cache_lock_resource(cache_name, source);
-        let mut owners = ACTIVE_CACHE_OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let active = owners.entry(resource.clone()).or_default();
-        *active += 1;
-        Self {
-            resource: Some(resource),
-        }
-    }
-
-    pub(crate) fn another_local_owner_now(&self) -> bool {
-        let Some(resource) = &self.resource else {
-            return false;
-        };
-        let owners = ACTIVE_CACHE_OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        owners.get(resource).is_some_and(|active| *active > 1)
-    }
-}
-
-impl Drop for ScannerCacheOwnerTraceGuard {
-    fn drop(&mut self) {
-        let Some(resource) = &self.resource else {
-            return;
-        };
-        let mut owners = ACTIVE_CACHE_OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(active) = owners.get_mut(resource) {
-            *active -= 1;
-            if *active == 0 {
-                owners.remove(resource);
-            }
-        }
-    }
-}
 
 async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
     let deadline = tokio::time::Instant::now() + CHECKPOINT_FOREGROUND_QUIET_WAIT;
@@ -173,7 +69,9 @@ async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
 /// Persist one bounded checkpoint and refresh its CAS revisions.
 ///
 /// Local and remote workers share the same publication/leader fencing and
-/// revision-refresh contract; only their lock/cancellation handling remains
+/// revision-refresh contract. Cycle/leader state belongs to the global store,
+/// while cache revisions and publication admission belong to the set store.
+/// Only their lock/cancellation handling remains
 /// at the caller because those guards have different concrete types.
 pub(crate) async fn persist_scanner_checkpoint<S, F>(
     store: Arc<S>,
@@ -187,16 +85,8 @@ where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
     F: ScannerObjectIO,
 {
-    checkpoint_trace(&context, cache_name, "checkpoint_begin", revisions, "before_foreground_wait");
     let foreground_quiet = wait_for_checkpoint_foreground_quiet(context.ctx).await;
     if !foreground_quiet && context.ctx.is_cancelled() {
-        checkpoint_trace(
-            &context,
-            cache_name,
-            "checkpoint_fence_changed",
-            revisions,
-            "cancelled_during_foreground_wait",
-        );
         return ScannerCheckpointPersistResult::FenceChanged;
     }
     if !foreground_quiet {
@@ -211,106 +101,42 @@ where
         );
     }
 
-    if let Err(error) = crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
         context.cycle,
         context.leader_epoch,
         fence_store.clone(),
     )
     .await
+    .is_err()
     {
-        checkpoint_trace(
-            &context,
-            cache_name,
-            "checkpoint_fence_changed",
-            revisions,
-            &format!("pre_save_leader_cycle: {error}"),
-        );
         return ScannerCheckpointPersistResult::FenceChanged;
     }
     if scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
         .await
         .is_none()
     {
-        checkpoint_trace(
-            &context,
-            cache_name,
-            "checkpoint_fence_changed",
-            revisions,
-            "pre_save_publication_admission",
-        );
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    checkpoint_trace(&context, cache_name, "checkpoint_save_begin", revisions, "save_main_then_backup");
     if let Err(error) = checkpoint
         .save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch)
         .await
     {
-        checkpoint_trace(&context, cache_name, "checkpoint_save_failed", revisions, &error.to_string());
         return ScannerCheckpointPersistResult::Failed(error);
     }
-    checkpoint_trace(
-        &context,
-        cache_name,
-        "checkpoint_save_returned",
-        revisions,
-        "persistence_returns_no_revision",
-    );
-    if std::env::var("RUSTFS_SCANNER_CHECKPOINT_TRACE_BUCKET").ok().as_deref() == Some(context.bucket) {
-        match DataUsageCache::read_revisions(store.clone(), cache_name).await {
-            Ok(observed) => checkpoint_trace(
-                &context,
-                cache_name,
-                "checkpoint_immediate_revision",
-                &observed,
-                "after_persistence_before_post_save_fence_validation",
-            ),
-            Err(error) => checkpoint_trace(
-                &context,
-                cache_name,
-                "checkpoint_immediate_revision_failed",
-                revisions,
-                &error.to_string(),
-            ),
-        }
-    }
 
-    if let Err(error) =
-        crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
-            .await
-    {
-        checkpoint_trace(
-            &context,
-            cache_name,
-            "checkpoint_fence_changed",
-            revisions,
-            &format!("post_save_leader_cycle: {error}"),
-        );
-        return ScannerCheckpointPersistResult::FenceChanged;
-    }
-    if scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
         .await
-        .is_none()
+        .is_err()
+        || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+            .await
+            .is_none()
     {
-        checkpoint_trace(
-            &context,
-            cache_name,
-            "checkpoint_fence_changed",
-            revisions,
-            "post_save_publication_admission",
-        );
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
     match DataUsageCache::read_revisions(store, cache_name).await {
         Ok(next_revisions) => {
-            checkpoint_trace(
-                &context,
-                cache_name,
-                "checkpoint_revision_refresh",
-                &next_revisions,
-                "after_save_read_revisions",
-            );
             *revisions = next_revisions;
             ScannerCheckpointPersistResult::Saved
         }

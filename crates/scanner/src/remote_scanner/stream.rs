@@ -16,9 +16,9 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCacheOwnerTraceGuard, ScannerCheckpointPersistContext,
-    ScannerCheckpointPersistResult, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
-    cache_root_entry_info, current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
+    ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
+    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -667,8 +667,6 @@ async fn scan_and_persist_local_bucket(
         bucket,
         next_cycle,
         leader_epoch,
-        session_id,
-        session_sequence,
         scan_plan_digest,
         skip_healing,
         scan_mode,
@@ -710,7 +708,6 @@ async fn scan_and_persist_local_bucket(
                 RemoteScannerServerError::worker(format!("remote namespace scanner cache lock acquisition failed: {err}"))
             }
         })?;
-    let owner_trace = ScannerCacheOwnerTraceGuard::new(&cache_name, source);
     let mut cache = DataUsageCache::default();
     let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
@@ -849,13 +846,6 @@ async fn scan_and_persist_local_bucket(
                         expected_publication_epoch,
                         cycle: next_cycle,
                         leader_epoch,
-                        scanner_kind: "remote_worker",
-                        bucket: &bucket,
-                        source,
-                        disk_location: format!("disk-{:?}", disk.get_disk_location().disk_idx),
-                        session_id,
-                        retry_generation: Some(session_sequence),
-                        another_local_owner: owner_trace.another_local_owner_now(),
                     },
                     &cache_name,
                     &checkpoint,
