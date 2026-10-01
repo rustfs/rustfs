@@ -816,6 +816,7 @@ async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
     for late_cycle in [11, saved.next] {
         let late = crate::scanner_io::persist_scanner_checkpoint(
             store.clone(),
+            store.clone(),
             crate::scanner_io::ScannerCheckpointPersistContext {
                 ctx: &ctx,
                 expected_publication_epoch: 0,
