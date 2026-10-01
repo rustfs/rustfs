@@ -1685,6 +1685,28 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // Reserve capacity before holding lifecycle locks or opening source streams.
+        // The source metadata has not yet established the authoritative copy length.
+        let _copy_admission = match self
+            .concurrency_manager()
+            .admit_multipart_copy()
+            .await
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
+        {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => {
+                counter!("rustfs.upload_part_copy.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            ForegroundWriteAdmission::Rejected => {
+                counter!("rustfs.upload_part_copy.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
+                ));
+            }
+        };
+
         let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
             acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
         let current_source_incarnation_id = store
@@ -3375,6 +3397,189 @@ mod tests {
             assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
+    }
+
+    fn copy_admission_request(bucket: &str, upload_id: &str, range: Option<&str>) -> S3Request<UploadPartCopyInput> {
+        build_request(
+            UploadPartCopyInput::builder()
+                .bucket(bucket.to_string())
+                .key("destination".to_string())
+                .copy_source(CopySource::Bucket {
+                    bucket: bucket.into(),
+                    key: "source".into(),
+                    version_id: None,
+                })
+                .copy_source_range(range.map(str::to_owned))
+                .part_number(1)
+                .upload_id(upload_id.to_string())
+                .build()
+                .expect("copy input should build"),
+            Method::PUT,
+        )
+    }
+
+    async fn copy_admission_fixture(manager: Arc<ConcurrencyManager>) -> (DefaultMultipartUsecase, String, String) {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-admission-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create copy test bucket");
+        let upload = store
+            .new_multipart_upload(&bucket, "destination", &ObjectOptions::default())
+            .await
+            .expect("create copy destination session");
+        (
+            DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), manager),
+            bucket,
+            upload.upload_id,
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_copy_shares_admission_before_source_lookup() {
+        let manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            true,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let (usecase, bucket, upload_id) = copy_admission_fixture(Arc::clone(&manager)).await;
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("hold the shared upload permit");
+        for range in [None, Some("bytes=0-33554431")] {
+            let err = Box::pin(usecase.execute_upload_part_copy(copy_admission_request(&bucket, &upload_id, range)))
+                .await
+                .expect_err("saturated gate must reject before the missing source is accessed");
+            assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+            assert_eq!(manager.put_object_admission_snapshot().active, Some(1));
+        }
+        drop(held);
+        let err = Box::pin(usecase.execute_upload_part_copy(copy_admission_request(&bucket, &upload_id, None)))
+            .await
+            .expect_err("released capacity must reach the missing-source check");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_copy_rejects_before_waiting_for_bucket_lock() {
+        use crate::app::storage_api::test::contract::namespace::NamespaceLocking;
+        let manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            true,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let (usecase, bucket, upload_id) = copy_admission_fixture(Arc::clone(&manager)).await;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let lock = store
+            .new_ns_lock(&bucket, crate::app::storage_api::object_usecase::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("create bucket lifecycle lock");
+        let blocker = lock
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("hold lifecycle write lock");
+        let held = manager.admit_multipart_part(1024).await.expect("fill foreground capacity");
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            Box::pin(usecase.execute_upload_part_copy(copy_admission_request(&bucket, &upload_id, None))),
+        )
+        .await
+        .expect("capacity rejection must not wait on the bucket lock")
+        .expect_err("copy must reject at capacity");
+        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+        drop(held);
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_copy_wait_cancellation_releases_queue_slot() {
+        let manager = Arc::new(ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(60), 1));
+        let (usecase, bucket, upload_id) = copy_admission_fixture(Arc::clone(&manager)).await;
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("hold the only foreground permit");
+        let request = copy_admission_request(&bucket, &upload_id, None);
+        let waiter = tokio::spawn(async move { Box::pin(usecase.execute_upload_part_copy(request)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.put_object_admission_snapshot().queued != Some(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("copy must wait in the bounded queue before accessing its source");
+        waiter.abort();
+        assert!(waiter.await.expect_err("waiting copy must be cancelled").is_cancelled());
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(1));
+        drop(held);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_copy_cancellation_after_admission_releases_permit() {
+        use crate::app::storage_api::test::contract::namespace::NamespaceLocking;
+        let manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            true,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let (usecase, bucket, upload_id) = copy_admission_fixture(Arc::clone(&manager)).await;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let lock = store
+            .new_ns_lock(&bucket, crate::app::storage_api::object_usecase::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("create lifecycle lock");
+        let blocker = lock
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("hold lifecycle lock");
+        let request = copy_admission_request(&bucket, &upload_id, None);
+        let task = tokio::spawn(async move { Box::pin(usecase.execute_upload_part_copy(request)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.put_object_admission_snapshot().active != Some(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("copy must reserve capacity before waiting on its lifecycle lock");
+        assert!(matches!(
+            manager.admit_multipart_part(1024).await.expect("gate should remain open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        task.abort();
+        assert!(task.await.expect_err("blocked copy must be cancelled").is_cancelled());
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_copy_disabled_admission_keeps_source_error() {
+        let manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            false,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let (usecase, bucket, upload_id) = copy_admission_fixture(manager).await;
+        let err = Box::pin(usecase.execute_upload_part_copy(copy_admission_request(&bucket, &upload_id, None)))
+            .await
+            .expect_err("disabled admission must retain the source error");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
     }
 
     #[test]

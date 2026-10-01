@@ -387,7 +387,9 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 32 * 10
 /// Multipart pressure is often many moderate-sized parts rather than one very
 /// large request. The default gates every multipart part through the same permit
 /// pool as large/unknown-size PutObject while keeping small direct PUTs on the
-/// legacy path.
+/// legacy path. Server-side UploadPartCopy requests use this same multipart
+/// admission path with unknown-size weighting because source metadata and range
+/// validation happen after admission.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
@@ -415,7 +417,9 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
 /// wait with a 10 s request deadline. The wait must leave margin under the
 /// shortest of those, not merely fall below an SDK default, so the part
 /// receives S3 `SlowDown`/503 for the client to retry instead of losing its
-/// connection (issue #7385). `0` rejects immediately when the pool is full.
+/// connection (issue #7385). Server-side UploadPartCopy waits in the same queue
+/// before taking bucket lifecycle locks or opening source readers. `0` rejects
+/// immediately when the pool is full.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_000;
@@ -427,7 +431,7 @@ pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_0
 // the wait past any client timeout.
 const _: () = assert!(DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS * 3 <= 30_000);
 
-/// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
+/// Maximum multipart UploadPart or UploadPartCopy requests waiting for a foreground write permit per process.
 ///
 /// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
 /// waiting, so a genuinely saturated node still fails fast instead of holding
