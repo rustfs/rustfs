@@ -448,7 +448,7 @@ pub mod disk {
 pub mod error {
     pub use crate::error::{
         Error, PoolMetadataError, PoolMetadataFailure, Result, StorageError, classify_system_path_failure_reason,
-        is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -501,6 +501,13 @@ pub mod notification {
         ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
         legacy_transition_state_reconcile_fleet_proof_matches, new_global_notification_sys,
         scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+    };
+}
+
+pub mod integrity {
+    pub use crate::services::integrity::{
+        IntegrityError, InventoryItem, InventoryPage, ItemRequest, ItemResult, ItemState, Job, JobMode, JobRequest, JobState,
+        Protection, Readiness, control_job, create_job, get_job, inventory, readiness, resume_job,
     };
 }
 
@@ -577,7 +584,9 @@ pub mod set_disk {
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
-        pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::bucket::quota::reservation::{
+            SafeNoQuotaCacheFastPathGuard, enable_safe_no_quota_cache_fast_path_for_test, fail_next_quota_ledger_save_for_test,
+        };
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 
         /// Keep a namespace commit pending until the returned owner is dropped.

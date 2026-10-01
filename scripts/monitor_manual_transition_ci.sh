@@ -129,14 +129,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-require_cmd gh
-require_cmd jq
-require_cmd date
-
-if ! [[ "${RUNS}" =~ ^[0-9]+$ ]] || (( RUNS == 0 )); then
+if ! [[ "${RUNS}" =~ ^[0-9]+$ && "${RUNS}" =~ [1-9] ]]; then
   echo "ERROR: --runs must be a positive integer" >&2
   exit 1
 fi
+
+require_cmd gh
+require_cmd jq
+require_cmd date
 
 run_failed=0
 active_found=0

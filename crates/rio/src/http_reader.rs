@@ -57,6 +57,7 @@ const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty ch
 pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
 pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
 pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
+pub const INTERNODE_FILE_CORRUPT: &str = "file-corrupt";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -185,6 +186,7 @@ pub struct InternodeHttpError {
 enum RemoteDiskErrorKind {
     FileNotFound,
     VolumeNotFound,
+    FileCorrupt,
 }
 
 impl std::fmt::Debug for InternodeHttpError {
@@ -213,6 +215,10 @@ impl InternodeHttpError {
 
     pub fn is_remote_volume_not_found(&self) -> bool {
         self.remote_disk_error == Some(RemoteDiskErrorKind::VolumeNotFound)
+    }
+
+    pub fn is_remote_file_corrupt(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileCorrupt)
     }
 
     fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
@@ -324,6 +330,20 @@ pub fn new_test_remote_volume_not_found_http_io_error() -> io::Error {
             operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
         },
         RemoteDiskErrorKind::VolumeNotFound,
+    )
+    .into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_file_corrupt_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileCorrupt,
     )
     .into_io_error()
 }
@@ -738,7 +758,7 @@ fn internode_request_context(method: &Method, url: &str, operation: Option<&'sta
 ///
 /// Ordering matters:
 /// 1. A caller-reported timeout wins outright (`ConnectTimeout`).
-/// 2. A typed `io::ErrorKind` anywhere in the source chain wins over any
+/// 2. A typed I/O error or HTTP EOF anywhere in the source chain wins over any
 ///    string or body signal — a real `ConnectionRefused` must never be
 ///    mislabeled `DnsResolutionFailed` just because "dns" appears in the text.
 /// 3. Only for connect-phase failures with no typed kind do we consult the
@@ -755,7 +775,7 @@ fn classify_transport_error(
         return InternodeHttpErrorKind::ConnectTimeout;
     }
 
-    if let Some(kind) = find_io_error_kind_in_chain(err) {
+    if let Some(kind) = find_transport_error_kind_in_chain(err) {
         return kind;
     }
 
@@ -773,10 +793,8 @@ fn classify_transport_error(
     InternodeHttpErrorKind::Unknown
 }
 
-/// Walk the error source chain looking for a `std::io::Error` and map its
-/// [`io::ErrorKind`] onto our typed classification. Returns `None` when no
-/// `io::Error` is present or its kind carries no actionable signal.
-fn find_io_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
+/// Map typed I/O failures and HTTP EOFs from the error source chain.
+fn find_transport_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(current) = source {
         if let Some(io_err) = current.downcast_ref::<io::Error>() {
@@ -791,6 +809,12 @@ fn find_io_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Optio
                 }
                 _ => {}
             }
+        }
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return Some(InternodeHttpErrorKind::ConnectionReset);
         }
         source = current.source();
     }
@@ -841,15 +865,19 @@ fn classify_http_response(
     operation: Option<&'static str>,
 ) -> ClassifiedHttpResponse {
     let kind = classify_http_status(status);
-    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR || operation != Some(INTERNODE_OPERATION_READ_FILE_STREAM) {
+    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
         return ClassifiedHttpResponse {
             kind,
             remote_disk_error: None,
         };
     }
-    let remote_disk_error = match headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok()) {
-        Some(INTERNODE_FILE_NOT_FOUND) => Some(RemoteDiskErrorKind::FileNotFound),
-        Some(INTERNODE_VOLUME_NOT_FOUND) => Some(RemoteDiskErrorKind::VolumeNotFound),
+    let token = headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok());
+    let remote_disk_error = match (operation, token) {
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_FILE_NOT_FOUND)) => Some(RemoteDiskErrorKind::FileNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_VOLUME_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_VOLUME_NOT_FOUND)) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_CORRUPT)) => Some(RemoteDiskErrorKind::FileCorrupt),
         _ => None,
     };
     ClassifiedHttpResponse { kind, remote_disk_error }
@@ -1044,7 +1072,26 @@ impl HttpReader {
         }
 
         let request_started = Instant::now();
-        let resp = request.send().await.map_err(|e| {
+        // `send()` resolves at the response headers, before the body stall timer
+        // in `poll_read` can run. A restarted peer (or a pooled connection left
+        // half-open when its pod network namespace disappeared) accepts the TCP
+        // connection and then never sends headers. Without this bound the shard
+        // open waits out kernel retransmits, long after the client has given up
+        // on the GET. The body stall budget is the same deadline: a header
+        // black hole is the same failure as a body that stops mid-shard.
+        let send_result = match stall_timeout {
+            Some(stall_timeout) => match time::timeout(stall_timeout, request.send()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_stall_timeout(track_internode_metrics, internode_operation);
+                    record_internode_error(track_internode_metrics, internode_operation);
+                    return Err(body_stalled_error(stall_timeout));
+                }
+            },
+            None => request.send().await,
+        };
+        let resp = send_result.map_err(|e| {
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
@@ -1995,6 +2042,98 @@ mod tests {
         assert_eq!(classify_transport_error(&err, false, false, false), InternodeHttpErrorKind::Unknown);
     }
 
+    #[tokio::test]
+    async fn peer_close_before_upload_response_remains_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = socket.read(&mut buffer).await.expect("peer should read the request");
+                    assert_ne!(count, 0, "upload should reach the peer before it closes");
+                    received.extend_from_slice(&buffer[..count]);
+                    if received
+                        .windows(b"restart-mid-upload".len())
+                        .any(|part| part == b"restart-mid-upload")
+                    {
+                        break;
+                    }
+                }
+                socket
+                    .shutdown()
+                    .await
+                    .expect("peer should close before returning response headers");
+            }
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("restart-mid-upload")
+            .send()
+            .await
+            .expect_err("closing the peer before its response should fail the upload");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::ConnectionReset);
+        assert!(kind.is_retryable(), "a peer close during an upload must retain bounded retry eligibility");
+
+        let mut writer =
+            HttpWriter::new(format!("http://{address}/rustfs/rpc/put_file_stream_v1"), Method::PUT, HeaderMap::new())
+                .await
+                .expect("internode writer should be created");
+        writer.write_all(b"restart-mid-upload").await.expect("upload should start");
+        let error = writer.shutdown().await.expect_err("peer close should fail the shard writer");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("shard failure should preserve the internode error classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectionReset);
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        peer.await.expect("peer should finish normally");
+    }
+
+    #[tokio::test]
+    async fn malformed_upload_response_is_not_an_eof_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+            let mut buffer = [0_u8; 4096];
+            assert!(socket.read(&mut buffer).await.expect("peer should read the request") > 0);
+            socket
+                .write_all(b"invalid HTTP response\r\n\r\n")
+                .await
+                .expect("peer should send the invalid response");
+            socket.shutdown().await.expect("peer should close");
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("payload")
+            .send()
+            .await
+            .expect_err("invalid response headers should fail the request");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::Unknown);
+        assert!(!kind.is_retryable(), "a malformed response must not become a transport retry");
+        peer.await.expect("peer should finish normally");
+    }
+
     #[test]
     fn classify_typed_wins_over_body() {
         // io ConnectionReset present AND is_body: typed classification wins.
@@ -2047,6 +2186,7 @@ mod tests {
         assert_eq!(INTERNODE_DISK_ERROR_HEADER, "x-rustfs-disk-error");
         assert_eq!(INTERNODE_FILE_NOT_FOUND, "file-not-found");
         assert_eq!(INTERNODE_VOLUME_NOT_FOUND, "volume-not-found");
+        assert_eq!(INTERNODE_FILE_CORRUPT, "file-corrupt");
     }
 
     #[test]
@@ -2085,9 +2225,61 @@ mod tests {
         let wrong_status =
             classify_http_response(reqwest::StatusCode::NOT_FOUND, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM));
         assert!(wrong_status.remote_disk_error.is_none());
-        let wrong_operation =
+        let walk_dir_missing =
             classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_missing.remote_disk_error, Some(RemoteDiskErrorKind::FileNotFound));
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_VOLUME_NOT_FOUND.parse().unwrap());
+        let walk_dir_volume_missing =
+            classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_volume_missing.remote_disk_error, Some(RemoteDiskErrorKind::VolumeNotFound));
+        let wrong_operation = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        );
         assert!(wrong_operation.remote_disk_error.is_none());
+    }
+
+    #[test]
+    fn classify_http_response_scopes_corrupt_disk_error_to_read_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT.parse().expect("valid error token"));
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileCorrupt));
+        for status in [reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(
+                classify_http_response(status, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM))
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        for operation in [
+            None,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            Some(INTERNODE_OPERATION_WALK_DIR),
+        ] {
+            assert!(
+                classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, operation)
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "unknown-disk-error".parse().expect("valid unknown token"));
+        for headers in [&headers, &HeaderMap::new()] {
+            assert!(
+                classify_http_response(
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+                )
+                .remote_disk_error
+                .is_none()
+            );
+        }
     }
 
     #[derive(Clone, Default)]
@@ -2158,6 +2350,16 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route(
+                READ_FILE_STREAM_PATH,
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT)],
+                        "read file err file corrupt",
+                    )
+                }),
+            )
             .route(WALK_DIR_PATH, get(get_stream))
             .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
@@ -2170,6 +2372,44 @@ mod tests {
         });
 
         Some((format!("http://{addr}/stream"), handle))
+    }
+
+    #[tokio::test]
+    async fn http_readers_preserve_remote_file_corruption() {
+        let (url, server) = start_test_server(TestState::default())
+            .await
+            .expect("corruption regression server must bind");
+        let url = format!("{}{READ_FILE_STREAM_PATH}", url.strip_suffix("/stream").expect("test server URL suffix"));
+        let byte_error = HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None)
+            .await
+            .err()
+            .expect("byte reader must reject corrupt shard response");
+        let chunk_error = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .err()
+            .expect("chunk reader must reject corrupt shard response");
+        for error in [byte_error, chunk_error] {
+            let source = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("HTTP error must retain typed internode source");
+            assert!(source.is_remote_file_corrupt());
+            assert!(!source.is_remote_file_not_found());
+            assert!(!source.is_remote_volume_not_found());
+            assert_eq!(
+                source.kind(),
+                InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            let cloned = clone_internode_http_io_error(&error).expect("typed transport error must be cloneable");
+            assert!(
+                cloned
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("clone must retain typed internode source")
+                    .is_remote_file_corrupt()
+            );
+        }
+        server.abort();
     }
 
     struct BlockedH2Server {
@@ -2558,6 +2798,52 @@ mod tests {
         assert_eq!(stalled.timeout, Duration::from_millis(20));
 
         handle.abort();
+    }
+
+    /// A peer that accepts the connection and then never sends response headers.
+    /// This is the restarted-pod case: the pooled TCP connection stays open, so
+    /// connect timeout does not fire, and the body stall timer has not started
+    /// because `send()` has not returned. The open itself must fail as
+    /// `BodyStalled` inside the stall budget.
+    #[tokio::test]
+    async fn http_reader_header_stall_fails_open_within_stall_budget() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let app = Router::new().route(
+            "/hang-headers",
+            axum::routing::get(|| async {
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }),
+        );
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/hang-headers");
+        let stall = Duration::from_millis(50);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(stall)),
+        )
+        .await
+        .expect("header stall must fail the open instead of hanging until the test deadline");
+        let err = match opened {
+            Ok(_reader) => panic!("a peer that never sends headers must fail the reader open"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("header stall should retain the typed body-stalled source");
+        assert_eq!(stalled.timeout, stall);
+
+        server_handle.abort();
     }
 
     #[tokio::test]

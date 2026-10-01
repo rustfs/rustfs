@@ -1185,14 +1185,18 @@ mod decommission_lock_order_tests {
         barrier.wait_until_paused().await;
 
         let probe_store = Arc::clone(&other_store);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async move {
-            probe_store
-                .save_current_pool_meta_for_test(&[0])
-                .await
-                .expect("pool metadata mutation probe should commit before UploadPart admission");
-        })
+        let pool_meta_lock = probe_store
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("create the public UploadPart capacity guard probe");
+        let pool_meta_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool_meta_lock.get_write_lock(std::time::Duration::from_secs(30)),
+        )
         .await
-        .expect("public UploadPart must not hold a capacity read guard during staging");
+        .expect("public UploadPart must not hold a capacity read guard during staging")
+        .expect("public UploadPart capacity guard probe should acquire");
+        drop(pool_meta_guard);
 
         barrier.release();
         let part = tokio::time::timeout(std::time::Duration::from_secs(30), put)
@@ -2284,7 +2288,7 @@ mod decommission_lock_order_tests {
         let (lossy_store, refresh_calls) = store_with_capacity_lease_loss(&other_store).await;
         set_decommission_capacity_info_overrides_for_test(lossy_store.id, (0..40).map(|_| capacity_snapshot()).collect());
         let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::AfterObjectPublication);
-        let migration = tokio::spawn({
+        let mut migration = tokio::spawn({
             let migration_store = Arc::clone(&lossy_store);
             let migration_bucket = bucket.clone();
             async move {
@@ -2300,7 +2304,12 @@ mod decommission_lock_order_tests {
                 .await
             }
         });
-        barrier.wait_until_paused().await;
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut migration => {
+                panic!("initial multipart migration completed before reaching the publication barrier: {result:?}");
+            }
+        }
         tokio::time::pause();
         let published = lossy_store.pools[2]
             .get_object_info(
@@ -2317,6 +2326,18 @@ mod decommission_lock_order_tests {
             .expect("the multipart target must publish before capacity progress save");
         assert!(published.is_multipart(), "published target must retain multipart identity");
         assert_eq!(published.version_id.map(|version| version.to_string()), Some(source_version.clone()));
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert_eq!(
+                published
+                    .user_defined
+                    .get(&format!("{prefix}{}", rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)),
+                Some(&source_upload.upload_id),
+                "migration must preserve the source completion identity under both internal prefixes"
+            );
+        }
         let mut published_reader = lossy_store.pools[2]
             .get_object_reader(
                 &bucket,
@@ -4253,6 +4274,13 @@ mod decommission_lock_order_tests {
                 panic!("cancellation probe finished before observing target contention: {result:?}");
             }
         }
+        // The mutation absorbs the gate contention inline before the outer wait
+        // loop ever sees it, and that inline budget is bounded.
+        assert_eq!(
+            retry_observer.target_gate_inline_retries(),
+            crate::core::pools::DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS - 1,
+            "inline target-gate retries must stop at their bounded attempt budget"
+        );
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),
@@ -6840,7 +6868,7 @@ mod decommission_lock_order_tests {
             let migration_store = Arc::clone(&store);
             let migration_bucket = bucket.clone();
             async move {
-                data_movement::migrate_decommission_object(
+                let result = data_movement::migrate_decommission_object(
                     migration_store,
                     0,
                     migration_bucket,
@@ -6849,16 +6877,19 @@ mod decommission_lock_order_tests {
                     "decommission_object_lock_order",
                     Some(owner),
                 )
-                .await
+                .await;
+                (result, std::time::Instant::now())
             }
         });
         barrier.wait_until_owner_paused().await;
 
+        let ordinary_launched_at = std::time::Instant::now();
         let mut ordinary_mutation = tokio::spawn({
             let ordinary_store = Arc::clone(&other_store);
             let ordinary_bucket = bucket.clone();
             async move {
-                match mutation {
+                let ordinary_started_at = std::time::Instant::now();
+                let result = match mutation {
                     ExternalObjectMutation::Put => {
                         let mut data = PutObjReader::from_vec(b"ordinary replacement".to_vec());
                         ordinary_store
@@ -6930,7 +6961,8 @@ mod decommission_lock_order_tests {
                             .restore_transitioned_object(&ordinary_bucket, object, &opts)
                             .await
                     }
-                }
+                };
+                (result, ordinary_started_at, std::time::Instant::now())
             }
         });
         if let Some(get_barrier) = restore_get_barrier.as_ref() {
@@ -6978,8 +7010,10 @@ mod decommission_lock_order_tests {
         } else {
             barrier.wait_until_external_capacity_released().await;
         }
+        let ordinary_lock_phase_observed_at = std::time::Instant::now();
         assert!(!ordinary_mutation.is_finished());
-        let migration_result = if pause_restore_tail {
+        let owner_released_at = std::time::Instant::now();
+        let (migration_result, migration_finished_at) = if pause_restore_tail {
             barrier.release_owner();
             tokio::time::timeout(std::time::Duration::from_secs(30), &mut migration)
                 .await
@@ -6994,7 +7028,7 @@ mod decommission_lock_order_tests {
         };
         migration_result.expect("migration should commit to its reserved target");
 
-        let ordinary_result = if pause_restore_tail {
+        let (ordinary_result, ordinary_started_at, ordinary_finished_at) = if pause_restore_tail {
             let handoff_barrier = PutObjectCommitBarrier::install(&bucket, object, PutObjectCommitPause::AfterRenameHandoff);
             let tail_barrier =
                 crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
@@ -7066,7 +7100,20 @@ mod decommission_lock_order_tests {
                 .expect("ordinary object mutation task should join")
         };
         drop(barrier);
-        ordinary_result.expect("ordinary object mutation should commit to the unreserved target");
+        ordinary_result.unwrap_or_else(|error| {
+            panic!(
+                "ordinary object mutation should commit to the unreserved target: {error:?}; \
+                 ordinary_start_after_launch={:?}, lock_phase_observed_after_launch={:?}, \
+                 owner_release_after_launch={:?}, migration_after_owner_release={:?}, \
+                 ordinary_finish_after_launch={:?}, ordinary_finished_before_migration={}",
+                ordinary_started_at.duration_since(ordinary_launched_at),
+                ordinary_lock_phase_observed_at.duration_since(ordinary_launched_at),
+                owner_released_at.duration_since(ordinary_launched_at),
+                migration_finished_at.duration_since(owner_released_at),
+                ordinary_finished_at.duration_since(ordinary_launched_at),
+                ordinary_finished_at < migration_finished_at,
+            );
+        });
         store.pools[1]
             .get_object_info(
                 &bucket,
@@ -7241,7 +7288,7 @@ mod decommission_lock_order_tests {
             let migration_store = Arc::clone(&store);
             let migration_bucket = bucket.clone();
             async move {
-                data_movement::migrate_decommission_object(
+                let result = data_movement::migrate_decommission_object(
                     migration_store,
                     0,
                     migration_bucket,
@@ -7250,11 +7297,13 @@ mod decommission_lock_order_tests {
                     "same_object_copy_lock_order",
                     Some(owner),
                 )
-                .await
+                .await;
+                (result, std::time::Instant::now())
             }
         });
         barrier.wait_until_owner_paused().await;
 
+        let ordinary_launched_at = std::time::Instant::now();
         let copy_task = tokio::spawn({
             let copy_store = Arc::clone(&other_store);
             let copy_bucket = bucket.clone();
@@ -7269,7 +7318,8 @@ mod decommission_lock_order_tests {
                 ..Default::default()
             };
             async move {
-                copy_store
+                let ordinary_started_at = std::time::Instant::now();
+                let result = copy_store
                     .copy_object(
                         &copy_bucket,
                         object,
@@ -7280,27 +7330,44 @@ mod decommission_lock_order_tests {
                         &destination_opts,
                     )
                     .await
-                    .map(|_| ())
+                    .map(|_| ());
+                (result, ordinary_started_at, std::time::Instant::now())
             }
         });
         barrier.wait_until_external_capacity_released().await;
+        let ordinary_lock_phase_observed_at = std::time::Instant::now();
         assert!(
             !copy_task.is_finished(),
             "historical same-object CopyObject must wait behind the migration object fence"
         );
+        let owner_released_at = std::time::Instant::now();
         barrier.release_owner();
         drop(barrier);
 
-        tokio::time::timeout(std::time::Duration::from_secs(30), migration)
+        let (migration_result, migration_finished_at) = tokio::time::timeout(std::time::Duration::from_secs(30), migration)
             .await
             .expect("migration must not deadlock with historical same-object CopyObject")
-            .expect("migration task should join")
-            .expect("migration should commit to its reserved target");
-        tokio::time::timeout(std::time::Duration::from_secs(30), copy_task)
-            .await
-            .expect("historical same-object CopyObject must finish after the migration releases its object fence")
-            .expect("CopyObject task should join")
-            .expect("CopyObject should preserve the expected current-version precondition");
+            .expect("migration task should join");
+        migration_result.expect("migration should commit to its reserved target");
+        let (ordinary_result, ordinary_started_at, ordinary_finished_at) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), copy_task)
+                .await
+                .expect("historical same-object CopyObject must finish after the migration releases its object fence")
+                .expect("CopyObject task should join");
+        ordinary_result.unwrap_or_else(|error| {
+            panic!(
+                "CopyObject should preserve the expected current-version precondition: {error:?}; \
+                 ordinary_start_after_launch={:?}, lock_phase_observed_after_launch={:?}, \
+                 owner_release_after_launch={:?}, migration_after_owner_release={:?}, \
+                 ordinary_finish_after_launch={:?}, ordinary_finished_before_migration={}",
+                ordinary_started_at.duration_since(ordinary_launched_at),
+                ordinary_lock_phase_observed_at.duration_since(ordinary_launched_at),
+                owner_released_at.duration_since(ordinary_launched_at),
+                migration_finished_at.duration_since(owner_released_at),
+                ordinary_finished_at.duration_since(ordinary_launched_at),
+                ordinary_finished_at < migration_finished_at,
+            );
+        });
     }
 
     #[tokio::test]

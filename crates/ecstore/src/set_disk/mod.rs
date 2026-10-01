@@ -166,7 +166,7 @@ use sha2::Sha256;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -435,6 +435,99 @@ impl Drop for ObjectLockDiagGuard {
     }
 }
 
+pub(crate) struct GetObjectMetadataCacheMutationGuard {
+    notification_sys: Arc<crate::services::notification_sys::NotificationSys>,
+    pending_mutations: Arc<std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>>,
+    pending_all_mutations: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    bucket: String,
+    object: String,
+    scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+    mutation_id: Uuid,
+}
+
+fn finish_get_object_metadata_cache_mutation(
+    pending: &std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>,
+    bucket: &str,
+    object: &str,
+    mutation_id: Uuid,
+) {
+    let mut pending = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (bucket.to_owned(), object.to_owned());
+    if let Some(mutations) = pending.get_mut(&key) {
+        mutations.remove(&mutation_id);
+        if mutations.is_empty() {
+            pending.remove(&key);
+        }
+    }
+}
+
+fn finish_get_object_metadata_cache_mutation_scope(
+    scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+    pending: &std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>,
+    pending_all: &std::sync::Mutex<HashSet<Uuid>>,
+    bucket: &str,
+    object: &str,
+    mutation_id: Uuid,
+) {
+    match scope {
+        rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object => {
+            finish_get_object_metadata_cache_mutation(pending, bucket, object, mutation_id);
+        }
+        rustfs_protos::ObjectMetadataCacheMutationRpcScope::All => {
+            pending_all
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&mutation_id);
+        }
+    }
+}
+
+impl GetObjectMetadataCacheMutationGuard {
+    pub(crate) async fn commit(self) -> Result<()> {
+        self.notification_sys
+            .mutate_object_metadata_cache_on_peers_scoped(
+                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit,
+                self.mutation_id,
+                &self.bucket,
+                &self.object,
+                self.scope,
+                true,
+            )
+            .await?;
+        finish_get_object_metadata_cache_mutation_scope(
+            self.scope,
+            &self.pending_mutations,
+            &self.pending_all_mutations,
+            &self.bucket,
+            &self.object,
+            self.mutation_id,
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn abort(self) -> Result<()> {
+        self.notification_sys
+            .mutate_object_metadata_cache_on_peers_scoped(
+                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
+                self.mutation_id,
+                &self.bucket,
+                &self.object,
+                self.scope,
+                true,
+            )
+            .await?;
+        finish_get_object_metadata_cache_mutation_scope(
+            self.scope,
+            &self.pending_mutations,
+            &self.pending_all_mutations,
+            &self.bucket,
+            &self.object,
+            self.mutation_id,
+        );
+        Ok(())
+    }
+}
+
 struct SetDiskLockGuardedReader {
     inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
     guard: Option<ObjectLockDiagGuard>,
@@ -699,6 +792,9 @@ const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Incre
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
 const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
+const GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATION_KEYS: usize = 4096;
+const GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATIONS_PER_KEY: usize = 64;
+const GET_OBJECT_METADATA_CACHE_MAX_GLOBAL_PENDING_MUTATIONS: usize = 64;
 
 // --- Codec Streaming Configuration ---
 
@@ -787,6 +883,8 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
+const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE";
+const DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE: bool = false;
 
 // Opt-in non-inline data-read quorum early-stop rollout (backlog#1309). The
 // existing metadata fanout still reads data-bearing metadata; this gate only
@@ -1599,6 +1697,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Hold this object's hedge timer so real-disk latency cannot add speculative fanout.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -2498,6 +2598,26 @@ fn is_get_metadata_data_read_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+pub(crate) fn is_get_object_metadata_cache_distributed_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
+            DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
+                DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
             )
         })
     }
@@ -3883,9 +4003,18 @@ pub struct SetDisks {
     pub format: FormatV3,
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+    /// Coalesce bounded GET probes of missing remote slots. Shared by set clones;
+    /// the timestamp also limits repeated probes while a peer remains absent.
+    read_reconnect: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
+    /// Object keys whose distributed mutation fence has begun but has not
+    /// reached a terminal phase on this process. Clones share this state.
+    get_object_metadata_cache_pending_mutations: Arc<std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>>,
+    get_object_metadata_cache_pending_all_mutations: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    /// Fail-closed latch set if pending-key tracking exceeds its bound.
+    get_object_metadata_cache_fence_overflowed: Arc<AtomicBool>,
     /// GET codecs keyed by every persisted layout dimension that affects
     /// decoding. Clones of a set share the memoized shells.
     erasure_cache: Arc<ErasureCache>,
@@ -3907,6 +4036,9 @@ pub struct SetDisks {
     /// writes skip the global registry mutex (backlog#1315). `Arc` so clones of
     /// a set share one generation marker.
     capacity_dirty_generation: Arc<AtomicU64>,
+    /// Per-set proof that successful rename_data peers return the old-current
+    /// source capability needed before PUT may skip its pre-rename lookup.
+    tier_free_version_rename_data_source_capable: Arc<AtomicBool>,
     /// Orphan prefixes whose last purge scan met data that can never be
     /// purged by listing (residue without a committed marker, an in-flight
     /// write), keyed by `bucket/prefix` with the time of that scan. Empty
@@ -4340,9 +4472,15 @@ impl SetDisks {
         }
     }
 
-    pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+    pub(in crate::set_disk) async fn persist_partial_write(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        source_bucket_incarnation_id: Option<Uuid>,
+    ) -> bool {
         use rustfs_common::mrf_channel::{
-            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,
+            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent_with_incarnation,
         };
 
         if !mrf_delivery_enabled() {
@@ -4361,7 +4499,9 @@ impl SetDisks {
             Ok::<_, MrfDurableAdmissionError>((version, scope))
         })();
         let result = match identity {
-            Ok((version, scope)) => persist_partial_write_intent(bucket, object, version, scope).await,
+            Ok((version, scope)) => {
+                persist_partial_write_intent_with_incarnation(bucket, object, version, scope, source_bucket_incarnation_id).await
+            }
             Err(err) => Err(err),
         };
         match result {
@@ -4397,15 +4537,24 @@ impl SetDisks {
 
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
-        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        mut request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) {
         if let Some(object) = request.object_prefix.as_deref()
             && self
-                .persist_partial_write(&request.bucket, object, request.object_version_id.as_deref())
+                .persist_partial_write(
+                    &request.bucket,
+                    object,
+                    request.object_version_id.as_deref(),
+                    request.expected_bucket_incarnation_id,
+                )
                 .await
         {
             return;
         }
+        if request.expected_bucket_incarnation_id.is_none() {
+            return;
+        }
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
         {
             let capture = self
@@ -4475,6 +4624,219 @@ impl SetDisks {
 
     fn is_get_object_metadata_cache_generation_current(&self, generation: GetObjectMetadataCacheGeneration) -> bool {
         self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
+    }
+
+    /// Begin a local cache fence for one distributed object mutation.
+    ///
+    /// The caller must not commit the object mutation until every serving peer
+    /// has acknowledged the matching begin phase. Pending keys remain
+    /// fail-closed if the caller is cancelled or a later phase is uncertain.
+    pub async fn begin_get_object_metadata_cache_mutation_local(&self, bucket: &str, object: &str, mutation_id: Uuid) {
+        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let (overflowed, inserted) = {
+            let mut pending = self
+                .get_object_metadata_cache_pending_mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (bucket.to_owned(), object.to_owned());
+            if !pending.contains_key(&key) && pending.len() >= GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATION_KEYS {
+                pending.clear();
+                (true, false)
+            } else if pending.get(&key).is_some_and(|mutations| {
+                mutations.len() >= GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATIONS_PER_KEY && !mutations.contains(&mutation_id)
+            }) {
+                pending.clear();
+                (true, false)
+            } else {
+                (false, pending.entry(key).or_default().insert(mutation_id))
+            }
+        };
+
+        if overflowed {
+            self.get_object_metadata_cache_fence_overflowed.store(true, Ordering::Release);
+            self.invalidate_all_get_object_metadata_cache();
+            return;
+        }
+
+        if !inserted {
+            return;
+        }
+
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+    }
+
+    /// Begin a local full-cache fence for a mutation that can remove many object keys.
+    pub async fn begin_get_object_metadata_cache_all_mutation_local(&self, mutation_id: Uuid) {
+        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire) {
+            return;
+        }
+        let (overflowed, inserted) = {
+            let mut pending = self
+                .get_object_metadata_cache_pending_all_mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !pending.contains(&mutation_id) && pending.len() >= GET_OBJECT_METADATA_CACHE_MAX_GLOBAL_PENDING_MUTATIONS {
+                pending.clear();
+                (true, false)
+            } else {
+                (false, pending.insert(mutation_id))
+            }
+        };
+        if overflowed {
+            self.get_object_metadata_cache_fence_overflowed.store(true, Ordering::Release);
+            self.invalidate_all_get_object_metadata_cache();
+            return;
+        }
+        if inserted {
+            self.invalidate_all_get_object_metadata_cache();
+        }
+    }
+
+    /// Complete one local mutation fence. A duplicate or reordered terminal
+    /// message only removes its own id and cannot clear another mutation.
+    pub fn finish_get_object_metadata_cache_mutation_local(&self, bucket: &str, object: &str, mutation_id: Uuid) {
+        finish_get_object_metadata_cache_mutation(&self.get_object_metadata_cache_pending_mutations, bucket, object, mutation_id);
+    }
+
+    pub fn finish_get_object_metadata_cache_all_mutation_local(&self, mutation_id: Uuid) {
+        self.get_object_metadata_cache_pending_all_mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&mutation_id);
+    }
+
+    pub(crate) fn get_object_metadata_cache_mutation_pending(&self, bucket: &str, object: &str) -> bool {
+        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire)
+            || !self
+                .get_object_metadata_cache_pending_all_mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        {
+            return true;
+        }
+        self.get_object_metadata_cache_pending_mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(bucket.to_owned(), object.to_owned()))
+    }
+
+    pub(crate) async fn begin_get_object_metadata_cache_mutation(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
+        self.begin_get_object_metadata_cache_mutation_with_scope(
+            bucket,
+            object,
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_get_object_metadata_cache_all_mutation(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
+        self.begin_get_object_metadata_cache_mutation_with_scope(
+            bucket,
+            prefix,
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
+        )
+        .await
+    }
+
+    async fn begin_get_object_metadata_cache_mutation_with_scope(
+        &self,
+        bucket: &str,
+        object: &str,
+        scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) || !self.ctx.is_dist_erasure().await {
+            return Ok(None);
+        }
+        let local_cache_enabled = is_get_object_metadata_cache_distributed_enabled();
+        let Some(notification_sys) = runtime_sources::notification_sys() else {
+            return if local_cache_enabled {
+                Err(Error::other("object metadata cache configuration cannot be verified before peer setup"))
+            } else {
+                Ok(None)
+            };
+        };
+        match notification_sys
+            .object_metadata_cache_cluster_mode(local_cache_enabled)
+            .await?
+        {
+            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Disabled => return Ok(None),
+            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Inconsistent => {
+                return Err(Error::other("object metadata cache configuration differs across cluster peers"));
+            }
+            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Enabled => {}
+        }
+
+        let mutation_id = Uuid::new_v4();
+        match scope {
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object => {
+                self.begin_get_object_metadata_cache_mutation_local(bucket, object, mutation_id)
+                    .await;
+            }
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::All => {
+                self.begin_get_object_metadata_cache_all_mutation_local(mutation_id).await;
+            }
+        }
+        if let Err(begin_error) = notification_sys
+            .mutate_object_metadata_cache_on_peers_scoped(
+                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+                mutation_id,
+                bucket,
+                object,
+                scope,
+                local_cache_enabled,
+            )
+            .await
+        {
+            if notification_sys
+                .mutate_object_metadata_cache_on_peers_scoped(
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
+                    mutation_id,
+                    bucket,
+                    object,
+                    scope,
+                    local_cache_enabled,
+                )
+                .await
+                .is_ok()
+            {
+                finish_get_object_metadata_cache_mutation_scope(
+                    scope,
+                    &self.get_object_metadata_cache_pending_mutations,
+                    &self.get_object_metadata_cache_pending_all_mutations,
+                    bucket,
+                    object,
+                    mutation_id,
+                );
+            }
+            return Err(begin_error);
+        }
+
+        Ok(Some(GetObjectMetadataCacheMutationGuard {
+            notification_sys,
+            pending_mutations: Arc::clone(&self.get_object_metadata_cache_pending_mutations),
+            pending_all_mutations: Arc::clone(&self.get_object_metadata_cache_pending_all_mutations),
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            scope,
+            mutation_id,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_object_metadata_cache_fence_overflowed_for_test(&self) -> bool {
+        self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
@@ -4749,6 +5111,7 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
+            read_reconnect: Arc::new(tokio::sync::Mutex::new(None)),
             get_object_metadata_cache: moka::future::Cache::builder()
                 .max_capacity(get_object_metadata_cache_max_entries() as u64)
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
@@ -4759,6 +5122,9 @@ impl SetDisks {
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>(),
             ),
+            get_object_metadata_cache_pending_mutations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            get_object_metadata_cache_pending_all_mutations: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            get_object_metadata_cache_fence_overflowed: Arc::new(AtomicBool::new(false)),
             erasure_cache: Arc::new(ErasureCache::new()),
             lockers,
             shared_lockers,
@@ -4769,6 +5135,7 @@ impl SetDisks {
             ctx,
             capacity_scope_cache: Arc::new(std::sync::RwLock::new(CapacityScopeCache::default())),
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            tier_free_version_rename_data_source_capable: Arc::new(AtomicBool::new(false)),
             orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
@@ -4783,6 +5150,15 @@ impl SetDisks {
         &self.ctx
     }
 
+    pub(in crate::set_disk) fn tier_free_version_rename_data_source_capable(&self) -> bool {
+        self.tier_free_version_rename_data_source_capable.load(Ordering::Acquire)
+    }
+
+    pub(in crate::set_disk) fn observe_tier_free_version_rename_data_source_capability(&self, capable: bool) {
+        self.tier_free_version_rename_data_source_capable
+            .store(capable, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
         self.local_lock_manager = ctx.lock_manager();
@@ -4792,6 +5168,10 @@ impl SetDisks {
     /// Read the persisted bucket identity through this set's metadata owner.
     /// Missing or non-authoritative legacy identities remain errors.
     pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            // Metadata writes can already hold the pool metadata write lock.
+            return Err(Error::other("system metadata bucket has no bucket incarnation"));
+        }
         metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
@@ -6086,6 +6466,11 @@ impl SetDisks {
         }
         ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
 
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| Error::other(err.to_string()))?;
         let disks = self.disks.read().await.clone();
         let futures = disks.into_iter().map(|disk| {
             let file_info = fi.clone();
@@ -6107,8 +6492,14 @@ impl SetDisks {
         }
 
         ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
-
-        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        if result.is_ok() {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(guard) = metadata_cache_mutation_guard {
+                guard.commit().await.map_err(|err| Error::other(err.to_string()))?;
+            }
+        }
+        result
     }
 
     async fn count_decommission_tier_free_version_equivalents(&self, bucket: &str, object: &str, fi: &FileInfo) -> Result<usize> {
@@ -6219,6 +6610,11 @@ impl SetDisks {
                 achieved: 0,
             });
         }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| Error::other(err.to_string()))?;
         // Rebuilt tiered metadata starts with index zero, but shuffling validates
         // each source slot before assigning the shuffled index below.
         let parts_metadata: Vec<FileInfo> = (0..disks.len())
@@ -6251,7 +6647,34 @@ impl SetDisks {
             }
         }
 
-        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+        if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "decommission_tiered_object_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        if result.is_ok() {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(guard) = metadata_cache_mutation_guard {
+                guard.commit().await.map_err(|err| Error::other(err.to_string()))?;
+            }
+        }
+        result
     }
 }
 
@@ -6479,6 +6902,28 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
         .map_err(|_| DiskError::FileCorrupt)
 }
 
+fn validate_deep_scan_results(results: &[usize], expected_parts: usize) -> disk::error::Result<()> {
+    if results.len() != expected_parts {
+        return Err(DiskError::other(format!(
+            "incomplete deep scan result: expected {expected_parts} parts, received {}",
+            results.len()
+        )));
+    }
+    for (part, status) in results.iter().enumerate() {
+        match *status {
+            CHECK_PART_SUCCESS | CHECK_PART_FILE_NOT_FOUND | CHECK_PART_FILE_CORRUPT => {}
+            CHECK_PART_DISK_NOT_FOUND => return Err(DiskError::DiskNotFound),
+            crate::disk::CHECK_PART_VOLUME_NOT_FOUND => return Err(DiskError::VolumeNotFound),
+            _ => {
+                return Err(DiskError::other(format!(
+                    "incomplete deep scan result: part {part} has unverified status {status}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// disks_with_all_partsv2 is a corrected version based on Go implementation.
 /// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
 /// It also checks if the status of each part (corrupted, missing, ok) in each drive.
@@ -6699,9 +7144,13 @@ async fn disks_with_all_parts(
             // it needs healing too.
             match disk.verify_file(bucket, object, meta).await {
                 Ok(v) => {
+                    validate_deep_scan_results(&v.results, latest_meta.parts.len())?;
                     verify_resp = v;
                 }
                 Err(err) => {
+                    if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::FileCorrupt) {
+                        return Err(err);
+                    }
                     debug!(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
@@ -6785,7 +7234,10 @@ pub fn should_heal_object_on_disk(
     latest_meta: &FileInfo,
 ) -> (bool, bool, Option<DiskError>) {
     if let Some(err) = err
-        && (err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt)
+        && (err == &DiskError::FileNotFound
+            || err == &DiskError::FileVersionNotFound
+            || err == &DiskError::FileCorrupt
+            || err == &DiskError::VolumeNotFound)
     {
         return (true, true, Some(err.clone()));
     }
@@ -6794,7 +7246,12 @@ pub fn should_heal_object_on_disk(
         return (false, false, err.clone());
     }
 
-    if !meta.equals(latest_meta) {
+    // `FileInfo::equals` intentionally compares the erasure payload shape and
+    // modification time, but it does not compare the selected version or the
+    // delete-marker bit. Heal uses this decision for versioned metadata, so a
+    // stale historical version that is still marked latest must be treated as
+    // outdated even when those storage-level fields happen to match.
+    if !meta.equals(latest_meta) || !heal_metadata_identity_matches(meta, latest_meta) {
         debug!(
             event = EVENT_SET_DISK_HEAL,
             component = LOG_COMPONENT_ECSTORE,
@@ -6815,6 +7272,11 @@ pub fn should_heal_object_on_disk(
         }
     }
     (false, false, None)
+}
+
+fn heal_metadata_identity_matches(meta: &FileInfo, latest_meta: &FileInfo) -> bool {
+    meta.deleted == latest_meta.deleted
+        && meta.version_id.filter(|version| !version.is_nil()) == latest_meta.version_id.filter(|version| !version.is_nil())
 }
 
 /// Probe every drive of the set at once. Each live probe is bounded by the
@@ -7376,6 +7838,35 @@ mod tests {
 
     async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
         make_test_set_disks_with_ctx(lockers, bootstrap_ctx()).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn system_metadata_incarnation_lookup_does_not_reenter_pool_metadata() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let _pool_meta_guard = store.pool_meta.write().await;
+        let set = &store.pools[0].disk_set[0];
+
+        for bucket in [RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, crate::disk::MIGRATING_META_BUCKET] {
+            tokio::time::timeout(Duration::from_secs(30), set.bucket_incarnation_id_from_disk(bucket))
+                .await
+                .expect("system metadata identity lookup must not reacquire the held pool metadata lock")
+                .expect_err("system metadata buckets have no user bucket incarnation");
+        }
+
+        drop(_pool_meta_guard);
+        let bucket = "user-incarnation-boundary";
+        let incarnation = Uuid::new_v4();
+        crate::bucket::metadata::save_bucket_incarnation(Arc::clone(&store), bucket, incarnation)
+            .await
+            .expect("persist the user bucket identity through the metadata owner");
+        assert_eq!(
+            set.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("user bucket identities must still load from the metadata owner"),
+            incarnation,
+        );
     }
 
     async fn make_test_set_disks_with_ctx(
@@ -9381,6 +9872,31 @@ mod tests {
         assert!(!purged, "a missing prefix should report nothing to purge");
     }
 
+    #[tokio::test]
+    async fn orphan_directory_purge_preserves_tree_when_a_disk_slot_is_offline() {
+        let (dir, disk) = make_single_local_disk().await;
+        let prefix_dir = dir.path().join("bucket").join("pfx");
+        fs::create_dir_all(prefix_dir.join("nested").join("leaf"))
+            .await
+            .expect("orphan directory tree should be created");
+
+        let set = make_set_disks_with(vec![Some(disk), None]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("an unavailable slot should fail closed without a scan error");
+
+        assert!(!purged, "an incomplete disk scan must not claim the tree is an orphan");
+        assert!(prefix_dir.join("nested/leaf").exists(), "online disk contents must remain untouched");
+
+        let bucket_purged = set.purge_orphan_dir_objects_in_bucket("bucket").await;
+        assert!(!bucket_purged, "bucket-wide cleanup must fail closed with an unavailable disk slot");
+        assert!(
+            prefix_dir.join("nested/leaf").exists(),
+            "bucket-wide cleanup must preserve the online tree"
+        );
+    }
+
     // Cross-disk safety: if any drive still holds object data under the prefix, refuse
     // to purge on every drive so a degraded/healable object is never destroyed.
     #[tokio::test]
@@ -11116,6 +11632,50 @@ mod tests {
     }
 
     #[test]
+    fn deep_scan_results_accept_only_complete_verified_or_repairable_parts() {
+        for (results, expected_parts) in [
+            (vec![], 0),
+            (vec![CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_FILE_NOT_FOUND], 1),
+            (vec![CHECK_PART_FILE_CORRUPT], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT], 3),
+        ] {
+            validate_deep_scan_results(&results, expected_parts)
+                .expect("complete results must allow healthy or repairable parts");
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_reject_unknown_and_incomplete_observations() {
+        for (results, expected_parts) in [
+            (vec![CHECK_PART_UNKNOWN], 1),
+            (vec![usize::MAX], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN], 2),
+            (vec![], 1),
+            (vec![CHECK_PART_SUCCESS], 2),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_SUCCESS], 0),
+        ] {
+            let error =
+                validate_deep_scan_results(&results, expected_parts).expect_err("unverified parts must not become healthy");
+            assert!(matches!(error, DiskError::Io(_)), "an incomplete observation is not proven corruption");
+            assert!(error.to_string().contains("incomplete deep scan result"));
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_preserve_disk_and_volume_failures() {
+        for (status, expected_error) in [
+            (CHECK_PART_DISK_NOT_FOUND, DiskError::DiskNotFound),
+            (CHECK_PART_VOLUME_NOT_FOUND, DiskError::VolumeNotFound),
+        ] {
+            let error = validate_deep_scan_results(&[CHECK_PART_SUCCESS, status], 2)
+                .expect_err("an unavailable part cannot certify a healthy disk");
+            assert_eq!(error, expected_error);
+        }
+    }
+
+    #[test]
     fn test_has_part_err() {
         // Test checking for part errors
         let no_errors = vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS];
@@ -11195,6 +11755,12 @@ mod tests {
         let (should_heal, _, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
 
+        let err = Some(DiskError::VolumeNotFound);
+        let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        assert!(should_heal);
+        assert!(is_meta);
+        assert_eq!(reason, Some(DiskError::VolumeNotFound));
+
         let err = Some(DiskError::FileCorrupt);
         let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
@@ -11209,6 +11775,29 @@ mod tests {
         let (should_heal, _, reason) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
         assert_eq!(reason, Some(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn stale_delete_marker_identity_requires_metadata_heal() {
+        let historical_version = Uuid::new_v4();
+        let marker_version = Uuid::new_v4();
+        let mut stale = FileInfo {
+            version_id: Some(historical_version),
+            ..FileInfo::default()
+        };
+        let mut latest = stale.clone();
+        stale.deleted = false;
+        latest.deleted = true;
+        latest.version_id = Some(marker_version);
+
+        // The generic equality helper intentionally considers these records
+        // equal when their erasure shape and mod-time match. Heal must still
+        // repair the version identity and delete-marker state.
+        assert!(stale.equals(&latest));
+        let (should_heal, metadata, reason) = should_heal_object_on_disk(&None, &[], &stale, &latest);
+        assert!(should_heal);
+        assert!(metadata);
+        assert_eq!(reason, Some(DiskError::OutdatedXLMeta));
     }
 
     #[test]
@@ -13634,6 +14223,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,
@@ -13745,6 +14335,7 @@ mod tests {
                 0,
                 0,
                 true,
+                false,
                 false,
                 false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,

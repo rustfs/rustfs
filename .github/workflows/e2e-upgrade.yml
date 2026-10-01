@@ -51,8 +51,53 @@ env:
   UPGRADE_SOURCE_SHA256: 3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d
 
 jobs:
+  build:
+    name: Build upgrade candidate
+    runs-on: sm-standard-2
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: e2e-upgrade-server
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: "false"
+          install-test-tools: "false"
+
+      - name: Download pinned previous release
+        run: |
+          mkdir -p target/debug
+          archive="target/debug/$UPGRADE_SOURCE_ASSET"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
+          echo "$UPGRADE_SOURCE_SHA256  $archive" | sha256sum --check --strict
+
+      - name: Build current RustFS binary
+        run: python3 scripts/e2e_binary.py build
+
+      - name: Upload verified upgrade candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-candidate-${{ github.run_id }}
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
+            target/debug/${{ env.UPGRADE_SOURCE_ASSET }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: true
+
   upgrade:
     name: ${{ matrix.name }}
+    needs: build
     strategy:
       fail-fast: false
       matrix:
@@ -63,59 +108,61 @@ jobs:
           # the CI required-check names. UPGRADE_SOURCE_VERSION above is the
           # single source of truth for which release they actually run against.
           - name: Direct upgrade from the previous release
-            cache_key: e2e-direct-upgrade
             test: direct_upgrade_from_rc2_preserves_object_contracts
             artifact: direct-upgrade
           - name: Mixed-version rolling upgrade from the previous release
-            cache_key: e2e-mixed-version-upgrade
             test: rolling_upgrade_from_rc2_preserves_mixed_version_contracts
             artifact: mixed-version-upgrade
           - name: Bucket configuration survives the upgrade
-            cache_key: e2e-bucket-config-upgrade
             test: direct_upgrade_from_previous_release_preserves_bucket_configuration
             artifact: bucket-config-upgrade
           - name: Rollback reads current bucket metadata
-            cache_key: e2e-bucket-config-rollback
             test: rollback_to_previous_release_reads_current_bucket_metadata
             artifact: bucket-config-rollback
           - name: ODM configuration recovery after rc.5 rollback
-            cache_key: e2e-odm-config-rollback
             test: rc5_rollback_requires_restoring_odm_configuration
             artifact: odm-config-rollback
           - name: Multipart layouts survive the rc.5 upgrade
-            cache_key: e2e-multipart-layout-upgrade
             test: direct_upgrade_from_rc5_preserves_multipart_layouts
             artifact: multipart-layout-upgrade
           - name: rc.5 multipart replication baseline
-            cache_key: e2e-multipart-layout-baseline
             test: rc5_baseline_replicates_multipart_layouts
             artifact: multipart-layout-baseline
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: ${{ matrix.cache_key }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-shared-key: e2e-upgrade-tests
+          # One main-branch consumer warms the shared test-harness dependencies.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.artifact == 'direct-upgrade' }}
           install-build-packaging-tools: "false"
+          install-test-tools: "false"
 
-      - name: Download pinned previous release
+      - name: Download verified upgrade candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upgrade-candidate-${{ github.run_id }}
+          path: target/debug
+
+      - name: Restore candidate executable bit
+        run: chmod +x target/debug/rustfs
+
+      - name: Verify and unpack pinned previous release
         env:
           SOURCE_DIR: ${{ runner.temp }}/rustfs-upgrade-source
         run: |
           set -euo pipefail
           mkdir -p "$SOURCE_DIR"
-          archive="$SOURCE_DIR/$UPGRADE_SOURCE_ASSET"
-          curl --fail --location --retry 3 --output "$archive" \
-            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
+          archive="target/debug/$UPGRADE_SOURCE_ASSET"
           echo "$UPGRADE_SOURCE_SHA256  $archive" | sha256sum --check --strict
           unzip -q "$archive" -d "$SOURCE_DIR"
           chmod +x "$SOURCE_DIR/rustfs"
@@ -123,21 +170,19 @@ jobs:
           echo "RUSTFS_UPGRADE_SOURCE_BINARY=$SOURCE_DIR/rustfs" >> "$GITHUB_ENV"
           echo "RUSTFS_E2E_LOG_DIR=$RUNNER_TEMP/rustfs-upgrade-logs" >> "$GITHUB_ENV"
 
-      - name: Build current RustFS binary
-        run: |
-          python3 scripts/e2e_binary.py build
-
       - name: Run upgrade compatibility test
         env:
           RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
+          NO_PROXY: 127.0.0.1,localhost,::1
         run: |
+          export no_proxy="$NO_PROXY"
           python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test \
             "upgrade_compatibility_test::${{ matrix.test }}" \
             -- --ignored --exact --nocapture
 
       - name: Upload scanner/heal G09 evidence
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}-g09-evidence-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
@@ -146,7 +191,7 @@ jobs:
 
       - name: Upload server logs
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}-server-logs-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-logs

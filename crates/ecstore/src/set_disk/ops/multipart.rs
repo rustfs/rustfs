@@ -66,6 +66,7 @@ use crate::disk::DiskOption;
 use crate::disk::STORAGE_FORMAT_FILE;
 #[cfg(test)]
 use crate::disk::new_disk;
+use crate::erasure::coding::BitrotWriterWrapper;
 use crate::multipart_listing::paginate_multipart_listing;
 #[cfg(test)]
 use crate::object_api::ObjectLockConfigSnapshot;
@@ -77,7 +78,7 @@ use crate::storage_api_contracts::multipart::MultipartOperations;
 #[cfg(test)]
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::storage_api_contracts::object::ObjectOperations;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future::join_all, stream};
 #[cfg(test)]
 use http::HeaderMap;
 use rustfs_filemeta::metadata_keys;
@@ -99,6 +100,49 @@ use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
+
+// The erasure-set width bounds fan-out. Await every opener so errors retain
+// their disk slots and every successful writer remains owned until quorum is checked.
+async fn create_part_writers(
+    disks: &[Option<DiskStore>],
+    path: &str,
+    length: i64,
+    shard_size: usize,
+) -> (Vec<Option<BitrotWriterWrapper>>, Vec<Option<DiskError>>) {
+    join_all(disks.iter().map(|disk| async move {
+        let Some(disk) = disk else {
+            return (None, Some(DiskError::DiskNotFound));
+        };
+        match create_bitrot_writer(
+            false,
+            Some(disk),
+            RUSTFS_META_TMP_BUCKET,
+            path,
+            length,
+            shard_size,
+            HashAlgorithm::HighwayHash256S,
+        )
+        .await
+        {
+            Ok(writer) => (Some(writer), None),
+            Err(err) => {
+                warn!(
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    disk = ?disk,
+                    state = "bitrot_writer_skipped",
+                    error = ?err,
+                    "Set disk multipart bitrot writer skipped"
+                );
+                (None, Some(err))
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .unzip()
+}
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
@@ -1407,6 +1451,103 @@ impl SetDisks {
             delimiter: delimiter.to_owned(),
         })
     }
+
+    /// Answer a CompleteMultipartUpload whose staging upload is already gone.
+    ///
+    /// AWS keeps Complete idempotent for the same upload id and part list while
+    /// the completed object is still the result of that upload (the first 200
+    /// can be lost, and SDK retries depend on a second 200 with the same ETag).
+    /// Returns `Ok(None)` when this key has no such object, so the caller keeps
+    /// `InvalidUploadID`. A matching upload id with a different part list is
+    /// `InvalidPart` and must not fall through to `NoSuchUpload`.
+    async fn replay_completed_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: &[CompletePart],
+        opts: &ObjectOptions,
+    ) -> Result<Option<ObjectInfo>> {
+        if upload_id.is_empty() {
+            return Ok(None);
+        }
+
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: false,
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            ..Default::default()
+        };
+        match self.get_object_info(bucket, object, &read_opts).await {
+            Ok(info) => {
+                match completed_multipart_upload_matches(
+                    &info.user_defined,
+                    info.parts.as_ref(),
+                    info.delete_marker,
+                    upload_id,
+                    uploaded_parts,
+                    bucket,
+                    object,
+                ) {
+                    Ok(true) => return Ok(Some(mark_multipart_completion_replayed(info))),
+                    Ok(false) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+            Err(err) => return Err(err),
+        }
+
+        // Unversioned overwrite replaces the only slot. A versioned bucket can
+        // keep the completed version under a newer one; that version is still
+        // the result of this upload until it is deleted.
+        if !(opts.versioned || opts.version_suspended) {
+            return Ok(None);
+        }
+
+        let Some(versions) = self.load_file_info_versions_exact(bucket, object).await? else {
+            return Ok(None);
+        };
+        for fi in versions.versions {
+            if fi.deleted || fi.tier_free_version() || fi.is_canonical_delete_marker() {
+                continue;
+            }
+            match completed_multipart_upload_matches(&fi.metadata, &fi.parts, false, upload_id, uploaded_parts, bucket, object) {
+                Ok(true) => {
+                    let info = ObjectInfo::from_file_info(&fi, bucket, object, true);
+                    return Ok(Some(mark_multipart_completion_replayed(info)));
+                }
+                Ok(false) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Best-effort removal of staging left behind when commit succeeded and the
+    /// process stopped before `delete_all`. A cleanup miss must not turn the
+    /// idempotent 200 into an error; the object is already durable.
+    async fn reclaim_replayed_multipart_staging(&self, bucket: &str, object: &str, upload_id: &str, upload_id_path: &str) {
+        if let Err(err) = self
+            .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, upload_id_path, self.default_write_quorum())
+            .await
+        {
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                event = EVENT_SET_DISK_MULTIPART,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                op = "complete_multipart_upload",
+                result = "cleanup_quorum_missed",
+                bucket = %bucket,
+                object = %object,
+                upload_id = %upload_id,
+                error = %err,
+                "replayed multipart completion left staging behind"
+            );
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1542,45 +1683,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .map_err(Error::from)?);
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let mut writers = Vec::with_capacity(shuffle_disks.len());
-            let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
-                if let Some(disk) = disk_op {
-                    let writer = match create_bitrot_writer(
-                        false,
-                        Some(disk),
-                        RUSTFS_META_TMP_BUCKET,
-                        &tmp_part_path,
-                        erasure.shard_file_size(data.size()),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
-                    )
-                    .await
-                    {
-                        Ok(writer) => writer,
-                        Err(err) => {
-                            warn!(
-                                event = EVENT_SET_DISK_MULTIPART,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                disk = ?disk,
-                                state = "bitrot_writer_skipped",
-                                error = ?err,
-                                "Set disk multipart bitrot writer skipped"
-                            );
-                            errors.push(Some(err));
-                            writers.push(None);
-                            continue;
-                        }
-                    };
-
-                    writers.push(Some(writer));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    writers.push(None);
-                }
-            }
+            let (mut writers, errors) = create_part_writers(
+                &shuffle_disks,
+                &tmp_part_path,
+                erasure.shard_file_size(data.size()),
+                erasure.shard_size(),
+            )
+            .await;
 
             if let Some(stage_start) = writer_setup_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -2325,6 +2434,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         result
     }
+
     // complete_multipart_upload finished
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
@@ -2388,9 +2498,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await?;
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
-        let (mut fi, files_metas) = self
+        let (mut fi, files_metas) = match self
             .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
-            .await?;
+            .await
+        {
+            Ok(found) => found,
+            Err(err) if crate::error::is_err_invalid_upload_id(&err) => {
+                match self
+                    .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, opts)
+                    .await
+                {
+                    Ok(Some(existing)) => {
+                        self.reclaim_replayed_multipart_staging(bucket, object, upload_id, &upload_id_path)
+                            .await;
+                        return Ok(existing);
+                    }
+                    Ok(None) => return Err(err),
+                    Err(replay_err) => return Err(replay_err),
+                }
+            }
+            Err(err) => return Err(err),
+        };
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
@@ -2976,6 +3104,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY);
         fi.persist_shard_integrity()?;
 
+        // The staging directory is removed after commit. Recording the upload id
+        // on the object is what lets a retried CompleteMultipartUpload return this
+        // version instead of NoSuchUpload. insert_str writes both internal prefixes;
+        // a later conflicting pair fails closed in the replay matcher.
+        // Internal migration must preserve the source completion identity rather
+        // than replace it (or invent one) with the temporary transfer upload id.
+        if !opts.data_movement && !upload_id.is_empty() {
+            insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID, upload_id.to_owned());
+        }
+
         for meta in parts_metadatas.iter_mut() {
             if meta.has_valid_erasure_geometry() {
                 meta.size = fi.size;
@@ -3196,6 +3334,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let transaction_epoch =
             transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&commit_disks, &mut parts_metadatas));
 
+        let metadata_cache_mutation_guard = match self.begin_get_object_metadata_cache_mutation(bucket, object).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                quota_reservation.abort().await;
+                return Err(err);
+            }
+        };
+
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
         let commit_object = object.to_owned();
@@ -3218,6 +3364,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit_allows_early_ack = false;
         let detach_commit_owner = commit_allows_early_ack || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
+            let mut metadata_cache_mutation_guard = metadata_cache_mutation_guard;
             let mut _object_lock_guard = commit_object_lock_guard;
             let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
             let mut _upload_guard = upload_guard;
@@ -3320,6 +3467,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
             .await;
             if let Err(err) = pre_rename_result {
+                if let Some(guard) = metadata_cache_mutation_guard.take() {
+                    let _ = guard.abort().await;
+                }
                 SetDisks::abort_quota_reservation_after_fence(
                     quota_reservation,
                     &commit_disks,
@@ -3434,6 +3584,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                 .await;
 
+            if let Some(guard) = metadata_cache_mutation_guard.take() {
+                guard.commit().await?;
+            }
+
             drop(_object_lock_guard.take()); // release the object lock before multipart cleanup IO.
 
             #[cfg(test)]
@@ -3508,6 +3662,58 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         result
     }
+}
+
+fn mark_multipart_completion_replayed(mut info: ObjectInfo) -> ObjectInfo {
+    info.multipart_completion_replayed = true;
+    info
+}
+
+/// `Ok(true)` when `upload_id` is the completion that published this version and
+/// the requested parts are that version's part list. `Ok(false)` means this
+/// version is not that completion. `Err` is a definite part-list or metadata
+/// failure and must not be reported as `NoSuchUpload`.
+fn completed_multipart_upload_matches(
+    metadata: &HashMap<String, String>,
+    parts: &[ObjectPartInfo],
+    delete_marker: bool,
+    upload_id: &str,
+    uploaded_parts: &[CompletePart],
+    bucket: &str,
+    object: &str,
+) -> Result<bool> {
+    if delete_marker || upload_id.is_empty() {
+        return Ok(false);
+    }
+    let Some(stored_upload_id) = rustfs_utils::http::get_consistent_str(metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)
+    else {
+        if rustfs_utils::http::contains_key_str(metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID) {
+            return Err(Error::FileCorrupt);
+        }
+        return Ok(false);
+    };
+    if stored_upload_id.is_empty() || stored_upload_id != upload_id {
+        return Ok(false);
+    }
+    if parts.len() != uploaded_parts.len() {
+        let part_num = uploaded_parts.first().map(|part| part.part_num).unwrap_or(0);
+        return Err(Error::InvalidPart(part_num, bucket.to_owned(), object.to_owned()));
+    }
+    for (stored, requested) in parts.iter().zip(uploaded_parts) {
+        if stored.number != requested.part_num {
+            return Err(Error::InvalidPart(requested.part_num, bucket.to_owned(), object.to_owned()));
+        }
+        let stored_etag = rustfs_utils::path::trim_etag(&stored.etag);
+        let client_etag = requested.etag.as_deref().map(rustfs_utils::path::trim_etag);
+        if client_etag.as_deref() != Some(stored_etag.as_str()) {
+            return Err(Error::InvalidPart(
+                requested.part_num,
+                stored.etag.clone(),
+                requested.etag.clone().unwrap_or_default(),
+            ));
+        }
+    }
+    Ok(true)
 }
 
 /// Final ETag for a completed multipart object. An authorized replication
@@ -3593,6 +3799,82 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[tokio::test]
+    async fn multipart_writer_setup_opens_disks_concurrently_and_preserves_error_slots() {
+        use crate::cluster::rpc::internode_data_transport::{
+            InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, WalkDirStreamRequest,
+            WriteStreamRequest,
+        };
+        use crate::cluster::rpc::remote_disk::RemoteDisk;
+        use crate::disk::{Disk, FileReader, FileWriter};
+
+        #[derive(Debug)]
+        struct BarrierTransport {
+            barrier: Arc<tokio::sync::Barrier>,
+            fail: bool,
+        }
+        #[async_trait::async_trait]
+        impl InternodeDataTransport for BarrierTransport {
+            async fn open_read(&self, _: ReadStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not read")
+            }
+            async fn open_walk_dir(&self, _: WalkDirStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not list")
+            }
+            async fn open_write(&self, request: WriteStreamRequest) -> disk::error::Result<FileWriter> {
+                assert_eq!(request.volume, RUSTFS_META_TMP_BUCKET);
+                assert_eq!(request.path, "upload/part.1");
+                self.barrier.wait().await;
+                if self.fail {
+                    Err(DiskError::FileAccessDenied)
+                } else {
+                    Ok(Box::new(tokio::io::sink()))
+                }
+            }
+            fn name(&self) -> &'static str {
+                "multipart-writer-test"
+            }
+            fn capabilities(&self) -> InternodeDataTransportCapabilities {
+                InternodeDataTransportCapabilities::tcp_http()
+            }
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut disks = Vec::new();
+        for i in 0..3 {
+            let endpoint = Endpoint {
+                url: url::Url::parse(&format!("http://multipart-test.invalid:9000/disk{i}")).expect("endpoint"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i,
+            };
+            let disk = RemoteDisk::new(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+                Arc::new(BarrierTransport {
+                    barrier: Arc::clone(&barrier),
+                    fail: i == 1,
+                }),
+            )
+            .await
+            .expect("remote disk");
+            disks.push(Some(Arc::new(Disk::Remote(Box::new(disk)))));
+        }
+        disks.insert(1, None);
+        // A serial opener cannot cross the barrier. The timeout only bounds failures;
+        // the assertion depends on all three independent openers making progress.
+        let (writers, errors) =
+            tokio::time::timeout(Duration::from_secs(10), create_part_writers(&disks, "upload/part.1", 1024, 256))
+                .await
+                .expect("all disk openers must be polled concurrently");
+        assert_eq!(writers.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, false, true]);
+        assert_eq!(errors, [None, Some(DiskError::DiskNotFound), Some(DiskError::FileAccessDenied), None]);
+    }
 
     #[test]
     fn multipart_bucket_incarnation_metadata_is_consistent_and_non_nil() {
@@ -4851,6 +5133,10 @@ mod tests {
             )
             .await
             .expect("completed data movement object should be readable");
+        assert!(
+            !rustfs_utils::http::contains_key_str(&completed.user_defined, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID),
+            "migration of a source without a completion identity must not invent one"
+        );
         assert!(!rustfs_utils::http::contains_key_str(
             &completed.user_defined,
             rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD
@@ -8542,6 +8828,216 @@ mod tests {
         assert_eq!(paged, vec!["u0", "u1", "u2", "u3"]);
     }
 
+    #[test]
+    fn completed_multipart_upload_match_requires_same_upload_and_parts() {
+        let upload_id = "upload-1";
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID, upload_id.to_string());
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            etag: "abc".to_string(),
+            ..Default::default()
+        }];
+        let requested = vec![CompletePart {
+            part_num: 1,
+            etag: Some("\"abc\"".to_string()),
+            ..Default::default()
+        }];
+
+        assert!(
+            completed_multipart_upload_matches(&metadata, &parts, false, upload_id, &requested, "bucket", "object")
+                .expect("quoted ETag must match the stored part")
+        );
+        let wrong_etag = vec![CompletePart {
+            part_num: 1,
+            etag: Some("def".to_string()),
+            ..Default::default()
+        }];
+        assert!(matches!(
+            completed_multipart_upload_matches(&metadata, &parts, false, upload_id, &wrong_etag, "bucket", "object"),
+            Err(StorageError::InvalidPart(1, _, _))
+        ));
+        assert!(
+            !completed_multipart_upload_matches(&metadata, &parts, false, "other-upload", &requested, "bucket", "object")
+                .expect("a different upload id is not this completion")
+        );
+        assert!(
+            !completed_multipart_upload_matches(&metadata, &parts, true, upload_id, &requested, "bucket", "object")
+                .expect("a delete marker is not the completed object")
+        );
+
+        metadata.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+                rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID
+            ),
+            "disagrees".to_string(),
+        );
+        assert!(
+            matches!(
+                completed_multipart_upload_matches(&metadata, &parts, false, upload_id, &requested, "bucket", "object"),
+                Err(StorageError::FileCorrupt)
+            ),
+            "conflicting internal upload ids must fail closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retried_complete_multipart_upload_returns_the_committed_object() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-complete-retry";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let payload = vec![0x11; 4096];
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &payload, &ObjectOptions::default()).await;
+        let first = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
+            .await
+            .expect("the first completion should publish the object");
+        assert!(!first.multipart_completion_replayed, "the first completion publishes a new object");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&first.user_defined, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID),
+            Some(upload_id.as_str()),
+            "the completed object must record the upload id"
+        );
+
+        let mut quoted_parts = parts.clone();
+        quoted_parts[0].etag = quoted_parts[0].etag.as_ref().map(|etag| format!("\"{etag}\""));
+        let retried = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, quoted_parts, &ObjectOptions::default())
+            .await
+            .expect("a retry with the same upload id and parts must succeed");
+        assert!(retried.multipart_completion_replayed);
+        assert_eq!(retried.etag, first.etag);
+        assert_eq!(retried.size, first.size);
+        assert_eq!(retried.version_id, first.version_id);
+
+        let mismatched = parts.clone();
+        let mut mismatched = mismatched;
+        mismatched[0].etag = Some("not-the-part".to_string());
+        let mismatch_err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, mismatched, &ObjectOptions::default())
+            .await
+            .expect_err("a retry with a different part ETag must not pretend the upload is missing");
+        assert!(matches!(mismatch_err, StorageError::InvalidPart(..)));
+
+        let unknown = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, "not-a-real-upload", parts.clone(), &ObjectOptions::default())
+            .await
+            .expect_err("an unknown upload id must stay InvalidUploadID");
+        assert!(matches!(unknown, StorageError::InvalidUploadID(..)));
+
+        let mut reader = PutObjReader::from_vec(b"replaced".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("an overwrite should replace the completed object");
+        let overwritten = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts, &ObjectOptions::default())
+            .await
+            .expect_err("a retry after the object is no longer that upload must stay InvalidUploadID");
+        assert!(matches!(overwritten, StorageError::InvalidUploadID(..)));
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the overwrite must remain readable");
+        assert_eq!(current.size, b"replaced".len() as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_complete_multipart_upload_returns_one_object() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-complete-concurrent";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &[0x22; 4096], &ObjectOptions::default()).await;
+        let first_set = set_disks.clone();
+        let second_set = set_disks.clone();
+        let first_parts = parts.clone();
+        let second_parts = parts.clone();
+        let first_upload = upload_id.clone();
+        let second_upload = upload_id.clone();
+        let (first, second) = tokio::join!(
+            async move {
+                first_set
+                    .complete_multipart_upload(bucket, object, &first_upload, first_parts, &ObjectOptions::default())
+                    .await
+            },
+            async move {
+                second_set
+                    .complete_multipart_upload(bucket, object, &second_upload, second_parts, &ObjectOptions::default())
+                    .await
+            },
+        );
+        let first = first.expect("one completion must succeed");
+        let second = second.expect("the duplicate completion must succeed");
+        assert_eq!(first.etag, second.etag, "both completions must report the same ETag");
+        assert_eq!(first.version_id, second.version_id);
+        assert_eq!(
+            usize::from(first.multipart_completion_replayed) + usize::from(second.multipart_completion_replayed),
+            1
+        );
+        let info = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the object must be readable after duplicate completion");
+        assert_eq!(info.etag, first.etag);
+        assert_eq!(info.size, 4096);
+    }
+
+    #[tokio::test]
+    async fn versioned_complete_retry_returns_the_completed_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-complete-versioned";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let versioned = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x33; 4096], &versioned).await;
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &versioned)
+            .await
+            .expect("versioned completion should publish a version");
+        let completed_version = completed.version_id.expect("versioned completion assigns a version id");
+
+        let mut reader = PutObjReader::from_vec(b"newer-version".to_vec());
+        let successor = set_disks
+            .put_object(bucket, object, &mut reader, &versioned)
+            .await
+            .expect("a later versioned put should add a version");
+        assert_ne!(successor.version_id, Some(completed_version));
+
+        let retried = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts, &versioned)
+            .await
+            .expect("the retry must still find the version this upload published");
+        assert!(retried.multipart_completion_replayed);
+        assert_eq!(retried.etag, completed.etag);
+        assert_eq!(retried.version_id, Some(completed_version));
+
+        let latest = set_disks
+            .get_object_info(bucket, object, &versioned)
+            .await
+            .expect("the latest version must stay the successor put");
+        assert_eq!(latest.version_id, successor.version_id);
+        assert_ne!(latest.etag, completed.etag);
+    }
+
     /// Crash-consistency for the two `complete_multipart_upload` commit windows.
     ///
     /// rustfs/backlog#864: a fault that interrupts a completion must never mutate
@@ -9211,18 +9707,24 @@ mod tests {
                 "the post-commit crash must leave the upload listable for reclamation"
             );
 
-            // A retried CompleteMultipartUpload is answered deterministically: the
-            // commit rename already consumed the upload's metadata, so the retry
-            // resolves to InvalidUploadID (NoSuchUpload to the S3 client, the
-            // standard answer for a completed-then-retried upload) — never a torn
-            // state, and the committed object is untouched by the retry.
-            let retried = complete(&set_disks, bucket, object, &u_new, parts_retry).await;
+            // The commit rename already consumed the upload's xl.meta, so the
+            // retry cannot read staging. It must still return the committed
+            // object: AWS CompleteMultipartUpload is idempotent for the same
+            // upload id and part list, and the retry must not tear that object.
+            let (body_before_retry, etag_before_retry) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body_before_retry, new, "a post-commit crash must leave the whole new version readable");
+            let retried = complete(&set_disks, bucket, object, &u_new, parts_retry)
+                .await
+                .expect("a retried complete after the commit landed must return the committed object");
+            assert!(retried.multipart_completion_replayed, "the retry must not publish a second object");
+            assert_eq!(retried.etag, etag_before_retry, "the retry must return the committed ETag");
+            let (body_after_retry, etag_after_retry) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body_after_retry, new, "the retry must not disturb the committed object");
+            assert_eq!(etag_after_retry, etag_before_retry, "the retry must not rewrite the committed ETag");
             assert!(
-                matches!(retried, Err(StorageError::InvalidUploadID(..))),
-                "a retried complete after the commit landed must resolve to InvalidUploadID, got {retried:?}"
+                !upload_is_listed(&set_disks, bucket, object, &u_new).await,
+                "the idempotent retry must reclaim staging left behind by the crash"
             );
-            let (body_after_retry, _) = read_object(&set_disks, bucket, object).await;
-            assert_eq!(body_after_retry, new, "the failed retry must not disturb the committed object");
 
             // Reclaim the leftover exactly as the production tail does: delete_all
             // on the upload path (abort_multipart_upload cannot — the upload's

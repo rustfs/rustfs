@@ -486,6 +486,10 @@ pub(crate) mod prepare_rename_test_hooks {
 /// Fsync a directory so recently created or renamed entries survive power loss.
 /// No-op on non-Unix platforms where directories cannot be opened for syncing.
 pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    fsync_directory_handle_std(dir.as_ref(), None)
+}
+
+pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::File>) -> io::Result<()> {
     #[cfg(test)]
     fsync_dir_recorder::record(dir.as_ref());
     #[cfg(unix)]
@@ -494,10 +498,13 @@ pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
         if let Some(kind) = fsync_dir_recorder::take_failure(dir.as_ref()) {
             return Err(io::Error::from(kind));
         }
-        std::fs::File::open(dir.as_ref())?.sync_all()?;
+        match opened {
+            Some(file) => file.sync_all()?,
+            None => std::fs::File::open(dir)?.sync_all()?,
+        }
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    let _ = (dir, opened);
     Ok(())
 }
 
@@ -670,6 +677,8 @@ fn file_fdatasync_group_commit_wait() -> Duration {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct DstDirFsyncGroupKey {
     canonical_path: PathBuf,
+    // A batch must execute in the same resource class as its producers.
+    isolated: bool,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -686,13 +695,17 @@ impl DstDirFsyncGroupKey {
             use std::os::unix::fs::MetadataExt;
             Ok(Self {
                 canonical_path,
+                isolated: FSYNC_ON_CURRENT_RUNTIME.get(),
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             })
         }
         #[cfg(not(unix))]
         {
-            Ok(Self { canonical_path })
+            Ok(Self {
+                canonical_path,
+                isolated: FSYNC_ON_CURRENT_RUNTIME.get(),
+            })
         }
     }
 }
@@ -728,6 +741,17 @@ impl OpenedDstDirFsyncGroup {
             let dir = key.canonical_path.clone();
             Ok(Self { key, dir })
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_file(dir: &Path, file: Arc<std::fs::File>) -> io::Result<Self> {
+        let key = DstDirFsyncGroupKey::from_metadata(dir.canonicalize()?, file.metadata()?)?;
+        Ok(Self {
+            #[cfg(test)]
+            dir: key.canonical_path.clone(),
+            key,
+            dir_file: file,
+        })
     }
 }
 
@@ -1002,19 +1026,45 @@ fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::fut
     }
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 async fn fsync_dst_dir_group_commit_with_enabled(
     dir: impl AsRef<Path>,
     enabled: bool,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
+    fsync_dst_dir_group_commit_opened(dir.as_ref(), enabled, namespace_owner, None).await
+}
+
+async fn fsync_dst_dir_group_commit_opened(
+    dir: &Path,
+    enabled: bool,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    opened: Option<Arc<std::fs::File>>,
+) -> io::Result<()> {
     if !enabled {
-        return fsync_dir_with_owner(dir.as_ref(), namespace_owner).await;
+        if let Some(file) = opened {
+            let dir = dir.to_path_buf();
+            return fsync_spawn_blocking(move || {
+                let _owner = namespace_owner;
+                fsync_directory_handle_std(&dir, Some(&file))
+            })
+            .await?;
+        }
+        return fsync_dir_with_owner(dir, namespace_owner).await;
     }
 
-    let dir = dir.as_ref().to_path_buf();
-    let opened = tokio::task::spawn_blocking(move || OpenedDstDirFsyncGroup::open(&dir))
-        .await
-        .map_err(|err| io::Error::other(format!("blocking dst dir group open failed: {err}")))??;
+    let dir = dir.to_path_buf();
+    let opened = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "linux")]
+        if let Some(file) = opened {
+            return OpenedDstDirFsyncGroup::from_file(&dir, file);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = opened;
+        OpenedDstDirFsyncGroup::open(&dir)
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("blocking dst dir group open failed: {err}")))??;
     let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened, namespace_owner)?;
     if let Some(group) = worker {
         tokio::spawn(run_dst_dir_fsync_group_worker(group));
@@ -1027,6 +1077,49 @@ async fn fsync_dst_dir_group_commit_with_enabled(
     }
 }
 
+/// Reuse the published directory without bypassing group commit or sync admission.
+pub(crate) async fn fsync_commit_directory(
+    dir: &Path,
+    guard: &RenameCommitGuard,
+    lease: Arc<NamespaceMutationLease>,
+    admission: Option<&FileSyncAdmission>,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if dir != guard.directories.destination_path {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "sync directory does not match commit guard"));
+        }
+        let file = guard
+            .directories
+            .destination
+            .get()
+            .ok_or_else(|| io::Error::other("commit directory was not published"))?
+            .file
+            .clone();
+        if !dst_dir_fsync_group_commit_enabled()
+            && let Some(admission) = admission
+        {
+            let dir = dir.to_path_buf();
+            return run_blocking_namespace_file_sync_operation(lease, admission, move || {
+                #[cfg(test)]
+                fsync_dir_recorder::record_limited(&dir);
+                fsync_directory_handle_std(&dir, Some(&file))
+            })
+            .await;
+        }
+        fsync_dst_dir_group_commit_opened(dir, dst_dir_fsync_group_commit_enabled(), Some(lease), Some(file)).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = guard;
+        match admission {
+            Some(admission) => fsync_dst_dir_group_commit_or_namespace_file_sync_limit(dir, lease, admission).await,
+            None => fsync_dst_dir_group_commit(dir, Some(lease)).await,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn fsync_dst_dir_group_commit(
     dir: impl AsRef<Path>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
@@ -1034,6 +1127,7 @@ pub(crate) async fn fsync_dst_dir_group_commit(
     fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled(), namespace_owner).await
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
     dir: impl AsRef<Path>,
     lease: Arc<NamespaceMutationLease>,
@@ -1061,7 +1155,7 @@ fn clear_dst_dir_fsync_group_commit_for_test() {
     DST_DIR_FSYNC_GROUP_COMMIT.clear_for_test();
 }
 
-type FileFdatasyncGroupKey = usize;
+type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
@@ -1133,7 +1227,7 @@ impl FileFdatasyncGroupCommit {
             ));
         }
         let (result_tx, result_rx) = oneshot::channel();
-        let key = Arc::as_ptr(&disk_permits) as FileFdatasyncGroupKey;
+        let key = (Arc::as_ptr(&disk_permits) as usize, FSYNC_ON_CURRENT_RUNTIME.get());
         let mut registry = self.inner.lock();
         registry.groups.retain(|_, group| group.disk_permits.strong_count() > 0);
         if registry.total_waiters >= MAX_FILE_FDATASYNC_WAITERS {
@@ -1371,9 +1465,26 @@ static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(
     }
 });
 
+thread_local! {
+    static FSYNC_ON_CURRENT_RUNTIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called only when starting threads belonging to an isolated I/O runtime.
+/// Async and blocking threads use the same runtime's blocking budget for fsync.
+pub(crate) fn use_current_runtime_for_fsync() {
+    FSYNC_ON_CURRENT_RUNTIME.set(true);
+}
+
+pub(super) fn is_isolated_io_thread() -> bool {
+    FSYNC_ON_CURRENT_RUNTIME.get()
+}
+
 /// Spawn a blocking task on the fsync-dedicated runtime if configured,
 /// otherwise fall back to the main tokio blocking pool.
 fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
+    if FSYNC_ON_CURRENT_RUNTIME.get() {
+        return tokio::task::spawn_blocking(f);
+    }
     match FSYNC_RUNTIME.as_ref() {
         Some(rt) => rt.spawn_blocking(f),
         None => tokio::task::spawn_blocking(f),
@@ -2268,6 +2379,20 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
     #[cfg(not(windows))]
     {
         let _ = (dst_file_path, commit_guard);
+        #[cfg(target_os = "linux")]
+        let source = {
+            use rustix::fs::{Mode, OFlags};
+            let directories = &commit_guard.directories;
+            let name = directories.file_name(src_file_path, true)?;
+            directories.file_name(dst_file_path, false)?;
+            open_linux_relative(
+                &directories.source.file,
+                Path::new(name),
+                OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+                Mode::from_raw_mode(0o666),
+            )?
+        };
+        #[cfg(not(target_os = "linux"))]
         let source = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -2288,18 +2413,39 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn read_destination_file_with_commit_guard(
     file_path: &Path,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<Option<Vec<u8>>> {
-    if file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "destination file parent does not match its commit guard",
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let directories = &commit_guard.directories;
+        let name = directories.file_name(file_path, false)?;
+        let Some(parent) = directories.destination.get() else {
+            return Ok(None);
+        };
+        return match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
+            Ok(mut file) => {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut data)?;
+                Ok(Some(data))
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        };
     }
-    read_windows_relative_file(file_path, &commit_guard.destination_parent_guard)
+    #[cfg(windows)]
+    {
+        if file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination file parent does not match its commit guard",
+            ));
+        }
+        read_windows_relative_file(file_path, &commit_guard.destination_parent_guard)
+    }
 }
 
 #[cfg(windows)]
@@ -2337,23 +2483,40 @@ pub(crate) async fn rename_all_with_prepared_source(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
     publication_root: &PublicationRoot,
-    _commit_guard: &RenameCommitGuard,
+    commit_guard: &RenameCommitGuard,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
+    #[cfg(not(target_os = "linux"))]
     let publication_root = publication_root.clone();
+    #[cfg(target_os = "linux")]
+    let _ = publication_root;
+    let commit_guard = commit_guard.clone();
     let operation = {
         let src_file_path = src_file_path.clone();
         let dst_file_path = dst_file_path.clone();
+        #[cfg(not(target_os = "linux"))]
         let base_dir = base_dir.clone();
         move || {
-            validate_prepared_rename_source(&prepared_source, &src_file_path)?;
-            let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            #[cfg(any(test, feature = "test-util"))]
-            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-            rename_prepared(&src_file_path, &dst_file_path, &preparation)
+            #[cfg(target_os = "linux")]
+            {
+                #[cfg(any(test, feature = "test-util"))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
+                return commit_guard
+                    .directories
+                    .rename(&src_file_path, &dst_file_path, Some(&prepared_source));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = commit_guard;
+                validate_prepared_rename_source(&prepared_source, &src_file_path)?;
+                let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+                #[cfg(any(test, feature = "test-util"))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
+                rename_prepared(&src_file_path, &dst_file_path, &preparation)
+            }
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
@@ -2370,10 +2533,35 @@ pub(crate) async fn rename_all_with_commit_guard(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
     publication_root: &PublicationRoot,
-    _commit_guard: &RenameCommitGuard,
+    commit_guard: &RenameCommitGuard,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
-    rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
+    #[cfg(target_os = "linux")]
+    {
+        let source = src_file_path.as_ref().to_path_buf();
+        let destination = dst_file_path.as_ref().to_path_buf();
+        let guard = commit_guard.clone();
+        let _ = (base_dir, publication_root);
+        return run_blocking_namespace_operation(lease, move || {
+            guard.directories.prepare_destination()?;
+            #[cfg(test)]
+            prepared_publication_test_hooks::run_rename_destination(&source, &destination);
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
+            }
+            guard.directories.rename(&source, &destination, None)
+        })
+        .await
+        .map_err(to_file_error)
+        .map_err(DiskError::from);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = commit_guard;
+        rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
+    }
 }
 
 #[tracing::instrument(level = "debug", skip_all)]
@@ -2501,7 +2689,7 @@ async fn reliable_rename_inner_with_lease(
     result
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn validate_prepared_rename_source(prepared_source: &PreparedRenameSource, src_file_path: &Path) -> io::Result<()> {
     if prepared_source.path != src_file_path {
         return Err(io::Error::new(
@@ -2701,6 +2889,8 @@ pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
 
 struct RenamePreparation {
     parent_guard: Option<ExistingBaseDirectoryGuard>,
+    #[cfg(target_os = "linux")]
+    publication_root: PublicationRoot,
     #[cfg(windows)]
     _source_parent_guard: ExistingBaseDirectoryGuard,
     #[cfg(windows)]
@@ -2709,15 +2899,32 @@ struct RenamePreparation {
 
 #[cfg(not(windows))]
 fn prepare_rename_with_retry(
-    src_file_path: &Path,
+    _src_file_path: &Path,
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<RenamePreparation> {
-    let prune_budget = prepare_prune_budget(dst_file_path, base_dir);
+    let parent_guard = dst_file_path
+        .parent()
+        .map(|parent| prepare_destination_parent_with_retry(parent, base_dir, publication_root))
+        .transpose()?;
+    Ok(RenamePreparation {
+        parent_guard,
+        #[cfg(target_os = "linux")]
+        publication_root: publication_root.clone(),
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_destination_parent_with_retry(
+    parent: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<ExistingBaseDirectoryGuard> {
+    let prune_budget = parent_prune_budget(parent, base_dir);
     let mut attempt = 0;
     loop {
-        match prepare_rename(src_file_path, dst_file_path, base_dir, publication_root) {
+        match mkdir_all_below_existing_base_std(parent, base_dir, publication_root) {
             Ok(preparation) => return Ok(preparation),
             Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
                 attempt += 1;
@@ -2807,20 +3014,6 @@ fn prepare_rename_with_retry(
     })
 }
 
-#[cfg(not(windows))]
-fn prepare_rename(
-    _src_file_path: &Path,
-    dst_file_path: &Path,
-    base_dir: &Path,
-    publication_root: &PublicationRoot,
-) -> io::Result<RenamePreparation> {
-    let parent_guard = dst_file_path
-        .parent()
-        .map(|parent| mkdir_all_below_existing_base_std(parent, base_dir, publication_root))
-        .transpose()?;
-    Ok(RenamePreparation { parent_guard })
-}
-
 /// Publish a prepared rename. The retry budget starts fresh here: preparation
 /// keeps its own counter, so a chain rebuilt after a concurrent prune must not
 /// cost the rename its one retry.
@@ -2836,9 +3029,23 @@ fn rename_prepared(_src_file_path: &Path, dst_file_path: &Path, preparation: &Re
 
     #[cfg(not(windows))]
     {
+        // A missing source parent is not a destination-prune race. Open it once
+        // outside both retry loops, retaining it through any rename retry.
+        #[cfg(target_os = "linux")]
+        let source_parent = preparation.publication_root.open_directory(
+            _src_file_path
+                .parent()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing rename source parent"))?,
+        )?;
         let mut attempt = 0;
         loop {
-            let rename_result = rename_into_existing_parent(_src_file_path, dst_file_path, preparation.parent_guard.as_ref());
+            let rename_result = rename_into_existing_parent(
+                _src_file_path,
+                dst_file_path,
+                preparation.parent_guard.as_ref(),
+                #[cfg(target_os = "linux")]
+                &source_parent,
+            );
             match rename_result {
                 Ok(()) => return Ok(()),
                 Err(err) if should_retry_rename(&err, attempt) => {
@@ -2877,8 +3084,9 @@ fn rename_into_existing_parent(
     src_file_path: &Path,
     dst_file_path: &Path,
     parent_guard: Option<&ExistingBaseDirectoryGuard>,
+    #[cfg(target_os = "linux")] source_parent: &std::fs::File,
 ) -> io::Result<()> {
-    use rustix::fs::{Mode, OFlags, open, renameat};
+    use rustix::fs::renameat;
 
     let Some(parent_guard) = parent_guard else {
         let rename_started = rustfs_io_metrics::put_stage_timer();
@@ -2889,6 +3097,7 @@ fn rename_into_existing_parent(
         );
         return result;
     };
+    #[cfg(not(target_os = "linux"))]
     let src_parent = src_file_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a parent directory"))?;
@@ -2898,10 +3107,11 @@ fn rename_into_existing_parent(
     let dst_name = dst_file_path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a file name"))?;
-    let src_parent = open(
+    #[cfg(not(target_os = "linux"))]
+    let src_parent = rustix::fs::open(
         src_parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
     )
     .map_err(io::Error::from)?;
     let dst_parent = parent_guard
@@ -2909,6 +3119,9 @@ fn rename_into_existing_parent(
         .ok_or_else(|| io::Error::other("rename destination parent guard is empty"))?;
 
     let rename_started = rustfs_io_metrics::put_stage_timer();
+    #[cfg(target_os = "linux")]
+    let result = renameat(source_parent, src_name, dst_parent, dst_name).map_err(io::Error::from);
+    #[cfg(not(target_os = "linux"))]
     let result = renameat(&src_parent, src_name, dst_parent, dst_name).map_err(io::Error::from);
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
@@ -3091,16 +3304,18 @@ struct WindowsDirectoryHandle {
 
 /// Stable root for namespace-changing disk operations.
 ///
-/// Windows opens the configured endpoint once and keeps that directory identity
-/// pinned for the lifetime of the disk. Publication then resolves every source
-/// and destination component relative to this handle instead of re-entering the
-/// mutable pathname namespace. Other platforms retain the path so callers use a
-/// uniform API while their existing `openat`/`renameat` guards remain unchanged.
+/// Linux and Windows pin the configured directory for the lifetime of the disk.
+/// Linux also exposes a procfs alias for operations not yet using relative IO;
+/// both access forms share one root handle and therefore one mount identity.
 #[derive(Clone)]
 pub(crate) struct PublicationRoot {
-    path: PathBuf,
+    path: Arc<PathBuf>,
+    #[cfg(target_os = "linux")]
+    directory: Arc<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    io_path: Arc<PathBuf>,
     #[cfg(windows)]
-    configured_path: PathBuf,
+    configured_path: Arc<PathBuf>,
     #[cfg(windows)]
     directory: WindowsDirectoryHandle,
 }
@@ -3114,15 +3329,34 @@ impl PublicationRoot {
         #[cfg(windows)]
         let (resolved_path, directory) = open_windows_publication_root(path)?;
 
+        #[cfg(target_os = "linux")]
+        let directory = {
+            use rustix::fs::{Mode, OFlags, open};
+            Arc::new(std::fs::File::from(open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?))
+        };
+        #[cfg(target_os = "linux")]
+        let io_path = {
+            use std::os::fd::AsRawFd;
+            Arc::new(PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd())))
+        };
+
         Ok(Self {
             #[cfg(not(windows))]
-            path: path.to_path_buf(),
+            path: Arc::new(path.to_path_buf()),
             #[cfg(windows)]
-            path: resolved_path,
+            path: Arc::new(resolved_path),
             #[cfg(windows)]
-            configured_path: path.to_path_buf(),
+            configured_path: Arc::new(path.to_path_buf()),
             #[cfg(windows)]
             directory,
+            #[cfg(target_os = "linux")]
+            directory,
+            #[cfg(target_os = "linux")]
+            io_path,
         })
     }
 
@@ -3130,12 +3364,167 @@ impl PublicationRoot {
         &self.path
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory(&self) -> &Arc<std::fs::File> {
+        &self.directory
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn io_path(&self) -> &Path {
+        &self.io_path
+    }
+
+    pub(crate) fn open_readonly(&self, path: &Path) -> io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
+        #[cfg(not(target_os = "linux"))]
+        std::fs::File::open(path)
+    }
+
+    pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags};
+            self.open_relative(path, OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC, Mode::from_raw_mode(0o666))
+        }
+        #[cfg(not(target_os = "linux"))]
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)
+    }
+
+    pub(crate) fn create_truncate_with_parent(&self, path: &Path) -> io::Result<(std::fs::File, Option<std::fs::File>)> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let parent = self.open_directory(
+                path.parent()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file parent"))?,
+            )?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+            let file = open_linux_relative(
+                &parent,
+                Path::new(name),
+                OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC,
+                Mode::from_raw_mode(0o666),
+            )?;
+            Ok((file, Some(parent)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok((self.create_truncate(path)?, None))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_relative(&self, path: &Path, flags: rustix::fs::OFlags, mode: rustix::fs::Mode) -> io::Result<std::fs::File> {
+        let relative = path
+            .strip_prefix(self.io_path.as_path())
+            .or_else(|_| path.strip_prefix(self.path.as_path()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))?;
+        open_linux_relative(&self.directory, relative, flags, mode)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
+        self.open_relative(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+    }
+
     #[cfg(windows)]
     fn relative_path<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
         // The configured path only derives a suffix; traversal stays rooted at the pinned directory handle.
-        path.strip_prefix(&self.path)
-            .or_else(|_| path.strip_prefix(&self.configured_path))
+        path.strip_prefix(self.path.as_path())
+            .or_else(|_| path.strip_prefix(self.configured_path.as_path()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
+    }
+}
+
+/// Open the actual IO handle with the same containment policy as path validation.
+/// Older kernels retain fd-relative traversal; only ENOSYS enables the fallback.
+#[cfg(target_os = "linux")]
+fn open_linux_relative(
+    directory: &std::fs::File,
+    relative: &Path,
+    flags: rustix::fs::OFlags,
+    mode: rustix::fs::Mode,
+) -> io::Result<std::fs::File> {
+    use rustix::fs::{OFlags, ResolveFlags, openat2};
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+    }
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let flags = flags | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    match openat2(directory, relative, flags, mode, ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+        Ok(fd) => Ok(fd.into()),
+        Err(rustix::io::Errno::NOSYS) => open_linux_relative_legacy(directory, relative, flags, mode),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => Err(DiskError::InvalidPath.into()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_relative_legacy(
+    directory: &std::fs::File,
+    relative: &Path,
+    flags: rustix::fs::OFlags,
+    mode: rustix::fs::Mode,
+) -> io::Result<std::fs::File> {
+    use rustix::fs::OFlags;
+
+    let mut parent = None;
+    let mut components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = components.next() {
+        let current = parent.as_ref().unwrap_or(directory);
+        if components.peek().is_none() {
+            return open_linux_relative_component(current, name, flags, mode);
+        }
+        parent = Some(open_linux_relative_component(
+            current,
+            name,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?);
+    }
+    open_linux_relative_component(directory, std::ffi::OsStr::new("."), flags, mode)
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_relative_component(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: rustix::fs::OFlags,
+    mode: rustix::fs::Mode,
+) -> io::Result<std::fs::File> {
+    use rustix::fs::{AtFlags, FileType, openat, statat};
+    use rustix::io::Errno;
+    match openat(directory, name, flags, mode) {
+        Ok(fd) => Ok(fd.into()),
+        Err(Errno::LOOP) => Err(DiskError::InvalidPath.into()),
+        // O_DIRECTORY | O_NOFOLLOW reports ENOTDIR for an intermediate link.
+        // Inspect only this failure so ordinary non-directory errors retain
+        // their classification without adding a stat to successful opens.
+        Err(Errno::NOTDIR)
+            if statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|metadata| FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink) =>
+        {
+            Err(DiskError::InvalidPath.into())
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -3176,6 +3565,8 @@ pub(crate) type ExistingBaseDirectoryGuard = ();
 
 #[derive(Clone)]
 pub(crate) struct RenameCommitGuard {
+    #[cfg(target_os = "linux")]
+    directories: Arc<LinuxCommitDirectories>,
     #[cfg(windows)]
     source_parent: PathBuf,
     #[cfg(windows)]
@@ -3184,6 +3575,108 @@ pub(crate) struct RenameCommitGuard {
     source_parent_guard: ExistingBaseDirectoryGuard,
     #[cfg(windows)]
     destination_parent_guard: ExistingBaseDirectoryGuard,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxCommitDirectory {
+    file: Arc<std::fs::File>,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCommitDirectory {
+    fn new(file: std::fs::File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            file: Arc::new(file),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxCommitDirectories {
+    root: PublicationRoot,
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    source: LinuxCommitDirectory,
+    destination: std::sync::OnceLock<LinuxCommitDirectory>,
+    destination_base: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCommitDirectories {
+    fn prepare_destination(&self) -> io::Result<&LinuxCommitDirectory> {
+        if let Some(directory) = self.destination.get() {
+            return Ok(directory);
+        }
+        let mut parents = prepare_destination_parent_with_retry(&self.destination_path, &self.destination_base, &self.root)?;
+        let directory = std::fs::File::from(
+            parents
+                .pop()
+                .ok_or_else(|| io::Error::other("missing destination directory guard"))?,
+        );
+        let directory = LinuxCommitDirectory::new(directory)?;
+        Ok(self.destination.get_or_init(|| directory))
+    }
+
+    fn file_name<'a>(&self, path: &'a Path, source: bool) -> io::Result<&'a std::ffi::OsStr> {
+        let parent = if source { &self.source_path } else { &self.destination_path };
+        if path.parent() != Some(parent) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"));
+        }
+        path.file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        // A pinned directory may have been unlinked or replaced. Do not report a
+        // successful publication into a detached object tree.
+        for (path, directory) in [
+            (&self.source_path, &self.source),
+            (&self.destination_path, self.prepare_destination()?),
+        ] {
+            let current = self.root.open_directory(path)?.metadata()?;
+            if (current.dev(), current.ino()) != (directory.device, directory.inode) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn rename(&self, source: &Path, destination: &Path, prepared: Option<&PreparedRenameSource>) -> io::Result<()> {
+        let source_name = self.file_name(source, true)?;
+        let destination_name = self.file_name(destination, false)?;
+        let destination_parent = self.prepare_destination()?;
+        self.validate()?;
+        let mut attempt = 0;
+        loop {
+            if let Some(prepared) = prepared {
+                let metadata = rustix::fs::statat(&*self.source.file, source_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+                if prepared.path != source || metadata.st_dev != prepared.device || metadata.st_ino != prepared.inode {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rename source identity changed while publication was prepared",
+                    ));
+                }
+            }
+            let started = rustfs_io_metrics::put_stage_timer();
+            let result = rustix::fs::renameat(&*self.source.file, source_name, &*destination_parent.file, destination_name)
+                .map_err(io::Error::from);
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+                started,
+            );
+            match result {
+                Err(err) if should_retry_rename(&err, attempt) => attempt += 1,
+                result => return result,
+            }
+        }
+    }
 }
 
 pub(crate) struct RenameDestinationPathGuard {
@@ -3385,6 +3878,29 @@ pub(crate) fn prepare_rename_commit_guard(
     destination_base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<RenameCommitGuard> {
+    #[cfg(target_os = "linux")]
+    {
+        existing_base_directory_suffix(destination_parent, destination_base)?;
+        let source = LinuxCommitDirectory::new(publication_root.open_directory(source_parent)?)?;
+        let destination = std::sync::OnceLock::new();
+        match publication_root.open_directory(destination_parent) {
+            Ok(directory) => {
+                let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        return Ok(RenameCommitGuard {
+            directories: Arc::new(LinuxCommitDirectories {
+                root: publication_root.clone(),
+                source_path: source_parent.to_path_buf(),
+                destination_path: destination_parent.to_path_buf(),
+                source,
+                destination,
+                destination_base: destination_base.to_path_buf(),
+            }),
+        });
+    }
     #[cfg(windows)]
     {
         // A same-directory rename must use one shared-write parent handle:
@@ -3413,7 +3929,7 @@ pub(crate) fn prepare_rename_commit_guard(
         })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (source_parent, destination_parent, destination_base, publication_root);
         Ok(RenameCommitGuard {})
@@ -4209,11 +4725,7 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || reparse_tag == IO_REPARSE_TAG_DEDUP
 }
 
-pub(crate) fn mkdir_all_below_existing_base_std(
-    dir_path: &Path,
-    base_dir: &Path,
-    publication_root: &PublicationRoot,
-) -> io::Result<ExistingBaseDirectoryGuard> {
+fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
     let relative = dir_path
         .strip_prefix(base_dir)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory"))?;
@@ -4226,15 +4738,31 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         }
     }
 
+    Ok(relative)
+}
+
+pub(crate) fn mkdir_all_below_existing_base_std(
+    dir_path: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<ExistingBaseDirectoryGuard> {
+    let relative = existing_base_directory_suffix(dir_path, base_dir)?;
+
     #[cfg(unix)]
     {
-        let _ = publication_root;
-        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
         use rustix::io::Errno;
 
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let mut parents = vec![open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?];
+        #[cfg(target_os = "linux")]
+        let base = publication_root.open_directory(base_dir)?.into();
+        #[cfg(not(target_os = "linux"))]
+        let base = {
+            let _ = publication_root;
+            rustix::fs::open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?
+        };
+        let mut parents = vec![base];
 
         #[cfg(test)]
         let mut walked_path = base_dir.to_path_buf();
@@ -4354,10 +4882,18 @@ fn should_retry_rename(err: &io::Error, attempt: usize) -> bool {
 /// steal an attempt by making that same upward progress. A destination whose
 /// parent *is* the base gets a budget of zero, keeping `NotFound` immediately
 /// terminal for speculative cleanup renames.
+#[cfg(any(windows, test))]
 fn prepare_prune_budget(dst_file_path: &Path, base_dir: &Path) -> usize {
     dst_file_path
         .parent()
-        .and_then(|parent| parent.strip_prefix(base_dir).ok())
+        .map(|parent| parent_prune_budget(parent, base_dir))
+        .unwrap_or(0)
+}
+
+fn parent_prune_budget(parent: &Path, base_dir: &Path) -> usize {
+    parent
+        .strip_prefix(base_dir)
+        .ok()
         .map(|relative| relative.components().count())
         .unwrap_or(0)
 }
@@ -4484,6 +5020,60 @@ mod tests {
     use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
 
+    #[test]
+    fn fsync_groups_do_not_mix_cleanup_and_foreground_workers() {
+        let dir = tempdir().unwrap();
+        let dst_groups = Arc::new(DstDirFsyncGroupCommit::default());
+        let file_groups = Arc::new(FileFdatasyncGroupCommit::default());
+        let disk_permits = Arc::new(Semaphore::new(1));
+        let (_, dst_worker) = dst_groups.enqueue_for_test(dir.path()).unwrap();
+        let (_, file_worker) = file_groups
+            .enqueue(disk_permits.clone(), vec![dir.path().join("one")])
+            .unwrap();
+        assert!(dst_worker.is_some());
+        assert!(file_worker.is_some());
+        let cleanup_dst_groups = dst_groups.clone();
+        let cleanup_file_groups = file_groups.clone();
+        std::thread::spawn(move || {
+            use_current_runtime_for_fsync();
+            let (_, dst_worker) = cleanup_dst_groups.enqueue_for_test(dir.path()).unwrap();
+            let (_, file_worker) = cleanup_file_groups
+                .enqueue(disk_permits, vec![dir.path().join("two")])
+                .unwrap();
+            assert!(dst_worker.is_some(), "cleanup must not join a foreground directory worker");
+            assert!(file_worker.is_some(), "cleanup must not join a foreground file worker");
+        })
+        .join()
+        .unwrap();
+        assert_eq!(dst_groups.inner.lock().groups.len(), 2);
+        assert_eq!(file_groups.inner.lock().groups.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn isolated_runtime_keeps_fsync_on_its_own_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("isolated-fsync-test")
+            .on_thread_start(use_current_runtime_for_fsync)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .spawn(async {
+                fsync_spawn_blocking(|| {
+                    assert_eq!(std::thread::current().name(), Some("isolated-fsync-test"));
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+        // A runtime cannot be dropped from another runtime's async context.
+        runtime.shutdown_background();
+        result.unwrap();
+        assert!(!FSYNC_ON_CURRENT_RUNTIME.get(), "the calling runtime must retain normal fsync routing");
+    }
+
     fn file_sync_limiter() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS))
     }
@@ -4493,7 +5083,11 @@ mod tests {
             .first()
             .expect("test publication root requires at least one path")
             .to_path_buf();
-        while !paths.iter().all(|path| path.starts_with(&common)) {
+        // The disk root must exist independently of a missing or symlinked
+        // rename base; those are inputs whose rejection the tests exercise.
+        while !paths.iter().all(|path| path.starts_with(&common))
+            || !std::fs::symlink_metadata(&common).is_ok_and(|metadata| metadata.is_dir())
+        {
             assert!(common.pop(), "test paths must share an absolute root");
         }
         PublicationRoot::new(&common).expect("test publication root should open")
@@ -7735,5 +8329,174 @@ mod tests {
 
         let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fd_relative_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn guarded_first_publication_recovers_from_a_concurrent_parent_prune() {
+        let temp = tempfile::tempdir().expect("temporary disk");
+        let root = PublicationRoot::new(temp.path()).expect("pinned root");
+        let source = temp.path().join("tmp");
+        let base = temp.path().join("bucket");
+        let shared = base.join("prefix");
+        let destination = shared.join("object");
+        std::fs::create_dir(&source).expect("staging directory");
+        std::fs::create_dir_all(&shared).expect("shared prefix");
+        let guard = prepare_rename_commit_guard(&source, &destination, &base, &root).expect("commit directories");
+        let src = source.join("xl.meta");
+        let dst = destination.join("xl.meta");
+        let mut staged = create_prepared_rename_source_with_commit_guard(&src, &dst, &guard).expect("staged metadata");
+        staged.write_all(b"metadata", true).expect("write metadata");
+        let pruned = shared.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&shared, move || {
+            std::fs::remove_dir(pruned).expect("prune empty prefix");
+        });
+        let lease = acquire_namespace_mutation_lease(&dst).await;
+        rename_all_with_prepared_source(staged, &src, &dst, &base, &root, &guard, lease)
+            .await
+            .expect("publication must rebuild the pruned parent");
+        assert_eq!(std::fs::read(dst).expect("published metadata"), b"metadata");
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn legacy_relative_open_rejects_symlinks_and_opens_existing_components() {
+        use rustix::fs::{Mode, OFlags};
+        let temp = tempfile::tempdir().expect("temporary disk");
+        std::fs::create_dir(temp.path().join("parent")).expect("parent directory");
+        std::fs::write(temp.path().join("parent/data"), b"data").expect("file data");
+        std::os::unix::fs::symlink("parent", temp.path().join("link")).expect("directory link");
+        std::os::unix::fs::symlink("data", temp.path().join("parent/link")).expect("file link");
+        let root = PublicationRoot::new(temp.path()).expect("pinned root");
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut bytes = Vec::new();
+        open_linux_relative_legacy(root.directory(), Path::new("parent/data"), flags, Mode::empty())
+            .expect("legacy open")
+            .read_to_end(&mut bytes)
+            .expect("legacy read");
+        assert_eq!(bytes, b"data");
+        for relative in ["link/data", "parent/link"] {
+            assert!(open_linux_relative_legacy(root.directory(), Path::new(relative), flags, Mode::empty()).is_err());
+        }
+    }
+
+    #[test]
+    fn root_relative_io_retains_mount_identity_after_path_replacement() {
+        let temp = tempfile::tempdir().expect("temporary disk");
+        let disk = temp.path().join("disk");
+        std::fs::create_dir(&disk).expect("disk root");
+        std::fs::write(disk.join("data"), b"original").expect("original data");
+        let root = PublicationRoot::new(&disk).expect("pinned root");
+        let original = temp.path().join("original");
+        std::fs::rename(&disk, &original).expect("move root");
+        std::fs::create_dir(&disk).expect("replacement root");
+        std::fs::write(disk.join("data"), b"replacement").expect("replacement data");
+        for path in [disk.join("data"), root.io_path().join("data")] {
+            let mut actual = Vec::new();
+            root.open_readonly(&path)
+                .expect("pinned read")
+                .read_to_end(&mut actual)
+                .expect("read bytes");
+            assert_eq!(actual, b"original");
+        }
+        let (mut file, parent) = root.create_truncate_with_parent(&disk.join("new")).expect("pinned creation");
+        file.write_all(b"new").expect("write bytes");
+        file.sync_data().expect("file sync");
+        fsync_directory_handle_std(&disk, parent.as_ref()).expect("pinned parent sync");
+        assert_eq!(std::fs::read(original.join("new")).expect("original disk file"), b"new");
+        assert!(!disk.join("new").exists());
+    }
+
+    #[test]
+    fn root_relative_io_rejects_links_and_parent_escape_without_truncation() {
+        let temp = tempfile::tempdir().expect("temporary disk");
+        let disk = temp.path().join("disk");
+        std::fs::create_dir(&disk).expect("disk root");
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, b"preserved").expect("outside data");
+        std::os::unix::fs::symlink(&outside, disk.join("link")).expect("file link");
+        std::os::unix::fs::symlink(temp.path(), disk.join("parent")).expect("directory link");
+        let root = PublicationRoot::new(&disk).expect("pinned root");
+        for path in [disk.join("link"), disk.join("parent/outside"), disk.join("../outside")] {
+            assert!(root.open_readonly(&path).is_err(), "unsafe read: {path:?}");
+            assert!(root.create_truncate(&path).is_err(), "unsafe write: {path:?}");
+        }
+        assert_eq!(std::fs::read(&outside).expect("outside remains readable"), b"preserved");
+    }
+
+    #[tokio::test]
+    async fn guarded_publication_reuses_parents_and_syncs_without_changing_bytes() {
+        for grouped in [false, true] {
+            let _grouping = set_dst_dir_fsync_group_commit_for_test(grouped);
+            let temp = tempfile::tempdir().expect("temporary disk");
+            let root = PublicationRoot::new(temp.path()).expect("pinned root");
+            let source = temp.path().join("tmp");
+            let destination = temp.path().join("bucket/object");
+            let base = temp.path().join("bucket");
+            std::fs::create_dir(&source).expect("staging directory");
+            std::fs::create_dir(&base).expect("bucket directory");
+            let guard = prepare_rename_commit_guard(&source, &destination, &base, &root).expect("commit directories");
+            assert!(!destination.exists(), "preparation must not create the object directory");
+            let src = source.join("xl.meta");
+            let dst = destination.join("xl.meta");
+            assert!(
+                read_destination_file_with_commit_guard(&dst, &guard)
+                    .expect("absent read")
+                    .is_none()
+            );
+            let mut staged = create_prepared_rename_source_with_commit_guard(&src, &dst, &guard).expect("staged metadata");
+            staged.write_all(b"metadata", true).expect("write metadata");
+            let lease = acquire_namespace_mutation_lease(&dst).await;
+            rename_all_with_prepared_source(staged, &src, &dst, &base, &root, &guard, lease.clone())
+                .await
+                .expect("publish");
+            fsync_commit_directory(&destination, &guard, lease, None)
+                .await
+                .expect("directory sync");
+            assert_eq!(
+                read_destination_file_with_commit_guard(&dst, &guard).expect("committed read"),
+                Some(b"metadata".to_vec())
+            );
+            assert!(!src.exists());
+            assert_eq!(std::fs::read_dir(&destination).expect("object directory").count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_publication_rejects_replaced_directory_and_source() {
+        for replace_directory in [false, true] {
+            let temp = tempfile::tempdir().expect("temporary disk");
+            let root = PublicationRoot::new(temp.path()).expect("pinned root");
+            let source = temp.path().join("tmp");
+            let destination = temp.path().join("object");
+            std::fs::create_dir(&source).expect("staging directory");
+            std::fs::create_dir(&destination).expect("existing object directory");
+            let guard = prepare_rename_commit_guard(&source, &destination, temp.path(), &root).expect("commit directories");
+            let src = source.join("xl.meta");
+            let dst = destination.join("xl.meta");
+            std::fs::write(&dst, b"old").expect("old metadata");
+            let mut staged = create_prepared_rename_source_with_commit_guard(&src, &dst, &guard).expect("staged metadata");
+            staged.write_all(b"new", false).expect("new metadata");
+            if replace_directory {
+                std::fs::rename(&destination, temp.path().join("detached")).expect("replace destination");
+                std::fs::create_dir(&destination).expect("replacement directory");
+                std::fs::write(&dst, b"old").expect("replacement metadata");
+            } else {
+                std::fs::rename(&src, source.join("detached")).expect("replace staged file");
+                std::fs::write(&src, b"unrelated").expect("replacement file");
+            }
+            let lease = acquire_namespace_mutation_lease(&dst).await;
+            assert!(
+                rename_all_with_prepared_source(staged, &src, &dst, temp.path(), &root, &guard, lease)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&dst).expect("old metadata survives"), b"old");
+        }
     }
 }

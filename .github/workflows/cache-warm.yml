@@ -15,16 +15,16 @@
 # Sole writer of the Rust dependency caches that ci.yml restores.
 #
 # Why this is a separate workflow rather than steps inside ci.yml: ci.yml's
-# concurrency group cancels in-progress runs on main pushes, and merges land far
-# faster than its 70-minute pipeline. Measured over 15 consecutive main pushes:
+# concurrency group originally cancelled in-progress main runs, while merges
+# landed faster than its 70-minute pipeline. Over 15 consecutive main pushes:
 # 12 cancelled, 2 failed, 0 succeeded. A cancelled run never reaches
 # Swatinem/rust-cache's post step (cache-on-failure does not cover cancellation),
 # so the writer lanes were saving nothing and every PR paid a cold restore —
 # 11.8-20.9 minutes of "Setup Rust environment" against 0.7-3.4 warm.
 #
-# Splitting cache writing out of the test pipeline lets ci.yml keep cancelling
-# superseded runs (which is correct — nobody needs test results for a commit
-# that is already three merges behind) while the caches still get written.
+# Keep cache writing separate from validation: only these jobs publish the
+# complete feature closure for each key. Main validation now also finishes its
+# running baseline, while superseded PR attempts can still be cancelled.
 #
 # The group below deliberately does NOT cancel in progress; see the comment on
 # it for how that bounds concurrency and why it is scoped by event.
@@ -109,7 +109,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -141,7 +141,7 @@ jobs:
 
       - name: Upload cargo timings report
         if: inputs.emit_timings
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-timings-ci-dev
           path: target/cargo-timings/
@@ -199,7 +199,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -230,7 +230,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -260,7 +260,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 

@@ -224,6 +224,9 @@ mod cluster_multidrive_pool_test;
 #[cfg(test)]
 mod inline_fast_path_cluster_test;
 
+#[cfg(test)]
+mod object_metadata_cache_mutation_cluster_test;
+
 // backlog#2207: two-node gate for the cluster-authoritative tier stats contract.
 #[cfg(test)]
 mod tier_stats_cluster_test;
@@ -231,6 +234,10 @@ mod tier_stats_cluster_test;
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
+
+// GetObject with partNumber reporting x-amz-mp-parts-count
+#[cfg(test)]
+mod get_object_parts_count_test;
 
 // Group deletion tests
 #[cfg(test)]
@@ -272,6 +279,8 @@ mod storage_class_capability_test;
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
+#[cfg(test)]
+mod website_hosting_test;
 
 // Multipart control API auth regression tests
 #[cfg(test)]

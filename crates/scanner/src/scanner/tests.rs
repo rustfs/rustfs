@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+pub(super) mod cycle_persist_failure;
 mod quota_reset_preservation;
 
 mod recovery_control;
@@ -635,8 +636,8 @@ async fn cycle_budget_fence_accepts_bootstrap_pending_usage_marker() {
 
 #[tokio::test]
 async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
-    let lock = store
+    let (_temp_dir, lock_store) = setup_scanner_cycle_store().await;
+    let lock = lock_store
         .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
         .await
         .expect("scanner leader lock should be created");
@@ -644,6 +645,17 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
         .get_write_lock(Duration::from_secs(1))
         .await
         .expect("scanner leader lock should be acquired");
+
+    // Keep the real guard, but isolate the fencing deadline from filesystem I/O.
+    let store = Arc::new(MemoryConfigStore::default());
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+            .expect("scanner cycle usage baseline should encode"),
+    )
+    .await
+    .expect("scanner cycle usage baseline should persist");
 
     let ctx = CancellationToken::new();
     let mut cycle_info = CurrentCycle {
@@ -678,6 +690,8 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     .await;
 
     assert!(guard.is_released());
+    assert_eq!(leader_epoch, 2, "deadline handler should claim the next epoch");
+    assert!(matches!(cycle_revision, DataUsageCacheRevision::Etag(_)));
     let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .expect("deadline handler should persist a fenced cursor");
@@ -10015,7 +10029,7 @@ async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
 #[serial]
 fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
-        let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), bitrot_scan_cycle());
+        let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024));
         assert_eq!(mode, HealScanMode::Deep);
     });
 }
@@ -10027,8 +10041,14 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
         let recent = Utc::now() - chrono::Duration::minutes(30);
         let old = Utc::now() - chrono::Duration::hours(2);
 
-        assert_eq!(get_cycle_scan_mode(2048, 0, Some(recent), bitrot_scan_cycle()), HealScanMode::Normal);
-        assert_eq!(get_cycle_scan_mode(2048, 0, Some(old), bitrot_scan_cycle()), HealScanMode::Deep);
+        assert_eq!(
+            get_cycle_scan_mode(2048, 0, Some(recent), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            HealScanMode::Normal
+        );
+        assert_eq!(
+            get_cycle_scan_mode(2048, 0, Some(old), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            HealScanMode::Deep
+        );
     });
 }
 
@@ -10036,17 +10056,48 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
 #[serial]
 fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
-        assert_eq!(get_cycle_scan_mode(1, 0, None, bitrot_scan_cycle()), HealScanMode::Normal);
+        assert_eq!(
+            get_cycle_scan_mode(1, 0, None, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)),
+            HealScanMode::Normal
+        );
     });
+}
+
+#[test]
+fn test_erasure_sd_does_not_enter_deep_scan_mode() {
+    let started = Utc::now();
+    let cycle = Some(Duration::from_secs(3600));
+
+    let unsupported_policy = ScannerBitrotPolicy::new(cycle, false, 1024);
+    assert_eq!(get_cycle_scan_mode(10, 10, Some(started), unsupported_policy), HealScanMode::Normal);
+    assert_eq!(get_cycle_scan_mode(11, 10, None, unsupported_policy), HealScanMode::Normal);
+    assert_eq!(
+        get_cycle_scan_mode(10, 10, None, ScannerBitrotPolicy::new(Some(Duration::ZERO), false, 1024)),
+        HealScanMode::Normal
+    );
+
+    let info = BackgroundHealInfo {
+        bitrot_start_time: Some(started),
+        bitrot_start_cycle: 10,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let normalized = background_heal_info_for_scan_start(info, 11, HealScanMode::Normal, started, unsupported_policy)
+        .expect("ErasureSD should persist a legacy Deep state as Normal");
+    assert_eq!(normalized.current_scan_mode, HealScanMode::Normal);
 }
 
 #[test]
 #[serial]
 fn test_background_heal_info_for_scan_start_marks_deep_active() {
     let now = Utc::now();
-    let info =
-        background_heal_info_for_scan_start(BackgroundHealInfo::default(), 7, HealScanMode::Deep, now, bitrot_scan_cycle())
-            .expect("deep scan should update background heal info");
+    let info = background_heal_info_for_scan_start(
+        BackgroundHealInfo::default(),
+        7,
+        HealScanMode::Deep,
+        now,
+        ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024),
+    )
+    .expect("deep scan should update background heal info");
 
     assert_eq!(info.current_scan_mode, HealScanMode::Deep);
     assert_eq!(info.bitrot_start_cycle, 7);
@@ -10077,8 +10128,14 @@ fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
             current_scan_mode: HealScanMode::Normal,
         };
 
-        let info = background_heal_info_for_scan_start(info, 8, HealScanMode::Deep, Utc::now(), bitrot_scan_cycle())
-            .expect("deep scan should mark active status");
+        let info = background_heal_info_for_scan_start(
+            info,
+            8,
+            HealScanMode::Deep,
+            Utc::now(),
+            ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024),
+        )
+        .expect("deep scan should mark active status");
 
         assert_eq!(info.current_scan_mode, HealScanMode::Deep);
         assert_eq!(info.bitrot_start_cycle, 7);

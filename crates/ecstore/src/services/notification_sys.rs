@@ -23,7 +23,6 @@ use crate::error::{Error, Result};
 use crate::layout::endpoints::EndpointServerPools;
 use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
-use crate::services::rebalance::RebalSaveOpt;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -1479,12 +1478,27 @@ pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
     GLOBAL_NOTIFICATION_SYS.get().cloned()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectMetadataCacheClusterMode {
+    Disabled,
+    Enabled,
+    Inconsistent,
+}
+
+#[derive(Default)]
+struct MetadataCacheConfigurationGate {
+    stable: tokio::sync::OnceCell<ObjectMetadataCacheClusterMode>,
+    transient: tokio::sync::Mutex<Option<(Instant, ObjectMetadataCacheClusterMode)>>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
 pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
     peer_topology_hosts: Vec<String>,
     peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
     tier_config_reload_workers: Arc<Mutex<TierConfigReloadWorkers>>,
+    metadata_cache_configuration: Arc<MetadataCacheConfigurationGate>,
 }
 
 impl NotificationSys {
@@ -1507,6 +1521,7 @@ impl NotificationSys {
             peer_topology_hosts,
             peer_admin_caches,
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         }
     }
 
@@ -2455,30 +2470,11 @@ impl NotificationSys {
             None => store.current_rebalance_id().await,
         };
         match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
-            Ok(_) => {
-                let save_result = match local_rebalance_id.as_deref() {
-                    Some(expected_id) => {
-                        store
-                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
-                            .await
-                    }
-                    None => Ok(()),
-                };
-                if let Err(err) = save_result {
-                    error!(
-                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        action = "stop_rebalance",
-                        result = "local_save_failed",
-                        error = %err,
-                        "notification peer propagation"
-                    );
-                    return Err(Error::other(format!(
-                        "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
-                    )));
-                }
-            }
+            // `stop_rebalance_for_id` durably saves the terminal snapshot after
+            // activation readers drain. Do not acquire the same metadata lock
+            // again for an equivalent `StoppedAt` save while cleanup is still
+            // releasing its own metadata work.
+            Ok(_) => {}
             Err(err) => {
                 error!(
                     event = EVENT_NOTIFICATION_PEER_PROPAGATION,
@@ -3213,6 +3209,122 @@ impl NotificationSys {
             });
         }
         join_all(futures).await
+    }
+
+    pub async fn object_metadata_cache_cluster_mode(&self, local_enabled: bool) -> Result<ObjectMetadataCacheClusterMode> {
+        let gate = &self.metadata_cache_configuration;
+        if let Some(mode) = gate.stable.get() {
+            return Ok(*mode);
+        }
+        if let Some((expires_at, mode)) = *gate.transient.lock().await
+            && Instant::now() < expires_at
+        {
+            return Ok(mode);
+        }
+        let _refresh = gate.refresh.lock().await;
+        if let Some(mode) = gate.stable.get() {
+            return Ok(*mode);
+        }
+        if let Some((expires_at, mode)) = *gate.transient.lock().await
+            && Instant::now() < expires_at
+        {
+            return Ok(mode);
+        }
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            Self::cache_inconsistent_metadata_cache_configuration(gate).await;
+            return Err(Error::other("object metadata cache configuration topology is incomplete"));
+        }
+
+        let probes = self.peer_clients.iter().cloned().map(|client| async move {
+            let client = client.ok_or_else(|| Error::other("object metadata cache configuration peer is unreachable"))?;
+            client.probe_object_metadata_cache_configuration(local_enabled).await
+        });
+        let mut peers_enabled = Vec::with_capacity(self.peer_clients.len());
+        for result in join_all(probes).await {
+            match result {
+                Ok(enabled) => peers_enabled.push(enabled),
+                Err(err) => {
+                    Self::cache_inconsistent_metadata_cache_configuration(gate).await;
+                    return Err(err);
+                }
+            }
+        }
+        let mode = if local_enabled && peers_enabled.iter().all(|peer| *peer == Some(true)) {
+            ObjectMetadataCacheClusterMode::Enabled
+        } else if !local_enabled && peers_enabled.iter().all(|peer| peer != &Some(true)) {
+            ObjectMetadataCacheClusterMode::Disabled
+        } else {
+            ObjectMetadataCacheClusterMode::Inconsistent
+        };
+        if mode == ObjectMetadataCacheClusterMode::Inconsistent {
+            Self::cache_inconsistent_metadata_cache_configuration(gate).await;
+        } else {
+            let _ = gate.stable.set(mode);
+        }
+        Ok(mode)
+    }
+
+    async fn cache_inconsistent_metadata_cache_configuration(gate: &MetadataCacheConfigurationGate) {
+        const INCONSISTENT_REPROBE_INTERVAL: Duration = Duration::from_secs(1);
+        let expires_at = Instant::now()
+            .checked_add(INCONSISTENT_REPROBE_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        *gate.transient.lock().await = Some((expires_at, ObjectMetadataCacheClusterMode::Inconsistent));
+    }
+
+    pub async fn mutate_object_metadata_cache_on_peers(
+        &self,
+        phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase,
+        mutation_id: Uuid,
+        bucket: &str,
+        object: &str,
+    ) -> Result<()> {
+        self.mutate_object_metadata_cache_on_peers_scoped(
+            phase,
+            mutation_id,
+            bucket,
+            object,
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+            crate::set_disk::is_get_object_metadata_cache_distributed_enabled(),
+        )
+        .await
+    }
+
+    pub async fn mutate_object_metadata_cache_on_peers_scoped(
+        &self,
+        phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase,
+        mutation_id: Uuid,
+        bucket: &str,
+        object: &str,
+        scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+        cache_enabled: bool,
+    ) -> Result<()> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("object metadata cache mutation peer topology is incomplete"));
+        }
+
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for (idx, client) in self.peer_clients.iter().cloned().enumerate() {
+            let bucket = bucket.to_owned();
+            let object = object.to_owned();
+            let host = self.peer_topology_hosts[idx].clone();
+            futures.push(async move {
+                match client {
+                    Some(client) => client
+                        .mutate_object_metadata_cache_scoped(phase, mutation_id, &bucket, &object, scope, cache_enabled)
+                        .await
+                        .map_err(|err| (host, err)),
+                    None => Err((host, Error::other("peer is not reachable"))),
+                }
+            });
+        }
+
+        let failures = join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|result| result.err().map(|(host, err)| format!("peer {host}: {err}")))
+            .collect();
+        aggregate_notification_failures("object metadata cache mutation", failures)
     }
 }
 
@@ -4674,6 +4786,7 @@ mod tests {
             peer_topology_hosts: vec!["peer-a".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = notification_sys
@@ -4691,6 +4804,7 @@ mod tests {
             peer_topology_hosts: vec!["peer-a".to_string()],
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = notification_sys
@@ -4708,6 +4822,7 @@ mod tests {
             peer_topology_hosts: vec!["peer-a".to_string()],
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let missing_err = missing
             .probe_cross_pool_fence_fleet("topology-a")
@@ -4721,6 +4836,7 @@ mod tests {
             peer_topology_hosts: vec!["peer-a".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let unreachable_err = unreachable
             .probe_cross_pool_fence_fleet("topology-a")
@@ -4737,6 +4853,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let (peers, minimum_version) = notification_sys
             .probe_cross_pool_fence_fleet("topology-a")
@@ -4859,6 +4976,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let client = sys
@@ -4904,6 +5022,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = sys
@@ -4925,6 +5044,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = sys
@@ -4943,6 +5063,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = sys
@@ -4961,6 +5082,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let grants = ["peer-a", "peer-b"]
             .into_iter()
@@ -4997,6 +5119,7 @@ mod tests {
             peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = sys
@@ -5015,6 +5138,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let err = unreachable
             .scanner_dirty_usage_snapshots()
@@ -5028,6 +5152,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let err = empty
             .scanner_dirty_usage_snapshots()
@@ -5045,6 +5170,7 @@ mod tests {
             peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let err = incomplete
             .scanner_dirty_usage_snapshots()
@@ -5061,6 +5187,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let servers = sys.server_info().await;
@@ -5136,6 +5263,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
             peer_topology_hosts: Vec::new(),
         };
         let missing = sys
@@ -5225,6 +5353,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let err = sys
@@ -5255,6 +5384,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
         assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5284,6 +5414,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
         assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5313,6 +5444,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
         assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5336,6 +5468,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
         assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
         let sys_for_reload = Arc::clone(&sys);
@@ -5368,6 +5501,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
 
         sys.spawn_transition_tier_config_reload_workers_with_cancel_token(Some(CancellationToken::new()));
@@ -5393,6 +5527,7 @@ mod tests {
             peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
 
         sys.spawn_transition_tier_config_reload_workers_with_cancel_token(None);
@@ -5414,6 +5549,7 @@ mod tests {
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         });
         assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
         let cancel_token = CancellationToken::new();
@@ -5445,6 +5581,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
 
         let results = sys.load_transition_tier_config().await;
@@ -5462,6 +5599,7 @@ mod tests {
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let mutation_id = Uuid::from_u128(1);
 
@@ -5484,6 +5622,49 @@ mod tests {
         let abort = sys.abort_tier_mutation(mutation_id, Bytes::from_static(b"prepare")).await;
         assert_eq!(abort.len(), 1);
         assert!(abort[0].err.is_some());
+    }
+
+    #[tokio::test]
+    async fn object_metadata_cache_mutation_fanout_rejects_missing_or_unreachable_peer_slots() {
+        let unavailable = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
+        };
+        let mutation_id = Uuid::new_v4();
+        let unavailable_error = unavailable
+            .mutate_object_metadata_cache_on_peers(
+                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+                mutation_id,
+                "bucket",
+                "object",
+            )
+            .await
+            .expect_err("an unreachable serving peer must fail the Begin phase");
+        assert!(unavailable_error.to_string().contains("node-a:9000"));
+        assert!(unavailable_error.to_string().contains("peer is not reachable"));
+
+        let incomplete = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
+        };
+        let incomplete_error = incomplete
+            .mutate_object_metadata_cache_on_peers(
+                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+                mutation_id,
+                "bucket",
+                "object",
+            )
+            .await
+            .expect_err("incomplete topology must fail closed before fanout");
+        assert!(incomplete_error.to_string().contains("peer topology is incomplete"));
     }
 
     // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
@@ -5530,6 +5711,7 @@ mod tests {
             peer_topology_hosts: vec!["peer-unavailable".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
             tier_config_reload_workers: Default::default(),
+            metadata_cache_configuration: Default::default(),
         };
         let info = sys.storage_info(&LocalInventory).await;
         let peer = info

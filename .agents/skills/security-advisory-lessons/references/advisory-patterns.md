@@ -101,6 +101,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 ### SSE and on-disk storage invariants
 
 - `GHSA-xrrf-67jm-3c2r`: SSE metadata reported encryption while reader composition bypassed `EncryptReader` and stored plaintext. Lesson: test actual bytes on disk and wrapper order, not only API metadata.
+- `GHSA-wqmc-vjgv-jrpw`: SSE-C persisted and listed the plaintext MD5 as the ETag, allowing list-only users to confirm or brute-force low-entropy content and correlate equal plaintext across keys. Lesson: encrypted-object ETags must not expose deterministic plaintext fingerprints; protect them with per-object key material and keep listing, conditional, copy, and multipart semantics consistent.
 
 ### Object Lock and retention invariants
 
@@ -126,7 +127,7 @@ rg -n "normalize_extract_entry_key|Snowball|auto-extract|PathBuf::join|canonical
 rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECRET" rustfs crates
 rg -n "TONIC_RPC_PREFIX|verify_rpc_signature|check_auth|NodeServiceServer|x-rustfs-signature" rustfs crates
 rg -n "debug!|trace!|info!|error!|\\?resp|\\?merged_config|session_token|secret_key" rustfs crates
-rg -n "HashReader|EncryptReader|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
+rg -n "HashReader|EncryptReader|try_resolve_etag|ETag|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
 rg -n "ObjectLock|object_lock|retention|COMPLIANCE|GOVERNANCE|delete_prefix|lifecycle|scanner" rustfs crates
 rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ```
@@ -145,5 +146,5 @@ rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 - IAM export fixes: assert exported archives omit plaintext user and service-account secrets unless the format deliberately encrypts or seals them.
 - RPC auth fixes: include captured metadata replay across two concrete methods, stale timestamps, wrong path, wrong method surrogate, wrong secret, and valid same-method calls.
 - Browser/CORS fixes: assert no credentials on reflected/default origins, correct behavior for explicit allowlists, and no same-origin script execution for previewed object content.
-- SSE fixes: inspect stored bytes and verify API metadata, read-back behavior, and on-disk ciphertext together.
+- SSE fixes: inspect stored bytes and verify API metadata, read-back behavior, and on-disk ciphertext together; for ETags, upload equal plaintext under different keys and assert list-only callers cannot derive or correlate the plaintext digest, including multipart objects.
 - Object Lock fixes: include unreadable metadata, fabricated metadata defaults, unparsable config, confirmed absent config, COMPLIANCE/GOVERNANCE retention, lifecycle expiry, scanner sweeps, and force-delete paths.

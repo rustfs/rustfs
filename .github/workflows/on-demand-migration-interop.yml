@@ -69,8 +69,7 @@ env:
 jobs:
   minio-source:
     name: MinIO source (read-through, list-through, backfill)
-    # Skip on forks: needs this repository's runners and is not a contributor
-    # gate.
+    # Keep this scheduled interoperability lane scoped to the upstream repo.
     if: github.repository == 'rustfs/rustfs'
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -93,7 +92,7 @@ jobs:
       NEXTEST_LISTING: ${{ github.workspace }}/artifacts/odm-interop/minio/selection.json
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -108,11 +107,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/odm-interop/minio
+          docker build -t rustfs-odm-interop-minio \
+            -f crates/rio-v2/tests/minio_fixture_lab/Dockerfile \
+            crates/rio-v2/tests/minio_fixture_lab
           docker run -d --name rustfs-odm-interop-minio \
+            --entrypoint /usr/local/bin/minio \
             -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
             -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
             -p 9100:9000 \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            rustfs-odm-interop-minio server /data
           for _ in $(seq 1 120); do
             curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1 && break
             sleep 1
@@ -166,7 +169,7 @@ jobs:
 
       - name: Upload the MinIO interop report
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: odm-interop-minio-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
@@ -183,7 +186,7 @@ jobs:
   cloud-source:
     name: ${{ matrix.provider }} source (three-case minimum)
     if: github.repository == 'rustfs/rustfs'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -237,7 +240,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.credentials.outputs.present == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -286,7 +289,7 @@ jobs:
 
       - name: Upload the ${{ matrix.provider }} interop report
         if: always() && steps.credentials.outputs.present == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: odm-interop-${{ matrix.provider }}-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
@@ -306,7 +309,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

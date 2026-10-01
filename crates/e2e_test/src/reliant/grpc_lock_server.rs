@@ -22,10 +22,11 @@ use rustfs_protos::{
     models::PingBodyBuilder,
     proto_gen::node_service::{
         BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
-        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest,
-        ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-        SnapshotLeaseRequest, SnapshotLeaseResponse, node_service_server::NodeService,
+        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, ObjectMetadataCacheMutationRequest,
+        ObjectMetadataCacheMutationResponse, PingRequest, PingResponse, ScannerPublicationLeaseReleaseRequest,
+        ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        SnapshotLeaseResponse, node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -734,6 +735,13 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::GetProcInfoRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::GetProcInfoResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn mutate_object_metadata_cache(
+        &self,
+        _request: Request<ObjectMetadataCacheMutationRequest>,
+    ) -> Result<Response<ObjectMetadataCacheMutationResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

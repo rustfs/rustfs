@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod health;
 mod inspect;
 mod job;
 pub(crate) mod job_delivery;
@@ -40,6 +41,7 @@ mod trace_runtime;
 
 /// Signed diagnostic producers available through the CLI or authenticated service jobs.
 pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
+    health::HEALTH_SERVICE_CAPABILITY,
     perf_client::CLIENT_CAPABILITY,
     perf_drive::DRIVE_CAPABILITY,
     perf_network::NETWORK_CAPABILITY,
@@ -48,6 +50,7 @@ pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
     logs::LOGS_CAPABILITY,
     profile_cpu::CPU_PROFILE_CAPABILITY,
     profile_cpu::MEMORY_PROFILE_CAPABILITY,
+    profile_memory::MEMORY_PROFILE_SERVICE_CAPABILITY,
     profile_cpu::THREAD_PROFILE_CAPABILITY,
     trace_record::TELEMETRY_RECORD_CAPABILITY,
     trace_record::TELEMETRY_OTLP_CAPABILITY,
@@ -63,6 +66,13 @@ pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
 #[path = "trace_runtime_unsupported.rs"]
 mod trace_runtime;
 
+pub use health::{
+    HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome, HealthSaveError,
+    HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
+    MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
+    save_signed_health_export, sign_health_export,
+};
 pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
     InspectOutcome, InspectProvenance, InspectReason, InspectReasonCode, InspectRequest, InspectRule, InspectRuleOutcome,
@@ -121,6 +131,7 @@ pub use perf_site_replication::{
     SiteReplicationTargetResult, measure_site_replication, read_protected_site_replication_credential,
     save_signed_site_replication_export, sign_site_replication_export, validate_site_replication_limits,
 };
+pub(crate) use profile_cpu::LocalRuntimeProfileRequest;
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
     ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
@@ -161,5 +172,11 @@ pub use trace_record::{
 };
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
 pub(crate) use trace_runtime::{
-    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+    LocalHealthRequest, LocalNetworkRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, load_selected_offline_key,
+    request_local_health, request_local_native_threads_profile, request_local_network, request_local_runtime_profile,
+    request_local_top_api, request_local_top_disk, request_local_top_locks, request_local_top_rpc, request_local_trace_capture,
+    spawn_local_trace_capture_runtime,
 };
+
+pub(crate) use top_api::save_top_archive;
+pub(crate) use top_disk::LocalTopRequest;

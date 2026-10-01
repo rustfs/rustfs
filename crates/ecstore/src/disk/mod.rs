@@ -14,6 +14,7 @@
 
 // #730: disk abstractions still carry staged health and direct-I/O migration paths.
 
+pub(crate) mod cleanup_runtime;
 pub mod disk_store;
 pub mod endpoint;
 pub mod error;
@@ -825,7 +826,7 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        let Some(scope) = crate::store::bucket_heal_scope(dst_volume) else {
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
             return self
                 .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
                 .await;
@@ -1365,6 +1366,10 @@ pub struct DiskInfoOptions {
     pub disk_id: String,
     pub metrics: bool,
     pub noop: bool,
+    /// Bypass the ordinary one-second admin cache and return a positive
+    /// acknowledgement only after a fresh capacity syscall completes.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1389,6 +1394,10 @@ pub struct DiskInfo {
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
+    /// Older peers omit this field. Callers must treat an absent/false value as
+    /// cached or otherwise unproven capacity evidence.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1554,6 +1563,14 @@ pub struct RenameDataResp {
     /// "cannot vote", never as `Absent`.
     #[serde(default)]
     pub old_current_size: Option<OldCurrentSize>,
+    /// Whether this disk decoded enough of the overwritten current version to
+    /// decide if a transitioned source has to be returned.
+    #[serde(default)]
+    pub old_current_source_checked: bool,
+    /// Transitioned old-current source used by PUT free-version cleanup receipt.
+    /// Empty when the old current is not transitioned or no source was known.
+    #[serde(default)]
+    pub old_current_source: Option<FileInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1912,11 +1929,40 @@ mod tests {
             disk_id: "test-disk-id".to_string(),
             metrics: true,
             noop: false,
+            fresh_capacity: true,
         };
 
         assert_eq!(opts.disk_id, "test-disk-id");
         assert!(opts.metrics);
         assert!(!opts.noop);
+        assert!(opts.fresh_capacity);
+    }
+
+    #[test]
+    fn disk_info_fresh_capacity_ack_is_additive_for_old_peers() {
+        let old_options: DiskInfoOptions =
+            serde_json::from_str(r#"{"disk_id":"disk","metrics":false,"noop":false}"#).expect("old options");
+        assert!(!old_options.fresh_capacity);
+
+        let mut old_response_json = serde_json::to_value(DiskInfo {
+            total: 10,
+            free: 4,
+            used: 6,
+            ..Default::default()
+        })
+        .expect("response fixture");
+        old_response_json
+            .as_object_mut()
+            .expect("response object")
+            .remove("fresh_capacity");
+        let old_response: DiskInfo = serde_json::from_value(old_response_json).expect("old response");
+        assert!(!old_response.fresh_capacity);
+
+        let requested = DiskInfoOptions {
+            fresh_capacity: true,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(requested).expect("new options")["fresh_capacity"], true);
     }
 
     /// Test ReadMultipleReq structure
@@ -2001,6 +2047,8 @@ mod tests {
             cleanup_data_dir: Some(uuid),
             sign: Some(signature.clone()),
             old_current_size: Some(OldCurrentSize::Present(42)),
+            old_current_source_checked: false,
+            old_current_source: None,
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
@@ -2021,6 +2069,8 @@ mod tests {
                 cleanup_data_dir: Some(Uuid::new_v4()),
                 sign: Some(vec![0x01, 0x02, 0x03]),
                 old_current_size,
+                old_current_source_checked: false,
+                old_current_source: None,
             };
 
             let encoded = rmp_serde::encode::to_vec_named(&resp).expect("named msgpack should encode");
@@ -2058,6 +2108,8 @@ mod tests {
         assert_eq!(decoded.cleanup_data_dir, None);
         assert_eq!(decoded.sign, legacy.sign);
         assert_eq!(decoded.old_current_size, None);
+        assert!(!decoded.old_current_source_checked);
+        assert!(decoded.old_current_source.is_none());
     }
 
     /// Test constants

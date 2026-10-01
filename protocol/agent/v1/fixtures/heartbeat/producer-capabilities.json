@@ -9,6 +9,7 @@
     "inventory.environment@1"
   ],
   "producerCapabilities": [
+    "health.check.service@1",
     "performance.client@1",
     "performance.drive@1",
     "performance.network@1",
@@ -17,6 +18,7 @@
     "logs.capture@1",
     "profile.cpu@1",
     "profile.memory@1",
+    "profile.memory.service@1",
     "profile.threads@1",
     "telemetry.record@1",
     "telemetry.otlp@1",
@@ -32,6 +34,7 @@
     "heartbeat",
     "diagnostics.policy.v1",
     "inventory.environment@1",
+    "health.check.service@1",
     "performance.client@1",
     "performance.drive@1",
     "performance.network@1",
@@ -40,6 +43,7 @@
     "logs.capture@1",
     "profile.cpu@1",
     "profile.memory@1",
+    "profile.memory.service@1",
     "profile.threads@1",
     "telemetry.record@1",
     "telemetry.otlp@1",

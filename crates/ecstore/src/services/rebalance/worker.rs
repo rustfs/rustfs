@@ -109,7 +109,13 @@ pub(super) fn resolve_rebalance_save_task_result(
 }
 
 pub(super) fn resolve_rebalance_meta_save_result(result: Result<()>, stage: &str) -> Result<()> {
-    result.map_err(|err| Error::other(format!("rebalance meta save failed during {stage}: {err}")))
+    // Keep the source error reachable: the metadata retry policy classifies
+    // transient lock timeouts by inspecting the source chain, so collapsing the
+    // failure into a plain string here would make that retry a no-op.
+    result.map_err(|err| {
+        let rendered = format!("rebalance meta save failed during {stage}: {err}");
+        crate::data_movement::data_movement_context_error(rendered, err)
+    })
 }
 
 pub(super) fn rebalance_meta_lock_error(err: rustfs_lock::LockError, mode: &'static str) -> Error {
@@ -737,6 +743,29 @@ mod error_source_tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rebalance_metadata_retry_engages_for_wrapped_meta_save_lock_timeout() {
+        let mut attempts = 0;
+        let result = retry_rebalance_metadata_access(None, 3, || {
+            attempts += 1;
+            std::future::ready(resolve_rebalance_meta_save_result(
+                Err(rebalance_meta_lock_error(
+                    rustfs_lock::LockError::timeout(".rustfs.sys/rebalance.bin@latest", Duration::from_secs(5)),
+                    "write",
+                )),
+                "save_rebalance_stats for pool 0 opt Stats",
+            ))
+        })
+        .await;
+
+        assert_eq!(attempts, 3, "a wrapped meta save lock timeout must stay retryable");
+        let err = result.expect_err("persistent lock contention must not become success");
+        assert!(matches!(
+            rebalance_error_source(&err),
+            Error::Lock(rustfs_lock::LockError::Timeout { .. })
+        ));
     }
 
     #[tokio::test]

@@ -200,8 +200,8 @@ md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
 # "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
-# (backlog#1178); "fs" comes from the workspace default.
-rustix = { workspace = true, features = ["process", "fs"] }
+# (backlog#1178); "thread" provides cleanup affinity; "fs" is a workspace default.
+rustix = { workspace = true, features = ["process", "fs", "thread"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
@@ -223,11 +223,13 @@ aws-smithy-http-client = { workspace = true, default-features = false, features 
 # Observability and Metrics
 metrics = { workspace = true }
 
-# Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
-# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only.
+# The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.2.2"
+# SharedReadBudget and the bounded read APIs are available in the 0.3.0
+# registry release; keep the application on the published contract.
+rustfs-uring = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
@@ -280,6 +282,10 @@ harness = false
 
 [[bench]]
 name = "single_block_non_inline_benchmark"
+harness = false
+
+[[bench]]
+name = "multipart_read_parts_benchmark"
 harness = false
 
 [lib]

@@ -7,8 +7,9 @@ use super::meta::{
     validate_start_rebalance_state,
 };
 use super::worker::{
-    resolve_rebalance_bucket_result, resolve_rebalance_meta_save_result, resolve_rebalance_save_task_result,
-    resolve_rebalance_terminal_error, send_rebalance_done_signal,
+    rebalance_max_attempts, resolve_rebalance_bucket_result, resolve_rebalance_meta_save_result,
+    resolve_rebalance_save_task_result, resolve_rebalance_terminal_error, retry_rebalance_metadata_access,
+    send_rebalance_done_signal,
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
@@ -449,13 +450,14 @@ impl ECStore {
                         };
 
                         if terminal_state_present {
-                            if let Err(err) = store
-                                .save_rebalance_stats_inner(
+                            if let Err(err) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+                                store.save_rebalance_stats_inner(
                                     pool_index,
                                     RebalSaveOpt::Stats,
                                     Some(save_rebalance_id.as_ref()),
                                 )
-                                .await
+                            })
+                            .await
                             {
                                 let mut rebalance_meta = store.rebalance_meta.write().await;
                                 *rebalance_meta = previous_meta;
@@ -475,9 +477,10 @@ impl ECStore {
                 }
 
                 if !terminal_state_saved
-                    && let Err(err) = store
-                        .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
-                        .await
+                    && let Err(err) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+                        store.save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
+                    })
+                    .await
                 {
                     let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
                     error!("{} err: {:?}", msg, wrapped);

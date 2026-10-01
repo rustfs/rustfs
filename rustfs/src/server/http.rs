@@ -191,6 +191,39 @@ fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
     Ok(Some(domains))
 }
 
+fn website_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
+    if config.console_enable {
+        return Ok(None);
+    }
+    let raw = std::env::var("RUSTFS_WEBSITE_DOMAINS").unwrap_or_default();
+    let mut domains = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for domain in raw.split(',').map(str::trim).filter(|domain| !domain.is_empty()) {
+        if domain.contains(':') || domain.ends_with('.') {
+            return Err(Error::other(format!("invalid RUSTFS_WEBSITE_DOMAINS entry: {domain}")));
+        }
+        let normalized = domain.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            return Err(Error::other(format!("duplicate RUSTFS_WEBSITE_DOMAINS entry: {domain}")));
+        }
+        if config
+            .server_domains
+            .iter()
+            .map(|s| strip_valid_port_suffix(s).to_ascii_lowercase())
+            .any(|s| normalized == s || normalized.ends_with(&format!(".{s}")) || s.ends_with(&format!(".{normalized}")))
+        {
+            return Err(Error::other(format!("website domain overlaps RUSTFS_SERVER_DOMAINS: {domain}")));
+        }
+        domains.push(normalized);
+    }
+    if domains.is_empty() {
+        Ok(None)
+    } else {
+        MultiDomain::new(&domains).map_err(|err| Error::other(format!("invalid RUSTFS_WEBSITE_DOMAINS {:?}: {err}", domains)))?;
+        Ok(Some(domains))
+    }
+}
+
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -1170,18 +1203,12 @@ pub async fn start_http_server(
 
             // 4. Socket buffers. The receive buffer is left to kernel autotuning
             // unless RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set: a fixed SO_RCVBUF
-            // is inherited by every accepted socket and disables autotuning, so a
-            // request whose body is not being read yet (a multipart part queued
-            // for a foreground write permit) lets up to the fixed size of unread
-            // body accumulate in kernel memory — the former hard-coded 4 MiB held
-            // up to 8 MiB per queued connection on Linux, which doubles the
-            // requested size. Autotuning keeps an unread connection at the
-            // kernel's initial size and grows only connections that are actually
-            // being drained (issue #7385). The send buffer stays fixed at 4 MiB
-            // because the stock Linux send autotuning ceiling (`tcp_wmem` max,
-            // 4 MiB) is below what a GB-level response stream needs, whereas the
-            // receive ceiling (`tcp_rmem` max, 6 MiB) already exceeds the old
-            // fixed request.
+            // is inherited by every accepted socket and disables autotuning.
+            // A reused autotuned connection can retain a buffer enlarged by a
+            // previous request, so queued multipart bodies still consume kernel
+            // memory. Neither policy makes socket capacity an allocation or
+            // guarantees a fixed per-waiter memory footprint. Keep the existing
+            // send-buffer tuning independent of receive autotuning.
             // Some constrained local environments reject these socket options with
             // EPERM/ENOPROTOOPT-style failures; log and continue in that case.
             if recv_buffer_bytes > 0
@@ -1364,12 +1391,17 @@ pub async fn start_http_server(
             .map(MultiDomain::new)
             .transpose()
             .map_err(Error::other)?;
+        let website_host_sets = website_host_domains(config)?;
+        let website_route_domains = website_host_sets.unwrap_or_default();
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
             admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
+            website_route_domains,
+            protocol,
+            Arc::clone(&server_ctx),
         ));
 
         // Normalize leading/duplicate forward slashes in object keys (MinIO parity).

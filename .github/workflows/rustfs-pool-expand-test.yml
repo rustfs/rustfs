@@ -7,6 +7,11 @@ on:
         description: Verified candidate and chain attempt from the chain driver
         type: string
         required: true
+      pool_timeout_minutes:
+        description: Wall-clock budget (minutes) for the pool run step
+        type: string
+        required: false
+        default: '240'
   workflow_dispatch:
     inputs:
       rustfs_version:
@@ -39,6 +44,10 @@ on:
         description: 'Run the pool decommission step (3-pool topology only)'
         type: boolean
         default: true
+      pool_timeout_minutes:
+        description: 'Wall-clock budget (minutes) for the whole pool run: fill + rebalance wait + decommission'
+        required: false
+        default: '240'
       cleanup_before:
         description: 'Reset the nodes before the test (DESTROYS existing data/config)'
         type: boolean
@@ -82,7 +91,8 @@ jobs:
   pool-expansion-test:
     name: Pool expansion / decommission test
     runs-on: smoke-testing
-    timeout-minutes: 60
+    # Leave setup and finalizer headroom beyond the default 240-minute test.
+    timeout-minutes: 360
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     env:
       RUSTFS_POOL_ADMIN_ENDPOINT: ${{ secrets.RUSTFS_POOL_ADMIN_ENDPOINT || vars.RUSTFS_POOL_ADMIN_ENDPOINT || 'http://rustfs-node1:9000' }}
@@ -92,7 +102,7 @@ jobs:
       RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000 http://rustfs-node4:9000' }}
     steps:
       - name: Checkout chain tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -104,7 +114,7 @@ jobs:
         run: python3 scripts/functional_chain_evidence.py consume
 
       - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           repository: rustfs/auto-testing
           ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
@@ -251,7 +261,12 @@ jobs:
 
       - name: Run pool expansion & decommission test
         id: pool_test
-        timeout-minutes: 45
+        # The suite budgets up to 24h each for rebalance and decommission
+        # (REBALANCE_TIMEOUT / DECOMMISSION_TIMEOUT in rustfs_pool_expand.sh);
+        # the previous 45m step cap killed four consecutive runs mid-rebalance
+        # with steps 1-7 green. 240m covers the observed pace (rebalance 1/4
+        # in ~21m) plus one decommission pass; override per dispatch.
+        timeout-minutes: ${{ inputs.pool_timeout_minutes || 240 }}
         # Case failures keep the run green: the report and the backlog
         # issue manager carry the product signal.
         continue-on-error: true
@@ -568,6 +583,25 @@ jobs:
             echo "pool test script reported a failure (step FAIL verdict or die() abort)" >&2
             failed=1
           fi
+          # A runner-level kill (step timeout) truncates the suite without a
+          # FAIL verdict or an [ERROR] line, so require every expected
+          # [POOL-STEP] marker to be present with PASS - missing markers mean
+          # the run was truncated, not green. This also closes the gap for
+          # standalone dispatches, where the chain driver's evidence
+          # validation does not run.
+          last_step=6
+          if [ "${{ inputs.pools || '3' }}" = "3" ]; then
+            last_step=8
+            if [ "${{ inputs.run_decommission != 'false' }}" = "true" ]; then
+              last_step=9
+            fi
+          fi
+          for n in $(seq 1 "${last_step}"); do
+            grep -q "^\[POOL-STEP\] ${n} .* PASS" "${POOL_ARTIFACT_DIR}/pool-test.log" 2>/dev/null || {
+              echo "pool test log is missing [POOL-STEP] ${n} PASS (expected through step ${last_step}); the run was truncated" >&2
+              failed=1
+            }
+          done
           [ "${failed}" -eq 0 ] || exit 1
 
       - name: Upload functional report to dashboard
@@ -656,7 +690,7 @@ jobs:
       - name: Upload test logs
         timeout-minutes: 2
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-pool-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rustfs-pool-${{ github.run_id }}-${{ github.run_attempt }}
@@ -764,7 +798,7 @@ jobs:
 
       - name: Upload chain evidence
         if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: functional-chain-pool-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-pool-${{ github.run_id }}-${{ github.run_attempt }}/pool.json

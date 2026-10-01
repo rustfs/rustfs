@@ -17,6 +17,14 @@ name: Connect profile.threads service-job acceptance
 on:
   workflow_dispatch:
     inputs:
+      thread_scope:
+        description: Thread profile scope
+        required: true
+        type: choice
+        default: native
+        options:
+          - native
+          - runtime
       build_run_id:
         description: Main-branch Build and Release workflow run ID
         required: true
@@ -48,24 +56,24 @@ permissions:
 
 jobs:
   profile-threads:
-    name: Verify native Linux x86_64 profile.threads service job
-    runs-on: ubuntu-latest
+    name: Verify Linux x86_64 profile.threads service job
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout acceptance harness
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Checkout exact RustFS source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           path: rustfs-source
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
       - name: Checkout exact Connect harness
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           repository: rustfs/connect
           path: connect-harness
@@ -76,9 +84,42 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.22.2
+          node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
+
+      - name: Ensure GitHub CLI
+        shell: bash
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+
+          gh_version="2.101.0"
+          case "$(uname -m)" in
+            x86_64) gh_arch="amd64" ;;
+            aarch64|arm64) gh_arch="arm64" ;;
+            *)
+              echo "Unsupported Linux architecture for GitHub CLI: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          gh_install_root="${RUNNER_TEMP:-$PWD}/gh-cli"
+          rm -rf "$gh_install_root"
+          mkdir -p "$gh_install_root/bin"
+          archive="$gh_install_root/gh.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_${gh_arch}.tar.gz" \
+            --output "$archive"
+          tar -xzf "$archive" -C "$gh_install_root"
+          install -m 0755 \
+            "$gh_install_root/gh_${gh_version}_linux_${gh_arch}/bin/gh" \
+            "$gh_install_root/bin/gh"
+          echo "$gh_install_root/bin" >> "$GITHUB_PATH"
+          export PATH="$gh_install_root/bin:$PATH"
+          gh --version
 
       - name: Verify source run and artifact identity
         shell: bash
@@ -107,7 +148,7 @@ jobs:
           [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
           [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
 
-          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-4, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
           jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e --arg name "$expected_job" '
             [.[].jobs[] | select(.name == $name)] as $matches
@@ -122,7 +163,7 @@ jobs:
           [[ $(jq -r '.expired' <<<"$artifact") == false ]]
 
       - name: Download exact build artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ inputs.artifact_id }}
           path: artifact
@@ -148,8 +189,14 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          THREAD_SCOPE: ${{ inputs.thread_scope }}
         run: |
           set -euo pipefail
+          case "$THREAD_SCOPE" in
+            native) export CONNECT_E2E_THREAD_SCOPE=NATIVE_THREADS ;;
+            runtime) export CONNECT_E2E_THREAD_SCOPE=TOKIO_RUNTIME ;;
+            *) exit 1 ;;
+          esac
           printf '%s\n' "$SOURCE_SHA" >connect-harness/tests/e2e/connected/rustfs-ref
           npm --prefix connect-harness/web ci
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
@@ -168,6 +215,7 @@ jobs:
           ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
           CONNECT_SHA: ${{ inputs.connect_sha }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          THREAD_SCOPE: ${{ inputs.thread_scope }}
         run: |
           set -euo pipefail
           jq \
@@ -177,13 +225,14 @@ jobs:
             --arg artifactDigest "$ARTIFACT_DIGEST" \
             --arg connectSha "$CONNECT_SHA" \
             --arg sourceSha "$SOURCE_SHA" \
-            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha}' \
+            --arg requestedThreadScope "$THREAD_SCOPE" \
+            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha, requestedThreadScope: $requestedThreadScope}' \
             profile-threads-service-job-evidence.json >profile-threads-service-job-evidence.bound.json
           mv profile-threads-service-job-evidence.bound.json profile-threads-service-job-evidence.json
 
       - name: Upload acceptance evidence
         if: ${{ always() && hashFiles('profile-threads-service-job-evidence.json') != '' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: connect-profile-threads-evidence-${{ github.run_id }}
           path: |

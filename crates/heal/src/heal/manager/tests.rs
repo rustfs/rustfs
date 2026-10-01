@@ -1228,6 +1228,7 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
         }),
         delete_marker_purge: None,
         lease: None,
+        durable_anchor: None,
     };
     let matching = HealObjectOutcome {
         identity: HealObjectIdentity {
@@ -1336,6 +1337,102 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
 }
 
 #[test]
+fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    use rustfs_common::mrf_channel::{
+        MrfDurableRepairAnchor, MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent,
+    };
+
+    let bucket = Arc::<str>::from("legacy-held-bucket");
+    let object = Arc::<str>::from("legacy-held-object");
+    let scope = MrfScope {
+        pool_index: 1,
+        set_index: 2,
+    };
+    let mut intent = MrfIntent {
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(scope),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let lease = intent.lease.expect("replayed intent should own a generation");
+    let anchor = MrfDurableRepairAnchor {
+        kind: MrfKind::PartialWrite,
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        scope: Some(scope),
+        delete_marker_purge: None,
+        lease,
+        bucket_incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let target = MrfRepairNoticeTarget {
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        scope: Some(scope),
+        delete_marker_purge: None,
+        lease: Some(lease),
+        durable_anchor: Some(anchor.clone()),
+    };
+    let incarnation = anchor.bucket_incarnation_id;
+    let outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Unknown,
+        detail: Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_string()),
+    };
+
+    let event = super::scheduler::unverified_legacy_mrf_event_for_target(&target, &outcome)
+        .expect("exact legacy partial-write outcome should park only its runtime retry");
+    assert_eq!(event.anchor, anchor);
+
+    let wrong_identity = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            object: "other-object".to_string(),
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_identity).is_none());
+    let missing_incarnation = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            bucket_incarnation_id: None,
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &missing_incarnation).is_none());
+    let wrong_incarnation = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            bucket_incarnation_id: Some(uuid::Uuid::new_v4()),
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_incarnation).is_none());
+    let wrong_reason = HealObjectOutcome {
+        detail: Some("object was readable".to_string()),
+        ..outcome
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_none());
+}
+
+#[test]
 fn completed_mrf_notice_publishes_only_verified_positive_events() {
     use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome};
     use rustfs_common::mrf_channel::{MrfKind, MrfScope, take_mrf_verified_repair_events_for};
@@ -1355,6 +1452,7 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
         }),
         delete_marker_purge: None,
         lease: None,
+        durable_anchor: None,
     };
     let mismatch_target = MrfRepairNoticeTarget {
         object: Arc::from("object-b"),
@@ -2469,6 +2567,70 @@ fn test_retry_request_for_recoverable_lock_timeout() {
     assert_eq!(retry_request.priority, task.priority);
     assert!(retry_delay > Duration::ZERO);
     assert!(retry_error.contains("Lock acquisition timeout"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contended_healing_marker_cas_retains_bounded_task_retries() {
+    let temp = TempDir::new().expect("marker contention directory");
+    let disk = make_manager_resume_disk(&temp, "marker-contention").await;
+    let metadata = temp.path().join("marker-contention").join(super::super::RUSTFS_META_BUCKET);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(metadata.join(".rustfs-cas.lock"))
+        .expect("marker CAS lock should open");
+    lock.lock().expect("fixture should own the marker CAS lock");
+    let result = super::super::apply_healing_markers_to_targets(vec![disk.clone()], Some("owner"), None, false).await;
+    assert!(
+        matches!(&result, Err(Error::Disk(DiskError::Io(error))) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the real contended marker CAS must return WouldBlock: {result:?}"
+    );
+    assert!(
+        !metadata.join(super::super::HEALING_MARKER_PATH).exists(),
+        "lock contention must not publish a healing marker"
+    );
+
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions {
+            timeout: Some(Duration::from_secs(60)),
+            ..HealOptions::default()
+        },
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    let original = request.clone();
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    for attempt in 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result_with_budget(&task, &result)
+            .await
+            .expect("marker CAS contention should retain the existing task retry budget");
+        assert_eq!(retry.id, original.id);
+        assert_eq!(retry.heal_type, original.heal_type);
+        assert_eq!(retry.source, original.source);
+        assert_eq!(retry.options.timeout, original.options.timeout);
+        assert_eq!(retry.retry_attempts, attempt);
+        assert!(delay > Duration::ZERO);
+        request = retry;
+    }
+    let exhausted = HealTask::from_request(request, storage);
+    assert!(retry_request_for_result_with_budget(&exhausted, &result).await.is_none());
+
+    drop(lock);
+    super::super::apply_healing_markers_to_targets(vec![disk], Some("owner"), None, false)
+        .await
+        .expect("the marker CAS should succeed once contention ends");
+    assert_eq!(
+        std::fs::read(metadata.join(super::super::HEALING_MARKER_PATH)).expect("published marker should be readable"),
+        b"owner"
+    );
 }
 
 #[tokio::test]

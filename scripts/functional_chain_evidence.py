@@ -28,7 +28,12 @@ def current_chain():
     require(sha(chain["workflow_sha"]) and chain["workflow_sha"] == os.environ["GITHUB_SHA"], "chain workflow source mismatch")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     require(head == chain["workflow_sha"], "lane checkout differs from chain workflow source")
-    require(chain["testing_sha"] == (ROOT / ".config/functional-script-revision.txt").read_text().strip() and sha(chain["testing_sha"]), "private script pin differs from chain")
+    # testing_sha is either the committed pin or auto-testing main HEAD via
+    # resolve_functional_candidate.py's >24h staleness fallback, so pin
+    # equality is no longer an invariant (the 09-21 chain died on exactly
+    # that check once the fallback finally fired). Lanes check out exactly
+    # this sha, which is what the format check guards.
+    require(sha(chain["testing_sha"]), "private script revision is not a valid commit sha")
     candidate = chain["candidate"]
     require(isinstance(candidate, dict) and set(candidate) == {"manifest", "artifact_id", "artifact_digest", "workflow_sha", "workflow_ref", "build_started_at"}, "invalid candidate envelope")
     manifest = candidate["manifest"]
@@ -108,12 +113,27 @@ def fault_tolerance_counts(text):
     return counts
 
 
+def auto_testing_dir():
+    """Locate the auto-testing checkout. Lanes that run this script from a
+    subdirectory checkout (security keeps its rustfs clone in rustfs-repo/)
+    still check auto-testing out at the workspace root, so ROOT alone is not
+    always the right base."""
+    candidates = [ROOT / "auto-testing"]
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        candidates.append(Path(workspace) / "auto-testing")
+    for candidate in candidates:
+        if (candidate / ".git").exists():
+            return candidate
+    return candidates[0]
+
+
 def record(chain, suite, report, output):
     require(suite in SUITES, "unknown suite")
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
     error = None
     try:
-        private_head = subprocess.check_output(["git", "-C", "auto-testing", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        private_head = subprocess.check_output(["git", "-C", str(auto_testing_dir()), "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         require(private_head == chain["testing_sha"], "suite used a different private script revision")
         require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
         data = report.read_bytes()

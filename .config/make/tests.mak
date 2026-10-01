@@ -24,6 +24,7 @@ TEST_THREADS ?= 1
 .PHONY: script-tests
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
+	trap 'status=$$?; printf "ERROR: script-tests failed (exit %s): %s\n" "$$status" "$$BASH_COMMAND" >&2; exit "$$status"' ERR
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_docker_runtime_timezone.sh
 	./scripts/test_entrypoint_credentials.sh
@@ -51,6 +52,7 @@ script-tests: ## Run shell script tests
 	./scripts/check_embedded_secrets.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_migration_gate_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
@@ -60,6 +62,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test

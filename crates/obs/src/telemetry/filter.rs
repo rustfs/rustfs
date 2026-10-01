@@ -89,6 +89,18 @@ fn rust_log_requests_verbose(rust_log: &str) -> bool {
     })
 }
 
+/// Returns `true` when the effective logging configuration selects a verbose
+/// (`debug`/`trace`) level.
+///
+/// Follows the same precedence as [`build_env_filter`]: `RUST_LOG` overrides
+/// `logger_level` when it is set.
+pub(super) fn effective_verbose_logging(logger_level: &str) -> bool {
+    match env::var("RUST_LOG").ok().filter(|value| !value.trim().is_empty()) {
+        Some(rust_log) => rust_log_requests_verbose(&rust_log),
+        None => is_verbose_level(logger_level),
+    }
+}
+
 fn should_suppress_noisy_crates(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
     if let Some(level) = default_level {
         return !is_verbose_level(level);

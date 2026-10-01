@@ -607,9 +607,16 @@ impl DefaultObjectUsecase {
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
-        if let Some(replacement_metadata) = replacement_metadata {
+        if let Some(mut replacement_metadata) = replacement_metadata {
+            // S3 defaults an object's content type to `binary/octet-stream` when none is
+            // supplied. REPLACE must apply that same default instead of leaving
+            // content-type unset.
+            if !replacement_metadata.contains_key("content-type") {
+                replacement_metadata.insert("content-type".to_string(), "binary/octet-stream".to_string());
+            }
+            let effective_content_type = replacement_metadata.get("content-type").cloned();
             user_defined = replacement_metadata;
-            src_info.content_type = content_type.clone();
+            src_info.content_type = effective_content_type;
             src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
             src_info.expires = expires_timestamp.map(OffsetDateTime::from);
         } else if metadata_directive.is_some() || website_redirect_location.is_some() {

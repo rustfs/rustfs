@@ -1481,6 +1481,7 @@ impl NodeService {
             after_handler_started,
         );
         let response_build_started = rustfs_io_metrics::put_stage_timer();
+        let response_encode_started = rustfs_io_metrics::put_stage_timer();
         let response = match result {
             Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
                 Ok((rename_data_resp, rename_data_resp_bin)) => Response::new(RenameDataResponse {
@@ -1503,6 +1504,10 @@ impl NodeService {
                 error: Some(err.into()),
             }),
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
+            response_encode_started,
+        );
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
             response_build_started,

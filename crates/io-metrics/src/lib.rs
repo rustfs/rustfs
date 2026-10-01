@@ -49,8 +49,9 @@
 #[macro_use]
 extern crate metrics;
 
+use std::collections::HashMap;
 use std::sync::{
-    Mutex,
+    LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -61,6 +62,25 @@ use std::sync::{
 /// Enabled only through an explicit runtime opt-in.
 static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static GET_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+static GET_STAGE_LOCAL_SUMMARY_ENABLED: AtomicBool = AtomicBool::new(false);
+static GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE: AtomicU64 = AtomicU64::new(64);
+static GET_STAGE_LOCAL_SUMMARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+type GetStageLocalSummaryKey = (&'static str, &'static str, &'static str, &'static str);
+
+/// Sampled local aggregate for one bounded GetObject stage label set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetStageLocalSummary {
+    pub path: &'static str,
+    pub stage: &'static str,
+    pub object_class: &'static str,
+    pub size_bucket: &'static str,
+    pub sampled_count: u64,
+    pub duration_nanoseconds: u64,
+}
+
+static GET_STAGE_LOCAL_SUMMARY: LazyLock<Mutex<HashMap<GetStageLocalSummaryKey, GetStageLocalSummary>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Global switch for all remaining (non GET/PUT-stage) metric emission in this
 /// crate's free `record_*` functions — I/O scheduler, bytes-pool, zero-copy,
@@ -85,6 +105,66 @@ pub fn set_put_stage_metrics_enabled(enabled: bool) {
 
 pub fn set_get_stage_metrics_enabled(enabled: bool) {
     GET_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_get_stage_local_summary_enabled(enabled: bool) {
+    GET_STAGE_LOCAL_SUMMARY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_get_stage_local_summary_sample_rate(sample_rate: u64) {
+    GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE.store(sample_rate.max(1), Ordering::Relaxed);
+}
+
+pub fn get_stage_local_summary_enabled() -> bool {
+    GET_STAGE_LOCAL_SUMMARY_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn get_stage_local_summary_sample_rate() -> u64 {
+    GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE.load(Ordering::Relaxed)
+}
+
+pub fn take_get_stage_local_summary() -> Vec<GetStageLocalSummary> {
+    let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
+        return Vec::new();
+    };
+    let mut rows = summary.drain().map(|(_, row)| row).collect::<Vec<_>>();
+    rows.sort_unstable_by_key(|row| (row.path, row.stage, row.object_class, row.size_bucket));
+    rows
+}
+
+fn record_get_stage_local_summary(
+    path: &'static str,
+    stage: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    duration_secs: f64,
+) {
+    let sample_rate = get_stage_local_summary_sample_rate();
+    if sample_rate > 1 && GET_STAGE_LOCAL_SUMMARY_SEQUENCE.fetch_add(1, Ordering::Relaxed) % sample_rate != 0 {
+        return;
+    }
+
+    let Ok(duration) = std::time::Duration::try_from_secs_f64(duration_secs) else {
+        return;
+    };
+    let Ok(duration_nanoseconds) = u64::try_from(duration.as_nanos()) else {
+        return;
+    };
+
+    let key = (path, stage, object_class, size_bucket);
+    let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
+        return;
+    };
+    let row = summary.entry(key).or_insert_with(|| GetStageLocalSummary {
+        path,
+        stage,
+        object_class,
+        size_bucket,
+        sampled_count: 0,
+        duration_nanoseconds: 0,
+    });
+    row.sampled_count = row.sampled_count.saturating_add(1);
+    row.duration_nanoseconds = row.duration_nanoseconds.saturating_add(duration_nanoseconds);
 }
 
 /// Enable or disable general (non GET/PUT-stage) metric emission.
@@ -135,7 +215,11 @@ pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD: &st
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN: &str =
     "put_object_commit_namespace_lock_held_post_object_info_to_return";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT: &str = "put_object_commit_task_wait";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_FUTURE_TOTAL: &str = "put_object_commit_future_total";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT: &str = "put_object_commit_operation_select_wait";
+pub const PUT_STAGE_PUT_OBJECT_OPERATION_AWAIT_TOTAL: &str = "put_object_operation_await_total";
+pub const PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT: &str = "put_object_operation_body_to_commit_submit";
+pub const PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN: &str = "put_object_operation_result_return";
 pub const PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY: &str = "put_object_operation_first_poll_delay";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY: &str =
     "put_object_commit_namespace_lock_acquired_to_commit_ready";
@@ -157,7 +241,9 @@ pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_QUOTA_MUTATION_FENCE_PREPARE: &str =
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE: &str = "put_object_commit_ready_context_prepare";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH: &str = "put_object_quota_begin_meta_bucket_fast_path";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK: &str = "put_object_quota_begin_metadata_lock";
+pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP: &str = "put_object_quota_begin_cache_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ: &str = "put_object_quota_begin_config_read";
+pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT: &str = "put_object_quota_begin_safe_no_quota_cache_hit";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK: &str = "put_object_quota_begin_lock_lost_check";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE: &str = "put_object_quota_begin_policy_evaluate";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF: &str = "put_object_quota_begin_capability_proof";
@@ -166,10 +252,100 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP: &str = "put_obje
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD: &str = "put_object_quota_begin_context_build";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER: &str = "put_object_commit_submit_to_closure_enter";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT: &str = "put_object_commit_closure_enter_to_first_await";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL: &str = "put_object_commit_closure_total";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME: &str = "put_object_commit_before_rename";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_AWAIT_TOTAL: &str = "put_object_commit_pre_rename_await_total";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_QUOTA_MARK_COMMIT_STARTED: &str =
+    "put_object_commit_pre_rename_quota_mark_commit_started";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_FIRST_FENCE_CHECK: &str = "put_object_commit_pre_rename_first_fence_check";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_RESTORE_VERIFY: &str = "put_object_commit_pre_rename_restore_verify";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TRANSACTION_FENCE_VERIFY: &str =
+    "put_object_commit_pre_rename_transaction_fence_verify";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SECOND_FENCE_CHECK: &str = "put_object_commit_pre_rename_second_fence_check";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SCANNER_SCOPE_CHECK: &str = "put_object_commit_pre_rename_scanner_scope_check";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TIER_FREE_VERSION_SOURCE_LOOKUP: &str =
+    "put_object_commit_pre_rename_tier_free_version_source_lookup";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_ASSIGN_RENAME_INDEXES: &str =
+    "put_object_commit_pre_rename_assign_rename_indexes";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_POST_AWAIT_TO_RENAME: &str = "put_object_commit_pre_rename_post_await_to_rename";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN: &str = "put_object_commit_after_rename_to_return";
 pub const PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT: &str = "set_disk_rename_quorum_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_SYNC_FULL_FANOUT_WAIT: &str = "set_disk_rename_sync_full_fanout_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_SPAWN_TO_QUORUM_WAIT: &str = "set_disk_rename_early_ack_spawn_to_quorum_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_ATTACH_TAIL_OWNER: &str = "set_disk_rename_early_ack_attach_tail_owner";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT: &str = "set_disk_rename_tail_after_quorum_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_ASYNC_WAIT: &str = "set_disk_rename_tail_async_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_GUARD_RELEASE_WAIT: &str = "set_disk_rename_tail_guard_release_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_FINALIZE: &str = "set_disk_rename_tail_finalize";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP: &str = "set_disk_rename_tail_cleanup";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT: &str = "set_disk_rename_tail_cleanup_submit";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP: &str = "set_disk_rename_tail_cleanup_counterfactual_skip";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_ENQUEUED: &str = "set_disk_rename_tail_cleanup_defer_enqueued";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_FALLBACK_SYNC: &str = "set_disk_rename_tail_cleanup_defer_fallback_sync";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_PUSH: &str = "set_disk_rename_tail_cleanup_defer_queue_push";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH: &str = "set_disk_rename_tail_cleanup_defer_queue_depth";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE: &str =
+    "set_disk_rename_tail_cleanup_defer_queue_depth_max_sample";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE: &str = "set_disk_rename_tail_cleanup_defer_oldest_age";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE_MAX_SAMPLE: &str =
+    "set_disk_rename_tail_cleanup_defer_oldest_age_max_sample";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_TARGETS: &str = "set_disk_rename_tail_cleanup_defer_targets";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_START_DELAY: &str = "set_disk_rename_tail_cleanup_defer_start_delay";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED_LAG: &str = "set_disk_rename_tail_cleanup_defer_completed_lag";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER: &str = "set_disk_rename_tail_cleanup_defer_hold_worker";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY: &str = "set_disk_rename_tail_cleanup_defer_worker_delay";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_PERMIT_WAIT: &str = "set_disk_rename_tail_cleanup_per_disk_permit_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_INFLIGHT: &str = "set_disk_rename_tail_cleanup_per_disk_inflight";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_FOREGROUND_YIELD: &str = "set_disk_rename_tail_cleanup_foreground_yield";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFERRED_FOREGROUND_ACTIVE: &str =
+    "set_disk_rename_tail_cleanup_deferred_foreground_active";
+pub const PUT_STAGE_SET_DISK_RENAME_FOREGROUND_ACTIVE: &str = "set_disk_rename_foreground_active";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW: &str = "set_disk_rename_tail_cleanup_defer_batch_window";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_SIZE: &str = "set_disk_rename_tail_cleanup_defer_batch_size";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BURST_BATCH_SIZE: &str =
+    "set_disk_rename_tail_cleanup_defer_burst_batch_size";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_ACTIVE: &str = "set_disk_rename_tail_cleanup_defer_worker_active";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_POLL_WAIT: &str =
+    "set_disk_rename_tail_cleanup_defer_worker_poll_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_IDLE_WAIT: &str =
+    "set_disk_rename_tail_cleanup_defer_worker_idle_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT: &str =
+    "set_disk_rename_tail_cleanup_defer_worker_job_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED: &str = "set_disk_rename_tail_cleanup_defer_completed";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DURATION: &str =
+    "set_disk_rename_tail_cleanup_defer_worker_duration";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT: &str = "set_disk_rename_tail_cleanup_target_receipt";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY: &str =
+    "set_disk_rename_tail_cleanup_target_commit_capacity";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT: &str = "set_disk_rename_tail_cleanup_target_report";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT: &str = "set_disk_rename_tail_cleanup_target_count";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET: &str = "set_disk_rename_tail_cleanup_zero_target";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE: &str = "set_disk_rename_tail_cleanup_tmp_delete";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP: &str =
+    "set_disk_rename_tail_cleanup_tmp_delete_counterfactual_skip";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP: &str =
+    "set_disk_rename_tail_cleanup_decommission_guard_drop";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH: &str = "set_disk_rename_tail_cleanup_lane_queue_depth";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH: &str = "set_disk_rename_tail_cleanup_lane_queue_push";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE: &str =
+    "set_disk_rename_tail_cleanup_lane_queue_depth_max_sample";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE: &str = "set_disk_rename_tail_cleanup_lane_oldest_age";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE_MAX_SAMPLE: &str =
+    "set_disk_rename_tail_cleanup_lane_oldest_age_max_sample";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BATCH_SIZE: &str = "set_disk_rename_tail_cleanup_lane_batch_size";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BURST_BATCH_SIZE: &str =
+    "set_disk_rename_tail_cleanup_lane_burst_batch_size";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_ACTIVE: &str = "set_disk_rename_tail_cleanup_lane_worker_active";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_POLL_WAIT: &str =
+    "set_disk_rename_tail_cleanup_lane_worker_poll_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_IDLE_WAIT: &str =
+    "set_disk_rename_tail_cleanup_lane_worker_idle_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_JOB_WAIT: &str = "set_disk_rename_tail_cleanup_lane_worker_job_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_SERVICE_TIME: &str = "set_disk_rename_tail_cleanup_lane_service_time";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_REQUEUE: &str = "set_disk_rename_tail_cleanup_lane_requeue";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_FOREGROUND_ACTIVE_HIT: &str =
+    "set_disk_rename_tail_cleanup_lane_foreground_active_hit";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_HEAL_SUBMIT: &str = "set_disk_rename_tail_heal_submit";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL: &str = "set_disk_rename_disk_wait_local";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_disk_wait_remote";
@@ -190,6 +366,9 @@ pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE: &str = "set_d
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_INTO_INNER: &str = "set_disk_rename_remote_client_into_inner";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_SUCCESS_CHECK: &str = "set_disk_rename_remote_client_success_check";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_DECODE: &str = "set_disk_rename_remote_client_decode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RESPONSE_PROCESS: &str = "set_disk_rename_remote_client_response_process";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RESPONSE_HEADERS: &str = "set_disk_rename_remote_client_response_headers";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE: &str = "set_disk_rename_remote_service_response_encode";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_TRIGGERED: &str =
     "put_object_commit_namespace_lock_held_quota_fence_release_triggered";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_SKIPPED: &str =
@@ -863,6 +1042,10 @@ pub fn record_get_object_io_state(
 /// Record GetObject phase duration for the current read path.
 #[inline(always)]
 pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str, duration_secs: f64) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary(path, stage, "", "", duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -878,6 +1061,10 @@ pub fn record_get_object_stage_duration_by_size(
     size_bucket: &'static str,
     duration_secs: f64,
 ) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary(path, stage, object_class, size_bucket, duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -1771,6 +1958,10 @@ pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
 /// Record metadata phase duration with early-stop state label.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration_with_early_stop(duration_secs: f64, early_stop_active: &'static str) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("legacy_duplex", "metadata", early_stop_active, "", duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -2217,6 +2408,14 @@ where
     record_put_object_stage_count(pending_count_stage, pending_count);
     record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
     output
+}
+
+#[inline(always)]
+pub fn record_put_object_quota_cache_decision(decision: &'static str, reason: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_s3_put_object_quota_cache_total", "decision" => decision, "reason" => reason).increment(1);
 }
 
 #[inline(always)]
@@ -3333,7 +3532,11 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
             PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT,
+            PUT_STAGE_PUT_OBJECT_COMMIT_FUTURE_TOTAL,
             PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT,
+            PUT_STAGE_PUT_OBJECT_OPERATION_AWAIT_TOTAL,
+            PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT,
+            PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN,
             PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY,
             PUT_STAGE_PUT_OBJECT_COMMIT_READY_PRECONDITION_AND_TIMESTAMP,
@@ -3350,7 +3553,9 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
+            PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ,
+            PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF,
@@ -3359,10 +3564,79 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD,
             PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
+            PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
+            PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_AWAIT_TOTAL,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_QUOTA_MARK_COMMIT_STARTED,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_FIRST_FENCE_CHECK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_RESTORE_VERIFY,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TRANSACTION_FENCE_VERIFY,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SECOND_FENCE_CHECK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SCANNER_SCOPE_CHECK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TIER_FREE_VERSION_SOURCE_LOOKUP,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_ASSIGN_RENAME_INDEXES,
+            PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_POST_AWAIT_TO_RENAME,
+            PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
             PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             PUT_STAGE_SET_DISK_RENAME_SYNC_FULL_FANOUT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_SPAWN_TO_QUORUM_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_ATTACH_TAIL_OWNER,
             PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT,
             PUT_STAGE_SET_DISK_RENAME_TAIL_ASYNC_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_GUARD_RELEASE_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_FINALIZE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_ENQUEUED,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_FALLBACK_SYNC,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_PUSH,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE_MAX_SAMPLE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_TARGETS,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_START_DELAY,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED_LAG,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_PERMIT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_INFLIGHT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_FOREGROUND_YIELD,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFERRED_FOREGROUND_ACTIVE,
+            PUT_STAGE_SET_DISK_RENAME_FOREGROUND_ACTIVE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_SIZE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BURST_BATCH_SIZE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_ACTIVE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_POLL_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_IDLE_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DURATION,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE_MAX_SAMPLE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BATCH_SIZE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BURST_BATCH_SIZE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_ACTIVE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_POLL_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_IDLE_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_JOB_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_SERVICE_TIME,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_REQUEUE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_FOREGROUND_ACTIVE_HIT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_HEAL_SUBMIT,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE,
@@ -3377,6 +3651,9 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_INTO_INNER,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_SUCCESS_CHECK,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_DECODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RESPONSE_PROCESS,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RESPONSE_HEADERS,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_TRIGGERED,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_SKIPPED,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_TRIGGERED,
@@ -3413,13 +3690,21 @@ mod tests {
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT
+                || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_FUTURE_TOTAL
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT
+                || *stage == PUT_STAGE_PUT_OBJECT_OPERATION_AWAIT_TOTAL
+                || *stage == PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT
+                || *stage == PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN
                 || *stage == PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY
                 || stage.starts_with("put_object_commit_ready_")
                 || stage.starts_with("put_object_quota_begin_")
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT
+                || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL
+                || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME
+                || stage.starts_with("put_object_commit_pre_rename_")
+                || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN
                 || stage.starts_with("put_object_commit_namespace_lock_held_"))
                 && !stage.contains('/')
                 && !stage.contains('{')
@@ -3451,9 +3736,12 @@ mod tests {
             set_put_stage_metrics_enabled(false);
         });
 
-        let recorded = snapshotter
-            .snapshot()
-            .into_vec()
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_object_stage_count"),
+            Some(u64::try_from(count_stages.len()).expect("count stage length fits u64")),
+        );
+        let recorded = rows
             .into_iter()
             .filter(|(composite, _, _, _)| {
                 composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
@@ -3469,25 +3757,6 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(recorded.len(), stages.len());
         assert!(stages.iter().all(|stage| recorded.contains(*stage)));
-
-        let recorded_counts = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter(|(composite, _, _, _)| {
-                composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_s3_put_object_stage_count"
-            })
-            .flat_map(|(composite, _, _, _)| {
-                composite
-                    .key()
-                    .labels()
-                    .filter(|label| label.key() == "stage")
-                    .map(|label| label.value().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<HashSet<_>>();
-        assert_eq!(recorded_counts.len(), count_stages.len());
-        assert!(count_stages.iter().all(|stage| recorded_counts.contains(*stage)));
     }
 
     #[test]
@@ -3565,6 +3834,63 @@ mod tests {
             ("budget".to_string(), PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS.to_string()),
             ("outcome".to_string(), PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED.to_string()),
         ])));
+    }
+
+    #[test]
+    fn put_stage_future_observer_preserves_outputs_and_counts_pending() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime for observer test");
+        let duration_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT;
+        let count_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT;
+        let pending_stage = PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY;
+
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            let output = runtime.block_on(observe_put_stage_future(
+                std::future::ready(42),
+                duration_stage,
+                count_stage,
+                pending_stage,
+            ));
+            assert_eq!(output, 42, "disabled observer must preserve the future output");
+        });
+        assert!(snapshotter.snapshot().into_vec().is_empty(), "disabled observer must emit no metrics");
+
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(true);
+            let mut pending = 2;
+            let future = std::future::poll_fn(|cx| {
+                if pending > 0 {
+                    pending -= 1;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(Err::<(), _>("original error"))
+                }
+            });
+            let output = runtime.block_on(observe_put_stage_future(future, duration_stage, count_stage, pending_stage));
+            set_put_stage_metrics_enabled(false);
+            assert_eq!(output, Err("original error"), "enabled observer must preserve errors");
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_s3_put_object_stage_count"), Some(2));
+        let count_labels = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_s3_put_object_stage_count")
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(count_labels, vec![count_stage.to_string()]);
+        let durations = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_s3_put_object_stage_duration_ms")
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<HashSet<_>>();
+        assert_eq!(durations, HashSet::from([duration_stage.to_string(), pending_stage.to_string()]));
     }
 
     #[test]

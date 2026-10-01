@@ -244,12 +244,15 @@ impl StdError for ConditionalFileNotCommittedError {
     }
 }
 
-fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
+fn classify_internode_disk_error(error: &InternodeHttpError) -> Option<DiskError> {
     if error.is_remote_file_not_found() {
         return Some(DiskError::FileNotFound);
     }
     if error.is_remote_volume_not_found() {
         return Some(DiskError::VolumeNotFound);
+    }
+    if error.is_remote_file_corrupt() {
+        return Some(DiskError::FileCorrupt);
     }
     None
 }
@@ -425,6 +428,19 @@ impl DiskError {
         }
     }
 
+    /// Whether an internode RPC was cancelled, without classifying the peer as offline.
+    pub fn io_error_is_rpc_cancelled(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RpcStatusError>())
+            .is_some_and(|error| error.status().code() == tonic::Code::Cancelled)
+    }
+
+    pub(crate) fn clone_rpc_status_io_error(error: &io::Error) -> Option<io::Error> {
+        let status = error.get_ref()?.downcast_ref::<RpcStatusError>()?;
+        Some(io::Error::new(error.kind(), RpcStatusError(status.0.clone())))
+    }
+
     pub fn internode_http_error_kind(&self) -> Option<InternodeHttpErrorKind> {
         match self {
             DiskError::Io(io_error) => io_error
@@ -526,13 +542,10 @@ fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorK
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
-            if error.is_remote_file_not_found() {
-                return DiskError::FileNotFound;
-            }
-            if error.is_remote_volume_not_found() {
-                return DiskError::VolumeNotFound;
-            }
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            && let Some(classified) = classify_internode_disk_error(error)
+        {
+            return classified;
         }
         let e = match e.downcast::<TerminalReadError>() {
             Ok(terminal_error) => {
@@ -541,7 +554,7 @@ impl From<std::io::Error> for DiskError {
                     && let Some(internode_error) = io_error
                         .get_ref()
                         .and_then(|source| source.downcast_ref::<InternodeHttpError>())
-                    && let Some(classified) = classify_internode_missing_error(internode_error)
+                    && let Some(classified) = classify_internode_disk_error(internode_error)
                 {
                     return classified;
                 }
@@ -701,8 +714,8 @@ impl Clone for DiskError {
                 DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
             ),
             DiskError::Io(io_error) => {
-                if let Some(status) = io_error.get_ref().and_then(|source| source.downcast_ref::<RpcStatusError>()) {
-                    return DiskError::Io(io::Error::new(io_error.kind(), RpcStatusError(status.0.clone())));
+                if let Some(error) = Self::clone_rpc_status_io_error(io_error) {
+                    return DiskError::Io(error);
                 }
                 DiskError::Io(
                     Self::clone_dangling_delete_grace(io_error)
@@ -901,6 +914,25 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn rpc_status_survives_disk_and_storage_clones() {
+        for code in [tonic::Code::Cancelled, tonic::Code::PermissionDenied] {
+            let status = tonic::Status::new(code, "operation was canceled");
+            let original = DiskError::Io(io::Error::new(io::ErrorKind::Interrupted, RpcStatusError::from(status)));
+            let display = original.to_string();
+            let disk = original.clone();
+            let storage = crate::error::StorageError::from(disk);
+            let cloned = storage.clone();
+            for error in [io::Error::from(original), io::Error::from(storage), io::Error::from(cloned)] {
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                let status = error.get_ref().unwrap().downcast_ref::<RpcStatusError>().unwrap().status();
+                assert_eq!(status.code(), code);
+                assert_eq!(status.message(), "operation was canceled");
+                assert_eq!(DiskError::from(error).to_string(), display);
+            }
+        }
+    }
+
+    #[test]
     fn retired_marker_deferral_survives_disk_and_storage_clones() {
         let original = DiskError::retired_marker_deferred("missing retirement record");
         let disk = original.clone();
@@ -963,6 +995,7 @@ mod tests {
         for (remote_error, expected) in [
             (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
             (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+            (rustfs_rio::new_test_remote_file_corrupt_http_io_error(), DiskError::FileCorrupt),
         ] {
             let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
             assert_eq!(DiskError::from(wrapped), expected);
@@ -1533,25 +1566,23 @@ mod tests {
     }
 
     #[test]
-    fn test_internode_missing_errors_preserve_disk_error_types() {
+    fn test_internode_disk_errors_preserve_disk_error_types() {
         let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
         let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let file_corrupt = DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error());
         let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
             rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
         ));
 
         assert_eq!(file_missing, DiskError::FileNotFound);
         assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert_eq!(file_corrupt, DiskError::FileCorrupt);
         assert!(matches!(unmarked_server_error, DiskError::Io(_)));
-        for missing in [file_missing, volume_missing] {
-            assert_eq!(missing.clone(), missing);
+        for error in [file_missing, volume_missing, file_corrupt] {
+            assert_eq!(error.clone(), error);
             assert_eq!(
-                crate::disk::error_reduce::reduce_write_quorum_errs(
-                    &[Some(missing.clone()), Some(missing.clone()), None],
-                    &[],
-                    2
-                ),
-                Some(missing)
+                crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error.clone()), Some(error.clone()), None], &[], 2),
+                Some(error)
             );
         }
     }

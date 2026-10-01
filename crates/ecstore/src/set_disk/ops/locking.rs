@@ -341,14 +341,17 @@ impl SetDisks {
     pub async fn renew_disk(&self, ep: &Endpoint) {
         debug!("renew_disk: start {:?}", ep);
 
-        let previous_health = {
+        let previous_disk = {
             let disks = self.disks.read().await;
             disks
                 .iter()
                 .filter_map(|disk| disk.as_ref())
                 .find(|disk| disk.endpoint() == *ep)
-                .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect())
+                .cloned()
         };
+        let previous_health = previous_disk
+            .as_ref()
+            .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
 
         let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
             Ok(res) => res,
@@ -406,6 +409,25 @@ impl SetDisks {
         }
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
+
+        if !new_disk.is_local() {
+            let mut disks = self.disks.write().await;
+            let slot = &mut disks[disk_idx];
+            let unchanged = match (slot.as_ref(), previous_disk.as_ref()) {
+                (None, None) => true,
+                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                _ => false,
+            };
+            // A GET probe or another reconnect may have filled this slot while
+            // format I/O was pending. Do not replace its handle or start a
+            // second health monitor for an unpublished handle.
+            if unchanged {
+                new_disk.enable_health_check();
+                *slot = Some(new_disk);
+            }
+            return;
+        }
+
         new_disk.enable_health_check();
 
         if new_disk.is_local() {

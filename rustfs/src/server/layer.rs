@@ -2603,7 +2603,7 @@ mod tests {
         assert!(futures::poll!(cancelled.as_mut()).is_pending());
         drop(cancelled);
         for path in [
-            "/rustfs/admin/v3/metrics",
+            "/rustfs/admin/v3/realtime",
             "/minio/admin/v3/storageinfo",
             CONSOLE_PREFIX,
             "/rustfs/rpc/test",

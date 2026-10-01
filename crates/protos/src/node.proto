@@ -774,6 +774,23 @@ message LoadBucketMetadataResponse {
   optional ControlPlaneErrorCode error_code = 3;
 }
 
+message ObjectMetadataCacheMutationRequest {
+  uint32 protocol_version = 1;
+  uint32 phase = 2;
+  bytes mutation_id = 3;
+  string bucket = 4;
+  string object = 5;
+  uint32 scope = 6;
+  bool cache_enabled = 7;
+}
+
+message ObjectMetadataCacheMutationResponse {
+  bool success = 1;
+  optional string error_info = 2;
+  bytes response_proof = 3;
+  bool cache_enabled = 4;
+}
+
 message DeleteBucketMetadataRequest {
   string bucket = 1;
 }
@@ -1282,6 +1299,7 @@ service NodeService {
   rpc GetSRMetrics(GetSRMetricsDataRequest) returns (GetSRMetricsDataResponse) {}; // auth-policy: unimplemented
   rpc GetAllBucketStats(GetAllBucketStatsRequest) returns (GetAllBucketStatsResponse) {}; // auth-policy: unimplemented
   rpc LoadBucketMetadata(LoadBucketMetadataRequest) returns (LoadBucketMetadataResponse) {}; // auth-policy: body-bound
+  rpc MutateObjectMetadataCache(ObjectMetadataCacheMutationRequest) returns (ObjectMetadataCacheMutationResponse) {}; // auth-policy: body-bound
   rpc DeleteBucketMetadata(DeleteBucketMetadataRequest) returns (DeleteBucketMetadataResponse) {}; // auth-policy: body-bound
   rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {}; // auth-policy: body-bound
   rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse) {}; // auth-policy: body-bound

@@ -1371,14 +1371,18 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
 
     let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
     let mut cache = cache_with_raw_cursor(invalid);
     cache.info.scan_identity = Some(identity);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_cursor.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -1410,13 +1414,17 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
 
     let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
     cache.info.scan_raw_enumeration_page_index = Some(invalid);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 3, 3, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_page_index.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -2078,7 +2086,7 @@ fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
     assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
 
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 8, 2, source, TEST_PLAN_DIGEST, identity),
+        cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
     assert_eq!(cache.info.leader_epoch, 2);

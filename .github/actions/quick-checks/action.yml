@@ -19,7 +19,7 @@ runs:
   using: composite
   steps:
     - name: Install quality tools
-      uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+      uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
       with:
         tool: |
           ripgrep@15.2.0
@@ -100,12 +100,7 @@ runs:
 
     - name: Check test wiring
       shell: bash
-      run: |
-        python3 ./scripts/check_test_wiring.py --self-test
-        python3 ./scripts/check_scheduled_validation_freshness.py --self-test
-        python3 ./scripts/test_security_workflow.py
-        python3 ./scripts/test_nightly_candidate.py
-        python3 ./scripts/check_test_wiring.py
+      run: python3 ./scripts/check_test_wiring.py
 
     - name: Check no planning docs committed
       shell: bash

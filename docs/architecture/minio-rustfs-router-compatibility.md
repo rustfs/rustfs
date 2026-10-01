@@ -41,7 +41,7 @@ Every route asserted in `rustfs/src/admin/route_registration_test.rs` is registe
 | Pools decommission / cancel / clear | 部分兼容 | `rustfs/src/admin/handlers/pools.rs` returns `NotImplemented` when endpoints are not initialized (single-pool or uninitialized clusters). |
 | `/v3/top/drives`, `/v3/top/net` | 缺失 | Only `/v3/top/locks` is registered (`rustfs/src/admin/handlers/diagnostics.rs`). |
 | Bucket / site replication per-object diff | 缺失 | `/v3/replicationmetrics` and site-replication status exist; no diff endpoint. |
-| MRF (most-recent-failures) replication metrics breakdown | 缺失 | Only the generic `/v3/metrics` stream and replication metrics wire (`rustfs/src/admin/replication_metrics_wire.rs`). |
+| MRF (most-recent-failures) replication metrics breakdown | 缺失 | Only the generic `/v3/realtime` stream and replication metrics wire (`rustfs/src/admin/replication_metrics_wire.rs`). |
 
 Formerly-missing families that are now registered and therefore not exceptions: `/v3/healthinfo`, `/v3/obdinfo`, `/v3/force-unlock`, `/v3/top/locks`, `/v3/speedtest*`, `/v3/log`, `/v3/trace`, `/v3/profile`, `/v3/profiling/*`, `/v3/idp/{ldap|openid}/*`, `/v3/idp-config/*`.
 

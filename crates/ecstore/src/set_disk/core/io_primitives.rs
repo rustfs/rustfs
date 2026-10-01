@@ -382,7 +382,7 @@ async fn flush_read_version_coalescer_pending(
 fn map_batch_read_version_responses(
     expected_items: &[ExpectedBatchReadVersionItem],
     responses: Vec<BatchReadVersionResp>,
-) -> Vec<crate::disk::error::Result<FileInfo>> {
+) -> Vec<disk::error::Result<FileInfo>> {
     let mut results = (0..expected_items.len())
         .map(|_| Err(DiskError::other("coalesced read_version response missing")))
         .collect::<Vec<_>>();
@@ -1163,13 +1163,10 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) set_index: usize,
     pub(in crate::set_disk) part_number: Option<usize>,
     pub(in crate::set_disk) reason: &'static str,
-    /// Durable MRF journal intent to file alongside the read-repair request
-    /// (backlog#1894 axis A): the intent kind plus its native `Uuid`
-    /// version id (the submission's string form stays display-only). Bound
-    /// to the reservation — the intent is only delivered when this sighting
-    /// wins the dedup TTL, so a burst of reads failing on the same object
-    /// books exactly one journal record instead of one per retry. `None`
-    /// keeps the historical no-intent behavior.
+    /// Best-effort ingress for the durable MRF consumer. Its identity coalescer
+    /// is independent of the heal reservation: an earlier metadata repair must
+    /// not suppress newly observed payload damage, and rejected ingress must
+    /// remain retryable. Channel admission does not prove checkpoint commit.
     pub(in crate::set_disk) mrf_intent: Option<(rustfs_common::mrf_channel::MrfKind, Option<uuid::Uuid>)>,
 }
 
@@ -1224,6 +1221,27 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         mrf_intent,
     } = submission;
 
+    if let Some((kind, version_uuid)) = mrf_intent
+        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
+    {
+        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+        let ingress = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "mrf_ingress",
+            mrf_kind = ?kind,
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            result = ?ingress,
+            "Read-repair MRF ingress result"
+        );
+    }
+
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
@@ -1232,15 +1250,6 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         );
         return;
     };
-
-    // Reservation won: this sighting owns the repair records for the object,
-    // including the durable journal intent when the caller asked for one.
-    if let Some((kind, version_uuid)) = mrf_intent
-        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
-    {
-        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
-        let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
-    }
 
     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -2481,15 +2490,15 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let bucket = bucket.to_string();
-        let part_meta_paths = part_meta_paths.to_vec();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let part_meta_paths: Arc<[String]> = Arc::from(part_meta_paths);
 
         let tasks: Vec<_> = disks
             .iter()
             .map(|disk| {
                 let disk = disk.clone();
-                let bucket = bucket.clone();
-                let part_meta_paths = part_meta_paths.clone();
+                let bucket = Arc::clone(&bucket);
+                let part_meta_paths = Arc::clone(&part_meta_paths);
 
                 async move {
                     if let Some(disk) = disk {
@@ -2875,7 +2884,16 @@ impl SetDisks {
             let result = if let Some(deadline) = single_pending_hedge_deadline.take() {
                 tokio::select! {
                     result = join_set.join_next() => result,
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = async {
+                        tokio::time::sleep_until(deadline).await;
+                        #[cfg(test)]
+                        rename_fanout_barrier::checkpoint(
+                            object.as_ref(),
+                            0,
+                            rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER,
+                        )
+                        .await;
+                    } => {
                         if bounded_fanout
                             && !force_full_wait
                             && join_set.len() == 1
@@ -3609,6 +3627,9 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) data_dir: Option<Uuid>,
     pub(in crate::set_disk) cleanup_disks: Vec<Option<DiskStore>>,
     pub(in crate::set_disk) old_current_size: Option<OldCurrentSize>,
+    pub(in crate::set_disk) old_current_source_checked: bool,
+    pub(in crate::set_disk) old_current_source_all_successful_checked: bool,
+    pub(in crate::set_disk) old_current_source: Option<FileInfo>,
     pub(in crate::set_disk) committed_file_info: FileInfo,
     pub(in crate::set_disk) tail_drain: Option<tokio::task::JoinHandle<Option<RenameTailOutcome>>>,
 }
@@ -3622,6 +3643,500 @@ pub(in crate::set_disk) struct RenameTailCleanup {
 pub(in crate::set_disk) struct RenameTailOutcome {
     pub(in crate::set_disk) convergence: RenameConvergence,
     pub(in crate::set_disk) cleanup: Vec<RenameTailCleanup>,
+}
+
+const RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP";
+const RENAME_TAIL_CLEANUP_DEFER_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ENABLE";
+const RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY";
+const RENAME_TAIL_CLEANUP_DEFER_WORKERS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS";
+const RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY_MS";
+const RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW_MS";
+const RENAME_TAIL_CLEANUP_DEFER_BATCH_MAX_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_BATCH_MAX";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_ENABLE_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_ENABLE";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_MIN_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_MIN";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_LOW_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_LOW";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_HIGH_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_HIGH";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_LOW_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_LOW";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_HIGH_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_HIGH";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_LOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_LOW_MS";
+const RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_HIGH_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_HIGH_MS";
+const RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER";
+const RENAME_FOREGROUND_ACTIVE_LANES_ENV: &str = "RUSTFS_PUT_RENAME_FOREGROUND_ACTIVE_LANES";
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_WORKERS: usize = 2;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_BATCH_MAX: usize = 1;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_LOW: usize = 128;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_HIGH: usize = 512;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_LOW_MS: u64 = 500;
+const DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_HIGH_MS: u64 = 2_000;
+const DEFAULT_RENAME_FOREGROUND_ACTIVE_LANES: usize = 1024;
+
+fn rename_tail_cleanup_counterfactual_skip_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_defer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_DEFER_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_defer_queue_capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY_ENV,
+            DEFAULT_RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY,
+        )
+        .max(1)
+    })
+}
+
+fn rename_tail_cleanup_defer_workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_DEFER_WORKERS_ENV, DEFAULT_RENAME_TAIL_CLEANUP_DEFER_WORKERS).max(1)
+    })
+}
+
+fn rename_tail_cleanup_defer_worker_delay() -> Duration {
+    static DELAY: OnceLock<Duration> = OnceLock::new();
+    *DELAY.get_or_init(|| Duration::from_millis(rustfs_utils::get_env_u64(RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY_MS_ENV, 0)))
+}
+
+fn rename_tail_cleanup_defer_batch_window() -> Duration {
+    static WINDOW: OnceLock<Duration> = OnceLock::new();
+    *WINDOW.get_or_init(|| Duration::from_millis(rustfs_utils::get_env_u64(RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW_MS_ENV, 0)))
+}
+
+fn rename_tail_cleanup_defer_batch_max() -> usize {
+    static BATCH_MAX: OnceLock<usize> = OnceLock::new();
+    *BATCH_MAX.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_DEFER_BATCH_MAX_ENV, DEFAULT_RENAME_TAIL_CLEANUP_DEFER_BATCH_MAX).max(1)
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_batch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_ENABLE_ENV)
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_batch_min() -> usize {
+    static BATCH_MIN: OnceLock<usize> = OnceLock::new();
+    *BATCH_MIN.get_or_init(|| rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_MIN_ENV, 1).max(1))
+}
+
+fn rename_tail_cleanup_defer_adaptive_batch_low() -> usize {
+    static BATCH_LOW: OnceLock<usize> = OnceLock::new();
+    *BATCH_LOW.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_LOW_ENV, rename_tail_cleanup_defer_batch_max())
+            .max(1)
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_batch_high() -> usize {
+    static BATCH_HIGH: OnceLock<usize> = OnceLock::new();
+    *BATCH_HIGH.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_BATCH_HIGH_ENV,
+            rename_tail_cleanup_defer_adaptive_batch_low().max(rename_tail_cleanup_defer_batch_max()),
+        )
+        .max(1)
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_queue_low() -> usize {
+    static QUEUE_LOW: OnceLock<usize> = OnceLock::new();
+    *QUEUE_LOW.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_LOW_ENV,
+            DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_LOW,
+        )
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_queue_high() -> usize {
+    static QUEUE_HIGH: OnceLock<usize> = OnceLock::new();
+    *QUEUE_HIGH.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_HIGH_ENV,
+            DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_QUEUE_HIGH,
+        )
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_age_low() -> Duration {
+    static AGE_LOW: OnceLock<Duration> = OnceLock::new();
+    *AGE_LOW.get_or_init(|| {
+        Duration::from_millis(rustfs_utils::get_env_u64(
+            RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_LOW_MS_ENV,
+            DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_LOW_MS,
+        ))
+    })
+}
+
+fn rename_tail_cleanup_defer_adaptive_age_high() -> Duration {
+    static AGE_HIGH: OnceLock<Duration> = OnceLock::new();
+    *AGE_HIGH.get_or_init(|| {
+        Duration::from_millis(rustfs_utils::get_env_u64(
+            RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_HIGH_MS_ENV,
+            DEFAULT_RENAME_TAIL_CLEANUP_DEFER_ADAPTIVE_AGE_HIGH_MS,
+        ))
+    })
+}
+
+fn rename_tail_cleanup_defer_batch_target(queued_depth: usize, oldest_age: Option<Duration>) -> usize {
+    let fixed = rename_tail_cleanup_defer_batch_max();
+    if !rename_tail_cleanup_defer_adaptive_batch_enabled() {
+        return fixed;
+    }
+
+    let min = rename_tail_cleanup_defer_adaptive_batch_min();
+    let low = rename_tail_cleanup_defer_adaptive_batch_low().max(min);
+    let high = rename_tail_cleanup_defer_adaptive_batch_high().max(low);
+    let queue_low = rename_tail_cleanup_defer_adaptive_queue_low();
+    let queue_high = rename_tail_cleanup_defer_adaptive_queue_high().max(queue_low);
+    let age_low = rename_tail_cleanup_defer_adaptive_age_low();
+    let age_high = rename_tail_cleanup_defer_adaptive_age_high().max(age_low);
+
+    let age = oldest_age.unwrap_or_default();
+    if queued_depth >= queue_high || age >= age_high {
+        high
+    } else if queued_depth >= queue_low || age >= age_low {
+        low
+    } else {
+        min
+    }
+}
+
+fn rename_tail_cleanup_defer_hold_worker_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_foreground_active_lanes() -> &'static Vec<AtomicUsize> {
+    static LANES: OnceLock<Vec<AtomicUsize>> = OnceLock::new();
+    LANES.get_or_init(|| {
+        let lanes =
+            rustfs_utils::get_env_usize(RENAME_FOREGROUND_ACTIVE_LANES_ENV, DEFAULT_RENAME_FOREGROUND_ACTIVE_LANES).max(1);
+        (0..lanes).map(|_| AtomicUsize::new(0)).collect()
+    })
+}
+
+pub(in crate::set_disk) fn rename_foreground_active_count(disk_index: usize) -> usize {
+    let lanes = rename_foreground_active_lanes();
+    lanes[disk_index % lanes.len()].load(Ordering::Relaxed)
+}
+
+struct RenameForegroundActiveGuard {
+    disk_index: usize,
+}
+
+impl Drop for RenameForegroundActiveGuard {
+    fn drop(&mut self) {
+        let lanes = rename_foreground_active_lanes();
+        lanes[self.disk_index % lanes.len()].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn rename_foreground_active_guard(disk_index: usize) -> RenameForegroundActiveGuard {
+    let lanes = rename_foreground_active_lanes();
+    let active = lanes[disk_index % lanes.len()].fetch_add(1, Ordering::Relaxed) + 1;
+    rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FOREGROUND_ACTIVE,
+        active as f64,
+    );
+    RenameForegroundActiveGuard { disk_index }
+}
+
+type RenameTailCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct RenameTailCleanupJob {
+    enqueued_at: Instant,
+    targets: usize,
+    future: RenameTailCleanupFuture,
+}
+
+struct RenameTailCleanupQueue {
+    sender: tokio::sync::mpsc::Sender<RenameTailCleanupJob>,
+    queued: Arc<AtomicUsize>,
+    oldest_enqueued_at: Arc<tokio::sync::Mutex<Option<Instant>>>,
+}
+
+async fn run_rename_tail_cleanup_job(job: RenameTailCleanupJob) {
+    rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_START_DELAY,
+        job.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+    );
+    rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_TARGETS,
+        job.targets as f64,
+    );
+    let worker_delay = rename_tail_cleanup_defer_worker_delay();
+    if !worker_delay.is_zero() {
+        let delay_started = rustfs_io_metrics::put_stage_timer();
+        tokio::time::sleep(worker_delay).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DELAY,
+            delay_started,
+        );
+    }
+    let cleanup_started = rustfs_io_metrics::put_stage_timer();
+    job.future.await;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DURATION,
+        cleanup_started,
+    );
+    rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED,
+        1.0,
+    );
+    rustfs_io_metrics::record_put_object_stage_duration(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED_LAG,
+        job.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+impl RenameTailCleanupQueue {
+    fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<RenameTailCleanupJob>(rename_tail_cleanup_defer_queue_capacity());
+        let queued = Arc::new(AtomicUsize::new(0));
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let oldest_enqueued_at = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        if !rename_tail_cleanup_defer_hold_worker_enabled() {
+            for _ in 0..rename_tail_cleanup_defer_workers() {
+                let receiver = Arc::clone(&receiver);
+                let queued = Arc::clone(&queued);
+                let active_workers = Arc::clone(&active_workers);
+                let oldest_enqueued_at = Arc::clone(&oldest_enqueued_at);
+                tokio::spawn(async move {
+                    loop {
+                        let queued_before_poll = queued.load(Ordering::Relaxed);
+                        let worker_poll_started = rustfs_io_metrics::put_stage_timer();
+                        let Some(job) = receiver.lock().await.recv().await else {
+                            return;
+                        };
+                        if queued_before_poll == 0 {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_IDLE_WAIT,
+                                worker_poll_started,
+                            );
+                        } else {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_POLL_WAIT,
+                                worker_poll_started,
+                            );
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT,
+                                worker_poll_started,
+                            );
+                        }
+                        let mut batch = vec![job];
+                        let batch_window = rename_tail_cleanup_defer_batch_window();
+                        let queued_snapshot = queued.load(Ordering::Relaxed);
+                        let oldest_snapshot = *oldest_enqueued_at.lock().await;
+                        let batch_max = rename_tail_cleanup_defer_batch_target(
+                            queued_snapshot,
+                            oldest_snapshot.map(|oldest| oldest.elapsed()),
+                        );
+                        if batch_max > 1 && !batch_window.is_zero() {
+                            let window_started = rustfs_io_metrics::put_stage_timer();
+                            tokio::time::sleep(batch_window).await;
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_WINDOW,
+                                window_started,
+                            );
+                        }
+                        while batch.len() < batch_max {
+                            let next = {
+                                let mut locked = receiver.lock().await;
+                                locked.try_recv().ok()
+                            };
+                            let Some(next) = next else {
+                                break;
+                            };
+                            batch.push(next);
+                        }
+                        let queued_after_dequeue = queued.fetch_sub(batch.len(), Ordering::Relaxed).saturating_sub(batch.len());
+                        if queued_after_dequeue == 0 {
+                            *oldest_enqueued_at.lock().await = None;
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH,
+                            queued_after_dequeue as f64,
+                        );
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE,
+                            queued_after_dequeue as f64,
+                        );
+                        if let Some(oldest) = *oldest_enqueued_at.lock().await {
+                            let oldest_age_ms = oldest.elapsed().as_secs_f64() * 1000.0;
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE,
+                                oldest_age_ms,
+                            );
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE_MAX_SAMPLE,
+                                oldest_age_ms,
+                            );
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BATCH_SIZE,
+                            batch.len() as f64,
+                        );
+                        if batch.len() > 1 {
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_BURST_BATCH_SIZE,
+                                batch.len() as f64,
+                            );
+                        }
+                        let active = active_workers.fetch_add(1, Ordering::Relaxed) + 1;
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_ACTIVE,
+                            active as f64,
+                        );
+                        for job in batch {
+                            run_rename_tail_cleanup_job(job).await;
+                        }
+                        active_workers.fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        }
+        Self {
+            sender,
+            queued,
+            oldest_enqueued_at,
+        }
+    }
+
+    async fn try_enqueue(&self, job: RenameTailCleanupJob) -> std::result::Result<(), RenameTailCleanupJob> {
+        let queue_push_started = rustfs_io_metrics::put_stage_timer();
+        {
+            let mut oldest = self.oldest_enqueued_at.lock().await;
+            if oldest.is_none() {
+                *oldest = Some(job.enqueued_at);
+            }
+        }
+        let queued_after_enqueue = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        if rename_tail_cleanup_defer_hold_worker_enabled() {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_ENQUEUED,
+                1.0,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER,
+                1.0,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH,
+                queued_after_enqueue as f64,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE,
+                queued_after_enqueue as f64,
+            );
+            if let Some(oldest) = *self.oldest_enqueued_at.lock().await {
+                let oldest_age_ms = oldest.elapsed().as_secs_f64() * 1000.0;
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE,
+                    oldest_age_ms,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE_MAX_SAMPLE,
+                    oldest_age_ms,
+                );
+            }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_PUSH,
+                queue_push_started,
+            );
+            return Ok(());
+        }
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_ENQUEUED,
+                    1.0,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH,
+                    queued_after_enqueue as f64,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE,
+                    queued_after_enqueue as f64,
+                );
+                if let Some(oldest) = *self.oldest_enqueued_at.lock().await {
+                    let oldest_age_ms = oldest.elapsed().as_secs_f64() * 1000.0;
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE,
+                        oldest_age_ms,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_OLDEST_AGE_MAX_SAMPLE,
+                        oldest_age_ms,
+                    );
+                }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_PUSH,
+                    queue_push_started,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                if self.queued.load(Ordering::Relaxed) == 0 {
+                    *self.oldest_enqueued_at.lock().await = None;
+                }
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_FALLBACK_SYNC,
+                    1.0,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH,
+                    self.queued.load(Ordering::Relaxed) as f64,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_DEPTH_MAX_SAMPLE,
+                    self.queued.load(Ordering::Relaxed) as f64,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_QUEUE_PUSH,
+                    queue_push_started,
+                );
+                Err(err.into_inner())
+            }
+        }
+    }
+}
+
+fn rename_tail_cleanup_queue() -> &'static RenameTailCleanupQueue {
+    static QUEUE: OnceLock<RenameTailCleanupQueue> = OnceLock::new();
+    QUEUE.get_or_init(RenameTailCleanupQueue::new)
 }
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
@@ -3718,10 +4233,9 @@ async fn inspect_incomplete_rename_rollback(
     request.recreate_missing = Some(false);
     request.update_parity = Some(false);
     request.recursive = Some(false);
-    match tokio::time::timeout(Duration::from_secs(1), submitter(request)).await {
-        Ok(result) => result,
-        Err(_) => ReadRepairAdmissionOutcome::Failed("rollback inspection admission timed out".to_string()),
-    }
+    tokio::time::timeout(Duration::from_secs(1), submitter(request))
+        .await
+        .unwrap_or_else(|_| ReadRepairAdmissionOutcome::Failed("rollback inspection admission timed out".to_string()))
 }
 
 fn rename_rollback_task_outcome(
@@ -4008,18 +4522,20 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     SubmitFuture,
 >(
     tail_drain: tokio::task::JoinHandle<Option<RenameTailOutcome>>,
-    guard_release: tokio::sync::oneshot::Receiver<bool>,
+    guard_release: oneshot::Receiver<bool>,
     guards: Guards,
     request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     finalize: Finalize,
     cleanup: Cleanup,
     submit: Submit,
 ) where
-    Guards: Send,
+    Guards: Send + 'static,
     Finalize: FnOnce() -> FinalizeFuture + Send,
     FinalizeFuture: Future<Output = ()> + Send,
     Cleanup: FnOnce(Guards, Vec<RenameTailCleanup>) -> CleanupFuture + Send,
     CleanupFuture: Future<Output = ()> + Send,
+    Cleanup: 'static,
+    CleanupFuture: 'static,
     Submit: FnOnce(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
     SubmitFuture: Future<Output = ()> + Send,
 {
@@ -4059,13 +4575,73 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     // A dropped sender means the request continuation was cancelled. Cleanup
     // must still run; only the explicit `false` used by the hard-crash harness
     // suppresses all in-process continuation work.
+    let guard_release_wait_started = rustfs_io_metrics::put_stage_timer();
     if matches!(guard_release.await, Ok(false)) {
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_GUARD_RELEASE_WAIT,
+            guard_release_wait_started,
+        );
         drop(guards);
         return;
     }
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_GUARD_RELEASE_WAIT,
+        guard_release_wait_started,
+    );
+    let finalize_started = rustfs_io_metrics::put_stage_timer();
     finalize().await;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_FINALIZE,
+        finalize_started,
+    );
     if tail_complete {
-        cleanup(guards, tail_cleanup).await;
+        let cleanup_submit_started = rustfs_io_metrics::put_stage_timer();
+        if rename_tail_cleanup_counterfactual_skip_enabled() {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP,
+                1.0,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
+                cleanup_submit_started,
+            );
+            drop(guards);
+        } else if rename_tail_cleanup_defer_enabled() {
+            let targets = tail_cleanup.len();
+            let job = RenameTailCleanupJob {
+                enqueued_at: Instant::now(),
+                targets,
+                future: Box::pin(cleanup(guards, tail_cleanup)),
+            };
+            if let Err(job) = rename_tail_cleanup_queue().try_enqueue(job).await {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
+                    cleanup_submit_started,
+                );
+                let cleanup_started = rustfs_io_metrics::put_stage_timer();
+                job.future.await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP,
+                    cleanup_started,
+                );
+            } else {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
+                    cleanup_submit_started,
+                );
+            }
+        } else {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
+                cleanup_submit_started,
+            );
+            let cleanup_started = rustfs_io_metrics::put_stage_timer();
+            cleanup(guards, tail_cleanup).await;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP,
+                cleanup_started,
+            );
+        }
     } else {
         // The outer coordinator may fail while a disk rename still owns the
         // staging source. Preserve it for later healing/GC instead of racing
@@ -4073,7 +4649,12 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
         drop(guards);
     }
     if needs_heal {
+        let heal_submit_started = rustfs_io_metrics::put_stage_timer();
         submit(request).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_HEAL_SUBMIT,
+            heal_submit_started,
+        );
     }
 }
 
@@ -4127,8 +4708,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         write_quorum: usize,
-    ) -> crate::error::Result<(Vec<Option<DiskStore>>, Vec<Option<SnapshotLeaseToken>>)> {
-        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<Option<SnapshotLeaseToken>>)> {
+        let fence_path = disk::quota_mutation_fence_path(bucket, object);
         let results = join_all(disks.iter().map(|disk| {
             let disk = disk.clone();
             let fence_path = fence_path.clone();
@@ -4170,8 +4751,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         write_quorum: usize,
-    ) -> crate::error::Result<()> {
-        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+    ) -> Result<()> {
+        let fence_path = disk::quota_mutation_fence_path(bucket, object);
         let results = join_all(disks.iter().zip(tokens).filter_map(|(disk, token)| {
             let disk = disk.as_ref()?.clone();
             let token = (*token)?;
@@ -4200,11 +4781,25 @@ impl SetDisks {
         errs: &[Option<DiskError>],
         cleanup_data_dirs: &[Option<Uuid>],
         old_current_sizes: &[Option<OldCurrentSize>],
+        old_current_source_checked: &[bool],
+        old_current_sources: &[Option<FileInfo>],
         write_quorum: usize,
     ) -> disk::error::Result<RenameDataCommit> {
         let data_dir = Self::reduce_common_data_dir(cleanup_data_dirs, write_quorum);
         let convergence = Self::classify_rename_convergence(disk_versions, errs);
         let old_current_size = Self::reduce_common_old_current_size(old_current_sizes, write_quorum);
+        let old_current_source_quorum_checked =
+            old_current_source_checked.iter().filter(|checked| **checked).count() >= write_quorum;
+        let old_current_source_all_successful_checked = errs
+            .iter()
+            .enumerate()
+            .filter(|(_, err)| err.is_none())
+            .all(|(idx, _)| old_current_source_checked.get(idx).copied().unwrap_or(false));
+        let old_current_source = if old_current_source_quorum_checked {
+            Self::reduce_common_old_current_source(old_current_sources, write_quorum)
+        } else {
+            None
+        };
         let online_disks = Self::eval_disks(disks, errs);
         let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
         let committed_file_info = file_infos.get(committed_slot).cloned().ok_or(DiskError::Unexpected)?;
@@ -4232,6 +4827,9 @@ impl SetDisks {
             data_dir,
             cleanup_disks,
             old_current_size,
+            old_current_source_checked: old_current_source_quorum_checked,
+            old_current_source_all_successful_checked,
+            old_current_source,
             committed_file_info,
             tail_drain: None,
         })
@@ -4349,9 +4947,10 @@ impl SetDisks {
         let src_object = Arc::new(src_object.to_string());
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
-        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (commit_tx, commit_rx) = oneshot::channel();
 
         let coordinator_failure_receipt = rollback_receipt.clone();
+        let early_ack_spawn_to_quorum_wait_started = rustfs_io_metrics::put_stage_timer();
         let tail_drain = tokio::spawn({
             let fanout_src_bucket = src_bucket.clone();
             let fanout_src_object = src_object.clone();
@@ -4408,6 +5007,7 @@ impl SetDisks {
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             dispatch_state = RenameDispatchState::MayHavePublished;
+                            let _foreground_active_guard = rename_foreground_active_guard(i);
                             let observed = disk
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
@@ -4415,7 +5015,7 @@ impl SetDisks {
                                     &file_info,
                                     &dst_bucket,
                                     &dst_object,
-                                    crate::disk::RenameDataGuards {
+                                    disk::RenameDataGuards {
                                         scanner_publication_lease_token,
                                         namespace_owner: namespace_commit_guard
                                             .clone()
@@ -4475,6 +5075,8 @@ impl SetDisks {
                 let mut data_dirs = vec![None; disk_count];
                 let mut cleanup_data_dirs = vec![None; disk_count];
                 let mut old_current_sizes = vec![None; disk_count];
+                let mut old_current_source_checked = vec![false; disk_count];
+                let mut old_current_sources = vec![None; disk_count];
                 let mut capacity_scope_generation = None;
                 let mut cleanup_at_snapshot = vec![false; disk_count];
 
@@ -4488,6 +5090,8 @@ impl SetDisks {
                             cleanup_data_dirs[idx] = res.cleanup_data_dir;
                             disk_versions[idx] = res.sign;
                             old_current_sizes[idx] = res.old_current_size;
+                            old_current_source_checked[idx] = res.old_current_source_checked;
+                            old_current_sources[idx] = res.old_current_source;
                             errs[idx] = None;
                             success_count += 1;
                         }
@@ -4513,6 +5117,8 @@ impl SetDisks {
                             &errs,
                             &cleanup_data_dirs,
                             &old_current_sizes,
+                            &old_current_source_checked,
+                            &old_current_sources,
                             write_quorum,
                         );
                         if let Ok(commit) = snapshot_commit.as_ref() {
@@ -4649,6 +5255,10 @@ impl SetDisks {
             }
         });
 
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_SPAWN_TO_QUORUM_WAIT,
+            early_ack_spawn_to_quorum_wait_started,
+        );
         let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
         let commit = match commit_rx.await {
             Ok(commit) => commit,
@@ -4661,8 +5271,13 @@ impl SetDisks {
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             quorum_wait_started,
         );
+        let attach_tail_owner_started = rustfs_io_metrics::put_stage_timer();
         commit.map(|mut commit| {
             commit.tail_drain = Some(tail_drain);
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_ATTACH_TAIL_OWNER,
+                attach_tail_owner_started,
+            );
             commit
         })
     }
@@ -4823,6 +5438,7 @@ impl SetDisks {
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             dispatch_state = RenameDispatchState::MayHavePublished;
+                            let _foreground_active_guard = rename_foreground_active_guard(i);
                             let observed = disk
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
@@ -4830,7 +5446,7 @@ impl SetDisks {
                                     file_info,
                                     &dst_bucket,
                                     &dst_object,
-                                    crate::disk::RenameDataGuards {
+                                    disk::RenameDataGuards {
                                         scanner_publication_lease_token,
                                         namespace_owner: namespace_commit_guard
                                             .clone()
@@ -4887,6 +5503,8 @@ impl SetDisks {
         let mut data_dirs = vec![None; disk_count];
         let mut cleanup_data_dirs = vec![None; disk_count];
         let mut old_current_sizes = vec![None; disk_count];
+        let mut old_current_source_checked = vec![false; disk_count];
+        let mut old_current_sources = vec![None; disk_count];
 
         let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
         let sync_full_fanout_started = rustfs_io_metrics::put_stage_timer();
@@ -4935,6 +5553,8 @@ impl SetDisks {
                     cleanup_data_dirs[idx] = res.cleanup_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
                     old_current_sizes[idx] = res.old_current_size;
+                    old_current_source_checked[idx] = res.old_current_source_checked;
+                    old_current_sources[idx] = res.old_current_source.clone();
                     errs.push(None);
                 }
                 Ok(Err(e)) => {
@@ -5071,6 +5691,18 @@ impl SetDisks {
         let data_dir = Self::reduce_common_data_dir(&cleanup_data_dirs, write_quorum);
         let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
+        let old_current_source_quorum_checked =
+            old_current_source_checked.iter().filter(|checked| **checked).count() >= write_quorum;
+        let old_current_source_all_successful_checked = errs
+            .iter()
+            .enumerate()
+            .filter(|(_, err)| err.is_none())
+            .all(|(idx, _)| old_current_source_checked.get(idx).copied().unwrap_or(false));
+        let old_current_source = if old_current_source_quorum_checked {
+            Self::reduce_common_old_current_source(&old_current_sources, write_quorum)
+        } else {
+            None
+        };
         let online_disks = Self::eval_disks(disks, &errs);
         let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
         let committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
@@ -5098,9 +5730,32 @@ impl SetDisks {
             data_dir,
             cleanup_disks,
             old_current_size,
+            old_current_source_checked: old_current_source_quorum_checked,
+            old_current_source_all_successful_checked,
+            old_current_source,
             committed_file_info,
             tail_drain: None,
         })
+    }
+
+    pub(in crate::set_disk) fn reduce_common_old_current_source(
+        old_current_sources: &[Option<FileInfo>],
+        write_quorum: usize,
+    ) -> Option<FileInfo> {
+        let mut counts: HashMap<[u8; 32], (usize, FileInfo)> = HashMap::new();
+
+        for source in old_current_sources.iter().flatten() {
+            let entry = counts
+                .entry(Self::file_info_quorum_hash(source))
+                .or_insert_with(|| (0, source.clone()));
+            entry.0 += 1;
+        }
+
+        counts
+            .into_values()
+            .filter(|(count, _)| *count >= write_quorum)
+            .max_by_key(|(count, _)| *count)
+            .map(|(_, source)| source)
     }
 
     /// rustfs/backlog#1009: reduce the per-disk observations of the
@@ -6053,6 +6708,10 @@ impl SetDisks {
         }
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -6086,6 +6745,10 @@ impl SetDisks {
         }
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+
+        if let Some(guard) = metadata_cache_mutation_guard {
+            guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
+        }
 
         Ok(())
     }
@@ -6197,6 +6860,11 @@ impl SetDisks {
         fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
 
         let disks = self.get_disks_internal().await;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let mut futures = Vec::with_capacity(disks.len());
         for (disk_index, disk_op) in disks.iter().enumerate() {
@@ -6277,6 +6945,12 @@ impl SetDisks {
         } else {
             false
         };
+        if absent {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(guard) = metadata_cache_mutation_guard {
+                guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
+            }
+        }
         Ok((m, absent))
     }
 
@@ -6322,6 +6996,10 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
         let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(&disks, scanner_publication_lease_tokens)?;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_all_mutation(bucket, prefix)
+            .await
+            .map_err(|err| DiskError::other(format!("metadata-cache prefix mutation fence failed: {err}")))?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -6358,10 +7036,19 @@ impl SetDisks {
             });
         }
 
-        run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
+        let result = run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
             Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
         })
-        .await
+        .await;
+        if result.is_ok()
+            && let Some(guard) = metadata_cache_mutation_guard
+        {
+            guard
+                .commit()
+                .await
+                .map_err(|err| DiskError::other(format!("metadata-cache prefix mutation commit failed: {err}")))?;
+        }
+        result
     }
 
     /// Scan a single disk's copy of `prefix` and classify every directory
@@ -6535,7 +7222,15 @@ impl SetDisks {
 
         let disks = self.get_disks_internal().await;
 
-        // Phase 1: classify every online disk. A directory that holds object
+        // An unresolved slot may hold the only copy of readable object
+        // metadata or uncommitted data under this prefix. Do not classify or
+        // remove orphan residue from the online subset while any drive is
+        // unavailable.
+        if disks.iter().any(Option::is_none) {
+            return Ok(false);
+        }
+
+        // Phase 1: classify every disk. A directory that holds object
         // data or uncommitted residue on ANY disk blocks itself and its
         // ancestors on every disk, so a degraded/healable object is never
         // destroyed; purgeable subtrees beside it are still reclaimed.
@@ -6587,6 +7282,47 @@ impl SetDisks {
         }
 
         Ok(purged)
+    }
+
+    /// Reclaim metadata-less directory trees discovered by a recursive empty
+    /// bucket listing. The initial directory read fails closed if any slot is
+    /// unavailable; per-prefix purges then reuse the full cross-disk scan.
+    pub(crate) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
+        let disks = self.get_disks_internal().await;
+        if disks.is_empty() || disks.iter().any(Option::is_none) {
+            return false;
+        }
+
+        let mut prefixes = HashSet::new();
+        for disk in disks.iter().flatten() {
+            let entries = match disk.list_dir("", bucket, "", 0).await {
+                Ok(entries) => entries,
+                Err(_) => return false,
+            };
+            prefixes.extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.ends_with(SLASH_SEPARATOR) && is_safe_orphan_dir_entry(entry)),
+            );
+        }
+
+        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
+        prefixes.sort_unstable();
+        let mut purged = false;
+        for prefix in prefixes {
+            match self.purge_orphan_dir_object(bucket, &prefix).await {
+                Ok(prefix_purged) => purged |= prefix_purged,
+                Err(_) => return false,
+            }
+        }
+        purged
+    }
+
+    /// Orphan cleanup must not infer a complete scan from only the online
+    /// subset of a set's disks.
+    pub(crate) async fn orphan_purge_has_complete_disk_set(&self) -> bool {
+        let disks = self.get_disks_internal().await;
+        !disks.is_empty() && disks.iter().all(Option::is_some)
     }
 
     fn orphan_purge_in_backoff(&self, key: &str) -> bool {
@@ -7341,6 +8077,9 @@ pub(crate) mod rename_fanout_barrier {
         CLEANUP as PHASE_CLEANUP, READ_VERSION as PHASE_READ_VERSION, RENAME as PHASE_RENAME, ROLLBACK as PHASE_ROLLBACK,
     };
 
+    /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
+    pub const PHASE_NON_INLINE_HEDGE_TIMER: &str = "non_inline_hedge_timer";
+
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {
         disk_index: usize,
@@ -7574,9 +8313,9 @@ mod tests {
         );
         scope.try_begin().expect("delete scope should enter flight");
         let scope_guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
 
         let waiter = tokio::spawn(run_scanner_publication_delete_owner(Some(scope.clone()), move || async move {
             started_tx.send(()).expect("delete owner should start");
@@ -10006,7 +10745,7 @@ mod tests {
             #[allow(unreachable_code)]
             None
         });
-        let (release, released) = tokio::sync::oneshot::channel::<bool>();
+        let (release, released) = oneshot::channel::<bool>();
         drop(release);
 
         finish_rename_tail_heal(
@@ -11213,7 +11952,7 @@ mod tests {
                     info.size = 11;
                     info.parts.clear();
                     info.add_object_part(1, "new-etag".to_string(), 11, None, 11, None, None);
-                    let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    let disk::Disk::Local(local) = disk.as_ref() else {
                         panic!("physical publication fixture requires local disks");
                     };
                     // Linux IO paths use a mount FD, which is also the namespace lock key.
@@ -11221,7 +11960,7 @@ mod tests {
                         .get_disk()
                         .get_object_path_for_io(bucket, object)
                         .expect("the publication path must resolve through the disk's mount lease");
-                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (entered_tx, entered_rx) = oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                     hooks.push(os::prepared_publication_test_hooks::install(
                         &destination.join(STORAGE_FORMAT_FILE),
@@ -11407,11 +12146,11 @@ mod tests {
                     info.add_object_part(1, "new-etag".to_string(), 11, None, 11, None, None);
                 }
                 let disk = disks[3].as_ref().expect("tail disk");
-                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                let disk::Disk::Local(local) = disk.as_ref() else {
                     panic!("local fixture");
                 };
                 let destination = local.get_disk().get_object_path_for_io(bucket, object).expect("tail IO path");
-                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (entered_tx, entered_rx) = oneshot::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                 let _hook = os::prepared_publication_test_hooks::install(&destination.join(STORAGE_FORMAT_FILE), move || {
                     let _ = entered_tx.send(());
@@ -11423,7 +12162,7 @@ mod tests {
                 let receipt = RenameRollbackReceipt::default();
                 let caller_receipt = receipt.clone();
                 let caller_disks = disks.clone();
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let (ack_tx, ack_rx) = oneshot::channel();
                 let caller = tokio::spawn(async move {
                     let commit = SetDisks::rename_data_owned_with_fence(
                         &caller_disks,
@@ -12680,6 +13419,30 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_prefix_starts_and_retains_global_cache_fence_on_quorum_failure() {
+        temp_env::async_with_vars([("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true"))], async {
+            crate::services::notification_sys::new_global_notification_sys(Default::default())
+                .await
+                .expect("publish empty test peer topology");
+            let set = io_primitives_test_set(vec![None], 0).await;
+            set.ctx
+                .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+
+            let result = set
+                .delete_prefix_with_scanner_publication_lease("bucket", "prefix", None, None)
+                .await;
+            assert!(result.is_err(), "a missing disk cannot satisfy recursive delete quorum");
+            assert!(
+                set.get_object_metadata_cache_mutation_pending("bucket", "prefix/object"),
+                "an uncertain recursive deletion must retain its global cache fence"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn delete_prefix_succeeds_when_present_disks_reach_quorum() {
         let bucket = "delete-prefix-bucket";
         let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
@@ -12989,7 +13752,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn mrf_intent_is_filed_once_per_read_repair_reservation() {
+    async fn mrf_ingress_is_coalesced_independently_of_read_repair_reservations() {
         // Serial: owns the process-global MRF channel for this test binary
         // (same key as the other channel-owning tests above).
         let bucket = format!("mrf-intent-bucket-{}", Uuid::new_v4());
@@ -13010,8 +13773,13 @@ mod tests {
             }
         }
 
-        // First sighting wins the reservation: the journal intent is filed
-        // synchronously before the admission task is spawned.
+        // An earlier metadata/missing-shard admission has no payload MRF intent.
+        let mut metadata_submission = intent_submission(&bucket, &object);
+        metadata_submission.mrf_intent = None;
+        submit_read_repair_heal_with_submitter(metadata_submission, accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+
+        // Newly observed corruption must reach MRF despite that reservation.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         let first = receiver.try_recv().expect("first sighting must file exactly one MRF intent");
         assert_eq!(*first.bucket, bucket);
@@ -13021,6 +13789,20 @@ mod tests {
         // second journal record.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         assert!(receiver.try_recv().is_err(), "duplicate sighting must not file another MRF intent");
+
+        let retry_object = format!("retry-object-{}", Uuid::new_v4());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(true);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        let retried = receiver
+            .try_recv()
+            .expect("a heal reservation cannot suppress a previously rejected MRF intent");
+        assert_eq!(*retried.object, retry_object);
+        rustfs_common::mrf_channel::release_mrf_intent(&first);
+        rustfs_common::mrf_channel::release_mrf_intent(&retried);
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
     }
 
     #[tokio::test]

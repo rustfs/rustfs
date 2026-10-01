@@ -341,6 +341,8 @@ impl ErasureSetHealer {
                 se,
                 EcstoreError::DiskNotFound
                     | EcstoreError::VolumeNotFound
+                    | EcstoreError::FaultyDisk
+                    | EcstoreError::FaultyRemoteDisk
                     | EcstoreError::SlowDown
                     | EcstoreError::OperationCanceled
             )
@@ -907,6 +909,21 @@ impl ErasureSetHealer {
         }
 
         if failed_objects == 0 && skipped_objects == 0 && failed_buckets == 0 {
+            let targets = if self.pool_metadata_target_endpoints.is_empty() {
+                self.target_endpoints.as_ref()
+            } else {
+                self.pool_metadata_target_endpoints.as_ref()
+            };
+            if self.replacement_task_id.is_some() || (!self.heal_opts.dry_run && self.heal_opts.recreate && !targets.is_empty()) {
+                self.verify_replacement_identity_fence("bucket metadata").await?;
+                // Recheck even resumed buckets: their user-object cursor does not
+                // prove that the replacement holds the internal bucket records.
+                for bucket in buckets {
+                    self.storage
+                        .heal_replacement_bucket_metadata(bucket, &self.heal_opts, targets)
+                        .await?;
+                }
+            }
             self.heal_replacement_pool_metadata(
                 set_disk_id,
                 &mut ErasureSetPassCounters {
@@ -2040,6 +2057,8 @@ mod tests {
     fn disk_not_found_is_transient_not_absent() {
         assert!(matches!(classify(EcstoreError::DiskNotFound), HealObjectOutcome::Transient));
         assert!(matches!(classify(EcstoreError::VolumeNotFound), HealObjectOutcome::Transient));
+        assert!(matches!(classify(EcstoreError::FaultyDisk), HealObjectOutcome::Transient));
+        assert!(matches!(classify(EcstoreError::FaultyRemoteDisk), HealObjectOutcome::Transient));
     }
 
     #[test]
@@ -2235,6 +2254,8 @@ mod resume_loop_tests {
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
+        RpcCancelled(u32),
+        Cancelled,
         Timeout,
     }
 
@@ -2267,6 +2288,8 @@ mod resume_loop_tests {
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         pool_metadata_placement: Mutex<Option<ReplacementCommitEvidence>>,
+        bucket_metadata_calls: Mutex<Vec<String>>,
+        bucket_metadata_failure: AtomicBool,
         fail_listing: AtomicBool,
         fail_listing_buckets: Mutex<HashSet<String>>,
     }
@@ -2435,14 +2458,31 @@ mod resume_loop_tests {
                 .unwrap()
                 .push((object.to_string(), version_id.map(str::to_string)));
             let key = compose_key(object, version_id);
-            let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
+            let outcome = {
+                let mut outcomes = self.outcomes.lock().unwrap();
+                let outcome = outcomes.get(&key).cloned().unwrap_or(HealOutcome::Ok);
+                if let HealOutcome::RpcCancelled(remaining) = &outcome {
+                    outcomes.insert(key.clone(), HealOutcome::RpcCancelled(remaining.saturating_sub(1)));
+                }
+                outcome
+            };
             match outcome {
-                HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
+                HealOutcome::Ok | HealOutcome::RpcCancelled(0) => {
+                    Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None))
+                }
                 HealOutcome::FileNotFound => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileNotFound)))),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
                 HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
+                HealOutcome::RpcCancelled(_) => {
+                    // Pool aggregation clones the selected error before returning it to heal.
+                    let error = EcstoreError::from(tonic::Status::cancelled("injected peer cancellation"));
+                    let cloned = error.clone();
+                    assert_eq!(cloned, error, "pool error clone must preserve its kind and message");
+                    Err(Error::Storage(cloned))
+                }
+                HealOutcome::Cancelled => Err(Error::TaskCancelled),
                 HealOutcome::Timeout => Err(Error::TaskTimeout),
             }
         }
@@ -2461,6 +2501,13 @@ mod resume_loop_tests {
                 Some(ReplacementCommitEvidence::Error(message)) => Err(Error::other(message.clone())),
                 None => Ok(true),
             }
+        }
+        async fn heal_replacement_bucket_metadata(&self, bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+            self.bucket_metadata_calls.lock().unwrap().push(bucket.to_owned());
+            if self.bucket_metadata_failure.load(Ordering::SeqCst) {
+                return Err(Error::Storage(EcstoreError::PreconditionFailed));
+            }
+            Ok(())
         }
         async fn replacement_targets_have_version(
             &self,
@@ -3058,6 +3105,18 @@ mod resume_loop_tests {
         )
         .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
 
+        env.storage.bucket_metadata_failure.store(true, Ordering::SeqCst);
+        assert!(healer.heal_erasure_set(&["b".to_string()], "pool_0_set_0").await.is_err());
+        let incomplete = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("failed metadata repair must retain replacement intent")
+            .get_state()
+            .await;
+        assert!(!incomplete.completed);
+        assert_ne!(incomplete.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+        assert!(env.storage.calls().is_empty(), "metadata failure must stop completion before pool.bin");
+        env.storage.bucket_metadata_failure.store(false, Ordering::SeqCst);
+
         let error = healer
             .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
             .await
@@ -3073,6 +3132,11 @@ mod resume_loop_tests {
         assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
         assert_eq!(state.retry_count, 1);
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        assert_eq!(
+            *env.storage.bucket_metadata_calls.lock().unwrap(),
+            vec!["b", "b"],
+            "resuming a completed user scan must retry bucket metadata"
+        );
     }
 
     #[tokio::test]

@@ -226,6 +226,20 @@ class EnvelopeTests(unittest.TestCase):
                 evidence.current_chain()
         self.assertFalse((self.root / "env").exists())
 
+    def test_testing_sha_fallback_is_accepted_while_garbage_is_rejected(self):
+        # prepare's >24h staleness fallback legitimately sets testing_sha to
+        # auto-testing main HEAD, which differs from the committed pin; only
+        # the sha format is an invariant now.
+        for testing_sha, ok in (("d" * 40, True), ("1" * 40, True), ("xyz", False), ("", False)):
+            chain = dict(self.chain, testing_sha=testing_sha)
+            env = dict(self.env, CHAIN_MANIFEST=json.dumps(chain))
+            if ok:
+                with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, env), mock.patch.object(evidence.subprocess, "check_output", return_value="e" * 40):
+                    evidence.consume(evidence.current_chain())
+            else:
+                with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, env), mock.patch.object(evidence.subprocess, "check_output", return_value="e" * 40), self.assertRaises(ValueError):
+                    evidence.current_chain()
+
     def test_report_or_swallowed_test_failure_cannot_produce_valid_evidence(self):
         report = self.root / "cases.md"
         report.write_text("| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n")
@@ -389,12 +403,22 @@ class WorkflowTimeoutTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
-                self.assertIn("    timeout-minutes: 60", job)
+                job_timeout = 360 if suite == "pool-expand" else 60
+                self.assertIn(f"    timeout-minutes: {job_timeout}", job)
                 steps = named_steps(job)
                 primary = [step for step in steps.values() if any(
                     line in ("        id: test", "        id: pool_test") for line in step)]
                 self.assertEqual(len(primary), 1)
-                self.assertIn("        timeout-minutes: 45", primary[0])
+                if suite == "pool-expand":
+                    self.assertIn("        timeout-minutes: ${{ inputs.pool_timeout_minutes || 240 }}", primary[0])
+                    for event in ("workflow_call", "workflow_dispatch"):
+                        event_block = yaml_block(source.splitlines(), event, 2)
+                        timeout_input = yaml_block(event_block, "pool_timeout_minutes", 6)
+                        self.assertIsNotNone(timeout_input, event)
+                        self.assertIn("        default: '240'", timeout_input)
+                        self.assertIn("        required: false", timeout_input)
+                else:
+                    self.assertIn("        timeout-minutes: 45", primary[0])
                 cleanup = "Cleanup environment"
                 for phase in ("before", "after"):
                     self.assertIn("        timeout-minutes: 5", steps[f"{cleanup} ({phase})"])

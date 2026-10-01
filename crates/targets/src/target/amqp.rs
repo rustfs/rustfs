@@ -30,8 +30,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
-        open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_queued_payload_with_records, build_target_tls_fingerprint,
+        is_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -404,7 +404,10 @@ where
     }
 
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        build_queued_payload_with_records(event, vec![event.clone()])
+        match self.args.target_type {
+            TargetType::NotifyEvent => build_queued_payload(event),
+            TargetType::AuditLog => build_queued_payload_with_records(event, vec![event.clone()]),
+        }
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
@@ -676,6 +679,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn valid_args() -> AMQPArgs {
@@ -711,6 +715,87 @@ mod tests {
             event_name: EventName::ObjectCreatedPut,
             data: json!({"ok": true}),
         })
+    }
+
+    fn notification_event() -> EntityTarget<serde_json::Value> {
+        EntityTarget {
+            object_name: "incoming%2Fclip+%252F.mp4".to_string(),
+            bucket_name: "example-bucket".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: json!({
+                "eventVersion": "2.0",
+                "eventSource": "aws:s3",
+                "eventName": "s3:ObjectCreated:Put",
+                "s3": {
+                    "bucket": {"name": "example-bucket"},
+                    "object": {"key": "incoming%2Fclip+%252F.mp4", "size": 42,
+                               "eTag": "example-etag", "versionId": "example-version"}
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn notification_records_contain_the_event_directly() {
+        let target = AMQPTarget::new("notification".to_string(), valid_args()).unwrap();
+        let event = notification_event();
+        let queued = target.build_queued_payload(&event).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+
+        assert_eq!(payload["Records"], json!([event.data]));
+        assert_eq!(payload["Key"], "example-bucket/incoming/clip %2F.mp4");
+        assert_eq!(payload["EventName"], "s3:ObjectCreated:Put");
+        assert_eq!(payload["Records"][0]["s3"]["object"]["key"], event.object_name);
+    }
+
+    #[test]
+    fn audit_records_preserve_the_entity_envelope() {
+        let mut args = valid_args();
+        args.target_type = TargetType::AuditLog;
+        let target = AMQPTarget::new("audit".to_string(), args).unwrap();
+        let event = test_event();
+        let queued = target.build_queued_payload(&event).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+
+        assert_eq!(payload["Records"], json!([event.as_ref()]));
+    }
+
+    #[tokio::test]
+    async fn queued_notification_preserves_the_flat_record_and_metadata() {
+        let mut args = unreachable_args();
+        args.queue_dir = temp_store_dir("record-shape").to_string_lossy().to_string();
+        let target = AMQPTarget::new("notification".to_string(), args.clone()).unwrap();
+        let event = notification_event();
+        let expected = target.build_queued_payload(&event).unwrap();
+        let unix_time_ms = || {
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock should be after the Unix epoch")
+                    .as_millis(),
+            )
+            .expect("current Unix timestamp should fit in u64")
+        };
+        let before_save = unix_time_ms();
+        target.save(Arc::new(event.clone())).await.unwrap();
+        let after_save = unix_time_ms();
+        let store = target.store().unwrap();
+        let keys = store.list();
+        assert_eq!(keys.len(), 1);
+        let raw = store.get_raw(&keys[0]).unwrap();
+        let queued = QueuedPayload::decode(&raw).unwrap();
+        assert_eq!(queued.body, expected.body);
+        assert_eq!(queued.meta.event_name, expected.meta.event_name);
+        assert_eq!(queued.meta.bucket_name, expected.meta.bucket_name);
+        assert_eq!(queued.meta.object_name, expected.meta.object_name);
+        assert_eq!(queued.meta.content_type, expected.meta.content_type);
+        assert_eq!(queued.meta.payload_len, expected.meta.payload_len);
+        assert_eq!(queued.meta.dedup_id, expected.meta.dedup_id);
+        assert_eq!(queued.meta.failure, expected.meta.failure);
+        assert!((before_save..=after_save).contains(&queued.meta.queued_at_unix_ms));
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+        assert_eq!(payload["Records"], json!([event.data]));
+        std::fs::remove_dir_all(args.queue_dir).unwrap();
     }
 
     fn temp_store_dir(name: &str) -> PathBuf {

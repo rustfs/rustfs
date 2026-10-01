@@ -298,7 +298,11 @@ mod tests {
         assert_eq!(empty_head_resp.content_disposition(), None);
         assert_eq!(empty_head_resp.content_encoding(), None);
         assert_eq!(empty_head_resp.content_language(), None);
-        assert_eq!(empty_head_resp.content_type(), None);
+        assert_eq!(
+            empty_head_resp.content_type(),
+            Some("binary/octet-stream"),
+            "REPLACE without an explicit content type must default to binary/octet-stream, matching S3"
+        );
         assert_eq!(empty_head_resp.expires_string(), None);
         assert_eq!(empty_head_resp.website_redirect_location(), None);
 
@@ -394,7 +398,15 @@ mod tests {
             assert_eq!(head.content_disposition(), (field == "content-disposition").then_some("attachment"));
             assert_eq!(head.content_encoding(), (field == "content-encoding").then_some("gzip"));
             assert_eq!(head.content_language(), (field == "content-language").then_some("de"));
-            assert_eq!(head.content_type(), (field == "content-type").then_some("text/field"));
+            assert_eq!(
+                head.content_type(),
+                Some(if field == "content-type" {
+                    "text/field"
+                } else {
+                    "binary/octet-stream"
+                }),
+                "REPLACE without an explicit content type must default to binary/octet-stream, matching S3"
+            );
             assert_eq!(
                 head.expires_string(),
                 (field == "expires").then_some(replacement_expires_http_date.as_str())
@@ -420,7 +432,11 @@ mod tests {
             .send()
             .await
             .expect("HEAD failed for metadata collision case");
-        assert_eq!(collision_head.content_type(), None);
+        assert_eq!(
+            collision_head.content_type(),
+            Some("binary/octet-stream"),
+            "user-metadata under the reserved 'content-type' key must not satisfy the system content-type default"
+        );
         assert_eq!(collision_head.content_encoding(), None);
         assert_eq!(
             collision_head.metadata().and_then(|metadata| metadata.get("content-type")),

@@ -130,6 +130,19 @@ fn minio_key(suffix: &str) -> String {
     format!("{MINIO_PREFIX}{suffix}")
 }
 
+/// Reads `x-rustfs-force-delete` / `x-minio-force-delete`.
+///
+/// `Ok(None)` means the header is absent. `Ok(Some(_))` is a boolean accepted
+/// by [`crate::string::parse_bool`]. `Err` means the header is present but not
+/// a boolean; callers must reject that request instead of treating the flag as
+/// absent, which would turn a malformed force-delete into a normal delete.
+pub fn force_delete_header(headers: &HeaderMap) -> std::io::Result<Option<bool>> {
+    match get_header(headers, SUFFIX_FORCE_DELETE) {
+        None => Ok(None),
+        Some(value) => crate::string::parse_bool(value.as_ref()).map(Some),
+    }
+}
+
 /// Get header value: tries x-rustfs-{suffix} first, then x-minio-{suffix}. Case-insensitive.
 pub fn get_header<'a>(headers: &'a HeaderMap, suffix: &str) -> Option<Cow<'a, str>> {
     let rk = rustfs_key(suffix);
@@ -244,5 +257,21 @@ mod tests {
         let mut headers2 = HeaderMap::new();
         headers2.insert("X-Rustfs-Force-Delete", HeaderValue::from_static("true"));
         assert_eq!(get_header(&headers2, SUFFIX_FORCE_DELETE).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn force_delete_header_accepts_minio_bools_and_rejects_garbage() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(force_delete_header(&headers).expect("absent header"), None);
+
+        headers.insert("x-minio-force-delete", HeaderValue::from_static("TRUE"));
+        assert_eq!(force_delete_header(&headers).expect("minio true"), Some(true));
+
+        headers.insert("x-rustfs-force-delete", HeaderValue::from_static("false"));
+        assert_eq!(force_delete_header(&headers).expect("rustfs header wins"), Some(false));
+
+        headers.clear();
+        headers.insert("x-rustfs-force-delete", HeaderValue::from_static("maybe"));
+        assert!(force_delete_header(&headers).is_err());
     }
 }

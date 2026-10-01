@@ -184,7 +184,7 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
         let (status, metrics_body) = admin_request(
             &node.url,
             Method::GET,
-            "/rustfs/admin/v3/metrics?n=1&by-host=true&by-disk=true",
+            "/rustfs/admin/v3/realtime?n=1&by-host=true&by-disk=true",
             None,
             &dist.cluster.access_key,
             &dist.cluster.secret_key,
@@ -257,7 +257,7 @@ async fn node_admin_body(dist: &DistCluster, node: usize, path: &str) -> TestRes
 }
 
 async fn http_put_counts(dist: &DistCluster, node: usize) -> TestResult<[u64; 2]> {
-    let body = node_admin_body(dist, node, "/rustfs/admin/v3/metrics?types=512&by-host=true&n=1").await?;
+    let body = node_admin_body(dist, node, "/rustfs/admin/v3/realtime?types=512&by-host=true&n=1").await?;
     let sample: RealtimeMetrics = serde_json::from_str(body.lines().next().ok_or("empty HTTP metrics stream")?)?;
     assert!(sample.errors.is_empty(), "HTTP metrics returned errors: {:?}", sample.errors);
     let http = sample.aggregated.http.ok_or("HTTP metrics missing at WARN log level")?;

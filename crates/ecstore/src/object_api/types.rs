@@ -935,6 +935,8 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Internal read-only inspection must not enqueue metadata or payload repairs.
+    pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
     /// key use TailDrained without changing namespace lock ownership.
     #[doc(hidden)]
@@ -1442,6 +1444,10 @@ pub struct ObjectInfo {
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
     pub checksum: Option<Bytes>,
+    /// True when this `CompleteMultipartUpload` result is the object already
+    /// published by the same upload. Callers must not repeat quota, replication,
+    /// lifecycle, or object-created side effects for that response.
+    pub multipart_completion_replayed: bool,
 }
 
 impl Clone for ObjectInfo {
@@ -1482,6 +1488,7 @@ impl Clone for ObjectInfo {
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
+            multipart_completion_replayed: self.multipart_completion_replayed,
             expires: self.expires,
         }
     }

@@ -39,8 +39,14 @@ class HealthTests(unittest.TestCase):
     def test_substituted_producer_pin_attempt_or_empty_suite_fails(self):
         with self.assertRaises(ValueError):
             self.validate(candidate={**self.candidate, "workflow_sha": "e" * 40})
+        # The prepare step's >24h staleness fallback legitimately sets
+        # testing_sha to auto-testing main HEAD, so the pin FILE is no longer
+        # consulted at all; the sha FORMAT of the chain's testing_sha is the
+        # remaining invariant.
+        wrong = copy.deepcopy(self.summary)
+        wrong["chain"]["testing_sha"] = "short"
         with self.assertRaises(ValueError):
-            self.validate(config={"content": base64.b64encode(b"wrong pin").decode()})
+            self.validate(wrong)
         wrong = copy.deepcopy(self.summary)
         wrong["chain"]["attempt"] = 1
         with self.assertRaises(ValueError):
