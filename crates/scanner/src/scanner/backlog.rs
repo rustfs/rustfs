@@ -977,85 +977,55 @@ async fn read_scanner_pause_backlog_replica(store: Arc<SetDisks>) -> ScannerPaus
     ScannerPauseBacklogReplica { id, revision, state }
 }
 
-fn scanner_pause_backlog_replica_diagnostics(replicas: &[ScannerPauseBacklogReplica]) -> Vec<ScannerPauseBacklogReplicaStatus> {
+fn scanner_pause_backlog_replica_diagnostics(replicas: Vec<ScannerPauseBacklogReplica>) -> Vec<ScannerPauseBacklogReplicaStatus> {
     replicas
-        .iter()
+        .into_iter()
         .map(|replica| {
-            let revision = match &replica.revision {
-                Some(DataUsageCacheRevision::Etag(etag)) => Some(etag.clone()),
-                Some(DataUsageCacheRevision::Missing) | None => None,
-            };
-            let (
-                state,
-                stable_generation,
-                stable_writer_epoch,
-                committed_generation,
-                committed_writer_epoch,
-                committed_replica_count,
-                error,
-            ) = match &replica.state {
-                ScannerPauseBacklogReplicaState::Missing => {
-                    (ScannerPauseBacklogReplicaStatusState::Missing, None, None, None, None, None, None)
-                }
-                ScannerPauseBacklogReplicaState::Valid(record) => {
-                    let stable = record.stable.as_ref();
-                    let committed = record.committed.as_ref();
-                    (
-                        ScannerPauseBacklogReplicaStatusState::Valid,
-                        stable.map(|ledger| ledger.generation),
-                        stable.map(|ledger| ledger.writer_epoch),
-                        committed.map(|commit| commit.ledger.generation),
-                        committed.map(|commit| commit.ledger.writer_epoch),
-                        committed.map(|commit| commit.replicas.len()),
-                        None,
-                    )
-                }
-                ScannerPauseBacklogReplicaState::Invalid(reason) => (
-                    ScannerPauseBacklogReplicaStatusState::Invalid,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(reason.clone()),
-                ),
-                ScannerPauseBacklogReplicaState::FutureSchema(version) => (
-                    ScannerPauseBacklogReplicaStatusState::FutureSchema,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(format!("unsupported future schema {version}")),
-                ),
-                ScannerPauseBacklogReplicaState::Unavailable(reason) => (
-                    ScannerPauseBacklogReplicaStatusState::Unavailable,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(reason.clone()),
-                ),
-            };
-            ScannerPauseBacklogReplicaStatus {
+            let mut status = ScannerPauseBacklogReplicaStatus {
                 pool_index: replica.id.pool_index,
                 set_index: replica.id.set_index,
-                state,
-                revision,
-                stable_generation,
-                stable_writer_epoch,
-                committed_generation,
-                committed_writer_epoch,
-                committed_replica_count,
-                committed_replicas: match &replica.state {
-                    ScannerPauseBacklogReplicaState::Valid(record) => {
-                        record.committed.as_ref().map(|commit| commit.replicas.clone())
-                    }
-                    _ => None,
+                state: ScannerPauseBacklogReplicaStatusState::Missing,
+                revision: match replica.revision {
+                    Some(DataUsageCacheRevision::Etag(etag)) => Some(etag),
+                    Some(DataUsageCacheRevision::Missing) | None => None,
                 },
-                error,
+                stable_generation: None,
+                stable_writer_epoch: None,
+                committed_generation: None,
+                committed_writer_epoch: None,
+                committed_replica_count: None,
+                committed_replicas: None,
+                error: None,
+            };
+            match replica.state {
+                ScannerPauseBacklogReplicaState::Missing => {}
+                ScannerPauseBacklogReplicaState::Valid(record) => {
+                    status.state = ScannerPauseBacklogReplicaStatusState::Valid;
+                    if let Some(stable) = record.stable {
+                        status.stable_generation = Some(stable.generation);
+                        status.stable_writer_epoch = Some(stable.writer_epoch);
+                    }
+                    if let Some(committed) = record.committed {
+                        status.committed_generation = Some(committed.ledger.generation);
+                        status.committed_writer_epoch = Some(committed.ledger.writer_epoch);
+                        status.committed_replica_count = Some(committed.replicas.len());
+                        status.committed_replicas = Some(committed.replicas);
+                    }
+                }
+                ScannerPauseBacklogReplicaState::Invalid(reason) => {
+                    status.state = ScannerPauseBacklogReplicaStatusState::Invalid;
+                    status.error = Some(reason);
+                }
+                ScannerPauseBacklogReplicaState::FutureSchema(version) => {
+                    status.state = ScannerPauseBacklogReplicaStatusState::FutureSchema;
+                    status.error = Some(format!("unsupported future schema {version}"));
+                }
+                ScannerPauseBacklogReplicaState::Unavailable(reason) => {
+                    status.state = ScannerPauseBacklogReplicaStatusState::Unavailable;
+                    status.error = Some(reason);
+                }
             }
+            status
         })
         .collect()
 }
@@ -2103,13 +2073,13 @@ pub async fn scanner_pause_backlog_status(storeapi: Arc<ECStore>) -> ScannerPaus
                 || status.stale_or_unavailable_replicas > 0
                 || status.persistence_state != "healthy"
             {
-                status.replica_diagnostics = Some(scanner_pause_backlog_replica_diagnostics(&loaded.replicas));
+                status.replica_diagnostics = Some(scanner_pause_backlog_replica_diagnostics(loaded.replicas));
             }
             status
         }
         Err(failure) => {
-            let replica_diagnostics = scanner_pause_backlog_replica_diagnostics(&failure.replicas);
             let error = runtime_error().map_or(failure.to_string(), |runtime| format!("{failure}; {runtime}"));
+            let replica_diagnostics = scanner_pause_backlog_replica_diagnostics(failure.replicas);
             status_from_ledger(
                 &ScannerPauseBacklogLedger::default(),
                 now,
@@ -2136,6 +2106,62 @@ mod tests {
     use super::*;
 
     const NATIVE_RETIREMENT_DRIVES_PER_SET: usize = 2;
+
+    #[test]
+    fn replica_diagnostics_move_snapshot_buffers_and_preserve_json() {
+        let mut stable = durable_ledger(100);
+        stable.generation = 7;
+        stable.writer_epoch = 3;
+        let mut committed = stable.clone();
+        committed.generation = 11;
+        committed.writer_epoch = 5;
+        let members = vec![replica_id(0, 1), replica_id(1, 0)];
+        let members_buffer = members.as_ptr();
+        let revision = "native-revision".to_string();
+        let revision_buffer = revision.as_ptr();
+        let reason = "temporary read error".to_string();
+        let reason_buffer = reason.as_ptr();
+        let record =
+            ScannerPauseBacklogReplicaRecord::new(Some(stable), Some(ScannerPauseBacklogCommitRecord::new(committed, members)));
+        record
+            .validate()
+            .expect("the diagnostic fixture must satisfy the persisted record contract");
+        let diagnostics = scanner_pause_backlog_replica_diagnostics(vec![
+            ScannerPauseBacklogReplica {
+                id: replica_id(0, 1),
+                revision: Some(DataUsageCacheRevision::Etag(revision)),
+                state: ScannerPauseBacklogReplicaState::Valid(Box::new(record)),
+            },
+            ScannerPauseBacklogReplica {
+                id: replica_id(1, 0),
+                revision: None,
+                state: ScannerPauseBacklogReplicaState::Unavailable(reason),
+            },
+        ]);
+        assert_eq!(diagnostics[0].revision.as_ref().expect("revision").as_ptr(), revision_buffer);
+        assert_eq!(diagnostics[0].committed_replicas.as_ref().expect("membership").as_ptr(), members_buffer);
+        assert_eq!(diagnostics[1].error.as_ref().expect("read error").as_ptr(), reason_buffer);
+        assert_eq!(
+            serde_json::to_value(diagnostics).expect("diagnostics must serialize"),
+            serde_json::json!([
+                {
+                    "pool_index": 0, "set_index": 1, "state": "valid", "revision": "native-revision",
+                    "stable_generation": 7, "stable_writer_epoch": 3,
+                    "committed_generation": 11, "committed_writer_epoch": 5,
+                    "committed_replica_count": 2,
+                    "committed_replicas": [{"pool_index": 0, "set_index": 1}, {"pool_index": 1, "set_index": 0}],
+                    "error": null
+                },
+                {
+                    "pool_index": 1, "set_index": 0, "state": "unavailable", "revision": null,
+                    "stable_generation": null, "stable_writer_epoch": null,
+                    "committed_generation": null, "committed_writer_epoch": null,
+                    "committed_replica_count": null, "committed_replicas": null,
+                    "error": "temporary read error"
+                }
+            ])
+        );
+    }
 
     fn run_native_retirement_test<C, F>(case: C)
     where
@@ -2419,7 +2445,7 @@ mod tests {
                     && replica["error"].as_str().is_some_and(|reason| !reason.is_empty())
             }));
 
-            let unavailable = scanner_pause_backlog_replica_diagnostics(&[ScannerPauseBacklogReplica {
+            let unavailable = scanner_pause_backlog_replica_diagnostics(vec![ScannerPauseBacklogReplica {
                 id: replica_id(9, 9),
                 revision: None,
                 state: ScannerPauseBacklogReplicaState::Unavailable("read failed".to_string()),
