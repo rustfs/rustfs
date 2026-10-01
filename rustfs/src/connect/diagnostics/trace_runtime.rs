@@ -2460,9 +2460,11 @@ mod tests {
                 signed_request
                     .headers_mut()
                     .extend(crate::storage_api::server::http::gen_signature_headers(&uri, &Method::GET).unwrap());
+                sender.ready().await.unwrap();
                 let success = sender.send_request(signed_request).await.unwrap();
                 assert_eq!(success.status(), StatusCode::OK);
                 success.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let rejected = sender
                     .send_request(
                         Request::builder()
@@ -2476,6 +2478,7 @@ mod tests {
                     .unwrap();
                 assert!(rejected.status().is_client_error());
                 rejected.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let unrelated = sender
                     .send_request(Request::builder().uri("/not-rpc").body(Empty::<Bytes>::new()).unwrap())
                     .await
