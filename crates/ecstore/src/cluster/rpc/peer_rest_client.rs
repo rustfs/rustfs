@@ -48,15 +48,17 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, PingRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
-    ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest,
-    ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-    ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse,
-    ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
-    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
-    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
+    LocalStorageInfoRequest, Mss, ObjectMetadataCacheMutationRequest, ObjectMetadataCacheMutationResponse, PingRequest,
+    ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest, ScannerActivityRequest,
+    ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
+    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
+    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
+    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
+use rustfs_protos::{OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_BUCKET_BYTES, OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_OBJECT_BYTES};
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
 use rustfs_utils::XHost;
@@ -102,6 +104,8 @@ const SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT: Duration = Duration::from_secs(5
 const SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 const BUCKET_METADATA_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const OBJECT_METADATA_CACHE_MUTATION_TIMEOUT: Duration = Duration::from_secs(5);
+const OBJECT_METADATA_CACHE_CONFIG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Error for a peer that reported `success = false` without an `error_info` payload.
 ///
@@ -1975,6 +1979,168 @@ impl PeerRestClient {
         .await
     }
 
+    pub async fn mutate_object_metadata_cache(
+        &self,
+        phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase,
+        mutation_id: Uuid,
+        bucket: &str,
+        object: &str,
+    ) -> Result<()> {
+        self.mutate_object_metadata_cache_scoped(
+            phase,
+            mutation_id,
+            bucket,
+            object,
+            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+            crate::set_disk::is_get_object_metadata_cache_distributed_enabled(),
+        )
+        .await
+    }
+
+    pub async fn mutate_object_metadata_cache_scoped(
+        &self,
+        phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase,
+        mutation_id: Uuid,
+        bucket: &str,
+        object: &str,
+        scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+        cache_enabled: bool,
+    ) -> Result<()> {
+        if bucket.is_empty() || bucket.len() > OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_BUCKET_BYTES {
+            return Err(Error::other("object metadata cache mutation bucket is invalid"));
+        }
+        if (scope == rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object && object.is_empty())
+            || object.len() > OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_OBJECT_BYTES
+        {
+            return Err(Error::other("object metadata cache mutation object is invalid"));
+        }
+        if mutation_id.is_nil() {
+            return Err(Error::other("object metadata cache mutation id must not be nil"));
+        }
+
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        let result = tokio::time::timeout(OBJECT_METADATA_CACHE_MUTATION_TIMEOUT, async {
+            let result = self
+                .mutate_object_metadata_cache_once(phase, mutation_id, &bucket, &object, scope, cache_enabled)
+                .await;
+            if let Err(err) = &result
+                && Self::is_network_like_error(err)
+            {
+                self.prepare_retry().await;
+                return self
+                    .mutate_object_metadata_cache_once(phase, mutation_id, &bucket, &object, scope, cache_enabled)
+                    .await;
+            }
+            result
+        })
+        .await
+        .unwrap_or_else(|_| Err(Error::other("object metadata cache mutation timed out")));
+        self.finalize_result(result).await
+    }
+
+    async fn mutate_object_metadata_cache_once(
+        &self,
+        phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase,
+        mutation_id: Uuid,
+        bucket: &str,
+        object: &str,
+        scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
+        cache_enabled: bool,
+    ) -> Result<()> {
+        let mut client = self.get_client().await?;
+        let request_body = ObjectMetadataCacheMutationRequest {
+            protocol_version: rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: phase.as_wire_value(),
+            mutation_id: mutation_id.as_bytes().to_vec().into(),
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            scope: scope.as_wire_value(),
+            cache_enabled,
+        };
+        let mut request = Request::new(request_body.clone());
+        let canonical_body = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_body(request.get_ref())
+            .map_err(|_| Error::other("object metadata cache mutation request length cannot be represented"))?;
+        set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+        request.set_timeout(OBJECT_METADATA_CACHE_MUTATION_TIMEOUT);
+        let response = client.mutate_object_metadata_cache(request).await?.into_inner();
+        Self::validate_object_metadata_cache_mutation_response_proof(&request_body, &response)?;
+        if !response.success {
+            return Err(response
+                .error_info
+                .map(Error::other)
+                .unwrap_or_else(|| Error::other("peer rejected object metadata cache mutation")));
+        }
+        Ok(())
+    }
+
+    pub async fn probe_object_metadata_cache_configuration(&self, cache_enabled: bool) -> Result<Option<bool>> {
+        let result = tokio::time::timeout(OBJECT_METADATA_CACHE_CONFIG_PROBE_TIMEOUT, async {
+            let result = self.probe_object_metadata_cache_configuration_once(cache_enabled).await;
+            if let Err(err) = &result
+                && Self::is_network_like_error(err)
+            {
+                self.prepare_retry().await;
+                return self.probe_object_metadata_cache_configuration_once(cache_enabled).await;
+            }
+            result
+        })
+        .await
+        .unwrap_or_else(|_| Err(Error::other("object metadata cache configuration probe timed out")));
+        self.finalize_result(result).await
+    }
+
+    async fn probe_object_metadata_cache_configuration_once(&self, cache_enabled: bool) -> Result<Option<bool>> {
+        let mut client = self.get_client().await?;
+        let request_body = ObjectMetadataCacheMutationRequest {
+            protocol_version: rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase::ConfigProbe.as_wire_value(),
+            mutation_id: Uuid::new_v4().as_bytes().to_vec().into(),
+            bucket: "metadata-cache-config".to_string(),
+            object: "probe".to_string(),
+            scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object.as_wire_value(),
+            cache_enabled,
+        };
+        let mut request = Request::new(request_body.clone());
+        let canonical_body = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_body(&request_body)
+            .map_err(|_| Error::other("object metadata cache configuration request cannot be encoded"))?;
+        set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+        request.set_timeout(OBJECT_METADATA_CACHE_MUTATION_TIMEOUT);
+        let response = match client.mutate_object_metadata_cache(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+            Err(status) => return Err(status.into()),
+        };
+        Self::validate_object_metadata_cache_mutation_response_proof(&request_body, &response)?;
+        if !response.success {
+            return Err(response
+                .error_info
+                .map(Error::other)
+                .unwrap_or_else(|| Error::other("peer rejected object metadata cache configuration probe")));
+        }
+        Ok(Some(response.cache_enabled))
+    }
+
+    fn validate_object_metadata_cache_mutation_response_proof(
+        request: &ObjectMetadataCacheMutationRequest,
+        response: &ObjectMetadataCacheMutationResponse,
+    ) -> Result<()> {
+        if response.response_proof.len() > rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE {
+            return Err(Error::other("peer object metadata cache mutation response proof exceeds size limit"));
+        }
+        if response
+            .error_info
+            .as_ref()
+            .is_some_and(|error| error.len() > rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_ERROR_INFO_SIZE)
+        {
+            return Err(Error::other("peer object metadata cache mutation error response exceeds size limit"));
+        }
+        let canonical_response = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_response_body(request, response)
+            .map_err(|_| Error::other("object metadata cache mutation response length cannot be represented"))?;
+        verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .map_err(|_| Error::other("peer returned an invalid object metadata cache mutation response proof"))
+    }
+
     pub async fn delete_policy(&self, policy: &str) -> Result<()> {
         self.finalize_result(
             async {
@@ -3136,6 +3302,84 @@ mod tests {
             },
             "http://127.0.0.1:9000".to_string(),
         )
+    }
+
+    fn signed_object_metadata_cache_mutation_response(
+        request: &ObjectMetadataCacheMutationRequest,
+        success: bool,
+        error_info: Option<&str>,
+    ) -> ObjectMetadataCacheMutationResponse {
+        let mut response = ObjectMetadataCacheMutationResponse {
+            success,
+            error_info: error_info.map(str::to_string),
+            response_proof: Bytes::new(),
+            cache_enabled: true,
+        };
+        let canonical = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_response_body(request, &response)
+            .expect("small mutation response should encode");
+        response.response_proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(&canonical)
+            .expect("mutation response should sign")
+            .into();
+        response
+    }
+
+    #[test]
+    fn object_metadata_cache_mutation_response_proof_binds_request_result_and_limits() {
+        runtime_sources::ensure_test_rpc_secret();
+        let request = ObjectMetadataCacheMutationRequest {
+            protocol_version: rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit.as_wire_value(),
+            mutation_id: Uuid::new_v4().as_bytes().to_vec().into(),
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object.as_wire_value(),
+            cache_enabled: true,
+        };
+        let response = signed_object_metadata_cache_mutation_response(&request, true, None);
+        assert!(PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&request, &response).is_ok());
+
+        let mut unsigned = response.clone();
+        unsigned.response_proof = Bytes::new();
+        let err = PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&request, &unsigned)
+            .expect_err("unsigned mutation acknowledgements must fail closed");
+        assert!(
+            err.to_string()
+                .contains("invalid object metadata cache mutation response proof")
+        );
+
+        let mut changed_result = response.clone();
+        changed_result.success = false;
+        let err = PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&request, &changed_result)
+            .expect_err("a peer cannot change a signed success into an error");
+        assert!(
+            err.to_string()
+                .contains("invalid object metadata cache mutation response proof")
+        );
+
+        let mut changed_request = request.clone();
+        changed_request.phase = rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort.as_wire_value();
+        let err = PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&changed_request, &response)
+            .expect_err("a response proof cannot be replayed for another phase");
+        assert!(
+            err.to_string()
+                .contains("invalid object metadata cache mutation response proof")
+        );
+
+        let mut oversized_proof = response.clone();
+        oversized_proof.response_proof =
+            vec![0; rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE + 1].into();
+        let err = PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&request, &oversized_proof)
+            .expect_err("oversized response proof must fail before verification");
+        assert!(err.to_string().contains("response proof exceeds size limit"));
+
+        let oversized_error = signed_object_metadata_cache_mutation_response(
+            &request,
+            false,
+            Some(&"x".repeat(rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_ERROR_INFO_SIZE + 1)),
+        );
+        let err = PeerRestClient::validate_object_metadata_cache_mutation_response_proof(&request, &oversized_error)
+            .expect_err("oversized error info must fail before verification");
+        assert!(err.to_string().contains("error response exceeds size limit"));
     }
 
     fn decode_test_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerPeerActivity> {

@@ -6708,6 +6708,10 @@ impl SetDisks {
         }
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -6741,6 +6745,10 @@ impl SetDisks {
         }
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+
+        if let Some(guard) = metadata_cache_mutation_guard {
+            guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
+        }
 
         Ok(())
     }
@@ -6852,6 +6860,11 @@ impl SetDisks {
         fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
 
         let disks = self.get_disks_internal().await;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let mut futures = Vec::with_capacity(disks.len());
         for (disk_index, disk_op) in disks.iter().enumerate() {
@@ -6932,6 +6945,12 @@ impl SetDisks {
         } else {
             false
         };
+        if absent {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(guard) = metadata_cache_mutation_guard {
+                guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
+            }
+        }
         Ok((m, absent))
     }
 
@@ -6977,6 +6996,10 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
         let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(&disks, scanner_publication_lease_tokens)?;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_all_mutation(bucket, prefix)
+            .await
+            .map_err(|err| DiskError::other(format!("metadata-cache prefix mutation fence failed: {err}")))?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -7013,10 +7036,19 @@ impl SetDisks {
             });
         }
 
-        run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
+        let result = run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
             Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
         })
-        .await
+        .await;
+        if result.is_ok()
+            && let Some(guard) = metadata_cache_mutation_guard
+        {
+            guard
+                .commit()
+                .await
+                .map_err(|err| DiskError::other(format!("metadata-cache prefix mutation commit failed: {err}")))?;
+        }
+        result
     }
 
     /// Scan a single disk's copy of `prefix` and classify every directory
@@ -13335,6 +13367,30 @@ mod tests {
         assert_eq!(missing.reclaimed, 0);
         assert!(!missing.has_residue(), "missing disk slots must not be counted as cleanup residue");
         assert!(missing.below_quorum, "missing disk slots should remain visible in the quorum lens");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_prefix_starts_and_retains_global_cache_fence_on_quorum_failure() {
+        temp_env::async_with_vars([("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true"))], async {
+            crate::services::notification_sys::new_global_notification_sys(Default::default())
+                .await
+                .expect("publish empty test peer topology");
+            let set = io_primitives_test_set(vec![None], 0).await;
+            set.ctx
+                .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+
+            let result = set
+                .delete_prefix_with_scanner_publication_lease("bucket", "prefix", None, None)
+                .await;
+            assert!(result.is_err(), "a missing disk cannot satisfy recursive delete quorum");
+            assert!(
+                set.get_object_metadata_cache_mutation_pending("bucket", "prefix/object"),
+                "an uncertain recursive deletion must retain its global cache fence"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
