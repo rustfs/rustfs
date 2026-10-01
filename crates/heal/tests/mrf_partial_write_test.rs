@@ -918,10 +918,19 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
             "replayed responsibility must be released only after verified repair"
         );
     } else {
+        // A repair can finish before the next legacy check parks its responsibility.
         assert!(
             wait_until(|| async {
                 let snapshot = manager.operations_snapshot().await;
-                snapshot.queue_length == 0 && snapshot.active_tasks == 0
+                snapshot.queue_length == 0
+                    && snapshot.active_tasks == 0
+                    && mrf_queue::list_legacy_responsibilities(None, 32).await.is_ok_and(|state| {
+                        state.responsibilities.iter().any(|entry| {
+                            entry.bucket == "partial-crash"
+                                && entry.object == "crash.bin"
+                                && entry.status == "held_unverified_legacy"
+                        })
+                    })
             })
             .await,
             "legacy replay attempts must finish"
