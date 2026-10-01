@@ -173,6 +173,7 @@ pub struct ScannerPauseBacklogReplicaStatus {
     pub committed_generation: Option<u64>,
     pub committed_writer_epoch: Option<u64>,
     pub committed_replica_count: Option<usize>,
+    pub committed_replicas: Option<Vec<ScannerPauseBacklogReplicaId>>,
     pub error: Option<String>,
 }
 
@@ -682,9 +683,9 @@ pub(super) enum ScannerPauseBacklogAttemptDecision {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-struct ScannerPauseBacklogReplicaId {
-    pool_index: usize,
-    set_index: usize,
+pub struct ScannerPauseBacklogReplicaId {
+    pub pool_index: usize,
+    pub set_index: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -795,9 +796,6 @@ impl LoadedScannerPauseBacklog {
     fn status(&self, now: u64, error: Option<String>) -> ScannerPauseBacklogStatus {
         let persistence_unavailable = error.is_some();
         let replica_degraded = self.durable && self.stale_or_unavailable_replicas > 0;
-        let diagnostics_needed =
-            persistence_unavailable || !self.durable || replica_degraded || self.persistence_state != "healthy";
-        let replica_diagnostics = diagnostics_needed.then(|| scanner_pause_backlog_replica_diagnostics(&self.replicas));
         status_from_ledger(
             &self.ledger,
             now,
@@ -809,7 +807,7 @@ impl LoadedScannerPauseBacklog {
             replica_degraded,
             persistence_unavailable,
             error,
-            replica_diagnostics,
+            None,
         )
     }
 }
@@ -1050,6 +1048,12 @@ fn scanner_pause_backlog_replica_diagnostics(replicas: &[ScannerPauseBacklogRepl
                 committed_generation,
                 committed_writer_epoch,
                 committed_replica_count,
+                committed_replicas: match &replica.state {
+                    ScannerPauseBacklogReplicaState::Valid(record) => {
+                        record.committed.as_ref().map(|commit| commit.replicas.clone())
+                    }
+                    _ => None,
+                },
                 error,
             }
         })
@@ -2092,7 +2096,17 @@ pub async fn scanner_pause_backlog_status(storeapi: Arc<ECStore>) -> ScannerPaus
     let replicas = read_scanner_pause_backlog_replicas(storeapi).await;
     let replica_count = replicas.len();
     match select_scanner_pause_backlog_replicas(replicas) {
-        Ok(loaded) => loaded.status(now, runtime_error()),
+        Ok(loaded) => {
+            let mut status = loaded.status(now, runtime_error());
+            if status.error.is_some()
+                || !status.durable
+                || status.stale_or_unavailable_replicas > 0
+                || status.persistence_state != "healthy"
+            {
+                status.replica_diagnostics = Some(scanner_pause_backlog_replica_diagnostics(&loaded.replicas));
+            }
+            status
+        }
         Err(failure) => {
             let replica_diagnostics = scanner_pause_backlog_replica_diagnostics(&failure.replicas);
             let error = runtime_error().map_or(failure.to_string(), |runtime| format!("{failure}; {runtime}"));
@@ -2148,18 +2162,145 @@ mod tests {
     }
 
     async fn native_retirement_store() -> (tempfile::TempDir, Arc<ECStore>) {
+        native_pause_backlog_store(3, 2).await
+    }
+
+    async fn native_pause_backlog_store(pool_count: usize, sets_per_pool: usize) -> (tempfile::TempDir, Arc<ECStore>) {
         register_scanner_pause_backlog_retirement();
         let root = tempfile::tempdir().expect("native retirement fixture directory");
         let store = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
             root.path(),
             false,
-            3,
-            2,
+            pool_count,
+            sets_per_pool,
             NATIVE_RETIREMENT_DRIVES_PER_SET,
             false,
         )
         .await;
         (root, store)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_single_pool_partial_commit_converges_across_24_sets() {
+        run_native_retirement_test(async || {
+            set_runtime_error(None);
+            let (_root, store) = native_pause_backlog_store(1, 24).await;
+            let now = unix_now();
+            let mut controller = ScannerPauseBacklogController::claim(Arc::clone(&store), now)
+                .await
+                .expect("bootstrap the single-pool ledger");
+            controller.observe(observation(now + 1, true, 7)).await;
+            controller.observe(observation(now + 2, false, 7)).await;
+            let stable = controller.loaded.ledger.clone();
+            assert!(stable.pending_full_scan);
+            let ids = scanner_pause_backlog_replica_ids(&controller.loaded.replicas);
+            assert_eq!(ids.len(), 24);
+            let old_commit = controller
+                .loaded
+                .authoritative_commit
+                .clone()
+                .expect("initial full membership proof");
+            drop(controller);
+            let candidate = claim_scanner_pause_backlog_writer(&stable, now + 3).expect("interrupted writer generation");
+            let new_commit = ScannerPauseBacklogCommitRecord::new(candidate, ids.clone());
+            for (index, id) in ids.iter().enumerate() {
+                let commit = if index < 12 { &new_commit } else { &old_commit };
+                replace_native_pause_backlog_replica(
+                    &store,
+                    *id,
+                    ScannerPauseBacklogReplicaRecord::new(Some(stable.clone()), Some(commit.clone())),
+                )
+                .await;
+            }
+
+            let metric_status = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("the common rollback must be selectable")
+                .status(now + 3, None);
+            assert_eq!(metric_status.persistence_state, "rolled_back_partial_commit");
+            assert!(
+                metric_status.replica_diagnostics.is_none(),
+                "metrics must not allocate discarded replica diagnostics"
+            );
+            let status = scanner_pause_backlog_status(Arc::clone(&store)).await;
+            assert_eq!(status.persistence_state, "rolled_back_partial_commit");
+            assert_eq!(status.healthy_replicas, 0);
+            assert_eq!(status.replica_count, 24);
+            assert_eq!(status.generation, stable.generation);
+            let diagnostics = status.replica_diagnostics.expect("partial commit must expose every replica");
+            assert_eq!(diagnostics.len(), 24);
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|replica| replica.committed_replicas.as_ref() == Some(&ids))
+            );
+            let expected = claim_scanner_pause_backlog_writer(&stable, now + 4).expect("recovery writer generation");
+            let recovered = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 4)
+                .await
+                .expect("the common stable rollback must converge without resetting the ledger");
+            assert_current_native_writer_ledger(&store, &expected).await;
+            assert!(recovered.loaded.ledger.pending_full_scan);
+            assert_eq!(recovered.loaded.ledger.dirty_usage_buckets, 7);
+            assert_eq!(recovered.loaded.ledger.writer_epoch, stable.writer_epoch + 1);
+            drop(recovered);
+            shutdown_native_retirement_store(store).await;
+            set_runtime_error(None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_single_pool_conflicting_stable_proofs_preserve_all_24_sets() {
+        run_native_retirement_test(async || {
+            set_runtime_error(None);
+            let (_root, store) = native_pause_backlog_store(1, 24).await;
+            let now = unix_now();
+            let controller = ScannerPauseBacklogController::claim(Arc::clone(&store), now)
+                .await
+                .expect("bootstrap the single-pool ledger");
+            let stable = controller.loaded.ledger.clone();
+            let ids = scanner_pause_backlog_replica_ids(&controller.loaded.replicas);
+            assert_eq!(ids.len(), 24);
+            drop(controller);
+            let first = claim_scanner_pause_backlog_writer(&stable, now + 1).expect("first valid fork");
+            let second = claim_scanner_pause_backlog_writer(&stable, now + 2).expect("second valid fork");
+            for (index, id) in ids.iter().enumerate() {
+                let ledger = if index < 12 { &first } else { &second };
+                let commit = ScannerPauseBacklogCommitRecord::new(ledger.clone(), ids.clone());
+                replace_native_pause_backlog_replica(
+                    &store,
+                    *id,
+                    ScannerPauseBacklogReplicaRecord::new(Some(ledger.clone()), Some(commit)),
+                )
+                .await;
+            }
+            let mut before = Vec::with_capacity(24);
+            for set in &store.pools[0].disk_set {
+                before.push(native_replica_bytes(set).await);
+            }
+            let error = match ScannerPauseBacklogController::claim(Arc::clone(&store), now + 3).await {
+                Ok(_) => panic!("conflicting rollback proofs must never be reset or arbitrarily selected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("neither a surviving membership commit nor a stable rollback point"),
+                "{error}"
+            );
+            let status = scanner_pause_backlog_status(Arc::clone(&store)).await;
+            assert_eq!(status.persistence_state, "unavailable");
+            assert_eq!(status.replica_count, 24);
+            assert_eq!(status.replica_diagnostics.as_ref().map(Vec::len), Some(24));
+            for (index, set) in store.pools[0].disk_set.iter().enumerate() {
+                assert_eq!(
+                    native_replica_bytes(set).await,
+                    before[index],
+                    "failed recovery must preserve bytes and CAS revisions"
+                );
+            }
+            shutdown_native_retirement_store(store).await;
+            set_runtime_error(None);
+        });
     }
 
     #[test]
