@@ -330,7 +330,7 @@ s3s = {
 s3s-http3 = {
   version = "0.17.0-alpha.1",
   git = "https://github.com/s3s-project/s3s.git",
-  rev = "4f83b149341ebdcd76dc4df76db3821033ae2d47",
+  rev = "c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0",
 }
 # s3s = { version = "0.16.0", features = ["minio"] }
 # s3s-http3 = { version = "0.17.0-alpha.1" }

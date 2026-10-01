@@ -21,7 +21,7 @@ use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
-    hybrid::hybrid,
+    hybrid::{HybridBody, hybrid},
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
         ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
@@ -1422,15 +1422,6 @@ pub async fn start_http_server(
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-    #[cfg(feature = "http3")]
-    let http3_task = if let Some(server_config) = http3_server_config {
-        let (_, task) = http3::spawn(server_config, local_addr, s3_service.clone(), shutdown_tx.subscribe())
-            .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
-        Some(task)
-    } else {
-        None
-    };
-
     // Create compression configuration from environment variables
     let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
@@ -1511,6 +1502,58 @@ pub async fn start_http_server(
             "Connection cap state changed"
         );
     }
+
+    #[cfg(feature = "http3")]
+    let http3_task = if let Some(server_config) = http3_server_config {
+        let h3_s3_service = s3_service.clone();
+        let h3_readiness = Arc::clone(&readiness);
+        let h3_server_ctx = Arc::clone(&server_ctx);
+        let h3_keystone = auth_keystone::get_keystone_auth();
+        let h3_rate_limit = api_rate_limit_layer.clone();
+        let h3_compression = compression_config.clone();
+        let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
+        let h3_domains_configured = !config.server_domains.is_empty();
+
+        let make_service = move |peer_addr: SocketAddr| {
+            let remote_addr = RemoteAddr(peer_addr);
+
+            ServiceBuilder::new()
+                .layer(AddExtensionLayer::new(Some(remote_addr)))
+                .layer(AddExtensionLayer::new(peer_addr))
+                .option_layer(h3_trusted_proxy.clone())
+                .layer(ExternalRequestContextLayer::new(false))
+                .layer(StsQueryApiCompatLayer)
+                .layer(EmptyBodyContentLengthCompatLayer)
+                .layer(CatchPanicLayer::new())
+                .option_layer(h3_rate_limit.clone())
+                .layer(SsecTransportLayer::new(true))
+                .layer(ReadinessGateLayer::new(Arc::clone(&h3_readiness)))
+                .layer(KeystoneAuthLayer::new(h3_keystone.clone()))
+                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(h3_compression.clone())))
+                .option_layer(h3_compression.enabled.then_some(PathCategoryInjectionLayer))
+                .layer(S3ErrorMessageCompatLayer)
+                .layer(IcebergRestErrorCompatLayer)
+                .layer(ObjectAttributesEtagFixLayer)
+                .layer(ConditionalCorsLayer::new())
+                .layer(BodylessStatusFixLayer)
+                .layer(HeadRequestBodyFixLayer)
+                .layer(PublicHealthEndpointLayer::new(Arc::clone(&h3_server_ctx), Arc::clone(&h3_readiness)))
+                .option_layer((!h3_domains_configured).then_some(VirtualHostStyleHintLayer))
+                .layer(DoubleSlashListBucketsCompatLayer)
+                .layer(SigV4HeaderGuardLayer)
+                .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
+                    response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                }))
+                .service(h3_s3_service.clone())
+        };
+
+        let (_, task) = http3::spawn(server_config, local_addr, make_service, shutdown_tx.subscribe())
+            .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
+
+        Some(task)
+    } else {
+        None
+    };
 
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
