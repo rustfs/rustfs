@@ -346,6 +346,42 @@ pub(crate) fn encryption_frame_v2_enabled() -> bool {
     }
 }
 
+/// Write-side switch for part-keyed multipart segments.
+///
+/// Every part of a Direct-mode multipart upload shares one data key and base
+/// nonce, so the legacy and v2 part layouts derive the same nonce sequence
+/// each time a part number is written. With this switch on, each part write
+/// opens with a random salt and seals its frames under a key derived from it,
+/// so rewriting a part number never reuses a (key, nonce) pair.
+///
+/// Off by default for rolling-upgrade safety, like
+/// [`ENV_RUSTFS_ENCRYPTION_FRAME_V2`]: nodes without part-keyed read support
+/// reject these segments, and encrypted ciphertext travels verbatim through
+/// transition, decommission and SSE-C replication passthrough. Turn it on only
+/// after every node (and every RustFS warm/replication target that receives
+/// raw ciphertext) runs a release that reads part-keyed segments. Reading them
+/// needs no switch — the decrypt reader dispatches on the frame type byte.
+// RUSTFS_COMPAT_TODO(multipart-part-key-default-off-window): staged rollout switch for part-keyed multipart encryption, flipping the default to enabled on retirement. Remove after the minimum supported direct-upgrade release reads part-keyed segments.
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) const ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY: &str = "RUSTFS_ENCRYPTION_MULTIPART_PART_KEY";
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) const DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY: bool = false;
+
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) fn encryption_multipart_part_key_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WriteEncryptionMode {
     SinglepartObjectKey,
@@ -470,7 +506,9 @@ impl WritePlan {
                     multipart_part_number,
                 } => {
                     #[cfg(not(feature = "rio-v2"))]
-                    let encrypt_reader = if encryption_frame_v2_enabled() {
+                    let encrypt_reader = if encryption_multipart_part_key_enabled() {
+                        EncryptReader::new_multipart_part_keyed(reader, encryption.key_bytes, base_nonce, multipart_part_number)
+                    } else if encryption_frame_v2_enabled() {
                         EncryptReader::new_multipart_v2(reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     } else {
                         EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number)
@@ -644,6 +682,118 @@ mod tests {
             .expect("decrypt and decompress transformed stream");
 
         assert_eq!(actual, plaintext);
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    async fn write_multipart_part(
+        plaintext: &[u8],
+        key_bytes: [u8; 32],
+        base_nonce: [u8; 12],
+        part_number: usize,
+    ) -> (Vec<u8>, String) {
+        let actual_size = plaintext.len() as i64;
+        let reader = HashReader::from_stream(Cursor::new(plaintext.to_vec()), actual_size, actual_size, None, None, false)
+            .expect("create hash reader");
+        let mut transformed = WritePlan::new()
+            .with_encryption(WriteEncryption::multipart(key_bytes, base_nonce, part_number))
+            .apply(reader, actual_size)
+            .expect("apply multipart encryption plan");
+        let mut ciphertext = Vec::new();
+        transformed
+            .read_to_end(&mut ciphertext)
+            .await
+            .expect("read transformed ciphertext");
+        let etag = transformed.try_resolve_etag().expect("part ETag resolves");
+        (ciphertext, etag)
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn write_plan_part_key_switch_gives_each_part_write_its_own_key() {
+        let key_bytes = [0x5Au8; 32];
+        let base_nonce = [0xA5u8; 12];
+        let part_number = 4;
+        let first = b"first-part-write-".repeat(1024);
+        let second = b"other-part-write-".repeat(1024);
+
+        // Default: the rolling-upgrade-safe legacy layout, which repeats the
+        // part's nonce sequence on every write of the same part number.
+        let (legacy_one, legacy_etag) = temp_env::async_with_vars(
+            [(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, None::<&str>)],
+            write_multipart_part(&first, key_bytes, base_nonce, part_number),
+        )
+        .await;
+        let (legacy_retry, _) = temp_env::async_with_vars(
+            [(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, None::<&str>)],
+            write_multipart_part(&first, key_bytes, base_nonce, part_number),
+        )
+        .await;
+        assert_eq!(legacy_one[0], 0x00, "the default writer keeps the legacy v1 frame layout");
+        assert_eq!(legacy_one, legacy_retry);
+
+        let (keyed_one, keyed_etag) = temp_env::async_with_vars(
+            [(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, Some("true"))],
+            write_multipart_part(&first, key_bytes, base_nonce, part_number),
+        )
+        .await;
+        let (keyed_retry, keyed_retry_etag) = temp_env::async_with_vars(
+            [(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, Some("true"))],
+            write_multipart_part(&first, key_bytes, base_nonce, part_number),
+        )
+        .await;
+        let (keyed_other, _) = temp_env::async_with_vars(
+            [(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, Some("true"))],
+            write_multipart_part(&second, key_bytes, base_nonce, part_number),
+        )
+        .await;
+        assert_eq!(keyed_one[0], 0x03, "a part-keyed segment opens with its key frame");
+        assert_ne!(keyed_one[8..40], keyed_retry[8..40], "every part write draws a fresh salt");
+        assert_ne!(keyed_one[8..40], keyed_other[8..40]);
+        assert_ne!(keyed_one, keyed_retry);
+        // The part ETag stays the plaintext MD5: unchanged by the layout.
+        assert_eq!(keyed_etag, legacy_etag);
+        assert_eq!(keyed_retry_etag, legacy_etag);
+
+        // Legacy and part-keyed parts read back through one multipart reader.
+        let (legacy_two, _) = write_multipart_part(&second, key_bytes, base_nonce, part_number + 1).await;
+        let stream = [keyed_one.as_slice(), legacy_two.as_slice()].concat();
+        let mut actual = Vec::new();
+        DecryptReader::new_multipart(Cursor::new(stream), key_bytes, base_nonce, vec![part_number, part_number + 1])
+            .read_to_end(&mut actual)
+            .await
+            .expect("decrypt mixed part layouts");
+        assert_eq!(actual, [first.as_slice(), second.as_slice()].concat());
+
+        // Compressed multipart parts are encrypted after compression; the
+        // part-keyed layout wraps that stream the same way.
+        let compressed_ciphertext =
+            temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_MULTIPART_PART_KEY, Some("true"))], async {
+                let actual_size = first.len() as i64;
+                let reader = HashReader::from_stream(Cursor::new(first.clone()), actual_size, actual_size, None, None, false)
+                    .expect("create hash reader");
+                let mut transformed = WritePlan::new()
+                    .with_compression(CompressionAlgorithm::default())
+                    .with_encryption(WriteEncryption::multipart(key_bytes, base_nonce, part_number))
+                    .apply(reader, actual_size)
+                    .expect("apply compression and part-keyed encryption plan");
+                let mut ciphertext = Vec::new();
+                transformed
+                    .read_to_end(&mut ciphertext)
+                    .await
+                    .expect("read transformed ciphertext");
+                ciphertext
+            })
+            .await;
+        assert_eq!(compressed_ciphertext[0], 0x03);
+        let decrypt_reader =
+            DecryptReader::new_multipart(Cursor::new(compressed_ciphertext), key_bytes, base_nonce, vec![part_number]);
+        let mut decompressed = DecompressReader::new(Box::new(decrypt_reader), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressed
+            .read_to_end(&mut actual)
+            .await
+            .expect("decrypt and decompress part-keyed stream");
+        assert_eq!(actual, first);
     }
 
     #[cfg(feature = "rio-v2")]

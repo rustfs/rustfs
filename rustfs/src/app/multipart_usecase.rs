@@ -2599,6 +2599,136 @@ mod tests {
         .await;
     }
 
+    /// Both Direct-mode session kinds — SSE-C (customer key) and managed SSE
+    /// (session DEK) — resolve one key and base nonce for every part of an
+    /// upload. A part-keyed rewrite of a part number must still seal under a
+    /// fresh key, and the GET-side material must read the rewritten part next
+    /// to a legacy part.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn part_keyed_rewrites_round_trip_for_ssec_and_managed_sessions() {
+        use base64_simd::STANDARD as BASE64;
+        use md5::{Digest, Md5};
+
+        let customer_key_bytes = [0x5Eu8; 32];
+        let customer_key = BASE64.encode_to_string(customer_key_bytes);
+        let customer_key_md5 = BASE64.encode_to_string(Md5::digest(customer_key_bytes));
+        let local_sse_master_key = BASE64.encode_to_string([0x24u8; 32]);
+
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(local_sse_master_key)),
+            ],
+            async {
+                for ssec in [true, false] {
+                    let (sse, algorithm, sse_key, sse_key_md5) = if ssec {
+                        (
+                            None,
+                            Some("AES256".to_string()),
+                            Some(customer_key.clone()),
+                            Some(customer_key_md5.clone()),
+                        )
+                    } else {
+                        (Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)), None, None, None)
+                    };
+                    let session_material = sse_prepare_encryption(PrepareEncryptionRequest {
+                        bucket: "bucket",
+                        key: "object",
+                        server_side_encryption: sse,
+                        ssekms_key_id: None,
+                        ssekms_context: None,
+                        sse_customer_algorithm: algorithm,
+                        sse_customer_key: sse_key,
+                        sse_customer_key_md5: sse_key_md5,
+                        principal: None,
+                    })
+                    .await
+                    .expect("prepare multipart encryption")
+                    .expect("multipart session material");
+                    assert_eq!(session_material.key_kind, EncryptionKeyKind::Direct);
+                    let mut session_metadata =
+                        encryption_material_to_metadata(&session_material).expect("multipart session metadata");
+                    mark_encrypted_multipart_metadata(&mut session_metadata);
+
+                    let resolve = || {
+                        sse_decryption(DecryptionRequest {
+                            bucket: "bucket",
+                            key: "object",
+                            metadata: &session_metadata,
+                            sse_customer_key: ssec.then_some(&customer_key),
+                            sse_customer_key_md5: ssec.then_some(&customer_key_md5),
+                            principal: None,
+                        })
+                    };
+
+                    // UploadPart resolves the session material per part.
+                    let part_material = resolve().await.expect("resolve part material").expect("part material");
+                    let encrypt = |plaintext: Vec<u8>, part_number: usize, part_keyed: bool| {
+                        let (key, nonce) = (part_material.key_bytes, part_material.base_nonce);
+                        async move {
+                            let mut out = Vec::new();
+                            if part_keyed {
+                                EncryptReader::new_multipart_part_keyed(Cursor::new(plaintext), key, nonce, part_number)
+                                    .read_to_end(&mut out)
+                                    .await
+                            } else {
+                                EncryptReader::new_multipart(Cursor::new(plaintext), key, nonce, part_number)
+                                    .read_to_end(&mut out)
+                                    .await
+                            }
+                            .expect("encrypt part");
+                            out
+                        }
+                    };
+
+                    let part_one = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
+                    let first_write = encrypt(vec![0x99; part_one.len()], 1, true).await;
+                    let rewrite = encrypt(part_one.clone(), 1, true).await;
+                    assert_eq!((first_write[0], rewrite[0]), (0x03, 0x03), "ssec={ssec}: part-keyed segments");
+                    assert_ne!(first_write[8..40], rewrite[8..40], "ssec={ssec}: a rewrite draws a fresh part key");
+
+                    let part_two = vec![0x32; 777];
+                    let legacy_two = encrypt(part_two.clone(), 2, false).await;
+                    let parts = vec![
+                        ObjectPartInfo {
+                            number: 1,
+                            size: rewrite.len(),
+                            actual_size: part_one.len() as i64,
+                            ..Default::default()
+                        },
+                        ObjectPartInfo {
+                            number: 2,
+                            size: legacy_two.len(),
+                            actual_size: part_two.len() as i64,
+                            ..Default::default()
+                        },
+                    ];
+
+                    // GET resolves the stored object's material independently.
+                    let read_material = resolve().await.expect("resolve read material").expect("read material");
+                    let plaintext_size = multipart_plaintext_size(&parts, -1);
+                    let mut decrypted_reader = HardLimitReader::new(
+                        boxed_reader(DecryptReader::new_multipart(
+                            wrap_reader(Cursor::new([rewrite, legacy_two].concat())),
+                            read_material.key_bytes,
+                            read_material.base_nonce,
+                            multipart_part_numbers(&parts),
+                        )),
+                        plaintext_size,
+                    );
+                    let mut decrypted = Vec::new();
+                    decrypted_reader
+                        .read_to_end(&mut decrypted)
+                        .await
+                        .expect("read part-keyed and legacy parts");
+                    assert_eq!(decrypted, [part_one, part_two].concat(), "ssec={ssec}");
+                }
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
         let input = AbortMultipartUploadInput::builder()

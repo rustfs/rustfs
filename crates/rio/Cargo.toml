@@ -65,6 +65,7 @@ rand = { workspace = true, features = ["serde"] }
 http.workspace = true
 hyper.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
+hmac.workspace = true
 crc-fast = { workspace = true }
 pin-project-lite.workspace = true
 serde = { workspace = true, features = ["derive"] }

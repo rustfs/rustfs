@@ -15,8 +15,11 @@
 use crate::compress_index::{Index, TryGetIndex};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use hmac::{Hmac, Mac};
 use pin_project_lite::pin_project;
+use rand::Rng;
 use rustfs_utils::{put_uvarint, put_uvarint_len};
+use sha2::Sha256;
 use std::io::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -46,6 +49,54 @@ const FRAME_TYPE_V2: u8 = 0x01;
 const FRAME_TYPE_V2_FINAL: u8 = 0x02;
 const FRAME_TYPE_END: u8 = 0xFF;
 
+/// Leading frame of a part-keyed multipart segment.
+///
+/// Every part segment of a multipart object shares the upload's data key and
+/// base nonce, and the per-block nonces depend only on the part number and
+/// the block index. Writing the same part number twice within one upload
+/// therefore repeats the exact (key, nonce) sequence. A part-keyed segment
+/// opens with this frame, which carries a fresh random salt; the segment's
+/// v2 frames are then sealed under a key derived from the data key, the salt
+/// and the part number, so every part write uses its own AES-GCM key.
+///
+/// Layout: the usual 8-byte header (type, `len = salt + 4` as u24 LE, CRC32
+/// of the salt) followed by the raw salt. The salt is not secret; a modified
+/// salt derives a different key and the segment's frames fail authentication.
+const FRAME_TYPE_PART_KEY: u8 = 0x03;
+const PART_KEY_SALT_LEN: usize = 32;
+const PART_KEY_DERIVATION_LABEL: &[u8] = b"rustfs-sse-multipart-part-key-v1";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Key that seals one part-keyed segment: HMAC-SHA256 over a fixed label,
+/// the part number and the segment's salt, keyed by the object data key.
+fn derive_part_segment_key(key: &[u8; 32], salt: &[u8; PART_KEY_SALT_LEN], part_number: usize) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts 32-byte keys");
+    mac.update(PART_KEY_DERIVATION_LABEL);
+    mac.update(&(part_number as u64).to_be_bytes());
+    mac.update(salt);
+    let mut segment_key = [0u8; 32];
+    segment_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
+    segment_key
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    hasher.update(bytes);
+    hasher.finalize() as u32
+}
+
+fn part_key_frame(salt: &[u8; PART_KEY_SALT_LEN]) -> Vec<u8> {
+    let len = PART_KEY_SALT_LEN + 4;
+    let crc = crc32(salt);
+    let mut out = Vec::with_capacity(8 + PART_KEY_SALT_LEN);
+    out.push(FRAME_TYPE_PART_KEY);
+    out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(salt);
+    out
+}
+
 /// AEAD associated data of a v2 frame: the 8-byte header followed by the
 /// frame index within its segment, little-endian.
 fn v2_frame_aad(header: &[u8; 8], block_index: usize) -> [u8; 16] {
@@ -72,6 +123,8 @@ pin_project! {
         frame_v2: bool,
         pending: usize,
         input_done: bool,
+        // Salt of a part-keyed segment, emitted as the segment's first frame.
+        pending_part_key_frame: Option<[u8; PART_KEY_SALT_LEN]>,
     }
 }
 
@@ -92,6 +145,7 @@ where
             frame_v2: false,
             pending: 0,
             input_done: false,
+            pending_part_key_frame: None,
         }
     }
 
@@ -114,6 +168,28 @@ where
     pub fn new_multipart_v2(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
         let mut reader = Self::new_multipart(inner, key, base_nonce, part_number);
         reader.frame_v2 = true;
+        reader
+    }
+
+    /// Multipart writer for a part-keyed v2 segment (see the
+    /// `FRAME_TYPE_PART_KEY` frame): a fresh random salt per call, so writing the
+    /// same part number again never reuses a (key, nonce) pair.
+    pub fn new_multipart_part_keyed(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        let mut salt = [0u8; PART_KEY_SALT_LEN];
+        rand::rng().fill_bytes(&mut salt);
+        Self::new_multipart_part_keyed_with_salt(inner, key, base_nonce, part_number, salt)
+    }
+
+    fn new_multipart_part_keyed_with_salt(
+        inner: R,
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        part_number: usize,
+        salt: [u8; PART_KEY_SALT_LEN],
+    ) -> Self {
+        let segment_key = derive_part_segment_key(&key, &salt, part_number);
+        let mut reader = Self::new_multipart_v2(inner, segment_key, base_nonce, part_number);
+        reader.pending_part_key_frame = Some(salt);
         reader
     }
 }
@@ -190,6 +266,14 @@ where
             return Poll::Ready(Ok(()));
         }
         if *this.finished {
+            return Poll::Ready(Ok(()));
+        }
+
+        if let Some(salt) = this.pending_part_key_frame.take() {
+            *this.buffer = part_key_frame(&salt);
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos = to_copy;
             return Poll::Ready(Ok(()));
         }
 
@@ -409,6 +493,11 @@ pin_project! {
         segments_completed: usize,
         v1_nonce_layout: Option<V1NonceLayout>,
         legacy_nonce_fallback: bool,
+        // Part-keyed segments (see FRAME_TYPE_PART_KEY): the object data key
+        // the segment keys derive from, and the current segment's cipher.
+        key: [u8; 32],
+        segment_keyed: bool,
+        segment_cipher: Option<Aes256Gcm>,
     }
 }
 
@@ -444,6 +533,9 @@ where
             segments_completed: 0,
             v1_nonce_layout: None,
             legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
+            key,
+            segment_keyed: false,
+            segment_cipher: None,
         }
     }
 
@@ -496,6 +588,9 @@ where
             segments_completed: 0,
             v1_nonce_layout: None,
             legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
+            key,
+            segment_keyed: false,
+            segment_cipher: None,
         }
     }
 }
@@ -540,7 +635,7 @@ where
                                     // frames were dropped.
                                     if *this.segment_frame_version == Some(2)
                                         && !*this.saw_final_frame
-                                        && *this.segment_frames > 0
+                                        && (*this.segment_frames > 0 || *this.segment_keyed)
                                     {
                                         return Poll::Ready(Err(Error::new(
                                             std::io::ErrorKind::UnexpectedEof,
@@ -603,6 +698,8 @@ where
                     *this.saw_final_frame = false;
                     *this.segment_frames = 0;
                     *this.v1_nonce_layout = None;
+                    *this.segment_keyed = false;
+                    *this.segment_cipher = None;
 
                     if *this.multipart_mode {
                         let next_part = if *this.current_part_index + 1 < this.multipart_parts.len() {
@@ -627,6 +724,33 @@ where
                     *this.block_index = 0;
                     *this.ciphertext_read = 0;
                     *this.ciphertext_len = 0;
+                    continue;
+                }
+
+                if typ == FRAME_TYPE_PART_KEY {
+                    // Only the first frame of a multipart part segment may
+                    // name the segment key; anywhere else it would let a
+                    // spliced frame switch keys mid-segment.
+                    if !*this.multipart_mode || this.segment_frame_version.is_some() || *this.segment_keyed {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "part key frame outside the start of a multipart part segment",
+                        )));
+                    }
+                    if len != PART_KEY_SALT_LEN + 4 {
+                        return Poll::Ready(Err(Error::new(std::io::ErrorKind::InvalidData, "invalid part key frame length")));
+                    }
+                    // A part-keyed segment carries only authenticated v2 frames
+                    // and must end with its final frame.
+                    *this.segment_keyed = true;
+                    *this.segment_frame_version = Some(2);
+                    *this.stream_saw_v2 = true;
+                    *this.current_frame_type = typ;
+                    if this.ciphertext_buf.len() < PART_KEY_SALT_LEN {
+                        this.ciphertext_buf.resize(PART_KEY_SALT_LEN, 0);
+                    }
+                    *this.ciphertext_len = PART_KEY_SALT_LEN;
+                    *this.ciphertext_read = 0;
                     continue;
                 }
 
@@ -714,6 +838,22 @@ where
                 return Poll::Pending;
             }
 
+            if *this.current_frame_type == FRAME_TYPE_PART_KEY {
+                let mut salt = [0u8; PART_KEY_SALT_LEN];
+                salt.copy_from_slice(&this.ciphertext_buf[..PART_KEY_SALT_LEN]);
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                let expected_crc =
+                    u32::from_le_bytes([this.header_buf[4], this.header_buf[5], this.header_buf[6], this.header_buf[7]]);
+                if crc32(&salt) != expected_crc {
+                    return Poll::Ready(Err(Error::new(std::io::ErrorKind::InvalidData, "part key frame CRC32 mismatch")));
+                }
+                let segment_key = derive_part_segment_key(this.key, &salt, *this.current_part);
+                *this.segment_cipher =
+                    Some(Aes256Gcm::new_from_slice(&segment_key).map_err(|_| Error::other("invalid part segment key length"))?);
+                continue;
+            }
+
             let ciphertext_buf = &this.ciphertext_buf[..*this.ciphertext_len];
             // `ciphertext_buf`'s length derives from the untrusted 24-bit header length field, so
             // it can be shorter than 16 bytes. `uvarint` is safe on any slice length, so pass the
@@ -736,7 +876,11 @@ where
                 // derivation is exactly the modern scheme, and there are no
                 // legacy fallbacks — any mismatch is tampering, not history.
                 let aad = v2_frame_aad(this.header_buf, *this.block_index);
-                this.cipher
+                let cipher: &Aes256Gcm = match this.segment_cipher.as_ref() {
+                    Some(segment_cipher) => segment_cipher,
+                    None => this.cipher,
+                };
+                cipher
                     .decrypt(
                         &nonce,
                         Payload {
@@ -1818,5 +1962,277 @@ mod tests {
             .read_to_end(&mut decrypted)
             .await
             .expect_err("a wrong absolute frame index must fail authentication");
+    }
+
+    // Frozen ciphertext written by the pre-part-key multipart writers
+    // (`new_multipart` v1 for part 1, `new_multipart_v2` for part 2) under
+    // FIXTURE_KEY / FIXTURE_BASE_NONCE. Existing objects keep these bytes on
+    // disk, so they must decrypt unchanged, alone and next to part-keyed parts.
+    const FIXTURE_KEY: [u8; 32] = [0x11; 32];
+    const FIXTURE_BASE_NONCE: [u8; 12] = [0x22; 12];
+    const FROZEN_V1_PART_ONE: &str = "003d00003c2ea60d28cc95ba74f479d9ba69fba8f3ae0dc5ff36bd9017ba93f2bf3538623cb9b1ea23527d7122e15f68054fab6f3a97001384264c8dbed0a6923aff00000000000000";
+    const FROZEN_V2_PART_TWO: &str =
+        "022d0000be2e9f09184b9d704c7411f32671790af637f706520d50a5da1459ee0c5e122ce4e5e9ccd0bf68abb412bb0439ff00000000000000";
+
+    fn frozen_part(hex: &str) -> Vec<u8> {
+        let mut out = vec![0u8; hex.len() / 2];
+        faster_hex::hex_decode(hex.as_bytes(), &mut out).expect("valid fixture hex");
+        out
+    }
+
+    fn frozen_part_one_plaintext() -> Vec<u8> {
+        (0..40u8).collect()
+    }
+
+    fn frozen_part_two_plaintext() -> Vec<u8> {
+        (100..124u8).collect()
+    }
+
+    async fn encrypt_part_keyed(data: &[u8], key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        EncryptReader::new_multipart_part_keyed(Cursor::new(data.to_vec()), key, base_nonce, part_number)
+            .read_to_end(&mut out)
+            .await
+            .expect("part-keyed encryption succeeds");
+        out
+    }
+
+    async fn decrypt_parts(stream: Vec<u8>, key: [u8; 32], base_nonce: [u8; 12], parts: Vec<usize>) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        DecryptReader::new_multipart(BufReader::new(Cursor::new(stream)), key, base_nonce, parts)
+            .read_to_end(&mut out)
+            .await?;
+        Ok(out)
+    }
+
+    fn part_key_salt(segment: &[u8]) -> [u8; super::PART_KEY_SALT_LEN] {
+        assert_eq!(segment[0], super::FRAME_TYPE_PART_KEY, "a part-keyed segment opens with its key frame");
+        segment[8..8 + super::PART_KEY_SALT_LEN].try_into().expect("salt slice")
+    }
+
+    /// Ciphertext bytes (tag excluded) of the frame whose header starts at
+    /// `frame_start`.
+    fn frame_ciphertext(segment: &[u8], frame_start: usize, plaintext_len: usize) -> Vec<u8> {
+        assert_ne!(segment[frame_start], super::FRAME_TYPE_END);
+        let ct_start = frame_start + 8 + put_uvarint_len(plaintext_len as u64);
+        segment[ct_start..ct_start + plaintext_len].to_vec()
+    }
+
+    fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
+        a.iter().zip(b).map(|(x, y)| x ^ y).collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_part_writes_of_one_part_number_share_a_keystream() {
+        // The defect the part-keyed layout closes: the legacy writer derives
+        // the same (key, nonce) sequence each time a part number is written,
+        // so the XOR of two ciphertexts equals the XOR of their plaintexts.
+        let first = vec![0x41u8; 64];
+        let second = vec![0x7Au8; 64];
+        let mut c1 = Vec::new();
+        EncryptReader::new_multipart(Cursor::new(first.clone()), FIXTURE_KEY, FIXTURE_BASE_NONCE, 3)
+            .read_to_end(&mut c1)
+            .await
+            .expect("legacy encryption succeeds");
+        let mut c2 = Vec::new();
+        EncryptReader::new_multipart(Cursor::new(second.clone()), FIXTURE_KEY, FIXTURE_BASE_NONCE, 3)
+            .read_to_end(&mut c2)
+            .await
+            .expect("legacy encryption succeeds");
+        assert_eq!(xor(&frame_ciphertext(&c1, 0, 64), &frame_ciphertext(&c2, 0, 64)), xor(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn part_keyed_rewrites_of_one_part_number_never_reuse_a_key_nonce_pair() {
+        let block = ENCRYPTION_BLOCK_SIZE;
+        let first = vec![0x41u8; block + 64];
+        let second = vec![0x7Au8; block + 64];
+        let c1 = encrypt_part_keyed(&first, FIXTURE_KEY, FIXTURE_BASE_NONCE, 3).await;
+        let c2 = encrypt_part_keyed(&second, FIXTURE_KEY, FIXTURE_BASE_NONCE, 3).await;
+
+        let (s1, s2) = (part_key_salt(&c1), part_key_salt(&c2));
+        assert_ne!(s1, s2, "each part write draws a fresh salt");
+        let k1 = super::derive_part_segment_key(&FIXTURE_KEY, &s1, 3);
+        let k2 = super::derive_part_segment_key(&FIXTURE_KEY, &s2, 3);
+        assert_ne!(k1, k2, "rewrites of one part number seal under different keys");
+        assert_ne!(k1, FIXTURE_KEY, "the object data key never seals a part-keyed frame");
+
+        // Same block position in both writes: the nonce is identical by
+        // construction, so the (key, nonce) pair differs only through the key,
+        // and the keystream no longer cancels out.
+        let frame_start = 8 + super::PART_KEY_SALT_LEN;
+        assert_ne!(
+            xor(&frame_ciphertext(&c1, frame_start, block), &frame_ciphertext(&c2, frame_start, block)),
+            xor(&first[..block], &second[..block])
+        );
+
+        // An identical-content retry also yields distinct ciphertext.
+        let c3 = encrypt_part_keyed(&first, FIXTURE_KEY, FIXTURE_BASE_NONCE, 3).await;
+        assert_ne!(c1, c3);
+        for (stream, expected) in [(c1, &first), (c2, &second), (c3, &first)] {
+            let decrypted = decrypt_parts(stream, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![3])
+                .await
+                .expect("part-keyed segment decrypts");
+            assert_eq!(&decrypted, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn part_keyed_segments_round_trip_every_boundary_length() {
+        let block = ENCRYPTION_BLOCK_SIZE;
+        for len in [0, 1, block - 1, block, block + 1, 3 * block, 3 * block + 5] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let tail: Vec<u8> = vec![0xC3; 17];
+            let mut stream = encrypt_part_keyed(&data, FIXTURE_KEY, FIXTURE_BASE_NONCE, 1).await;
+            stream.extend_from_slice(&encrypt_part_keyed(&tail, FIXTURE_KEY, FIXTURE_BASE_NONCE, 2).await);
+            let mut expected = data;
+            expected.extend_from_slice(&tail);
+
+            // Small upstream reads split the key frame across polls.
+            let mut chunked = Vec::new();
+            DecryptReader::new_multipart(ChunkedCursor::new(stream.clone(), 5), FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![1, 2])
+                .read_to_end(&mut chunked)
+                .await
+                .unwrap_or_else(|e| panic!("chunked len {len}: {e}"));
+            assert_eq!(chunked, expected, "chunked len {len}");
+
+            let decrypted = decrypt_parts(stream, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![1, 2])
+                .await
+                .unwrap_or_else(|e| panic!("len {len}: {e}"));
+            assert_eq!(decrypted, expected, "len {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_legacy_parts_still_decrypt_alone_and_mixed_with_part_keyed_parts() {
+        let part_one = frozen_part(FROZEN_V1_PART_ONE);
+        let part_two = frozen_part(FROZEN_V2_PART_TWO);
+        let mut expected = frozen_part_one_plaintext();
+        expected.extend_from_slice(&frozen_part_two_plaintext());
+        let legacy = [part_one.as_slice(), part_two.as_slice()].concat();
+        assert_eq!(
+            decrypt_parts(legacy, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![1, 2])
+                .await
+                .expect("frozen legacy parts decrypt"),
+            expected
+        );
+
+        // Part 3 was written after the upgrade; parts 1 and 2 stay legacy.
+        let part_three_plain = vec![0x5Cu8; ENCRYPTION_BLOCK_SIZE + 9];
+        let part_three = encrypt_part_keyed(&part_three_plain, FIXTURE_KEY, FIXTURE_BASE_NONCE, 3).await;
+        let mut expected_all = expected.clone();
+        expected_all.extend_from_slice(&part_three_plain);
+        let mixed = [part_one.as_slice(), part_two.as_slice(), part_three.as_slice()].concat();
+        assert_eq!(
+            decrypt_parts(mixed, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![1, 2, 3])
+                .await
+                .expect("legacy and part-keyed parts decrypt together"),
+            expected_all
+        );
+
+        // A legacy part between part-keyed parts.
+        let keyed_one = encrypt_part_keyed(&frozen_part_one_plaintext(), FIXTURE_KEY, FIXTURE_BASE_NONCE, 1).await;
+        let interleaved = [keyed_one.as_slice(), part_two.as_slice(), part_three.as_slice()].concat();
+        assert_eq!(
+            decrypt_parts(interleaved, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![1, 2, 3])
+                .await
+                .expect("part-keyed, legacy v2 and part-keyed parts decrypt together"),
+            expected_all
+        );
+
+        // A read that starts at a later part boundary (multipart range seek).
+        let from_two = [part_two.as_slice(), part_three.as_slice()].concat();
+        let mut expected_from_two = frozen_part_two_plaintext();
+        expected_from_two.extend_from_slice(&part_three_plain);
+        assert_eq!(
+            decrypt_parts(from_two, FIXTURE_KEY, FIXTURE_BASE_NONCE, vec![2, 3])
+                .await
+                .expect("seek to a part boundary"),
+            expected_from_two
+        );
+    }
+
+    #[tokio::test]
+    async fn part_keyed_segments_reject_tampering_and_misplacement() {
+        let data = vec![0x6Du8; ENCRYPTION_BLOCK_SIZE + 3];
+        let segment = encrypt_part_keyed(&data, FIXTURE_KEY, FIXTURE_BASE_NONCE, 2).await;
+        let key_frame_len = 8 + super::PART_KEY_SALT_LEN;
+        let decrypt = |stream: Vec<u8>, parts: Vec<usize>| decrypt_parts(stream, FIXTURE_KEY, FIXTURE_BASE_NONCE, parts);
+
+        // A modified salt with a consistent CRC derives another key.
+        let mut salt_flip = segment.clone();
+        salt_flip[8] ^= 0x01;
+        let crc = super::crc32(&salt_flip[8..key_frame_len]);
+        salt_flip[4..8].copy_from_slice(&crc.to_le_bytes());
+        let err = decrypt(salt_flip, vec![2]).await.expect_err("salt tampering must fail");
+        assert_eq!(err.to_string(), "v2 encrypted frame failed authentication");
+
+        // A salt that disagrees with its header CRC is corruption.
+        let mut crc_flip = segment.clone();
+        crc_flip[9] ^= 0x01;
+        let err = decrypt(crc_flip, vec![2]).await.expect_err("salt CRC mismatch must fail");
+        assert_eq!(err.to_string(), "part key frame CRC32 mismatch");
+
+        // The segment key binds the part number: the same bytes listed as
+        // another part fail authentication.
+        decrypt(segment.clone(), vec![5])
+            .await
+            .expect_err("a segment moved to another part must fail");
+
+        // Without its key frame the segment is decrypted under the data key.
+        decrypt(segment[key_frame_len..].to_vec(), vec![2])
+            .await
+            .expect_err("a stripped key frame must fail");
+
+        // A key frame alone, or followed only by the end marker, is truncation.
+        decrypt(segment[..key_frame_len].to_vec(), vec![2])
+            .await
+            .expect_err("a lone key frame must fail");
+        let mut key_then_end = segment[..key_frame_len].to_vec();
+        key_then_end.extend_from_slice(&[super::FRAME_TYPE_END, 0, 0, 0, 0, 0, 0, 0]);
+        decrypt(key_then_end, vec![2])
+            .await
+            .expect_err("an empty keyed segment must fail");
+
+        // A second key frame cannot switch keys mid-segment.
+        let first_frame_end = key_frame_len + V2_FULL_FRAME_LEN;
+        let rekeyed = [
+            &segment[..first_frame_end],
+            &segment[..key_frame_len],
+            &segment[first_frame_end..],
+        ]
+        .concat();
+        let err = decrypt(rekeyed, vec![2])
+            .await
+            .expect_err("a mid-segment key frame must fail");
+        assert_eq!(err.to_string(), "part key frame outside the start of a multipart part segment");
+
+        // A keyed segment carries only v2 frames.
+        let mut v1 = Vec::new();
+        EncryptReader::new_multipart(Cursor::new(vec![0x01u8; 16]), FIXTURE_KEY, FIXTURE_BASE_NONCE, 2)
+            .read_to_end(&mut v1)
+            .await
+            .expect("v1 encryption succeeds");
+        let v1_after_key = [&segment[..key_frame_len], v1.as_slice()].concat();
+        decrypt(v1_after_key, vec![2])
+            .await
+            .expect_err("v1 frames in a keyed segment must fail");
+
+        // Malformed key-frame length.
+        let mut bad_len = segment.clone();
+        bad_len[1] = bad_len[1].wrapping_add(1);
+        let err = decrypt(bad_len, vec![2]).await.expect_err("a malformed key frame must fail");
+        assert_eq!(err.to_string(), "invalid part key frame length");
+
+        // Single-part streams never carry part keys.
+        let mut single = Vec::new();
+        let err = DecryptReader::new(Cursor::new(segment.clone()), FIXTURE_KEY, FIXTURE_BASE_NONCE)
+            .read_to_end(&mut single)
+            .await
+            .expect_err("a single-part reader must reject a key frame");
+        assert_eq!(err.to_string(), "part key frame outside the start of a multipart part segment");
+
+        // Control: the untampered segment decrypts.
+        assert_eq!(decrypt(segment, vec![2]).await.expect("control decrypt"), data);
     }
 }

@@ -3078,26 +3078,58 @@ mod tests {
         object: &str,
         key_bytes: [u8; 32],
         part_plain_sizes: &[usize],
+        user_defined: HashMap<String, String>,
+    ) -> LegacyMultipartFixture {
+        let layouts = vec![FixturePartLayout::Legacy; part_plain_sizes.len()];
+        build_multipart_fixture_with_layouts(bucket, object, key_bytes, part_plain_sizes, &layouts, user_defined).await
+    }
+
+    /// Stored layout of one fixture part: the legacy v1 segment, or the
+    /// part-keyed v2 segment written under `RUSTFS_ENCRYPTION_MULTIPART_PART_KEY`.
+    #[derive(Clone, Copy)]
+    enum FixturePartLayout {
+        Legacy,
+        PartKeyed,
+    }
+
+    async fn build_multipart_fixture_with_layouts(
+        bucket: &str,
+        object: &str,
+        key_bytes: [u8; 32],
+        part_plain_sizes: &[usize],
+        layouts: &[FixturePartLayout],
         mut user_defined: HashMap<String, String>,
     ) -> LegacyMultipartFixture {
+        assert_eq!(part_plain_sizes.len(), layouts.len());
         let mut plaintext = Vec::new();
         let mut ciphertext = Vec::new();
         let mut parts = Vec::new();
         let mut part_physical_sizes = Vec::new();
 
-        for (part_index, &part_plain_size) in part_plain_sizes.iter().enumerate() {
+        for (part_index, (&part_plain_size, layout)) in part_plain_sizes.iter().zip(layouts).enumerate() {
             let part_number = part_index + 1;
             let part_plain = legacy_fixture_part_plaintext(part_number, part_plain_size);
             let mut part_cipher = Vec::new();
-            rustfs_rio::EncryptReader::new_multipart(
-                Cursor::new(part_plain.clone()),
-                key_bytes,
-                LEGACY_FIXTURE_BASE_NONCE,
-                part_number,
-            )
-            .read_to_end(&mut part_cipher)
-            .await
-            .expect("encrypt multipart fixture part");
+            match layout {
+                FixturePartLayout::Legacy => rustfs_rio::EncryptReader::new_multipart(
+                    Cursor::new(part_plain.clone()),
+                    key_bytes,
+                    LEGACY_FIXTURE_BASE_NONCE,
+                    part_number,
+                )
+                .read_to_end(&mut part_cipher)
+                .await
+                .expect("encrypt multipart fixture part"),
+                FixturePartLayout::PartKeyed => rustfs_rio::EncryptReader::new_multipart_part_keyed(
+                    Cursor::new(part_plain.clone()),
+                    key_bytes,
+                    LEGACY_FIXTURE_BASE_NONCE,
+                    part_number,
+                )
+                .read_to_end(&mut part_cipher)
+                .await
+                .expect("encrypt part-keyed multipart fixture part"),
+            };
 
             parts.push(ObjectPartInfo {
                 number: part_number,
@@ -3484,6 +3516,71 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn part_keyed_and_mixed_ssec_multipart_reads_are_byte_exact() {
+        use FixturePartLayout::{Legacy, PartKeyed};
+        let key_bytes = [0x74; 32];
+        let sizes = [20_000, 9_000, 5_000];
+        let total_plaintext: usize = sizes.iter().sum();
+        let headers = ssec_headers_from_key(key_bytes);
+        for layouts in [
+            [PartKeyed, PartKeyed, PartKeyed],
+            [Legacy, PartKeyed, Legacy],
+            [PartKeyed, Legacy, PartKeyed],
+        ] {
+            let fixture = build_multipart_fixture_with_layouts(
+                "bucket",
+                "part-keyed-multipart",
+                key_bytes,
+                &sizes,
+                &layouts,
+                legacy_ssec_multipart_metadata(key_bytes, total_plaintext),
+            )
+            .await;
+            let total = fixture.plaintext.len() as i64;
+            let starts = [0, fixture.physical_part_start(1), fixture.physical_part_start(2)];
+            let ranges: [(i64, i64, usize); 9] = [
+                (0, 9, starts[0]),
+                (8_191, 8_193, starts[0]),
+                (19_999, 20_000, starts[0]),
+                (20_000, 20_000, starts[1]),
+                (20_100, 20_199, starts[1]),
+                (20_000, 29_100, starts[1]),
+                (28_999, 29_000, starts[1]),
+                (33_900, 33_999, starts[2]),
+                (0, total - 1, starts[0]),
+            ];
+
+            for seek in ["true", "false"] {
+                async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some(seek))], async {
+                    let opts = ObjectOptions::default();
+                    for (start, end, part_start) in ranges {
+                        let label = format!("seek={seek} range {start}-{end}");
+                        let (body, offset, _, reported) =
+                            read_via_seek_window(&fixture, Some(range(start, end)), &opts, &headers).await;
+                        let expected = &fixture.plaintext[start as usize..=end as usize];
+                        assert_eq!(body, expected, "{label}: body bytes");
+                        assert_eq!(reported, end - start + 1, "{label}: reported size");
+                        let expected_offset = if seek == "true" { part_start } else { 0 };
+                        assert_eq!(offset, expected_offset, "{label}: physical offset");
+                    }
+
+                    let (body, offset, length, _) = read_via_seek_window(&fixture, None, &opts, &headers).await;
+                    assert_eq!((offset, length), (0, fixture.ciphertext.len() as i64), "seek={seek}: full read");
+                    assert_eq!(body, fixture.plaintext, "seek={seek}: full body");
+
+                    let part_two = ObjectOptions {
+                        part_number: Some(2),
+                        ..Default::default()
+                    };
+                    let (body, _, _, _) = read_via_seek_window(&fixture, None, &part_two, &headers).await;
+                    assert_eq!(body, &fixture.plaintext[20_000..29_000], "seek={seek}: partNumber=2 body");
+                })
+                .await;
+            }
+        }
     }
 
     /// The amplification-inversion guard: a small Range inside part 2 must schedule
