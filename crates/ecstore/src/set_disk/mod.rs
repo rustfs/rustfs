@@ -7171,10 +7171,10 @@ fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Opti
         return Some(part_numbers);
     }
 
-    part_numbers
-        .iter()
-        .position(|&part_number| part_number != 0 && part_number == part_number_marker)
-        .map(|index| &part_numbers[index + 1..])
+    // reduce_quorum_part_numbers returns sorted numbers; the marker need not exist.
+    part_numbers.last().filter(|&&last| part_number_marker <= last)?;
+    let index = part_numbers.partition_point(|&part_number| part_number <= part_number_marker);
+    Some(&part_numbers[index..])
 }
 
 pub fn canonicalize_etag(etag: &str) -> String {
@@ -13970,6 +13970,24 @@ mod tests {
         let part_numbers = vec![1, 2, 3];
 
         assert!(parts_after_marker(&part_numbers, 4).is_none());
+    }
+
+    #[test]
+    fn parts_after_marker_uses_exclusive_numeric_boundary_for_sparse_parts() {
+        let part_numbers = [1, 3, 10];
+        for (marker, expected) in [
+            (0, Some(&part_numbers[..])),
+            (1, Some(&part_numbers[1..])),
+            (2, Some(&part_numbers[1..])),
+            (3, Some(&part_numbers[2..])),
+            (9, Some(&part_numbers[2..])),
+            (10, Some(&part_numbers[3..])),
+            (11, None),
+            (usize::MAX, None),
+        ] {
+            assert_eq!(parts_after_marker(&part_numbers, marker), expected, "marker {marker}");
+        }
+        assert_eq!(parts_after_marker(&[], 1), None);
     }
 
     #[test]

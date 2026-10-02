@@ -260,6 +260,55 @@ mod tests {
     }
 
     #[test]
+    fn test_list_parts_output_xml_omits_terminal_marker() {
+        for (marker, part_numbers) in [(0, vec![]), (3, vec![10]), (0, vec![1, 3])] {
+            let output = build_list_parts_output(ListPartsInfo {
+                part_number_marker: marker,
+                max_parts: 2,
+                parts: part_numbers
+                    .into_iter()
+                    .map(|part_num| PartInfo {
+                        part_num,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+
+            assert_eq!(output.is_truncated, Some(false));
+            assert_eq!(output.next_part_number_marker, None);
+            let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).expect("output should serialize"))
+                .expect("XML should be UTF-8");
+            assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+            assert!(xml.contains(&format!("<PartNumberMarker>{marker}</PartNumberMarker>")));
+            assert!(!xml.contains("NextPartNumberMarker"), "terminal page must omit the token: {xml}");
+        }
+    }
+
+    #[test]
+    fn test_list_parts_output_xml_preserves_truncated_marker() {
+        let output = build_list_parts_output(ListPartsInfo {
+            is_truncated: true,
+            next_part_number_marker: Some(3),
+            max_parts: 2,
+            parts: [1, 3]
+                .into_iter()
+                .map(|part_num| PartInfo {
+                    part_num,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+
+        let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).expect("output should serialize"))
+            .expect("XML should be UTF-8");
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"));
+        assert_eq!(output.parts.as_ref().expect("parts should be present").len(), 2);
+    }
+
+    #[test]
     fn test_list_parts_output_reports_logical_size_for_compressed_parts() {
         let input = ListPartsInfo {
             bucket: "bucket-a".to_string(),
