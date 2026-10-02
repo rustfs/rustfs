@@ -6888,7 +6888,6 @@ impl LocalDisk {
     }
 
     #[tracing::instrument(name = "delete_file", level = "trace", skip_all)]
-    #[async_recursion::async_recursion]
     async fn delete_file_with_namespace_owner(
         &self,
         base_path: &PathBuf,
@@ -8057,7 +8056,6 @@ impl LocalDisk {
         Err(DiskError::FileCorrupt)
     }
 
-    #[async_recursion::async_recursion]
     #[allow(clippy::too_many_arguments)]
     async fn scan_dir<W>(
         &self,
