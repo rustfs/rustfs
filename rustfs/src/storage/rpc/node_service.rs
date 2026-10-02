@@ -2131,7 +2131,7 @@ impl Node for NodeService {
         verify_tonic_canonical_body_digest(&request, &canonical_body)
             .map_err(|err| Status::permission_denied(format!("object metadata cache mutation authentication failed: {err}")))?;
 
-        let local_cache_enabled = rustfs_ecstore::object_metadata_cache_distributed_enabled();
+        let local_cache_enabled = crate::storage::storage_api::object_metadata_cache_distributed_enabled();
         if phase == rustfs_protos::ObjectMetadataCacheMutationRpcPhase::ConfigProbe {
             return object_metadata_cache_mutation_response(body, true, None, local_cache_enabled);
         }
@@ -5044,7 +5044,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 object: "object".to_string(),
                 scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object.as_wire_value(),
-                cache_enabled: rustfs_ecstore::object_metadata_cache_distributed_enabled(),
+                cache_enabled: crate::storage::storage_api::object_metadata_cache_distributed_enabled(),
             })
         };
 

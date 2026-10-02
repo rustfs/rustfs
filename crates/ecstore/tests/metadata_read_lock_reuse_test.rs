@@ -18,6 +18,7 @@ mod storage_api;
 
 use std::sync::Arc;
 use std::time::Duration;
+use storage_api::contract_compat::ECStore;
 use storage_api::metadata_lock::{
     BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
     ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, enable_safe_no_quota_cache_fast_path_for_test,
@@ -257,7 +258,7 @@ async fn safe_no_quota_cache_fast_path_fails_closed_on_invalid_quota_json() {
         .expect_err("invalid quota JSON must not degrade to no-quota");
 }
 
-async fn quota_snapshot_options(store: &Arc<storage_api::ECStore>, bucket: &str) -> ObjectOptions {
+async fn quota_snapshot_options(store: &Arc<ECStore>, bucket: &str) -> ObjectOptions {
     ObjectOptions {
         versioned: true,
         version_id: Some(Uuid::new_v4().to_string()),

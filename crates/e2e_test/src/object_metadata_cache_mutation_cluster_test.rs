@@ -18,13 +18,13 @@
 //! restart recovery across independent RustFS processes.
 
 use crate::common::{RustFSTestClusterEnvironment, init_logging};
+use crate::storage_api::PeerRestClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, Tag, Tagging,
     VersioningConfiguration,
 };
-use rustfs_ecstore::api::rpc::PeerRestClient;
 use rustfs_utils::XHost;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
