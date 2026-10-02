@@ -3500,6 +3500,13 @@ impl SetDisks {
         mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         let protect_write = opts.shard_integrity_write_enabled();
+        let source_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
+            Some(incarnation_id) => Some(incarnation_id),
+            // Internal metadata writes may already hold the pool metadata
+            // lock; resolving a user bucket identity would re-enter it.
+            None if !is_meta_bucketname(bucket) => self.bucket_incarnation_id_from_disk(bucket).await.ok(),
+            None => None,
+        };
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
@@ -4031,7 +4038,7 @@ impl SetDisks {
             {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
-                if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+                if let Some(expected_incarnation_id) = source_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
                 {
                     bucket_lifecycle_guard = Some(
@@ -4642,6 +4649,7 @@ impl SetDisks {
                         request.object_version_id = committed_version_id
                             .or_else(|| commit_version_suspended.then(Uuid::nil))
                             .map(|version_id| version_id.to_string());
+                        request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
                         let object_lock_guard = _object_lock_guard.take();
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
@@ -4790,6 +4798,7 @@ impl SetDisks {
                     request.object_version_id = committed_version_id
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
+                    request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
                     commit_set.submit_rename_tail_heal(request).await;
                 }
 
@@ -7492,8 +7501,15 @@ impl SetDisks {
             ensure_delete_commit_locks_held(None, bucket, &encoded_object, opts)?;
             authorization.authorized_journal_name(&candidate)?;
             begin_scanner_publication_delete_mutation(opts.scanner_publication_commit_scope.as_ref())?;
-            self.delete_object_version(bucket, &encoded_object, &delete_request, false)
-                .await?;
+            self.delete_object_version_with_purge(
+                bucket,
+                &encoded_object,
+                &delete_request,
+                false,
+                None,
+                opts.expected_bucket_incarnation_id,
+            )
+            .await?;
             if let Some((_, deleted_object)) = replication_delete {
                 ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
             }
@@ -7573,6 +7589,7 @@ impl SetDisks {
         fi: &FileInfo,
         force_del_marker: bool,
         delete_marker_purge: Option<MrfDeleteMarkerPurge>,
+        source_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<()> {
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
@@ -7727,10 +7744,52 @@ impl SetDisks {
         {
             let version_id = fi.version_id.map(|version| version.to_string());
             let _ = self
-                .add_partial(bucket, object, version_id.as_deref().unwrap_or_default())
+                .add_partial_with_source_incarnation(
+                    bucket,
+                    object,
+                    version_id.as_deref().unwrap_or_default(),
+                    source_bucket_incarnation_id,
+                )
                 .await;
         }
         quorum_result
+    }
+}
+
+impl SetDisks {
+    async fn add_partial_with_source_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        source_bucket_incarnation_id: Option<Uuid>,
+    ) -> Result<()> {
+        if self
+            .persist_partial_write(bucket, object, Some(version_id), source_bucket_incarnation_id)
+            .await
+        {
+            return Ok(());
+        }
+        let Some(source_bucket_incarnation_id) = source_bucket_incarnation_id else {
+            // The fallback is best-effort. Without the source generation it
+            // cannot safely target the object name after bucket recreation.
+            return Ok(());
+        };
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+            bucket.to_string(),
+            Some(object.to_string()),
+            false,
+            Some(HealChannelPriority::Normal),
+            Some(self.pool_index),
+            Some(self.set_index),
+        );
+        request.object_version_id = (!version_id.is_empty()).then(|| version_id.to_string());
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
+        request.expected_bucket_incarnation_id = Some(source_bucket_incarnation_id);
+        if let Err(error) = rustfs_heal_contracts::heal_channel::send_heal_request(request).await {
+            warn!(bucket, object, version_id, error = %error, "Failed to enqueue heal request for partial object");
+        }
+        Ok(())
     }
 }
 
@@ -8021,7 +8080,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        self.delete_object_version_with_purge(bucket, object, fi, force_del_marker, None)
+        let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            self.bucket_incarnation_id_from_disk(bucket).await.ok()
+        };
+        self.delete_object_version_with_purge(bucket, object, fi, force_del_marker, None, source_bucket_incarnation_id)
             .await
     }
 
@@ -8843,7 +8907,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 delete_request.set_skip_tier_free_version();
                             }
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                            self.delete_object_version_with_purge(
+                                bucket,
+                                object,
+                                &delete_request,
+                                false,
+                                None,
+                                opts.expected_bucket_incarnation_id,
+                            )
+                            .await?;
                             if let Some((_, deleted_object)) = replication_delete {
                                 ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
                             }
@@ -8858,7 +8930,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                            self.delete_object_version_with_purge(
+                                bucket,
+                                object,
+                                &delete_request,
+                                false,
+                                None,
+                                opts.expected_bucket_incarnation_id,
+                            )
+                            .await?;
                         }
                         for version in &versions.free_versions {
                             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
@@ -8870,7 +8950,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             };
                             delete_request.set_tier_free_version();
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                            self.delete_object_version_with_purge(
+                                bucket,
+                                object,
+                                &delete_request,
+                                false,
+                                None,
+                                opts.expected_bucket_incarnation_id,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -8978,7 +9066,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             };
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-            self.delete_object_version(bucket, object, &dfi, false)
+            self.delete_object_version_with_purge(bucket, object, &dfi, false, None, opts.expected_bucket_incarnation_id)
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
@@ -9072,6 +9160,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &fi,
                 should_force_delete_marker_for_missing_version(&opts),
                 delete_marker_purge.clone(),
+                opts.expected_bucket_incarnation_id,
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -9124,9 +9213,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if opts.skip_free_version {
             dfi.set_skip_tier_free_version();
         }
-        self.delete_object_version_with_purge(bucket, object, &dfi, opts.delete_marker, delete_marker_purge)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+        self.delete_object_version_with_purge(
+            bucket,
+            object,
+            &dfi,
+            opts.delete_marker,
+            delete_marker_purge,
+            opts.expected_bucket_incarnation_id,
+        )
+        .await
+        .map_err(|e| to_object_err(e, vec![bucket, object]))?;
         #[cfg(test)]
         pause_delete_object_commit_after_publish(bucket, object).await;
 
@@ -9188,28 +9284,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        if self.persist_partial_write(bucket, object, Some(version_id)).await {
-            return Ok(());
-        }
-        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
-            bucket.to_string(),
-            Some(object.to_string()),
-            false,
-            Some(HealChannelPriority::Normal),
-            Some(self.pool_index),
-            Some(self.set_index),
-        );
-        request.object_version_id = (!version_id.is_empty()).then(|| version_id.to_string());
-        if let Err(e) = rustfs_heal_contracts::heal_channel::send_heal_request(request).await {
-            warn!(
-                bucket,
-                object,
-                version_id,
-                error = %e,
-                "Failed to enqueue heal request for partial object"
-            );
-        }
-        Ok(())
+        let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            self.bucket_incarnation_id_from_disk(bucket).await.ok()
+        };
+        self.add_partial_with_source_incarnation(bucket, object, version_id, source_bucket_incarnation_id)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -9768,7 +9849,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         #[cfg(all(test, feature = "test-util"))]
         pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
-        if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
+        if let Err(err) = self
+            .delete_object_version_with_purge(bucket, object, &fi, false, None, opts.expected_bucket_incarnation_id)
+            .await
+        {
             warn!(
                 bucket = bucket,
                 object = object,
@@ -9839,7 +9923,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 continue;
             }
             let _ = self
-                .add_partial(bucket, object, opts.version_id.as_deref().unwrap_or_default())
+                .add_partial_with_source_incarnation(
+                    bucket,
+                    object,
+                    opts.version_id.as_deref().unwrap_or_default(),
+                    opts.expected_bucket_incarnation_id,
+                )
                 .await;
             break;
         }
@@ -19558,15 +19647,11 @@ mod put_object_tmp_cleanup_tests {
                 expected.is_subset(&after_tail),
                 "the detached tail must re-mark capacity after the first scope was drained"
             );
-            let request = tokio::time::timeout(Duration::from_secs(30), heal_requests.recv())
-                .await
-                .expect("a failed tail should submit heal")
-                .expect("the per-set heal capture should stay connected");
-            assert_eq!(request.bucket, bucket);
-            assert_eq!(request.object_prefix.as_deref(), Some(object));
-            assert_eq!(request.object_version_id.as_deref(), Some(expected_version_id.as_str()));
-            assert_eq!(request.pool_index, Some(set_disks.pool_index));
-            assert_eq!(request.set_index, Some(set_disks.set_index));
+            assert!(
+                heal_requests.try_recv().is_err(),
+                "a legacy fixture without a bucket-generation record must not enqueue an unfenced fallback heal"
+            );
+            assert_eq!(expected_version_id, Uuid::nil().to_string());
         })
         .await;
     }
@@ -19687,7 +19772,7 @@ mod put_object_tmp_cleanup_tests {
 
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
-    async fn tail_drained_put_preserves_quorum_success_and_heals_failed_tail() {
+    async fn tail_drained_put_preserves_quorum_success_without_unfenced_fallback_heal() {
         let (_dirs, disks, set) = hermetic_set_disks(4).await;
         let bucket = "put-full-tail-heal";
         let object = "full-tail-heal-object";
@@ -19723,12 +19808,10 @@ mod put_object_tmp_cleanup_tests {
             .expect("PUT task should join")
             .expect("a minority tail error must not negate committed quorum");
         assert_eq!(tasks.running(), 0);
-        let heal = tokio::time::timeout(Duration::from_secs(30), heals.recv())
-            .await
-            .expect("failed tail must schedule heal")
-            .expect("heal capture must remain connected");
-        assert_eq!(heal.bucket, bucket);
-        assert_eq!(heal.object_prefix.as_deref(), Some(object));
+        assert!(
+            heals.try_recv().is_err(),
+            "a legacy fixture without a bucket-generation record must not enqueue an unfenced fallback heal"
+        );
         let info = set
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
@@ -22369,6 +22452,61 @@ mod single_delete_namespace_owner_tests {
         )
         .await
         .expect("seed a complete real object version");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_metadata_mutations_do_not_reenter_pool_metadata() {
+        let (_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let set = &store.pools[0].disk_set[0];
+        let disks = set.disk_inventory().await.into_iter().flatten().collect::<Vec<_>>();
+
+        for bucket in [RUSTFS_META_BUCKET, crate::disk::MIGRATING_META_BUCKET] {
+            for disk in &disks {
+                if let Err(err) = disk.make_volume(bucket).await {
+                    assert_eq!(err, DiskError::VolumeExists, "prepare the internal metadata volume");
+                }
+            }
+            let version = Uuid::new_v4();
+            seed_version(set, bucket, "delete-under-pool-lock", version, b"metadata version").await;
+            let request = FileInfo {
+                name: "delete-under-pool-lock".to_string(),
+                version_id: Some(version),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let mut reader = PutObjReader::from_vec(b"metadata under lock".to_vec());
+            let opts = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+
+            // Pool metadata transactions retain this write guard while saving
+            // internal objects. None of these paths may look up a user bucket.
+            let _pool_meta_guard = store.pool_meta.write().await;
+            let limit = Duration::from_secs(30);
+            let (put, delete, partial) = tokio::join!(
+                tokio::time::timeout(limit, set.put_object(bucket, "put-under-pool-lock", &mut reader, &opts)),
+                tokio::time::timeout(limit, set.delete_object_version(bucket, &request.name, &request, false)),
+                tokio::time::timeout(limit, set.add_partial(bucket, "partial-under-pool-lock", "")),
+            );
+            assert!(
+                matches!(&put, Ok(Ok(_))) && matches!(&delete, Ok(Ok(()))) && matches!(&partial, Ok(Ok(()))),
+                "internal operations must finish while pool metadata is locked: bucket={bucket}, put={put:?}, delete={delete:?}, partial={partial:?}"
+            );
+            for disk in &disks {
+                let written = disk
+                    .read_version("", bucket, "put-under-pool-lock", "", &ReadOptions::default())
+                    .await
+                    .expect("the internal PUT must reach every disk");
+                assert_eq!(written.size, b"metadata under lock".len() as i64);
+                let deleted = disk
+                    .read_version("", bucket, &request.name, &version.to_string(), &ReadOptions::default())
+                    .await;
+                assert!(matches!(deleted, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)));
+            }
+        }
     }
 
     #[tokio::test]

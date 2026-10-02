@@ -891,8 +891,8 @@ impl DefaultMultipartUsecase {
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some(location),
-            server_side_encryption: server_side_encryption.clone(),
-            ssekms_key_id: ssekms_key_id.clone(),
+            server_side_encryption,
+            ssekms_key_id,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
@@ -1769,18 +1769,25 @@ impl DefaultMultipartUsecase {
             .into());
         }
 
-        let (src_reader, _source_cancellation) = store
-            .get_object_reader_for_copy(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+        let prepared_source = store
+            .prepare_get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 
-        let src_info = src_reader.object_info;
+        let src_info = prepared_source.object_info();
+        if src_info.delete_marker {
+            let error = if src_opts.version_id.is_none() {
+                StorageError::ObjectNotFound(src_bucket.clone(), src_key.clone())
+            } else {
+                StorageError::MethodNotAllowed
+            };
+            return Err(map_get_object_reader_error(error).into());
+        }
 
         // Same shape as CopyObject: the part copy reads the source plaintext, and the source
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let src_stream = src_reader.stream;
         let resolved_src_version_id = src_info.version_id.map(|version_id| {
             if version_id == Uuid::nil() {
                 "null".to_string()
@@ -1811,12 +1818,13 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        let source_logical_size = match src_info.get_actual_size() {
-            Ok(size) if size >= 0 => size,
-            Ok(_) | Err(_) if destination_size_limit.is_some() => {
+        let source_actual_size = src_info.get_actual_size().ok().filter(|size| *size >= 0);
+        let source_logical_size = match source_actual_size {
+            Some(size) => size,
+            None if destination_size_limit.is_some() => {
                 return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
             }
-            Ok(_) | Err(_) => src_info.size,
+            None => src_info.size,
         };
 
         let (_start_offset, length) = if let Some(ref range_spec) = rs {
@@ -1831,6 +1839,26 @@ impl DefaultMultipartUsecase {
         } else {
             (0, source_logical_size)
         };
+
+        // Resolve the range under the prepared source's read lock, then try the
+        // shared budget without waiting while holding namespace/lifecycle locks.
+        // Keep both the budget and source cancellation alive through the write.
+        let admission_length = source_actual_size.map_or(-1, |_| length);
+        let _copy_admission = match self.concurrency_manager().try_admit_multipart_part_copy(admission_length) {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => Some(permit),
+            ForegroundWriteAdmission::Rejected => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
+                ));
+            }
+        };
+        let (src_reader, _source_cancellation) = prepared_source
+            .into_reader_for_copy()
+            .await
+            .map_err(map_get_object_reader_error)?;
+        let src_stream = src_reader.stream;
 
         let is_disk_compressed =
             rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
@@ -2035,6 +2063,7 @@ mod tests {
     use super::*;
 
     mod body_read_tests;
+    mod copy_admission_tests;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
     use rustfs_filemeta::ObjectPartInfo;
     use rustfs_utils::http::{

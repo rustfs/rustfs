@@ -6,7 +6,7 @@
 # #1052 — all closed) and now keep the resulting boundaries from rotting
 # (facade bypasses, compat-shim resurrection, owner-module drift). Closed
 # migration issues are NOT a reason to retire this script or its pins.
-# Runs in ci.yml Quick Checks and .github/workflows/architecture-migration-rules.yml.
+# Runs in ci.yml Quick Checks for every pull request.
 
 set -euo pipefail
 

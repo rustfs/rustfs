@@ -41,6 +41,9 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+// Allow durable state and real TLS setup independently of transport and cancellation deadlines.
+const STATUS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
@@ -191,7 +194,21 @@ impl Reply {
 struct TestServer {
     endpoint: String,
     seen: Arc<Mutex<Vec<Value>>>,
+    paths: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl TestServer {
+    fn request_diagnostics(&self) -> String {
+        match self.paths.try_lock() {
+            Ok(paths) => format!(
+                "request_count={} request_paths={paths:?} server_task_finished={}",
+                paths.len(),
+                self.task.is_finished()
+            ),
+            Err(error) => format!("request_paths_unavailable={error} server_task_finished={}", self.task.is_finished()),
+        }
+    }
 }
 
 impl Drop for TestServer {
@@ -207,16 +224,20 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
     let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let captured_paths = paths.clone();
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let replies = replies.clone();
             let seen = captured.clone();
+            let paths = captured_paths.clone();
             tokio::spawn(async move {
                 let Ok(stream) = acceptor.accept(stream).await else { return };
                 let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                     let replies = replies.clone();
                     let seen = seen.clone();
+                    let paths = paths.clone();
                     async move {
                         let path = request.uri().path().to_owned();
                         assert!(
@@ -227,6 +248,7 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
                         seen.lock()
                             .expect("seen lock")
                             .push(serde_json::from_slice(&body).expect("request JSON"));
+                        paths.lock().expect("paths lock").push(path.clone());
                         let reply = if path.ends_with("/diagnosticExecutionReceipts") {
                             Reply {
                                 status: StatusCode::OK,
@@ -266,6 +288,7 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
     TestServer {
         endpoint: format!("https://localhost:{}/agent/", address.port()),
         seen,
+        paths,
         task,
     }
 }
@@ -314,20 +337,33 @@ fn summary() -> CoarseNodeSummary {
 }
 
 async fn wait_for(
+    server: &TestServer,
     status: &mut watch::Receiver<HeartbeatStatus>,
     predicate: impl Fn(&HeartbeatStatus) -> bool,
 ) -> HeartbeatStatus {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(STATUS_OBSERVATION_TIMEOUT, async {
         loop {
             let current = status.borrow_and_update().clone();
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("status channel");
+            status.changed().await.unwrap_or_else(|error| {
+                panic!(
+                    "heartbeat status channel closed: {error}; last status: {:?}; {}",
+                    *status.borrow(),
+                    server.request_diagnostics()
+                )
+            });
         }
     })
     .await
-    .expect("heartbeat status timeout")
+    .unwrap_or_else(|error| {
+        panic!(
+            "heartbeat status timeout: {error}; last status: {:?}; {}",
+            *status.borrow(),
+            server.request_diagnostics()
+        )
+    })
 }
 
 async fn assert_credential_failure(config: HeartbeatConfig, server: &TestServer, expected: &str) {
@@ -337,7 +373,7 @@ async fn assert_credential_failure(config: HeartbeatConfig, server: &TestServer,
         .expect("configured runtime");
     let mut status = runtime.status();
     assert!(matches!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+        wait_for(server, &mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
         HeartbeatStatus::Failed { reason } if reason.contains(expected)
     ));
     assert!(server.seen.lock().expect("seen lock").is_empty());
@@ -433,7 +469,7 @@ async fn corrupt_persisted_state_is_rejected_before_network_delivery() {
     let mut status = runtime.status();
 
     assert!(matches!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+        wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
         HeartbeatStatus::Failed { reason } if reason.contains("violates the protocol invariants")
     ));
     assert!(server.seen.lock().expect("seen lock").is_empty());
@@ -502,7 +538,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
     let mut status = runtime.status();
 
     assert_eq!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
         HeartbeatStatus::Online {
             server_time: "2038-01-19T03:14:07Z".to_owned()
         }
@@ -596,7 +632,7 @@ async fn restart_replays_a_pending_heartbeat_from_before_environment_collection(
         .expect("configured runtime");
     let mut status = runtime.status();
     assert!(matches!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
         HeartbeatStatus::Online { .. }
     ));
     runtime.shutdown().await;
@@ -617,7 +653,7 @@ async fn restart_replays_pending_request_then_advances_sequence() {
         .expect("start runtime")
         .expect("configured runtime");
     let mut status = runtime.status();
-    wait_for(&mut status, |status| matches!(status, HeartbeatStatus::BackingOff { .. })).await;
+    wait_for(&first_server, &mut status, |status| matches!(status, HeartbeatStatus::BackingOff { .. })).await;
     runtime.shutdown().await;
     let first = first_server.seen.lock().expect("seen lock")[0].clone();
     drop(first_server);
@@ -634,7 +670,13 @@ async fn restart_replays_pending_request_then_advances_sequence() {
         }
     })
     .await
-    .expect("two heartbeats");
+    .unwrap_or_else(|error| {
+        panic!(
+            "two heartbeats: {error}; last status: {:?}; received: {}",
+            *runtime.status().borrow(),
+            second_server.seen.lock().expect("seen lock").len()
+        )
+    });
     runtime.shutdown().await;
 
     let seen = second_server.seen.lock().expect("seen lock");
@@ -694,14 +736,25 @@ fn pending_heartbeat_with_capabilities(capabilities: &[&str]) -> Value {
 
 #[tokio::test]
 async fn restart_replays_exact_legacy_capabilities_with_and_without_jobs() {
-    for (job_capable, service_memory) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (job_capable, service_memory, health_service) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
         let pki = TestPki::new();
         let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
         let temp = tempfile::tempdir().expect("tempdir");
         let shutdown = CancellationToken::new();
         let config = config(&temp, &pki, &server);
         fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
-        let pending = pending_heartbeat_with_capabilities(&legacy_capabilities(job_capable, service_memory));
+        let mut capabilities = legacy_capabilities(job_capable, service_memory);
+        if health_service {
+            capabilities.insert(if job_capable { 4 } else { 3 }, "health.check.service@1");
+        }
+        let pending = pending_heartbeat_with_capabilities(&capabilities);
         let state = json!({"nextSequence": 0, "pending": pending});
         fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
         private_mode(&config.state_path);
@@ -710,7 +763,7 @@ async fn restart_replays_exact_legacy_capabilities_with_and_without_jobs() {
             .expect("configured runtime");
         let mut status = runtime.status();
         assert!(matches!(
-            wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+            wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
             HeartbeatStatus::Online { .. }
         ));
         runtime.shutdown().await;
@@ -750,7 +803,7 @@ async fn legacy_compatibility_does_not_accept_changed_capabilities() {
             let mut status = runtime.status();
             assert!(
                 matches!(
-                    wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+                    wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
                     HeartbeatStatus::Failed { reason } if reason.contains("violates the protocol invariants")
                 ),
                 "accepted altered persisted capabilities: {mutation}, jobs={job_capable}, service_memory={service_memory}"
@@ -839,7 +892,7 @@ async fn retry_after_is_respected_with_the_local_upper_bound() {
         .expect("configured runtime");
     let mut status = runtime.status();
     assert_eq!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::BackingOff { .. })).await,
+        wait_for(&server, &mut status, |status| matches!(status, HeartbeatStatus::BackingOff { .. })).await,
         HeartbeatStatus::BackingOff {
             delay: Duration::from_millis(80)
         }
@@ -867,7 +920,7 @@ async fn disconnects_use_exponential_backoff_with_a_cap() {
     let mut status = runtime.status();
     for delay in [20, 40, 80] {
         assert_eq!(
-            wait_for(&mut status, |status| {
+            wait_for(&server, &mut status, |status| {
                 matches!(status, HeartbeatStatus::BackingOff { delay: observed } if *observed == Duration::from_millis(delay))
             })
             .await,
@@ -892,7 +945,11 @@ async fn revoked_credential_stops_and_exposes_local_status() {
         .expect("configured runtime");
     let mut status = runtime.status();
     assert_eq!(
-        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::AuthenticationStopped { .. })).await,
+        wait_for(&server, &mut status, |status| matches!(
+            status,
+            HeartbeatStatus::AuthenticationStopped { .. }
+        ))
+        .await,
         HeartbeatStatus::AuthenticationStopped {
             status: 401,
             reason: Some("CREDENTIAL_REVOKED".to_owned())

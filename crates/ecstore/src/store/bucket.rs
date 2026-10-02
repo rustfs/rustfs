@@ -1569,12 +1569,27 @@ mod tests {
         disk_indexes: &[usize],
     ) -> Vec<(usize, crate::disk::DiskStore)> {
         let offline = {
-            let mut disks = set.disks.write().await;
+            let disks = set.disks.read().await;
             disk_indexes
                 .iter()
-                .map(|index| (*index, disks[*index].take().expect("fault-injection disk should start online")))
+                .map(|index| (*index, disks[*index].clone().expect("fault-injection disk should start online")))
                 .collect::<Vec<_>>()
         };
+        for (_, disk) in &offline {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_offline_for_test();
+        }
+        // Empty slots can be renewed from the still-present disk paths by the endpoint monitor.
+        // Keep the original handles and prove reconnect cannot clear their injected IO failure.
+        set.connect_disks().await;
+        {
+            let disks = set.disks.read().await;
+            for (index, disk) in &offline {
+                let current = disks[*index].as_ref().expect("fault-injection slot should remain populated");
+                assert!(Arc::ptr_eq(current, disk), "reconnect must preserve the fault-injection handle");
+                assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            }
+        }
         let local_disk_map = ecstore.ctx.local_disk_map();
         let mut local_disks = local_disk_map.write().await;
         for (_, disk) in &offline {
@@ -1595,9 +1610,12 @@ mod tests {
                 local_disks.insert(disk.endpoint().to_string(), Some(Arc::clone(disk)));
             }
         }
-        let mut disks = set.disks.write().await;
+        let disks = set.disks.read().await;
         for (index, disk) in offline {
-            assert!(disks[index].replace(disk).is_none(), "fault-injection disk slot should remain empty");
+            let current = disks[index].as_ref().expect("fault-injection slot should remain populated");
+            assert!(Arc::ptr_eq(current, &disk), "fault-injection disk handle should remain unchanged");
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.reset_health_for_store_init_retry();
         }
     }
 
@@ -1854,8 +1872,12 @@ mod tests {
         assert_eq!(residue.diagnostic_bytes_read, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bucket_residue_scan_distinguishes_visible_and_tier_free_xlmeta() {
+        // Classification keeps the production budget, but real filesystem
+        // scheduling must not advance the clock before classification finishes.
+        let (clock_guard_tx, clock_guard_rx) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || clock_guard_rx.recv());
         let root = tempfile::tempdir().expect("temporary bucket root should be created");
         let bucket_path = root.path().join("bucket");
         let visible_path = bucket_path.join("visible").join(STORAGE_FORMAT_FILE);
@@ -1877,6 +1899,7 @@ mod tests {
         let visible_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("visible xl.meta scan should succeed");
+        assert!(!visible_scan.diagnostic_truncated, "{visible_scan:?}");
         assert_eq!(visible_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::VisibleVersion));
 
         tokio::fs::remove_dir_all(bucket_path.join("visible"))
@@ -1913,6 +1936,7 @@ mod tests {
         let free_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("free-version xl.meta scan should succeed");
+        assert!(!free_scan.diagnostic_truncated, "{free_scan:?}");
         assert_eq!(free_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::TierFreeVersion));
 
         tokio::fs::remove_dir_all(bucket_path.join("free"))
@@ -1933,6 +1957,7 @@ mod tests {
         let exact_limit_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("exact-limit xl.meta scan should remain fail closed");
+        assert!(!exact_limit_scan.diagnostic_truncated, "{exact_limit_scan:?}");
         assert_eq!(exact_limit_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
         assert_eq!(exact_limit_scan.diagnostic_bytes_read, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
         tokio::fs::remove_dir_all(bucket_path.join("exact-limit"))
@@ -1953,9 +1978,31 @@ mod tests {
         let oversized_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("oversized xl.meta scan should remain fail closed");
+        assert!(!oversized_scan.diagnostic_truncated, "{oversized_scan:?}");
         assert_eq!(oversized_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
         assert_eq!(oversized_scan.diagnostic_bytes_read, 0);
         assert!(oversized_scan.diagnostic_bytes_read <= BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
+
+        drop(clock_guard_tx);
+        let _ = clock_guard
+            .await
+            .expect("classification clock guard should exit after its sender is dropped");
+
+        // An exhausted diagnostic budget may return before observing xl.meta.
+        // It must report truncation rather than inventing a classification.
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let mut budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+        let truncated = scan_metadata_less_residue_with_budget(&bucket_path, &mut budget)
+            .await
+            .expect("a diagnostic timeout should return a partial scan");
+        assert!(first_io_started.load(Ordering::SeqCst));
+        assert!(truncated.diagnostic_truncated, "{truncated:?}");
+        assert_eq!(truncated.xlmeta_blocker, None);
+        assert_eq!(truncated.entries_scanned, 0);
+        assert_eq!(truncated.diagnostic_bytes_read, 0);
     }
 
     #[tokio::test]
@@ -3376,7 +3423,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn make_bucket_seeds_new_bucket_durability_override() {
+    async fn make_bucket_inherits_default_durability() {
         temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
             let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
             let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
@@ -3389,10 +3436,7 @@ mod tests {
             let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
                 .await
                 .expect("metadata should load for the new bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
         })
         .await;
     }

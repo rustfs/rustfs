@@ -107,7 +107,9 @@ async fn handle_prepare(
     }
     let tier_config_mgr = api.tier_config_mgr();
 
-    for _ in 0..3 {
+    // Peers can race to create the same durable intent. Re-read after bounded
+    // lock contention so the winning publication follows the normal identity checks.
+    for attempt in 0..3 {
         let (stored, applied) = match load_tier_mutation_intent_record(api.clone(), mutation_id).await {
             Ok(existing) => {
                 if !existing.same_identity_as(&intent) {
@@ -123,9 +125,11 @@ async fn handle_prepare(
                 match save_tier_mutation_intent_record_if_absent(api.clone(), &intent).await {
                     Ok(()) => (intent.clone(), true),
                     Err(Error::PreconditionFailed) => continue,
+                    Err(Error::Lock(rustfs_lock::LockError::Timeout { .. })) if attempt < 2 => continue,
                     Err(err) => return Err(err.into()),
                 }
             }
+            Err(Error::Lock(rustfs_lock::LockError::Timeout { .. })) if attempt < 2 => continue,
             Err(err) => return Err(err.into()),
         };
 
