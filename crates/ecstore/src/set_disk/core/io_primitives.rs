@@ -104,9 +104,9 @@ use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 #[cfg(test)]
 use crate::disk::new_disk;
 use crate::disk::{
-    BATCH_READ_VERSION_MAX_ITEMS, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp, DataDirDeleteStatus, Disk,
-    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
-    STORAGE_FORMAT_FILE_BACKUP, part_transaction_path,
+    BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
+    DataDirDeleteStatus, Disk, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
+    PartTransactionAction, STORAGE_FORMAT_FILE_BACKUP, part_transaction_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
@@ -1206,6 +1206,15 @@ pub(in crate::set_disk) async fn submit_read_repair_heal(
     .await;
 }
 
+fn is_unversioned_scanner_usage_observation(bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+    version_id.is_none()
+        && bucket == RUSTFS_META_BUCKET
+        && object
+            .strip_prefix(BUCKET_META_PREFIX)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            == Some(rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME)
+}
+
 pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     submission: ReadRepairHealSubmission<'_>,
     submitter: ReadRepairAdmissionSubmitter,
@@ -1240,6 +1249,15 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
             result = ?ingress,
             "Read-repair MRF ingress result"
         );
+    }
+
+    // The observation is best-effort scanner state and authoritative
+    // publication intentionally deletes it after convergence. Do not admit a
+    // read repair that can outlive that deletion and try to recreate the
+    // retired snapshot. Decode failures still reached the durable MRF ingress
+    // above and retain its storage-proof requirements.
+    if is_unversioned_scanner_usage_observation(bucket, object, version_id) {
+        return;
     }
 
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
@@ -7892,6 +7910,15 @@ mod tests {
         Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
     }
 
+    static READ_REPAIR_TEST_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
+        READ_REPAIR_TEST_SUBMISSIONS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
+
     fn accepted_read_repair_submitter(
         _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) -> ReadRepairAdmissionFuture {
@@ -13027,6 +13054,54 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].exists);
         assert_eq!(responses[0].error, Error::ErasureReadQuorum.to_string());
+    }
+
+    #[test]
+    fn scanner_usage_observation_read_repair_exclusion_is_exact() {
+        let observation = format!("{BUCKET_META_PREFIX}/{}", rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME);
+        assert!(is_unversioned_scanner_usage_observation(RUSTFS_META_BUCKET, &observation, None));
+
+        for (bucket, object, version_id) in [
+            ("user-bucket", observation.as_str(), None),
+            (RUSTFS_META_BUCKET, observation.as_str(), Some("version-a")),
+            (RUSTFS_META_BUCKET, rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME, None),
+            (RUSTFS_META_BUCKET, "buckets/.usage.observed.json.bkp", None),
+            (RUSTFS_META_BUCKET, "buckets/nested/.usage.observed.json", None),
+        ] {
+            assert!(
+                !is_unversioned_scanner_usage_observation(bucket, object, version_id),
+                "{bucket}/{object} {version_id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn usage_observation_is_not_admitted_for_read_repair() {
+        READ_REPAIR_TEST_SUBMISSIONS.store(0, Ordering::SeqCst);
+        let object = format!("{BUCKET_META_PREFIX}/{}", rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME);
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: RUSTFS_META_BUCKET,
+                object: &object,
+                version_id: None,
+                pool_index: 1,
+                set_index: 2,
+                part_number: Some(1),
+                reason: "metadata_read_error",
+                mrf_intent: None,
+            },
+            counting_read_repair_submitter,
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(READ_REPAIR_TEST_SUBMISSIONS.load(Ordering::SeqCst), 0);
+        let reservation = reserve_read_repair_heal(RUSTFS_META_BUCKET, &object, None, 1, 2)
+            .await
+            .expect("excluded observation must not consume a read-repair reservation");
+        release_read_repair_heal_reservation(&reservation).await;
     }
 
     #[tokio::test]
