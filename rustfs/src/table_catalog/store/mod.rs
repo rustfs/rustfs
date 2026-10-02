@@ -14,11 +14,15 @@
 
 use super::*;
 
+mod backup;
 mod migration;
 mod object;
 mod strong;
 
-use migration::table_catalog_backing_manifest;
+pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
+#[cfg(test)]
+pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
+use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
 pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
@@ -567,6 +571,7 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+    pub size: u64,
 }
 
 pub(crate) struct TableCatalogLockGuard {
@@ -680,6 +685,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: object.data.len() as u64,
             }))
     }
 
@@ -694,6 +700,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: object.data.len() as u64,
             }))
     }
 
@@ -781,6 +788,90 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     fn complete_table_commit_publication(&self) {}
+}
+
+pub(super) async fn diagnose_table_catalog_from_export<B>(
+    backend: &B,
+    parsed_namespace: &Namespace,
+    parsed_table: &IdentifierSegment,
+    catalog: TableCatalogExport,
+    commit_recovery: TableCommitRecoveryReport,
+    retain_recent_metadata_files: usize,
+) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport>
+where
+    B: TableCatalogObjectBackend,
+{
+    let current_metadata_location = catalog.table.metadata_location.clone();
+    let backing_manifest = catalog.backing_manifest.clone();
+    let mut retained = BTreeSet::new();
+    let mut current_metadata_for_refs = None;
+    let current_metadata_status = if is_valid_table_metadata_location(parsed_namespace, parsed_table, &current_metadata_location)
+    {
+        retained.insert(current_metadata_location.clone());
+        match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
+            Ok(Some(current_metadata)) => {
+                retained.extend(metadata_log_locations(
+                    &current_metadata,
+                    &catalog.table_bucket.table_bucket,
+                    parsed_namespace,
+                    parsed_table,
+                ));
+                current_metadata_for_refs = Some(current_metadata);
+                TableMetadataPointerStatus::Valid
+            }
+            Ok(None) => TableMetadataPointerStatus::MissingObject,
+            Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
+            Err(err) => return Err(err),
+        }
+    } else {
+        TableMetadataPointerStatus::InvalidLocation
+    };
+
+    let mut metadata_locations = Vec::new();
+    let metadata_prefix = format!("{}/", default_table_metadata_dir_path(parsed_namespace, parsed_table));
+    for object in backend
+        .list_objects(&catalog.table_bucket.table_bucket, &metadata_prefix)
+        .await?
+    {
+        if let Some(metadata_location) = metadata_location_from_metadata_file_path(parsed_namespace, parsed_table, &object) {
+            metadata_locations.push(metadata_location);
+        }
+    }
+    metadata_locations.sort();
+    metadata_locations.dedup();
+
+    for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
+        retained.insert(metadata_location.clone());
+    }
+    if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
+        retained.extend(
+            metadata_locations_for_protected_snapshot_refs(
+                backend,
+                &catalog.table_bucket.table_bucket,
+                parsed_namespace,
+                parsed_table,
+                current_metadata,
+                &metadata_locations,
+            )
+            .await?,
+        );
+    }
+
+    let orphan_metadata_candidate_locations = metadata_locations
+        .into_iter()
+        .filter(|metadata_location| !retained.contains(metadata_location))
+        .collect();
+    let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+
+    Ok(TableCatalogDiagnosticsReport {
+        catalog,
+        current_metadata_status,
+        recovery_status,
+        recommended_actions,
+        commit_recovery,
+        backing_manifest,
+        orphan_metadata_candidate_locations,
+    })
 }
 
 #[async_trait::async_trait]
@@ -1068,6 +1159,26 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
+        format!(
+            "{}/{}/{}/{}.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket),
+            table_catalog_path_hash(backup_id)
+        )
+    }
+
+    pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_RESTORE_ROOT,
+            table_catalog_path_hash(table_bucket),
+            TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE
+        )
+    }
+
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
         format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
@@ -1118,6 +1229,23 @@ where
         TableCatalogStoreError::Invalid(format!(
             "{operation} is not supported with {TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing"
         ))
+    }
+
+    pub(crate) async fn get_table_catalog_diagnostics_retention(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<usize> {
+        match self {
+            Self::ObjectBacked(store) => Ok(store
+                .get_table_maintenance_config(table_bucket, namespace, table)
+                .await?
+                .retain_recent_metadata_files),
+            // Durable-strong maintenance configuration is not persisted yet; use the
+            // conservative default while keeping diagnostics read-only.
+            Self::DurableStrong(_) => Ok(0),
+        }
     }
 }
 
@@ -1615,7 +1743,7 @@ where
     ) -> TableCatalogStoreResult<TableCatalogExport> {
         match self {
             Self::ObjectBacked(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog export")),
+            Self::DurableStrong(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
         }
     }
 
@@ -1632,7 +1760,11 @@ where
                     .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
                     .await
             }
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog diagnostics")),
+            Self::DurableStrong(store) => {
+                store
+                    .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
+                    .await
+            }
         }
     }
 
@@ -1675,6 +1807,42 @@ where
         match self {
             Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
+        }
+    }
+
+    pub(crate) async fn create_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        expected_snapshot_etag: Option<&str>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog backup requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn restore_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        backup_id: &str,
+        expected_snapshot_etag: Option<&str>,
+        allow_replace: bool,
+    ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog restore requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .await
+            }
         }
     }
 }
@@ -1764,6 +1932,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
@@ -1790,6 +1959,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),

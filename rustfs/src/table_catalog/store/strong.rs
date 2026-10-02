@@ -51,7 +51,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) hydrated: bool,
     snapshot_required: bool,
     pub(in crate::table_catalog) snapshot_etag: Option<String>,
-    snapshot_version: Option<u16>,
+    pub(super) snapshot_version: Option<u16>,
     pub(in crate::table_catalog) table_buckets: BTreeMap<String, TableBucketEntry>,
     pub(in crate::table_catalog) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
     namespace_children: BTreeMap<StrongNamespaceChildKey, String>,
@@ -102,7 +102,8 @@ pub(in crate::table_catalog) struct StrongTableCatalogSnapshot {
     pub(in crate::table_catalog) idempotency: Vec<StrongCommitSnapshotRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
     pub(super) table_bucket: TableBucketEntry,
     pub(super) namespaces: Vec<NamespaceEntry>,
@@ -113,7 +114,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
 }
 
 #[derive(Clone)]
-enum StrongSnapshotWritePostcondition {
+pub(super) enum StrongSnapshotWritePostcondition {
     TableBucketPresent(TableBucketEntry),
     TableBucketAbsent(String),
     NamespacePresent(NamespaceEntry),
@@ -297,8 +298,8 @@ pub(in crate::table_catalog) fn table_catalog_bucket_snapshot_fingerprint(
 
 #[derive(Clone)]
 pub(crate) struct StrongTableCatalogStore<B> {
-    object_backend: B,
-    snapshot_write_version: u16,
+    pub(super) object_backend: B,
+    pub(super) snapshot_write_version: u16,
     snapshot_required_on_start: bool,
     // Single mutex protecting all catalog state (table_buckets, namespaces, tables, views, commits, idempotency).
     // This is intentional: many operations require atomic read-modify-write across multiple fields.
@@ -309,7 +310,7 @@ pub(crate) struct StrongTableCatalogStore<B> {
     // 3. Using optimistic concurrency with version checks
     pub(in crate::table_catalog) state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
     // Coalesces reloads for clones of one store so only one task reads and decodes a changed snapshot.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -596,7 +597,7 @@ where
         }
     }
 
-    fn bucket_snapshot_from_state_locked(
+    pub(super) fn bucket_snapshot_from_state_locked(
         state: &StrongTableCatalogState,
         table_bucket: &str,
     ) -> Option<StrongTableCatalogBucketSnapshot> {
@@ -646,7 +647,7 @@ where
         })
     }
 
-    fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
+    pub(super) fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
         state.table_buckets.remove(table_bucket);
         state.namespaces.retain(|(entry_bucket, _), _| entry_bucket != table_bucket);
         state
@@ -960,7 +961,7 @@ where
         Ok(())
     }
 
-    fn snapshot_from_mutated_state_locked(
+    pub(super) fn snapshot_from_mutated_state_locked(
         state: &mut StrongTableCatalogState,
         configured_write_version: u16,
     ) -> TableCatalogStoreResult<StrongTableCatalogSnapshot> {
@@ -1000,7 +1001,7 @@ where
         Ok(snapshot)
     }
 
-    fn state_from_snapshot(
+    pub(super) fn state_from_snapshot(
         snapshot: StrongTableCatalogSnapshot,
         snapshot_etag: Option<String>,
     ) -> TableCatalogStoreResult<StrongTableCatalogState> {
@@ -1228,7 +1229,7 @@ where
         );
     }
 
-    async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
+    pub(super) async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
         let Some((current_snapshot_etag, current_snapshot_required)) = ({
             let state = self.state.lock().await;
             if state.hydrated {
@@ -1330,7 +1331,7 @@ where
         ))
     }
 
-    async fn finalize_snapshot_write(
+    pub(super) async fn finalize_snapshot_write(
         &self,
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
@@ -1591,7 +1592,7 @@ where
         Ok(())
     }
 
-    fn table_commit_recovery_report_for_entry_locked(
+    pub(super) fn table_commit_recovery_report_for_entry_locked(
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
@@ -1872,6 +1873,150 @@ where
             )));
         };
         Ok(Self::table_commit_recovery_report_for_entry_locked(&state, entry))
+    }
+
+    fn table_catalog_export_locked(
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<TableCatalogExport> {
+        Self::ensure_namespace_identifiers_are_unambiguous_locked(state, table_bucket, &namespace.public_name())?;
+        let table_bucket_entry = state
+            .table_buckets
+            .get(table_bucket)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+            .ok_or_else(|| TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")))?;
+        validate_table_bucket_entry(&table_bucket_entry)?;
+
+        let namespace_key = Self::namespace_key(table_bucket, namespace);
+        let namespace_entry = match state
+            .namespaces
+            .get(&namespace_key)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+        {
+            Some(entry) => entry,
+            None if Self::namespace_exists_locked(state, table_bucket, namespace) => {
+                synthetic_namespace_entry(table_bucket, namespace)
+            }
+            None => {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "namespace {}/{}",
+                    table_bucket,
+                    namespace.public_name()
+                )));
+            }
+        };
+        let validated_namespace = validate_namespace_entry_identity(&namespace_entry)?;
+        if validated_namespace != *namespace {
+            return Err(TableCatalogStoreError::Invalid(
+                "strong catalog namespace entry identity does not match its state key".to_string(),
+            ));
+        }
+
+        let table_key = Self::table_key(table_bucket, namespace, table);
+        let table_entry = state
+            .tables
+            .get(&table_key)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+            .ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!("table {}/{}/{}", table_bucket, namespace.public_name(), table.as_str()))
+            })?;
+        validate_table_entry_version_and_id(&table_entry)?;
+        if table_entry.table_bucket != table_bucket
+            || table_entry.namespace != namespace.public_name()
+            || table_entry.table != table.as_str()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "strong catalog table entry identity does not match its state key".to_string(),
+            ));
+        }
+
+        let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(state, &table_entry);
+        let snapshot_etag = state
+            .snapshot_etag
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no etag".to_string()))?;
+        let snapshot_version = state
+            .snapshot_version
+            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no version".to_string()))?;
+        let backing_manifest = durable_strong_table_catalog_backing_manifest(
+            Self::snapshot_object_path(),
+            Some(snapshot_etag),
+            Some(snapshot_version),
+            namespace,
+            table,
+            &table_entry,
+            &commit_recovery,
+        );
+
+        Ok(TableCatalogExport {
+            table_bucket: table_bucket_entry,
+            namespace: namespace_entry,
+            table: table_entry,
+            backing_manifest,
+        })
+    }
+
+    pub(crate) async fn export_table_catalog_entry(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let state = self.state.lock().await;
+        Self::table_catalog_export_locked(&state, table_bucket, &namespace, &table)
+    }
+
+    pub(crate) async fn diagnose_table_catalog(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
+        let parsed_namespace = parse_namespace_for_store(namespace)?;
+        let parsed_table = parse_table_for_store(table)?;
+
+        for _ in 0..STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS {
+            self.hydrate_state().await?;
+            let (catalog, commit_recovery, observation) = {
+                let state = self.state.lock().await;
+                let catalog = Self::table_catalog_export_locked(&state, table_bucket, &parsed_namespace, &parsed_table)?;
+                let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(&state, &catalog.table);
+                let observation = (state.snapshot_etag.clone(), state.snapshot_version);
+                (catalog, commit_recovery, observation)
+            };
+
+            let report = diagnose_table_catalog_from_export(
+                &self.object_backend,
+                &parsed_namespace,
+                &parsed_table,
+                catalog,
+                commit_recovery,
+                retain_recent_metadata_files,
+            )
+            .await?;
+
+            self.hydrate_state().await?;
+            let current_observation = {
+                let state = self.state.lock().await;
+                (state.snapshot_etag.clone(), state.snapshot_version)
+            };
+            if current_observation == observation {
+                return Ok(report);
+            }
+        }
+
+        Err(TableCatalogStoreError::Conflict(
+            "durable strong catalog changed repeatedly while diagnosing table state".to_string(),
+        ))
     }
 }
 

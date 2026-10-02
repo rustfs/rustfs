@@ -207,6 +207,15 @@ const TABLE_CATALOG_MIGRATION_FENCE_FILE: &str = "durable-strong-fence.json";
 const TABLE_CATALOG_MIGRATION_FENCE_LOCK: &str = "durable-strong-fence.lock";
 const TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_FILE: &str = "durable-strong-global-fence.json";
 const TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK: &str = "durable-strong-global-fence.lock";
+pub(crate) const TABLE_CATALOG_BACKUP_VERSION: u16 = 1;
+const TABLE_CATALOG_BACKUP_ROOT: &str = "backups";
+const TABLE_CATALOG_BACKUP_RESTORE_ROOT: &str = "restore-intents";
+const TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE: &str = "intent.json";
+const TABLE_CATALOG_BACKUP_MAX_SIZE: usize = 64 * 1024 * 1024;
+const TABLE_CATALOG_BACKUP_MAX_OBJECTS: usize = 1_000_000;
+const TABLE_CATALOG_BACKUP_HASH_MAX_SIZE: u64 = 16 * 1024 * 1024;
+const TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE: usize = 4 * 1024 * 1024;
+const TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_BYTES: usize = 32 * 1024 * 1024;
 
 type CatalogListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type CatalogListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;

@@ -819,6 +819,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         Ok(state.objects.get(&key).map(|record| TableCatalogObjectMetadata {
             etag: (!etagless).then(|| record.etag.clone()),
             mod_time: record.mod_time,
+            size: record.data.len() as u64,
         }))
     }
 
