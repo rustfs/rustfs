@@ -41,6 +41,7 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1424,22 +1425,15 @@ impl<T: Store> IamSys<T> {
                     tracing::warn!("eval_prepared: OPA mode requested but plugin is unavailable");
                     return Ok(false);
                 };
-                // Conditions may originate in headers, claims or another resource's
-                // authorization. Only the addressed bucket supplies this namespace.
-                let mut conditions = args.conditions.clone();
-                conditions.retain(|key, _| {
-                    let namespace = key.split('/').next().unwrap_or_default();
-                    !namespace.eq_ignore_ascii_case("ExistingBucketTag")
-                        && !namespace.eq_ignore_ascii_case("s3:ExistingBucketTag")
-                });
-                if !args.bucket.is_empty() {
-                    for (key, value) in self.store.api.load_bucket_tags(args.bucket).await? {
-                        conditions.insert(format!("ExistingBucketTag/{key}"), vec![value]);
-                    }
-                }
+                let tags = if args.bucket.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.store.api.load_bucket_tags(args.bucket).await?
+                };
+                let conditions = opa_bucket_tag_conditions(args.conditions, tags);
                 opa_enable
                     .is_allowed(&Args {
-                        conditions: &conditions,
+                        conditions: conditions.as_ref(),
                         ..args.clone()
                     })
                     .await
@@ -1818,6 +1812,29 @@ impl<T: Store> IamSys<T> {
     pub fn is_ready(&self) -> bool {
         self.store.is_ready()
     }
+}
+
+fn opa_bucket_tag_conditions(
+    conditions: &HashMap<String, Vec<String>>,
+    tags: HashMap<String, String>,
+) -> Cow<'_, HashMap<String, Vec<String>>> {
+    // Conditions may originate in headers, claims or another resource's
+    // authorization. Only the addressed bucket supplies this namespace.
+    let is_bucket_tag = |key: &str| {
+        let namespace = key.split('/').next().unwrap_or_default();
+        namespace.eq_ignore_ascii_case("ExistingBucketTag") || namespace.eq_ignore_ascii_case("s3:ExistingBucketTag")
+    };
+    if tags.is_empty() && !conditions.keys().any(|key| is_bucket_tag(key)) {
+        return Cow::Borrowed(conditions);
+    }
+
+    let mut conditions = conditions.clone();
+    conditions.retain(|key, _| !is_bucket_tag(key));
+    conditions.reserve(tags.len());
+    for (key, value) in tags {
+        conditions.insert(format!("ExistingBucketTag/{key}"), vec![value]);
+    }
+    Cow::Owned(conditions)
 }
 
 async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &PreparedSessionPolicy, args: &Args<'_>) -> bool {
@@ -2209,6 +2226,58 @@ mod tests {
         assert!(matches!(state, PolicyPluginState::Failed));
     }
 
+    #[test]
+    fn opa_bucket_tag_conditions_reuse_clean_input() {
+        let empty = HashMap::new();
+        let clean = HashMap::from([
+            ("userid".to_string(), vec!["tag-user".to_string()]),
+            ("ExistingBucketTagger/role".to_string(), vec!["unrelated".to_string()]),
+        ]);
+        for conditions in [&empty, &clean] {
+            let result = opa_bucket_tag_conditions(conditions, HashMap::new());
+            assert_eq!(result.as_ref(), conditions);
+            assert!(
+                matches!(result, Cow::Borrowed(borrowed) if std::ptr::eq(borrowed, conditions)),
+                "clean, untagged authorization must reuse the existing conditions"
+            );
+        }
+        let result = opa_bucket_tag_conditions(&clean, HashMap::from([("department".to_string(), "finance".to_string())]));
+        assert_eq!(result.get("ExistingBucketTag/department"), Some(&vec!["finance".to_string()]));
+        assert_eq!(result.get("userid"), clean.get("userid"));
+        assert!(!clean.contains_key("ExistingBucketTag/department"));
+    }
+
+    #[test]
+    fn opa_bucket_tag_conditions_sanitize_before_enrichment() {
+        let mut untrusted = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+        for key in [
+            "ExistingBucketTag",
+            "s3:ExistingBucketTag",
+            "ExistingBucketTag/Department",
+            "existingbuckettag/department",
+            "S3:EXISTINGBUCKETTAG/role",
+        ] {
+            untrusted.insert(key.to_string(), vec!["forged".to_string()]);
+        }
+        let original = untrusted.clone();
+        for tags in [
+            HashMap::new(),
+            HashMap::from([
+                ("Department".to_string(), "Finance".to_string()),
+                ("note".to_string(), String::new()),
+                ("team/name".to_string(), "reporting".to_string()),
+            ]),
+        ] {
+            let mut expected = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+            for (key, value) in &tags {
+                expected.insert(format!("ExistingBucketTag/{key}"), vec![value.clone()]);
+            }
+            let result = opa_bucket_tag_conditions(&untrusted, tags);
+            assert_eq!(result.as_ref(), &expected);
+            assert_eq!(untrusted, original, "enrichment must not alter reusable request conditions");
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn opa_bucket_tags_replace_untrusted_conditions_and_lookup_errors_deny() {
@@ -2218,7 +2287,7 @@ mod tests {
         let url = format!("http://{}/decision", listener.local_addr().expect("receiver address"));
         let receiver = tokio::spawn(async move {
             let mut payloads = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let (stream, _) = listener.accept().await.expect("accept OPA request");
                 let mut stream = BufReader::new(stream);
                 let mut length = None;
@@ -2294,6 +2363,16 @@ mod tests {
                     *store.bucket_tags.lock().expect("tag state") = tags;
                     outcomes.push(iam.is_allowed(&args).await);
                 }
+                let clean_conditions = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+                args.conditions = &clean_conditions;
+                for (bucket, tags) in [
+                    ("untagged", Ok(HashMap::new())),
+                    ("", Err(Error::other("bucketless decisions must not read metadata"))),
+                ] {
+                    args.bucket = bucket;
+                    *store.bucket_tags.lock().expect("tag state") = tags;
+                    outcomes.push(iam.is_allowed(&args).await);
+                }
                 args.bucket = "unavailable";
                 let prepared = iam.prepare_auth(&args).await;
                 let error = iam.try_eval_prepared(&prepared, &args).await;
@@ -2303,7 +2382,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(outcomes, [true, true, true]);
+        assert_eq!(outcomes, [true; 5]);
         assert!(
             matches!(error, Err(Error::Io(_))),
             "lookup failure must remain an error, not an implicit denial"
