@@ -768,7 +768,15 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
-        } else if use_metadata_cache && metadata_fanout_complete {
+        } else if use_metadata_cache
+            && (metadata_fanout_complete
+                || (read_data
+                    && allow_early_stop
+                    && metadata_fanout_diagnostics.valid_responses() >= read_quorum
+                    && errs.iter().all(Option::is_none)
+                    && fileinfo_selection_quorum >= read_quorum
+                    && op_online_disks.iter().filter(|disk| disk.is_some()).count() >= read_quorum))
+        {
             #[cfg(test)]
             metadata_cache_tests::wait_before_metadata_cache_publish(bucket, object).await;
             self.cache_get_object_fileinfo(
@@ -3700,7 +3708,7 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    #[serial(metadata_cache_publish_barrier)]
+    #[serial(metadata_cache_early_stop)]
     async fn metadata_cache_production_fanout_cannot_publish_after_mutation_fence_begin() {
         // Isolated context: an ambient DistErasure window (another test's
         // SetupTypeGuard) would bypass metadata-cache publication entirely
@@ -3756,6 +3764,149 @@ mod metadata_cache_tests {
         );
         assert!(set.get_object_metadata_cache_mutation_pending(bucket, object));
         set.finish_get_object_metadata_cache_mutation_local(bucket, object, mutation_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(metadata_cache_early_stop)]
+    async fn metadata_cache_publishes_quorum_selected_early_stop_result() {
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
+        let bucket = "metadata-cache-early-stop";
+        let object = "objects/repeated-key";
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.make_volume(bucket)
+                .await
+                .expect("test bucket should be created on each disk");
+        }
+        let expected_body = vec![0x5a; 1024 * 1024];
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_body.clone()),
+            &ObjectOptions::default(),
+        )
+        .await
+        .expect("test object should be written before enabling the slow-tail fault");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("false")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS", Some("500")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS", Some("3")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET", Some(bucket)),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(object);
+                let first = tokio::time::timeout(
+                    Duration::from_millis(400),
+                    set.get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true),
+                )
+                .await
+                .expect("first metadata read should stop before the delayed peer")
+                .expect("read quorum should provide valid object metadata");
+                assert!(first.owned.is_some(), "the first lookup should resolve through disk metadata");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+                assert_eq!(calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT), 1);
+
+                let second = set
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true)
+                    .await
+                    .expect("second lookup should use the quorum-published metadata cache entry");
+                assert!(second.shared_entry().is_some(), "the repeated GET should hit the published cache entry");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+
+                let cached = second.shared_entry().expect("second lookup should share cached metadata");
+                assert_eq!(cached.fi.name, object);
+                assert!(cached.online_disks.iter().filter(|disk| disk.is_some()).count() >= cached.read_quorum);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(metadata_cache_early_stop)]
+    async fn metadata_cache_early_stop_publication_is_fenced_by_mutation() {
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
+        let bucket = "metadata-cache-early-stop-fence";
+        let object = "objects/repeated-key";
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.make_volume(bucket)
+                .await
+                .expect("test bucket should be created on each disk");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x5a; 1024 * 1024]),
+            &ObjectOptions::default(),
+        )
+        .await
+        .expect("test object should be written before enabling the slow-tail fault");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("false")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS", Some("500")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS", Some("3")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET", Some(bucket)),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
+            ],
+            async {
+                let barrier = MetadataCachePublishBarrier::install(bucket, object);
+                let stale_generation = set
+                    .get_object_metadata_cache_generation(bucket, object)
+                    .expect("metadata cache generation should be active");
+                let reader_set = Arc::clone(&set);
+                let read = tokio::spawn(async move {
+                    reader_set
+                        .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true)
+                        .await
+                });
+                barrier.wait_until_paused().await;
+                let mutation_id = Uuid::new_v4();
+                set.begin_get_object_metadata_cache_mutation_local(bucket, object, mutation_id)
+                    .await;
+                barrier.release();
+
+                let snapshot = read
+                    .await
+                    .expect("early-stop metadata read should not panic")
+                    .expect("read quorum should resolve the selected FileInfo");
+                assert!(snapshot.owned.is_some());
+                assert!(
+                    set.get_object_metadata_cache
+                        .get(&GetObjectMetadataCacheKey::new(bucket, object, stale_generation))
+                        .await
+                        .is_none(),
+                    "early-stop publication must not retain an entry under the retired generation"
+                );
+                assert!(
+                    set.cached_get_object_fileinfo(bucket, object).await.is_none(),
+                    "mutation fence must reject the quorum-selected early-stop publication"
+                );
+                assert!(set.get_object_metadata_cache_mutation_pending(bucket, object));
+                set.finish_get_object_metadata_cache_mutation_local(bucket, object, mutation_id);
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
