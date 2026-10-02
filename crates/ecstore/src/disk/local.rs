@@ -280,18 +280,19 @@ async fn write_delete_rollback_file(
 ) -> Result<()> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
     let path = backup_dir.join(name);
-    if namespace_owner.is_none() {
-        fs::create_dir_all(&backup_dir).await.map_err(to_file_error)?;
-        fs::write(path, data).await.map_err(to_file_error)?;
-        return Ok(());
-    }
     let lease = os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
     let data = data.to_vec();
+    let object_dir = object_dir.to_path_buf();
     os::run_blocking_namespace_operation(lease, move || {
         std::fs::create_dir_all(&backup_dir)?;
         #[cfg(test)]
         run_owned_file_write_before_open(&path);
-        std::fs::write(path, data)
+        // Rollback must never consume a partially written backup. Stage outside
+        // the rollback directory so interrupted writes cannot become staged data.
+        let mut staged = tempfile::Builder::new().prefix(".delete-rollback-").tempfile_in(object_dir)?;
+        std::io::Write::write_all(&mut staged, &data)?;
+        staged.persist(path).map_err(|err| err.error)?;
+        Ok(())
     })
     .await
     .map_err(to_file_error)?;
@@ -16839,6 +16840,99 @@ mod test {
                 .exists(),
             "copy fallback backup should be consumed by atomic rollback"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_rollback_partial_backup_write_preserves_version_history() {
+        const CHILD: &str = "RUSTFS_TEST_DELETE_BACKUP_PARTIAL_WRITE_CHILD";
+        let bucket = "partial-backup-bucket";
+        let object = "versioned-object";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            let xl_path = root.join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let original = fs::read(&xl_path).await.expect("committed history");
+            let version_id = Uuid::parse_str(&std::env::var("RUSTFS_TEST_DELETE_BACKUP_VERSION").expect("version ID"))
+                .expect("valid version ID");
+            let first = test_file_info(object, version_id, None, None);
+            let rollback_dir = Uuid::new_v4();
+            let result = disk
+                .delete_version(
+                    bucket,
+                    object,
+                    first.clone(),
+                    false,
+                    DeleteOptions {
+                        old_data_dir: Some(rollback_dir),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "the backup must fail under the file-size limit");
+            disk.undo_write_with_namespace_owner(
+                bucket,
+                object,
+                first,
+                DeleteOptions {
+                    undo_write: true,
+                    undo_delete: true,
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("failed delete rollback");
+            assert_eq!(fs::read(&xl_path).await.expect("metadata after rollback"), original);
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object directory");
+        let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let version_id = Uuid::new_v4();
+        let mut meta = FileMeta::new();
+        meta.add_version(test_file_info(object, version_id, None, None))
+            .expect("first version");
+        for _ in 1..100 {
+            meta.add_version(test_file_info(object, Uuid::new_v4(), None, None))
+                .expect("history version");
+        }
+        let original = meta.marshal_msg().expect("version history");
+        assert!(original.len() > 4096, "backup must exceed the injected write limit");
+        fs::write(&xl_path, &original).await.expect("committed metadata");
+
+        // Isolate the process-wide limit and ignored signal in a child. A real
+        // EFBIG short write exercises the failed-backup path without privileges.
+        let output = std::process::Command::new("sh")
+            .args(["-c", "trap '' XFSZ; ulimit -f 4; exec \"$@\"", "partial-backup-test"])
+            .arg(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "disk::local::test::delete_rollback_partial_backup_write_preserves_version_history",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .env("RUSTFS_TEST_DELETE_BACKUP_VERSION", version_id.to_string())
+            .output()
+            .expect("isolated partial-write test should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "partial-write child failed: {stdout} {stderr}");
+        assert!(stdout.contains("1 passed"), "child must execute the selected regression: {stdout}");
+        assert_eq!(fs::read(&xl_path).await.expect("metadata after rollback"), original);
+        disk.write_metadata("", bucket, object, test_file_info(object, Uuid::new_v4(), None, None))
+            .await
+            .expect("write after failed delete");
+        let after = fs::read(&xl_path).await.expect("metadata after subsequent write");
+        assert_eq!(FileMeta::load(&after).expect("readable history").versions.len(), 101);
     }
 
     // The undo_write restore consumes `<rollback>/xl.meta.bkp` by rename; a
