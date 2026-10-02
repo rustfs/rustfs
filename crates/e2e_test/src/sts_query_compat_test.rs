@@ -878,6 +878,13 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
         )
         .send()
         .await?;
+    // A normal OPA denial retains the existing bucket-policy Allow fallback;
+    // a metadata lookup error must abort that same authorization path.
+    set_department(&admin, destination, "engineering").await?;
+    let read = client.get_object().bucket(destination).key("multipart").send().await?;
+    assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
+    opa.expect_bucket_tags("s3:GetObject", destination, Some("engineering"))
+        .await?;
     admin
         .put_bucket_tagging()
         .bucket(destination)

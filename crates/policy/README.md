@@ -94,9 +94,14 @@ and `DeleteBucketTagging` separately when tags control access.
 
 This is an OPA input extension, not a new native IAM condition key. Native policy
 evaluation, owner/anonymous handling, and existing authorization combination rules
-remain unchanged. Lookup errors on the OPA path never become an untagged-policy
-fallback. Custom IAM `Store` implementations must implement `load_bucket_tags`
-to support bucket-scoped OPA requests; the default fails closed.
+remain unchanged. For S3 authorization, an OPA `false` decision is an implicit IAM
+denial that an applicable bucket-policy Allow may supplement. A tag mismatch alone
+therefore does not revoke access granted by such a bucket policy; policy authors
+must account for those grants when relying on tags to restrict access. ListBuckets
+filtering remains IAM-only. Lookup errors on the OPA path abort authorization and
+never fall through to a bucket-policy Allow. Custom IAM `Store` implementations
+must implement `load_bucket_tags` to support bucket-scoped OPA requests; the default
+fails closed.
 
 ## 📚 Documentation
 
