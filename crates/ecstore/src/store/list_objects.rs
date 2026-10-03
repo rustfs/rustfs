@@ -10125,6 +10125,7 @@ mod test {
             .expect("bucket should be created with authoritative metadata");
         let committed_dir = uuid::Uuid::new_v4();
         let unmarked_dir = uuid::Uuid::new_v4();
+        let backup_dir = uuid::Uuid::new_v4();
         let transaction = uuid::Uuid::new_v4();
         for dir in &dirs {
             let committed = dir
@@ -10135,6 +10136,9 @@ mod test {
             tokio::fs::create_dir_all(&committed)
                 .await
                 .expect("committed delete residue should be created");
+            tokio::fs::write(committed.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("committed rollback backup should be written");
             tokio::fs::write(committed.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
@@ -10158,6 +10162,18 @@ mod test {
             tokio::fs::write(unmarked.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
+
+            let backup = dir
+                .path()
+                .join(bucket)
+                .join("metrics/statefulset/2026/08/26/18/object.parquet")
+                .join(backup_dir.to_string());
+            tokio::fs::create_dir_all(&backup)
+                .await
+                .expect("rollback backup directory should be created");
+            tokio::fs::write(backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("rollback backup should be written");
         }
 
         let result = store
@@ -10166,7 +10182,7 @@ mod test {
             .await
             .expect("delimiter listing should succeed");
         assert!(result.objects.is_empty());
-        assert!(result.prefixes.is_empty(), "neither residue subtree may surface as a prefix");
+        assert!(result.prefixes.is_empty(), "residue subtrees may not surface as prefixes");
         for dir in &dirs {
             let metrics = dir.path().join(bucket).join("metrics");
             assert!(
@@ -10180,6 +10196,17 @@ mod test {
                     .join("part.1")
                     .exists(),
                 "residue without a committed marker must survive the purge"
+            );
+            assert_eq!(
+                tokio::fs::read(
+                    metrics
+                        .join("statefulset/2026/08/26/18/object.parquet")
+                        .join(backup_dir.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                )
+                .await
+                .expect("uncommitted rollback backup must survive the listing"),
+                b"rollback metadata"
             );
         }
     }
