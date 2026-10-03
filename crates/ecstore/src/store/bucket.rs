@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bucket::{
-    metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
+    metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
 use crate::error::is_err_bucket_not_found;
@@ -270,6 +270,32 @@ impl ECStore {
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
+    }
+
+    /// Resolve stored tags for authorization. Only confirmed absence returns an
+    /// empty map; unavailable, fabricated or malformed metadata must not grant access.
+    pub async fn get_bucket_tags_for_policy(&self, bucket: &str) -> Result<HashMap<String, String>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let metadata = match sys.read().await.get_authoritative_metadata(bucket).await {
+            Ok(metadata) => metadata,
+            Err(Error::ConfigNotFound) => return Ok(HashMap::new()),
+            Err(err) => return Err(err),
+        };
+        let Some(tagging) =
+            ConfigState::of(&metadata.tagging_config_xml, &metadata.tagging_config).require(bucket, BUCKET_TAGGING_CONFIG)?
+        else {
+            return Ok(HashMap::new());
+        };
+        let mut tags = HashMap::with_capacity(tagging.tag_set.len());
+        for tag in &tagging.tag_set {
+            let (Some(key), Some(value)) = (&tag.key, &tag.value) else {
+                return Err(Error::other("stored bucket tag is missing a key or value"));
+            };
+            if key.is_empty() || tags.insert(key.clone(), value.clone()).is_some() {
+                return Err(Error::other("stored bucket tags contain empty or duplicate keys"));
+            }
+        }
+        Ok(tags)
     }
 
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -1212,6 +1238,7 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileMeta, TRANSITION_COMPLETE};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1620,12 +1647,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_tags_for_policy_distinguish_absence_from_corrupt_metadata() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        assert!(
+            store
+                .get_bucket_tags_for_policy("not-created")
+                .await
+                .expect("confirmed missing bucket")
+                .is_empty()
+        );
+
+        let bucket = "policy-bucket-tags";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create tagged bucket");
+        let original = store.get_bucket_metadata(bucket).await.expect("read bucket metadata");
+        let cases = &[
+            (b"".as_slice(), Some(HashMap::new())),
+            (b"<Tagging><TagSet/></Tagging>", Some(HashMap::new())),
+            (
+                b"<Tagging><TagSet><Tag><Key>Department</Key><Value>Finance</Value></Tag><Tag><Key>note</Key><Value></Value></Tag></TagSet></Tagging>",
+                Some(HashMap::from([("Department".to_string(), "Finance".to_string()), ("note".to_string(), String::new())])),
+            ),
+            (b"<Tagging><TagSet>", None),
+            (b"<Tagging><TagSet><Tag><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key>department</Key></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key></Key><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (
+                b"<Tagging><TagSet><Tag><Key>department</Key><Value>finance</Value></Tag><Tag><Key>department</Key><Value>engineering</Value></Tag></TagSet></Tagging>",
+                None,
+            ),
+        ];
+        for (xml, expected) in cases {
+            let mut metadata = (*original).clone();
+            metadata.tagging_config_xml = xml.to_vec();
+            metadata.tagging_config = crate::bucket::utils::deserialize(xml).ok();
+            metadata_sys::set_bucket_metadata_in(&store.ctx, metadata)
+                .await
+                .expect("inject persisted tag state");
+            let result = store.get_bucket_tags_for_policy(bucket).await;
+            match expected {
+                Some(tags) => assert_eq!(&result.expect("valid tag configuration"), tags),
+                None => assert!(result.is_err(), "corrupt tags must not become an untagged bucket: {xml:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn request_metadata_methods_fail_closed_before_instance_initialization() {
         let (_temp_dir, store) = setup_multi_pool_bucket_test_env().await;
 
         let expected = "bucket metadata sys not initialized for this instance";
         let errors = [
             store.get_bucket_metadata("bucket").await.unwrap_err(),
+            store
+                .get_bucket_tags_for_policy("bucket")
+                .await
+                .expect_err("uninitialized metadata must deny tag lookup"),
             store.get_bucket_policy("bucket").await.unwrap_err(),
             store.get_bucket_policy_raw("bucket").await.unwrap_err(),
             store.restricts_public_bucket_access("bucket").await.unwrap_err(),

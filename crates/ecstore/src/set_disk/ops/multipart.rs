@@ -2125,7 +2125,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         if object_parts.len() > ret.parts.len() {
             ret.is_truncated = true;
-            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num).unwrap_or_default();
+            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num);
         }
 
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
@@ -4518,6 +4518,54 @@ mod tests {
             part_num: part.part_num,
             etag: part.etag,
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_parts_pagination_preserves_sparse_markers_and_terminates() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-pagination";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let opts = ObjectOptions::default();
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &opts)
+            .await
+            .expect("multipart upload should be created");
+
+        let empty = set_disks
+            .list_object_parts(bucket, object, &upload.upload_id, None, 2, &opts)
+            .await
+            .expect("empty upload should be listable");
+        assert!(empty.parts.is_empty());
+        assert!(!empty.is_truncated);
+        assert_eq!(empty.next_part_number_marker, None);
+
+        for part_number in [10, 1, 3] {
+            put_test_part(&set_disks, bucket, object, &upload.upload_id, part_number, b"part", 4).await;
+        }
+
+        for (marker, max_parts, expected_parts, next_marker) in [
+            (None, 0, vec![], None),
+            (None, 1, vec![1], Some(1)),
+            (None, 2, vec![1, 3], Some(3)),
+            (None, 3, vec![1, 3, 10], None),
+            (None, MAX_PARTS_COUNT + 1, vec![1, 3, 10], None),
+            (Some(1), 2, vec![3, 10], None),
+            (Some(2), 1, vec![3], Some(3)),
+            (Some(3), 2, vec![10], None),
+            (Some(10), 2, vec![], None),
+            (Some(11), 2, vec![], None),
+        ] {
+            let page = set_disks
+                .list_object_parts(bucket, object, &upload.upload_id, marker, max_parts, &opts)
+                .await
+                .expect("uploaded parts should be listable");
+            assert_eq!(page.part_number_marker, marker.unwrap_or_default());
+            assert_eq!(page.max_parts, max_parts.min(MAX_PARTS_COUNT));
+            assert_eq!(page.parts.iter().map(|part| part.part_num).collect::<Vec<_>>(), expected_parts);
+            assert_eq!(page.is_truncated, next_marker.is_some());
+            assert_eq!(page.next_part_number_marker, next_marker);
         }
     }
 

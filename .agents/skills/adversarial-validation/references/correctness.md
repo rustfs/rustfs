@@ -15,6 +15,8 @@ Attack the changed behavior, not every subsystem in the repository.
   bytes and length.
 - For multipart/object commits, fail before/after rename and cleanup; committed
   data must remain readable and pre-commit cleanup must not destroy parts.
+- Bound recursion over untrusted or persisted input; handle corrupted/cyclic
+  tree and cache traversals safely.
 - For version/index ordering, test `len - 1`, `len`, equal timestamps, missing
   versions, and deterministic tie-breaking.
 - For directory-object behavior, trace `__XLDIR__` at the store layer; branches

@@ -458,7 +458,11 @@ impl SessionCtxFactory {
             input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
         let normalized_csv_requires_single_file_scan =
             context.input.request.input_serialization.csv.as_ref().is_some_and(|csv| {
-                crate::csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+                csv.allow_quoted_record_delimiter.unwrap_or(false)
+                    || crate::csv_input_requires_normalization(
+                        csv.quote_character.as_deref(),
+                        csv.quote_escape_character.as_deref(),
+                    )
             });
         let config = if normalized_csv_requires_single_file_scan
             || custom_two_byte_record_delimiter
@@ -908,6 +912,24 @@ mod tests {
             .await
             .expect("CSV ScanRange session should be created");
 
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_disable_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input)
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("CSV input")
+            .allow_quoted_record_delimiter = Some(true);
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("multiline CSV session");
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
     }
 

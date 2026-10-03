@@ -395,6 +395,8 @@ pub mod data_usage {
         ScannerPauseBacklogRetirementPlanner, ScannerPauseBacklogRetirementReplica,
         register_scanner_pause_backlog_retirement_planner,
     };
+    #[cfg(feature = "test-util")]
+    pub use crate::data_usage::seed_bucket_usage_memory_for_test;
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
@@ -406,8 +408,7 @@ pub mod data_usage {
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
         store_data_usage_in_backend,
     };
-    #[cfg(feature = "test-util")]
-    pub use crate::data_usage::{get_bucket_usage_memory, seed_bucket_usage_memory_for_test};
+    pub use crate::data_usage::{get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline};
 }
 
 pub mod disk {

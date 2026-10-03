@@ -9,6 +9,7 @@ WebDAV (Web Distributed Authoring and Versioning) protocol implementation for Ru
 - Directory (bucket/prefix) creation and deletion
 - File upload, download, and deletion
 - Property queries (PROPFIND) for metadata
+- Quota reporting (PROPFIND `quota-available-bytes` / `quota-used-bytes`) so drive mounts show capacity
 - TLS support with multi-certificate SNI
 - Integration with RustFS IAM for access control
 
@@ -29,6 +30,27 @@ WebDAV (Web Distributed Authoring and Versioning) protocol implementation for Ru
 |--------|-------------|--------|
 | `MOVE` | Move/rename file | Returns 501 Not Implemented |
 | `COPY` | Copy file | Returns 501 Not Implemented |
+
+## Quota Reporting
+
+WebDAV clients (RaiDrive, Mountain Duck, Windows Explorer, macOS Finder) read
+drive capacity from the `quota-available-bytes` and `quota-used-bytes`
+properties. dav-server queries quota once per request without a path, so the
+reported value is a single filesystem-wide pair rather than per-bucket:
+
+- If every bucket visible to the authenticated session has a hard quota
+  configured, the server reports the summed cached bucket usage against the
+  summed quota limits. A bucket whose usage cache has no scanner snapshot yet
+  (fresh deployment, new bucket) counts as zero until the first complete
+  scanner cycle lands.
+- Otherwise the server falls back to the cluster's usable capacity — the same
+  erasure-aware used/total numbers the console dashboard shows — refreshed at
+  most every 30 seconds.
+- If neither source is available, quota properties are omitted from the
+  response and clients fall back to their own placeholder capacity.
+
+All inputs are cache or snapshot reads; quota reporting never triggers a
+scanner cycle or a live object listing.
 
 ## Enable Feature
 
