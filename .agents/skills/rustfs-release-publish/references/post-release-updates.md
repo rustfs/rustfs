@@ -1,6 +1,14 @@
-# Post-release Installation and Website Updates
+# Post-release Milestone, Installation, and Website Updates
 
 Read only after the final non-preview tag has passed Phase 6. Tag creation or a green binary build alone is insufficient: the release assets, source archive, container images, Helm package, and applicable latest channels must be available. Preview tags never enter this phase.
+
+## Version milestones
+
+1. Query all pages of both open and closed milestones in the RustFS release repository, matching titles exactly to version strings without a `v` prefix. A failed or incomplete query is not evidence that a milestone is absent; resolve the lookup before making changes.
+2. Close the milestone matching the published `<target>` if it is open; an already closed milestone needs no change. If it is missing, report the gap and continue checking the next version. Do not create a substitute for the released milestone or close/reassign its issues or PRs.
+3. Use an explicitly planned next version when provided; otherwise, for a stable `X.Y.Z`, use `X.Y.(Z+1)`. For example, after `1.0.1` is published, close milestone `1.0.1` and ensure milestone `1.0.2` exists. For an alpha/beta/rc target with a trailing numeric counter, increment that counter within the same channel unless a different next version was specified. If the next version cannot be determined, ask for that version and report this follow-up as blocked. Creating a planning milestone does not confirm the target of a future release or bypass the semver gate.
+4. Reuse an existing next-version milestone, whether open or closed; do not reopen it or create a duplicate. Only when the complete query confirms it is absent, create an open milestone with the exact next-version title. Do not invent a due date or description. After an uncertain creation result, query again before retrying.
+5. Read back both milestones and report their titles, URLs, and actual states, including whether the next milestone was reused or created. A failed close, create, or verification leaves milestone maintenance incomplete; retry only the unfinished operation after refreshing live state. Continue independent installation and website work without moving or republishing the release tag.
 
 ## Installation references
 
