@@ -178,7 +178,7 @@ impl Error {
     }
 
     /// Retry an unproven missing object only within the per-object budget.
-    /// Whole-task requeueing retains the narrower classification above.
+    /// Generic task retries retain the narrower classification above.
     pub(crate) fn is_recoverable_object_heal(&self) -> bool {
         self.is_recoverable_heal()
             || matches!(
