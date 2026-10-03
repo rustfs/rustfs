@@ -333,6 +333,7 @@ where
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
                 state = "cycle_activity_baseline_failed",
+                stage = "baseline_probe",
                 error = %err,
                 "Scanner cycle skipped because cluster activity could not be baselined"
             );
