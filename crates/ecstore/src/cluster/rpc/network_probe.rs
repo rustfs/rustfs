@@ -56,7 +56,7 @@ impl DiagnosticPacing {
         // Reservation is never refunded: a failed or dropped RPC may have sent some payload.
         let previous = self
             .charged_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 charged.checked_add(bytes).filter(|total| *total <= MAX_NETWORK_PROBE_BYTES)
             })
             .map_err(|_| NetworkPeerProbeError::LimitExceeded)?;
