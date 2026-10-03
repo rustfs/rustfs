@@ -35,14 +35,6 @@ pub(crate) struct DefaultFederatedSessionBinding;
 // Legacy receivers reject an empty parsed mapping; current receivers ignore it when the virtual-parent marker is present.
 const OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY: &str = " ";
 
-fn all_oidc_policies_resolved(selected_policy_names: &[String], resolved_policy_mapping: &str) -> bool {
-    let resolved_policy_names = MappedPolicy::new(resolved_policy_mapping).to_slice();
-    !selected_policy_names.is_empty()
-        && selected_policy_names
-            .iter()
-            .all(|policy_name| is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name))
-}
-
 /// Returns the subset of `selected_policy_names` that are safe claim names
 /// and exist in the resolved policy mapping. Groups whose names contain
 /// characters outside the safe set (e.g., `DOMAIN\Domain Users`) or that
@@ -694,14 +686,6 @@ mod tests {
         let error = issue_credentials(&transaction, &transaction.authorization.policies, Some("signing-secret"))
             .expect_err("credential issuance should reject a missing issuer");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
-    }
-
-    #[test]
-    fn oidc_replication_requires_all_selected_policies() {
-        assert!(all_oidc_policies_resolved(&["readonly".to_string()], "readonly"));
-        assert!(!all_oidc_policies_resolved(&["readonly".to_string(), "missing".to_string()], "readonly"));
-        assert!(!all_oidc_policies_resolved(&[], ""));
-        assert!(!all_oidc_policies_resolved(&["team+readonly".to_string()], "team+readonly"));
     }
 
     #[test]
