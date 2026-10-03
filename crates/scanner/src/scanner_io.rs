@@ -1083,6 +1083,7 @@ where
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
                 state = "cycle_activity_probe_failed",
+                stage = "post_scan_probe",
                 error = %err,
                 "Scanner cycle activity verification failed"
             );
@@ -1619,8 +1620,9 @@ pub use dirty_usage::{
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
+    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_bucket_generation,
+    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
+    set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};
