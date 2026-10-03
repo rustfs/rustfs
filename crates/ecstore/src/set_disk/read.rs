@@ -15,12 +15,13 @@
 use super::{
     Arc, Bytes, DiskError, DiskOption, DiskStore, Endpoint, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason,
     GetObjectFileInfo, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey,
-    GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo,
-    ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size,
-    build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index,
-    debug, error, get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
-    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
-    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
+    GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK,
+    OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks, StorageError,
+    adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
+    collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
+    get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
+    is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, reduce_read_quorum_errs, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
@@ -426,7 +427,7 @@ impl SetDisks {
         let Some(generation) = self.get_object_metadata_cache_generation(bucket, object) else {
             return MetadataCacheLookup::Miss;
         };
-        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let key = GetObjectMetadataCacheLookupKey::new(bucket, object, generation);
         // moka handles TTL expiry automatically; no is_fresh() check needed
         let Some(entry) = self.get_object_metadata_cache.get(&key).await else {
             return MetadataCacheLookup::Miss;
@@ -4213,12 +4214,15 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket-a", "object-a")
             .expect("metadata cache generation should be active");
         let first_key = GetObjectMetadataCacheKey::new("bucket-a", "object-a", generation);
+        let first_lookup = GetObjectMetadataCacheLookupKey::new("bucket-a", "object-a", generation);
         let second_key = GetObjectMetadataCacheKey {
             bucket: Arc::from("bucket-b"),
             object: Arc::from("object-b"),
             generation: generation.value,
             hash: generation.hash,
         };
+        let second_lookup = GetObjectMetadataCacheLookupKey::new("bucket-b", "object-b", generation);
+        let unrelated_lookup = GetObjectMetadataCacheLookupKey::new("bucket-c", "object-c", generation);
         let first_fi = valid_test_fileinfo("object-a");
         let second_fi = valid_test_fileinfo("object-b");
         let entry = |fi: FileInfo| {
@@ -4238,7 +4242,7 @@ mod metadata_cache_tests {
 
         assert_eq!(
             set.get_object_metadata_cache
-                .get(&first_key)
+                .get(&first_lookup)
                 .await
                 .expect("first colliding entry should remain addressable")
                 .fi
@@ -4247,13 +4251,14 @@ mod metadata_cache_tests {
         );
         assert_eq!(
             set.get_object_metadata_cache
-                .get(&second_key)
+                .get(&second_lookup)
                 .await
                 .expect("second colliding entry should remain addressable")
                 .fi
                 .name,
             "object-b"
         );
+        assert!(set.get_object_metadata_cache.get(&unrelated_lookup).await.is_none());
     }
 
     #[tokio::test]
