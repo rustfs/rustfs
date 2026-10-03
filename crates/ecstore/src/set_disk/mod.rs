@@ -5886,12 +5886,29 @@ fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
     parts_metadata: &'a [FileInfo],
     fi: &FileInfo,
     data_shards: usize,
+    disk_is_online: impl FnMut(usize) -> bool,
+) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
+    collect_inline_data_shard_fileinfos_from_observations(
+        parts_metadata
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| (index, Some(metadata))),
+        fi,
+        data_shards,
+        disk_is_online,
+    )
+}
+
+fn collect_inline_data_shard_fileinfos_from_observations<'a>(
+    observations: impl IntoIterator<Item = (usize, Option<&'a FileInfo>)>,
+    fi: &FileInfo,
+    data_shards: usize,
     mut disk_is_online: impl FnMut(usize) -> bool,
 ) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
     let distribution = &fi.erasure.distribution;
     let mut data_files = vec![None; data_shards];
 
-    for (disk_index, file_info) in parts_metadata.iter().enumerate() {
+    for (disk_index, file_info) in observations {
         if !disk_is_online(disk_index) {
             continue;
         }
@@ -5901,9 +5918,9 @@ fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
         if block_index == 0 || block_index > data_shards {
             continue;
         }
-        if file_info.name.is_empty() {
+        let Some(file_info) = file_info.filter(|metadata| !metadata.name.is_empty()) else {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD);
-        }
+        };
         if file_info.erasure.index != block_index {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
         }
