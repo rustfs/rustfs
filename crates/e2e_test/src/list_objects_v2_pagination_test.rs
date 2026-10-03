@@ -30,6 +30,7 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
+    use futures::{StreamExt, stream};
     use std::collections::HashSet;
     use std::future::Future;
     use std::time::Duration;
@@ -1040,22 +1041,35 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        // 12 dirs × 100 files = 1200 raw keys
+        // Keep all 1200 raw keys while bounding upload concurrency so fixture setup
+        // leaves the test's timeout budget available for the listing regression.
         let dir_count = 12;
         let files_per_dir = 100;
-        for d in 0..dir_count {
-            for f in 0..files_per_dir {
-                let key = format!("dir-{:02}/file{:03}.txt", d, f);
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .body(ByteStream::from_static(b"x"))
-                    .send()
-                    .await
-                    .expect("Failed to put object");
-            }
-        }
+        let fixture_started = std::time::Instant::now();
+        stream::iter((0..dir_count).flat_map(|d| (0..files_per_dir).map(move |f| (d, f))))
+            .for_each_concurrent(16, |(d, f)| {
+                let client = &client;
+                async move {
+                    let key = format!("dir-{d:02}/file{f:03}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                }
+            })
+            .await;
+        info!(
+            event = "pagination_fixture_ready",
+            component = "e2e_test",
+            subsystem = "list_objects_v2",
+            object_count = dir_count * files_per_dir,
+            elapsed_ms = fixture_started.elapsed().as_millis(),
+            "Pagination fixture ready"
+        );
 
         eprintln!(
             "Seeded {} objects in {bucket}; starting ListObjectsV2 pagination",
@@ -1077,7 +1091,16 @@ mod tests {
             dir_count,
             output.common_prefixes().len()
         );
+        let prefixes: HashSet<_> = output.common_prefixes().iter().filter_map(|entry| entry.prefix()).collect();
+        let expected_prefixes: Vec<_> = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect();
+        assert_eq!(prefixes, expected_prefixes.iter().map(String::as_str).collect());
+        assert!(output.contents().is_empty(), "all objects must collapse into common prefixes");
+        assert_eq!(output.key_count(), Some(12));
         assert_eq!(output.max_keys(), Some(1000));
+        assert!(
+            output.next_continuation_token().is_none(),
+            "a complete listing must not return a continuation token"
+        );
         // 12 visible < 1000 capped MaxKeys → not truncated
         assert!(
             !output.is_truncated().unwrap_or(false),
