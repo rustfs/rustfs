@@ -60,6 +60,16 @@ async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     heal_env_at(None).await
 }
 
+async fn heal_env_with_bucket(bucket: &str) -> (Vec<PathBuf>, Arc<dyn HealStorageAPI>) {
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("rustfs_heal_mrf_test")
+        .build()
+        .await;
+    env.make_bucket(bucket, false).await;
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+    (env.disk_paths, storage)
+}
+
 async fn heal_env_at(base_dir: Option<&Path>) -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     let mut builder = rustfs_test_utils::TestECStoreEnv::builder().prefix("rustfs_heal_mrf_test");
     if let Some(base_dir) = base_dir {
@@ -302,6 +312,87 @@ fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u
     })
 }
 
+async fn assert_legacy_responsibilities_parked(
+    disk_paths: &[PathBuf],
+    expected_records: &[&[u8]],
+    observed_bucket_incarnation_id: uuid::Uuid,
+) {
+    assert!(!observed_bucket_incarnation_id.is_nil(), "the observed bucket generation must be real");
+    let checkpoint = mrf_queue::snapshot::inspect_local_committed_snapshot(rustfs_config::DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES)
+        .await
+        .expect("inspect the committed legacy responsibility checkpoint")
+        .expect("parked responsibilities must retain a committed checkpoint");
+    assert_eq!(
+        checkpoint.payload().len(),
+        expected_records.iter().map(|record| record.len()).sum::<usize>()
+    );
+    assert!(
+        expected_records
+            .iter()
+            .all(|record| { checkpoint.payload().windows(record.len()).any(|bytes| bytes == *record) }),
+        "the latest checkpoint must preserve each exact kind, scope, version and object identity"
+    );
+
+    // The production inspector selects and validates the committed slot. Read
+    // its private lifecycle companion without adding a test-only public API.
+    let companion_path = format!(".heal-mrf-lifecycle.{}.bin", checkpoint.slot());
+    let companions: Vec<_> = disk_paths
+        .iter()
+        .map(|path| std::fs::read(path.join(META_BUCKET).join(&companion_path)).expect("read each parked lifecycle replica"))
+        .collect();
+    let companion = companions.first().expect("the fixture must have journal disks");
+    assert!(
+        companions.iter().all(|replica| replica == companion),
+        "every disk must retain the same lifecycle responsibility"
+    );
+    assert!(companion.len() >= 49, "lifecycle envelope must be complete");
+    assert_eq!(&companion[..8], b"RFMFLC01");
+    assert_eq!(companion[8], 1);
+    assert_eq!(
+        u64::from_le_bytes(companion[9..17].try_into().expect("lifecycle payload length")),
+        u64::try_from(companion.len() - 49).expect("fixture lifecycle length fits")
+    );
+    assert_eq!(&companion[17..49], Sha256::digest(&companion[49..]).as_slice());
+    let payload: serde_json::Value = serde_json::from_slice(&companion[49..]).expect("decode committed lifecycle payload");
+    assert_eq!(payload["format_version"], 1);
+    assert_eq!(payload["checkpoint_owner"], checkpoint.owner().to_string());
+    assert_eq!(payload["checkpoint_sequence"], checkpoint.sequence());
+    let records = payload["records"].as_array().expect("lifecycle responsibility records");
+    assert_eq!(records.len(), expected_records.len());
+    let mut responsibility_ids = std::collections::HashSet::new();
+    for expected in expected_records {
+        let digest: [u8; 32] = Sha256::digest(expected).into();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| record["intent_digest"] == serde_json::json!(digest))
+            .collect();
+        assert_eq!(matching.len(), 1, "each exact partial-write identity must own one parked responsibility");
+        let record = matching[0];
+        let id = uuid::Uuid::parse_str(record["responsibility_id"].as_str().expect("responsibility UUID"))
+            .expect("valid responsibility UUID");
+        assert!(
+            !id.is_nil() && responsibility_ids.insert(id),
+            "scoped responsibilities must have distinct non-nil IDs"
+        );
+        assert_eq!(
+            record.get("source_bucket_incarnation_id"),
+            Some(&serde_json::Value::Null),
+            "replay must not invent the unknown producer generation"
+        );
+        assert_eq!(
+            record.get("last_operator_acceptance"),
+            Some(&serde_json::Value::Null),
+            "replay must not fabricate operator authorization"
+        );
+        assert_eq!(record["state"]["state"], "legacy_generation_unknown");
+        assert_eq!(
+            record["state"]["observed_bucket_incarnation_id"],
+            observed_bucket_incarnation_id.to_string()
+        );
+        assert!(record["state"]["detected_at_ms"].as_u64().is_some_and(|time| time > 0));
+    }
+}
+
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -351,12 +442,17 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
 
 /// A journal left behind by a previous process must be replayed into the
 /// manager queue, and a torn tail must not block replay of the intact records.
-/// The partial-write record keeps the legacy journal as the durable anchor
-/// until an exact verified repair proof can discharge it.
+/// A partial write with no producer generation remains durably parked rather
+/// than being admitted against whichever bucket happens to exist at replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("replay-bucket").await;
+    let bucket_incarnation_id = storage
+        .mrf_bucket_incarnation_id("replay-bucket")
+        .await
+        .expect("read the current replay bucket generation")
+        .expect("the replay bucket must have a persisted generation");
 
     // The journal reader resolves disks through the process-local disk map;
     // register the environment's disks the same way server startup does.
@@ -376,7 +472,10 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
     assert_eq!(replayed, 2, "the two intact records must be replayed");
 
     let snapshot = manager.operations_snapshot().await;
-    assert_eq!(snapshot.queued_by_source.mrf, 2, "replayed intents must be attributed to the MRF source");
+    assert_eq!(
+        snapshot.queued_by_source.mrf, 1,
+        "only the decode-failure intent may enter the MRF manager queue"
+    );
 
     assert!(
         disk_paths
@@ -387,13 +486,23 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
     assert!(
         disk_paths
             .iter()
-            .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
-        "missing authoritative journal remains absent"
+            .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "partial-write dispatch must first publish its authoritative successor"
+    );
+    let successor = journal_record(3, "replay-bucket", "partial-object", None, 1);
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &successor)
+            && committed_checkpoint_matches_on_all_disks(&disk_paths, 1, &successor),
+        "the committed and authoritative successor must preserve the partial-write identity"
     );
 
     let snapshot = manager.operations_snapshot().await;
     assert_eq!(snapshot.queued_by_priority.urgent, 1, "the decode-failure record must replay as Urgent");
-    assert!(snapshot.queued_by_priority.normal >= 1, "the partial-write record must replay as Normal");
+    assert_eq!(
+        snapshot.queued_by_priority.normal, 0,
+        "an unknown producer generation must not enter the repair queue"
+    );
+    assert_legacy_responsibilities_parked(&disk_paths, &[&successor], bucket_incarnation_id).await;
 }
 
 /// A committed checkpoint published by the new two-slot writer is the
@@ -402,7 +511,12 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("committed-bucket").await;
+    let bucket_incarnation_id = storage
+        .mrf_bucket_incarnation_id("committed-bucket")
+        .await
+        .expect("read the current committed bucket generation")
+        .expect("the committed bucket must have a persisted generation");
     register_local_disks(&disk_paths, "mrf-committed-replay-test").await;
 
     let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
@@ -416,10 +530,10 @@ async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
     assert_eq!(replayed, 1, "only the committed snapshot epoch may replay");
 
     let snapshot = manager.operations_snapshot().await;
-    assert_eq!(snapshot.queued_by_source.mrf, 1);
+    assert_eq!(snapshot.queued_by_source.mrf, 0);
     assert_eq!(
-        snapshot.queued_by_priority.normal, 1,
-        "the committed partial-write record must replay instead of the stale legacy decode-failure"
+        snapshot.queued_by_priority.normal, 0,
+        "the committed partial write without a producer generation must remain parked"
     );
     assert_eq!(
         snapshot.queued_by_priority.urgent, 0,
@@ -427,8 +541,9 @@ async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
     );
     assert!(
         journal_exists_on_all_disks(&disk_paths, COMMITTED_MANIFEST_REL),
-        "the committed checkpoint remains until the accepted partial-write has proof"
+        "the committed checkpoint must retain the parked partial-write responsibility"
     );
+    assert_legacy_responsibilities_parked(&disk_paths, &[&committed], bucket_incarnation_id).await;
 }
 
 /// A damaged committed checkpoint is ambiguous: replay must not fall back to
@@ -534,11 +649,18 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("identity-bucket").await;
+    let bucket_incarnation_id = storage
+        .mrf_bucket_incarnation_id("identity-bucket")
+        .await
+        .expect("read the current identity bucket generation")
+        .expect("the identity bucket must have a persisted generation");
     register_local_disks(&disk_paths, "mrf-authoritative-identity-test").await;
 
-    let mut authoritative = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
-    authoritative.extend(scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 8));
+    let first_partial = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
+    let second_partial = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 8);
+    let mut authoritative = first_partial.clone();
+    authoritative.extend_from_slice(&second_partial);
     authoritative.extend(journal_record(2, "identity-bucket", "same-object", None, 0));
     authoritative.extend(journal_record(1, "identity-bucket", "same-object", Some([4u8; 16]), 0));
     let stale_legacy = journal_record(3, "identity-bucket", "stale-legacy-object", None, 0);
@@ -554,12 +676,12 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
 
     let snapshot = manager.operations_snapshot().await;
     assert_eq!(
-        snapshot.queued_by_source.mrf, 4,
-        "same-object MRF replay must retain distinct kind and scope responsibilities"
+        snapshot.queued_by_source.mrf, 2,
+        "only metadata-corruption and decode-failure repairs may enter the manager"
     );
     assert_eq!(
-        snapshot.queued_by_priority.normal, 2,
-        "the two scoped partial-write records must remain independently queued"
+        snapshot.queued_by_priority.normal, 0,
+        "neither scoped partial write may be repaired with an unknown producer generation"
     );
     assert_eq!(
         snapshot.queued_by_priority.high, 1,
@@ -570,12 +692,16 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
         "decode-failure repair must not merge with object repair responsibility"
     );
     assert!(
-        disk_paths.iter().all(|path| {
-            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
-        }),
-        "partial-write responsibilities keep both replay anchors until proof"
+        journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &first_partial)
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &second_partial)
+            && committed_payload_contains_on_all_disks(&disk_paths, &[&first_partial, &second_partial]),
+        "both scoped partial-write identities must survive in the authoritative and committed successor"
     );
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &[]),
+        "the legacy mirror must not misrepresent scoped-only partial-write responsibilities"
+    );
+    assert_legacy_responsibilities_parked(&disk_paths, &[&first_partial, &second_partial], bucket_incarnation_id).await;
 }
 
 /// If replay reaches a full heal-manager queue, the old journal remains the

@@ -397,6 +397,7 @@ impl RelayHttpClient {
             let response = self
                 .client
                 .post(self.receive_url.clone())
+                .header(header::ORIGIN, self.receive_url.origin().ascii_serialization())
                 .header(header::COOKIE, self.cookie.clone())
                 .header("X-XSRF-TOKEN", self.csrf_token.clone())
                 .header(header::ACCEPT, "application/json")

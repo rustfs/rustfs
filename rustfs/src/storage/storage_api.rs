@@ -458,11 +458,10 @@ pub(crate) mod ecstore_config {
 }
 
 pub(crate) mod ecstore_data_usage {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::data_usage::get_bucket_usage_memory;
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_data_usage_from_backend, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+        apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
+        load_admin_data_usage_from_backend_cached, load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline,
+        quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
         record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
@@ -492,8 +491,8 @@ pub(crate) mod ecstore_error {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
     pub(crate) use rustfs_ecstore::api::error::{
-        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_invalid_upload_id,
+        is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -1787,6 +1786,117 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+pub(crate) async fn get_bucket_website_config_for_store(store: &ECStore, bucket: &str) -> Result<s3s::dto::WebsiteConfiguration> {
+    let metadata = store.get_bucket_metadata(bucket).await?;
+    match ecstore_bucket::metadata::ConfigState::of(&metadata.website_config_xml, &metadata.website_config)
+        .require(bucket, ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG)?
+    {
+        Some(config) => Ok(config.clone()),
+        None => Err(StorageError::ConfigNotFound),
+    }
+}
+
+pub(crate) fn validate_website_configuration(config: &s3s::dto::WebsiteConfiguration) -> s3s::S3Result<()> {
+    if config.redirect_all_requests_to.is_some()
+        && (config.index_document.is_some() || config.error_document.is_some() || config.routing_rules.is_some())
+    {
+        return Err(website_config_error(
+            "RedirectAllRequestsTo cannot be combined with other website settings",
+        ));
+    }
+    if config.redirect_all_requests_to.is_none() && config.index_document.is_none() {
+        return Err(website_config_error(
+            "IndexDocument is required unless RedirectAllRequestsTo is configured",
+        ));
+    }
+    if let Some(index) = &config.index_document
+        && (index.suffix.is_empty() || index.suffix.contains('/'))
+    {
+        return Err(website_config_error("IndexDocument suffix must be a single nonempty name"));
+    }
+    if let Some(error) = &config.error_document
+        && error.key.is_empty()
+    {
+        return Err(website_config_error("ErrorDocument key cannot be empty"));
+    }
+    if let Some(rules) = &config.routing_rules {
+        if rules.len() > 50 {
+            return Err(website_config_error("RoutingRules cannot contain more than 50 rules"));
+        }
+        if rules.is_empty() {
+            return Err(website_config_error("RoutingRules cannot be empty"));
+        }
+        for rule in rules {
+            if let Some(condition) = &rule.condition
+                && condition.key_prefix_equals.is_none()
+                && condition.http_error_code_returned_equals.is_none()
+            {
+                return Err(website_config_error("RoutingRule Condition cannot be empty"));
+            }
+            if rule.redirect.host_name.is_none()
+                && rule.redirect.protocol.is_none()
+                && rule.redirect.replace_key_prefix_with.is_none()
+                && rule.redirect.replace_key_with.is_none()
+                && rule.redirect.http_redirect_code.is_none()
+            {
+                return Err(website_config_error("RoutingRule Redirect cannot be empty"));
+            }
+            if rule.redirect.replace_key_prefix_with.is_some() && rule.redirect.replace_key_with.is_some() {
+                return Err(website_config_error("RoutingRule redirect key replacements are mutually exclusive"));
+            }
+            if let Some(protocol) = rule.redirect.protocol.as_ref().map(|protocol| protocol.as_str())
+                && !matches!(protocol, "http" | "https")
+            {
+                return Err(website_config_error("RoutingRule protocol must be http or https"));
+            }
+            if let Some(code) = rule.redirect.http_redirect_code.as_deref()
+                && !matches!(code, "301" | "302" | "303" | "307" | "308")
+            {
+                return Err(website_config_error("RoutingRule redirect code is invalid"));
+            }
+            if let Some(host) = rule.redirect.host_name.as_deref() {
+                validate_website_redirect_host(host)?;
+            }
+            if let Some(code) = rule
+                .condition
+                .as_ref()
+                .and_then(|condition| condition.http_error_code_returned_equals.as_deref())
+                && (code.parse::<u16>().ok().is_none_or(|value| !(400..=599).contains(&value)))
+            {
+                return Err(website_config_error("RoutingRule error code is invalid"));
+            }
+        }
+    }
+    if let Some(redirect) = &config.redirect_all_requests_to {
+        validate_website_redirect_host(&redirect.host_name)?;
+        if let Some(protocol) = redirect.protocol.as_ref().map(|protocol| protocol.as_str())
+            && !matches!(protocol, "http" | "https")
+        {
+            return Err(website_config_error("RedirectAllRequestsTo protocol must be http or https"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_website_redirect_host(host: &str) -> s3s::S3Result<()> {
+    let url =
+        url::Url::parse(&format!("http://{host}/")).map_err(|_| website_config_error("website redirect host is invalid"))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(website_config_error("website redirect host is invalid"));
+    }
+    Ok(())
+}
+
+fn website_config_error(message: &'static str) -> s3s::S3Error {
+    s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, message)
+}
+
 #[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
@@ -1905,6 +2015,10 @@ pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
+}
+
+pub(crate) fn is_err_invalid_upload_id(err: &Error) -> bool {
+    ecstore_error::is_err_invalid_upload_id(err)
 }
 
 pub(crate) fn is_err_object_not_found(err: &Error) -> bool {

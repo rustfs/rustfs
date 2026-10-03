@@ -17,6 +17,8 @@ The `main` ruleset (`6436880`) requires exactly these contexts, with `strict_req
 
 Every PR enters `ci.yml`. The `classify-changes` job uses the base revision of `scripts/ci_gate.py` to select a conservative documentation-only path: root Markdown/licenses, `AGENTS.md`, Markdown under `docs/` or `.agents/skills/`, and documentation images. Unknown paths, unavailable Git history, an empty diff, or a missing base policy select the full matrix. Renames include their deleted source path. Documentation-only PRs still run Quick Checks and Typos; the aggregate requires the expensive jobs to be skipped exactly as selected.
 
+PRs changing only Rust sources under `crates/e2e_test/src/` and known E2E selection digests (optionally with those documentation paths) use the `e2e` scope. They keep workspace validation, the server build, E2E smoke, and both S3 lanes; independent workflows retain their path selection. Connect boundary, serial ILM, optional protocol/rio-v2, and real io_uring jobs are skipped because their sources and test inputs are unchanged. Manifests, fixtures, shared nextest configuration, scripts, production sources, and unknown paths still select `full`. A dependency on `e2e_test` from another workspace member or reachable local dependency disables this shortcut. All non-PR events retain their full selection.
+
 `required-checks` runs even after failed or skipped dependencies. `scripts/ci_gate.py verify` rejects missing jobs, unexpected jobs, failure, cancellation, and unexpected skips; optional lanes are required only on their declared events. `Workspace Test and Lint` is the ordinary Rust job, while `Test and Lint` uniquely names the aggregate. New validation jobs must update both its direct dependencies and the script contract. Test this wiring and its failure cases with `python3 scripts/ci_gate.py --self-test`.
 
 Verify the live rule before changing merge policy:
@@ -28,6 +30,12 @@ gh api repos/rustfs/rustfs/rulesets/6436880 \
 
 The aggregate requires the validation lanes already selected by `ci.yml`; this closes the gap where a failing critical lane left the required workspace check green. Independent workflows remain report-only unless separately required. Before adding a new expensive lane or moving existing PR coverage to a schedule, collect representative execution and regression evidence, establish ownership and a working scheduled replacement, and update this reference with the resulting policy.
 
+Superseded PR attempts are cancelled. A running main validation finishes, with only the newest pending main run retained, so frequent merges cannot continuously cancel the full baseline. Having a `merge_group` trigger does not itself require use of the merge queue.
+
+Protocol matrix jobs finish independently when a sibling fails. Each executed protocol test step preserves its log and available JUnit under a separate, attempt-specific artifact; a skipped test step cannot upload a cached report.
+
+The four site-replication state-writer concurrency proofs reserve the available nextest slots in both local and CI profiles. This isolates their durable IO from unrelated test processes while retaining each proof's internal two-writer race, production five-second lock-acquisition limit, assertions, and zero retries.
+
 ## Pull request and merge matrix
 
 "Via aggregate" means a wrong result fails the required `Test and Lint` check. "Report-only" means visible and actionable but outside both the required list and aggregate. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
@@ -35,18 +43,18 @@ The aggregate requires the validation lanes already selected by `ci.yml`; this c
 | Event | Check name | Workflow / job | Merge status | Reproduce |
 |---|---|---|---|---|
 | PR, non-doc change | `Quick Checks` | `ci.yml` `quick-checks` | Required | `make pre-commit` |
-| PR, non-doc change | `Workspace Test and Lint` | `ci.yml` `test-and-lint` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; `scripts/check_migration_gate_count.sh` |
+| PR, non-doc change | `Workspace Test and Lint` | `ci.yml` `test-and-lint` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; migration evidence check described below |
 | PR, non-doc change | `Typos` | `ci.yml` `typos` | Via aggregate | `typos` |
-| PR, non-doc change | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Via aggregate | exact command in the job |
-| PR, non-doc change | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Via aggregate | `cargo nextest run` with the job's `--features` |
-| PR, non-doc change | `Connect Short Credential Boundary` | `ci.yml` `connect-short-credential-boundary` | Via aggregate | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `cargo check -p rustfs --release --features connect-e2e-short-credentials` must fail |
+| PR, full selection | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Via aggregate | exact command in the job |
+| PR, full selection | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Via aggregate | `cargo nextest run` with the job's `--features` |
+| PR, full selection | `Connect Short Credential Boundary` | `ci.yml` `connect-short-credential-boundary` | Via aggregate | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `cargo check -p rustfs --release --features connect-e2e-short-credentials` must fail |
+| PR, full selection | `Offline Enrollment E2E Root Boundary` | `ci.yml` `offline-enrollment-e2e` | Via aggregate | `scripts/check_offline_enrollment_e2e.sh` |
 | PR, non-doc change | `Build RustFS Debug Binary` | `ci.yml` `build-rustfs-debug-binary` | Via aggregate; prerequisite for black-box jobs | `python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks` (binary plus its `rustfs.e2e.json` sidecar) |
-| PR, non-doc change | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Via aggregate | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
+| PR, full selection | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Via aggregate | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
 | PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Via aggregate | `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` under the same wrapper; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
 | PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Via aggregate | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
 | PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Via aggregate | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
 | PR touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
-| PR touching `paths` in `architecture-migration-rules.yml` | `Architecture Migration Rules` | `architecture-migration-rules.yml` `architecture-migration-rules` | Report-only | `scripts/check_architecture_migration_rules.sh` |
 | PR touching `paths` in `nix.yml` | `Nix Build & Check` | `nix.yml` `nix-validation` | Report-only | `nix flake check` |
 | PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
 | PR touching `paths` in `windows-filesystem.yml` | `Rename Safety` | `windows-filesystem.yml` `rename-safety` | Report-only | the `cargo test -p rustfs-ecstore --lib <filter>` commands in the job, on Windows |
@@ -58,6 +66,8 @@ The aggregate requires the validation lanes already selected by `ci.yml`; this c
 | `merge_group`; push to `main` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Via aggregate on these events | `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test` (CI adds `--binary "$RUSTFS_E2E_STARTUP_CAS_BINARY"` for the downloaded binary and sidecar) |
 
 e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
+
+Architecture migration rules run once in the required Quick Checks job. Migration proofs reuse the successful workspace run: `scripts/check_migration_gate_count.sh evidence <core-listing.json> <junit.xml>` checks the unchanged name selection and committed floor, and requires exactly one successful execution without retries for each proof. Missing, filtered, skipped, failed, or duplicate evidence fails the gate. Local `check` and `run` modes remain available. Upgrade compatibility builds one current server and shares its binary and provenance sidecar across the seven cases; each case independently verifies the pinned previous release checksum and runs its existing test.
 
 Scanner usage and heal rebuild coverage are intentionally split by risk and
 cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect
@@ -108,7 +118,7 @@ Post-merge and tag-driven; not a substitute for a PR gate.
 |---|---|---|
 | Push to `main`, weekly schedule, dispatch | `build.yml` `build-rustfs` (a development build on a main push restricts the matrix to the Linux targets) | build artifacts; no release publication |
 | Valid release or preview tag | `build.yml` `build-rustfs`, `create-release`, `upload-release-assets`, `publish-release` | draft release, checksummed assets, publish |
-| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `build-docker`, `scan-docker-image`, `sync-dockerhub-description` | multi-architecture images, vulnerability report, and the Docker Hub overview republished from `README.md` |
+| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `build-docker`, `scan-docker-image` | multi-architecture images and vulnerability report |
 | Successful release-tag build (`workflow_run`) | `package.yml` `package` | DEB/RPM packages and checksums uploaded to the release |
 | Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `build-helm-package`, `publish-helm-package` | versioned chart and repository index |
 | Final tag's release published | `build.yml` `cleanup-preview-releases` | deletes every `<target>-preview.<N>` Release for that target; the tags are kept |

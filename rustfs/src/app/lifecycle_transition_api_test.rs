@@ -1479,7 +1479,10 @@ async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
                 .transition_object(&transition_bucket, object, &transition_opts)
                 .await
         });
-        put_barrier.wait_until_paused().await;
+        tokio::select! {
+            result = &mut transition => panic!("transition ended before reaching the tier PUT barrier: {result:?}"),
+            () = put_barrier.wait_until_paused() => {}
+        }
 
         let prepared_reader = ecstore
             .prepare_get_object_reader(bucket.as_str(), object, None, HeaderMap::new(), &ObjectOptions::default())

@@ -38,6 +38,9 @@ use zeroize::Zeroizing;
 mod common;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Real storage setup shares the measurement window. Verify functionality with
+// an integration budget; deadline behavior is checked against a stalled peer.
+const REAL_SERVER_MEASUREMENT_BUDGET: Duration = Duration::from_secs(10);
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64
@@ -306,6 +309,56 @@ async fn deadline_and_in_flight_cancellation_stop_a_stalled_probe() {
 }
 
 #[tokio::test]
+async fn s3_request_deadline_stops_a_peer_that_never_responds() {
+    use tokio::io::AsyncReadExt as _;
+
+    let _guard = TEST_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("response listener");
+    let address = listener.local_addr().expect("listener address");
+    let (received, request_received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("object connection");
+        let mut request = [0_u8; 4096];
+        assert!(socket.read(&mut request).await.expect("request headers") > 0);
+        received.send(()).expect("report received request");
+        std::future::pending::<()>().await;
+        drop(socket);
+    });
+    let probe = S3ObjectProbe::new(
+        &format!("http://{address}"),
+        None,
+        None,
+        Zeroizing::new("access".to_owned()),
+        Zeroizing::new("secret".to_owned()),
+        Zeroizing::new(String::new()),
+        Duration::from_secs(60),
+    )
+    .expect("object probe");
+    let mut request = request(ObjectOperation::GetObject);
+    request.duration = Duration::from_secs(30);
+    let measurement = tokio::spawn(async move { measure_object(&request, &probe, &CancellationToken::new()).await });
+
+    // Complete real TCP setup before pausing time. The 30s operation deadline
+    // must fire independently of the client's longer 60s transport timeout.
+    tokio::time::timeout(Duration::from_secs(10), request_received)
+        .await
+        .expect("peer received the request")
+        .expect("peer notification");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let measurement = tokio::time::timeout(Duration::from_secs(1), measurement)
+        .await
+        .expect("operation deadline must stop the request")
+        .expect("measurement task")
+        .expect("typed timeout");
+    assert_eq!(measurement.result.outcome(), ObjectOutcome::Failed);
+    assert_eq!(measurement.target.reason_code, ObjectTargetReasonCode::TimedOut);
+    assert_eq!(measurement.target.completed_operations, 0);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn only_one_object_collector_can_run_at_a_time() {
     let _guard = TEST_LOCK.lock().await;
     let first_cancel = CancellationToken::new();
@@ -519,6 +572,7 @@ fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put() {
 
 async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_body() {
     let _guard = TEST_LOCK.lock().await;
+    let startup = std::time::Instant::now();
     let port = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -531,6 +585,7 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .build()
         .await
         .expect("start embedded server");
+    eprintln!("embedded object fixture ready after {:?}", startup.elapsed());
     let probe = S3ObjectProbe::new(
         &server.endpoint(),
         None,
@@ -538,13 +593,13 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         Zeroizing::new(server.access_key().to_owned()),
         Zeroizing::new(server.secret_key().to_owned()),
         Zeroizing::new(String::new()),
-        Duration::from_secs(2),
+        REAL_SERVER_MEASUREMENT_BUDGET,
     )
     .expect("object probe");
 
     for operation in [ObjectOperation::GetObject, ObjectOperation::PutObject] {
         let mut request = request(operation);
-        request.duration = Duration::from_secs(2);
+        request.duration = REAL_SERVER_MEASUREMENT_BUDGET;
         if operation == ObjectOperation::PutObject {
             request.artifact_uid = "019e3ae0-0000-7000-8000-000000000016".to_owned();
         }
@@ -604,7 +659,7 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
             "--traffic-bytes",
             "65536",
             "--duration-millis",
-            "1000",
+            &REAL_SERVER_MEASUREMENT_BUDGET.as_millis().to_string(),
             "--acknowledge-l1",
         ]);
     let result = tokio::task::spawn_blocking(move || command.output())
@@ -612,7 +667,12 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .expect("CLI task")
         .expect("run production rustfs binary");
 
-    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("tool=performance.object outcome=SUCCEEDED reason=COMPLETE\n"));
     assert!(stdout.contains("upload=not-performed\n"));

@@ -58,8 +58,14 @@ impl ActionSet {
     }
 
     pub fn is_match(&self, action: &Action) -> bool {
+        self.is_match_for_effect(action, false)
+    }
+
+    /// `deny` lets a blanket `s3:*` cover force-delete actions so an explicit
+    /// Deny still wins. Allow matching stays name-only for those actions.
+    pub fn is_match_for_effect(&self, action: &Action, deny: bool) -> bool {
         for act in self.0.iter() {
-            if act.is_match(action) {
+            if act.is_match_for_effect(action, deny) {
                 return true;
             }
 
@@ -71,6 +77,22 @@ impl ActionSet {
         }
 
         false
+    }
+
+    /// Whether a statement with this `Action` list and `not_actions` as its
+    /// `NotAction` list covers `action`.
+    ///
+    /// `NotAction` always uses plain wildcard matching, so `NotAction: "s3:*"`
+    /// still excludes force-delete. An Allow grants force-delete only when its
+    /// `Action` list names it: an Allow built from `NotAction` alone never does.
+    pub fn statement_covers(&self, not_actions: &ActionSet, action: &Action, deny: bool) -> bool {
+        if not_actions.is_match_for_effect(action, true) {
+            return false;
+        }
+        if self.is_empty() {
+            return deny || !action_requires_explicit_grant(action);
+        }
+        self.is_match_for_effect(action, deny)
     }
 }
 
@@ -155,8 +177,26 @@ pub enum Action {
 
 impl Action {
     pub fn is_match(&self, action: &Action) -> bool {
+        self.is_match_for_effect(action, false)
+    }
+
+    pub fn is_match_for_effect(&self, action: &Action, deny: bool) -> bool {
+        // Force-delete bypasses emptiness and version checks. A blanket `s3:*`
+        // / `*` Allow (including canned consoleAdmin) must not confer it; the
+        // statement has to name `s3:ForceDeleteBucket` or `s3:ForceDeleteObject`.
+        // The same wildcard on a Deny still matches, so explicit deny wins.
+        if !deny && matches!(self, Action::S3Action(S3Action::AllActions)) && action_requires_explicit_grant(action) {
+            return false;
+        }
         wildcard::is_match::<&str, &str>(self.into(), action.into())
     }
+}
+
+fn action_requires_explicit_grant(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::S3Action(S3Action::ForceDeleteBucketAction | S3Action::ForceDeleteObjectAction)
+    )
 }
 
 impl From<&Action> for &str {
@@ -220,8 +260,14 @@ pub enum S3Action {
     CreateBucketAction,
     #[strum(serialize = "s3:DeleteBucket")]
     DeleteBucketAction,
+    /// DeleteBucket when `x-minio-force-delete` / `x-rustfs-force-delete` is set.
+    /// Not implied by `s3:*`; the action must be named on the statement.
     #[strum(serialize = "s3:ForceDeleteBucket")]
     ForceDeleteBucketAction,
+    /// Recursive DeleteObject selected by the same force-delete header.
+    /// Not implied by `s3:*`; the action must be named on the statement.
+    #[strum(serialize = "s3:ForceDeleteObject")]
+    ForceDeleteObjectAction,
     #[strum(serialize = "s3:DeleteBucketPolicy")]
     DeleteBucketPolicyAction,
     #[strum(serialize = "s3:DeleteBucketPublicAccessBlock")]
@@ -731,6 +777,26 @@ pub enum KmsAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blanket_s3_wildcard_does_not_grant_force_delete() {
+        let wildcard = Action::try_from("s3:*").expect("s3:* parses");
+        let star = Action::try_from("*").expect("* parses as s3:*");
+        let force_bucket = Action::try_from("s3:ForceDeleteBucket").expect("force bucket action parses");
+        let force_object = Action::try_from("s3:ForceDeleteObject").expect("force object action parses");
+        let delete_object = Action::try_from("s3:DeleteObject").expect("delete object parses");
+
+        assert!(!wildcard.is_match(&force_bucket));
+        assert!(!wildcard.is_match(&force_object));
+        assert!(!star.is_match(&force_bucket));
+        assert!(!star.is_match(&force_object));
+        assert!(wildcard.is_match(&delete_object));
+        assert!(wildcard.is_match_for_effect(&force_bucket, true));
+        assert!(wildcard.is_match_for_effect(&force_object, true));
+        assert!(force_bucket.is_match(&force_bucket));
+        assert!(force_object.is_match(&force_object));
+        assert!(!force_bucket.is_match(&force_object));
+    }
 
     #[test]
     fn test_action_wildcard_parsing() {

@@ -14,13 +14,19 @@
 
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
+use crate::runtime_sources::current_object_store_handle;
+#[cfg(feature = "webdav")]
 use crate::shared_types::RemoteAddr;
+#[cfg(feature = "webdav")]
+use crate::storage_api::protocols::client::capacity;
 use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
 #[cfg(feature = "webdav")]
 use rustfs_protocols::common::SessionContext;
+#[cfg(feature = "webdav")]
+use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 #[cfg(feature = "webdav")]
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
@@ -138,6 +144,53 @@ fn session_list_buckets_request(
         service: None,
         trailing_headers: None,
     }
+}
+
+/// TTL for the cluster usable-capacity snapshot behind WebDAV quota
+/// properties. WebDAV clients poll quota on a timer and the underlying
+/// storage-info fan-out touches every disk (plus every peer when
+/// distributed), so quota responses reuse the snapshot for this long.
+#[cfg(feature = "webdav")]
+const CLUSTER_CAPACITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached cluster usable capacity as `(loaded_at, (used_bytes, total_bytes))`.
+#[cfg(feature = "webdav")]
+type ClusterCapacitySnapshot = Option<(std::time::Instant, (u64, u64))>;
+
+#[cfg(feature = "webdav")]
+fn cluster_capacity_cache() -> &'static std::sync::Mutex<ClusterCapacitySnapshot> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ClusterCapacitySnapshot>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Cluster usable capacity as (used, total) bytes — the same erasure-aware
+/// numbers the console dashboard reports. Returns None while the object store
+/// is not initialized or no capacity has been measured yet; quota properties
+/// are omitted in that case.
+#[cfg(feature = "webdav")]
+async fn cluster_usable_capacity() -> Option<(u64, u64)> {
+    if let Ok(cache) = cluster_capacity_cache().lock()
+        && let Some((loaded_at, value)) = *cache
+        && loaded_at.elapsed() < CLUSTER_CAPACITY_CACHE_TTL
+    {
+        return Some(value);
+    }
+
+    let store = current_object_store_handle()?;
+    let info = capacity::StorageAdminApi::storage_info(store.as_ref()).await;
+    let total = capacity::get_total_usable_capacity(&info.disks, &info) as u64;
+    if total == 0 {
+        // Disks are still initializing; reporting a zero-capacity drive would
+        // make clients refuse writes, so omit quota properties instead.
+        return None;
+    }
+    let free = capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
+    let value = (total.saturating_sub(free), total);
+
+    if let Ok(mut cache) = cluster_capacity_cache().lock() {
+        *cache = Some((std::time::Instant::now(), value));
+    }
+    Some(value)
 }
 
 fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
@@ -500,6 +553,62 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         })?;
         let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
         self.fs.list_buckets(request).await.map(|response| response.output)
+    }
+
+    /// Every input is a cache or snapshot read: quota reporting never triggers
+    /// a scanner cycle or a live object listing.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &HeaderMap,
+        secure_transport: bool,
+    ) -> Result<Option<SessionCapacityView>, Self::Error> {
+        // List buckets under the session's own authorization so the view
+        // never covers buckets the caller cannot see.
+        let input = ListBucketsInput::builder().build().map_err(|e| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
+        })?;
+        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        let listing = self.fs.list_buckets(request).await?.output;
+
+        let store = current_object_store_handle();
+        let listed = listing.buckets.unwrap_or_default();
+        let mut buckets = Vec::with_capacity(listed.len());
+        for bucket in listed {
+            let Some(name) = bucket.name else { continue };
+            let quota_limit = match capacity::get_quota_config(&name).await {
+                Ok((config, _)) => config.get_quota_limit(),
+                // No quota configured, or the bucket was deleted between the
+                // listing and this read: either way it has no limit.
+                Err(e) if matches!(e, capacity::BucketConfigError::ConfigNotFound) || capacity::is_err_bucket_not_found(&e) => {
+                    None
+                }
+                Err(e) => {
+                    return Err(s3s::S3Error::with_message(
+                        s3s::S3ErrorCode::InternalError,
+                        format!("Failed to read bucket quota config: {e}"),
+                    ));
+                }
+            };
+            let usage = match capacity::get_bucket_usage_memory(&name).await {
+                Some(usage) => Some(usage),
+                // Degraded windows (pre-v2 upgrade, or a bucket no complete
+                // scanner cycle has covered) fall back to the last persisted
+                // scanner snapshot; absent everywhere means unknown, which the
+                // aggregation reports as zero.
+                None => match &store {
+                    Some(store) => capacity::lookup_degraded_bucket_usage_baseline(store.clone(), &name).await,
+                    None => None,
+                },
+            };
+            buckets.push(BucketCapacity { quota_limit, usage });
+        }
+
+        Ok(Some(SessionCapacityView {
+            buckets,
+            cluster_usable: cluster_usable_capacity().await,
+        }))
     }
 
     async fn create_bucket(

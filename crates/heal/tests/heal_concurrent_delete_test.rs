@@ -513,14 +513,24 @@ async fn delete_during_root(case: DeleteCase) {
 
 fn run_delete_case(case: DeleteCase) {
     // Incarnation-bound repairs use a spawned owner; retain the server's stack
-    // budget while exercising the real EC2+2 encode/decode futures in debug.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("concurrent delete runtime");
-    runtime.block_on(delete_during_root(case));
+    // budget for the whole scenario, including its foreground DELETE. block_on
+    // alone would poll that future on libtest's smaller calling-thread stack.
+    let stack_size = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("heal-concurrent-delete".to_owned())
+        .stack_size(stack_size)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(stack_size)
+                .enable_all()
+                .build()
+                .expect("concurrent delete runtime");
+            runtime.block_on(delete_during_root(case));
+        })
+        .expect("concurrent delete scenario thread starts")
+        .join()
+        .expect("concurrent delete scenario must not panic");
 }
 
 #[test]

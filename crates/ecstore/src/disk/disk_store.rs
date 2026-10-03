@@ -1236,6 +1236,17 @@ impl DiskHealthTracker {
                 record_drive_recovery_class(classify_drive_recovery(duration));
             }
             self.offline_since_unix_secs.store(0, Ordering::Release);
+            info!(
+                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                endpoint = %endpoint,
+                state = "recovered",
+                previous_state = current.as_str(),
+                runtime_state = next.as_str(),
+                reason,
+                "Disk recovered"
+            );
         } else if let Some(duration) = self.offline_duration() {
             record_drive_offline_duration(endpoint, duration);
         }
@@ -2074,7 +2085,9 @@ impl DiskAPI for LocalDiskWrapper {
                     }
                     let result = self.disk.disk_info(opts).await?;
 
-                    if let Some(current_disk_id) = *self.disk_id.read().await
+                    // Fresh capacity snapshots omit the disk ID; the stale-disk precheck above already verified it.
+                    if !opts.fresh_capacity
+                        && let Some(current_disk_id) = *self.disk_id.read().await
                         && Some(current_disk_id) != result.id
                     {
                         return Err(DiskError::DiskNotFound);
@@ -2560,7 +2573,9 @@ impl DiskAPI for LocalDiskWrapper {
 mod tests {
     use super::*;
     use crate::disk::endpoint::Endpoint;
+    use crate::disk::format::FormatV3;
     use crate::disk::health_state::RuntimeDriveHealthState;
+    use crate::disk::{FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET};
     use std::{
         io,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -2913,6 +2928,56 @@ mod tests {
         let snapshot = wrapper.metrics_snapshot();
         assert_eq!(snapshot.api_calls.get("write_all"), Some(&1));
         assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_capacity_keeps_disk_identity_precheck_without_requiring_id_in_snapshot() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta_dir = dir.path().join(RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&meta_dir)
+            .await
+            .expect("metadata directory should be created");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(meta_dir.join(FORMAT_CONFIG_FILE), format.to_json().expect("format should serialize"))
+            .await
+            .expect("format should be written");
+
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("formatted disk should open"));
+        let disk_id = disk
+            .get_disk_id()
+            .await
+            .expect("disk ID should be readable")
+            .expect("formatted disk should have an ID");
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        wrapper.set_disk_id_state(Some(disk_id)).await;
+
+        let snapshot = wrapper
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fresh capacity should pass when the disk identity matches");
+        assert!(snapshot.fresh_capacity);
+        assert!(snapshot.total > 0);
+        assert!(snapshot.id.is_none(), "capacity-only snapshots should not expose the disk ID");
+
+        let stale_wrapper = LocalDiskWrapper::new(disk, false);
+        stale_wrapper.set_disk_id_state(Some(Uuid::nil())).await;
+        let error = stale_wrapper
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a stale disk identity must still be rejected before the capacity probe");
+        assert_eq!(error, DiskError::DiskNotFound);
     }
 
     #[tokio::test]

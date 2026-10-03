@@ -12976,7 +12976,7 @@ impl ECStore {
                 .targets
                 .iter()
                 .find(|target| target.pool_index == permitted_target_pool_index)
-                .and_then(&candidate)
+                .and_then(candidate)
             {
                 return Ok(pool_index);
             }
@@ -19542,7 +19542,10 @@ mod tests {
             .await
             .expect("second-node activation should not panic")
             .expect_err("the second reservation must observe and reject the committed first reservation");
-        assert!(err.to_string().contains("requires 60 bytes, but 40 bytes are available"));
+        assert!(
+            err.to_string().contains("requires 60 bytes, but 40 bytes are available"),
+            "the second reservation must report the committed capacity rejection, got {err:?}"
+        );
 
         let mut persisted = PoolMeta::default();
         persisted
@@ -19855,9 +19858,9 @@ mod tests {
                 .reload_pool_meta()
                 .await
                 .expect("load the active generation on the remote node");
-            other_store
-                .decommission_cancel(0)
+            tokio::time::timeout(std::time::Duration::from_secs(30), other_store.decommission_cancel(0))
                 .await
+                .expect("remote cancel must persist pool metadata without re-entering its state locks")
                 .expect("the remote node should cancel the old generation");
             other_store
                 .clear_decommission(0)
@@ -20122,9 +20125,9 @@ mod tests {
             .expect("the stale operation should have a valid terminal fence plan")
             .expect("the stale operation should have an active reservation");
 
-        first_node
-            .decommission_cancel(0)
+        tokio::time::timeout(std::time::Duration::from_secs(30), first_node.decommission_cancel(0))
             .await
+            .expect("cancel must persist pool metadata without re-entering its state locks")
             .expect("cancel the first durable operation");
         first_node
             .clear_decommission(0)
@@ -20627,8 +20630,9 @@ mod tests {
             .await
             .expect("second target mutation task should not panic")
             .expect("second target mutation should finalize");
-        cancel
+        tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
             .await
+            .expect("cancel must finish after target mutations release their gates")
             .expect("decommission cancellation task should not panic")
             .expect("decommission cancellation should finish after target mutations");
 

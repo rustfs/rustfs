@@ -151,6 +151,9 @@ impl Error {
                     )
                     || is_recoverable_heal_error_message(&err.to_string())
             }
+            // Nonblocking local CAS and replacement leases report lock
+            // contention as WouldBlock; retain the existing task retry budget.
+            Error::Disk(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => true,
             Error::Disk(err) => {
                 if err.is_dangling_delete_grace() {
                     return true;
@@ -172,6 +175,21 @@ impl Error {
             Error::Io(err) => is_recoverable_internode_error(err) || is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
+    }
+
+    /// Retry an unproven missing object only within the per-object budget.
+    /// Generic task retries retain the narrower classification above.
+    pub(crate) fn is_recoverable_object_heal(&self) -> bool {
+        self.is_recoverable_heal()
+            || matches!(
+                self,
+                Error::Storage(
+                    EcstoreError::FileNotFound
+                        | EcstoreError::FileVersionNotFound
+                        | EcstoreError::ObjectNotFound(_, _)
+                        | EcstoreError::VersionNotFound(_, _, _)
+                ) | Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            )
     }
 
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
@@ -198,6 +216,11 @@ impl Error {
 }
 
 fn is_recoverable_internode_error(error: &std::io::Error) -> bool {
+    // A peer restart can cancel an RPC after a partial repair. Replay it within
+    // the existing heal retry budget; task cancellation remains terminal.
+    if DiskError::io_error_is_rpc_cancelled(error) {
+        return true;
+    }
     let Some(error) = error.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) else {
         return false;
     };
@@ -258,6 +281,39 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn cancelled_rpc_is_recoverable_across_storage_error_conversions() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        let disk = DiskError::from(status.clone());
+        let storage = EcstoreError::from(status.clone());
+        let disk_storage = EcstoreError::from(DiskError::from(status.clone()));
+        for error in [
+            Error::Disk(disk.clone()),
+            Error::Disk(disk),
+            Error::Storage(storage.clone()),
+            Error::Storage(storage),
+            Error::Storage(disk_storage.clone()),
+            Error::Storage(disk_storage),
+            Error::Io(std::io::Error::from(DiskError::from(status))),
+        ] {
+            assert!(error.is_recoverable_heal(), "typed RPC cancellation must be recoverable: {error:?}");
+        }
+        for status in [
+            tonic::Status::permission_denied("operation was canceled"),
+            tonic::Status::unauthenticated("operation was canceled"),
+            tonic::Status::invalid_argument("operation was canceled"),
+            tonic::Status::internal("operation was canceled"),
+        ] {
+            assert!(
+                !Error::Storage(EcstoreError::from(status).clone()).is_recoverable_heal(),
+                "cancellation text alone must not change application error classification"
+            );
+        }
+        assert!(!Error::Io(std::io::Error::other("operation was canceled")).is_recoverable_heal());
+        assert!(!Error::TaskCancelled.is_recoverable_heal());
+        assert!(!Error::TaskTimeout.is_recoverable_heal());
+    }
 
     #[test]
     fn internode_transport_errors_keep_their_recovery_classification() {
@@ -352,6 +408,26 @@ mod tests {
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyDisk).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyRemoteDisk).is_recoverable_heal());
+    }
+
+    #[test]
+    fn typed_missing_objects_retry_only_within_the_object_budget() {
+        for error in [
+            Error::Storage(EcstoreError::FileNotFound),
+            Error::Storage(EcstoreError::FileVersionNotFound),
+            Error::Storage(EcstoreError::ObjectNotFound("bucket".to_owned(), "object".to_owned())),
+            Error::Storage(EcstoreError::VersionNotFound(
+                "bucket".to_owned(),
+                "object".to_owned(),
+                "version".to_owned(),
+            )),
+            Error::Disk(DiskError::FileNotFound),
+            Error::Disk(DiskError::FileVersionNotFound),
+        ] {
+            assert!(error.is_recoverable_object_heal(), "{error:?}");
+            assert!(!error.is_recoverable_heal(), "missing objects must not requeue the whole task: {error:?}");
+        }
+        assert!(!Error::other("file not found").is_recoverable_object_heal());
     }
 
     #[test]

@@ -730,6 +730,90 @@ async fn root_recovery_orphan_report_never_commits_or_retires_pending_work() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn root_recovery_lock_contention_preserves_a_single_durable_owner() {
+    let (_first_temp, first_disk) = recovery_disk().await;
+    let (_second_temp, second_disk) = recovery_disk().await;
+    let (first_disk, second_disk) = ordered_recovery_disks(first_disk, second_disk);
+    let lock_owner = |disk: &DiskStore| {
+        let path = std::path::Path::new(&disk.endpoint().to_string())
+            .join(RUSTFS_META_BUCKET)
+            .join(".rustfs-cas.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open control-file lock");
+        file.lock().expect("hold control-file lock");
+        file
+    };
+    let first_lock = lock_owner(&first_disk);
+    let manager = recovery_manager(vec![first_disk.clone(), second_disk.clone()]);
+    let mut request = admin_request(HealType::Object {
+        bucket: "bucket".to_string(),
+        object: "object".to_string(),
+        version_id: None,
+    });
+    let receipt = manager
+        .submit_heal_request_with_receipt(request.clone())
+        .await
+        .expect("uncontended disk should own the durable heal intent");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    let path = format!("root-heal-{}.json", request.id);
+    assert!(matches!(
+        first_disk.read_all(RUSTFS_META_BUCKET, &path).await,
+        Err(DiskError::FileNotFound)
+    ));
+    let original = second_disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("durable intent");
+
+    drop(first_lock);
+    let _second_lock = lock_owner(&second_disk);
+    request.retry_attempts = 1;
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect_err("existing ownership must not migrate when its lock is contended");
+    assert!(matches!(
+        first_disk.read_all(RUSTFS_META_BUCKET, &path).await,
+        Err(DiskError::FileNotFound)
+    ));
+    assert_eq!(
+        second_disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("unchanged owner"),
+        original
+    );
+    let pending = manager.root_recovery.pending().await.expect("single durable owner");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, request.id);
+    assert_eq!(pending[0].retry_attempts, 0);
+
+    let _first_lock = lock_owner(&first_disk);
+    let blocked = admin_request(HealType::Object {
+        bucket: "bucket".to_string(),
+        object: "blocked".to_string(),
+        version_id: None,
+    });
+    manager
+        .root_recovery
+        .persist(&blocked)
+        .await
+        .expect_err("all owners remain contended");
+    let blocked_path = format!("root-heal-{}.json", blocked.id);
+    for disk in [&first_disk, &second_disk] {
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, &blocked_path).await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+    assert_eq!(manager.root_recovery.pending().await.expect("original intent remains").len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn root_recovery_new_intent_skips_prepublication_read_only_owner() {
     let (first_temp, first_disk) = recovery_disk().await;
     let (second_temp, second_disk) = recovery_disk().await;

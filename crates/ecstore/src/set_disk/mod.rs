@@ -1350,6 +1350,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1414,6 +1416,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1427,6 +1431,11 @@ mod prepared_get_object_metadata_tests {
                     .expect("late parity should restore the exact GET body");
                 assert_eq!(restored, payload);
                 assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 7);
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_READ_VERSION, order[3]),
+                    1,
+                    "the omitted parity disk must only be read by the late metadata refresh"
+                );
             },
         )
         .await;
@@ -1491,6 +1500,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1593,6 +1604,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Hold this object's hedge timer so real-disk latency cannot add speculative fanout.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -4337,9 +4350,15 @@ impl SetDisks {
         }
     }
 
-    pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+    pub(in crate::set_disk) async fn persist_partial_write(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        source_bucket_incarnation_id: Option<Uuid>,
+    ) -> bool {
         use rustfs_common::mrf_channel::{
-            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,
+            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent_with_incarnation,
         };
 
         if !mrf_delivery_enabled() {
@@ -4358,7 +4377,9 @@ impl SetDisks {
             Ok::<_, MrfDurableAdmissionError>((version, scope))
         })();
         let result = match identity {
-            Ok((version, scope)) => persist_partial_write_intent(bucket, object, version, scope).await,
+            Ok((version, scope)) => {
+                persist_partial_write_intent_with_incarnation(bucket, object, version, scope, source_bucket_incarnation_id).await
+            }
             Err(err) => Err(err),
         };
         match result {
@@ -4394,15 +4415,24 @@ impl SetDisks {
 
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
-        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        mut request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) {
         if let Some(object) = request.object_prefix.as_deref()
             && self
-                .persist_partial_write(&request.bucket, object, request.object_version_id.as_deref())
+                .persist_partial_write(
+                    &request.bucket,
+                    object,
+                    request.object_version_id.as_deref(),
+                    request.expected_bucket_incarnation_id,
+                )
                 .await
         {
             return;
         }
+        if request.expected_bucket_incarnation_id.is_none() {
+            return;
+        }
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
         {
             let capture = self
@@ -4790,6 +4820,10 @@ impl SetDisks {
     /// Read the persisted bucket identity through this set's metadata owner.
     /// Missing or non-authoritative legacy identities remain errors.
     pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            // Metadata writes can already hold the pool metadata write lock.
+            return Err(Error::other("system metadata bucket has no bucket incarnation"));
+        }
         metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
@@ -7148,10 +7182,10 @@ fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Opti
         return Some(part_numbers);
     }
 
-    part_numbers
-        .iter()
-        .position(|&part_number| part_number != 0 && part_number == part_number_marker)
-        .map(|index| &part_numbers[index + 1..])
+    // reduce_quorum_part_numbers returns sorted numbers; the marker need not exist.
+    part_numbers.last().filter(|&&last| part_number_marker <= last)?;
+    let index = part_numbers.partition_point(|&part_number| part_number <= part_number_marker);
+    Some(&part_numbers[index..])
 }
 
 pub fn canonicalize_etag(etag: &str) -> String {
@@ -7413,6 +7447,35 @@ mod tests {
 
     async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
         make_test_set_disks_with_ctx(lockers, bootstrap_ctx()).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn system_metadata_incarnation_lookup_does_not_reenter_pool_metadata() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let _pool_meta_guard = store.pool_meta.write().await;
+        let set = &store.pools[0].disk_set[0];
+
+        for bucket in [RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, crate::disk::MIGRATING_META_BUCKET] {
+            tokio::time::timeout(Duration::from_secs(30), set.bucket_incarnation_id_from_disk(bucket))
+                .await
+                .expect("system metadata identity lookup must not reacquire the held pool metadata lock")
+                .expect_err("system metadata buckets have no user bucket incarnation");
+        }
+
+        drop(_pool_meta_guard);
+        let bucket = "user-incarnation-boundary";
+        let incarnation = Uuid::new_v4();
+        crate::bucket::metadata::save_bucket_incarnation(Arc::clone(&store), bucket, incarnation)
+            .await
+            .expect("persist the user bucket identity through the metadata owner");
+        assert_eq!(
+            set.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("user bucket identities must still load from the metadata owner"),
+            incarnation,
+        );
     }
 
     async fn make_test_set_disks_with_ctx(
@@ -9416,6 +9479,31 @@ mod tests {
             .expect("scan should succeed");
 
         assert!(!purged, "a missing prefix should report nothing to purge");
+    }
+
+    #[tokio::test]
+    async fn orphan_directory_purge_preserves_tree_when_a_disk_slot_is_offline() {
+        let (dir, disk) = make_single_local_disk().await;
+        let prefix_dir = dir.path().join("bucket").join("pfx");
+        fs::create_dir_all(prefix_dir.join("nested").join("leaf"))
+            .await
+            .expect("orphan directory tree should be created");
+
+        let set = make_set_disks_with(vec![Some(disk), None]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("an unavailable slot should fail closed without a scan error");
+
+        assert!(!purged, "an incomplete disk scan must not claim the tree is an orphan");
+        assert!(prefix_dir.join("nested/leaf").exists(), "online disk contents must remain untouched");
+
+        let bucket_purged = set.purge_orphan_dir_objects_in_bucket("bucket").await;
+        assert!(!bucket_purged, "bucket-wide cleanup must fail closed with an unavailable disk slot");
+        assert!(
+            prefix_dir.join("nested/leaf").exists(),
+            "bucket-wide cleanup must preserve the online tree"
+        );
     }
 
     // Cross-disk safety: if any drive still holds object data under the prefix, refuse
@@ -13893,6 +13981,24 @@ mod tests {
         let part_numbers = vec![1, 2, 3];
 
         assert!(parts_after_marker(&part_numbers, 4).is_none());
+    }
+
+    #[test]
+    fn parts_after_marker_uses_exclusive_numeric_boundary_for_sparse_parts() {
+        let part_numbers = [1, 3, 10];
+        for (marker, expected) in [
+            (0, Some(&part_numbers[..])),
+            (1, Some(&part_numbers[1..])),
+            (2, Some(&part_numbers[1..])),
+            (3, Some(&part_numbers[2..])),
+            (9, Some(&part_numbers[2..])),
+            (10, Some(&part_numbers[3..])),
+            (11, None),
+            (usize::MAX, None),
+        ] {
+            assert_eq!(parts_after_marker(&part_numbers, marker), expected, "marker {marker}");
+        }
+        assert_eq!(parts_after_marker(&[], 1), None);
     }
 
     #[test]

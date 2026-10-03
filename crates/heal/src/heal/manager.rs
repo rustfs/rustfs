@@ -174,6 +174,7 @@ pub(super) struct MrfRepairNoticeTarget {
     pub(super) scope: Option<rustfs_common::mrf_channel::MrfScope>,
     pub(super) delete_marker_purge: Option<rustfs_common::mrf_channel::MrfDeleteMarkerPurgeIdentity>,
     pub(super) lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
+    pub(super) durable_anchor: Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor>,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +563,7 @@ fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key:
 fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
     request.heal_type == task.heal_type
         && request.bucket_incarnation_id == task.bucket_incarnation_id
+        && request.expected_mrf_bucket_incarnation_id == task.expected_mrf_bucket_incarnation_id
         && request.options == task.options
         && request.priority == task.priority
         && request.source == task.source
@@ -572,6 +574,7 @@ fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
 fn request_matches_request(request: &HealRequest, existing: &HealRequest) -> bool {
     request.heal_type == existing.heal_type
         && request.bucket_incarnation_id == existing.bucket_incarnation_id
+        && request.expected_mrf_bucket_incarnation_id == existing.expected_mrf_bucket_incarnation_id
         && request.options == existing.options
         && request.priority == existing.priority
         && request.source == existing.source
@@ -1808,6 +1811,7 @@ impl HealManager {
                 scope: None,
                 delete_marker_purge: None,
                 lease: None,
+                durable_anchor: None,
             },
         )
         .await

@@ -840,6 +840,7 @@ async fn scan_and_persist_local_bucket(
                 }
                 match persist_scanner_checkpoint(
                     set.clone(),
+                    store.clone(),
                     ScannerCheckpointPersistContext {
                         ctx: &scan_ctx,
                         expected_publication_epoch,
@@ -1246,11 +1247,12 @@ where
                 bounded_remote_scanner_deadline(Instant::now(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT, rpc_deadline);
         }
 
-        match frame.result {
+        let terminal = match frame.result {
             RemoteScannerFrameResult::Progress => {
                 if budget.budget_elapsed() && frame.phase == RemoteScannerPhase::Scanning {
                     return Ok(RemoteScannerOutcome::Partial);
                 }
+                None
             }
             RemoteScannerFrameResult::Complete(complete) => {
                 if complete.usage.name != expected.bucket || complete.usage.parent != crate::DATA_USAGE_ROOT {
@@ -1279,22 +1281,23 @@ where
                     )));
                 }
                 if budget.budget_elapsed() {
-                    return Ok(RemoteScannerOutcome::Partial);
+                    Some(Ok(RemoteScannerOutcome::Partial))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::Complete {
+                        usage: Box::new(complete.usage),
+                        pending_maintenance_work: complete.pending_maintenance_work,
+                    }))
                 }
-                return Ok(RemoteScannerOutcome::Complete {
-                    usage: Box::new(complete.usage),
-                    pending_maintenance_work: complete.pending_maintenance_work,
-                });
             }
-            RemoteScannerFrameResult::Partial => return Ok(RemoteScannerOutcome::Partial),
-            RemoteScannerFrameResult::NamespaceNotFound => return Ok(RemoteScannerOutcome::NamespaceNotFound),
+            RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
+            RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
             RemoteScannerFrameResult::CycleAhead { required_cycle } => {
                 if required_cycle <= expected.next_cycle || required_cycle == u64::MAX {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an invalid required cycle",
                     )));
                 }
-                return Ok(RemoteScannerOutcome::CycleAhead(required_cycle));
+                Some(Ok(RemoteScannerOutcome::CycleAhead(required_cycle)))
             }
             RemoteScannerFrameResult::Error(error_frame) => {
                 let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);
@@ -1305,12 +1308,45 @@ where
                     .unwrap_or(error_frame.message.as_str());
                 let error =
                     StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(message.to_string())));
-                return Err(match error_frame.scope {
+                Some(Err(match error_frame.scope {
                     RemoteScannerErrorScope::Bucket if retry_bucket => RemoteScannerStreamError::retry_bucket(error),
                     RemoteScannerErrorScope::Bucket => RemoteScannerStreamError::bucket(error),
                     RemoteScannerErrorScope::Worker => RemoteScannerStreamError::reconciled(error),
-                });
+                }))
             }
+        };
+
+        if let Some(result) = terminal {
+            let mut trailing = [0_u8; 1];
+            let read_deadline = rpc_deadline.min(semantic_progress_deadline);
+            let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
+            let eof = tokio::select! {
+                biased;
+                _ = ctx.cancelled(), if budget.reason().is_none() => {
+                    return Err(RemoteScannerStreamError::for_phase(
+                        StorageError::other("remote namespace scanner cancelled"), last_phase,
+                    ));
+                }
+                read = tokio::time::timeout_at(read_deadline, reader.read(&mut trailing)) => match read {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase)),
+                    Err(_) => {
+                        let message = if lifetime_limited {
+                            "remote namespace scanner RPC lifetime exceeded"
+                        } else {
+                            "remote namespace scanner made no semantic progress"
+                        };
+                        return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
+                    }
+                }
+            };
+            if eof != 0 {
+                return Err(RemoteScannerStreamError::for_phase(
+                    StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
+                    last_phase,
+                ));
+            }
+            return result;
         }
     }
 }

@@ -63,6 +63,7 @@ arc-swap.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 rand = { workspace = true, features = ["serde"] }
 http.workspace = true
+hyper.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
 crc-fast = { workspace = true }
 pin-project-lite.workspace = true

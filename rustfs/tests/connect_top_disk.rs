@@ -15,8 +15,8 @@
 use std::time::Duration;
 
 use rustfs::connect::diagnostics::{
-    DiskCounterSnapshot, LocalTopConsent, MAX_SAFE_INTEGER, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome,
-    TopReasonCode, evaluate_disk_window,
+    DiskCounterSnapshot, LocalTopConsent, MAX_SAFE_INTEGER, TopCaptureError, TopCaptureLimits, TopCaptureRequest,
+    TopCaptureScope, TopOutcome, TopReasonCode, evaluate_disk_window,
 };
 use time::OffsetDateTime;
 
@@ -102,5 +102,34 @@ fn top_disk_counter_reset_and_safe_integer_overflow_fail_without_data() {
         assert_eq!(result.outcome, TopOutcome::Failed);
         assert_eq!(result.reason_code, TopReasonCode::CollectionFailed);
         assert!(result.data.is_none());
+    }
+}
+
+#[test]
+fn top_disk_measured_window_obeys_the_duration_limit() {
+    let mut request = request();
+    request.window = Duration::from_millis(1_000);
+    request.limits.max_duration_millis = 2_000;
+    let before = DiskCounterSnapshot {
+        read_bytes: 100,
+        write_bytes: 200,
+        io_count: 10,
+    };
+    let after = DiskCounterSnapshot {
+        read_bytes: 110,
+        write_bytes: 220,
+        io_count: 12,
+    };
+
+    for window_millis in [1_001, 2_000] {
+        let result = evaluate_disk_window(&request, before, after, window_millis).expect("window within limit");
+        assert_eq!(result.duration_millis, window_millis);
+        assert_eq!(result.data.expect("disk counters").window_millis, window_millis);
+    }
+    for window_millis in [0, 2_001] {
+        assert!(matches!(
+            evaluate_disk_window(&request, before, after, window_millis),
+            Err(TopCaptureError::Limits)
+        ));
     }
 }

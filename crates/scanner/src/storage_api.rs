@@ -150,7 +150,11 @@ pub(crate) mod owner {
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
 
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
+    pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        PutObjectCommitBarrier, PutObjectCommitPause, hold_namespace_commit as ecstore_hold_namespace_commit,
+    };
 
     pub(crate) use super::storage_contracts::{
         HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
@@ -342,6 +346,18 @@ pub(crate) mod scanner_io {
     pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::{
+        bucket::{
+            lifecycle::bucket_lifecycle_ops::init_background_expiry, metadata::BUCKET_LIFECYCLE_CONFIG,
+            metadata_sys::update as update_bucket_metadata,
+        },
+        data_usage::{
+            apply_bucket_usage_memory_overlay, get_bucket_usage_memory, load_admin_data_usage_from_backend_cached,
+            load_data_usage_from_backend, record_bucket_object_delete_memory, record_bucket_object_write_memory,
+            replace_bucket_usage_memory_from_info, store_data_usage_in_backend as seed_persisted_usage,
+        },
+    };
 }
 
 pub(crate) type ScannerBucketListing = EcstoreScannerBucketListing;

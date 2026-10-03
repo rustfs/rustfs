@@ -4362,7 +4362,7 @@ mod tests {
             // successful attempts. Only injected faults spend this global budget.
             // A real failure may consume an attempt, so preserve the final chance.
             faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
                     (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
                         .then_some(faults.saturating_add(1))
                 })
@@ -11176,9 +11176,17 @@ mod tests {
         const ADMITTED_READS: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create validation-read shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-validation-read-shutdown", &[4]))
-                .await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-validation-read-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-validation-read-shutdown-bucket";
         store
@@ -11710,8 +11718,17 @@ mod tests {
         const ADMITTED_BATCH: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create delete-batch shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-delete-batch-shutdown", &[4])).await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-delete-batch-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-delete-batch-shutdown-bucket";
         store
@@ -20360,6 +20377,259 @@ mod tests {
             }],
             expires_at_unix_nanos: i64::MAX,
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_config_initial_reload_lock_failure_keeps_recovery_worker() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+
+        let temp_dir = tempfile::tempdir().expect("create contended tier startup store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-startup-contention", &[4])).await;
+        let manager = ctx.tier_config_mgr();
+        register_mock_tier(&manager, "COLD-A").await;
+        let candidate = TierConfigMgr::new();
+        let candidate = candidate.read().await;
+        let candidate_digest = tier_config_candidate_digest(&candidate).expect("empty candidate digest should resolve");
+        candidate
+            .save_tiering_config(store.clone())
+            .await
+            .expect("committed removal config should persist");
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{TIER_CONFIG_FILE}", com::CONFIG_PREFIX),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("committed removal config metadata should load");
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.kind = TierMutationIntentKind::Remove;
+        intent.affected_targets[0].new_backend_identity = None;
+        intent
+            .advance(
+                TierMutationIntentState::Committed,
+                Some(config_info.etag.expect("committed config should have an ETag")),
+            )
+            .expect("removal intent should commit");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("committed removal intent should persist");
+
+        let config_lock = format!("{}/{TIER_CONFIG_FILE}.lock", com::CONFIG_PREFIX);
+        let namespace = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &config_lock)
+            .await
+            .expect("tier config namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing recovery should hold the config lock");
+        let initial_error = runtime_sources::init_tier_config_mgr_handle(manager.clone(), store.clone())
+            .await
+            .expect_err("startup must still report the initial recovery lock failure");
+        assert!(initial_error.to_string().contains(&config_lock));
+        match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Err(err) => assert_eq!(err.message, "Remote tier configuration is being replaced"),
+            Ok(_) => panic!("failed initial recovery must retain its mutation fence"),
+        }
+        drop(owner);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if manager.read().await.tiers.is_empty()
+                    && matches!(
+                        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await,
+                        Err(err) if err.code == crate::services::tier::tier_handlers::ERR_TIER_NOT_FOUND.code
+                    )
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery worker must publish and clear its fence without another admin mutation");
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("unexpired committed tombstone must remain durable"),
+            intent
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_prepare_reloads_after_save_and_load_lock_timeouts() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create contended tier prepare store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-prepare-contention", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [9; 32]);
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let prepare_store = store.clone();
+        let payload = intent.encode().expect("prepare intent should encode");
+        let mut prepare = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                prepare_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                &payload,
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        // The competing publisher already owns the namespace. Bypass only its
+        // recursive acquisition and drain the durable tail before releasing it.
+        com::save_config_with_opts(
+            store.clone(),
+            &object,
+            intent.encode().expect("winning intent should encode"),
+            &ObjectOptions {
+                no_lock: true,
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("competing publisher should persist the matching intent under its lock");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        tokio::select! {
+            result = &mut prepare => panic!("Prepare must retry the contended save and load before completing: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(30), async {
+                while timeouts.load(Ordering::Relaxed) - before < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("the save and subsequent load should each exhaust their lock wait"),
+        }
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        drop(owner);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("third prepare round should complete after the competing publisher releases its lock")
+            .expect("prepare task should join")
+            .expect("third prepare round should reload the matching durable intent");
+        assert_eq!(outcome.state, TierMutationPeerState::Prepared);
+        assert!(!outcome.applied, "the retry must reuse the winning record rather than recreate it");
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("winning record should remain readable"),
+            intent
+        );
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_prepare_preserves_lock_timeout_after_three_rounds() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create exhausted tier prepare store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-prepare-exhaustion", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [9; 32]);
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let prepare_store = store.clone();
+        let payload = intent.encode().expect("prepare intent should encode");
+        let prepare = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                prepare_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                &payload,
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let lock_timeout = crate::set_disk::get_lock_acquire_timeout();
+        let owner = namespace
+            .get_write_lock(lock_timeout)
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        let error = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("three contended prepare rounds should exhaust the bounded budget")
+            .expect("prepare task should join")
+            .expect_err("Prepare must fail while the competing publisher keeps the namespace");
+        match error {
+            TierMutationPeerError::Store(Error::Lock(rustfs_lock::LockError::Timeout { resource, timeout })) => {
+                assert_eq!(resource, key.to_string());
+                assert_eq!(timeout, lock_timeout);
+            }
+            other => panic!("Prepare must preserve the final typed lock timeout: {other:?}"),
+        }
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 3, "save and load must share three rounds");
+        drop(owner);
+        assert!(matches!(
+            load_tier_mutation_intent_record(store, mutation_id).await,
+            Err(Error::ConfigNotFound)
+        ));
+        shutdown.cancel();
     }
 
     #[cfg(feature = "test-util")]

@@ -215,6 +215,8 @@ mod tests {
         probe_startup_cas_binary(&binary, &nonce, &artifact).await?;
 
         let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        // Isolate bootstrap CAS and its S3 readback from periodic usage publication.
+        cluster.set_env("RUSTFS_SCANNER_ENABLED", "false");
         let mut logs = Vec::new();
         let mut disks = Vec::new();
         let mut endpoints = Vec::new();

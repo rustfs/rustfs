@@ -191,6 +191,39 @@ fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
     Ok(Some(domains))
 }
 
+fn website_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
+    if config.console_enable {
+        return Ok(None);
+    }
+    let raw = std::env::var("RUSTFS_WEBSITE_DOMAINS").unwrap_or_default();
+    let mut domains = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for domain in raw.split(',').map(str::trim).filter(|domain| !domain.is_empty()) {
+        if domain.contains(':') || domain.ends_with('.') {
+            return Err(Error::other(format!("invalid RUSTFS_WEBSITE_DOMAINS entry: {domain}")));
+        }
+        let normalized = domain.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            return Err(Error::other(format!("duplicate RUSTFS_WEBSITE_DOMAINS entry: {domain}")));
+        }
+        if config
+            .server_domains
+            .iter()
+            .map(|s| strip_valid_port_suffix(s).to_ascii_lowercase())
+            .any(|s| normalized == s || normalized.ends_with(&format!(".{s}")) || s.ends_with(&format!(".{normalized}")))
+        {
+            return Err(Error::other(format!("website domain overlaps RUSTFS_SERVER_DOMAINS: {domain}")));
+        }
+        domains.push(normalized);
+    }
+    if domains.is_empty() {
+        Ok(None)
+    } else {
+        MultiDomain::new(&domains).map_err(|err| Error::other(format!("invalid RUSTFS_WEBSITE_DOMAINS {:?}: {err}", domains)))?;
+        Ok(Some(domains))
+    }
+}
+
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -1358,12 +1391,17 @@ pub async fn start_http_server(
             .map(MultiDomain::new)
             .transpose()
             .map_err(Error::other)?;
+        let website_host_sets = website_host_domains(config)?;
+        let website_route_domains = website_host_sets.unwrap_or_default();
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
             admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
+            website_route_domains,
+            protocol,
+            Arc::clone(&server_ctx),
         ));
 
         // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
@@ -2296,18 +2334,8 @@ fn process_connection(
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error + 'static)) {
     let peer_addr = peer_addr.unwrap_or("unknown");
-    let s = err.to_string();
-    if s.contains("connection reset") || s.contains("broken pipe") {
-        log_transport_closed(peer_addr, "connection_reset", &s, "client_disconnect");
-        return;
-    }
-
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
-        if hyper_err.is_incomplete_message() {
-            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
-        } else if hyper_err.is_closed() {
-            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
-        } else if hyper_err.is_parse() {
+        if hyper_err.is_parse() {
             log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
             // is_user() = "error from user's Body stream": the application
@@ -2328,6 +2356,14 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
                 result = "transport_error",
                 "HTTP transport failed"
             );
+        } else if let Some(kind) =
+            peer_transport_close_kind(err).or_else(|| hyper_body_write_close_kind(&format!("{hyper_err:?}")))
+        {
+            log_transport_closed(peer_addr, kind, &hyper_err.to_string(), "client_disconnect");
+        } else if hyper_err.is_incomplete_message() {
+            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
+        } else if hyper_err.is_closed() {
+            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_canceled() {
             log_transport_closed(peer_addr, "canceled", &hyper_err.to_string(), "client_disconnect");
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
@@ -2345,6 +2381,10 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
             );
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
+        if let Some(kind) = peer_transport_close_kind(err) {
+            log_transport_closed(peer_addr, kind, &io_err.to_string(), "client_disconnect");
+            return;
+        }
         error!(
             event = EVENT_HTTP_TRANSPORT_FAILED,
             component = LOG_COMPONENT_SERVER,
@@ -2366,6 +2406,37 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
             result = "transport_error",
             "HTTP transport failed"
         );
+    }
+}
+
+fn peer_transport_close_kind(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut source = Some(err);
+    while let Some(error) = source {
+        if let Some(io_error) = error.downcast_ref::<Error>() {
+            let kind = match io_error.kind() {
+                std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
+                std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
+                std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+                _ => None,
+            };
+            if kind.is_some() {
+                return kind;
+            }
+        }
+        source = error.source();
+    }
+    None
+}
+
+fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
+    let debug = debug.to_ascii_lowercase();
+    let fields = debug.strip_prefix("hyper::error(bodywrite, os {")?.split("message:").next()?;
+    let kind = fields.split(',').find_map(|field| field.trim().strip_prefix("kind: "))?;
+    match kind.trim_end_matches([' ', '}']) {
+        "brokenpipe" => Some("broken_pipe"),
+        "connectionreset" => Some("connection_reset"),
+        "connectionaborted" => Some("connection_aborted"),
+        _ => None,
     }
 }
 
@@ -2573,6 +2644,67 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
+
+    #[test]
+    fn peer_transport_close_kind_uses_io_error_sources() {
+        #[derive(Debug)]
+        struct SourceError(Error);
+
+        impl std::fmt::Display for SourceError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl std::error::Error for SourceError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        for (io_kind, expected) in [
+            (std::io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (std::io::ErrorKind::ConnectionReset, "connection_reset"),
+            (std::io::ErrorKind::ConnectionAborted, "connection_aborted"),
+        ] {
+            let nested = SourceError(Error::new(io_kind, "peer closed"));
+            assert_eq!(peer_transport_close_kind(&nested), Some(expected));
+        }
+        assert_eq!(peer_transport_close_kind(&Error::other("Broken pipe")), None);
+        assert_eq!(
+            peer_transport_close_kind(&Error::new(std::io::ErrorKind::UnexpectedEof, "stream failed")),
+            None
+        );
+    }
+
+    #[test]
+    fn capitalized_hyper_body_write_peer_close_uses_narrow_fallback() {
+        let observed = "hyper::Error(BodyWrite, Os { code: 32, kind: BrokenPipe, message: \"Broken pipe\" })";
+        assert_eq!(hyper_body_write_close_kind(observed), Some("broken_pipe"));
+        assert_eq!(hyper_body_write_close_kind(&observed.to_ascii_lowercase()), Some("broken_pipe"));
+        assert_eq!(
+            hyper_body_write_close_kind(
+                "hyper::Error(BodyWrite, Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" })"
+            ),
+            Some("connection_reset")
+        );
+        assert_eq!(
+            hyper_body_write_close_kind(
+                "hyper::Error(BodyWrite, Os { code: 103, kind: ConnectionAborted, message: \"Software caused connection abort\" })"
+            ),
+            Some("connection_aborted")
+        );
+        assert_eq!(hyper_body_write_close_kind("hyper::Error(User, Broken pipe)"), None);
+        assert_eq!(hyper_body_write_close_kind("hyper::Error(Parse, Os { kind: BrokenPipe })"), None);
+        assert_eq!(
+            hyper_body_write_close_kind("hyper::Error(BodyWrite, Os { kind: Other, message: \"Broken pipe\" })"),
+            None
+        );
+        assert_eq!(
+            hyper_body_write_close_kind("hyper::Error(BodyWrite, Os { kind: Other, message: \"kind: BrokenPipe\" })"),
+            None
+        );
+    }
 
     type MetricRow = (
         metrics_util::CompositeKey,

@@ -1450,10 +1450,18 @@ mod tests {
             cluster.set_env("RUSTFS_HEAL_PAGE_PARALLEL_ENABLE", "false");
         }
         // Keep every node's Heal runtime enabled for normal disk registration.
-        let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG")
-            .unwrap_or_else(|_| "rustfs::heal::task=info,rustfs=error".to_string());
+        // Capture durable handoff and marker cleanup failures during shutdown.
+        let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG").unwrap_or_else(|_| {
+            "rustfs::heal::task=info,rustfs::heal::manager=info,rustfs::main::handle_shutdown=info,rustfs_heal::heal=warn,rustfs=error"
+                .to_string()
+        });
         cluster.set_env("RUST_LOG", server_rust_log);
-        let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| format!("{}/logs", cluster.temp_dir));
+        let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| {
+            // Keep explicit directories compatible and isolate parallel suite captures.
+            std::env::var("RUSTFS_HEAL_CHAOS_LOG_ROOT")
+                .map(|root| format!("{root}/{interruption_kind}-{}", uuid::Uuid::new_v4()))
+                .unwrap_or_else(|_| format!("{}/logs", cluster.temp_dir))
+        });
         std::fs::create_dir_all(&log_dir)?;
         for node_index in 0..cluster.nodes.len() {
             cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
@@ -1799,7 +1807,8 @@ mod tests {
         let (mut client_token, mut task_status_url) = if background_rejoin_heal_evidence {
             (String::new(), String::new())
         } else {
-            let heal_start_body = signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+            let heal_start_body =
+                start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key).await?;
             let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
                 .map_err(|err| format!("heal start response is not JSON ({err}): {heal_start_body}"))?;
             let client_token = heal_start["clientToken"]
@@ -2140,7 +2149,8 @@ mod tests {
                     && status["summary"].as_str() == Some("failed")
                 {
                     let heal_start_body =
-                        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+                        start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key)
+                            .await?;
                     let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
                         .map_err(|err| format!("recovery heal start response is not JSON ({err}): {heal_start_body}"))?;
                     client_token = heal_start["clientToken"]
