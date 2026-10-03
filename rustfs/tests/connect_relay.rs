@@ -13,9 +13,18 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer as _, SigningKey};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use rcgen::generate_simple_self_signed;
 use rustfs::connect::relay;
 use rustfs::connect::relay::{
     RelayDirection, RelayEnvelope, RelayError, RelayMaterialKind, RelayParty, RelayReceiptOutcome, RelayReceiptPayload,
@@ -23,6 +32,8 @@ use rustfs::connect::relay::{
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 const TRANSFER_UID: &str = "0198f3a1-a200-7b20-8b22-112233445566";
 
@@ -135,6 +146,112 @@ fn party(party_type: &str, name: &str, key_id: bool) -> RelayParty {
 fn trusted(key: &SigningKey) -> TrustedReceiptSigner {
     let public_key = key.verifying_key().to_bytes();
     TrustedReceiptSigner::new(hex_lower(&Sha256::digest(public_key)), public_key).unwrap()
+}
+
+#[tokio::test]
+async fn http_relay_preserves_session_origin_and_credentials_across_retry() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let certificate = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("https://localhost:{}", listener.local_addr().unwrap().port());
+    let endpoint = format!("{origin}/console/api/");
+    let organization = "0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50";
+    let signing_key = SigningKey::from_bytes(&[13; 32]);
+    let trust = trusted(&signing_key);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let expected_origin = origin.clone();
+    let server = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            let captured = captured.clone();
+            let expected_origin = expected_origin.clone();
+            let signing_key = signing_key.clone();
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                let captured = captured.clone();
+                let expected_origin = expected_origin.clone();
+                let signing_key = signing_key.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = body.collect().await.unwrap().to_bytes();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let authenticated = parts.headers.get("origin").and_then(|value| value.to_str().ok())
+                        == Some(expected_origin.as_str())
+                        && parts.headers.get("cookie").unwrap() == "session=relay-test-only"
+                        && parts.headers.get("x-xsrf-token").unwrap() == "relay-csrf-test-only";
+                    captured.lock().unwrap().push((parts, body.clone()));
+                    let (status, response) = if !authenticated {
+                        (StatusCode::UNAUTHORIZED, Vec::new())
+                    } else if attempt == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+                    } else {
+                        let envelope = serde_json::from_value(body["envelope"].clone()).unwrap();
+                        let destination = Destination::new(signing_key, false);
+                        (StatusCode::OK, destination.receipt(&envelope, RelayReceiptOutcome::Applied))
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("connection", "close")
+                            .body(Full::new(Bytes::from(response)))
+                            .unwrap(),
+                    )
+                }
+            });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        }
+    });
+    let client = relay::RelayHttpClient::new(
+        &endpoint,
+        certificate.cert.pem().as_bytes(),
+        organization,
+        "approved-transfer".to_owned(),
+        "session=relay-test-only",
+        "relay-csrf-test-only",
+        Duration::from_secs(5),
+        None,
+    )
+    .unwrap();
+    let prepared = relay::prepare_approved_artifact(
+        TRANSFER_UID,
+        RelayMaterialKind::DiagnosticBundleManifest,
+        b"original signed manifest",
+        party("DEVICE", "organizations/o/clusters/c/clusterDevices/d", true),
+        party("CONNECT", "organizations/o", false),
+        |_| true,
+    )
+    .unwrap();
+    let result = client.deliver(prepared, &trust).await;
+    server.abort();
+    let delivery = result.expect("session-authenticated relay delivery");
+    assert_eq!(delivery.attempts, 2);
+    assert_eq!(delivery.receipt.outcome, RelayReceiptOutcome::Applied);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (parts, body) in seen.iter() {
+        assert_eq!(parts.method, "POST");
+        assert_eq!(
+            parts.uri.path(),
+            format!("/console/api/organizations/{organization}/relayTransfers:receive")
+        );
+        assert_eq!(parts.headers["origin"], origin);
+        assert_eq!(parts.headers["cookie"], "session=relay-test-only");
+        assert_eq!(parts.headers["x-xsrf-token"], "relay-csrf-test-only");
+        assert_eq!(body["approvalReference"], "approved-transfer");
+    }
+    assert_eq!(seen[0].1, seen[1].1);
 }
 
 #[test]

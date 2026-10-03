@@ -758,7 +758,7 @@ fn internode_request_context(method: &Method, url: &str, operation: Option<&'sta
 ///
 /// Ordering matters:
 /// 1. A caller-reported timeout wins outright (`ConnectTimeout`).
-/// 2. A typed `io::ErrorKind` anywhere in the source chain wins over any
+/// 2. A typed I/O error or HTTP EOF anywhere in the source chain wins over any
 ///    string or body signal — a real `ConnectionRefused` must never be
 ///    mislabeled `DnsResolutionFailed` just because "dns" appears in the text.
 /// 3. Only for connect-phase failures with no typed kind do we consult the
@@ -775,7 +775,7 @@ fn classify_transport_error(
         return InternodeHttpErrorKind::ConnectTimeout;
     }
 
-    if let Some(kind) = find_io_error_kind_in_chain(err) {
+    if let Some(kind) = find_transport_error_kind_in_chain(err) {
         return kind;
     }
 
@@ -793,10 +793,8 @@ fn classify_transport_error(
     InternodeHttpErrorKind::Unknown
 }
 
-/// Walk the error source chain looking for a `std::io::Error` and map its
-/// [`io::ErrorKind`] onto our typed classification. Returns `None` when no
-/// `io::Error` is present or its kind carries no actionable signal.
-fn find_io_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
+/// Map typed I/O failures and HTTP EOFs from the error source chain.
+fn find_transport_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(current) = source {
         if let Some(io_err) = current.downcast_ref::<io::Error>() {
@@ -811,6 +809,12 @@ fn find_io_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Optio
                 }
                 _ => {}
             }
+        }
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return Some(InternodeHttpErrorKind::ConnectionReset);
         }
         source = current.source();
     }
@@ -1738,22 +1742,24 @@ impl AsyncWrite for HttpWriter {
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
                     this.sender
-                        .send_item(Some(Bytes::copy_from_slice(buf)))
+                        .send_item(Some(Bytes::copy_from_slice(&buf[..HTTP_WRITER_BUFFER_SIZE])))
                         .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
                     this.start_request();
-                    return Poll::Ready(Ok(buf.len()));
+                    return Poll::Ready(Ok(HTTP_WRITER_BUFFER_SIZE));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        this.pending_chunk.extend_from_slice(buf);
-        if !buf.is_empty() {
+        // A slot bounds memory only when every queued and pending chunk is bounded.
+        let written = buf.len().min(HTTP_WRITER_BUFFER_SIZE - this.pending_chunk.len());
+        this.pending_chunk.extend_from_slice(&buf[..written]);
+        if written > 0 {
             this.start_request();
         }
 
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(written))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -1766,6 +1772,9 @@ impl AsyncWrite for HttpWriter {
     }
 
     fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        if bufs.len() == 1 {
+            return self.poll_write(cx, &bufs[0]);
+        }
         let this = self.as_mut().get_mut();
         if let Err(err) = this.take_background_error() {
             return Poll::Ready(Err(err));
@@ -1779,33 +1788,21 @@ impl AsyncWrite for HttpWriter {
             }
         }
 
-        let total_len = bufs.iter().map(|buf| buf.len()).sum::<usize>();
-        if total_len == 0 {
-            return Poll::Ready(Ok(0));
-        }
-
-        if bufs.len() == 1 && this.pending_chunk.is_empty() && total_len >= HTTP_WRITER_BUFFER_SIZE {
-            match this.sender.poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.sender
-                        .send_item(Some(Bytes::copy_from_slice(bufs[0].as_ref())))
-                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
-                    this.start_request();
-                    return Poll::Ready(Ok(total_len));
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
-                Poll::Pending => return Poll::Pending,
+        let available = HTTP_WRITER_BUFFER_SIZE - this.pending_chunk.len();
+        let mut written = 0;
+        for buf in bufs {
+            let len = buf.len().min(available - written);
+            this.pending_chunk.extend_from_slice(&buf[..len]);
+            written += len;
+            if written == available {
+                break;
             }
         }
-
-        for buf in bufs {
-            this.pending_chunk.extend_from_slice(buf);
-        }
-        if total_len > 0 {
+        if written > 0 {
             this.start_request();
         }
 
-        Poll::Ready(Ok(total_len))
+        Poll::Ready(Ok(written))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -2036,6 +2033,98 @@ mod tests {
     fn classify_nothing_is_unknown() {
         let err = WrapperError::new("mystery", None);
         assert_eq!(classify_transport_error(&err, false, false, false), InternodeHttpErrorKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn peer_close_before_upload_response_remains_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = socket.read(&mut buffer).await.expect("peer should read the request");
+                    assert_ne!(count, 0, "upload should reach the peer before it closes");
+                    received.extend_from_slice(&buffer[..count]);
+                    if received
+                        .windows(b"restart-mid-upload".len())
+                        .any(|part| part == b"restart-mid-upload")
+                    {
+                        break;
+                    }
+                }
+                socket
+                    .shutdown()
+                    .await
+                    .expect("peer should close before returning response headers");
+            }
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("restart-mid-upload")
+            .send()
+            .await
+            .expect_err("closing the peer before its response should fail the upload");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::ConnectionReset);
+        assert!(kind.is_retryable(), "a peer close during an upload must retain bounded retry eligibility");
+
+        let mut writer =
+            HttpWriter::new(format!("http://{address}/rustfs/rpc/put_file_stream_v1"), Method::PUT, HeaderMap::new())
+                .await
+                .expect("internode writer should be created");
+        writer.write_all(b"restart-mid-upload").await.expect("upload should start");
+        let error = writer.shutdown().await.expect_err("peer close should fail the shard writer");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("shard failure should preserve the internode error classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectionReset);
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        peer.await.expect("peer should finish normally");
+    }
+
+    #[tokio::test]
+    async fn malformed_upload_response_is_not_an_eof_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+            let mut buffer = [0_u8; 4096];
+            assert!(socket.read(&mut buffer).await.expect("peer should read the request") > 0);
+            socket
+                .write_all(b"invalid HTTP response\r\n\r\n")
+                .await
+                .expect("peer should send the invalid response");
+            socket.shutdown().await.expect("peer should close");
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("payload")
+            .send()
+            .await
+            .expect_err("invalid response headers should fail the request");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::Unknown);
+        assert!(!kind.is_retryable(), "a malformed response must not become a transport retry");
+        peer.await.expect("peer should finish normally");
     }
 
     #[test]
@@ -2817,6 +2906,131 @@ mod tests {
 
         assert_eq!(&read_result, b"hello");
 
+        handle.abort();
+    }
+
+    fn paused_http_writer() -> (HttpWriter, tokio::sync::mpsc::Receiver<Option<Bytes>>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(HTTP_WRITER_CHANNEL_CAPACITY);
+        let (_, err_rx) = tokio::sync::oneshot::channel();
+        let writer = HttpWriter {
+            url: "http://127.0.0.1/paused".to_string(),
+            method: Method::PUT,
+            headers: HeaderMap::new(),
+            err_rx,
+            start_tx: None,
+            sender: PollSender::new(sender),
+            handle: tokio::spawn(std::future::pending()),
+            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
+            finish: false,
+            track_internode_metrics: false,
+            internode_operation: None,
+        };
+        (writer, receiver)
+    }
+
+    #[tokio::test]
+    async fn http_writer_bounds_large_writes_under_backpressure() {
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        for vectored in [false, true] {
+            let (mut writer, mut receiver) = paused_http_writer();
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let written = std::future::poll_fn(|cx| {
+                    if vectored {
+                        Pin::new(&mut writer).poll_write_vectored(cx, &[IoSlice::new(&payload)])
+                    } else {
+                        Pin::new(&mut writer).poll_write(cx, &payload)
+                    }
+                })
+                .await
+                .expect("a free queue slot should accept one bounded chunk");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE, "large writes must be partial");
+            }
+            {
+                let write = std::future::poll_fn(|cx| {
+                    if vectored {
+                        Pin::new(&mut writer).poll_write_vectored(cx, &[IoSlice::new(&payload)])
+                    } else {
+                        Pin::new(&mut writer).poll_write(cx, &payload)
+                    }
+                });
+                tokio::pin!(write);
+                assert!(futures::poll!(&mut write).is_pending(), "a stalled receiver must exert backpressure");
+                let chunk = receiver.recv().await.expect("queued body chunk").expect("body, not EOF");
+                assert_eq!(chunk.as_ref(), &payload[..HTTP_WRITER_BUFFER_SIZE]);
+                let written = tokio::time::timeout(Duration::from_secs(1), write)
+                    .await
+                    .expect("draining a queue slot should wake the blocked writer")
+                    .expect("resumed write should succeed");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+            }
+            assert!(writer.pending_chunk.len() <= HTTP_WRITER_BUFFER_SIZE);
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let chunk = receiver.try_recv().expect("queued body chunk").expect("body, not EOF");
+                assert_eq!(chunk.as_ref(), &payload[..HTTP_WRITER_BUFFER_SIZE]);
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_bounds_mixed_writes_and_preserves_bytes() {
+        let header = [0x11; 32];
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        for vectored in [false, true] {
+            let (mut writer, mut receiver) = paused_http_writer();
+            writer.write_all(&header).await.expect("small prefix should be buffered");
+            let mut remaining = payload.as_slice();
+            while !remaining.is_empty() {
+                let written = if vectored {
+                    writer
+                        .write_vectored(&[IoSlice::new(&[]), IoSlice::new(remaining), IoSlice::new(&[])])
+                        .await
+                } else {
+                    writer.write(remaining).await
+                }
+                .expect("payload write should succeed");
+                assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+                assert!(writer.pending_chunk.len() <= HTTP_WRITER_BUFFER_SIZE, "pending bytes must stay bounded");
+                remaining = &remaining[written..];
+            }
+            writer.flush().await.expect("remaining prefix should flush");
+            let mut actual = Vec::new();
+            while let Ok(chunk) = receiver.try_recv() {
+                let chunk = chunk.expect("body, not EOF");
+                assert!(chunk.len() <= HTTP_WRITER_BUFFER_SIZE, "queued bytes must stay bounded");
+                actual.extend_from_slice(&chunk);
+            }
+            assert_eq!(&actual[..header.len()], &header);
+            assert_eq!(&actual[header.len()..], payload.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_large_vectored_body_preserves_hash_and_payload() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await.expect("test server should bind");
+        let header = [0x11; 32];
+        let payload: Vec<_> = (0..3 * HTTP_WRITER_BUFFER_SIZE + 17).map(|i| (i % 251) as u8).collect();
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new())
+            .await
+            .expect("HTTP writer should open");
+        let mut slices = [
+            IoSlice::new(&[]),
+            IoSlice::new(&header),
+            IoSlice::new(&payload),
+            IoSlice::new(&[]),
+        ];
+        let mut remaining = slices.as_mut_slice();
+        while remaining.iter().any(|slice| !slice.is_empty()) {
+            let written = writer.write_vectored(remaining).await.expect("body write should succeed");
+            assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+        writer.shutdown().await.expect("request should finish");
+        let bodies = state.put_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(&bodies[0][..header.len()], &header);
+        assert_eq!(&bodies[0][header.len()..], payload.as_slice());
         handle.abort();
     }
 

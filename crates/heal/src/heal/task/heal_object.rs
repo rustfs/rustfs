@@ -551,12 +551,22 @@ impl HealTask {
             set: self.options.set_index,
         };
         let mut expected = self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
-        let bucket_incarnation_id = self
+        let current_bucket_incarnation_id = self
             .outcome_bucket_incarnation_id(bucket, self.options.dry_run)
             .await?
             .ok_or_else(|| Error::TaskExecutionFailed {
                 message: format!("Missing bucket incarnation for durable MRF repair {bucket}/{object}"),
             })?;
+        let bucket_incarnation_id = self
+            .expected_mrf_bucket_incarnation_id
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing source bucket incarnation for durable MRF repair {bucket}/{object}"),
+            })?;
+        if current_bucket_incarnation_id != bucket_incarnation_id {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Bucket incarnation changed before durable MRF repair {bucket}/{object}"),
+            });
+        }
         expected.bucket_incarnation_id = Some(bucket_incarnation_id);
 
         let storage_result = self

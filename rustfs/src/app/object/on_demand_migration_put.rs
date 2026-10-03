@@ -517,36 +517,38 @@ mod tests {
         assert!(!local.delete_marker);
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn write_back_rejects_unsupported_topology_before_any_mutation() {
-        let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
-        let bucket = "odm-unsupported";
-        store
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket");
-        let write_back = OnDemandMigrationWriteBack::new();
-        let req = request(
-            bucket,
-            store.bucket_incarnation_id(bucket).await.expect("bucket incarnation"),
-            "key",
-            source_head(b"source"),
-        );
-        assert!(matches!(
-            write_back.put_object(&req, body_stream(b"source")).await,
-            Err(WriteBackError::Unsupported(_))
-        ));
-        assert!(matches!(
-            write_back.create_multipart_upload(&req).await,
-            Err(WriteBackError::Unsupported(_))
-        ));
-        assert!(matches!(
-            write_back.complete_multipart_upload(&req, "no-session", Vec::new()).await,
-            Err(WriteBackError::Unsupported(_))
-        ));
-        assert_nothing_left(&store, bucket, "key").await;
+    fn write_back_rejects_unsupported_topology_before_any_mutation() {
+        crate::app::gating_test_env::run_large_stack_test("odm-unsupported-topology", || async {
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            let bucket = "odm-unsupported";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket");
+            let write_back = OnDemandMigrationWriteBack::new();
+            let req = request(
+                bucket,
+                store.bucket_incarnation_id(bucket).await.expect("bucket incarnation"),
+                "key",
+                source_head(b"source"),
+            );
+            assert!(matches!(
+                write_back.put_object(&req, body_stream(b"source")).await,
+                Err(WriteBackError::Unsupported(_))
+            ));
+            assert!(matches!(
+                write_back.create_multipart_upload(&req).await,
+                Err(WriteBackError::Unsupported(_))
+            ));
+            assert!(matches!(
+                write_back.complete_multipart_upload(&req, "no-session", Vec::new()).await,
+                Err(WriteBackError::Unsupported(_))
+            ));
+            assert_nothing_left(&store, bucket, "key").await;
+        });
     }
 
     #[tokio::test]
