@@ -7526,10 +7526,9 @@ pub(crate) mod rename_fanout_barrier {
         let key = (object.to_string(), disk_index, phase.into());
         let hooks = {
             let reg = lock();
-            match reg.armed.get(&key) {
-                Some(a) => Some((a.arrived.clone(), a.release.clone(), a.paused.clone())),
-                _ => None,
-            }
+            reg.armed
+                .get(&key)
+                .map(|a| (a.arrived.clone(), a.release.clone(), a.paused.clone()))
         };
         if let Some((arrived, release, paused)) = hooks {
             paused.store(true, Ordering::SeqCst);
