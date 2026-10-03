@@ -78,6 +78,7 @@ concurrency:
 
 jobs:
   distributed:
+    if: github.repository == 'rustfs/rustfs'
     name: Distributed 4-node 4-disk e2e
     # GitHub-hosted VM: loop and tmpfs mounts work here. sm-standard-4 is an
     # ARC pod and rejects both (`mount -o loop` ENOENT, tmpfs "read-only").
@@ -200,7 +201,7 @@ jobs:
   alert-on-failure:
     name: Alert on scheduled failure
     needs: [distributed]
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

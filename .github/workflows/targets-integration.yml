@@ -40,6 +40,7 @@ env:
 
 jobs:
   targets-live:
+    if: github.repository == 'rustfs/rustfs'
     name: PostgreSQL, MySQL, AMQP, and NATS
     runs-on: sm-standard-2
     timeout-minutes: 90
@@ -175,8 +176,10 @@ jobs:
     name: Alert on scheduled failure
     needs: [targets-live]
     if: >-
-      always() && github.event_name == 'schedule' &&
-      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      github.repository == 'rustfs/rustfs' && (
+        always() && github.event_name == 'schedule' &&
+        (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
