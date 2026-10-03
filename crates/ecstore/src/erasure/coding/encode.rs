@@ -43,7 +43,7 @@ const ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: &str = "RUSTFS_ERASURE_ENCODE_B
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: usize = 4;
-const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = true;
 
 pub(crate) enum IntegrityEncodeMode {
     Inline(usize),
@@ -890,8 +890,6 @@ impl Erasure {
                 // capacity and never reallocates. Reading into uninitialized spare capacity
                 // (instead of resize + slice read) also skips zero-filling each fresh buffer.
                 let ingest_capacity = expanded_block_bytes.max(block_size);
-                // Pre-allocate buffer pool for this encoding session
-                let mut buf_pool: Vec<BytesMut> = Vec::with_capacity(4);
                 let mut buf = BytesMut::with_capacity(ingest_capacity);
                 loop {
                     match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
@@ -901,8 +899,6 @@ impl Erasure {
                             total += n;
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
-                            // Try to reuse buffer from pool, or allocate new one
-                            buf = buf_pool.pop().unwrap_or_else(|| BytesMut::with_capacity(ingest_capacity));
                             let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -910,11 +906,8 @@ impl Erasure {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
-                            // Return buffer to pool if it has sufficient capacity
-                            if buf.capacity() >= ingest_capacity && buf_pool.len() < 4 {
-                                buf_pool.push(buf);
-                                buf = BytesMut::with_capacity(ingest_capacity);
-                            }
+                            // Encoded shards own the previous allocation until writing completes.
+                            buf = BytesMut::with_capacity(ingest_capacity);
                         }
                         Ok(None) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1054,18 +1047,18 @@ impl Erasure {
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
-            let mut buf = vec![0u8; block_size];
+            let ingest_capacity = expanded_block_bytes.max(block_size);
+            let mut buf = BytesMut::with_capacity(ingest_capacity);
             let mut pending_batch = Vec::with_capacity(batch_blocks);
             let mut pending_batch_bytes = 0usize;
             let mut pending_batch_stage = None;
             loop {
-                match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
+                match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
                     Ok(Some(n)) => {
                         debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                         total += n;
-                        let encode_buf = std::mem::take(&mut buf);
-                        let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
-                        buf = returned_buf;
+                        let res = self.clone().encode_block_bytes_mut(buf, n).await?;
+                        buf = BytesMut::with_capacity(ingest_capacity);
                         let queued_bytes = res.queued_bytes();
                         pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
                         pending_batch.push(res);
@@ -1241,6 +1234,42 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides() {
+        const CHILD_CASE: &str = "RUSTFS_TEST_BYTESMUT_INGEST_SELECTOR_CASE";
+        if let Ok(case) = std::env::var(CHILD_CASE) {
+            let expected = match case.as_str() {
+                "default" | "true" => true,
+                "false" => false,
+                _ => panic!("unexpected ingest selector case: {case}"),
+            };
+            assert_eq!(use_bytesmut_ingest(), expected, "ingest selector case: {case}");
+            return;
+        }
+
+        // Each selector probe needs a fresh OnceLock and an isolated environment.
+        for case in ["default", "true", "false"] {
+            let mut child = std::process::Command::new(std::env::current_exe().expect("ingest selector test executable"));
+            child.args([
+                "--exact",
+                "erasure::coding::encode::tests::bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides",
+                "--nocapture",
+            ]);
+            child.env(CHILD_CASE, case);
+            child.env_remove(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST);
+            if case != "default" {
+                child.env(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, case);
+            }
+            let output = child.output().expect("start isolated ingest selector test");
+            assert!(
+                output.status.success(),
+                "ingest selector case {case} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 
     struct PendingReader {
         entered: Option<oneshot::Sender<()>>,
