@@ -83,3 +83,39 @@ A candidate is ready for code movement only when all of these hold:
 - old facade names have compatibility tests or explicit deprecation coverage;
 - focused tests cover the changed owner path before any full gate is attempted;
 - rollback preserves object IO, quorum, lifecycle/replication queues, scanner repair, notification/audit events, and metadata compatibility.
+
+## Metadata read ownership and identity
+
+`set_disk/core/metadata_read.rs` owns disk/RPC scheduling, coalescing, timeouts,
+hedging and cancellation. Its result retains each disk slot as pending, a
+successful `FileInfo`, or a typed `DiskError`. Pending includes both an
+unscheduled disk and a response not yet observed; it contributes no vote and
+does not establish absence. Task IDs retain the disk slot when a task panics.
+The existing full-wait and early-stop gates, coalescer admission, cancellation
+drain and fallback policy remain at this scheduling boundary.
+
+`set_disk/core/metadata_quorum.rs` consumes those observations without IO.
+`SetDisks` remains the sole owner of topology, locks and caches. Read and heal
+callers use the typed result; `MetadataReadResult::into_legacy` is the explicit
+adapter for existing quorum/layout and shard-reader helpers. It moves successful
+metadata without cloning and creates empty placeholders only at that adapter.
+Old full-wait facade callers retain the same aligned metadata/error slices.
+
+These identities have different purposes and must not become one generic hash:
+
+| Decision | Equal fields | Deliberately different or separately checked |
+| --- | --- | --- |
+| Quorum grouping (`file_info_quorum_hash`) | Size, deletion/restore/transition state, timestamps, version and data-directory UUIDs, checksums, mode/writer version, normalized metadata, target delete-marker versions and part identities. Payloads also include data/parity counts and distribution. | Object name and volume come from the request; per-disk erasure index and shard bytes are not an object identity. Canonical delete markers and zero-size objects do not add payload geometry. |
+| Early-stop strict match (`metadata_early_stop_candidate_matches`) | Request name/volume, version/latest/deletion state, transition fields, size/time, mode/writer version, complete metadata/replication state/parts/checksum, version-history fields, data directory, algorithm/block size/data/parity/distribution. | Per-disk erasure index and data bytes differ. A non-inline read reserve additionally proves distinct indexes mapped to their disk slots; inline reads verify shard identity and bitrot/body content before stopping. |
+| Late materialization (`LateMetadataIdentity`) | Request name/volume, algorithm, block size, legacy-checksum mode and quorum hash. | Each late shard must match the original distribution at its disk slot. A changed identity or insufficient matching shards fails read quorum; it cannot mix generations into a body. |
+
+`metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction`
+checks all 625 four-disk success/missing/corrupt/offline/pending combinations and
+24 arrival orders with early-stop on and off. The observation regressions also
+cover a newer pending response, same-time different directories, duplicated
+shard indexes, null versions, canonical delete markers and invalid success
+payloads. Existing bounded-fanout, legacy inline bitrot, cache, late-metadata and
+GET/Range regressions continue to exercise the real scheduling and reader paths;
+the pure matrix does not replace those checks. Their call counters bound actual
+disk reads, including canceled tails, without adding a scheduling policy or a
+per-request metadata clone.
