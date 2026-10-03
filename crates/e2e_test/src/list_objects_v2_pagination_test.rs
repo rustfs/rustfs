@@ -1091,11 +1091,15 @@ mod tests {
             dir_count,
             output.common_prefixes().len()
         );
-        let prefixes: HashSet<_> = output.common_prefixes().iter().filter_map(|entry| entry.prefix()).collect();
-        let expected_prefixes: Vec<_> = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect();
-        assert_eq!(prefixes, expected_prefixes.iter().map(String::as_str).collect());
-        assert!(output.contents().is_empty(), "all objects must collapse into common prefixes");
-        assert_eq!(output.key_count(), Some(12));
+        let prefixes = output
+            .common_prefixes()
+            .iter()
+            .map(|entry| entry.prefix().expect("each CommonPrefix must carry its prefix").to_owned())
+            .collect::<Vec<_>>();
+        let expected_prefixes = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect::<Vec<_>>();
+        assert_eq!(prefixes, expected_prefixes);
+        assert!(output.contents().is_empty(), "all fixture objects must collapse into prefixes");
+        assert_eq!(output.key_count(), Some(i32::try_from(dir_count).expect("fixture count fits i32")));
         assert_eq!(output.max_keys(), Some(1000));
         assert!(
             output.next_continuation_token().is_none(),

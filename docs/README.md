@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [Multipart upload memory diagnosis](operations/multipart-memory.md) — allocator attribution, Docker reproduction and sustained upload checks.
+
 For the logical per-operation io_uring read cap, see
 [io_uring read chunk size](operations/io-uring-read-chunks.md).
 
@@ -30,6 +32,9 @@ For the erasure-coded cluster lifecycle (planning, parity and `EC:0`,
 expansion, rebalance, decommission, heal, drive replacement, restart
 recovery, and the `rc` CLI mapping), start with
 [Cluster and erasure-coding lifecycle operations](operations/cluster-lifecycle-operations.md).
+
+For concurrent bucket creation and deletion, see
+[Bucket operation admission](operations/bucket-operation-admission.md).
 
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
