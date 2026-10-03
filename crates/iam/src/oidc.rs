@@ -1502,23 +1502,13 @@ impl OidcSys {
         for group in &claims.groups {
             groups.push(group.clone());
             if !has_role_policy {
-                let policy_name = if config.claim_prefix.is_empty() {
-                    group.clone()
-                } else {
-                    format!("{}{}", config.claim_prefix, group)
-                };
-                policies.push(policy_name);
+                policies.push(claim_policy_name(&config.claim_prefix, group));
             }
         }
 
         if !has_role_policy && config.claim_name != config.groups_claim {
             for val in extract_groups_claim(&claims.raw, &config.claim_name) {
-                let policy_name = if config.claim_prefix.is_empty() {
-                    val
-                } else {
-                    format!("{}{}", config.claim_prefix, val)
-                };
-                policies.push(policy_name);
+                policies.push(claim_policy_name(&config.claim_prefix, &val));
             }
         }
 
@@ -1570,6 +1560,41 @@ impl OidcSys {
         );
 
         (policies, groups)
+    }
+
+    /// Policy names produced only by the canonical groups in claim-based mode: the groups claim
+    /// plus the roles claim values that `extract_canonical_group_values` merges into it.
+    ///
+    /// Identity providers emit built-in groups and roles that can never have a matching policy
+    /// (for example `DOMAIN\Domain Users` or Keycloak's `offline_access`), so the session binding
+    /// may ignore these names when no such policy exists. Names from a fixed role policy or a
+    /// dedicated policy claim are never included, so those configurations keep requiring every
+    /// policy to resolve.
+    pub fn group_claim_policy_names(&self, provider_id: &str, claims: &OidcClaims) -> Vec<String> {
+        let Some(config) = self.configs.get(provider_id) else {
+            return Vec::new();
+        };
+        if !config.role_policy.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let explicit_policy_names: Vec<String> = if config.claim_name != config.groups_claim {
+            extract_groups_claim(&claims.raw, &config.claim_name)
+                .iter()
+                .map(|value| claim_policy_name(&config.claim_prefix, value))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut policies: Vec<String> = claims
+            .groups
+            .iter()
+            .map(|group| claim_policy_name(&config.claim_prefix, group))
+            .filter(|policy| !explicit_policy_names.contains(policy))
+            .collect();
+        policies.sort();
+        policies.dedup();
+        policies
     }
 
     /// Verify a raw JWT (id_token) for the AssumeRoleWithWebIdentity flow.
@@ -2360,6 +2385,10 @@ fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) 
         ClaimLookup::Found(value) => value.as_str().unwrap_or_default().to_string(),
         ClaimLookup::Missing | ClaimLookup::Ambiguous => String::new(),
     }
+}
+
+fn claim_policy_name(claim_prefix: &str, value: &str) -> String {
+    format!("{claim_prefix}{value}")
 }
 
 /// Extract a groups/array claim from raw claims with case-insensitive fallback. Handles both string arrays and single strings.
@@ -4576,6 +4605,66 @@ mod tests {
         let (policies, groups) = sys.map_claims_to_policies("authentik", &claims);
         assert_eq!(groups, vec!["authentik Admins", "users"]);
         assert_eq!(policies, vec!["consoleAdmin"]);
+    }
+
+    #[test]
+    fn group_claim_policy_names_cover_only_prefixed_group_values() {
+        let mut config = test_config("ad");
+        config.claim_prefix = "oidc-".to_string();
+        let sys = make_test_sys(vec![config]);
+        let claims = OidcClaims {
+            groups: vec![
+                "EXAMPLE\\Domain Users".to_string(),
+                "admins".to_string(),
+                "admins".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sys.group_claim_policy_names("ad", &claims),
+            vec!["oidc-EXAMPLE\\Domain Users", "oidc-admins"]
+        );
+        assert!(sys.group_claim_policy_names("missing-provider", &claims).is_empty());
+    }
+
+    #[test]
+    fn group_claim_policy_names_include_merged_roles_claim_values() {
+        let mut config = test_config("keycloak");
+        config.roles_claim = "roles".to_string();
+        let raw = HashMap::from([
+            ("groups".to_string(), serde_json::json!(["readonly"])),
+            ("roles".to_string(), serde_json::json!(["offline_access", "default-roles-corp"])),
+        ]);
+        let claims = OidcClaims {
+            groups: extract_canonical_group_values(&raw, &config.groups_claim, &config.roles_claim),
+            raw,
+            ..Default::default()
+        };
+        let sys = make_test_sys(vec![config]);
+
+        assert_eq!(
+            sys.group_claim_policy_names("keycloak", &claims),
+            vec!["default-roles-corp", "offline_access", "readonly"]
+        );
+    }
+
+    #[test]
+    fn group_claim_policy_names_exclude_role_policy_and_dedicated_policy_claim() {
+        let mut role_config = test_config("role");
+        role_config.role_policy = "consoleAdmin".to_string();
+        let mut claim_config = test_config("claim");
+        claim_config.claim_name = "policy".to_string();
+        let sys = make_test_sys(vec![role_config, claim_config]);
+        let claims = OidcClaims {
+            groups: vec!["readonly".to_string(), "unmapped".to_string()],
+            raw: HashMap::from([("policy".to_string(), serde_json::json!(["readonly", "writeonly"]))]),
+            ..Default::default()
+        };
+
+        assert!(sys.group_claim_policy_names("role", &claims).is_empty());
+        // `readonly` is also requested explicitly through the policy claim, so it must resolve.
+        assert_eq!(sys.group_claim_policy_names("claim", &claims), vec!["unmapped"]);
     }
 
     #[test]

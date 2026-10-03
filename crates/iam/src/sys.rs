@@ -1157,6 +1157,11 @@ impl<T: Store> IamSys<T> {
         self.store.get_policy_doc(name).await
     }
 
+    /// Whether `name` is a stored policy; see `IamCache::policy_exists`.
+    pub async fn policy_exists(&self, name: &str) -> Result<bool> {
+        self.store.policy_exists(name).await
+    }
+
     /// The stored mapping record for one user or group (see
     /// `IamCache::get_mapped_policy_record`).
     pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
