@@ -2072,8 +2072,10 @@ impl FolderScanner {
                 break;
             }
 
-            // If we have many subfolders, compact ourself.
+            // Checkpointed sweeps need child entries to validate their resume
+            // frontier. Keep the emergency compaction limit for large trees.
             let should_compact = (self.new_cache.info.name != folder.name
+                && self.old_cache.info.scan_progress.is_none()
                 && existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
                 || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
 
