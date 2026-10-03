@@ -177,6 +177,21 @@ impl Error {
         }
     }
 
+    /// Retry an unproven missing object only within the per-object budget.
+    /// Whole-task requeueing retains the narrower classification above.
+    pub(crate) fn is_recoverable_object_heal(&self) -> bool {
+        self.is_recoverable_heal()
+            || matches!(
+                self,
+                Error::Storage(
+                    EcstoreError::FileNotFound
+                        | EcstoreError::FileVersionNotFound
+                        | EcstoreError::ObjectNotFound(_, _)
+                        | EcstoreError::VersionNotFound(_, _, _)
+                ) | Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            )
+    }
+
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
         let after = match self {
             Self::Storage(error) => error.dangling_delete_retry_after(),
@@ -393,6 +408,26 @@ mod tests {
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyDisk).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyRemoteDisk).is_recoverable_heal());
+    }
+
+    #[test]
+    fn typed_missing_objects_retry_only_within_the_object_budget() {
+        for error in [
+            Error::Storage(EcstoreError::FileNotFound),
+            Error::Storage(EcstoreError::FileVersionNotFound),
+            Error::Storage(EcstoreError::ObjectNotFound("bucket".to_owned(), "object".to_owned())),
+            Error::Storage(EcstoreError::VersionNotFound(
+                "bucket".to_owned(),
+                "object".to_owned(),
+                "version".to_owned(),
+            )),
+            Error::Disk(DiskError::FileNotFound),
+            Error::Disk(DiskError::FileVersionNotFound),
+        ] {
+            assert!(error.is_recoverable_object_heal(), "{error:?}");
+            assert!(!error.is_recoverable_heal(), "missing objects must not requeue the whole task: {error:?}");
+        }
+        assert!(!Error::other("file not found").is_recoverable_object_heal());
     }
 
     #[test]

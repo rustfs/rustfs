@@ -335,9 +335,23 @@ async fn admin_erasure_dispositions_do_not_invent_success_and_retries_count_once
         .expect_err("unhealed objects must retain the failed task status");
     let outcome = task.get_outcome().await;
     let c = &outcome.counters;
-    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 1, 2, 1));
-    assert_eq!(c.attempt_failures, 5);
+    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 0, 3, 1));
+    assert_eq!(c.attempt_failures, 8);
+    assert_eq!(storage.calls().iter().filter(|(name, _)| name == "gone").count(), 4);
     assert_eq!(storage.calls().iter().filter(|(name, _)| name == "offline").count(), 4);
+    let gone = outcome
+        .objects
+        .iter()
+        .find(|item| item.identity.object == "gone")
+        .expect("missing version outcome");
+    assert_eq!(
+        gone.disposition,
+        HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::TransientExistenceCheck,
+            retry_not_before: None,
+        },
+        "exhausting retries cannot certify the missing version as absent"
+    );
     assert_partition(&outcome);
 }
 
