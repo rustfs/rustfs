@@ -1,9 +1,5 @@
----
-name: arch-checks
-description: Diagnose failures from check_layer_dependencies.sh, check_architecture_migration_rules.sh, check_unsafe_code_allowances.sh, check_logging_guardrails.sh, check_doc_paths.sh, or check_no_planning_docs.sh. Use when one of these guards fails, not for every architecture question or documentation edit.
----
 
-# Architecture Guard Checks
+# Architecture Guard Troubleshooting
 
 Read only the section for the failing guard. Use `.config/make/` and the current
 workflow to verify its wiring; not every guard is part of every gate. Fix the

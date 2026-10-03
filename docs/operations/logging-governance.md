@@ -1,5 +1,6 @@
 # Logging Audit and Migration Reference
 
+Use the [root logging rules](../../AGENTS.md#logging) for individual events.
 Read this reference only for a broad logging audit, an event-model migration,
 or a change to `scripts/check_logging_guardrails.sh`. Use `Cargo.toml` for the
 current workspace/crate list instead of maintaining one here.

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Code Change Verification"
-  short_description: "Prioritize risks and verify code changes before merge."
-  default_prompt: "Use $code-change-verification for an ordinary requested diff review with prioritized findings."

@@ -37,7 +37,7 @@ their issue closes.
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
-| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | arch-checks skill |
+| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
 | `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
