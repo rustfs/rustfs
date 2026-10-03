@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
-use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -496,6 +496,9 @@ where
 
     /// Attach the request context used by IAM policy conditions.
     pub fn with_request_context(mut self, request_headers: http::HeaderMap, secure_transport: bool) -> Self {
+        let session = Arc::make_mut(&mut self.session_context);
+        session.request_headers = request_headers.clone();
+        session.secure_transport = secure_transport;
         self.request_headers = Some(request_headers);
         self.secure_transport = secure_transport;
         self
@@ -521,6 +524,11 @@ where
             .max_keys(Some(1))
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
+
+        self.storage
+            .authorize_list_objects(&self.session_context, &list_input)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
 
         let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
             error!(
@@ -654,7 +662,9 @@ where
     async fn probe_head_object(&self, bucket: &str, key: &str) -> FsResult<HeadObjectProbe> {
         let credentials = self.credentials();
 
-        if authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
+        if self
+            .storage
+            .authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
             .await
             .is_err()
         {
@@ -699,12 +709,16 @@ where
                     });
                 }
 
-                if size == 0
-                    && authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
-                        .await
-                        .is_ok()
-                    && self.prefix_has_entries(bucket, &prefix).await?
-                {
+                let has_entries = if size == 0 {
+                    match self.prefix_has_entries(bucket, &prefix).await {
+                        Ok(has_entries) => has_entries,
+                        Err(FsError::Forbidden) => false,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
+                if has_entries {
                     return Ok(ResolvedPath::Directory {
                         prefix,
                         metadata: Some(output),
@@ -732,14 +746,11 @@ where
             HeadObjectProbe::Forbidden => {}
         }
 
-        if authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
-            .await
-            .is_ok()
-        {
-            had_visibility = true;
-            if self.prefix_has_entries(bucket, &prefix).await? {
-                return Ok(ResolvedPath::Directory { prefix, metadata: None });
-            }
+        match self.prefix_has_entries(bucket, &prefix).await {
+            Ok(true) => return Ok(ResolvedPath::Directory { prefix, metadata: None }),
+            Ok(false) => had_visibility = true,
+            Err(FsError::Forbidden) => {}
+            Err(error) => return Err(error),
         }
 
         if had_visibility {
@@ -783,7 +794,11 @@ where
 
     /// List all buckets (for root path)
     async fn list_buckets(&self) -> FsResult<Vec<WebDavDirEntry>> {
-        match authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None).await {
+        match self
+            .storage
+            .authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None)
+            .await
+        {
             Ok(()) => {
                 let credentials = self.credentials();
                 return match self.storage.list_buckets(credentials).await {
@@ -863,11 +878,6 @@ where
 
     /// List objects in a bucket
     async fn list_objects(&self, bucket: &str, prefix: Option<&str>) -> FsResult<Vec<WebDavDirEntry>> {
-        // Authorize the operation
-        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, prefix)
-            .await
-            .map_err(|_| FsError::Forbidden)?;
-
         let prefix_with_slash = prefix.map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
@@ -876,6 +886,11 @@ where
             .delimiter(Some("/".to_string()))
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
+
+        self.storage
+            .authorize_list_objects(&self.session_context, &list_input)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
 
         match self.storage.list_objects_v2(list_input, self.credentials()).await {
             Ok(output) => {
@@ -1000,10 +1015,6 @@ where
         // SECURITY: s3:DeleteBucket does not imply the right to destroy the
         // bucket contents. Enumerating and deleting each object are separate
         // authorization boundaries and must be cleared on their own.
-        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
-            .await
-            .map_err(|_| FsError::Forbidden)?;
-
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -1015,12 +1026,18 @@ where
 
             let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
 
+            self.storage
+                .authorize_list_objects(&self.session_context, &list_input)
+                .await
+                .map_err(|_| FsError::Forbidden)?;
+
             if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                 // Delete all objects in this page
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
-                            authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                            self.storage
+                                .authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
                                 .await
                                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1078,11 +1095,13 @@ where
 
             // Check authorization based on operation type
             if options.write || options.create || options.create_new || options.append {
-                authorize_operation(&session_context, &S3Action::PutObject, &bucket, Some(&key))
+                self.storage
+                    .authorize_operation(&session_context, &S3Action::PutObject, &bucket, Some(&key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
             } else {
-                authorize_operation(&session_context, &S3Action::GetObject, &bucket, Some(&key))
+                self.storage
+                    .authorize_operation(&session_context, &S3Action::GetObject, &bucket, Some(&key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
             }
@@ -1183,7 +1202,8 @@ where
                 };
             } else {
                 // Get bucket metadata
-                authorize_operation(&self.session_context, &S3Action::HeadBucket, &bucket, None)
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::HeadBucket, &bucket, None)
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1230,7 +1250,8 @@ where
                     format!("{}/", key_str)
                 };
 
-                authorize_operation(&self.session_context, &S3Action::PutObject, &bucket, Some(&dir_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::PutObject, &bucket, Some(&dir_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1277,7 +1298,8 @@ where
             }
 
             // Create bucket
-            authorize_operation(&self.session_context, &S3Action::CreateBucket, &bucket, None)
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::CreateBucket, &bucket, None)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1326,7 +1348,8 @@ where
                     format!("{}/", prefix)
                 };
 
-                authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1334,10 +1357,6 @@ where
                 // says nothing about the children stored under it. Enumerating the
                 // prefix and deleting each child are separate authorization
                 // boundaries and must be cleared on their own.
-                authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-
                 // List and delete all objects with this prefix
                 let mut continuation_token = None;
                 loop {
@@ -1351,11 +1370,22 @@ where
 
                     let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
 
+                    self.storage
+                        .authorize_list_objects(&self.session_context, &list_input)
+                        .await
+                        .map_err(|_| FsError::Forbidden)?;
+
                     if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                         if let Some(objects) = output.contents {
                             for obj in objects {
                                 if let Some(obj_key) = obj.key {
-                                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&obj_key))
+                                    self.storage
+                                        .authorize_operation(
+                                            &self.session_context,
+                                            &S3Action::DeleteObject,
+                                            &bucket,
+                                            Some(&obj_key),
+                                        )
                                         .await
                                         .map_err(|_| FsError::Forbidden)?;
 
@@ -1383,7 +1413,8 @@ where
             }
 
             // Delete bucket
-            authorize_operation(&self.session_context, &S3Action::DeleteBucket, &bucket, None)
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::DeleteBucket, &bucket, None)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1403,7 +1434,8 @@ where
             let key = key.ok_or(FsError::Forbidden)?;
 
             // Authorize delete object
-            authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&key))
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&key))
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1453,13 +1485,16 @@ where
             let resolved_src = self.resolve_path(&src_bucket, &src_key).await?;
             let (src_prefix, include_src_marker) = match resolved_src {
                 ResolvedPath::File(_) => {
-                    authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
-                    authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
-                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
 
@@ -1506,21 +1541,28 @@ where
             };
             let dst_prefix = format!("{}/", dst_key);
 
-            authorize_operation(&self.session_context, &S3Action::ListBucket, &src_bucket, Some(&src_prefix))
+            let mut list_input = ListObjectsV2Input::builder()
+                .bucket(src_bucket.clone())
+                .prefix(Some(src_prefix.clone()))
+                .build()
+                .map_err(|_| FsError::GeneralFailure)?;
+            self.storage
+                .authorize_list_objects(&self.session_context, &list_input)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
-
-            let mut continuation_token: Option<String> = None;
             let mut renamed_any = false;
 
             if include_src_marker {
-                authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1530,30 +1572,30 @@ where
             }
 
             loop {
-                let mut list_builder = ListObjectsV2Input::builder()
-                    .bucket(src_bucket.clone())
-                    .prefix(Some(src_prefix.clone()));
+                self.storage
+                    .authorize_list_objects(&self.session_context, &list_input)
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
 
-                if let Some(ref token) = continuation_token {
-                    list_builder = list_builder.continuation_token(Some(token.clone()));
-                }
-
-                let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
-                let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
-                    error!(
-                        event = EVENT_WEBDAV_RENAME_STATE,
-                        component = LOG_COMPONENT_PROTOCOLS,
-                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                        state = "directory_list_failed",
-                        src_bucket = %src_bucket,
-                        src_prefix = %src_prefix,
-                        dst_bucket = %dst_bucket,
-                        dst_prefix = %dst_prefix,
-                        error = %e,
-                        "WebDAV rename directory listing failed"
-                    );
-                    FsError::GeneralFailure
-                })?;
+                let output = self
+                    .storage
+                    .list_objects_v2(list_input.clone(), credentials)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            event = EVENT_WEBDAV_RENAME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "directory_list_failed",
+                            src_bucket = %src_bucket,
+                            src_prefix = %src_prefix,
+                            dst_bucket = %dst_bucket,
+                            dst_prefix = %dst_prefix,
+                            error = %e,
+                            "WebDAV rename directory listing failed"
+                        );
+                        FsError::GeneralFailure
+                    })?;
 
                 let mut page_pairs: Vec<(String, String)> = Vec::new();
                 if let Some(objects) = output.contents {
@@ -1567,13 +1609,16 @@ where
 
                 if !page_pairs.is_empty() {
                     for (src_obj_key, dst_obj_key) in &page_pairs {
-                        authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
-                        authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
-                        authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
                     }
@@ -1586,7 +1631,7 @@ where
                 if !output.is_truncated.unwrap_or(false) {
                     break;
                 }
-                continuation_token = output.next_continuation_token;
+                list_input.continuation_token = output.next_continuation_token;
             }
 
             if !renamed_any {
@@ -1646,6 +1691,45 @@ mod tests {
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn listing_authorizes_normalized_prefix_and_delimiter() {
+        let backend = DummyBackend::new();
+        let driver = WebDavDriver::new(backend.clone(), Arc::new(test_session(Protocol::WebDav)));
+        with_test_auth_override(
+            |_, bucket, prefix| bucket == "bucket" && prefix == Some("private/"),
+            driver.list_objects("bucket", Some("private")),
+        )
+        .await
+        .expect("normalized prefix satisfies conditional allow");
+        let authorized = backend.list_authorizations();
+        let executed = backend.list_objects_calls();
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(executed.len(), 1);
+        assert_eq!(authorized[0].prefix.as_deref(), Some("private/"));
+        assert_eq!(authorized[0].delimiter.as_deref(), Some("/"));
+        assert_eq!(authorized[0].prefix, executed[0].prefix);
+        assert_eq!(authorized[0].delimiter, executed[0].delimiter);
+        assert_eq!(authorized[0].max_keys, executed[0].max_keys);
+        let denied =
+            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.list_objects("bucket", Some("private")))
+                .await;
+        assert!(matches!(denied, Err(FsError::Forbidden)));
+        assert_eq!(backend.list_objects_calls().len(), 1, "denied listing cannot reach storage");
+    }
+
+    #[tokio::test]
+    async fn backend_policy_denial_blocks_webdav_delete() {
+        let backend = DummyBackend::new().deny_authorization();
+        backend.queue_delete_object_ok();
+        let driver = WebDavDriver::new(backend, Arc::new(test_session(Protocol::WebDav)));
+        let path = DavPath::new("/bucket/secret.txt").expect("path");
+        let result = with_test_auth_override(|_, _, _| true, driver.remove_file(&path)).await;
+        assert!(
+            matches!(result, Err(FsError::Forbidden)),
+            "backend policy deny must override identity allow"
+        );
+    }
 
     #[derive(Clone)]
     struct DummyStorage;

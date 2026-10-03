@@ -111,8 +111,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let remaining = size - offset;
         let actual_len = (capped_len as u64).min(remaining);
 
+        self.authorize(&S3Action::GetObject, &bucket, Some(&key)).await?;
+
         // Cache-hit fast path. Probe the cache while only borrowing
-        // the handle table. No backend call, no auth call, no await,
+        // the handle table. No backend call or await,
         // so cancellation cannot fire between the probe and the
         // return.
         let cached = self.with_handle_ref(&handle, |state| match state {
@@ -131,7 +133,6 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // smaller than actual_len, or when read_cache_window is the
         // READ_CACHE_DISABLED sentinel (0), the backend call still
         // returns the bytes the client requested.
-        self.authorize(&S3Action::GetObject, &bucket, Some(&key)).await?;
         let fetch_len = self.read_cache_window.max(actual_len).min(remaining);
 
         let window_bytes = self.fetch_object_range(&bucket, &key, offset, fetch_len).await?;
@@ -239,6 +240,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tracing::Level;
+
+    #[tokio::test]
+    async fn cached_read_checks_backend_policy() {
+        let backend = Arc::new(DummyBackend::new().deny_authorization());
+        let mut driver = build_driver_with_read_cache(backend, TEST_PART_SIZE, 4096, 1024 * 1024);
+        let handle = driver
+            .allocate_handle(file_handle("bucket", "secret.txt", 4096, FileAttributes::default()))
+            .expect("allocate read handle");
+        driver.try_populate_read_cache(&handle, 0, vec![42; 4096]);
+        let error = with_test_auth_override(|_, _, _| true, driver.read(1, handle, 0, 1024))
+            .await
+            .expect_err("backend policy denial must prevent cached content disclosure");
+        assert!(matches!(StatusCode::from(error), StatusCode::PermissionDenied));
+    }
 
     #[tokio::test]
     async fn read_with_len_zero_returns_bad_message_before_backend_call() {

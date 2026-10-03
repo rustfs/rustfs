@@ -170,7 +170,6 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                         // No object at this key. Check whether it is a
                         // directory by listing with the key as a prefix.
                         let prefix = format!("{object_key}/");
-                        self.authorize(&S3Action::ListBucket, &bucket, Some(prefix.as_str())).await?;
                         let input = ListObjectsV2Input::builder()
                             .bucket(bucket.clone())
                             .prefix(Some(prefix))
@@ -178,6 +177,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                             .max_keys(Some(1))
                             .build()
                             .map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+                        self.authorize_list_objects(&input).await?;
                         let out = self
                             .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
                             .await?;
