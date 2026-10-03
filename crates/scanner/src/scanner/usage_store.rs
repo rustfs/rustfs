@@ -1097,6 +1097,16 @@ where
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::Saved;
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "saved",
+                    snapshot_kind = if observational { "observed" } else { "authoritative" },
+                    cycle = ?data_usage_info.scanner_cycle,
+                    "Scanner usage snapshot saved"
+                );
             }
         }
 

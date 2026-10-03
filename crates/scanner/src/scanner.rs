@@ -2230,6 +2230,7 @@ where
                 cycle = cycle_info.current,
                 required_cycle,
                 state = "cache_cycle_ahead",
+                partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
@@ -2341,6 +2342,15 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
+    let partial_cause = if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        ) {
+        "activity_unverified_observation"
+    } else {
+        "incomplete_coverage"
+    };
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2405,6 +2415,7 @@ where
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     cycle = cycle_info.current,
                     state = "incomplete",
+                    partial_cause,
                     "Scanner cycle ended without a complete usage snapshot"
                 );
             }
@@ -3526,8 +3537,26 @@ where
     // Pending namespace commits invalidate this publication attempt, but only
     // storage movement creates durable, rate-limited catch-up debt.
     if storeapi.scanner_data_movement_pause_status().await.paused {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "data_movement",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::DataMovement)
     } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "pending_namespace_commit",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     }
 }
@@ -3543,7 +3572,24 @@ fn scanner_post_lease_activity_defer_reason(
         {
             None
         }
-        Ok(_) | Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        observed => {
+            let blocker = match &observed {
+                Err(_) => "probe_failed",
+                Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
+                Ok(_) if expected_digest.is_none() => "baseline_missing",
+                Ok(_) => "activity_changed",
+            };
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                stage = "post_lease_activity",
+                blocker,
+                "Scanner usage publication deferred"
+            );
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
     }
 }
 
