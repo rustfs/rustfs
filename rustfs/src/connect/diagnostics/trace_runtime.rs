@@ -2460,9 +2460,11 @@ mod tests {
                 signed_request
                     .headers_mut()
                     .extend(crate::storage_api::server::http::gen_signature_headers(&uri, &Method::GET).unwrap());
+                sender.ready().await.unwrap();
                 let success = sender.send_request(signed_request).await.unwrap();
                 assert_eq!(success.status(), StatusCode::OK);
                 success.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let rejected = sender
                     .send_request(
                         Request::builder()
@@ -2476,6 +2478,7 @@ mod tests {
                     .unwrap();
                 assert!(rejected.status().is_client_error());
                 rejected.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let unrelated = sender
                     .send_request(Request::builder().uri("/not-rpc").body(Empty::<Bytes>::new()).unwrap())
                     .await
@@ -3144,17 +3147,46 @@ mod tests {
     async fn local_runtime_profile_cancellation_waits_for_lease_release() {
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provenance = super::super::job_delivery::executable_provenance()
+            .await
+            .expect("test executable provenance should be available");
+        assert!(provenance.is_valid(), "profile capture requires valid executable provenance");
         let (mut request, _) = runtime_request(state.path());
         request.duration_millis = 5_000;
-        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        let server_state_root = state.path().to_path_buf();
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server_shutdown = CancellationToken::new();
+                    let runtime = spawn_local_trace_capture_runtime(&server_state_root, &server_shutdown).unwrap();
+                    ready.send(()).unwrap();
+                    let _ = stopped.await;
+                    runtime.shutdown().await;
+                });
+        });
+        wait.await.unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let state_root = state.path().to_path_buf();
-        let task = tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
+        let mut task =
+            tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if super::super::profile_cpu::CollectorLease::acquire().is_err() {
                     break;
+                }
+                if task.is_finished() {
+                    let detail = match (&mut task).await.expect("request task should not panic") {
+                        Ok(_) => "request completed successfully".to_owned(),
+                        Err(error) => format!("request failed: {error}"),
+                    };
+                    panic!("runtime profile finished before acquiring its collector lease: {detail}");
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -3165,7 +3197,8 @@ mod tests {
         assert!(matches!(task.await.unwrap(), Err(LocalTraceCaptureError::RuntimeProfile(code)) if code == "CANCELLED"));
         let lease = super::super::profile_cpu::CollectorLease::acquire().expect("client cancellation joins collector");
         drop(lease);
-        runtime.shutdown().await;
+        stop.send(()).unwrap();
+        server.join().unwrap();
     }
     #[tokio::test]
     #[serial]

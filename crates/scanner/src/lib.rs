@@ -87,7 +87,8 @@ pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_st
 pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
-    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus,
+    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogReplicaId,
+    ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState, ScannerPauseBacklogStatus,
     ScannerPauseBacklogThresholds, ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord,
     ScannerRecoveryIntentRequest, ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent,
     get_scanner_usage_recovery_intent, init_data_scanner, init_scanner_with_recovery, register_scanner_pause_backlog_retirement,
