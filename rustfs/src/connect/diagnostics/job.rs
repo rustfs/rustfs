@@ -1679,6 +1679,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
     async fn executes_thread_profile_jobs_against_the_service_process() {
         for scope in [ThreadProfileScope::NativeThreads, ThreadProfileScope::TokioRuntime] {
             let now = Utc::now();
