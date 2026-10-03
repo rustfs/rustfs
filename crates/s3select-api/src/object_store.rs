@@ -16,7 +16,10 @@ use crate::{
     PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
     SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
     SelectStore, SnapshotConsistencyError,
-    input_stream::{CompressionFormat, compressed_input_reader, compressed_input_stream, processed_bytes_limit},
+    input_stream::{
+        CompressionFormat, SELECT_DECODE_CHUNK_BYTES, compressed_input_reader, compressed_input_stream, input_io_error,
+        processed_bytes_limit,
+    },
     query::{
         ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
@@ -352,9 +355,11 @@ impl EcObjectStore {
         S: Stream<Item = Result<Bytes>> + Send + 'static,
     {
         if let Some(csv) = self.input.request.input_serialization.csv.as_ref()
-            && csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+            && (csv.allow_quoted_record_delimiter.unwrap_or(false)
+                || csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref()))
         {
             let syntax = CsvSyntax {
+                allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter.unwrap_or(false),
                 quote: csv.quote_character.as_deref(),
                 escape: csv.quote_escape_character.as_deref(),
                 field: csv.field_delimiter.as_deref(),
@@ -925,6 +930,26 @@ impl ObjectStore for EcObjectStore {
                     self.query_tracker.clone(),
                 );
                 GetResultPayload::Stream(stream)
+            } else if self
+                .input
+                .request
+                .input_serialization
+                .csv
+                .as_ref()
+                .is_some_and(|csv| csv.allow_quoted_record_delimiter.unwrap_or(false))
+            {
+                // The CSV normalizer owns logical-record limits; a physical-line
+                // tracker would count default CRLF terminators as record data.
+                let reader = compressed_input_reader(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    max_processed_bytes,
+                    query_guard,
+                );
+                let stream = ReaderStream::with_capacity(reader, SELECT_DECODE_CHUNK_BYTES).map_err(input_io_error);
+                GetResultPayload::Stream(self.convert_csv_stream(stream))
             } else {
                 let input_record_delimiter = if self.input.request.input_serialization.csv.is_some() {
                     self.record_delimiter()
@@ -3008,6 +3033,141 @@ mod test {
         assert_eq!(range, b"id"[..]);
         assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
         assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_preserve_compressed_values_and_metrics() {
+        const BUCKET: &str = "s3select-quoted-record-stream";
+        let data = b"name,kind\n\"line\nbreak\",tail\n";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, compression) in [
+            ("plain.csv", None),
+            ("gzip.csv", Some(CompressionFormat::Gzip)),
+            ("bzip.csv", Some(CompressionFormat::Bzip2)),
+        ] {
+            let bytes = match compression {
+                Some(format) => encode_compressed_fixture(format, data).await,
+                None => data.to_vec(),
+            };
+            let raw_size = bytes.len();
+            let mut reader = SelectPutObjReader::from_vec(bytes);
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("write multiline CSV");
+            let mut input = (*csv_input(BUCKET, object)).clone();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.allow_quoted_record_delimiter = Some(true);
+            input.request.input_serialization.compression_type = compression.map(|format| {
+                CompressionType::from_static(match format {
+                    CompressionFormat::Gzip => CompressionType::GZIP,
+                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                })
+            });
+            let metrics = Arc::new(SelectInputMetrics::default());
+            let store = EcObjectStore::build_with_snapshot(
+                Arc::new(input),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+                Arc::clone(&metrics),
+                prepare_test_snapshot(BUCKET, object).await,
+                JsonSource::default(),
+            )
+            .expect("snapshot store");
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open multiline CSV stream");
+            let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV must remain streaming") };
+            let output = stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("normalize multiline CSV")
+                .concat();
+            assert_eq!(output, b"\"name\",\"kind\"\n\"line\nbreak\",\"tail\"\n", "object={object}");
+            let measured = metrics.snapshot();
+            assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+            assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_preserve_compressed_crlf_size_boundaries() {
+        use crate::input_stream::MAX_SELECT_RECORD_BYTES;
+
+        const BUCKET: &str = "select-quoted-crlf-limit";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for compression in [None, Some(CompressionFormat::Gzip), Some(CompressionFormat::Bzip2)] {
+            for size in [
+                MAX_SELECT_RECORD_BYTES - 1,
+                MAX_SELECT_RECORD_BYTES,
+                MAX_SELECT_RECORD_BYTES + 1,
+            ] {
+                for multiline in [false, true] {
+                    let mut data = vec![b'a'; size];
+                    if multiline {
+                        data[0] = b'"';
+                        data[size / 2] = b'\n';
+                        data[size - 1] = b'"';
+                    }
+                    data.extend_from_slice(b"\r\n");
+                    let bytes = match compression {
+                        Some(format) => encode_compressed_fixture(format, &data).await,
+                        None => data.clone(),
+                    };
+                    let raw_size = bytes.len();
+                    let object = format!("{compression:?}-{size}-{multiline}");
+                    let mut reader = SelectPutObjReader::from_vec(bytes);
+                    env.ecstore
+                        .put_object(BUCKET, &object, &mut reader, &Default::default())
+                        .await
+                        .expect("write boundary fixture");
+                    let mut input = (*csv_input(BUCKET, &object)).clone();
+                    let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+                    csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+                    csv.allow_quoted_record_delimiter = Some(true);
+                    input.request.input_serialization.compression_type = compression.map(|format| {
+                        CompressionType::from_static(match format {
+                            CompressionFormat::Gzip => CompressionType::GZIP,
+                            CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                        })
+                    });
+                    let metrics = Arc::new(SelectInputMetrics::default());
+                    let store = EcObjectStore::build_with_snapshot(
+                        Arc::new(input),
+                        Arc::new(GreedyMemoryPool::new(4 * MAX_SELECT_RECORD_BYTES)),
+                        None,
+                        Arc::clone(&metrics),
+                        prepare_test_snapshot(BUCKET, &object).await,
+                        JsonSource::default(),
+                    )
+                    .expect("boundary store");
+                    let result = store
+                        .get_opts(&Path::from(object.as_str()), GetOptions::default())
+                        .await
+                        .expect("open boundary stream");
+                    let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV stream") };
+                    let output = stream.try_collect::<Vec<_>>().await;
+                    if size > MAX_SELECT_RECORD_BYTES {
+                        let error = output.expect_err("logical records over 1 MiB must fail, even with embedded newlines");
+                        let object_store::Error::Generic { source, .. } = error else { panic!("typed record size error") };
+                        assert_eq!(source.downcast_ref::<SelectError>(), Some(&SelectError::OverMaxRecordSize));
+                    } else {
+                        let value = if multiline { &data[1..size - 1] } else { &data[..size] };
+                        let mut expected = vec![b'"'];
+                        expected.extend_from_slice(value);
+                        expected.extend_from_slice(b"\"\n");
+                        assert_eq!(output.expect("records within the limit must pass").concat(), expected, "object={object}");
+                        let measured = metrics.snapshot();
+                        assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+                        assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

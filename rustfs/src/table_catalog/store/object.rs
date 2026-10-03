@@ -2424,6 +2424,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn plan_table_commit_recovery(
         &self,
         table_bucket: &str,
@@ -4076,6 +4077,17 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await
+            .map(|(catalog, _)| catalog)
+    }
+
+    async fn table_catalog_export_with_recovery(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
 
@@ -4110,12 +4122,15 @@ where
         let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
         let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
     }
 
     pub(crate) async fn diagnose_table_catalog(
@@ -4125,82 +4140,10 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
-        let parsed_namespace = parse_namespace_for_store(namespace)?;
-        let parsed_table = parse_table_for_store(table)?;
-        let catalog = self.export_table_catalog_entry(table_bucket, namespace, table).await?;
-        let current_metadata_location = catalog.table.metadata_location.clone();
-
-        let mut retained = BTreeSet::new();
-        let mut current_metadata_for_refs = None;
-        let current_metadata_status =
-            if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
-                retained.insert(current_metadata_location.clone());
-                match read_table_metadata_value(&self.backend, table_bucket, &current_metadata_location).await {
-                    Ok(Some(current_metadata)) => {
-                        retained.extend(metadata_log_locations(
-                            &current_metadata,
-                            table_bucket,
-                            &parsed_namespace,
-                            &parsed_table,
-                        ));
-                        current_metadata_for_refs = Some(current_metadata);
-                        TableMetadataPointerStatus::Valid
-                    }
-                    Ok(None) => TableMetadataPointerStatus::MissingObject,
-                    Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
-                    Err(err) => return Err(err),
-                }
-            } else {
-                TableMetadataPointerStatus::InvalidLocation
-            };
-
-        let mut metadata_locations = Vec::new();
-        let metadata_prefix = format!("{}/", default_table_metadata_dir_path(&parsed_namespace, &parsed_table));
-        for object in self.backend.list_objects(table_bucket, &metadata_prefix).await? {
-            if let Some(metadata_location) = metadata_location_from_metadata_file_path(&parsed_namespace, &parsed_table, &object)
-            {
-                metadata_locations.push(metadata_location);
-            }
-        }
-        metadata_locations.sort();
-        metadata_locations.dedup();
-
-        for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
-            retained.insert(metadata_location.clone());
-        }
-        if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
-            retained.extend(
-                metadata_locations_for_protected_snapshot_refs(
-                    &self.backend,
-                    table_bucket,
-                    &parsed_namespace,
-                    &parsed_table,
-                    current_metadata,
-                    &metadata_locations,
-                )
-                .await?,
-            );
-        }
-
-        let orphan_metadata_candidate_locations = metadata_locations
-            .into_iter()
-            .filter(|metadata_location| !retained.contains(metadata_location))
-            .collect();
-
-        let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
-        let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
-        let backing_manifest =
-            table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
-
-        Ok(TableCatalogDiagnosticsReport {
-            catalog,
-            current_metadata_status,
-            recovery_status,
-            recommended_actions,
-            commit_recovery,
-            backing_manifest,
-            orphan_metadata_candidate_locations,
-        })
+        let (catalog, commit_recovery) = self
+            .table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await?;
+        diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
     }
 
     pub(crate) async fn plan_table_metadata_maintenance(

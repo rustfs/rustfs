@@ -69,10 +69,13 @@ async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
 /// Persist one bounded checkpoint and refresh its CAS revisions.
 ///
 /// Local and remote workers share the same publication/leader fencing and
-/// revision-refresh contract; only their lock/cancellation handling remains
+/// revision-refresh contract. Cycle/leader state belongs to the global store,
+/// while cache revisions and publication admission belong to the set store.
+/// Only their lock/cancellation handling remains
 /// at the caller because those guards have different concrete types.
-pub(crate) async fn persist_scanner_checkpoint<S>(
+pub(crate) async fn persist_scanner_checkpoint<S, F>(
     store: Arc<S>,
+    fence_store: Arc<F>,
     context: ScannerCheckpointPersistContext<'_>,
     cache_name: &str,
     checkpoint: &DataUsageCache,
@@ -80,6 +83,7 @@ pub(crate) async fn persist_scanner_checkpoint<S>(
 ) -> ScannerCheckpointPersistResult
 where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
+    F: ScannerObjectIO,
 {
     let foreground_quiet = wait_for_checkpoint_foreground_quiet(context.ctx).await;
     if !foreground_quiet && context.ctx.is_cancelled() {
@@ -97,9 +101,13 @@ where
         );
     }
 
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
-        .await
-        .is_err()
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
+        context.cycle,
+        context.leader_epoch,
+        fence_store.clone(),
+    )
+    .await
+    .is_err()
     {
         return ScannerCheckpointPersistResult::FenceChanged;
     }
@@ -117,7 +125,7 @@ where
         return ScannerCheckpointPersistResult::Failed(error);
     }
 
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
         .await
         .is_err()
         || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
