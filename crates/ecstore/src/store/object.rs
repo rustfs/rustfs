@@ -1038,8 +1038,23 @@ impl fmt::Display for ObjectLockDiagMode {
     }
 }
 
+enum ObjectLockOwner {
+    Read(rustfs_lock::NamespaceLockGuard),
+    Write(Arc<rustfs_lock::NamespaceLockGuard>),
+}
+
+impl ObjectLockOwner {
+    fn as_ref(&self) -> &rustfs_lock::NamespaceLockGuard {
+        match self {
+            Self::Read(guard) => guard,
+            Self::Write(guard) => guard,
+        }
+    }
+}
+
 pub(crate) struct ObjectLockDiagGuard {
-    guard: rustfs_lock::NamespaceLockGuard,
+    guard: ObjectLockOwner,
+    write_key: Option<(String, String)>,
     #[cfg(test)]
     test_namespace_lock_fence: Option<NamespaceLockFence>,
     enabled: bool,
@@ -1063,7 +1078,11 @@ impl ObjectLockDiagGuard {
         mode: ObjectLockDiagMode,
     ) -> Self {
         Self {
-            guard,
+            guard: match mode {
+                ObjectLockDiagMode::Read => ObjectLockOwner::Read(guard),
+                ObjectLockDiagMode::Write => ObjectLockOwner::Write(Arc::new(guard)),
+            },
+            write_key: None,
             #[cfg(test)]
             test_namespace_lock_fence: None,
             enabled,
@@ -1082,15 +1101,20 @@ impl ObjectLockDiagGuard {
         self
     }
 
+    fn with_write_key(mut self, bucket: &str, object: &str) -> Self {
+        self.write_key = Some((bucket.to_owned(), object.to_owned()));
+        self
+    }
+
     pub(crate) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
-        match &self.guard {
+        match self.guard.as_ref() {
             rustfs_lock::NamespaceLockGuard::Standard(guard) => Some(guard.lock_lost()),
             rustfs_lock::NamespaceLockGuard::Fast(_) => None,
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
-        self.guard.is_lock_lost() || {
+        self.guard.as_ref().is_lock_lost() || {
             #[cfg(test)]
             {
                 self.test_namespace_lock_fence
@@ -1105,6 +1129,13 @@ impl ObjectLockDiagGuard {
     }
 
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        if let Some((bucket, object)) = self.write_key.as_ref()
+            && let ObjectLockOwner::Write(guard) = &self.guard
+        {
+            let no_lock = opts.no_lock;
+            opts.add_owned_write_lock(Arc::clone(guard), bucket, object);
+            opts.no_lock = no_lock;
+        }
         opts.ensure_namespace_lock_fence();
         if let Some(signal) = self.lock_lost_signal() {
             opts.add_namespace_lock_lost_signal(signal);
@@ -1301,7 +1332,7 @@ impl RestoreAcceptGuard {
     /// refresh lost quorum). Callers must check this before committing the
     /// restore-status write the guard exists to serialize.
     pub fn is_lock_lost(&self) -> bool {
-        self.0.guard.is_lock_lost()
+        self.0.guard.as_ref().is_lock_lost()
     }
 
     pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
@@ -1322,7 +1353,7 @@ impl RestoreWorkerGuard {
 
 impl Drop for ObjectLockDiagGuard {
     fn drop(&mut self) {
-        if !self.enabled || self.guard.is_released() {
+        if !self.enabled || self.guard.as_ref().is_released() {
             return;
         }
 
@@ -3029,7 +3060,8 @@ impl ECStore {
             owner,
             ObjectLockDiagMode::Write,
         )
-        .with_attempt(attempt))
+        .with_attempt(attempt)
+        .with_write_key(bucket, object))
     }
 
     async fn acquire_object_write_lock_if_needed(
@@ -3044,11 +3076,9 @@ impl ECStore {
         }
 
         let guard = self.acquire_object_write_lock(op, bucket, object).await?;
-        if let Some(signal) = guard.lock_lost_signal() {
-            opts.add_namespace_lock_lost_signal(signal);
-        }
-        opts.ensure_namespace_lock_fence();
+        guard.add_namespace_lock_fence(opts);
         opts.no_lock = true;
+        opts.write_completion = crate::object_api::WriteCompletion::TailDrained;
 
         Ok(Some(guard))
     }
@@ -3187,7 +3217,10 @@ impl ECStore {
         let store = Arc::clone(self);
         let write = async move {
             let object = "buckets/.scanner-pause-backlog.json";
-            let mut opts = ObjectOptions::default();
+            let mut opts = ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            };
             // Match migration: fixed object namespace -> durable pool metadata ->
             // actual replica namespace. The replica need not be the hash-routed set.
             let object_guard = if store.single_pool() {
@@ -3727,15 +3760,18 @@ impl ECStore {
                     acquire_start.elapsed(),
                     diag_enabled,
                 );
-                guards.push(ObjectLockDiagGuard::new(
-                    guard,
-                    diag_enabled,
-                    op,
-                    diag_enabled.then(|| bucket.to_string()),
-                    diag_enabled.then(|| object.to_string()),
-                    owner,
-                    ObjectLockDiagMode::Write,
-                ));
+                guards.push(
+                    ObjectLockDiagGuard::new(
+                        guard,
+                        diag_enabled,
+                        op,
+                        diag_enabled.then(|| bucket.to_string()),
+                        diag_enabled.then(|| object.to_string()),
+                        owner,
+                        ObjectLockDiagMode::Write,
+                    )
+                    .with_write_key(bucket, object),
+                );
                 locked_sets.push(Arc::clone(set));
             }
         }
@@ -3826,7 +3862,8 @@ impl ECStore {
                 diag_enabled.then(|| object.to_string()),
                 owner,
                 ObjectLockDiagMode::Write,
-            );
+            )
+            .with_write_key(bucket, object);
             #[cfg(test)]
             let guard = {
                 let mut guard = guard;
@@ -4576,6 +4613,7 @@ impl ECStore {
                     expected_current_version_id: dst_opts.expected_current_version_id.clone(),
                     expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
                     namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+                    write_lock_context: dst_opts.write_lock_context.clone(),
                     bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
                     object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                     quota_admission: dst_opts.quota_admission,
@@ -4619,6 +4657,7 @@ impl ECStore {
                         expected_current_version_id: dst_opts.expected_current_version_id.clone(),
                         expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
                         namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+                        write_lock_context: dst_opts.write_lock_context.clone(),
                         bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
                         object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                         quota_admission: dst_opts.quota_admission,
@@ -4672,6 +4711,7 @@ impl ECStore {
             expected_current_version_id: dst_opts.expected_current_version_id.clone(),
             expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
             namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+            write_lock_context: dst_opts.write_lock_context.clone(),
             bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
             object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             quota_admission: dst_opts.quota_admission,

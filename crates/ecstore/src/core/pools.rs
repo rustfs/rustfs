@@ -3692,8 +3692,8 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
 }
 
 pub(crate) struct PoolRebalanceActivationFence {
-    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
-    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    pool_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
+    rebalance_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     decommission_target_fence_proof: Option<crate::services::notification_sys::DecommissionTargetFenceFleetProofToken>,
     #[cfg(test)]
@@ -3720,7 +3720,12 @@ impl PoolRebalanceActivationFence {
         let forced_lost = self.forced_lost.load(Ordering::Acquire);
         #[cfg(not(test))]
         let forced_lost = false;
-        if forced_lost || self.pool_meta_guard.is_lock_lost() || self.rebalance_meta_guard.is_lock_lost() {
+        if forced_lost
+            || self.pool_meta_guard.is_lock_lost()
+            || self.pool_meta_guard.is_released()
+            || self.rebalance_meta_guard.is_lock_lost()
+            || self.rebalance_meta_guard.is_released()
+        {
             return Err(Error::other("activation lock lost before metadata commit or worker admission"));
         }
         if self
@@ -3742,8 +3747,8 @@ impl PoolRebalanceActivationFence {
     }
 
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.add_namespace_lock_guard(&self.pool_meta_guard);
-        opts.add_namespace_lock_guard(&self.rebalance_meta_guard);
+        opts.add_owned_write_lock(Arc::clone(&self.pool_meta_guard), RUSTFS_META_BUCKET, POOL_META_NAME);
+        opts.add_owned_write_lock(Arc::clone(&self.rebalance_meta_guard), RUSTFS_META_BUCKET, REBAL_META_NAME);
     }
 
     #[cfg(test)]
@@ -3784,8 +3789,8 @@ where
         .map_err(activation_pool_meta_lock_error)?;
 
     Ok(PoolRebalanceActivationFence {
-        pool_meta_guard,
-        rebalance_meta_guard,
+        pool_meta_guard: Arc::new(pool_meta_guard),
+        rebalance_meta_guard: Arc::new(rebalance_meta_guard),
         fleet_proof,
         decommission_target_fence_proof: None,
         #[cfg(test)]
@@ -4067,7 +4072,7 @@ fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool
 }
 
 fn ensure_pool_meta_write_fence(guard: &rustfs_lock::NamespaceLockGuard, operation: &str) -> Result<()> {
-    if guard.is_lock_lost() {
+    if guard.is_lock_lost() || guard.is_released() {
         return Err(Error::other(format!("{operation}: pool metadata distributed fence was lost")));
     }
     Ok(())
@@ -6339,6 +6344,9 @@ fn encode_pool_meta_v3_envelope(
 }
 
 enum PoolMetaPersistenceFence<'a> {
+    Owned(Arc<rustfs_lock::NamespaceLockGuard>),
+    OfflineRecovery,
+    #[cfg(test)]
     Distributed(Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>),
     Activation(&'a PoolRebalanceActivationFence),
 }
@@ -6346,6 +6354,10 @@ enum PoolMetaPersistenceFence<'a> {
 impl PoolMetaPersistenceFence<'_> {
     fn ensure_held(&self) -> Result<()> {
         match self {
+            Self::Owned(guard) if guard.is_lock_lost() || guard.is_released() => {
+                Err(Error::other("pool metadata distributed fence was lost before a replica write"))
+            }
+            #[cfg(test)]
             Self::Distributed(Some(signal)) if signal.is_lost() => {
                 Err(Error::other("pool metadata distributed fence was lost before a replica write"))
             }
@@ -6354,11 +6366,27 @@ impl PoolMetaPersistenceFence<'_> {
         }
     }
 
-    fn add_to_options(&self, opts: &mut ObjectOptions) {
+    fn add_to_options(&self, opts: &mut ObjectOptions, object: &str) {
         match self {
+            Self::Owned(guard) => opts.add_owned_write_lock(Arc::clone(guard), RUSTFS_META_BUCKET, object),
+            Self::OfflineRecovery => opts.use_offline_recovery_write(),
+            #[cfg(test)]
             Self::Distributed(Some(signal)) => opts.add_namespace_lock_lost_signal(Arc::clone(signal)),
-            Self::Activation(fence) => fence.add_namespace_lock_fence(opts),
+            Self::Activation(fence) => {
+                fence.add_namespace_lock_fence(opts);
+                opts.add_owned_write_lock(Arc::clone(&fence.pool_meta_guard), RUSTFS_META_BUCKET, object);
+            }
+            #[cfg(test)]
             Self::Distributed(None) => {}
+        }
+    }
+
+    fn allows_concurrent_phases(&self) -> bool {
+        match self {
+            Self::Owned(guard) => guard.lock_lost_signal().is_some(),
+            #[cfg(test)]
+            Self::Distributed(signal) => signal.is_some(),
+            _ => false,
         }
     }
 
@@ -6662,7 +6690,7 @@ fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMet
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
     };
-    fence.add_to_options(&mut opts);
+    fence.add_to_options(&mut opts, object);
     Ok(opts)
 }
 
@@ -7049,7 +7077,7 @@ where
         write_state,
         initialized,
         PoolMetaIdentityWriteScope::All,
-        &PoolMetaPersistenceFence::Distributed(None),
+        &PoolMetaPersistenceFence::OfflineRecovery,
         &mut transaction_arm,
     )
     .await?;
@@ -7076,7 +7104,7 @@ where
         write_state,
         false,
         PoolMetaIdentityWriteScope::Pools(pool_indices),
-        &PoolMetaPersistenceFence::Distributed(None),
+        &PoolMetaPersistenceFence::OfflineRecovery,
         &mut transaction_arm,
     )
     .await?;
@@ -8154,11 +8182,16 @@ impl PoolMeta {
             .cloned()
             .ok_or_else(|| Error::other("pool metadata save failed: no storage pools available"))?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let pool_meta_guard = Arc::new(pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let mut write_state = PoolMetaWriteState::default();
         let indices = (0..self.pools.len()).collect::<Vec<_>>();
         let outcome = self
-            .save_no_lock_armed_scoped(pools, &mut write_state, pool_meta_guard.lock_lost_signal(), Some(&indices))
+            .save_no_lock_armed_scoped(
+                pools,
+                &mut write_state,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                Some(&indices),
+            )
             .await?;
         outcome.disarm();
         Ok(())
@@ -8182,14 +8215,16 @@ impl PoolMeta {
     where
         S: EcstoreObjectIO,
     {
-        let outcome = self.save_no_lock_armed_scoped(pools, write_state, None, None).await?;
+        let outcome = self
+            .save_no_lock_armed_scoped(pools, write_state, PoolMetaPersistenceFence::OfflineRecovery, None)
+            .await?;
         Ok(outcome.into_committed())
     }
 
     async fn save_no_lock_with_fence<S>(
         &self,
         pools: Vec<Arc<S>>,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: &[usize],
     ) -> Result<()>
     where
@@ -8197,7 +8232,7 @@ impl PoolMeta {
     {
         let mut write_state = PoolMetaWriteState::default();
         let outcome = self
-            .save_no_lock_armed_scoped(pools, &mut write_state, lock_lost, Some(indices))
+            .save_no_lock_armed_scoped(pools, &mut write_state, fence, Some(indices))
             .await?;
         outcome.disarm();
         Ok(())
@@ -8233,21 +8268,20 @@ impl PoolMeta {
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: &[usize],
     ) -> Result<PoolMetaSaveOutcome>
     where
         S: EcstoreObjectIO,
     {
-        self.save_no_lock_armed_scoped(pools, write_state, lock_lost, Some(indices))
-            .await
+        self.save_no_lock_armed_scoped(pools, write_state, fence, Some(indices)).await
     }
 
     async fn save_no_lock_armed_scoped<S>(
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: Option<&[usize]>,
     ) -> Result<PoolMetaSaveOutcome>
     where
@@ -8258,7 +8292,6 @@ impl PoolMeta {
         // returned outcome is dropped before publication, Drop latches the
         // sticky recovery gate.
         let mut transaction_arm = write_state.arm_transaction();
-        let fence = PoolMetaPersistenceFence::Distributed(lock_lost);
         let committed = self
             .save_no_lock_transaction(pools, write_state, &fence, indices, &mut transaction_arm)
             .await
@@ -8489,7 +8522,7 @@ impl PoolMeta {
             && selection.revision.is_generation_protocol()
             && !selection.replica_state.needs_repair
             && !bootstrap_generation_required
-            && matches!(fence, PoolMetaPersistenceFence::Distributed(Some(_)));
+            && fence.allows_concurrent_phases();
         #[cfg(feature = "e2e-test-hooks")]
         let phase_barrier = if concurrent_phases && pools.len() == 4 {
             PoolMetaPhaseBarrier::bind(&previous, &committed, revision, &durable).await?
@@ -8635,7 +8668,9 @@ impl PoolMeta {
         S: EcstoreObjectIO,
     {
         let indices = (0..self.pools.len()).collect::<Vec<_>>();
-        let outcome = self.save_no_lock_armed(pools, write_state, None, &indices).await?;
+        let outcome = self
+            .save_no_lock_armed(pools, write_state, PoolMetaPersistenceFence::OfflineRecovery, &indices)
+            .await?;
         outcome.disarm();
         Ok(())
     }
@@ -10831,7 +10866,7 @@ impl ECStore {
         &self,
         write_state: &mut PoolMetaWriteState,
         operation: &str,
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, PoolMeta)> {
         self.acquire_pool_meta_write_guard_with_lock_error(write_state, operation, activation_pool_meta_lock_error)
             .await
     }
@@ -10841,7 +10876,7 @@ impl ECStore {
         write_state: &mut PoolMetaWriteState,
         operation: &str,
         map_lock_error: F,
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)>
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, PoolMeta)>
     where
         F: FnOnce(rustfs_lock::LockError) -> Error,
     {
@@ -10862,7 +10897,7 @@ impl ECStore {
         let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe(operation)?;
-        Ok((pool_meta_guard, selection.meta))
+        Ok((Arc::new(pool_meta_guard), selection.meta))
     }
 
     async fn acquire_pool_meta_read_guard(
@@ -11132,7 +11167,7 @@ impl ECStore {
     pub(crate) async fn acquire_pool_meta_object_heal_fence(
         &self,
         target_pool_indices: &[usize],
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, Vec<Result<()>>)> {
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, Vec<Result<()>>)> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
@@ -11361,7 +11396,12 @@ impl ECStore {
         ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
 
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, write_guard.lock_lost_signal(), &source_pool_indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                &source_pool_indices,
+            )
             .await?;
         ensure_pool_meta_write_fence(&write_guard, "exact delete capacity reconciliation save failed")?;
         for (target_pool_index, target_guard) in &target_guards {
@@ -11470,7 +11510,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 &mut save_guard,
-                pool_meta_guard.lock_lost_signal(),
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 &[source_pool_index],
             )
             .await?;
@@ -11659,7 +11699,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 &mut save_guard,
-                pool_meta_guard.lock_lost_signal(),
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 &[source_pool_index],
             )
             .await?;
@@ -11965,7 +12005,12 @@ impl ECStore {
         };
         if reservation_grew || pending_added > 0 {
             let outcome = snapshot
-                .save_no_lock_armed(self.pools.clone(), &mut save_guard, write_guard.lock_lost_signal(), &[source_pool_index])
+                .save_no_lock_armed(
+                    self.pools.clone(),
+                    &mut save_guard,
+                    PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                    &[source_pool_index],
+                )
                 .await?;
             ensure_pool_meta_write_fence(&write_guard, "decommission target capacity intent save failed")?;
             snapshot = outcome.committed.clone();
@@ -12137,7 +12182,12 @@ impl ECStore {
             return result;
         }
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), save_guard, write_guard.lock_lost_signal(), &[source_pool_index])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                &[source_pool_index],
+            )
             .await?;
         ensure_pool_meta_write_fence(write_guard, "decommission target capacity progress save failed")?;
         if let Some(target_guard) = target_guard.as_ref() {
@@ -12272,8 +12322,8 @@ impl ECStore {
             .first()
             .ok_or_else(|| Error::other("pool metadata recovery has no storage pools"))?;
         let lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
-        let fence = PoolMetaPersistenceFence::Distributed(guard.lock_lost_signal());
+        let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await?);
+        let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&guard));
         let mut candidate = PoolMetaWriteState {
             aborted_transaction: Arc::new(AtomicBool::new(false)),
             transaction_failure: Arc::default(),
@@ -12449,7 +12499,12 @@ impl ECStore {
             merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, indices, "pool metadata save failed")?;
         }
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                indices,
+            )
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
@@ -12544,7 +12599,12 @@ impl ECStore {
         };
 
         let outcome = match snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -12610,7 +12670,12 @@ impl ECStore {
         #[cfg(test)]
         decommission_test_wrap_result("bucket_completion_before_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await?;
         #[cfg(test)]
         decommission_test_wrap_result("bucket_completion_after_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
@@ -12744,7 +12809,12 @@ impl ECStore {
             .await?;
         rollback_start_decommission_pool_meta(&mut snapshot, previous_pool_meta, indices);
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                indices,
+            )
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
@@ -13044,7 +13114,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture + Send + 'static,
+        Save: FnOnce(PoolMeta, PoolMetaPersistenceFence<'static>) -> SaveFuture + Send + 'static,
         SaveFuture: Future<Output = Result<()>> + Send + 'static,
     {
         let store = self.clone();
@@ -13064,7 +13134,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture,
+        Save: FnOnce(PoolMeta, PoolMetaPersistenceFence<'static>) -> SaveFuture,
         SaveFuture: Future<Output = Result<()>>,
     {
         let owner = owner.as_ref();
@@ -13113,9 +13183,17 @@ impl ECStore {
                 ));
             }
         }
-        let pool_meta_fence = _pool_meta_guard
-            .as_ref()
-            .and_then(rustfs_lock::NamespaceLockGuard::lock_lost_signal);
+        let pool_meta_fence = match _pool_meta_guard.as_ref() {
+            Some(guard) => PoolMetaPersistenceFence::Owned(Arc::clone(guard)),
+            None => {
+                #[cfg(test)]
+                {
+                    PoolMetaPersistenceFence::OfflineRecovery
+                }
+                #[cfg(not(test))]
+                return Err(Error::other("runtime pool metadata cancellation requires its write-lock owner"));
+            }
+        };
 
         // Lock order: start gate, target gates, save gate, distributed pool
         // metadata fence, rebalance_meta, decommission_cancelers, then
@@ -13554,7 +13632,12 @@ impl ECStore {
             let (save_outcome, save_error) = if changed {
                 ensure_decommission_target_fence_fleet_proof(target_fence_proof.as_ref(), target_fence_proof_required)?;
                 match snapshot
-                    .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &changed_indices)
+                    .save_no_lock_armed(
+                        self.pools.clone(),
+                        &mut save_guard,
+                        PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                        &changed_indices,
+                    )
                     .await
                 {
                     Ok(outcome) => (Some(outcome), None),
@@ -13646,7 +13729,12 @@ impl ECStore {
             .await?;
         snapshot.mark_decommission_capacity_blocked(idx, err.to_string(), OffsetDateTime::now_utc())?;
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await?;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
         {
@@ -22023,7 +22111,7 @@ mod tests {
             let mut state = store.pool_meta_save_gate.lock().await;
             let (fence, _) = store.acquire_pool_meta_write_guard(&mut state, "test save").await.unwrap();
             let outcome = requested
-                .save_no_lock_armed(store.pools.clone(), &mut state, fence.lock_lost_signal(), &[0])
+                .save_no_lock_armed(store.pools.clone(), &mut state, PoolMetaPersistenceFence::Owned(Arc::clone(&fence)), &[0])
                 .await
                 .unwrap();
             assert_eq!(outcome.committed.pools[0].last_update, requested.pools[0].last_update);
@@ -24825,11 +24913,12 @@ mod pools_tests {
             config[3][0].gate = Some(gate.clone());
             let fixture = Fixture::new(config);
             let mut state = fixture.state();
-            let mut save = Box::pin(
-                fixture
-                    .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-            );
+            let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                fixture.pools.clone(),
+                &mut state,
+                PoolMetaPersistenceFence::Distributed(signal()),
+                &[0],
+            ));
             tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("commit crossed the last prepare") }
             assert_eq!(fixture.trace.commit_count(), 0);
             gate.add_permits(1);
@@ -24849,7 +24938,7 @@ mod pools_tests {
             let mut state = fixture.state();
             let err = fixture
                 .desired
-                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                 .await
                 .expect_err("a missing conditional-write revision must fail");
             assert!(err.to_string().contains("without a conditional-write revision"));
@@ -24866,11 +24955,12 @@ mod pools_tests {
             config[3][0].gate = Some(gate.clone());
             let fixture = Fixture::new(config);
             let mut state = fixture.state();
-            let mut save = Box::pin(
-                fixture
-                    .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-            );
+            let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                fixture.pools.clone(),
+                &mut state,
+                PoolMetaPersistenceFence::Distributed(signal()),
+                &[0],
+            ));
             tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("phase returned with a live replica") }
             assert_eq!(fixture.trace.commit_count(), 0);
             gate.add_permits(1);
@@ -25045,11 +25135,12 @@ mod pools_tests {
                 }
                 let fixture = Fixture::new(config);
                 let mut state = fixture.state();
-                let mut save = Box::pin(
-                    fixture
-                        .desired
-                        .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-                );
+                let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                    fixture.pools.clone(),
+                    &mut state,
+                    PoolMetaPersistenceFence::Distributed(signal()),
+                    &[0],
+                ));
                 tokio::select! { _ = fixture.trace.wait_for(4 * (phase + 1), 4 * phase) => {}, _ = &mut save => panic!("blocked phase finished") }
                 drop(save);
                 assert!(state.ensure_write_safe("cancelled phase").is_err());
@@ -25060,7 +25151,7 @@ mod pools_tests {
             let mut state = fixture.state();
             let outcome = fixture
                 .desired
-                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                 .await
                 .expect("durable save before publication");
             drop(outcome);
@@ -25088,6 +25179,7 @@ mod pools_tests {
                 .await
                 .expect("lease request")
                 .expect("lease acquired");
+            let guard = Arc::new(guard);
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let mut config = steps(6);
             for step in &mut config {
@@ -25096,7 +25188,7 @@ mod pools_tests {
             let fixture = Fixture::new(config);
             let state = fixture.state();
             let mut arm = state.arm_transaction();
-            let fence = PoolMetaPersistenceFence::Distributed(guard.lock_lost_signal());
+            let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&guard));
             let mut pending = Box::pin(prepare(&fixture, &fence, &mut arm));
             tokio::select! { _ = fixture.trace.wait_for(4, 0) => {}, _ = &mut pending => panic!("gate ignored") }
             tokio::time::timeout(StdDuration::from_secs(3), guard.lock_lost_notified())
@@ -25122,7 +25214,7 @@ mod pools_tests {
                 let mut state = fixture.state();
                 let result = fixture
                     .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                    .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                     .await;
                 assert_eq!(fixture.trace.commit_count(), 4);
                 if matches!(fault, WriteFault::TimeoutAfterWrite) {
@@ -25172,7 +25264,7 @@ mod pools_tests {
                 let mut save = Box::pin(fixture.desired.save_no_lock_armed(
                     fixture.pools.clone(),
                     &mut state,
-                    if legacy || needs_repair { signal() } else { None },
+                    PoolMetaPersistenceFence::Distributed(if legacy || needs_repair { signal() } else { None }),
                     &[0],
                 ));
                 tokio::select! { _ = fixture.trace.wait_for(1, 0) => {}, _ = &mut save => panic!("serial write gate ignored") }
@@ -25732,7 +25824,7 @@ mod pools_tests {
         let save_task = tokio::spawn(async move {
             let mut save_guard = save_store.pool_meta_save_gate.lock().await;
             let outcome = snapshot
-                .save_no_lock_armed(vec![save_committed], &mut save_guard, None, &[0])
+                .save_no_lock_armed(vec![save_committed], &mut save_guard, PoolMetaPersistenceFence::OfflineRecovery, &[0])
                 .await?;
             task_publish_started.notify_one();
             task_publish_release.notified().await;
@@ -25760,6 +25852,73 @@ mod pools_tests {
     }
 
     #[tokio::test]
+    async fn pool_meta_cas_context_retains_actual_owner_for_exact_target() {
+        use crate::object_api::write_commit_context::WriteCommitContext;
+
+        let lock = NamespaceLock::with_local_manager("pool-meta-cas-owner".to_string(), Arc::new(GlobalLockManager::new()));
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "cas-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1));
+        let owner = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("pool metadata lock acquisition should succeed")
+                .expect("pool metadata lock should be available"),
+        );
+        let weak_owner = Arc::downgrade(&owner);
+        let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&owner));
+        let mut contexts = Vec::new();
+        for object in [POOL_META_NAME, POOL_META_IDENTITY_NAME] {
+            let options = super::pool_meta_cas_options(object, &PoolMetaCasToken::Missing, &fence)
+                .expect("a held pool metadata lock should authorize its CAS target");
+            let cloned_options = options.clone();
+            let context = WriteCommitContext::from_options(&cloned_options, super::RUSTFS_META_BUCKET, object, false)
+                .expect("the actual CAS target should retain its borrowed namespace owner");
+            assert!(context.has_borrowed_owner(), "CAS must borrow the real protocol lock owner");
+            assert!(
+                WriteCommitContext::from_options(&cloned_options, super::RUSTFS_META_BUCKET, "unrelated-object", false).is_err(),
+                "a pool metadata CAS capability must not authorize an unrelated object"
+            );
+            drop(options);
+            drop(cloned_options);
+            contexts.push(context);
+        }
+        drop(fence);
+        drop(owner);
+        assert!(
+            weak_owner.upgrade().is_some(),
+            "queued commit contexts must keep the actual lock guard alive"
+        );
+        drop(contexts);
+        assert!(weak_owner.upgrade().is_none(), "the last commit context must release its lock owner");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_cas_rejects_released_owner() {
+        let lock = NamespaceLock::with_local_manager("pool-meta-released-owner".to_string(), Arc::new(GlobalLockManager::new()));
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "released-cas-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1));
+        let mut owner = lock
+            .acquire_guard(&request)
+            .await
+            .expect("pool metadata lock acquisition should succeed")
+            .expect("pool metadata lock should be available");
+        assert!(owner.release(), "the test must release a real namespace owner");
+        let fence = PoolMetaPersistenceFence::Owned(Arc::new(owner));
+        assert!(
+            super::pool_meta_cas_options(POOL_META_NAME, &PoolMetaCasToken::Missing, &fence).is_err(),
+            "a released namespace owner must not dispatch another CAS"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lost_pool_meta_fence_rejects_replica_write() {
         let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
         let lock = NamespaceLock::with_clients_and_quorum("pool-meta-fence-loss".to_string(), vec![client], 1);
@@ -25776,6 +25935,7 @@ mod pools_tests {
             .await
             .expect("pool metadata fence acquisition should not error")
             .expect("the stale writer should acquire the pool metadata fence");
+        let guard = Arc::new(guard);
         tokio::time::timeout(StdDuration::from_secs(2), guard.lock_lost_notified())
             .await
             .expect("the stale writer lease should expire");
@@ -25797,7 +25957,12 @@ mod pools_tests {
         };
         let mut write_state = super::PoolMetaWriteState::default();
         let err = snapshot
-            .save_no_lock_armed(vec![storage.clone()], &mut write_state, guard.lock_lost_signal(), &[0])
+            .save_no_lock_armed(
+                vec![storage.clone()],
+                &mut write_state,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&guard)),
+                &[0],
+            )
             .await
             .expect_err("a writer must not persist after losing the distributed pool metadata fence");
 
@@ -25825,6 +25990,7 @@ mod pools_tests {
             .await
             .expect("pool metadata fence acquisition should not error")
             .expect("the publishing writer should acquire the pool metadata fence");
+        let guard = Arc::new(guard);
         let storage = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
             fail_after_first_write: false,
@@ -25845,7 +26011,7 @@ mod pools_tests {
         current.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
         let mut write_state = super::PoolMetaWriteState::for_test_bootstrap();
         let outcome = saved
-            .save_no_lock_armed(vec![storage], &mut write_state, guard.lock_lost_signal(), &[0])
+            .save_no_lock_armed(vec![storage], &mut write_state, PoolMetaPersistenceFence::Owned(Arc::clone(&guard)), &[0])
             .await
             .expect("the replica save should finish while the fence is valid");
 

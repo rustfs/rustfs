@@ -826,8 +826,11 @@ pub(crate) async fn read_existing_admin_server_config_no_lock(api: Arc<ECStore>)
 }
 
 #[cfg(test)]
-pub(crate) async fn read_admin_config_without_migrate_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
-    ecstore_config::com::read_config_without_migrate_no_lock(api).await
+pub(crate) async fn read_admin_config_without_migrate_no_lock(
+    api: Arc<ECStore>,
+    guard: &crate::storage::storage_api::ecstore_object::WriteCommitGuard,
+) -> Result<rustfs_config::server_config::Config> {
+    ecstore_config::com::read_config_without_migrate_no_lock(api, guard).await
 }
 
 pub(crate) type AdminServerConfigSnapshot = ecstore_config::com::ServerConfigSnapshot;
@@ -850,14 +853,15 @@ pub(crate) async fn save_admin_server_config(api: Arc<ECStore>, cfg: &rustfs_con
 pub(crate) async fn save_admin_server_config_no_lock(
     api: Arc<ECStore>,
     cfg: &rustfs_config::server_config::Config,
+    guard: &crate::storage::storage_api::ecstore_object::WriteCommitGuard,
 ) -> Result<()> {
-    ecstore_config::com::save_server_config_no_lock(api, cfg).await
+    ecstore_config::com::save_server_config_no_lock(api, cfg, guard).await
 }
 
 #[cfg(test)]
 pub(crate) async fn with_admin_server_config_write_lock<F, Fut, T>(api: Arc<ECStore>, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::storage::storage_api::ecstore_object::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
@@ -1033,6 +1037,7 @@ pub(crate) mod metrics {
 
 pub(crate) mod object {
     pub(crate) use crate::storage::storage_api::StorageObjectOptions;
+    pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
 }
 
 pub(crate) mod rebalance {

@@ -169,10 +169,11 @@ pub(crate) async fn load_site_replication_repair_state_from_store(store: Arc<ECS
 pub(crate) async fn save_site_replication_repair_state_to_store(
     store: Arc<ECStore>,
     state: &SiteReplicationRepairState,
+    guard: &crate::storage_api::site_replication::WriteCommitGuard,
 ) -> S3Result<()> {
     let data = serde_json::to_vec(state)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair state failed: {e}")))?;
-    save_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH, data)
+    save_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH, data, guard)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save repair state failed: {e}")))
 }
@@ -197,10 +198,10 @@ where
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
     let read_store = store.clone();
     let save_store = store.clone();
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH.to_string(), move || async move {
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH.to_string(), move |write_guard| async move {
         let mut state = load_site_replication_repair_state_from_store(read_store).await?;
         let result = update(&mut state)?;
-        save_site_replication_repair_state_to_store(save_store, &state).await?;
+        save_site_replication_repair_state_to_store(save_store, &state, &write_guard).await?;
         Ok(result)
     })
     .await
@@ -709,9 +710,11 @@ pub(crate) async fn execute_site_replication_repair(
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        execute_site_replication_repair_locked(request).await
-    })
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
+        move |_write_guard| async move { execute_site_replication_repair_locked(request).await },
+    )
     .await
     .map_err(|_| {
         S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
