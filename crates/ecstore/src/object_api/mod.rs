@@ -104,6 +104,7 @@ mod hook_slot;
 mod object_mutation_hook;
 mod readers;
 mod types;
+pub(crate) mod write_commit_context;
 
 #[cfg(test)]
 mod persisted_metadata_keys_tests;
@@ -125,3 +126,4 @@ pub(crate) use object_mutation_hook::notify_object_mutation;
 pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook, unregister_object_mutation_hook};
 pub use readers::*;
 pub use types::*;
+pub use write_commit_context::{WriteCommitGuard, WriteLockContext};

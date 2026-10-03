@@ -577,9 +577,9 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
         ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
-        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, WriteCompletion, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, WriteCommitGuard, WriteCompletion,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 
@@ -1296,8 +1296,13 @@ pub(crate) fn replication_queue_current_count() -> Option<i64> {
     get_global_replication_stats().and_then(|stats| stats.queue_current_count())
 }
 
-pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
-    ecstore_config::com::save_config_no_lock(api, file, data).await
+pub(crate) async fn save_config_no_lock(
+    api: Arc<ECStore>,
+    file: &str,
+    data: Vec<u8>,
+    guard: &ecstore_object::WriteCommitGuard,
+) -> Result<()> {
+    ecstore_config::com::save_config_no_lock(api, file, data, guard).await
 }
 
 pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<()> {
@@ -1306,7 +1311,7 @@ pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Resu
 
 pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(ecstore_object::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {

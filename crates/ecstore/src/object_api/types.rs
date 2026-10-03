@@ -935,6 +935,9 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// A genuine target write guard; loss fences alone do not authorize a borrowed write.
+    #[doc(hidden)]
+    pub write_lock_context: Option<WriteLockContext>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace

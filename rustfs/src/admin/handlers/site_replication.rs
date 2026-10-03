@@ -7358,32 +7358,36 @@ where
 {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(), move || async move {
-        let fresh = load_site_replication_state().await?;
-        let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
-        if join_request_is_superseded(&fresh, join_req.updated_at) {
-            let peer = fresh
-                .peers
-                .get(&fresh_local_peer.deployment_id)
-                .cloned()
-                .unwrap_or(fresh_local_peer);
-            return Ok(PeerJoinOutcome::Superseded(peer));
-        }
-
-        apply_iam(join_req.clone()).await?;
-
-        let incoming_updated_at = join_req.updated_at;
-        update_site_replication_state_when_changed(move |state| {
-            let local_peer = local_peer_at_endpoint(local_endpoint, state);
-            if join_request_is_superseded(state, incoming_updated_at) {
-                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
-                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(),
+        move |_write_guard| async move {
+            let fresh = load_site_replication_state().await?;
+            let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+            if join_request_is_superseded(&fresh, join_req.updated_at) {
+                let peer = fresh
+                    .peers
+                    .get(&fresh_local_peer.deployment_id)
+                    .cloned()
+                    .unwrap_or(fresh_local_peer);
+                return Ok(PeerJoinOutcome::Superseded(peer));
             }
-            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
-            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
-        })
-        .await
-    })
+
+            apply_iam(join_req.clone()).await?;
+
+            let incoming_updated_at = join_req.updated_at;
+            update_site_replication_state_when_changed(move |state| {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                if join_request_is_superseded(state, incoming_updated_at) {
+                    let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+                    return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+                }
+                apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+                Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+            })
+            .await
+        },
+    )
     .await
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication join admission failed: {e}")))?
 }

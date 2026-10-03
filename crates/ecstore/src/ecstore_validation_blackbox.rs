@@ -259,7 +259,7 @@ async fn blackbox_put_unknown_actual_size_restores_body_and_records_written_size
         .map(|idx| ((idx * 17) % 251) as u8)
         .collect::<Vec<_>>();
     let opts = ObjectOptions {
-        no_lock: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         ..Default::default()
     };
 
@@ -300,7 +300,7 @@ async fn blackbox_get_restores_body_after_one_shard_file_is_removed() {
         .map(|idx| ((idx * 19) % 251) as u8)
         .collect::<Vec<_>>();
     let opts = ObjectOptions {
-        no_lock: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         ..Default::default()
     };
 
@@ -406,7 +406,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
                         put_object,
                         &mut put_reader,
                         &ObjectOptions {
-                            no_lock: true,
+                            write_completion: crate::object_api::WriteCompletion::TailDrained,
                             versioned: true,
                             expected_bucket_incarnation_id: Some(put_incarnation),
                             ..Default::default()
@@ -469,7 +469,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
             put_object,
             &mut healthy_reader,
             &ObjectOptions {
-                no_lock: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
@@ -509,7 +509,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
             .map(|idx| ((idx * 29) % 251) as u8)
             .collect::<Vec<_>>();
         let opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             ..Default::default()
         };
 
@@ -567,7 +567,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         let suspended_object = "suspended.bin";
         let payload = vec![0x5a; 1 << 20];
         let mpu_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             versioned: true,
             ..Default::default()
         };
@@ -675,7 +675,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
                 .expect("fourth disk should be online before suspended completion")
         };
         let suspended_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             version_suspended: true,
             ..Default::default()
         };
@@ -712,7 +712,7 @@ async fn blackbox_range_read_restores_exact_slice_with_one_offline_disk() {
     let range_start = 513usize;
     let range_len = 8192usize;
     let opts = ObjectOptions {
-        no_lock: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         ..Default::default()
     };
 
@@ -756,7 +756,7 @@ async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_
     let bucket = "bb-delete-marker-read-negative";
     let object = "object.bin";
     let opts = ObjectOptions {
-        no_lock: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         version_suspended: true,
         object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
         ..Default::default()
@@ -853,7 +853,7 @@ async fn blackbox_issue3031_diag_covers_put_success_cleanup_and_error_summary() 
         let first_payload = b"first diagnostic body".to_vec();
         let second_payload = b"second diagnostic body that replaces the first".to_vec();
         let opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             ..Default::default()
         };
 
@@ -959,7 +959,7 @@ mod old_current_size_backfill {
             .await
             .expect("bucket should be created");
         let opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             ..Default::default()
         };
 
@@ -993,7 +993,7 @@ mod old_current_size_backfill {
         // latest's size, not the incoming version's.
         let versioned = "versioned.bin";
         let first_version_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             versioned: true,
             version_id: Some(uuid::Uuid::new_v4().to_string()),
             ..Default::default()
@@ -1005,7 +1005,7 @@ mod old_current_size_backfill {
         let expected = prelookup_expectation(&set_disks, bucket, versioned).await;
         assert_eq!(expected, OldCurrentSize::Present(111));
         let second_version_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             versioned: true,
             version_id: Some(uuid::Uuid::new_v4().to_string()),
             ..Default::default()
@@ -1037,7 +1037,7 @@ mod old_current_size_backfill {
         let expected = prelookup_expectation(&set_disks, bucket, versioned).await;
         assert_eq!(expected, OldCurrentSize::Present(0));
         let third_version_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             versioned: true,
             version_id: Some(uuid::Uuid::new_v4().to_string()),
             ..Default::default()
@@ -1061,7 +1061,7 @@ mod old_current_size_backfill {
             .await
             .expect("bucket should be created");
         let opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             ..Default::default()
         };
 

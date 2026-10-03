@@ -1700,23 +1700,27 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
     // timestamp, and the locked reload below decides what may actually send.
     promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
 
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        let Some(runtime) = runtime_site_replication_targets().await? else {
-            return Ok(());
-        };
-        if runtime.state.pending_endpoint_refresh.is_some()
-            || runtime.state.pending_remove.is_some()
-            || runtime.state.pending_rotation.is_some()
-        {
-            return Ok(());
-        }
-        let now = OffsetDateTime::now_utc();
-        let (actionable, _) = lightweight_retry_drain_partition(&runtime.state, now);
-        if actionable.is_empty() {
-            return Ok(());
-        }
-        drain_site_replication_retry_queue_lightweight_locked(Arc::new(runtime), actionable, now).await
-    })
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
+        move |_write_guard| async move {
+            let Some(runtime) = runtime_site_replication_targets().await? else {
+                return Ok(());
+            };
+            if runtime.state.pending_endpoint_refresh.is_some()
+                || runtime.state.pending_remove.is_some()
+                || runtime.state.pending_rotation.is_some()
+            {
+                return Ok(());
+            }
+            let now = OffsetDateTime::now_utc();
+            let (actionable, _) = lightweight_retry_drain_partition(&runtime.state, now);
+            if actionable.is_empty() {
+                return Ok(());
+            }
+            drain_site_replication_retry_queue_lightweight_locked(Arc::new(runtime), actionable, now).await
+        },
+    )
     .await
     .map_err(ApiError::from)?
 }
@@ -1762,26 +1766,30 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     // re-runs the dry-run. The lock elects one server to replay the queue;
     // after acquiring it, reload state so a settled event or deleted bucket
     // cannot be replayed from this admission snapshot.
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        // Runtime and queue snapshots captured before this distributed lock
-        // are only admission hints. Another node may have settled the event,
-        // or a local bucket may have been deleted, while this node waited.
-        let Some(runtime) = runtime_site_replication_targets().await? else {
-            return Ok(());
-        };
-        if runtime.state.pending_endpoint_refresh.is_some()
-            || runtime.state.pending_remove.is_some()
-            || runtime.state.pending_rotation.is_some()
-        {
-            return Ok(());
-        }
-        let horizon = heavyweight_retry_drain_horizon(OffsetDateTime::now_utc());
-        let actionable = actionable_site_replication_retry_events(&runtime.state, horizon);
-        if actionable.is_empty() {
-            return Ok(());
-        }
-        drain_site_replication_retry_queue_locked(runtime, actionable).await
-    })
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
+        move |_write_guard| async move {
+            // Runtime and queue snapshots captured before this distributed lock
+            // are only admission hints. Another node may have settled the event,
+            // or a local bucket may have been deleted, while this node waited.
+            let Some(runtime) = runtime_site_replication_targets().await? else {
+                return Ok(());
+            };
+            if runtime.state.pending_endpoint_refresh.is_some()
+                || runtime.state.pending_remove.is_some()
+                || runtime.state.pending_rotation.is_some()
+            {
+                return Ok(());
+            }
+            let horizon = heavyweight_retry_drain_horizon(OffsetDateTime::now_utc());
+            let actionable = actionable_site_replication_retry_events(&runtime.state, horizon);
+            if actionable.is_empty() {
+                return Ok(());
+            }
+            drain_site_replication_retry_queue_locked(runtime, actionable).await
+        },
+    )
     .await
     .map_err(ApiError::from)?
 }
