@@ -98,6 +98,14 @@ pub(crate) fn set_get_stage_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_get_stage_metrics_enabled(enabled);
 }
 
+pub(crate) fn set_get_stage_local_summary_enabled(enabled: bool) {
+    rustfs_io_metrics::set_get_stage_local_summary_enabled(enabled);
+}
+
+pub(crate) fn set_get_stage_local_summary_sample_rate(sample_rate: u64) {
+    rustfs_io_metrics::set_get_stage_local_summary_sample_rate(sample_rate);
+}
+
 pub(crate) fn set_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_metrics_enabled(enabled);
 }

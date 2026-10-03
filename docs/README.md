@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
+see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
 

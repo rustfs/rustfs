@@ -15,7 +15,9 @@ pub(crate) mod metadata_lock {
     pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
         init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks,
     };
-    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{PutObjectCommitBarrier, PutObjectCommitPause};
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        PutObjectCommitBarrier, PutObjectCommitPause, enable_safe_no_quota_cache_fast_path_for_test,
+    };
 }
 
 pub(crate) mod contract_compat {
@@ -59,4 +61,15 @@ pub(crate) mod minio_generated_read {
     pub(crate) use super::{
         DiskAPI, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
     };
+}
+
+pub(crate) mod cleanup_isolation {
+    pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{DeleteOptions, DiskError};
+}
+
+#[cfg(all(feature = "test-util", target_os = "linux"))]
+pub(crate) mod fd_relative {
+    pub(crate) use super::{DiskAPI, DiskOption, DiskStore, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions};
 }

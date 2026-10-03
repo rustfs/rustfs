@@ -200,8 +200,8 @@ md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
 # "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
-# (backlog#1178); "fs" comes from the workspace default.
-rustix = { workspace = true, features = ["process", "fs"] }
+# (backlog#1178); "thread" provides cleanup affinity; "fs" is a workspace default.
+rustix = { workspace = true, features = ["process", "fs", "thread"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }

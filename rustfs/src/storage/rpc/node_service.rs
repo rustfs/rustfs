@@ -132,6 +132,87 @@ fn verify_node_mutation_body<T: CanonicalMutationBody>(request: &Request<T>, ope
         .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
 }
 
+fn object_metadata_cache_mutation_response(
+    request: &ObjectMetadataCacheMutationRequest,
+    success: bool,
+    error_info: Option<String>,
+    cache_enabled: bool,
+) -> Result<Response<ObjectMetadataCacheMutationResponse>, Status> {
+    if error_info
+        .as_ref()
+        .is_some_and(|error| error.len() > rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_ERROR_INFO_SIZE)
+    {
+        return Err(Status::internal("object metadata cache mutation response error exceeds size limit"));
+    }
+    let mut response = ObjectMetadataCacheMutationResponse {
+        success,
+        error_info,
+        response_proof: Bytes::new(),
+        cache_enabled,
+    };
+    let canonical_response = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_response_body(request, &response)
+        .map_err(|_| Status::internal("object metadata cache mutation response length cannot be represented"))?;
+    response.response_proof = sign_tonic_rpc_response_proof(&canonical_response)
+        .map_err(|_| Status::internal("object metadata cache mutation response proof is unavailable"))?
+        .into();
+    Ok(Response::new(response))
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+mod object_metadata_cache_mutation_response_fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static BEGIN_DROPPED: AtomicBool = AtomicBool::new(false);
+    static COMMIT_DROPPED: AtomicBool = AtomicBool::new(false);
+    static ABORT_DROPPED: AtomicBool = AtomicBool::new(false);
+    static BEGIN_DELAYED: AtomicBool = AtomicBool::new(false);
+    static COMMIT_DELAYED: AtomicBool = AtomicBool::new(false);
+    static ABORT_DELAYED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn drop_response_once(phase: u32) -> bool {
+        let (variable, dropped) = match phase {
+            1 => ("RUSTFS_E2E_TEST_DROP_METADATA_CACHE_BEGIN_RESPONSE_ONCE", &BEGIN_DROPPED),
+            2 => ("RUSTFS_E2E_TEST_DROP_METADATA_CACHE_COMMIT_RESPONSE_ONCE", &COMMIT_DROPPED),
+            3 => ("RUSTFS_E2E_TEST_DROP_METADATA_CACHE_ABORT_RESPONSE_ONCE", &ABORT_DROPPED),
+            _ => return false,
+        };
+        if !std::env::var(variable).is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+            || dropped
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        if let Some(marker_path) = std::env::var_os("RUSTFS_E2E_TEST_METADATA_CACHE_MUTATION_RESPONSE_LOSS_MARKER")
+            && let Ok(mut marker) = std::fs::OpenOptions::new().create(true).append(true).open(marker_path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(marker, "phase={phase}");
+        }
+        true
+    }
+
+    pub(super) async fn delay_response_once(phase: u32) {
+        let (variable, delayed) = match phase {
+            1 => ("RUSTFS_E2E_TEST_DELAY_METADATA_CACHE_BEGIN_RESPONSE_MS", &BEGIN_DELAYED),
+            2 => ("RUSTFS_E2E_TEST_DELAY_METADATA_CACHE_COMMIT_RESPONSE_MS", &COMMIT_DELAYED),
+            3 => ("RUSTFS_E2E_TEST_DELAY_METADATA_CACHE_ABORT_RESPONSE_MS", &ABORT_DELAYED),
+            _ => return,
+        };
+        let Some(delay_ms) = std::env::var(variable).ok().and_then(|value| value.parse::<u64>().ok()) else {
+            return;
+        };
+        if delay_ms == 0
+            || delayed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
+
 fn require_incarnation_body_digest<T>(request: &Request<T>) -> Result<(), Status> {
     if request
         .metadata()
@@ -2013,6 +2094,117 @@ impl Node for NodeService {
         self.handle_load_bucket_metadata(request).await
     }
 
+    async fn mutate_object_metadata_cache(
+        &self,
+        request: Request<ObjectMetadataCacheMutationRequest>,
+    ) -> Result<Response<ObjectMetadataCacheMutationResponse>, Status> {
+        let body = request.get_ref();
+        if body.protocol_version != rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition("unsupported object metadata cache mutation protocol version"));
+        }
+        let phase = match body.phase {
+            1 => rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+            2 => rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit,
+            3 => rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
+            4 => rustfs_protos::ObjectMetadataCacheMutationRpcPhase::ConfigProbe,
+            _ => return Err(Status::invalid_argument("invalid object metadata cache mutation phase")),
+        };
+        let scope = match body.scope {
+            1 => rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+            2 => rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
+            _ => return Err(Status::invalid_argument("invalid object metadata cache mutation scope")),
+        };
+        let mutation_id = Uuid::from_slice(&body.mutation_id)
+            .ok()
+            .filter(|mutation_id| !mutation_id.is_nil())
+            .ok_or_else(|| Status::invalid_argument("object metadata cache mutation id must be a non-nil UUID"))?;
+        if body.bucket.is_empty() || body.bucket.len() > rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_BUCKET_BYTES {
+            return Err(Status::invalid_argument("object metadata cache mutation bucket is invalid"));
+        }
+        if (scope == rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object && body.object.is_empty())
+            || body.object.len() > rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_MAX_OBJECT_BYTES
+        {
+            return Err(Status::invalid_argument("object metadata cache mutation object is invalid"));
+        }
+        let canonical_body = rustfs_protos::canonical_object_metadata_cache_mutation_rpc_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("object metadata cache mutation request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical_body)
+            .map_err(|err| Status::permission_denied(format!("object metadata cache mutation authentication failed: {err}")))?;
+
+        let local_cache_enabled = crate::storage::storage_api::object_metadata_cache_distributed_enabled();
+        if phase == rustfs_protos::ObjectMetadataCacheMutationRpcPhase::ConfigProbe {
+            return object_metadata_cache_mutation_response(body, true, None, local_cache_enabled);
+        }
+        if body.cache_enabled != local_cache_enabled {
+            return object_metadata_cache_mutation_response(
+                body,
+                false,
+                Some("object metadata cache configuration differs across cluster peers".to_string()),
+                local_cache_enabled,
+            );
+        }
+
+        let Some(store) = self.resolve_object_store() else {
+            return object_metadata_cache_mutation_response(
+                body,
+                false,
+                Some("errServerNotInitialized".to_string()),
+                local_cache_enabled,
+            );
+        };
+
+        for set in store.all_set_disks() {
+            match (phase, scope) {
+                (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+                ) => {
+                    set.begin_get_object_metadata_cache_mutation_local(&body.bucket, &body.object, mutation_id)
+                        .await;
+                }
+                (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
+                ) => {
+                    set.begin_get_object_metadata_cache_all_mutation_local(mutation_id).await;
+                }
+                (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+                )
+                | (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
+                ) => {
+                    set.finish_get_object_metadata_cache_mutation_local(&body.bucket, &body.object, mutation_id);
+                }
+                (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
+                )
+                | (
+                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
+                    rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
+                ) => {
+                    set.finish_get_object_metadata_cache_all_mutation_local(mutation_id);
+                }
+                (rustfs_protos::ObjectMetadataCacheMutationRpcPhase::ConfigProbe, _) => {
+                    unreachable!("configuration probe returned above")
+                }
+            }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        if object_metadata_cache_mutation_response_fault::drop_response_once(phase.as_wire_value()) {
+            return Err(Status::unavailable("injected object metadata cache mutation response loss"));
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        object_metadata_cache_mutation_response_fault::delay_response_once(phase.as_wire_value()).await;
+
+        object_metadata_cache_mutation_response(body, true, None, local_cache_enabled)
+    }
+
     async fn delete_bucket_metadata(
         &self,
         request: Request<DeleteBucketMetadataRequest>,
@@ -3068,14 +3260,15 @@ mod tests {
         HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
-        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
-        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        MakeVolumesRequest, Mss, ObjectMetadataCacheMutationRequest, PingRequest, PreparePartTransactionRequest, ReadAllRequest,
+        ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest,
+        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
+        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
+        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -4835,6 +5028,60 @@ mod tests {
             .expect("small response should encode");
         crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &unavailable.response_proof)
             .expect("v4 pre-dispatch rejection must authenticate its failure class");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_metadata_cache_mutation_requires_body_bound_auth_before_store_lookup() {
+        let _ = rustfs_credentials::set_global_rpc_secret("metadata-cache-mutation-auth-test-secret".to_string());
+        let service = make_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let request = || {
+            Request::new(ObjectMetadataCacheMutationRequest {
+                protocol_version: rustfs_protos::OBJECT_METADATA_CACHE_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin.as_wire_value(),
+                mutation_id: mutation_id.as_bytes().to_vec().into(),
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object.as_wire_value(),
+                cache_enabled: crate::storage::storage_api::object_metadata_cache_distributed_enabled(),
+            })
+        };
+
+        let unsigned = service
+            .mutate_object_metadata_cache(request())
+            .await
+            .expect_err("unsigned request must fail before store lookup");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+
+        let mut tampered = request();
+        let body = tampered.get_ref().canonical_body().expect("mutation request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &body).expect("request digest should encode");
+        mark_v2_authenticated(&mut tampered);
+        tampered.get_mut().object.push_str("/tampered");
+        let tampered = service
+            .mutate_object_metadata_cache(tampered)
+            .await
+            .expect_err("tampered request must fail body authentication");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        let mut signed = request();
+        let body = signed.get_ref().canonical_body().expect("mutation request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("request digest should encode");
+        mark_v2_authenticated(&mut signed);
+        let signed_body = signed.get_ref().clone();
+        let unavailable = service
+            .mutate_object_metadata_cache(signed)
+            .await
+            .expect("authenticated request should return a protocol response")
+            .into_inner();
+        assert!(!unavailable.success);
+        assert_eq!(unavailable.error_info.as_deref(), Some("errServerNotInitialized"));
+        let canonical_response =
+            rustfs_protos::canonical_object_metadata_cache_mutation_rpc_response_body(&signed_body, &unavailable)
+                .expect("small response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &unavailable.response_proof)
+            .expect("pre-dispatch error response must carry an authenticated proof");
     }
 
     #[tokio::test]

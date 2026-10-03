@@ -559,6 +559,10 @@ impl SetDisks {
         let _object_guard = self.acquire_write_lock_diag("delete_marker_purge", bucket, object).await?;
         let scope = crate::store::bucket_heal_scope(bucket).ok_or(StorageError::PreconditionFailed)?;
         scope.check()?;
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let request = FileInfo {
             volume: bucket.to_owned(),
@@ -613,6 +617,9 @@ impl SetDisks {
         }
         scope.check()?;
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(guard) = metadata_cache_mutation_guard {
+            guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
+        }
         Ok(removed)
     }
 
@@ -2281,6 +2288,10 @@ impl SetDisks {
         version: Uuid,
         disks: &[Option<DiskStore>],
     ) -> disk::error::Result<()> {
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::retired_marker_deferred(format!("metadata-cache mutation fence failed: {err}")))?;
         let request = FileInfo {
             volume: bucket.to_owned(),
             name: object.to_owned(),
@@ -2331,6 +2342,12 @@ impl SetDisks {
             ));
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(guard) = metadata_cache_mutation_guard {
+            guard
+                .commit()
+                .await
+                .map_err(|err| DiskError::retired_marker_deferred(format!("metadata-cache mutation commit failed: {err}")))?;
+        }
         Ok(())
     }
 
@@ -2439,6 +2456,22 @@ impl SetDisks {
             }
         }
 
+        let recovery_needed = disks.iter().enumerate().any(|(index, disk)| {
+            disk.is_some()
+                && matches!(
+                    errs.get(index).and_then(Option::as_ref),
+                    Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                )
+                && verified_disks.get(index).copied().unwrap_or(false)
+        });
+        if !recovery_needed {
+            return Ok(false);
+        }
+        let metadata_cache_mutation_guard = self
+            .begin_get_object_metadata_cache_mutation(bucket, object)
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))?;
+
         let mut wrote = 0usize;
         for (index, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else {
@@ -2471,6 +2504,11 @@ impl SetDisks {
                     );
                 }
             }
+        }
+        if wrote > 0
+            && let Some(guard) = metadata_cache_mutation_guard
+        {
+            guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
         }
         Ok(wrote > 0)
     }

@@ -195,8 +195,10 @@ struct ListingMetadataRead {
     has_namespace_child_candidate: bool,
 }
 
-fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
-    let mut file = std::fs::File::open(path).map_err(ReadAllError::Open)?;
+fn read_all_data_std(
+    opened: std::io::Result<std::fs::File>,
+) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
+    let mut file = opened.map_err(ReadAllError::Open)?;
     let metadata = file.metadata().map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
 
     if metadata.is_dir() {
@@ -5109,7 +5111,7 @@ pub struct LocalDisk {
     /// pathname is later covered by another mount.
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
-    mount_lease: std::fs::File,
+    mount_lease: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     mount_lease_mount_id: Option<u64>,
     /// Public path for callers that need the configured disk layout. Internal
@@ -5325,24 +5327,6 @@ fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64>
 }
 
 impl LocalDisk {
-    #[cfg(target_os = "linux")]
-    fn open_mount_lease(root: &Path) -> Result<(std::fs::File, PathBuf, Option<u64>)> {
-        use rustix::fs::{Mode, OFlags, open};
-        use std::os::fd::AsRawFd as _;
-
-        let fd = open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)
-        .map_err(DiskError::from)?;
-        let lease = std::fs::File::from(fd);
-        let io_root = PathBuf::from(format!("/proc/self/fd/{}/.", lease.as_raw_fd()));
-        let mount_id = mount_id_for_fd(&lease);
-        Ok((lease, io_root, mount_id))
-    }
-
     #[cfg(not(target_os = "linux"))]
     fn open_mount_lease(root: &Path) -> Result<PathBuf> {
         Ok(root.to_path_buf())
@@ -5426,7 +5410,11 @@ impl LocalDisk {
         let root = publication_root.path().to_path_buf();
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root, mount_lease_mount_id) = Self::open_mount_lease(&root)?;
+        let (mount_lease, io_root, mount_lease_mount_id) = (
+            publication_root.directory().clone(),
+            publication_root.io_path().to_path_buf(),
+            mount_id_for_fd(publication_root.directory()),
+        );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
@@ -5474,9 +5462,11 @@ impl LocalDisk {
             state = "format_path_resolved",
             "Local disk format path resolved"
         );
-        let (format_data, format_meta) = read_file_exists(&io_format_path).await.inspect_err(|err| {
-            log_startup_disk_error("read_format_json", &io_format_path, err);
-        })?;
+        let (format_data, format_meta) = read_file_exists(&io_format_path, &publication_root)
+            .await
+            .inspect_err(|err| {
+                log_startup_disk_error("read_format_json", &io_format_path, err);
+            })?;
 
         let mut id = None;
         // let mut format_legacy = false;
@@ -5622,7 +5612,13 @@ impl LocalDisk {
 
         let io_root = disk.io_root.clone();
         let publication_root = disk.publication_root.clone();
-        tokio::spawn(Self::cleanup_deleted_objects_loop(io_root, publication_root, exit_rx));
+        tokio::spawn(Self::cleanup_deleted_objects_loop(
+            io_root,
+            publication_root,
+            #[cfg(target_os = "linux")]
+            disk.mount_lease.clone(),
+            exit_rx,
+        ));
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -5638,30 +5634,53 @@ impl LocalDisk {
     async fn cleanup_deleted_objects_loop(
         root: PathBuf,
         publication_root: os::PublicationRoot,
+        #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
         mut exit_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
+                    let root = root.clone();
+                    let publication_root = publication_root.clone();
+                    #[cfg(target_os = "linux")]
+                    let mount_lease = mount_lease.clone();
+                    if let Err(err) = super::cleanup_runtime::run_gc(move |budget| async move {
+                        // Queued/detached scans must keep /proc/self/fd paths
+                        // attached to the original mount after LocalDisk drops.
+                        #[cfg(target_os = "linux")]
+                        let _mount_lease = mount_lease;
+                        if let Err(err) = Self::cleanup_deleted_objects(root.clone(), &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "deleted_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root, &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "stale_tmp_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        Ok(())
+                    }).await {
                         error!(
                             event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "deleted_objects",
-                            state = "failed",
-                            error = ?err,
-                            "Disk local background cleanup failed"
-                        );
-                    }
-                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root).await {
-                        error!(
-                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "stale_tmp_objects",
+                            task = "cleanup_dispatch",
                             state = "failed",
                             error = ?err,
                             "Disk local background cleanup failed"
@@ -5752,93 +5771,121 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_stale_tmp_objects(root: PathBuf, publication_root: &os::PublicationRoot) -> Result<()> {
-        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY).await
+    async fn cleanup_stale_tmp_objects(
+        root: PathBuf,
+        publication_root: &os::PublicationRoot,
+        budget: &super::cleanup_runtime::GcBudget,
+    ) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY, budget).await
     }
 
     async fn cleanup_stale_tmp_objects_with_expiry(
         root: PathBuf,
         publication_root: &os::PublicationRoot,
         expiry: Duration,
+        budget: &super::cleanup_runtime::GcBudget,
     ) -> Result<()> {
         let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
-        let mut entries = match fs::read_dir(&tmp_path).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&tmp_path).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
-                continue;
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_stale_tmp_entry(entry, &root, publication_root, expiry).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
-
-            let file_type = entry.file_type().await?;
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let Some(age) = entry
-                .metadata()
-                .await?
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-            else {
-                continue;
-            };
-            if age <= expiry {
-                continue;
-            }
-
-            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
-            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET), publication_root).await?;
         }
 
         Ok(())
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    async fn cleanup_stale_tmp_entry(
+        entry: fs::DirEntry,
+        root: &Path,
+        publication_root: &os::PublicationRoot,
+        expiry: Duration,
+    ) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." || name == ".trash" || !entry.file_type().await?.is_dir() {
+            return Ok(());
+        }
+        let Some(age) = entry
+            .metadata()
+            .await?
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+        else {
+            return Ok(());
+        };
+        if age <= expiry {
+            return Ok(());
+        }
+        let target_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+        rename_all(entry.path(), target_path, Self::meta_path(root, RUSTFS_META_BUCKET), publication_root).await?;
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf, budget: &super::cleanup_runtime::GcBudget) -> Result<()> {
         let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
-        let mut entries = match fs::read_dir(&trash).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&trash).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." {
-                continue;
-            }
-
-            let file_type = entry.file_type().await?;
-
-            let path = trash.join(name);
-
-            if file_type.is_dir() {
-                if let Err(e) = tokio::fs::remove_dir_all(path).await
-                    && e.kind() != ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-            } else if let Err(e) = tokio::fs::remove_file(path).await
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(e.into());
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_trash_entry(entry, &trash).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
         }
 
         Ok(())
+    }
+
+    async fn cleanup_trash_entry(entry: fs::DirEntry, trash: &Path) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            return Ok(());
+        }
+        let path = trash.join(name);
+        let result = if entry.file_type().await?.is_dir() {
+            fs::remove_dir_all(path).await
+        } else {
+            fs::remove_file(path).await
+        };
+        match result {
+            Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
+            _ => Ok(()),
+        }
     }
 
     fn is_valid_volname(volname: &str) -> bool {
@@ -5965,6 +6012,19 @@ impl LocalDisk {
 
     fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         self.local_disk_object_path(self.io_root(), bucket, key)
+    }
+
+    /// Only for operations that open through PublicationRoot or a commit guard:
+    /// containment and symlink checks happen with the actual open, off the runtime.
+    fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
+            check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
+            Ok(path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.io_get_object_path(bucket, key)
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -6125,7 +6185,7 @@ impl LocalDisk {
 
         let mut meta = FileMeta::new();
         if !fi.fresh {
-            let (buf, _) = read_file_exists(&p).await?;
+            let (buf, _) = read_file_exists(&p, &self.publication_root).await?;
             if !buf.is_empty() {
                 let _ = meta.unmarshal_msg(&buf).map_err(|_| {
                     meta = FileMeta::new();
@@ -6149,6 +6209,36 @@ impl LocalDisk {
         .await?;
 
         Ok(())
+    }
+
+    /// Keep the common GET completion on its caller. Only a last-reader
+    /// release with pending reclamation needs an owned cleanup task. Leave
+    /// that token untouched so the slow path owns the complete transition.
+    pub(in crate::disk) async fn release_snapshot_lease_without_cleanup(
+        &self,
+        volume: &str,
+        path: &str,
+        token: SnapshotLeaseToken,
+    ) -> bool {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+        };
+        let mut registry = self.snapshot_leases.lock().await;
+        let Some(entry) = registry.entries.get_mut(&key) else {
+            return true;
+        };
+        if !entry.deleting
+            && entry.pending_delete.is_some()
+            && (entry.tokens.is_empty() || (entry.tokens.len() == 1 && entry.tokens.contains(&token)))
+        {
+            return false;
+        }
+        entry.tokens.remove(&token);
+        if entry.tokens.is_empty() && !entry.deleting {
+            registry.entries.remove(&key);
+        }
+        true
     }
 
     async fn delete_data_dir_with_namespace_owner(
@@ -6943,9 +7033,10 @@ impl LocalDisk {
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
         let path = file_path.as_ref().to_path_buf();
+        let root = self.publication_root.clone();
         let (data, modtime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
             // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
-            let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
+            let mut f = root.open_readonly(&path).map_err(to_file_error)?;
 
             let meta = f.metadata().map_err(to_file_error)?;
 
@@ -6998,6 +7089,7 @@ impl LocalDisk {
         let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
+        let root = self.publication_root.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
             let part_error = |error: String| ObjectPartInfo {
                 number: num,
@@ -7010,7 +7102,7 @@ impl LocalDisk {
             // Invalid metadata paths remain request errors, but missing data wins
             // first, as it does in the serial reader.
             let metadata_path = metadata_path?;
-            Ok(read_all_data_std(&metadata_path)
+            Ok(read_all_data_std(root.open_readonly(&metadata_path))
                 .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
         })
         .await;
@@ -7029,8 +7121,9 @@ impl LocalDisk {
         let object_dir = self.io_get_object_path(volume, object_name)?;
         let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
         let volume_dir = self.io_get_bucket_path(volume)?;
+        let root = self.publication_root.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (bytes, _) = read_all_data_std(&metadata_path)?;
+            let (bytes, _) = read_all_data_std(root.open_readonly(&metadata_path))?;
             let file_meta = FileMeta::load(&bytes).ok();
             let data_dirs: HashSet<String> = file_meta
                 .as_ref()
@@ -7120,7 +7213,8 @@ impl LocalDisk {
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
         let path = file_path.as_ref().to_path_buf();
-        let res = tokio::task::spawn_blocking(move || read_all_data_std(&path))
+        let root = self.publication_root.clone();
+        let res = tokio::task::spawn_blocking(move || read_all_data_std(root.open_readonly(&path)))
             .await
             .map_err(DiskError::from)?;
 
@@ -7852,16 +7946,16 @@ impl LocalDisk {
                     os::make_dir_all(parent, skip_parent).await?;
                 }
 
+                let root = self.publication_root.clone();
                 tokio::task::spawn_blocking(move || {
                     #[cfg(test)]
                     run_owned_file_write_before_open(&path);
 
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&path)
-                        .map_err(to_file_error)?;
+                    let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
+                        root.create_truncate_with_parent(&path).map_err(to_file_error)?
+                    } else {
+                        (root.create_truncate(&path).map_err(to_file_error)?, None)
+                    };
                     std::io::Write::write_all(&mut file, buf.as_ref()).map_err(to_file_error)?;
                     if sync != SyncMode::None {
                         file.sync_data().map_err(to_file_error)?;
@@ -7870,7 +7964,7 @@ impl LocalDisk {
                         if sync == SyncMode::FileAndDir
                             && let Some(parent) = path.parent()
                         {
-                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                            os::fsync_directory_handle_std(parent, parent_handle.as_ref()).map_err(to_file_error)?;
                         }
                     }
                     Ok::<_, std::io::Error>(())
@@ -7895,7 +7989,18 @@ impl LocalDisk {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
+        let f = if mode == O_CREATE | O_WRONLY | O_TRUNC {
+            let path = path.as_ref().to_path_buf();
+            let root = self.publication_root.clone();
+            File::from_std(
+                tokio::task::spawn_blocking(move || root.create_truncate(&path))
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?,
+            )
+        } else {
+            super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?
+        };
 
         Ok(f)
     }
@@ -8773,9 +8878,9 @@ fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
 }
 
 // Filter std::io::ErrorKind::NotFound
-async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metadata>)> {
+async fn read_file_exists(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Option<Metadata>)> {
     let p = path.as_ref();
-    let (data, meta) = match read_file_all(&p).await {
+    let (data, meta) = match read_file_all(&p, root).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
             if e == Error::FileNotFound {
@@ -8794,32 +8899,28 @@ async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metad
     Ok((data, meta))
 }
 
-async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
-    let p = path.as_ref();
-    let meta = read_file_metadata(&path).await?;
-
-    let data = fs::read(&p)
-        .await
-        .inspect_err(|err| {
-            log_startup_disk_io_error("read_file_all", p, err);
-        })
-        .map_err(to_file_error)?;
-
-    Ok((data.into(), meta))
-}
-
-async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
-    let path = p.as_ref();
-    let meta = fs::metadata(path)
-        .await
-        .inspect_err(|err| {
-            if err.kind() != ErrorKind::NotFound {
-                log_startup_disk_io_error("read_file_metadata", path, err);
-            }
-        })
-        .map_err(to_file_error)?;
-
-    Ok(meta)
+async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Metadata)> {
+    let path = path.as_ref().to_path_buf();
+    let root = root.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let mut file = root.open_readonly(&path)?;
+            let metadata = file.metadata()?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut data)?;
+            Ok::<_, std::io::Error>((Bytes::from(data), metadata))
+        })();
+        result
+            .inspect_err(|err| {
+                if err.kind() != ErrorKind::NotFound {
+                    log_startup_disk_io_error("read_file_all", &path, err);
+                }
+            })
+            .map_err(to_file_error)
+            .map_err(DiskError::from)
+    })
+    .await
+    .map_err(DiskError::from)?
 }
 
 fn skip_access_checks(p: impl AsRef<str>) -> bool {
@@ -8901,13 +9002,19 @@ fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_object_path_at(root: &Path, root_fd: &std::fs::File, bucket_path: &Path, path: &Path) -> Result<()> {
+    check_local_disk_object_path_components(root, bucket_path, path)?;
+    reject_local_disk_symlink_components_at(root, root_fd, &normalize_path_components(path))
+}
+
+#[cfg(target_os = "linux")]
+fn check_local_disk_object_path_components(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
     let bucket_path = normalize_path_components(bucket_path);
     let path = normalize_path_components(path);
     if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
-    reject_local_disk_symlink_components_at(root, root_fd, &path)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -9457,9 +9564,9 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let p = self.io_get_object_path(volume, path)?;
+        let p = self.io_get_object_open_path(volume, path)?;
 
-        let (data, _) = read_file_all(&p).await?;
+        let (data, _) = read_file_all(&p, &self.publication_root).await?;
 
         Ok(data)
     }
@@ -10752,7 +10859,16 @@ impl DiskAPI for LocalDisk {
             entry.deleting = true;
             opts
         };
-        let result = self.delete_unleased(volume, path, &opts).await;
+        // Release the reader token even under saturation. A rejected reclaim
+        // retains pending_delete (and its on-disk receipt) for a later retry.
+        // Do not wait for execution while a releasing reader may own locks.
+        let result = match super::cleanup_runtime::try_disk_execution() {
+            Ok(permit) => {
+                let _permit = permit;
+                self.delete_unleased(volume, path, &opts).await
+            }
+            Err(err) => Err(err.into()),
+        };
         let mut registry = self.snapshot_leases.lock().await;
         match result {
             Ok(()) => {
@@ -11053,7 +11169,7 @@ impl DiskAPI for LocalDisk {
             };
 
             // if req.metadata_only {}
-            match read_file_all(&fpath).await {
+            match read_file_all(&fpath, &self.publication_root).await {
                 Ok((data, meta)) => {
                     found += 1;
 
@@ -12598,10 +12714,15 @@ mod test {
         disk.wait_for_startup_cleanup().await;
         assert_eq!(disk.startup_cleanup_ready.load(Ordering::Acquire), 1);
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().join("missing-root"), &publication_root, Duration::ZERO)
-            .await
-            .expect("missing tmp path should be a cleanup no-op");
-        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"))
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().join("missing-root"),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("missing tmp path should be a cleanup no-op");
+        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("missing trash path should be a cleanup no-op");
 
@@ -12614,9 +12735,14 @@ mod test {
         fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
         backdate_mtime(&stale_dir, Duration::from_secs(10));
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("stale tmp directory should move to trash");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("stale tmp directory should move to trash");
         assert!(!stale_dir.exists(), "stale tmp directory should be moved away");
         assert!(live_file.exists(), "plain tmp files should be ignored by stale dir cleanup");
 
@@ -12626,7 +12752,7 @@ mod test {
         fs::create_dir_all(trash_root.join("trash-dir"))
             .await
             .expect("trash dir should be created");
-        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf())
+        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf(), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("trash cleanup should remove files and directories");
         assert!(
@@ -18391,9 +18517,14 @@ mod test {
         // Backdate after the write above: creating stale/data refreshes the
         // scanned tmp/stale directory's mtime.
         backdate_mtime(&tmp.join("stale"), Duration::from_secs(10));
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(!tmp.join("stale").exists());
         assert!(trash.exists());
@@ -18420,15 +18551,58 @@ mod test {
         fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
         fs::write(&regular_file, b"keep").await.expect("operation should succeed");
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::from_secs(60))
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::from_secs(60),
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(tmp.join("fresh").exists());
         assert!(regular_file.exists());
 
         let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
         assert!(entries.next_entry().await.expect("operation should succeed").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn background_cleanup_keeps_mount_lease_after_disk_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let root = disk.io_root.clone();
+        let trash_entry = LocalDisk::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join("detached-gc");
+        fs::create_dir_all(&trash_entry).await.unwrap();
+        fs::write(trash_entry.join("part.1"), b"garbage").await.unwrap();
+        let live_file = root.join("keep");
+        fs::write(&live_file, b"live").await.unwrap();
+        let (exit, exited) = tokio::sync::broadcast::channel(1);
+        tokio::time::pause();
+        let cleanup = tokio::spawn(LocalDisk::cleanup_deleted_objects_loop(
+            root.clone(),
+            disk.publication_root.clone(),
+            disk.mount_lease.clone(),
+            exited,
+        ));
+        tokio::task::yield_now().await;
+        drop(disk);
+        tokio::task::yield_now().await;
+        assert!(live_file.exists(), "the GC owner must retain the original /proc/self/fd root");
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(20), async {
+            while trash_entry.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached cleanup must finish against the pinned mount");
+        assert_eq!(fs::read(&live_file).await.unwrap(), b"live");
+        exit.send(()).unwrap();
+        timeout(Duration::from_secs(20), cleanup).await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -21524,10 +21698,12 @@ mod test {
 
     #[tokio::test]
     async fn test_read_file_exists() {
-        let test_file = "./test_read_exists.txt";
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = os::PublicationRoot::new(directory.path()).expect("publication root");
+        let test_file = &directory.path().join("read_exists");
 
         // Test non-existent file
-        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_exists(test_file, &root).await.expect("operation should succeed");
         assert!(data.is_empty());
         assert!(metadata.is_none());
 
@@ -21535,7 +21711,7 @@ mod test {
         fs::write(test_file, b"test content").await.expect("operation should succeed");
 
         // Test existing file
-        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_exists(test_file, &root).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), b"test content");
         assert!(metadata.is_some());
 
@@ -21545,33 +21721,19 @@ mod test {
 
     #[tokio::test]
     async fn test_read_file_all() {
-        let test_file = "./test_read_all.txt";
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = os::PublicationRoot::new(directory.path()).expect("publication root");
+        let test_file = &directory.path().join("read_all");
         let test_content = b"test content for read_all";
 
         // Create test file
         fs::write(test_file, test_content).await.expect("operation should succeed");
 
         // Test reading file
-        let (data, metadata) = read_file_all(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_all(test_file, &root).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), test_content);
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), test_content.len() as u64);
-
-        // Clean up
-        let _ = fs::remove_file(test_file).await;
-    }
-
-    #[tokio::test]
-    async fn test_read_file_metadata() {
-        let test_file = "./test_metadata.txt";
-
-        // Create test file
-        fs::write(test_file, b"test").await.expect("operation should succeed");
-
-        // Test reading metadata
-        let metadata = read_file_metadata(test_file).await.expect("operation should succeed");
-        assert!(metadata.is_file());
-        assert_eq!(metadata.len(), 4); // "test" is 4 bytes
 
         // Clean up
         let _ = fs::remove_file(test_file).await;
@@ -22165,9 +22327,14 @@ mod test {
             Bytes::from_static(b"later")
         );
 
-        disk.release_snapshot_lease(volume, &data_dir, renewed)
-            .await
-            .expect("renewed lease release should succeed");
+        assert!(
+            disk.release_snapshot_lease_without_cleanup(volume, &data_dir, renewed).await,
+            "a non-final reader release must not dispatch cleanup"
+        );
+        assert!(
+            !disk.release_snapshot_lease_without_cleanup(volume, &data_dir, second).await,
+            "the final reader must retain its token for owned deferred reclamation"
+        );
         assert!(
             disk.read_all(volume, &first_part).await.is_ok(),
             "one remaining lease must keep the data directory"

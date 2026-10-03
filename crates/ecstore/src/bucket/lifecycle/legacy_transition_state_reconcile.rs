@@ -974,6 +974,17 @@ impl ECStore {
                         .find(|item| item.pool_index == set.pool_index && item.set_index == set.set_index)
                         .and_then(|item| item.copies.iter().find(|copy| copy.disk_index == original.disk_index))
                         .is_some_and(|copy| representation_matches_target(copy, &request.target));
+                    let metadata_cache_mutation_guard = if !verify_only && !already_target {
+                        set.begin_get_object_metadata_cache_mutation(&request.selector.bucket, &object)
+                            .await
+                            .map_err(|err| {
+                                LegacyTransitionStateReconcileError::BackendUnavailable(format!(
+                                    "object metadata cache mutation fence failed: {err}"
+                                ))
+                            })?
+                    } else {
+                        None
+                    };
                     // Empty metadata makes a server which ignores the new
                     // conditional option reject the legacy update operation.
                     let result = disk
@@ -987,6 +998,15 @@ impl ECStore {
                             &opts,
                         )
                         .await;
+                    if result.is_ok()
+                        && let Some(guard) = metadata_cache_mutation_guard
+                    {
+                        guard.commit().await.map_err(|err| {
+                            LegacyTransitionStateReconcileError::BackendUnavailable(format!(
+                                "object metadata cache mutation commit failed: {err}"
+                            ))
+                        })?;
+                    }
                     set.invalidate_get_object_metadata_cache(&request.selector.bucket, &object)
                         .await;
                     match result {
