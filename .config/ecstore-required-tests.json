@@ -55,6 +55,211 @@
       "invariant": "odm-source-contract-gcs",
       "suite": "rustfs",
       "name": "on_demand_migration::gcs::tests::gcs_native_backend_satisfies_the_shared_backend_contract"
+    },
+    {
+      "invariant": "rollback-inspection",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging"
+    },
+    {
+      "invariant": "rollback-cancellation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_rollback_incomplete_cancelled_task_is_not_success"
+    },
+    {
+      "invariant": "rollback-completion-equivalence",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_rollback_incomplete_matches_early_ack_and_full_wait_after_reopen"
+    },
+    {
+      "invariant": "rollback-physical-owner",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_rollback_children_keep_namespace_ownership_after_coordinator_panic"
+    },
+    {
+      "invariant": "late-ack-retains-commit",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_data_early_ack_post_mutation_tail_error_never_rolls_back_commit"
+    },
+    {
+      "invariant": "tail-drained-cas",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::tail_drained_put_waits_for_tail_and_allows_immediate_cas"
+    },
+    {
+      "invariant": "borrowed-lock-tail",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::no_lock_put_waits_for_rename_tail_under_outer_guard"
+    },
+    {
+      "invariant": "cancelled-writer-owner",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::tail_drained_put_owned_commit_survives_waiter_cancellation"
+    },
+    {
+      "invariant": "get-body-reconstruction",
+      "suite": "rustfs-ecstore",
+      "name": "ecstore_validation_blackbox::blackbox_get_restores_body_after_one_shard_file_is_removed"
+    },
+    {
+      "invariant": "range-reconstruction",
+      "suite": "rustfs-ecstore",
+      "name": "ecstore_validation_blackbox::blackbox_range_read_restores_exact_slice_with_one_offline_disk"
+    },
+    {
+      "invariant": "multipart-abort-linearization",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::multipart::tests::abort_and_complete_linearize_for_plain_sse_and_legacy_layouts"
+    },
+    {
+      "invariant": "multipart-write-quorum",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::multipart::tests::abort_enforces_delete_write_quorum_boundary"
+    },
+    {
+      "invariant": "multipart-physical-owner",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::multipart::tests::complete_multipart_timeout_keeps_namespace_owner_until_physical_publication"
+    },
+    {
+      "invariant": "restore-abort-cleanup",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::transition_commit_failure_tests::multipart_restore_aborts_every_post_create_failure"
+    },
+    {
+      "invariant": "legacy-metadata",
+      "suite": "rustfs-filemeta",
+      "name": "filemeta::test::test_issue_2288_legacy_xlmeta_compatibility"
+    },
+    {
+      "invariant": "legacy-nil-version",
+      "suite": "rustfs-filemeta",
+      "name": "filemeta::test::test_into_fileinfo_reads_legacy_nil_uuid_inline_key"
+    },
+    {
+      "invariant": "commit-phase-schedule",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::commit_fault_schedule_keeps_multiple_disk_phases_independent"
+    },
+    {
+      "invariant": "commit-phase-ownership",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::commit_fault_schedule_rejects_duplicate_checkpoint_without_disarming_owner"
+    },
+    {
+      "invariant": "metadata-observation-all-four-slot-states-and-arrival-orders-preserve-reduction",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction"
+    },
+    {
+      "invariant": "metadata-observation-pending-newer-version-and-same-time-different-directory-force-full-wait",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_pending_newer_version_and_same_time_different_directory_force_full_wait"
+    },
+    {
+      "invariant": "metadata-observation-duplicate-shard-cannot-supply-a-read-reserve",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_duplicate_shard_cannot_supply_a_read_reserve"
+    },
+    {
+      "invariant": "metadata-observation-null-versions-markers-and-invalid-success-keep-their-meaning",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_null_versions_markers_and_invalid_success_keep_their_meaning"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-static-namespace",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_static_namespace"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-cross-subdirectory-limit",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_cross_subdirectory_limit"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-max-and-max-plus-one",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_max_and_max_plus_one"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-fixed-seed-marker-and-prefix",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_fixed_seed_marker_and_prefix"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-offline-corrupt-and-minority-stale",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_offline_corrupt_and_minority_stale"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-versions-delete-markers-and-free-versions",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_versions_delete_markers_and_free_versions"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-orphan-cleanup-requires-authoritative-evidence",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_orphan_cleanup_requires_authoritative_evidence"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-consumer-drop-joins-real-disk-producer",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_consumer_drop_joins_real_disk_producer"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-cancelled-quorum-walk-releases-senders-and-disk-lock",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_cancelled_quorum_walk_releases_senders_and_disk_lock"
+    },
+    {
+      "invariant": "list-objects-shared-corpus-enabled-index-contracts",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_enabled_index_contracts"
+    },
+    {
+      "invariant": "borrowed-context-boundary",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::borrowed_write_context_rejects_wrong_namespace_and_cache_flag"
+    },
+    {
+      "invariant": "borrowed-put-cancellation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::borrowed_tail_drained_put_keeps_owner_after_caller_cancel"
+    },
+    {
+      "invariant": "borrowed-mpu-cancellation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::multipart::tests::borrowed_complete_keeps_namespace_owner_after_caller_cancel"
+    },
+    {
+      "invariant": "pool-cas-owner",
+      "suite": "rustfs-ecstore",
+      "name": "core::pools::pools_tests::pool_meta_cas_context_retains_actual_owner_for_exact_target"
+    },
+    {
+      "invariant": "pool-cas-released-owner",
+      "suite": "rustfs-ecstore",
+      "name": "core::pools::pools_tests::pool_meta_cas_rejects_released_owner"
+    },
+    {
+      "invariant": "copy-tail-drained",
+      "suite": "rustfs-ecstore",
+      "name": "store::object::tests::borrowed_copy_tail_drained_waits_for_rename_tail"
+    },
+    {
+      "invariant": "catalog-borrowed-publication",
+      "suite": "rustfs",
+      "name": "admin::handlers::table_catalog::tests::commit_backend_borrowed_put_preserves_owner_authorization_and_precondition"
+    },
+    {
+      "invariant": "directory-marker-quorum",
+      "suite": "rustfs-filemeta",
+      "name": "metacache::tests::resolve_directory_marker_and_prefix_preserve_quorum_in_both_orders"
+    },
+    {
+      "invariant": "logical-prefix-limit",
+      "suite": "rustfs-ecstore",
+      "name": "store::list_objects::test::list_path_gather_results_counts_common_prefixes_before_page_limit"
     }
   ],
   "fixtures": [
@@ -82,6 +287,21 @@
       "path": "crates/ecstore/tests/fixtures/minio/bucket_metadata_full.xlmeta.hex",
       "sha256": "3b6de589519c08a1614c8bd409bb8199c17d42043861b07bce513075e6fbfc12",
       "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    },
+    {
+      "path": "crates/filemeta/tests/fixtures/issue_2288_legacy_xlmeta.hex",
+      "sha256": "b3e8d32f9950a38b5dc71f679519cc830a2b2a807e8b0b39f78840b238d8eacf",
+      "source": "Legacy xl.meta captured for rustfs/backlog#2288; filemeta::test::test_issue_2288_legacy_xlmeta_compatibility"
+    },
+    {
+      "path": "crates/filemeta/tests/fixtures/issue_2265_legacy_meta_v2_object.hex",
+      "sha256": "89dd7ec92d16e54b5d31e0c49c9edffff8a7aa58890aaeff59bc2ff84da0a62f",
+      "source": "Legacy metadata v2 object captured for rustfs/backlog#2265; crates/filemeta/src/test_data.rs"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/list_namespace_keys.json",
+      "sha256": "5afddb60565deba0938e617470255563f0e15a15fab699645c59bb7ccc84898e",
+      "source": "Shared static LIST namespace corpus; ECStore differential tests and ODM list_through_static_namespace_boundary_matrix"
     }
   ]
 }
