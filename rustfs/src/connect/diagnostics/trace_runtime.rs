@@ -3079,6 +3079,63 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn local_runtime_profile_listener_checks_real_peer_credentials() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        for same_owner in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (request, _) = runtime_request(state.path());
+            let owner = super::private_state_owner(state.path()).unwrap();
+            let socket = state.path().join(super::SOCKET_FILE);
+            let listener = super::bind_listener(&socket, owner).unwrap();
+            let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            assert_eq!(client.peer_cred().unwrap().uid(), owner);
+            let mut bytes = serde_json::to_vec(&super::CaptureRequest::RuntimeProfile {
+                protocol_version: super::PROTOCOL_VERSION,
+                request,
+            })
+            .unwrap();
+            bytes.push(b'\n');
+            // Queue the same valid request before either listener checks its real peer UID.
+            client.write_all(&bytes).await.unwrap();
+            let shutdown = CancellationToken::new();
+            let expected_owner = if same_owner { owner } else { owner ^ 1 };
+            let server = tokio::spawn(super::run_listener(
+                listener,
+                expected_owner,
+                state.path().to_path_buf(),
+                shutdown.clone(),
+            ));
+            let mut response = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(30), client.read_to_end(&mut response))
+                .await
+                .expect("listener must close the connection");
+            shutdown.cancel();
+            server.await.unwrap();
+            if same_owner {
+                read.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<super::CaptureResponse>(&response).unwrap(),
+                    super::CaptureResponse::RuntimeOk { .. }
+                ));
+            } else {
+                // Unix platforms either report EOF or reset when unread request bytes are discarded.
+                if let Err(error) = read {
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                assert!(
+                    response.is_empty(),
+                    "a foreign peer must receive no signed archive or diagnostic response"
+                );
+            }
+            let lease = super::super::profile_cpu::CollectorLease::acquire().expect("listener leaves no collector lease");
+            drop(lease);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn local_runtime_profile_rejects_invalid_consent_identity_and_protocol() {
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
