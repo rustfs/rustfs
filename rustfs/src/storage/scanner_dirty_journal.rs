@@ -185,10 +185,9 @@ impl JournalState {
                 .buckets
                 .get(&entry.bucket)
                 .is_some_and(|state| state.generation <= entry.generation)
+                && let Some(removed) = self.buckets.remove(&entry.bucket)
             {
-                if let Some(removed) = self.buckets.remove(&entry.bucket) {
-                    self.scope_bytes = self.scope_bytes.saturating_sub(journal_scope_bytes(&removed.scope));
-                }
+                self.scope_bytes = self.scope_bytes.saturating_sub(journal_scope_bytes(&removed.scope));
             }
         }
     }
