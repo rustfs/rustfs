@@ -354,6 +354,15 @@ fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool>
     state
 }
 
+fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
+    !options.versioned
+        && (options.include_directories
+            || options
+                .separator
+                .as_deref()
+                .is_some_and(|separator| !separator.is_empty() && separator != SLASH_SEPARATOR))
+}
+
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
     if options.recursive || options.incl_deleted || options.versioned {
         return false;
@@ -2440,6 +2449,12 @@ where
             let suffix = key.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    if collect_stats {
+                        stats.skipped_keys += 1;
+                    }
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     if collect_stats {
                         stats.common_prefixes += 1;
@@ -2542,6 +2557,10 @@ fn list_objects_from_metadata_snapshot_candidates(
             let suffix = object.name.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    stats.skipped_keys += 1;
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     stats.common_prefixes += 1;
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
@@ -4962,6 +4981,8 @@ async fn gather_results(
     let gather_started = list_metrics_enabled.then(std::time::Instant::now);
     let mut scanned_entries = 0usize;
     let mut candidate_entries = 0usize;
+    let mut previous_prefix = String::new();
+    let folds_prefixes = list_path_folds_common_prefixes(&opts);
 
     while let Some(mut entry) = recv.recv().await {
         scanned_entries += 1;
@@ -4999,6 +5020,34 @@ async fn gather_results(
 
         if !opts.incl_deleted && is_latest_delete_marker {
             continue;
+        }
+
+        // Version LIST projections omit cleanup-only free versions. They must
+        // not consume the lookahead budget before a later visible version.
+        // Cleanup walks consume the raw set stream without this collector.
+        if opts.versioned
+            && is_object
+            && entry
+                .xl_meta()
+                .is_ok_and(|meta| !meta.versions.is_empty() && meta.versions.iter().all(|version| version.header.free_version()))
+        {
+            continue;
+        }
+
+        if folds_prefixes
+            && let Some(separator) = opts.separator.as_deref().filter(|separator| !separator.is_empty())
+            && let Some(offset) = entry.name[opts.prefix.len()..].find(separator)
+        {
+            let common_prefix = &entry.name[..opts.prefix.len() + offset + separator.len()];
+            if common_prefix == previous_prefix
+                || opts.marker.as_deref().is_some_and(|marker| {
+                    (!opts.include_marker && common_prefix <= marker) || (opts.include_marker && common_prefix < marker)
+                })
+            {
+                continue;
+            }
+            previous_prefix.clear();
+            previous_prefix.push_str(common_prefix);
         }
 
         // TODO(backlog): integrate lifecycle evaluation during object listing
@@ -7023,7 +7072,9 @@ impl SetDisks {
         );
 
         let limit = {
-            if opts.limit > 0 && opts.stop_disk_at_limit {
+            // A raw scan budget can be consumed entirely by keys folding into
+            // one common prefix. Let the logical collector stop these walks.
+            if opts.limit > 0 && opts.stop_disk_at_limit && !list_path_folds_common_prefixes(&opts) {
                 opts.limit + 4 + (opts.limit / 16)
             } else {
                 0
@@ -7247,6 +7298,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 }
 
 // list_path_raw
+
+#[cfg(test)]
+mod differential_tests;
 
 #[cfg(test)]
 mod test {
@@ -7924,6 +7978,117 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::LimitReached);
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_counts_common_prefixes_before_page_limit() {
+        for separator in ["/", "-"] {
+            for extra_object in [false, true] {
+                let prefix_name = format!("a{separator}");
+                let first = if separator == "/" {
+                    prefix_name.clone()
+                } else {
+                    format!("{prefix_name}first")
+                };
+                let mut input = vec![test_object_meta_entry(&first)];
+                if separator == "/" {
+                    input.push(test_dir_meta_entry(&prefix_name));
+                } else {
+                    input.push(test_object_meta_entry(&format!("{prefix_name}second")));
+                }
+                input.push(test_object_meta_entry("b"));
+                if extra_object {
+                    input.push(test_object_meta_entry("c"));
+                }
+                let (entry_tx, entry_rx) = mpsc::channel(input.len());
+                let (result_tx, mut result_rx) = mpsc::channel(1);
+                for entry in input {
+                    entry_tx.send(entry).await.expect("delimiter candidates should queue");
+                }
+                drop(entry_tx);
+                let state = gather_results(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: "bucket".to_owned(),
+                        separator: Some(separator.to_owned()),
+                        recursive: separator != "/",
+                        include_directories: separator == "/",
+                        limit: 3,
+                        ..Default::default()
+                    },
+                    entry_rx,
+                    result_tx,
+                )
+                .await
+                .expect("delimiter collection should succeed");
+                let result = result_rx.recv().await.expect("delimiter page should arrive");
+                let mut expected = vec![first, "b".to_owned()];
+                if extra_object {
+                    expected.push("c".to_owned());
+                }
+                assert_eq!(
+                    result
+                        .entries
+                        .expect("delimiter entries should exist")
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "delimiter={separator}, extra={extra_object}"
+                );
+                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
+                assert_eq!(
+                    state,
+                    if extra_object {
+                        GatherResultsState::LimitReached
+                    } else {
+                        GatherResultsState::InputClosed
+                    }
+                );
+            }
+        }
+        for include_marker in [false, true] {
+            let (entry_tx, entry_rx) = mpsc::channel(2);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            for name in ["a/child", "b"] {
+                entry_tx
+                    .send(test_object_meta_entry(name))
+                    .await
+                    .expect("marker candidates should queue");
+            }
+            drop(entry_tx);
+            gather_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    separator: Some("/".to_owned()),
+                    recursive: true,
+                    include_directories: true,
+                    marker: Some("a/".to_owned()),
+                    include_marker,
+                    limit: 3,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            )
+            .await
+            .expect("logical marker collection should succeed");
+            let entries = result_rx
+                .recv()
+                .await
+                .expect("logical marker page should arrive")
+                .entries
+                .expect("logical marker entries should exist");
+            let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
+            let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
+            assert_eq!(
+                names,
+                if include_marker { vec!["a/", "b"] } else { vec!["b"] },
+                "a folded prefix equal to the marker must follow include_marker={include_marker}"
+            );
+        }
     }
 
     #[test]
@@ -8977,6 +9142,29 @@ mod test {
         assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
         assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
         assert!(!result.info.is_truncated);
+
+        let resumed = list_objects_from_metadata_snapshot_candidates(
+            "bucket",
+            "photos/2026/",
+            Some("photos/2026/nested/"),
+            &Some("/".to_string()),
+            1,
+            &objects,
+        );
+        assert!(
+            resumed.info.prefixes.is_empty(),
+            "metadata-fast cursors must not replay an emitted prefix"
+        );
+        assert_eq!(
+            resumed
+                .info
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["photos/2026/z.jpg"]
+        );
+        assert!(!resumed.info.is_truncated);
     }
 
     #[test]
@@ -10089,6 +10277,23 @@ mod test {
         assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
         assert!(result.is_truncated);
         assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
+
+        let resumed = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            result.next_marker.as_deref(),
+            &Some("/".to_string()),
+            1,
+            &candidates,
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
+        )
+        .await
+        .expect("verified prefix continuation should succeed");
+        assert!(resumed.prefixes.is_empty(), "verified cursors must not replay an emitted prefix");
+        assert_eq!(
+            resumed.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            ["photos/2026/d.jpg"]
+        );
+        assert!(!resumed.is_truncated);
     }
 
     #[tokio::test]
