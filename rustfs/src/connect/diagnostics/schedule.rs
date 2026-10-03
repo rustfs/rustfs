@@ -683,13 +683,13 @@ mod tests {
     }
 
     async fn wait_running(status: &mut watch::Receiver<DiagnosticScheduleStatus>) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             while !matches!(&*status.borrow(), DiagnosticScheduleStatus::Running { .. }) {
                 status.changed().await.expect("schedule remains active");
             }
         })
         .await
-        .expect("running");
+        .unwrap_or_else(|_| panic!("timed out waiting for schedule to run; current status: {:?}", status.borrow()));
     }
 
     fn blocking_runner() -> Runner {

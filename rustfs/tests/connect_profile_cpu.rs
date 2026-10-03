@@ -80,9 +80,20 @@ async fn cpu_without_local_sampler_is_explicitly_unsupported() {
 #[cfg(feature = "pyroscope")]
 #[tokio::test]
 async fn cpu_with_local_sampler_returns_bounded_redacted_samples() {
-    let result = capture_cpu_profile(&request(), &CancellationToken::new())
-        .await
-        .expect("local CPU capture should complete");
+    // A CPU-time sampler needs CPU work during its capture window.
+    let workload_cancel = CancellationToken::new();
+    let _workload_cancel_on_drop = workload_cancel.clone().drop_guard();
+    let worker_cancel = workload_cancel.clone();
+    let worker = std::thread::spawn(move || {
+        let mut value = 1_u64;
+        while !worker_cancel.is_cancelled() {
+            value = std::hint::black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1));
+        }
+    });
+    let capture = capture_cpu_profile(&request(), &CancellationToken::new()).await;
+    workload_cancel.cancel();
+    worker.join().expect("CPU workload should stop after capture");
+    let result = capture.expect("local CPU capture should complete");
     assert!(matches!(result.outcome(), ProfileOutcome::Succeeded | ProfileOutcome::Partial));
     let json = serde_json::to_string(&result).expect("result JSON");
     assert!(json.contains("sha256:"));
