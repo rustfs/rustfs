@@ -43,6 +43,19 @@ fn all_oidc_policies_resolved(selected_policy_names: &[String], resolved_policy_
             .all(|policy_name| is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name))
 }
 
+/// Returns the subset of `selected_policy_names` that are safe claim names
+/// and exist in the resolved policy mapping. Groups whose names contain
+/// characters outside the safe set (e.g., `DOMAIN\Domain Users`) or that
+/// have no matching IAM policy are silently dropped.
+fn resolve_oidc_policies(selected_policy_names: &[String], resolved_policy_mapping: &str) -> Vec<String> {
+    let resolved_policy_names = MappedPolicy::new(resolved_policy_mapping).to_slice();
+    selected_policy_names
+        .iter()
+        .filter(|policy_name| is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name))
+        .cloned()
+        .collect()
+}
+
 fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap<String, Value> {
     let authorization = &transaction.authorization;
     let claims = &authorization.claims;
@@ -275,14 +288,27 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         };
         let selected_policy_mapping = selected_policy_names.join(",");
         let resolved_policy_mapping = iam_store.current_policies(&selected_policy_mapping).await;
-        if !all_oidc_policies_resolved(&selected_policy_names, &resolved_policy_mapping) {
+        let resolved_policy_names = resolve_oidc_policies(&selected_policy_names, &resolved_policy_mapping);
+        if resolved_policy_names.len() < selected_policy_names.len() {
+            let dropped: Vec<&String> = selected_policy_names
+                .iter()
+                .filter(|p| !resolved_policy_names.contains(p))
+                .collect();
+            debug!(
+                resolved_count = resolved_policy_names.len(),
+                selected_count = selected_policy_names.len(),
+                dropped_policies = ?dropped,
+                "OIDC claim-derived policies dropped (unsafe name or not a current policy)"
+            );
+        }
+        if resolved_policy_names.is_empty() {
             return Err(FederatedSessionBindingError::InvalidRequest(
                 "OIDC policy mapping did not resolve to current policies".to_string(),
             ));
         }
 
         let secret = current_token_signing_key();
-        let credentials = issue_credentials(transaction, &selected_policy_names, secret.as_deref())?;
+        let credentials = issue_credentials(transaction, &resolved_policy_names, secret.as_deref())?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_oidc_policy_diagnostics(
                 &iam_store,
@@ -676,5 +702,37 @@ mod tests {
         assert!(!all_oidc_policies_resolved(&["readonly".to_string(), "missing".to_string()], "readonly"));
         assert!(!all_oidc_policies_resolved(&[], ""));
         assert!(!all_oidc_policies_resolved(&["team+readonly".to_string()], "team+readonly"));
+    }
+
+    #[test]
+    fn resolve_oidc_policies_returns_only_matching_subset() {
+        // All policies resolve.
+        assert_eq!(resolve_oidc_policies(&["readonly".to_string()], "readonly"), vec!["readonly"]);
+
+        // Only the matching policy is returned; the missing one is dropped.
+        assert_eq!(
+            resolve_oidc_policies(&["readonly".to_string(), "missing".to_string()], "readonly"),
+            vec!["readonly"]
+        );
+
+        // Empty input yields empty output.
+        assert!(resolve_oidc_policies(&[], "").is_empty());
+
+        // Unsafe claim names (containing characters outside [a-zA-Z0-9_\-:.])
+        // are dropped even when present in the resolved mapping.
+        assert!(resolve_oidc_policies(&["team+readonly".to_string()], "team+readonly").is_empty());
+
+        // AD-style group names with backslash and spaces are dropped (#8163).
+        assert_eq!(
+            resolve_oidc_policies(
+                &[
+                    "DOMAIN\\Domain Users".to_string(),
+                    "DOMAIN\\rustfs_admins".to_string(),
+                    "rustfs_admins".to_string(),
+                ],
+                "rustfs_admins",
+            ),
+            vec!["rustfs_admins"]
+        );
     }
 }
