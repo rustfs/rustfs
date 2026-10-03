@@ -1610,6 +1610,24 @@ fn build_kms_request_context(
     context
 }
 
+/// Rejects a client encryption context that would replace the location binding.
+///
+/// [`build_kms_request_context`] binds the data key to `{bucket: bucket/key}`
+/// with `or_insert`, and only the client context is persisted. A client entry
+/// keyed by the bucket name therefore travels with the object and replaces the
+/// binding on every read, so the envelope would no longer be tied to the
+/// object's location. Only the write side rejects it: objects stored with such
+/// an entry stay readable because the read side rebuilds the context unchanged.
+fn reject_kms_context_location_override(bucket: &str, ssekms_context: Option<&HashMap<String, String>>) -> Result<(), ApiError> {
+    if ssekms_context.is_some_and(|context| context.contains_key(bucket)) {
+        return Err(sse_invalid_argument(&format!(
+            "The x-amz-server-side-encryption-context header contains the key \"{bucket}\", which equals the bucket name; \
+             that key is reserved for binding the data key to the object's location."
+        )));
+    }
+    Ok(())
+}
+
 fn build_object_encryption_context(
     bucket: &str,
     key: &str,
@@ -2697,6 +2715,10 @@ async fn apply_managed_encryption_material(
     content_size: i64,
     principal: Option<&SseKmsPrincipal>,
 ) -> Result<EncryptionMaterial, ApiError> {
+    // Request validation, not a KMS operation: reject before the KMS is called
+    // and before an audit outcome is recorded.
+    reject_kms_context_location_override(bucket, ssekms_context.as_ref())?;
+
     let requested_sse_type = managed_sse_type(server_side_encryption.as_str());
     let requested_key_id = kms_key_id.clone();
     let result = apply_managed_encryption_material_inner(
@@ -4358,14 +4380,15 @@ mod tests {
         MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, ObjectDekRewrapOutcome,
         ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
         SSEType, SseDekProvider, SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
-        apply_managed_decryption_material, apply_managed_encryption_material, authorize_sse_kms_object_read,
-        build_kms_request_context, classify_sse_read_response, encode_minio_kms_context, encryption_material_to_metadata,
-        extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-        generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
-        md5_base64, normalize_managed_metadata, project_sse_read_response_headers, recode_minio_kms_context,
-        reset_sse_dek_provider, resolve_effective_kms_key_id, resolve_stored_kms_key_id, rewrap_object_encryption_metadata,
-        sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-        validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
+        apply_managed_decryption_material, apply_managed_encryption_material, apply_managed_encryption_material_inner,
+        authorize_sse_kms_object_read, build_kms_request_context, classify_sse_read_response, encode_minio_kms_context,
+        encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
+        extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse, kms_operation_error,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64, normalize_managed_metadata,
+        project_sse_read_response_headers, recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id,
+        resolve_stored_kms_key_id, rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
+        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -8227,6 +8250,160 @@ mod tests {
         assert_eq!(audit_tag(&read_tags, "sseType").as_deref(), Some("SSE-KMS"));
         assert_eq!(audit_tag(&read_tags, "kmsKeyId").as_deref(), Some("audit-key"));
         assert_eq!(audit_tag(&read_tags, "kmsOutcome").as_deref(), Some("success"));
+    }
+
+    async fn install_test_kms_provider(key_name: &str) {
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+
+        reset_sse_dek_provider();
+        let manager = configure_test_global_local_kms().await;
+        manager
+            .get_encryption_service()
+            .await
+            .expect("encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_name.to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("kms test key should be created");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager)
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
+    }
+
+    fn sse_kms_request<'a>(bucket: &'a str, key: &'a str, context: HashMap<String, String>) -> EncryptionRequest<'a> {
+        EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("binding-key".to_string()),
+            ssekms_context: Some(context),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 64,
+            principal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_rejects_a_context_key_equal_to_the_bucket_name() {
+        let _guard = lock_sse_test_state().await;
+        install_test_kms_provider("binding-key").await;
+        let context = HashMap::from([("finance".to_string(), "finance/elsewhere".to_string())]);
+
+        let err = sse_encryption(sse_kms_request("finance", "ledger.csv", context.clone()))
+            .await
+            .expect_err("a context entry under the bucket name must be rejected");
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("\"finance\""),
+            "the message must name the offending key: {}",
+            err.message
+        );
+
+        // CreateMultipartUpload generates the session data key through the
+        // prepare path; it must refuse the same context.
+        let err = sse_prepare_encryption(PrepareEncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("binding-key".to_string()),
+            ssekms_context: Some(context),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect_err("the multipart prepare path must reject the same context");
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+
+        reset_sse_dek_provider();
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_keeps_the_location_binding_when_the_context_names_another_bucket() {
+        let _guard = lock_sse_test_state().await;
+        install_test_kms_provider("binding-key").await;
+        let context = HashMap::from([
+            ("archive".to_string(), "archive/ledger.csv".to_string()),
+            ("tenant".to_string(), "acct-4711".to_string()),
+        ]);
+
+        let material = sse_encryption(sse_kms_request("finance", "ledger.csv", context))
+            .await
+            .expect("a key naming a different bucket is an ordinary context entry")
+            .expect("managed sse-kms material");
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+
+        let read = |key: &'static str| {
+            let metadata = metadata.clone();
+            async move {
+                sse_decryption(DecryptionRequest {
+                    bucket: "finance",
+                    key,
+                    metadata: &metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    principal: None,
+                })
+                .await
+            }
+        };
+        let decrypted = read("ledger.csv")
+            .await
+            .expect("the object decrypts at its own location")
+            .expect("managed sse-kms material");
+        assert_eq!(decrypted.key_bytes, material.key_bytes);
+        read("relocated.csv")
+            .await
+            .expect_err("the data key stays bound to the object's location");
+
+        reset_sse_dek_provider();
+    }
+
+    #[tokio::test]
+    async fn sse_kms_objects_stored_with_a_bucket_keyed_context_stay_readable() {
+        let _guard = lock_sse_test_state().await;
+        install_test_kms_provider("binding-key").await;
+        let context = HashMap::from([("finance".to_string(), "finance/elsewhere".to_string())]);
+
+        // Objects written before the write-side rejection reached the inner
+        // routine without validation; reproduce that stored shape directly.
+        let material = apply_managed_encryption_material_inner(
+            "finance",
+            "ledger.csv",
+            ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+            Some("binding-key".to_string()),
+            Some(context),
+            64,
+            None,
+        )
+        .await
+        .expect("the inner routine does not validate the client context");
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+
+        let decrypted = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect("an existing object must stay readable after the write-side rejection")
+        .expect("managed sse-kms material");
+        assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+        reset_sse_dek_provider();
     }
 
     #[tokio::test]

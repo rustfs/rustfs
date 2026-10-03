@@ -1,6 +1,6 @@
 ---
 name: rustfs-release-publish
-description: "Run the RustFS console gate, source version bump, release-branch CI, preview validation, human confirmation, final-tag publication, and post-release installation and website updates. Use only when the user explicitly asks to release or publish a RustFS version (发版/发布)."
+description: "Run the RustFS console gate, source version bump, release-branch CI, preview validation, human confirmation, final-tag publication, and post-release milestone, installation, and website updates. Use only when the user explicitly asks to release or publish a RustFS version (发版/发布)."
 ---
 # RustFS Release Publish (preview-validated pipeline)
 
@@ -28,6 +28,7 @@ check console main against its latest Release
   -> tag <target> at the SAME commit (zero delta) -> re-verify CI/release
   -> CI deletes the <target>-preview.N Releases (tags kept)
   -> verify published images -> publish Helm chart from the validated source
+  -> close the released version's milestone -> ensure the next version's milestone exists
   -> update installation references on main -> update rustfs.com announcement
 ```
 
@@ -154,9 +155,9 @@ git push origin "<target>"
 - Verify the preview cleanup: `cleanup-preview-releases` must succeed, `gh release view "<preview-tag>"` must then report `release not found` for every preview iteration of this target, and `git rev-parse "<preview-tag>^{commit}"` must still resolve to `PREVIEW_HASH` (the tag is kept). If the job failed, delete the leftover Releases manually with `gh release delete "<preview-tag>" --yes` and report it.
 - Optionally spot-check `./rustfs --version` from a final-tag artifact — it must report `<target>`.
 
-## Phase 7 — Installation references and website announcement
+## Phase 7 — Milestones, installation references, and website announcement
 
-Only after Phase 6 succeeds, complete [post-release updates](references/post-release-updates.md): align installation references on main, then update the existing top banner in `rustfs/rustfs.com`. A failed or incomplete publication leaves both on the previous available version. These follow-up commits never change `PREVIEW_HASH` or either release tag. Track their PR, merge, and deployment states separately from artifact publication; an open PR is not a live website update.
+Only after Phase 6 succeeds, complete [post-release updates](references/post-release-updates.md): close the released version's milestone and ensure the next version's milestone exists, align installation references on main, then update the existing top banner in `rustfs/rustfs.com`. Milestone maintenance is required for every non-preview release and is independent of installation PR merges or website deployment. A failed or incomplete publication leaves milestones unchanged and installation references and the banner on the previous available version. These follow-up commits never change `PREVIEW_HASH` or either release tag. Track milestone, PR, merge, and deployment states separately from artifact publication; an open PR is not a live website update.
 
 ## Output contract
 
@@ -166,5 +167,6 @@ Always report:
 - Target version, release branch, release-branch CI run and validated SHA, preview tag(s) used, `PREVIEW_HASH` (which both tags point at).
 - Manual confirmation gate status (`WAITING_FOR_CONFIRMATION` or `CONFIRMED`) and its exact target, preview tag, and `PREVIEW_HASH`.
 - Per-phase result (PASS/FAIL/BLOCKED) with key evidence: preview and final Release URLs, preview `isPrerelease`/`isLatest` state, final latest-channel state, console check results, the rc command matrix, and the preview-Release cleanup result (deleted Releases plus surviving tags).
+- Released-version milestone title, URL, and verified closed state; next-version milestone title, URL, state, and whether it already existed or was created. Report missing milestones or failed checks/updates as incomplete follow-up work.
 - Post-release installation PR and verification results; website banner target, text, link, PR, and observed deployment state. Report any remaining merge authorization or failed deployment explicitly rather than claiming the banner is live.
 - Any deviation from this pipeline and why the user approved it.

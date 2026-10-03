@@ -102,6 +102,13 @@ setup = 'lifecycle-large-stack'
 filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
 setup = 'ecstore-large-stack'
 
+# These real-disk scanner fixtures assert quiet-workload publication and
+# durable MRF admission. Reserve the pool while their bounded CAS/fsync
+# handoffs run so unrelated disk fanouts cannot consume that fixture budget.
+[[profile.default.overrides]]
+filter = 'package(rustfs-scanner) & (test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(=scanner_io::tests::multi_pool_scanner_cycle_publishes_combined_usage) | test(=scanner_io::tests::pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage) | test(=scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail))'
+threads-required = "num-test-threads"
+
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
@@ -338,6 +345,13 @@ setup = 'lifecycle-large-stack'
 [[profile.ci.scripts]]
 filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
 setup = 'ecstore-large-stack'
+
+# These real-disk scanner fixtures assert quiet-workload publication and
+# durable MRF admission. Reserve the pool while their bounded CAS/fsync
+# handoffs run so unrelated disk fanouts cannot consume that fixture budget.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-scanner) & (test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(=scanner_io::tests::multi_pool_scanner_cycle_publishes_combined_usage) | test(=scanner_io::tests::pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage) | test(=scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail))'
+threads-required = "num-test-threads"
 
 # ===========================================================================
 # QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.

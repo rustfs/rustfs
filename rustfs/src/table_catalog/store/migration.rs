@@ -80,6 +80,8 @@ pub(super) fn table_catalog_backing_manifest(
                 includes_namespace: true,
                 includes_table_pointer: true,
                 includes_backing_manifest: true,
+                snapshot_etag: None,
+                snapshot_version: None,
             },
         },
         migration: TableCatalogBackingMigrationPlan {
@@ -114,6 +116,64 @@ pub(super) fn table_catalog_backing_manifest(
             ],
         },
     }
+}
+
+pub(super) fn durable_strong_table_catalog_backing_manifest(
+    snapshot_path: String,
+    snapshot_etag: Option<String>,
+    snapshot_version: Option<u16>,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    entry: &TableEntry,
+    commit_recovery: &TableCommitRecoveryReport,
+) -> TableCatalogBackingManifest {
+    let mut manifest =
+        table_catalog_backing_manifest(&TableCatalogObjectPaths::default(), namespace, table, entry, commit_recovery);
+    let recovery_required = commit_recovery.staged_before_table_update_count > 0
+        || commit_recovery.finalization_required_count > 0
+        || commit_recovery.idempotency_repair_required_count > 0;
+    let manual_review_required = commit_recovery.manual_review_count > 0;
+
+    manifest.current.kind = TableCatalogBackingKind::DurableStrongSnapshot;
+    manifest.current.authority = TableCatalogAuthority::LinearizableMetadataKv;
+    manifest.current.consistency = TableCatalogConsistencyMode::LinearizableCas;
+    manifest.current.durability = TableCatalogDurabilityMode::WalBeforeStateMachineApply;
+    manifest.current.current_pointer_path = snapshot_path.clone();
+    // Strong backing embeds the commit log and idempotency index in one authoritative snapshot.
+    manifest.current.wal.commit_log_prefix = snapshot_path.clone();
+    manifest.current.wal.idempotency_index_prefix = snapshot_path;
+    manifest.current.snapshot.snapshot_etag = snapshot_etag;
+    manifest.current.snapshot.snapshot_version = snapshot_version;
+
+    manifest.migration.status = if manual_review_required {
+        TableCatalogBackingMigrationStatus::ManualReviewRequired
+    } else if recovery_required {
+        TableCatalogBackingMigrationStatus::RecoveryRequired
+    } else {
+        TableCatalogBackingMigrationStatus::SnapshotMaterialized
+    };
+    manifest.migration.required_steps = if manual_review_required || recovery_required {
+        vec![
+            TableCatalogBackingMigrationStep::ReplayCommitLog,
+            TableCatalogBackingMigrationStep::VerifyCurrentPointer,
+        ]
+    } else {
+        Vec::new()
+    };
+    manifest.migration.blockers.clear();
+    if recovery_required {
+        manifest
+            .migration
+            .blockers
+            .push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
+    }
+    if manual_review_required {
+        manifest
+            .migration
+            .blockers
+            .push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
+    }
+    manifest
 }
 
 impl<B> ObjectTableCatalogStore<B>
