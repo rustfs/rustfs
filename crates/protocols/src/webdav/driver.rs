@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::client::s3::StorageBackend as S3StorageBackend;
+use crate::common::client::s3::{SessionCapacityView, StorageBackend as S3StorageBackend};
 use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use bytes::Bytes;
@@ -32,7 +32,7 @@ use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_WEBDAV_DRIVER: &str = "webdav_driver";
@@ -49,6 +49,7 @@ const EVENT_WEBDAV_BUCKET_METADATA_STATE: &str = "webdav_bucket_metadata_state";
 const EVENT_WEBDAV_DIRECTORY_STATE: &str = "webdav_directory_state";
 const EVENT_WEBDAV_OBJECT_DELETE_STATE: &str = "webdav_object_delete_state";
 const EVENT_WEBDAV_RENAME_STATE: &str = "webdav_rename_state";
+const EVENT_WEBDAV_QUOTA_VIEW_FAILED: &str = "webdav_quota_view_failed";
 
 /// Convert s3s ETag enum to string
 fn etag_to_string(etag: &ETag) -> String {
@@ -1059,6 +1060,31 @@ where
     }
 }
 
+/// Resolve the single (used, total) quota pair dav-server can report.
+///
+/// dav-server queries quota once per request without a path argument, so
+/// per-bucket reporting is impossible and the answer is session-scoped. When
+/// every visible bucket has a hard quota the pair is the summed cached usage
+/// against the summed limits; a bucket whose usage cache has no scanner
+/// snapshot yet counts as zero until the first complete cycle lands.
+/// Otherwise the pair falls back to the cluster's usable capacity (the
+/// console dashboard numbers, already erasure-aware). `None` makes dav-server
+/// omit quota properties from the PROPFIND response entirely.
+fn aggregate_session_capacity(view: &SessionCapacityView) -> Option<(u64, Option<u64>)> {
+    if !view.buckets.is_empty() && view.buckets.iter().all(|bucket| bucket.quota_limit.is_some()) {
+        let used = view
+            .buckets
+            .iter()
+            .fold(0_u64, |acc, bucket| acc.saturating_add(bucket.usage.unwrap_or(0)));
+        let total = view
+            .buckets
+            .iter()
+            .fold(0_u64, |acc, bucket| acc.saturating_add(bucket.quota_limit.unwrap_or(0)));
+        return Some((used, Some(total)));
+    }
+    view.cluster_usable.map(|(used, total)| (used, Some(total)))
+}
+
 impl<S> DavFileSystem for WebDavDriver<S>
 where
     S: S3StorageBackend + Debug + Clone + Send + Sync + 'static,
@@ -1624,12 +1650,39 @@ where
         // Could implement using S3 CopyObject, but not required for basic WebDAV
         async move { Err(FsError::NotImplemented) }.boxed()
     }
+
+    fn get_quota(&'_ self) -> FsFuture<'_, (u64, Option<u64>)> {
+        async move {
+            let request_headers = self.request_headers.clone().unwrap_or_default();
+            let view = self
+                .storage
+                .session_capacity_view(self.session_context.as_ref(), &request_headers, self.secure_transport)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        event = EVENT_WEBDAV_QUOTA_VIEW_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        error = %e,
+                        "webdav quota view failed"
+                    );
+                    FsError::GeneralFailure
+                })?;
+            // A backend without capacity support reports None; dav-server then
+            // omits quota properties from the response, as before this feature.
+            let Some(view) = view else {
+                return Err(FsError::NotImplemented);
+            };
+            aggregate_session_capacity(&view).ok_or(FsError::NotImplemented)
+        }
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::WebDavDriver;
-    use crate::common::client::s3::StorageBackend as S3StorageBackend;
+    use super::{WebDavDriver, aggregate_session_capacity};
+    use crate::common::client::s3::{BucketCapacity, SessionCapacityView, StorageBackend as S3StorageBackend};
     use crate::common::dummy_storage::DummyBackend;
     use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
     use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, test_session};
@@ -2381,5 +2434,149 @@ mod tests {
                 .objects
                 .contains_key(&("bucket".to_string(), "dst/file-b.txt".to_string()))
         );
+    }
+
+    fn quota_driver(storage: DummyBackend) -> WebDavDriver<DummyBackend> {
+        WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav))).with_request_context(http::HeaderMap::new(), false)
+    }
+
+    #[test]
+    fn aggregate_reports_summed_quotas_when_all_buckets_quotaed() {
+        let view = SessionCapacityView {
+            buckets: vec![
+                BucketCapacity {
+                    quota_limit: Some(100),
+                    usage: Some(40),
+                },
+                BucketCapacity {
+                    quota_limit: Some(50),
+                    usage: Some(10),
+                },
+            ],
+            cluster_usable: Some((999, 9999)),
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), Some((50, Some(150))));
+    }
+
+    #[test]
+    fn aggregate_counts_missing_usage_cache_as_zero() {
+        let view = SessionCapacityView {
+            buckets: vec![
+                BucketCapacity {
+                    quota_limit: Some(100),
+                    usage: Some(40),
+                },
+                BucketCapacity {
+                    quota_limit: Some(50),
+                    usage: None,
+                },
+            ],
+            cluster_usable: None,
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), Some((40, Some(150))));
+    }
+
+    #[test]
+    fn aggregate_falls_back_to_cluster_capacity_when_a_bucket_has_no_quota() {
+        let view = SessionCapacityView {
+            buckets: vec![
+                BucketCapacity {
+                    quota_limit: Some(100),
+                    usage: Some(40),
+                },
+                BucketCapacity {
+                    quota_limit: None,
+                    usage: Some(10),
+                },
+            ],
+            cluster_usable: Some((300, 1000)),
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), Some((300, Some(1000))));
+    }
+
+    #[test]
+    fn aggregate_uses_cluster_capacity_when_no_buckets_are_visible() {
+        let view = SessionCapacityView {
+            buckets: vec![],
+            cluster_usable: Some((300, 1000)),
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), Some((300, Some(1000))));
+    }
+
+    #[test]
+    fn aggregate_omits_quota_when_no_source_is_available() {
+        let view = SessionCapacityView {
+            buckets: vec![BucketCapacity {
+                quota_limit: None,
+                usage: Some(10),
+            }],
+            cluster_usable: None,
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), None);
+    }
+
+    #[test]
+    fn aggregate_saturates_instead_of_overflowing() {
+        let view = SessionCapacityView {
+            buckets: vec![
+                BucketCapacity {
+                    quota_limit: Some(u64::MAX),
+                    usage: Some(u64::MAX),
+                },
+                BucketCapacity {
+                    quota_limit: Some(1),
+                    usage: Some(1),
+                },
+            ],
+            cluster_usable: None,
+        };
+
+        assert_eq!(aggregate_session_capacity(&view), Some((u64::MAX, Some(u64::MAX))));
+    }
+
+    #[tokio::test]
+    async fn get_quota_reports_aggregated_session_view() {
+        let storage = DummyBackend::new();
+        storage.queue_session_capacity_view_ok(Some(SessionCapacityView {
+            buckets: vec![BucketCapacity {
+                quota_limit: Some(100),
+                usage: Some(40),
+            }],
+            cluster_usable: Some((300, 1000)),
+        }));
+        let driver = quota_driver(storage);
+
+        let quota = driver.get_quota().await.expect("quota should be reported");
+
+        assert_eq!(quota, (40, Some(100)));
+    }
+
+    #[tokio::test]
+    async fn get_quota_is_omitted_when_backend_has_no_capacity_support() {
+        // Empty queue: the dummy reports Ok(None), like the default trait method.
+        let driver = quota_driver(DummyBackend::new());
+
+        let err = driver.get_quota().await.expect_err("quota should be omitted");
+
+        assert!(matches!(err, FsError::NotImplemented));
+    }
+
+    #[tokio::test]
+    async fn get_quota_maps_backend_failure_to_general_failure() {
+        let storage = DummyBackend::new();
+        storage.queue_session_capacity_view_err(s3s::S3Error::with_message(
+            s3s::S3ErrorCode::InternalError,
+            "quota config unreadable",
+        ));
+        let driver = quota_driver(storage);
+
+        let err = driver.get_quota().await.expect_err("backend failure should surface");
+
+        assert!(matches!(err, FsError::GeneralFailure));
     }
 }

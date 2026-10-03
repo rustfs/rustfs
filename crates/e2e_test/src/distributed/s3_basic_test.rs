@@ -21,6 +21,60 @@ use aws_sdk_s3::types::{Delete, MetadataDirective, ObjectIdentifier};
 use std::time::Duration;
 
 #[tokio::test]
+async fn four_node_bucket_tags_opa_refreshes_warm_peer_caches() -> TestResult {
+    use super::harness::cluster_admin_ok;
+    use crate::sts_query_compat_test::{OPA_AUTH_TOKEN, OpaMock, set_department};
+
+    init_logging();
+    let mut opa = OpaMock::start().await?;
+    let dist = DistCluster::start_with_env(
+        DistLayout::FourNodeFourDisk,
+        &[
+            ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+            ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
+        ],
+    )
+    .await?;
+    let secret = uuid::Uuid::new_v4().to_string();
+    cluster_admin_ok(
+        &dist.cluster,
+        http::Method::PUT,
+        "/rustfs/admin/v3/add-user?accessKey=opabuckettags",
+        Some(serde_json::json!({"secretKey": secret, "status": "enabled"}).to_string()),
+    )
+    .await?;
+    let bucket = unique_bucket("opa-tags");
+    dist.create_bucket(&bucket).await?;
+    let admin = dist.client(0)?;
+    put_object(&admin, &bucket, "report", b"report".to_vec()).await?;
+    let clients = (0..4)
+        .map(|node| dist.client_with_credentials(node, "opabuckettags", &secret))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Warm every peer, then verify the acknowledged updates/removal without
+    // polling or restarting nodes. This exercises healthy-peer metadata reload.
+    for department in [Some("finance"), Some("engineering"), None, Some("finance")] {
+        match department {
+            Some(value) => set_department(&admin, &bucket, value).await?,
+            None => {
+                admin.delete_bucket_tagging().bucket(&bucket).send().await?;
+            }
+        }
+        for client in &clients {
+            let result = client.get_object().bucket(&bucket).key("report").send().await;
+            if department == Some("finance") {
+                assert_eq!(result?.body.collect().await?.into_bytes().as_ref(), b"report");
+            } else {
+                let error = result.expect_err("updated or removed bucket tags must revoke this policy's read access");
+                assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+            }
+            opa.expect_bucket_tags("s3:GetObject", &bucket, department).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn four_node_four_drive_s3_put_get_head_list_copy_rename_delete_and_presign() -> TestResult {
     init_logging();
     let dist = DistCluster::start(DistLayout::FourByFour).await?;

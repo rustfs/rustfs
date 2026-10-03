@@ -72,6 +72,12 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     async fn load_all(&self, cache: &Cache) -> Result<()>;
 
+    /// Stored, case-sensitive bucket tags for OPA. A confirmed missing or untagged
+    /// bucket has an empty map; unavailable metadata must return an error.
+    async fn load_bucket_tags(&self, _bucket: &str) -> Result<HashMap<String, String>> {
+        Err(crate::error::Error::other("bucket tag lookup is unavailable for this IAM store"))
+    }
+
     // Lock-free variants used by the cross-node notification handlers.
     //
     // Notification-path cache refreshes are asynchronous, best-effort, and
