@@ -811,23 +811,25 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        // Create 1000 objects: 100 directories with 10 files each
-        let mut all_keys = Vec::new();
-        let dirs: Vec<String> = (0..100).map(|i| format!("dir-{:03}/", i)).collect();
-        for dir in &dirs {
-            for i in 0..10 {
-                let key = format!("{dir}file{:02}.txt", i);
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .body(ByteStream::from_static(b"x"))
-                    .send()
-                    .await
-                    .expect("Failed to put object");
-                all_keys.push(key);
-            }
-        }
+        // Keep every fixture key while overlapping durable PUTs within a bounded fanout.
+        let all_keys: Vec<String> = (0..100)
+            .flat_map(|dir| (0..10).map(move |file| format!("dir-{dir:03}/file{file:02}.txt")))
+            .collect();
+        stream::iter(&all_keys)
+            .for_each_concurrent(16, |key| {
+                let client = &client;
+                async move {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                }
+            })
+            .await;
 
         eprintln!("Seeded {} objects in {bucket}; starting ListObjectsV2 pagination", all_keys.len());
         let deadline = Instant::now() + PAGINATION_TIMEOUT;

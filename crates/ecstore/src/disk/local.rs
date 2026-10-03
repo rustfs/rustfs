@@ -9499,7 +9499,9 @@ impl DiskAPI for LocalDisk {
                     .write(true)
                     .open(&lock_path)
                     .map_err(DiskError::conditional_file_not_committed)?;
-                flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)?;
+                flock(&lock, FlockOperation::NonBlockingLockExclusive)
+                    .map_err(std::io::Error::from)
+                    .map_err(DiskError::conditional_file_not_committed)?;
                 let result = (|| {
                     let current = match std::fs::read(&file_path) {
                         Ok(current) => Some(current),
@@ -25138,6 +25140,7 @@ mod test {
         .expect_err("contended conditional update must retry");
 
         assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::WouldBlock));
+        assert!(err.is_conditional_file_not_committed(), "lock contention cannot publish target bytes");
     }
 
     #[cfg(windows)]

@@ -1,0 +1,30 @@
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -11,6 +11,7 @@
+ import re
+ import pytz
+ from collections import OrderedDict
++from concurrent.futures import ThreadPoolExecutor
+ import requests
+ import json
+ import base64
+@@ -687,8 +688,16 @@
+     key_names = ['0/'] + ['0/%s' % i for i in range(1000, 1999)]
+     key_names2 = ['1999', '1999#', '1999+', '2000']
+     key_names += key_names2
+-    bucket_name = _create_objects(keys=key_names)
+-    client = get_client()
++    bucket_name = get_new_bucket_name()
++    get_new_bucket_resource(name=bucket_name)
++    client = get_client()
++
++    # Share the low-level client; Boto3 resources are not thread-safe.
++    with ThreadPoolExecutor(max_workers=16) as executor:
++        uploads = [executor.submit(client.put_object, Bucket=bucket_name,
++                                   Body=key, Key=key) for key in key_names]
++        for upload in uploads:
++            upload.result()
+
+     response = client.list_objects(Bucket=bucket_name, Delimiter='/')
+     assert response['Delimiter'] == '/'
