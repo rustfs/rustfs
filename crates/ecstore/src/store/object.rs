@@ -4608,6 +4608,7 @@ impl ECStore {
                     shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                     version_id: dst_opts.version_id.clone(),
                     no_lock: dst_opts.no_lock,
+                    write_completion: dst_opts.write_completion,
                     mod_time: dst_opts.mod_time,
                     http_preconditions: dst_opts.http_preconditions.clone(),
                     expected_current_version_id: dst_opts.expected_current_version_id.clone(),
@@ -4652,6 +4653,7 @@ impl ECStore {
                         shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                         version_id: dst_opts.version_id.clone(),
                         no_lock: dst_opts.no_lock,
+                        write_completion: dst_opts.write_completion,
                         mod_time: dst_opts.mod_time,
                         http_preconditions: dst_opts.http_preconditions.clone(),
                         expected_current_version_id: dst_opts.expected_current_version_id.clone(),
@@ -4706,6 +4708,7 @@ impl ECStore {
             shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
             version_id: dst_opts.version_id.clone(),
             no_lock: dst_opts.no_lock,
+            write_completion: dst_opts.write_completion,
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
             expected_current_version_id: dst_opts.expected_current_version_id.clone(),
@@ -8759,6 +8762,108 @@ mod tests {
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn borrowed_copy_tail_drained_waits_for_rename_tail() {
+        use crate::object_api::{WriteCommitGuard, WriteCompletion};
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], ctx).await);
+            let bucket = RUSTFS_META_BUCKET;
+            let source = "copy-tail-drained-source";
+            let target = "copy-tail-drained-target";
+            let payload = vec![0x64; 4097];
+            let set = store.pools[0].get_disks_by_key(target);
+            let mut source_info = set
+                .put_object(
+                    bucket,
+                    source,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed copy source");
+            source_info.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+
+            let barrier = rename_fanout_barrier::arm(target, 0, rename_fanout_barrier::PHASE_RENAME);
+            let rename_tasks = rename_fanout_barrier::observe_tasks(target);
+            let copy_store = Arc::clone(&store);
+            let mut copy = tokio::spawn(async move {
+                let lock = copy_store
+                    .new_ns_lock(bucket, target)
+                    .await
+                    .expect("target namespace wrapper");
+                let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+                    .await
+                    .expect("real Copy target namespace owner");
+                let mut options = ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                options.add_write_commit_guard(&guard);
+                copy_store
+                    .handle_copy_object(bucket, source, bucket, target, &mut source_info, &ObjectOptions::default(), &options)
+                    .await
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            tokio::time::timeout_at(deadline, barrier.wait_until_paused())
+                .await
+                .expect("copy reaches the paused rename checkpoint");
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    if let Ok(info) = set
+                        .get_object_info(
+                            bucket,
+                            target,
+                            &ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        && info.size == 4097
+                        && rename_tasks.running() == 1
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("copy commits a metadata quorum while one rename remains paused");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut copy).await.is_err(),
+                "Copy TailDrained must remain pending after metadata quorum"
+            );
+            barrier.release();
+            let result = tokio::time::timeout_at(deadline, copy)
+                .await
+                .expect("copy drains its rename tail")
+                .expect("copy task completes")
+                .expect("copy succeeds");
+            assert_eq!(result.size, 4097);
+            assert_eq!(rename_tasks.running(), 0);
+            let mut reader = store
+                .get_object_reader(bucket, target, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("read copied target");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("read complete copied bytes");
+            assert_eq!(actual, payload);
+        })
+        .await;
     }
 
     #[tokio::test]
