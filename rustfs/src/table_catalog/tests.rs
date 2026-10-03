@@ -10157,6 +10157,259 @@ async fn export_catalog_entry_includes_backing_migration_manifest() {
 }
 
 #[tokio::test]
+async fn durable_strong_catalog_export_reports_snapshot_identity() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let snapshot = test_strong_snapshot(
+        bucket,
+        &namespace,
+        vec![test_table_entry(bucket, &namespace, &table, current.clone())],
+        Vec::new(),
+    );
+    seed_strong_snapshot(&backend, &snapshot).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+
+    let export = StrongTableCatalogStore::new(backend)
+        .export_table_catalog_entry(bucket, "sales", "orders")
+        .await
+        .expect("strong catalog export should load from the snapshot");
+
+    assert_eq!(export.table.table_id, "table-id");
+    assert_eq!(export.backing_manifest.current.kind, TableCatalogBackingKind::DurableStrongSnapshot);
+    assert_eq!(export.backing_manifest.current.authority, TableCatalogAuthority::LinearizableMetadataKv);
+    assert_eq!(
+        export.backing_manifest.current.current_pointer_path,
+        StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path()
+    );
+    assert!(export.backing_manifest.current.snapshot.snapshot_etag.is_some());
+    assert_eq!(export.backing_manifest.current.snapshot.snapshot_version, Some(snapshot.version));
+    assert_eq!(
+        export.backing_manifest.migration.status,
+        TableCatalogBackingMigrationStatus::SnapshotMaterialized
+    );
+}
+
+#[tokio::test]
+async fn durable_strong_catalog_export_synthesizes_implicit_namespace() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let mut snapshot = test_strong_snapshot(
+        bucket,
+        &namespace,
+        vec![test_table_entry(bucket, &namespace, &table, current.clone())],
+        Vec::new(),
+    );
+    snapshot.namespaces.clear();
+    seed_strong_snapshot(&backend, &snapshot).await;
+
+    let export = StrongTableCatalogStore::new(backend)
+        .export_table_catalog_entry(bucket, "sales", "orders")
+        .await
+        .expect("strong export should preserve implicit namespace semantics");
+
+    assert_eq!(export.namespace.namespace, "sales");
+    assert_eq!(export.namespace.namespace_id, "sales");
+}
+
+#[tokio::test]
+async fn durable_strong_catalog_diagnostics_uses_snapshot_state_and_metadata_reachability() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let snapshot = test_strong_snapshot(
+        bucket,
+        &namespace,
+        vec![test_table_entry(bucket, &namespace, &table, current.clone())],
+        Vec::new(),
+    );
+    seed_strong_snapshot(&backend, &snapshot).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object(bucket, &orphan, br#"{"metadata-log":[]}"#.to_vec()).await;
+
+    let diagnostics = StrongTableCatalogStore::new(backend)
+        .diagnose_table_catalog(bucket, "sales", "orders", 0)
+        .await
+        .expect("strong catalog diagnostics should use the durable snapshot");
+
+    assert_eq!(diagnostics.current_metadata_status, TableMetadataPointerStatus::Valid);
+    assert_eq!(diagnostics.recovery_status, TableCatalogRecoveryStatus::Healthy);
+    assert_eq!(diagnostics.orphan_metadata_candidate_locations, vec![orphan]);
+    assert_eq!(diagnostics.catalog.table.metadata_location, current);
+    assert_eq!(diagnostics.backing_manifest.current.snapshot.snapshot_version, Some(snapshot.version));
+}
+
+#[tokio::test]
+async fn catalog_diagnostics_follows_renamed_and_custom_metadata_directories() {
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let original_table = IdentifierSegment::parse("original_orders").unwrap();
+    let original_dir = default_table_metadata_dir_path(&namespace, &original_table);
+    for (metadata_dir, use_uri) in [(original_dir.as_str(), false), ("tables/table-id/metadata", true)] {
+        for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+            let backend = TestCatalogObjectBackend::default();
+            let current = format!("{metadata_dir}/00005.metadata.json");
+            let logged = format!("{metadata_dir}/00004.metadata.json");
+            let pinned = format!("{metadata_dir}/00003.metadata.json");
+            let unreadable = format!("{metadata_dir}/00002.metadata.json");
+            let orphan = format!("{metadata_dir}/00001.metadata.json");
+            let foreign = default_table_metadata_file_path(&namespace, &table, "foreign.metadata.json");
+            let location = if use_uri {
+                format!("s3://{bucket}/{current}")
+            } else {
+                current.clone()
+            };
+            let entry = test_table_entry(bucket, &namespace, &table, location.clone());
+            let object_store = ObjectTableCatalogStore::new(backend.clone());
+            seed_table_for_metadata_maintenance(&object_store, bucket, &namespace, &table, location).await;
+            seed_strong_snapshot(&backend, &test_strong_snapshot(bucket, &namespace, vec![entry], Vec::new())).await;
+            backend
+                .seed_object(
+                    bucket,
+                    &current,
+                    serde_json::to_vec(&serde_json::json!({
+                        "metadata-log": [{"metadata-file": format!("s3://{bucket}/{logged}")}],
+                        "current-snapshot-id": 2,
+                        "refs": {"keep": {"snapshot-id": 1, "type": "tag"}}
+                    }))
+                    .unwrap(),
+                )
+                .await;
+            backend.seed_object(bucket, &logged, b"{}".to_vec()).await;
+            backend
+                .seed_object(bucket, &pinned, br#"{"current-snapshot-id":1}"#.to_vec())
+                .await;
+            backend.seed_object(bucket, &unreadable, b"invalid JSON".to_vec()).await;
+            backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+            backend.seed_object(bucket, &foreign, b"{}".to_vec()).await;
+
+            let report = ConfiguredTableCatalogStore::new_for_test(backend, mode)
+                .diagnose_table_catalog(bucket, "sales", "orders", 0)
+                .await
+                .expect("diagnostics should follow the persisted metadata directory");
+            assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
+            assert_eq!(report.recovery_status, TableCatalogRecoveryStatus::Healthy);
+            assert_eq!(report.orphan_metadata_candidate_locations, vec![orphan]);
+            assert_eq!(report.catalog.backing_manifest, report.backing_manifest);
+        }
+    }
+}
+
+#[tokio::test]
+async fn durable_strong_catalog_diagnostics_reloads_when_snapshot_changes_during_scan() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let replacement = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let snapshot = test_strong_snapshot(
+        bucket,
+        &namespace,
+        vec![test_table_entry(bucket, &namespace, &table, current.clone())],
+        Vec::new(),
+    );
+    seed_strong_snapshot(&backend, &snapshot).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend
+        .seed_object(bucket, &replacement, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    let pause = backend.pause_next_read(bucket, &current).await;
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let task = tokio::spawn(async move { store.diagnose_table_catalog(bucket, "sales", "orders", 0).await });
+
+    pause.wait_started().await;
+    let mut replacement_snapshot = snapshot;
+    replacement_snapshot.tables[0].metadata_location = replacement.clone();
+    seed_strong_snapshot(&backend, &replacement_snapshot).await;
+    pause.release();
+
+    let diagnostics = task
+        .await
+        .expect("diagnostics task should finish")
+        .expect("diagnostics should retry against the replacement snapshot");
+    assert_eq!(diagnostics.catalog.table.metadata_location, replacement);
+}
+
+#[tokio::test]
+async fn durable_strong_catalog_diagnostics_bounds_retries_under_snapshot_churn() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let mut snapshot = test_strong_snapshot(
+        bucket,
+        &namespace,
+        vec![test_table_entry(bucket, &namespace, &table, current.clone())],
+        Vec::new(),
+    );
+    seed_strong_snapshot(&backend, &snapshot).await;
+    backend.seed_object(bucket, &current, b"{}".to_vec()).await;
+    let mut pause = backend.pause_next_read(bucket, &current).await;
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let task = tokio::spawn(async move { store.diagnose_table_catalog(bucket, "sales", "orders", 0).await });
+
+    for attempt in 0..STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS {
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+            .await
+            .expect("each diagnostic attempt must scan the metadata");
+        let next_pause = if attempt + 1 < STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS {
+            Some(backend.pause_next_read(bucket, &current).await)
+        } else {
+            None
+        };
+        snapshot.tables[0].version_token = format!("changed-{attempt}");
+        seed_strong_snapshot(&backend, &snapshot).await;
+        pause.release();
+        if let Some(next_pause) = next_pause {
+            pause = next_pause;
+        }
+    }
+
+    let error = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, task)
+        .await
+        .expect("diagnostics must stop at the retry bound")
+        .expect("diagnostics task should join")
+        .expect_err("an unstable snapshot must never produce a successful report");
+    assert_matches!(error, TableCatalogStoreError::Conflict(message)
+        if message == "durable strong catalog changed repeatedly while diagnosing table state");
+    assert_eq!(
+        backend.state.lock().await.read_attempts[&(bucket.to_string(), current)],
+        STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS
+    );
+}
+
+#[tokio::test]
+async fn durable_strong_catalog_diagnostics_uses_conservative_retention_default() {
+    let store =
+        ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), TableCatalogBackingMode::DurableStrong);
+
+    assert_eq!(
+        store
+            .get_table_catalog_diagnostics_retention("analytics", "sales", "orders")
+            .await
+            .expect("strong diagnostics retention should have a safe default"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn object_table_catalog_store_serializes_namespace_drop_with_table_creation() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
@@ -15747,8 +16000,29 @@ async fn diagnostics_backing_manifest_requires_recovery_before_migration() {
         .await
         .unwrap();
 
-    let diagnostics = store.diagnose_table_catalog(bucket, "sales", "orders", 0).await.unwrap();
+    let commit_object = backend.read_object(RUSTFS_META_BUCKET, &commit_path).await.unwrap().unwrap();
+    let mut finalized: CommitLogEntry = serde_json::from_slice(&commit_object.data).unwrap();
+    finalized.status = CommitLogStatus::Committed;
+    let read_key = (RUSTFS_META_BUCKET.to_string(), commit_path.clone());
+    let reads_before = backend.state.lock().await.read_attempts[&read_key];
+    let pause = backend.pause_next_read(RUSTFS_META_BUCKET, &commit_path).await;
+    let task = tokio::spawn(async move { store.diagnose_table_catalog(bucket, "sales", "orders", 0).await });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .expect("diagnostics should read the staged commit");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &commit_path, serde_json::to_vec(&finalized).unwrap())
+        .await;
+    pause.release();
+    let diagnostics = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, task)
+        .await
+        .expect("diagnostics should finish")
+        .unwrap()
+        .unwrap();
 
+    assert_eq!(backend.state.lock().await.read_attempts[&read_key] - reads_before, 1);
+    assert_eq!(diagnostics.catalog.backing_manifest, diagnostics.backing_manifest);
+    assert_eq!(diagnostics.commit_recovery.finalization_required_count, 1);
     assert_eq!(diagnostics.backing_manifest.current.wal.finalization_required_count, 1);
     assert_eq!(
         diagnostics.backing_manifest.migration.status,
@@ -15790,7 +16064,7 @@ async fn consistency_check_reports_invalid_metadata_location() {
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
-    let invalid_metadata = ".rustfs-table/warehouses/default/namespaces/sales/tables/other/metadata/00001.metadata.json";
+    let invalid_metadata = "s3://other-bucket/tables/table-id/metadata/00001.metadata.json";
 
     store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
     store

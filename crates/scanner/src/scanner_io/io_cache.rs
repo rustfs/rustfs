@@ -1189,8 +1189,14 @@ impl ScannerIOCache for SetDisks {
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner leader fence changed before checkpoint save"));
                                 }
+                                let Some(fence_store) = crate::resolve_scanner_object_store_handle() else {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(Error::other("scanner global cycle fence store is unavailable before checkpoint save"));
+                                };
                                 match persist_scanner_checkpoint(
                                     store_clone_clone.clone(),
+                                    fence_store,
                                     ScannerCheckpointPersistContext {
                                         ctx: &ctx_clone,
                                         expected_publication_epoch: expected_publication_epoch_clone,

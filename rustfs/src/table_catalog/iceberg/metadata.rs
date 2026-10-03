@@ -41,6 +41,16 @@ pub(crate) fn metadata_log_locations(
     namespace: &Namespace,
     table: &IdentifierSegment,
 ) -> BTreeSet<String> {
+    metadata_log_locations_matching(current_metadata, table_bucket, |location| {
+        is_valid_table_metadata_location(namespace, table, location)
+    })
+}
+
+pub(crate) fn metadata_log_locations_matching(
+    current_metadata: &serde_json::Value,
+    table_bucket: &str,
+    is_valid_location: impl Fn(&str) -> bool,
+) -> BTreeSet<String> {
     let mut locations = BTreeSet::new();
     let Some(metadata_log) = current_metadata.get("metadata-log").and_then(serde_json::Value::as_array) else {
         return locations;
@@ -54,7 +64,7 @@ pub(crate) fn metadata_log_locations(
         else {
             continue;
         };
-        if is_valid_table_metadata_location(namespace, table, &metadata_location) {
+        if is_valid_location(&metadata_location) {
             locations.insert(metadata_location);
         }
     }
@@ -73,6 +83,26 @@ pub(crate) async fn metadata_locations_for_protected_snapshot_refs<B>(
 where
     B: TableCatalogObjectBackend,
 {
+    metadata_locations_for_protected_snapshot_refs_matching(
+        backend,
+        table_bucket,
+        current_metadata,
+        metadata_locations,
+        |location| is_valid_table_metadata_location(namespace, table, location),
+    )
+    .await
+}
+
+pub(crate) async fn metadata_locations_for_protected_snapshot_refs_matching<B>(
+    backend: &B,
+    table_bucket: &str,
+    current_metadata: &serde_json::Value,
+    metadata_locations: &[String],
+    is_valid_location: impl Fn(&str) -> bool + Send,
+) -> TableCatalogStoreResult<BTreeSet<String>>
+where
+    B: TableCatalogObjectBackend,
+{
     let protected_snapshot_ids = protected_ref_snapshot_ids(current_metadata);
     if protected_snapshot_ids.is_empty() {
         return Ok(BTreeSet::new());
@@ -80,7 +110,7 @@ where
 
     let mut retained = BTreeSet::new();
     for metadata_location in metadata_locations {
-        if !is_valid_table_metadata_location(namespace, table, metadata_location) {
+        if !is_valid_location(metadata_location) {
             continue;
         }
         match read_table_metadata_value(backend, table_bucket, metadata_location).await {
