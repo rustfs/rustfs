@@ -12185,7 +12185,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 save_guard,
-                PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                PoolMetaPersistenceFence::Owned(Arc::clone(write_guard)),
                 &[source_pool_index],
             )
             .await?;

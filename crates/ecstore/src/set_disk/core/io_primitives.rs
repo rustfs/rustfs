@@ -6318,10 +6318,9 @@ pub(crate) mod rename_fanout_barrier {
         let key = (object.to_string(), disk_index, phase.into());
         let hooks = {
             let reg = lock();
-            match reg.armed.get(&key) {
-                Some(a) => Some((a.arrived.clone(), a.release.clone(), a.paused.clone())),
-                _ => None,
-            }
+            reg.armed
+                .get(&key)
+                .map(|a| (a.arrived.clone(), a.release.clone(), a.paused.clone()))
         };
         if let Some((arrived, release, paused)) = hooks {
             paused.store(true, Ordering::SeqCst);
@@ -9963,9 +9962,20 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging() {
+        let heal_sender_state = match rustfs_heal_contracts::heal_channel::get_heal_channel_sender() {
+            None => "not_initialized",
+            Some(sender) => {
+                assert!(sender.is_closed(), "the global heal receiver must not admit rollback inspection");
+                "closed"
+            }
+        };
+        // Spawned rollback coordinators share this current-thread recorder.
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             for fault in [
                 rollback_fault_injection::Fault::Io,
@@ -10017,6 +10027,8 @@ mod tests {
                     let _rename_fault = rename_fault_injection::fail_rename_on(&object, &[2, 3]);
                     let _undo_fault = rollback_fault_injection::arm(&object, 0, fault);
                     let receipt = RenameRollbackReceipt::default();
+                    let rejected_inspections_before =
+                        recorder.counter_value("rustfs_rename_rollback_inspection_total", &[("admission", "failed")]);
                     assert!(
                         SetDisks::rename_data_owned_with_fence(
                             &disks,
@@ -10030,6 +10042,16 @@ mod tests {
                         .is_err()
                     );
                     assert!(receipt.is_incomplete());
+                    let rejected_inspections =
+                        recorder.counter_value("rustfs_rename_rollback_inspection_total", &[("admission", "failed")]);
+                    assert_eq!(
+                        rejected_inspections,
+                        rejected_inspections_before + 1,
+                        "the actual rollback inspection must retain its rejected admission evidence"
+                    );
+                    eprintln!(
+                        "rollback inspection sender={heal_sender_state}, fault={fault:?}, early_ack={early_ack}, failed_admission_total={rejected_inspections}"
+                    );
                     if !matches!(fault, rollback_fault_injection::Fault::Io) {
                         assert!(
                             matches!(

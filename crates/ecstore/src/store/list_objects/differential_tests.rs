@@ -437,7 +437,7 @@ async fn list_objects_shared_corpus_fixed_seed_marker_and_prefix() {
     let markers = [None, Some("a"), Some("a/"), Some("a/b"), Some("b"), Some("space key")];
     // Replayable query generation over one static real namespace. No cross-page
     // snapshot guarantee is assumed for concurrent writers.
-    let mut seed = 0xec57_07_u64;
+    let mut seed = 0x00ec_5707_u64;
     for _ in 0..32 {
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         let prefix = prefixes[usize::try_from(seed % 5).expect("small prefix index")];
