@@ -2688,7 +2688,7 @@ async fn recover_corrupt_mrf_generation<S: ReplicationStorage>(
         ReplicationMetadataStore::MRF_REPLICATION_FILE,
         data,
         preconditions,
-        &guard,
+        guard,
     )
     .await
     {
