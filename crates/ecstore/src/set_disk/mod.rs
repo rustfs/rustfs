@@ -4306,6 +4306,14 @@ struct GetObjectMetadataCacheKey {
     hash: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GetObjectMetadataCacheLookupKey<'a> {
+    bucket: &'a str,
+    object: &'a str,
+    generation: u64,
+    hash: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GetObjectMetadataCacheGeneration {
     index: usize,
@@ -4391,6 +4399,33 @@ impl GetObjectMetadataCacheKey {
             generation: generation.value,
             hash: generation.hash,
         }
+    }
+}
+
+impl<'a> GetObjectMetadataCacheLookupKey<'a> {
+    fn new(bucket: &'a str, object: &'a str, generation: GetObjectMetadataCacheGeneration) -> Self {
+        Self {
+            bucket,
+            object,
+            generation: generation.value,
+            hash: generation.hash,
+        }
+    }
+}
+
+impl Hash for GetObjectMetadataCacheLookupKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+        self.generation.hash(state);
+    }
+}
+
+impl moka::Equivalent<GetObjectMetadataCacheKey> for GetObjectMetadataCacheLookupKey<'_> {
+    fn equivalent(&self, key: &GetObjectMetadataCacheKey) -> bool {
+        self.bucket == key.bucket.as_ref()
+            && self.object == key.object.as_ref()
+            && self.generation == key.generation
+            && self.hash == key.hash
     }
 }
 
