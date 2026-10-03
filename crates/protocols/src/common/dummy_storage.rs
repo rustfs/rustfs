@@ -29,6 +29,8 @@
 //! driver is dropped. SessionContext fixtures live next to the
 //! SessionContext type in common::session.
 
+#[cfg(feature = "webdav")]
+use crate::common::client::s3::SessionCapacityView;
 use crate::common::client::s3::StorageBackend;
 #[cfg(feature = "webdav")]
 use crate::common::session::SessionContext;
@@ -147,6 +149,8 @@ struct Inner {
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
     session_list_buckets: VecDeque<s3s::S3Result<ListBucketsOutput>>,
     last_session_list_context: Option<(http::HeaderMap, bool)>,
+    #[cfg(feature = "webdav")]
+    session_capacity_view: VecDeque<s3s::S3Result<Option<SessionCapacityView>>>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -204,6 +208,8 @@ impl Inner {
             list_buckets: VecDeque::new(),
             session_list_buckets: VecDeque::new(),
             last_session_list_context: None,
+            #[cfg(feature = "webdav")]
+            session_capacity_view: VecDeque::new(),
             create_bucket: VecDeque::new(),
             delete_bucket: VecDeque::new(),
             copy_object: VecDeque::new(),
@@ -359,6 +365,19 @@ impl DummyBackend {
     /// Return the context from the last session-aware list_buckets request.
     pub fn last_session_list_context(&self) -> Option<(http::HeaderMap, bool)> {
         self.inner.lock().expect("lock").last_session_list_context.clone()
+    }
+
+    /// Queue a session_capacity_view response; `None` models a backend that
+    /// cannot report capacity at all.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_ok(&self, view: Option<SessionCapacityView>) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Ok(view));
+    }
+
+    /// Queue a session_capacity_view error.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_err(&self, error: s3s::S3Error) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Err(error));
     }
 
     /// Queue a put_object error. Used by the commit_write retry tests
@@ -774,6 +793,23 @@ impl StorageBackend for DummyBackend {
             .session_list_buckets
             .pop_front()
             .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
+    }
+
+    /// Capacity reporting is opt-in; an empty queue models a backend without
+    /// capacity support so unrelated tests keep omitting quota properties.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> s3s::S3Result<Option<SessionCapacityView>> {
+        self.inner
+            .lock()
+            .expect("lock")
+            .session_capacity_view
+            .pop_front()
+            .unwrap_or(Ok(None))
     }
 
     async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
