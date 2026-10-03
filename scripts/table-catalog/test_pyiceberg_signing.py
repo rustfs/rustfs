@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
-from botocore.auth import S3SigV4Auth, SigV4Auth
+from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 from requests import Request, Response, Session
@@ -29,7 +29,6 @@ class PyIcebergSigningTest(unittest.TestCase):
     def setUp(self) -> None:
         self.deps = SimpleNamespace(
             botocore_auth=SigV4Auth,
-            botocore_s3_auth=S3SigV4Auth,
             botocore_credentials=Credentials,
             botocore_awsrequest=AWSRequest,
         )
@@ -43,9 +42,13 @@ class PyIcebergSigningTest(unittest.TestCase):
         ):
             return pyiceberg_smoke.parse_args()
 
-    def expected_signature(self, request: object, args: object, signer: object = S3SigV4Auth) -> str:
-        headers = {key: value for key, value in request.headers.items() if key.lower() != "authorization"}
-        expected = AWSRequest(method=request.method, url=request.url, data=request.body, headers=headers)
+    def expected_signature(self, request: object, args: object, signer: object = SigV4Auth) -> str:
+        headers = {key: value for key, value in request.headers.items() if key.lower() not in {"authorization", "x-amz-content-sha256"}}
+        body = request.body or b""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+        expected = AWSRequest(method=request.method, url=request.url, data=body, headers=headers)
         signer(Credentials(args.access_key, args.secret_key), args.rest_signing_name, args.region).add_auth(expected)
         return expected.headers["Authorization"]
 
