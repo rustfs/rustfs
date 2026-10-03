@@ -38,7 +38,7 @@ use s3s::dto::{
     SelectObjectContentEventStream, SelectObjectContentInput, SelectObjectContentOutput, SelectObjectContentRequest, Stats,
     StatsEvent,
 };
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use std::{
     fmt,
     future::poll_fn,
@@ -606,7 +606,15 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
 
     normalize_input_serialization(&mut input.request.input_serialization)?;
     let compressed_input = is_compressed_input(&input.request.input_serialization);
-    if compressed_input && input.request.scan_range.as_ref().is_some_and(is_noop_scan_range) {
+    if compressed_input
+        && input.request.scan_range.as_ref().is_some_and(is_noop_scan_range)
+        && !input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .is_some_and(|csv| csv.allow_quoted_record_delimiter.unwrap_or(false))
+    {
         input.request.scan_range = None;
     }
     validate_scan_range(&input.request)?;
@@ -670,12 +678,6 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         .get_or_insert_with(|| CompressionType::from_static(CompressionType::NONE));
 
     if let Some(csv) = input.csv.as_mut() {
-        if csv.allow_quoted_record_delimiter.unwrap_or(false) {
-            return Err(s3_error!(
-                NotImplemented,
-                "CSV AllowQuotedRecordDelimiter is not supported by SelectObjectContent"
-            ));
-        }
         let file_header_info = csv
             .file_header_info
             .get_or_insert_with(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
@@ -755,7 +757,7 @@ fn validate_scan_range_protocol(request: &SelectObjectContentRequest) -> Result<
         input_serialization.json.as_ref(),
         input_serialization.parquet.as_ref(),
     ) {
-        (Some(_), None, None) => true,
+        (Some(csv), None, None) => !csv.allow_quoted_record_delimiter.unwrap_or(false),
         (None, Some(json), None) if !is_json_document(json) => true,
         (None, None, Some(_)) => true,
         _ => false,
@@ -3534,6 +3536,66 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_quoted_record_delimiter_options() {
+        for allow in [None, Some(false), Some(true)] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("CSV input")
+                .allow_quoted_record_delimiter = allow;
+            validate_select_request(&HeaderMap::new(), &mut input).expect("CSV option should validate without ScanRange");
+            assert_eq!(
+                input
+                    .request
+                    .input_serialization
+                    .csv
+                    .as_ref()
+                    .expect("CSV input")
+                    .allow_quoted_record_delimiter,
+                allow
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_quoted_record_delimiters_with_scan_range() {
+        for compression in [CompressionType::NONE, CompressionType::GZIP, CompressionType::BZIP2] {
+            for range in [
+                ScanRange {
+                    start: Some(0),
+                    end: None,
+                },
+                ScanRange {
+                    start: Some(0),
+                    end: Some(10),
+                },
+                ScanRange {
+                    start: None,
+                    end: Some(10),
+                },
+            ] {
+                let mut input = base_input();
+                input
+                    .request
+                    .input_serialization
+                    .csv
+                    .as_mut()
+                    .expect("CSV input")
+                    .allow_quoted_record_delimiter = Some(true);
+                input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+                input.request.scan_range = Some(range);
+                let error = validate_select_request(&HeaderMap::new(), &mut input)
+                    .expect_err("quoted record delimiters cannot be combined with ScanRange");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequestParameter);
+                assert_eq!(error.message(), Some(INVALID_SCAN_RANGE_MESSAGE));
+            }
+        }
+    }
+
+    #[test]
     fn validate_accepts_single_unicode_csv_input_quotes() {
         for quote in ["ع", "界", "🦀"] {
             let mut input = base_input();
@@ -4006,14 +4068,23 @@ mod tests {
 
     #[test]
     fn validate_allows_scan_range_for_csv_as_request_parameter() {
-        let mut input = base_input();
-        input.request.scan_range = Some(ScanRange {
-            start: Some(0),
-            end: Some(10),
-        });
+        for allow in [None, Some(false)] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("CSV input")
+                .allow_quoted_record_delimiter = allow;
+            input.request.scan_range = Some(ScanRange {
+                start: Some(0),
+                end: Some(10),
+            });
 
-        validate_select_request(&HeaderMap::new(), &mut input).expect("csv scan range should validate");
-        validate_scan_range_for_object_size(&input.request, 16).expect("csv scan range should validate against object size");
+            validate_select_request(&HeaderMap::new(), &mut input).expect("csv scan range should validate");
+            validate_scan_range_for_object_size(&input.request, 16).expect("csv scan range should validate against object size");
+        }
     }
 
     #[test]

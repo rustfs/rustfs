@@ -40,8 +40,9 @@ use http_body_util::{BodyExt, Full};
 use metrics::counter;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::{
-    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
-    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+    AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
 };
 use std::sync::Once;
 use std::task::{Context, Poll};
@@ -62,15 +63,26 @@ pub(crate) const METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL: &str = "rustfs_ssec_plain
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
+/// Every header that carries, or announces, a customer-provided key: the
+/// object's own triple and the copy-source triple that CopyObject and
+/// UploadPartCopy use to read an SSE-C source.
+const SSEC_HEADERS: [&str; 6] = [
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+    AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_ALGORITHM,
+    AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY_MD5,
+];
+
 /// Whether the request carries any SSE-C header.
 ///
-/// Any one of the three is enough: an incomplete triple is still an attempt to
-/// use SSE-C, and it is rejected later for being incomplete — but the key may
-/// already have crossed the wire.
+/// Any one is enough: an incomplete triple is still an attempt to use SSE-C,
+/// and it is rejected later for being incomplete — but the key may already
+/// have crossed the wire. The copy-source triple counts the same as the
+/// object's own: it is the source object's key, sent in the clear just the same.
 fn carries_ssec_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM)
-        || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY)
-        || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5)
+    SSEC_HEADERS.iter().any(|name| headers.contains_key(*name))
 }
 
 /// Whether this request reached the server over TLS.
@@ -204,6 +216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_utils::http::headers::AMZ_COPY_SOURCE;
     use std::net::{IpAddr, SocketAddr};
 
     fn ssec_headers() -> HeaderMap {
@@ -242,6 +255,26 @@ mod tests {
         let mut only_md5 = HeaderMap::new();
         only_md5.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, HeaderValue::from_static("bWQ1"));
         assert!(carries_ssec_headers(&only_md5));
+    }
+
+    #[test]
+    fn copy_source_ssec_headers_count_as_an_ssec_request() {
+        // CopyObject / UploadPartCopy of an SSE-C source send the source key in
+        // the copy-source triple; each one alone must trip the guard.
+        for name in [
+            AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_ALGORITHM,
+            AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY,
+            AMZ_SERVER_SIDE_ENCRYPTION_COPY_CUSTOMER_KEY_MD5,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("dmFsdWU="));
+            assert!(carries_ssec_headers(&headers), "{name} must count as an SSE-C header");
+        }
+
+        // Other copy-source headers are not key material.
+        let mut copy_only = HeaderMap::new();
+        copy_only.insert(AMZ_COPY_SOURCE, HeaderValue::from_static("bucket/object"));
+        assert!(!carries_ssec_headers(&copy_only));
     }
 
     #[test]

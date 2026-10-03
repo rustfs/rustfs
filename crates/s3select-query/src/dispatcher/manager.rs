@@ -478,13 +478,15 @@ impl SimpleQueryDispatcher {
                 if let Some(quote) = csv.quote_character.as_ref() {
                     file_format = file_format.with_quote(quote.as_bytes().first().copied().unwrap_or_default());
                 }
-                if rustfs_s3select_api::csv_input_requires_normalization(
-                    csv.quote_character.as_deref(),
-                    csv.quote_escape_character.as_deref(),
-                ) {
+                if csv.allow_quoted_record_delimiter.unwrap_or(false)
+                    || rustfs_s3select_api::csv_input_requires_normalization(
+                        csv.quote_character.as_deref(),
+                        csv.quote_escape_character.as_deref(),
+                    )
+                {
                     file_format = file_format
                         .with_quote(b'"')
-                        .with_escape(None)
+                        .with_escape(csv.allow_quoted_record_delimiter.unwrap_or(false).then_some(b'\\'))
                         .with_delimiter(b',')
                         .with_terminator(Some(b'\n'))
                         .with_comment(None)
@@ -1579,6 +1581,84 @@ mod tests {
                 }
             }
             assert_eq!(rows, expected, "fixture={index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_reach_arrow_without_changing_field_values() {
+        let cases = [
+            (
+                "\"",
+                "\"",
+                ",",
+                "\n",
+                "\"a\nb\",tail\nnext,row\n",
+                vec![vec!["a\nb", "tail"], vec!["next", "row"]],
+            ),
+            ("\"", "\"", ",", "\r\n", "\"a\r\nb\",tail\r\n", vec![vec!["a\r\nb", "tail"]]),
+            ("\"", "\"", ",", "|", "\"a|b\",tail|", vec![vec!["a|b", "tail"]]),
+            ("\"", "\"", ",", "^Y", "\"a^Yb\",tail^Y", vec![vec!["a^Yb", "tail"]]),
+            ("ع", "\\", "界", "^Y", "عa^Ybع界عline\nbreakع^Y", vec![vec!["a^Yb", "line\nbreak"]]),
+            ("'", "\\", ";", "\n", "'a\\'\nb';tail\n", vec![vec!["a'\nb", "tail"]]),
+            ("\"", "\"", ",", "\n", "\"a\"\"\nb\",tail", vec![vec!["a\"\nb", "tail"]]),
+            ("\"", "\"", ",", "\n", "path\\,\"line\nbreak\"\n", vec![vec!["path\\", "line\nbreak"]]),
+            ("\"", "\"", "\r", "\n", "a\rb\n", vec![vec!["a", "b"]]),
+            ("\"", "\"", "\r\n", "\n", "a\r\nb\n", vec![vec!["a", "b"]]),
+        ];
+        let env = snapshot_test_env().await;
+        for (index, (quote, escape, field, record, data, expected)) in cases.into_iter().enumerate() {
+            for header in [FileHeaderInfo::NONE, FileHeaderInfo::USE, FileHeaderInfo::IGNORE] {
+                let mut input = test_input();
+                input.bucket = format!("select-quoted-records-{index}-{}", header.to_ascii_lowercase());
+                input.key = "records".to_owned();
+                let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+                csv.allow_quoted_record_delimiter = Some(true);
+                csv.file_header_info = Some(FileHeaderInfo::from_static(header));
+                if index != 0 {
+                    csv.quote_character = Some(quote.to_owned());
+                    csv.quote_escape_character = Some(escape.to_owned());
+                    csv.field_delimiter = Some(field.to_owned());
+                    csv.record_delimiter = (!matches!(field, "\r" | "\r\n")).then(|| record.to_owned());
+                }
+                let data = if header == FileHeaderInfo::NONE {
+                    data.to_owned()
+                } else {
+                    format!("{quote}first{record}name{quote}{field}second{record}{data}")
+                };
+                env.make_bucket(&input.bucket, false).await;
+                env.put_object_bytes(&input.bucket, &input.key, data.as_bytes().to_vec())
+                    .await;
+                let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+                let input = Arc::new(input);
+                let dispatcher = production_dispatcher(Arc::clone(&input));
+                let query = Query::new_with_snapshot(QueryContext { input }, "SELECT * FROM S3Object".to_owned(), snapshot);
+                let output = dispatcher.execute_query(&query).await.expect("execute multiline CSV query");
+                let mut stream = output.into_record_batch_stream().expect("record stream");
+                let mut rows = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.expect("Arrow must receive valid UTF-8 fields");
+                    if header == FileHeaderInfo::USE {
+                        assert_eq!(batch.schema().field(0).name(), &format!("first{record}name"));
+                    }
+                    for row in 0..batch.num_rows() {
+                        rows.push(
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| {
+                                    column
+                                        .as_any()
+                                        .downcast_ref::<StringArray>()
+                                        .expect("CSV string column")
+                                        .value(row)
+                                        .to_owned()
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                assert_eq!(rows, expected, "fixture={index}, header={header}");
+            }
         }
     }
 

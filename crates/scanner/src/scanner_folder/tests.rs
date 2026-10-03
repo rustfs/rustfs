@@ -26,7 +26,7 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
 
-mod checkpoint_fixture;
+pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
 
