@@ -281,7 +281,7 @@ use super::super::GetObjectMetadataCacheEntry;
 use super::super::GetObjectMetadataCacheKey;
 #[cfg(test)]
 use super::super::capacity_scope_from_disks;
-#[cfg(all(test, feature = "test-util"))]
+#[cfg(test)]
 use super::super::get_lock_acquire_timeout;
 use crate::bucket::lifecycle::{
     tier_delete_journal::{TierDeleteDispatchAuthorization, record_tier_delete_journal_backend_identity},
@@ -320,10 +320,13 @@ use crate::disk::format::FormatV3;
 use crate::disk::new_disk;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
+#[cfg(test)]
+use crate::object_api::WriteCompletion;
+use crate::object_api::write_commit_context::WriteCommitContext;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::object_api::{
     NamespaceLockFence, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
-    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, WriteCompletion,
+    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
 };
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
@@ -3499,6 +3502,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let write_context = WriteCommitContext::from_options(opts, bucket, object, publication_fence.is_some())?;
         let protect_write = opts.shard_integrity_write_enabled();
         let source_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
             Some(incarnation_id) => Some(incarnation_id),
@@ -4026,7 +4030,7 @@ impl SetDisks {
                         self.pool_index,
                         bucket,
                         object,
-                        opts.no_lock || object_lock_guard.is_some(),
+                        !write_context.acquires_namespace() || object_lock_guard.is_some(),
                         DecommissionCapacityAdmission::Mutation,
                     )
                     .await?;
@@ -4034,7 +4038,8 @@ impl SetDisks {
                 decommission_target_lock_covered = target_lock_covered;
                 decommission_capacity_guard = capacity_guard;
             }
-            if publication_fence.is_some() || (!opts.no_lock && object_lock_guard.is_none() && !decommission_target_lock_covered)
+            if publication_fence.is_some()
+                || (write_context.acquires_namespace() && object_lock_guard.is_none() && !decommission_target_lock_covered)
             {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
@@ -4382,10 +4387,11 @@ impl SetDisks {
             // complete rename fan-out drains. Keep this path synchronous so
             // its terminal state is known before the coordinator releases
             // remote leases.
-            let commit_owns_namespace_guard = commit_object_lock_guard.is_some()
+            let commit_owns_namespace_guard = write_context.has_borrowed_owner()
+                || commit_object_lock_guard.is_some()
                 || commit_decommission_object_lock_guard.is_some()
                 || commit_publication_guard.is_some();
-            let commit_allows_early_ack = opts.write_completion == WriteCompletion::Quorum
+            let commit_allows_early_ack = write_context.allows_early_ack(opts.write_completion)
                 && !(opts.data_movement && opts.has_decommission_capacity_reservation())
                 && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
@@ -4412,6 +4418,7 @@ impl SetDisks {
             tmp_cleanup_owned = true;
 
             let commit = move |cancellation: Option<CancellationToken>| async move {
+                let write_context = write_context;
                 let mut _object_lock_guard = commit_object_lock_guard;
                 let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
                 let mut _publication_guard = commit_publication_guard;
@@ -4427,6 +4434,7 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
+                        || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
                             .as_ref()
@@ -4486,6 +4494,7 @@ impl SetDisks {
                     }
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
+                        || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
                             .as_ref()
@@ -4671,6 +4680,7 @@ impl SetDisks {
                             guard_release_rx,
                             (
                                 object_lock_guard,
+                                write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
                                 decommission_object_lock_guard,
@@ -4691,6 +4701,7 @@ impl SetDisks {
                             },
                             move |(
                                 object_lock_guard,
+                                write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
                                 decommission_object_lock_guard,
@@ -4698,6 +4709,7 @@ impl SetDisks {
                             ),
                                   targets| async move {
                                 drop(object_lock_guard);
+                                drop(write_context);
                                 drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
                                 cleanup_set
@@ -19817,6 +19829,16 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("committed object must remain readable despite the failed tail");
         assert_eq!(info.size, TEST_OBJECT_SIZE as i64);
+        let mut read = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed body must remain readable despite the failed tail");
+        let mut body = Vec::new();
+        read.stream
+            .read_to_end(&mut body)
+            .await
+            .expect("committed body must stream completely after the failed tail");
+        assert_eq!(body, vec![b'1'; TEST_OBJECT_SIZE]);
     }
 
     #[tokio::test]
@@ -20004,6 +20026,93 @@ mod put_object_tmp_cleanup_tests {
 
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
+    async fn borrowed_write_context_rejects_wrong_namespace_and_cache_flag() {
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        let bucket = "borrowed-write-target";
+        let object = "owned-object";
+        let guard = crate::object_api::WriteCommitGuard::acquire(
+            &set.new_ns_lock(bucket, object).await.expect("namespace wrapper"),
+            get_lock_acquire_timeout(),
+        )
+        .await
+        .expect("outer write lock");
+        let mut opts = ObjectOptions::default();
+        opts.add_write_commit_guard(&guard);
+        assert!(matches!(
+            WriteCommitContext::from_options(&opts, bucket, "other-object", false),
+            Err(Error::InvalidArgument(..))
+        ));
+        assert!(matches!(
+            WriteCommitContext::from_options(&opts, bucket, "other-object", true),
+            Err(Error::InvalidArgument(..))
+        ));
+        let fake = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            WriteCommitContext::from_options(&fake, bucket, object, false),
+            Err(Error::InvalidArgument(..))
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn borrowed_tail_drained_put_keeps_owner_after_caller_cancel() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "borrowed-put-cancel";
+        let object = "borrowed-put-cancel-object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume");
+        }
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let tasks = rename_fanout_barrier::observe_tasks(object);
+        let writer = Arc::clone(&set);
+        let put = tokio::spawn(async move {
+            let guard = crate::object_api::WriteCommitGuard::acquire(
+                &writer.new_ns_lock(bucket, object).await.expect("namespace wrapper"),
+                get_lock_acquire_timeout(),
+            )
+            .await
+            .expect("outer write guard");
+            let mut opts = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            opts.add_write_commit_guard(&guard);
+            let mut reader = PutObjReader::from_vec(vec![b'b'; TEST_OBJECT_SIZE]);
+            writer.put_object(bucket, object, &mut reader, &opts).await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("borrowed commit reaches rename phase");
+        wait_for_paused_tail_metadata_quorum(&disks, bucket, object).await;
+        assert!(!put.is_finished(), "full-tail borrowed write remains pending");
+        put.abort();
+        assert!(put.await.expect_err("caller was canceled").is_cancelled());
+        let mut probe = Box::pin(set.acquire_write_lock_diag("borrowed_cancel_probe", bucket, object));
+        assert!(
+            futures::poll!(probe.as_mut()).is_pending(),
+            "commit must retain the real borrowed namespace owner"
+        );
+        barrier.release();
+        drop(
+            tokio::time::timeout(Duration::from_secs(30), probe)
+                .await
+                .expect("borrowed owner drains")
+                .expect("next writer acquires"),
+        );
+        assert_eq!(tasks.running(), 0, "all borrowed rename tasks are reaped before releasing the owner");
+        let info = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("committed borrowed write remains readable");
+        assert_eq!(info.size, TEST_OBJECT_SIZE as i64);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn no_lock_put_waits_for_rename_tail_under_outer_guard() {
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -20013,27 +20122,23 @@ mod put_object_tmp_cleanup_tests {
                 disk.make_volume(bucket).await.expect("bucket volume should be created");
             }
 
-            let outer_guard = set_disks
-                .acquire_write_lock_diag("outer_no_lock_put", bucket, object)
-                .await
-                .expect("the outer caller should hold the namespace guard");
+            let outer_guard = crate::object_api::WriteCommitGuard::acquire(
+                &set_disks.new_ns_lock(bucket, object).await.expect("outer namespace wrapper"),
+                get_lock_acquire_timeout(),
+            )
+            .await
+            .expect("the outer caller should hold the namespace guard");
             let rename_tasks = rename_fanout_barrier::observe_tasks(object);
             let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let mut opts = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            opts.add_write_commit_guard(&outer_guard);
             let put_store = Arc::clone(&set_disks);
             let put = tokio::spawn(async move {
                 let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
-                put_store
-                    .put_object(
-                        bucket,
-                        object,
-                        &mut reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            write_completion: WriteCompletion::TailDrained,
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                put_store.put_object(bucket, object, &mut reader, &opts).await
             });
 
             tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())

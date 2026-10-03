@@ -382,7 +382,11 @@ pub(crate) async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> 
 /// Persist-or-clear under an already-held state object lock. Normalizes the
 /// peer map exactly once (the historical persist path normalized twice with
 /// two full clones — P2-22).
-pub(crate) async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, mut state: SiteReplicationState) -> S3Result<()> {
+pub(crate) async fn persist_site_replication_state_no_lock(
+    store: Arc<ECStore>,
+    mut state: SiteReplicationState,
+    guard: &crate::storage_api::site_replication::WriteCommitGuard,
+) -> S3Result<()> {
     state.peers = normalize_peer_map_by_identity(state.peers);
     if state.peers.len() <= 1 && state.pending_rotation.is_none() && state.pending_remove.is_none() {
         match delete_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
@@ -392,7 +396,7 @@ pub(crate) async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, 
     } else {
         let data = serde_json::to_vec(&state)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
-        save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, data)
+        save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, data, guard)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))
     }
@@ -437,13 +441,13 @@ where
     F: FnOnce(SiteReplicationState) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = S3Result<(T, Option<SiteReplicationState>)>> + Send + 'static,
 {
-    with_site_replication_state_lock(move || async move {
+    with_site_replication_state_lock(move |write_guard| async move {
         let store = current_object_store_handle()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
         let state = load_site_replication_state_no_lock(store.clone()).await?;
         let (result, changed) = transaction(state).await?;
         if let Some(state) = changed {
-            persist_site_replication_state_no_lock(store, state).await?;
+            persist_site_replication_state_no_lock(store, state, &write_guard).await?;
         }
         Ok(result)
     })
@@ -457,13 +461,13 @@ where
     T: Send + 'static,
     F: FnOnce(&mut SiteReplicationState) -> S3Result<StateCommit<T>> + Send + 'static,
 {
-    with_site_replication_state_lock(move || async move {
+    with_site_replication_state_lock(move |write_guard| async move {
         let store = current_object_store_handle()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
         let mut state = load_site_replication_state_no_lock(store.clone()).await?;
         match update(&mut state)? {
             StateCommit::Changed(result) => {
-                persist_site_replication_state_no_lock(store, state).await?;
+                persist_site_replication_state_no_lock(store, state, &write_guard).await?;
                 Ok(result)
             }
             StateCommit::Unchanged(result) => Ok(result),

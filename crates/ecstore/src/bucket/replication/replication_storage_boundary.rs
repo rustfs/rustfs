@@ -19,7 +19,8 @@ use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{replication_state_from_filemeta, version_purge_status_from_filemeta};
 pub(crate) type ReplicationObjectStore = crate::store::ECStore;
 pub(crate) use crate::object_api::{
-    GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
+    GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ReplicationStatusWritebackCondition,
+    ReplicationStatusWritebackMode, WriteCommitGuard, WriteCompletion,
 };
 #[cfg(test)]
 pub(crate) use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence};

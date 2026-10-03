@@ -57,6 +57,11 @@ impl NamespaceLockWrapper {
         &self.owner
     }
 
+    /// The exact namespace key used by this acquisition wrapper.
+    pub fn resource(&self) -> &ObjectKey {
+        &self.resource
+    }
+
     /// Logical namespace label for diagnostics; local namespaces may share a manager.
     pub fn namespace(&self) -> &str {
         self.lock.namespace()

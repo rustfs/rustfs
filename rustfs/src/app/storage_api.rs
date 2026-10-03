@@ -1181,6 +1181,7 @@ pub(crate) mod bucket_usecase {
 
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
+    pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 
     pub(crate) mod object_cache {
         #[cfg(test)]

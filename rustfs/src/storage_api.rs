@@ -289,6 +289,7 @@ pub(crate) mod site_replication {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
+    pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
 
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
@@ -443,6 +444,7 @@ pub(crate) mod workload {
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
