@@ -26,12 +26,10 @@ use super::{
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
-    GET_METADATA_CACHE_REASON_CONFIG_UNVERIFIED, GET_METADATA_CACHE_REASON_DATA_MOVEMENT,
-    GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
-    GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_MUTATION_PENDING, GET_METADATA_CACHE_REASON_NO_LOCK,
-    GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED, GET_METADATA_CACHE_REASON_NOT_READ_DATA,
-    GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
+    GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
+    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
     GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
     GET_METADATA_CACHE_REASON_VERSIONED, GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_INTERNAL_META,
@@ -249,21 +247,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
     }
 }
 
-#[cfg(feature = "e2e-test-hooks")]
-async fn record_e2e_metadata_cache_decision(bucket: &str, object: &str, decision: &str, reason: &str) {
-    use tokio::io::AsyncWriteExt;
-
-    let Some(path) = std::env::var_os("RUSTFS_E2E_TEST_METADATA_CACHE_HIT_MARKER") else {
-        return;
-    };
-    let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await else {
-        return;
-    };
-    let _ = file
-        .write_all(format!("{decision}|{bucket}|{object}|{reason}\n").as_bytes())
-        .await;
-}
-
 impl SetDisks {
     /// A startup quorum can leave remote slots unregistered even after their
     /// peers become ready. Refresh those slots before taking the GET metadata
@@ -377,33 +360,16 @@ impl SetDisks {
     async fn get_object_metadata_cache_bypass_reason(
         &self,
         bucket: &str,
-        object: &str,
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Option<&'static str> {
         if let Some(reason) = get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data) {
             return Some(reason);
         }
-        if self.get_object_metadata_cache_mutation_pending(bucket, object) {
-            return Some(GET_METADATA_CACHE_REASON_MUTATION_PENDING);
-        }
-        if self.ctx.is_dist_erasure().await {
-            if !super::is_get_object_metadata_cache_distributed_enabled() {
-                return Some(GET_METADATA_CACHE_REASON_DIST_ERASURE);
-            }
-            let Some(notification_sys) = runtime_sources::notification_sys() else {
-                return Some(GET_METADATA_CACHE_REASON_CONFIG_UNVERIFIED);
-            };
-            return match notification_sys.object_metadata_cache_cluster_mode(true).await {
-                Ok(crate::services::notification_sys::ObjectMetadataCacheClusterMode::Enabled) => None,
-                Ok(
-                    crate::services::notification_sys::ObjectMetadataCacheClusterMode::Disabled
-                    | crate::services::notification_sys::ObjectMetadataCacheClusterMode::Inconsistent,
-                )
-                | Err(_) => Some(GET_METADATA_CACHE_REASON_CONFIG_UNVERIFIED),
-            };
-        }
-        None
+        self.ctx
+            .is_dist_erasure()
+            .await
+            .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -438,9 +404,6 @@ impl SetDisks {
             return MetadataCacheLookup::Miss;
         }
         if entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum {
-            #[cfg(feature = "e2e-test-hooks")]
-            record_e2e_metadata_cache_decision(bucket, object, GET_METADATA_CACHE_DECISION_HIT, GET_METADATA_CACHE_REASON_USABLE)
-                .await;
             MetadataCacheLookup::Hit(entry)
         } else {
             MetadataCacheLookup::RejectedInsufficientQuorum
@@ -610,13 +573,9 @@ impl SetDisks {
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let cache_bypass_reason = self
-            .get_object_metadata_cache_bypass_reason(bucket, object, opts, read_data)
-            .await;
+        let cache_bypass_reason = self.get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
         let use_metadata_cache = cache_bypass_reason.is_none();
         if let Some(reason) = cache_bypass_reason {
-            #[cfg(feature = "e2e-test-hooks")]
-            record_e2e_metadata_cache_decision(bucket, object, GET_METADATA_CACHE_DECISION_SKIP, reason).await;
             rustfs_io_metrics::record_get_object_metadata_cache_decision(
                 GET_OBJECT_PATH_SET_DISK,
                 GET_METADATA_CACHE_DECISION_SKIP,
@@ -625,14 +584,6 @@ impl SetDisks {
         } else if vid.is_empty() {
             match self.lookup_cached_get_object_fileinfo(bucket, object).await {
                 MetadataCacheLookup::Hit(cached) => {
-                    #[cfg(feature = "e2e-test-hooks")]
-                    record_e2e_metadata_cache_decision(
-                        bucket,
-                        object,
-                        GET_METADATA_CACHE_DECISION_HIT,
-                        GET_METADATA_CACHE_REASON_USABLE,
-                    )
-                    .await;
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_HIT,
@@ -646,14 +597,6 @@ impl SetDisks {
                     return Ok(GetObjectFileInfo::shared(cached));
                 }
                 MetadataCacheLookup::Miss => {
-                    #[cfg(feature = "e2e-test-hooks")]
-                    record_e2e_metadata_cache_decision(
-                        bucket,
-                        object,
-                        GET_METADATA_CACHE_DECISION_MISS,
-                        GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
-                    )
-                    .await;
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_MISS,
@@ -661,14 +604,6 @@ impl SetDisks {
                     );
                 }
                 MetadataCacheLookup::RejectedInsufficientQuorum => {
-                    #[cfg(feature = "e2e-test-hooks")]
-                    record_e2e_metadata_cache_decision(
-                        bucket,
-                        object,
-                        GET_METADATA_CACHE_DECISION_REJECT,
-                        GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
-                    )
-                    .await;
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_REJECT,
@@ -3734,7 +3669,7 @@ mod metadata_cache_tests {
 
     #[tokio::test]
     #[serial(metadata_cache_early_stop)]
-    async fn metadata_cache_production_fanout_cannot_publish_after_mutation_fence_begin() {
+    async fn metadata_cache_production_fanout_cannot_publish_after_invalidation() {
         // Isolated context: an ambient DistErasure window (another test's
         // SetupTypeGuard) would bypass metadata-cache publication entirely
         // and time out the barrier below.
@@ -3765,9 +3700,7 @@ mod metadata_cache_tests {
                 .await
         });
         barrier.wait_until_paused().await;
-        let mutation_id = Uuid::new_v4();
-        set.begin_get_object_metadata_cache_mutation_local(bucket, object, mutation_id)
-            .await;
+        set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
         let snapshot = read
             .await
@@ -3787,8 +3720,6 @@ mod metadata_cache_tests {
             set.cached_get_object_fileinfo(bucket, object).await.is_none(),
             "the production fanout token captured before invalidation must not publish afterward"
         );
-        assert!(set.get_object_metadata_cache_mutation_pending(bucket, object));
-        set.finish_get_object_metadata_cache_mutation_local(bucket, object, mutation_id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3819,7 +3750,6 @@ mod metadata_cache_tests {
 
         temp_env::async_with_vars(
             [
-                ("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
@@ -3859,7 +3789,7 @@ mod metadata_cache_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(metadata_cache_early_stop)]
-    async fn metadata_cache_early_stop_publication_is_fenced_by_mutation() {
+    async fn metadata_cache_early_stop_publication_is_fenced_by_invalidation() {
         let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         isolated_ctx
             .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
@@ -3884,7 +3814,6 @@ mod metadata_cache_tests {
 
         temp_env::async_with_vars(
             [
-                ("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
                 ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
@@ -3906,9 +3835,7 @@ mod metadata_cache_tests {
                         .await
                 });
                 barrier.wait_until_paused().await;
-                let mutation_id = Uuid::new_v4();
-                set.begin_get_object_metadata_cache_mutation_local(bucket, object, mutation_id)
-                    .await;
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
                 barrier.release();
 
                 let snapshot = read
@@ -3925,10 +3852,8 @@ mod metadata_cache_tests {
                 );
                 assert!(
                     set.cached_get_object_fileinfo(bucket, object).await.is_none(),
-                    "mutation fence must reject the quorum-selected early-stop publication"
+                    "invalidation must reject the quorum-selected early-stop publication"
                 );
-                assert!(set.get_object_metadata_cache_mutation_pending(bucket, object));
-                set.finish_get_object_metadata_cache_mutation_local(bucket, object, mutation_id);
             },
         )
         .await;
@@ -4025,24 +3950,13 @@ mod metadata_cache_tests {
 
         assert_eq!(
             distributed
-                .get_object_metadata_cache_bypass_reason("bucket", "object", &ObjectOptions::default(), true)
+                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
                 .await,
             Some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
         );
-        let mutation_id = Uuid::new_v4();
-        distributed
-            .begin_get_object_metadata_cache_mutation_local("bucket", "object", mutation_id)
-            .await;
-        assert_eq!(
-            distributed
-                .get_object_metadata_cache_bypass_reason("bucket", "object", &ObjectOptions::default(), true)
-                .await,
-            Some(GET_METADATA_CACHE_REASON_MUTATION_PENDING)
-        );
-        distributed.finish_get_object_metadata_cache_mutation_local("bucket", "object", mutation_id);
         assert_eq!(
             standalone
-                .get_object_metadata_cache_bypass_reason("bucket", "object", &ObjectOptions::default(), true)
+                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
                 .await,
             None
         );
@@ -4067,144 +3981,6 @@ mod metadata_cache_tests {
         assert!(first.cached_get_object_fileinfo("bucket", "object").await.is_none());
         assert!(second.cached_get_object_fileinfo("bucket", "object").await.is_some());
         assert_eq!(second.get_object_metadata_cache_generation("bucket", "object"), second_generation);
-    }
-
-    #[tokio::test]
-    async fn metadata_cache_mutation_fence_tracks_overlapping_ids_and_invalidates_old_entries() {
-        let set = new_metadata_cache_test_set().await;
-        let fi = valid_test_fileinfo("object");
-        let initial = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), initial, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
-        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
-
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        set.begin_get_object_metadata_cache_mutation_local("bucket", "object", first)
-            .await;
-        let after_first_begin = set
-            .get_object_metadata_cache_generation("bucket", "object")
-            .expect("generation should remain enabled during a mutation fence");
-        set.begin_get_object_metadata_cache_mutation_local("bucket", "object", first)
-            .await;
-        assert_eq!(
-            set.get_object_metadata_cache_generation("bucket", "object"),
-            Some(after_first_begin),
-            "a replayed Begin must not advance the same local fence generation twice"
-        );
-        set.begin_get_object_metadata_cache_mutation_local("bucket", "object", second)
-            .await;
-
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "object"));
-        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
-        assert_eq!(
-            set.get_object_metadata_cache_bypass_reason("bucket", "object", &ObjectOptions::default(), true)
-                .await,
-            Some(GET_METADATA_CACHE_REASON_MUTATION_PENDING)
-        );
-
-        set.finish_get_object_metadata_cache_mutation_local("bucket", "object", first);
-        assert!(
-            set.get_object_metadata_cache_mutation_pending("bucket", "object"),
-            "one terminal phase must not clear a concurrent mutation fence"
-        );
-        set.finish_get_object_metadata_cache_mutation_local("bucket", "object", second);
-        assert!(!set.get_object_metadata_cache_mutation_pending("bucket", "object"));
-        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn metadata_cache_global_mutation_fence_invalidates_and_tracks_overlapping_ids() {
-        let set = new_metadata_cache_test_set().await;
-        for object in ["prefix/a", "prefix/nested/b", "outside"] {
-            let fi = valid_test_fileinfo(object);
-            let generation = set.get_object_metadata_cache_generation("bucket", object);
-            set.cache_get_object_fileinfo(("bucket", object), generation, &fi, std::slice::from_ref(&fi), &[], 0)
-                .await;
-            assert!(set.cached_get_object_fileinfo("bucket", object).await.is_some());
-        }
-
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        set.begin_get_object_metadata_cache_all_mutation_local(first).await;
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "prefix/a"));
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "outside"));
-        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
-        set.begin_get_object_metadata_cache_all_mutation_local(first).await;
-        set.begin_get_object_metadata_cache_all_mutation_local(second).await;
-
-        set.finish_get_object_metadata_cache_all_mutation_local(first);
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "prefix/nested/b"));
-        set.finish_get_object_metadata_cache_all_mutation_local(second);
-        assert!(!set.get_object_metadata_cache_mutation_pending("bucket", "prefix/nested/b"));
-        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn metadata_cache_global_mutation_fence_overflow_disables_cache_fail_closed() {
-        let set = new_metadata_cache_test_set().await;
-        {
-            let mut pending = set
-                .get_object_metadata_cache_pending_all_mutations
-                .lock()
-                .expect("global pending mutation set should be available in the test");
-            for _ in 0..super::super::GET_OBJECT_METADATA_CACHE_MAX_GLOBAL_PENDING_MUTATIONS {
-                pending.insert(Uuid::new_v4());
-            }
-        }
-
-        set.begin_get_object_metadata_cache_all_mutation_local(Uuid::new_v4()).await;
-
-        assert!(set.get_object_metadata_cache_fence_overflowed_for_test());
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "any-object"));
-        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn metadata_cache_mutation_fence_overflow_disables_cache_fail_closed() {
-        let set = new_metadata_cache_test_set().await;
-        {
-            let mut pending = set
-                .get_object_metadata_cache_pending_mutations
-                .lock()
-                .expect("pending mutation map should be available in the test");
-            for index in 0..super::super::GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATION_KEYS {
-                pending.insert(("bucket".to_string(), format!("object-{index}")), std::collections::HashSet::new());
-            }
-        }
-
-        set.begin_get_object_metadata_cache_mutation_local("bucket", "overflow", Uuid::new_v4())
-            .await;
-
-        assert!(set.get_object_metadata_cache_fence_overflowed_for_test());
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "overflow"));
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "any-object"));
-        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn metadata_cache_mutation_fence_per_key_id_overflow_disables_cache_fail_closed() {
-        let set = new_metadata_cache_test_set().await;
-        {
-            let mut pending = set
-                .get_object_metadata_cache_pending_mutations
-                .lock()
-                .expect("pending mutation map should be available in the test");
-            pending.insert(
-                ("bucket".to_string(), "object".to_string()),
-                (0..super::super::GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATIONS_PER_KEY)
-                    .map(|_| Uuid::new_v4())
-                    .collect(),
-            );
-        }
-
-        set.begin_get_object_metadata_cache_mutation_local("bucket", "object", Uuid::new_v4())
-            .await;
-
-        assert!(set.get_object_metadata_cache_fence_overflowed_for_test());
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "object"));
-        assert!(set.get_object_metadata_cache_mutation_pending("bucket", "other-object"));
-        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
     #[tokio::test]

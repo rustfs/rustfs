@@ -42,7 +42,11 @@ use std::{
 use time::OffsetDateTime;
 use tokio::time::timeout;
 use tonic::Request;
-use tracing::warn;
+use tracing::{error, trace, warn};
+
+const EVENT_SERVER_PING: &str = "server_ping";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DIAGNOSTICS: &str = "diagnostics";
 
 use shadow_rs::shadow;
 
@@ -157,11 +161,22 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 
         let response: PingResponse = client.ping(request).await?.into_inner();
 
-        let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
-        if let Err(e) = ping_response_body {
-            eprintln!("{e}");
+        if flatbuffers::root::<PingBody>(&response.body).is_err() {
+            error!(
+                event = EVENT_SERVER_PING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+                result = "invalid_response",
+                "Server ping response decoding failed"
+            );
         } else {
-            println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
+            trace!(
+                event = EVENT_SERVER_PING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+                result = "success",
+                "Server ping completed"
+            );
         }
 
         Ok(())

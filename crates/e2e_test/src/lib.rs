@@ -224,9 +224,6 @@ mod cluster_multidrive_pool_test;
 #[cfg(test)]
 mod inline_fast_path_cluster_test;
 
-#[cfg(test)]
-mod object_metadata_cache_mutation_cluster_test;
-
 // backlog#2207: two-node gate for the cluster-authoritative tier stats contract.
 #[cfg(test)]
 mod tier_stats_cluster_test;

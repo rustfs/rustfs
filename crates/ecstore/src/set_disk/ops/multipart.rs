@@ -3337,14 +3337,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let transaction_epoch =
             transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&commit_disks, &mut parts_metadatas));
 
-        let metadata_cache_mutation_guard = match self.begin_get_object_metadata_cache_mutation(bucket, object).await {
-            Ok(guard) => guard,
-            Err(err) => {
-                quota_reservation.abort().await;
-                return Err(err);
-            }
-        };
-
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
         let commit_object = object.to_owned();
@@ -3368,7 +3360,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let detach_commit_owner =
             write_context.has_borrowed_owner() || commit_allows_early_ack || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
-            let mut metadata_cache_mutation_guard = metadata_cache_mutation_guard;
             let write_context = write_context;
             let mut _object_lock_guard = commit_object_lock_guard;
             let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
@@ -3474,9 +3465,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
             .await;
             if let Err(err) = pre_rename_result {
-                if let Some(guard) = metadata_cache_mutation_guard.take() {
-                    let _ = guard.abort().await;
-                }
                 SetDisks::abort_quota_reservation_after_fence(
                     quota_reservation,
                     &commit_disks,
@@ -3590,10 +3578,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             commit_set
                 .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                 .await;
-
-            if let Some(guard) = metadata_cache_mutation_guard.take() {
-                guard.commit().await?;
-            }
 
             drop(_object_lock_guard.take()); // release the object lock before multipart cleanup IO.
 

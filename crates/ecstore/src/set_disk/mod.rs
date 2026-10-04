@@ -435,99 +435,6 @@ impl Drop for ObjectLockDiagGuard {
     }
 }
 
-pub(crate) struct GetObjectMetadataCacheMutationGuard {
-    notification_sys: Arc<crate::services::notification_sys::NotificationSys>,
-    pending_mutations: Arc<std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>>,
-    pending_all_mutations: Arc<std::sync::Mutex<HashSet<Uuid>>>,
-    bucket: String,
-    object: String,
-    scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
-    mutation_id: Uuid,
-}
-
-fn finish_get_object_metadata_cache_mutation(
-    pending: &std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>,
-    bucket: &str,
-    object: &str,
-    mutation_id: Uuid,
-) {
-    let mut pending = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (bucket.to_owned(), object.to_owned());
-    if let Some(mutations) = pending.get_mut(&key) {
-        mutations.remove(&mutation_id);
-        if mutations.is_empty() {
-            pending.remove(&key);
-        }
-    }
-}
-
-fn finish_get_object_metadata_cache_mutation_scope(
-    scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
-    pending: &std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>,
-    pending_all: &std::sync::Mutex<HashSet<Uuid>>,
-    bucket: &str,
-    object: &str,
-    mutation_id: Uuid,
-) {
-    match scope {
-        rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object => {
-            finish_get_object_metadata_cache_mutation(pending, bucket, object, mutation_id);
-        }
-        rustfs_protos::ObjectMetadataCacheMutationRpcScope::All => {
-            pending_all
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&mutation_id);
-        }
-    }
-}
-
-impl GetObjectMetadataCacheMutationGuard {
-    pub(crate) async fn commit(self) -> Result<()> {
-        self.notification_sys
-            .mutate_object_metadata_cache_on_peers_scoped(
-                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Commit,
-                self.mutation_id,
-                &self.bucket,
-                &self.object,
-                self.scope,
-                true,
-            )
-            .await?;
-        finish_get_object_metadata_cache_mutation_scope(
-            self.scope,
-            &self.pending_mutations,
-            &self.pending_all_mutations,
-            &self.bucket,
-            &self.object,
-            self.mutation_id,
-        );
-        Ok(())
-    }
-
-    pub(crate) async fn abort(self) -> Result<()> {
-        self.notification_sys
-            .mutate_object_metadata_cache_on_peers_scoped(
-                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
-                self.mutation_id,
-                &self.bucket,
-                &self.object,
-                self.scope,
-                true,
-            )
-            .await?;
-        finish_get_object_metadata_cache_mutation_scope(
-            self.scope,
-            &self.pending_mutations,
-            &self.pending_all_mutations,
-            &self.bucket,
-            &self.object,
-            self.mutation_id,
-        );
-        Ok(())
-    }
-}
-
 struct SetDiskLockGuardedReader {
     inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
     guard: Option<ObjectLockDiagGuard>,
@@ -792,9 +699,6 @@ const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Incre
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
 const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
-const GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATION_KEYS: usize = 4096;
-const GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATIONS_PER_KEY: usize = 64;
-const GET_OBJECT_METADATA_CACHE_MAX_GLOBAL_PENDING_MUTATIONS: usize = 64;
 
 // --- Codec Streaming Configuration ---
 
@@ -883,8 +787,6 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
-const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE";
-const DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE: bool = false;
 
 // Opt-in non-inline data-read quorum early-stop rollout (backlog#1309). The
 // existing metadata fanout still reads data-bearing metadata; this gate only
@@ -2614,26 +2516,6 @@ fn is_get_metadata_data_read_early_stop_enabled() -> bool {
     }
 }
 
-pub(crate) fn is_get_object_metadata_cache_distributed_enabled() -> bool {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_bool(
-            ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
-            DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
-        )
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_bool(
-                ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
-                DEFAULT_RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE,
-            )
-        })
-    }
-}
-
 fn is_get_metadata_non_inline_data_read_early_stop_enabled() -> bool {
     #[cfg(test)]
     {
@@ -4020,12 +3902,6 @@ pub struct SetDisks {
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
-    /// Object keys whose distributed mutation fence has begun but has not
-    /// reached a terminal phase on this process. Clones share this state.
-    get_object_metadata_cache_pending_mutations: Arc<std::sync::Mutex<HashMap<(String, String), HashSet<Uuid>>>>,
-    get_object_metadata_cache_pending_all_mutations: Arc<std::sync::Mutex<HashSet<Uuid>>>,
-    /// Fail-closed latch set if pending-key tracking exceeds its bound.
-    get_object_metadata_cache_fence_overflowed: Arc<AtomicBool>,
     /// GET codecs keyed by every persisted layout dimension that affects
     /// decoding. Clones of a set share the memoized shells.
     erasure_cache: Arc<ErasureCache>,
@@ -4671,219 +4547,6 @@ impl SetDisks {
         self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
     }
 
-    /// Begin a local cache fence for one distributed object mutation.
-    ///
-    /// The caller must not commit the object mutation until every serving peer
-    /// has acknowledged the matching begin phase. Pending keys remain
-    /// fail-closed if the caller is cancelled or a later phase is uncertain.
-    pub async fn begin_get_object_metadata_cache_mutation_local(&self, bucket: &str, object: &str, mutation_id: Uuid) {
-        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire) {
-            return;
-        }
-
-        let (overflowed, inserted) = {
-            let mut pending = self
-                .get_object_metadata_cache_pending_mutations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key = (bucket.to_owned(), object.to_owned());
-            if !pending.contains_key(&key) && pending.len() >= GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATION_KEYS {
-                pending.clear();
-                (true, false)
-            } else if pending.get(&key).is_some_and(|mutations| {
-                mutations.len() >= GET_OBJECT_METADATA_CACHE_MAX_PENDING_MUTATIONS_PER_KEY && !mutations.contains(&mutation_id)
-            }) {
-                pending.clear();
-                (true, false)
-            } else {
-                (false, pending.entry(key).or_default().insert(mutation_id))
-            }
-        };
-
-        if overflowed {
-            self.get_object_metadata_cache_fence_overflowed.store(true, Ordering::Release);
-            self.invalidate_all_get_object_metadata_cache();
-            return;
-        }
-
-        if !inserted {
-            return;
-        }
-
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
-    }
-
-    /// Begin a local full-cache fence for a mutation that can remove many object keys.
-    pub async fn begin_get_object_metadata_cache_all_mutation_local(&self, mutation_id: Uuid) {
-        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire) {
-            return;
-        }
-        let (overflowed, inserted) = {
-            let mut pending = self
-                .get_object_metadata_cache_pending_all_mutations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !pending.contains(&mutation_id) && pending.len() >= GET_OBJECT_METADATA_CACHE_MAX_GLOBAL_PENDING_MUTATIONS {
-                pending.clear();
-                (true, false)
-            } else {
-                (false, pending.insert(mutation_id))
-            }
-        };
-        if overflowed {
-            self.get_object_metadata_cache_fence_overflowed.store(true, Ordering::Release);
-            self.invalidate_all_get_object_metadata_cache();
-            return;
-        }
-        if inserted {
-            self.invalidate_all_get_object_metadata_cache();
-        }
-    }
-
-    /// Complete one local mutation fence. A duplicate or reordered terminal
-    /// message only removes its own id and cannot clear another mutation.
-    pub fn finish_get_object_metadata_cache_mutation_local(&self, bucket: &str, object: &str, mutation_id: Uuid) {
-        finish_get_object_metadata_cache_mutation(&self.get_object_metadata_cache_pending_mutations, bucket, object, mutation_id);
-    }
-
-    pub fn finish_get_object_metadata_cache_all_mutation_local(&self, mutation_id: Uuid) {
-        self.get_object_metadata_cache_pending_all_mutations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&mutation_id);
-    }
-
-    pub(crate) fn get_object_metadata_cache_mutation_pending(&self, bucket: &str, object: &str) -> bool {
-        if self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire)
-            || !self
-                .get_object_metadata_cache_pending_all_mutations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        {
-            return true;
-        }
-        self.get_object_metadata_cache_pending_mutations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&(bucket.to_owned(), object.to_owned()))
-    }
-
-    pub(crate) async fn begin_get_object_metadata_cache_mutation(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
-        self.begin_get_object_metadata_cache_mutation_with_scope(
-            bucket,
-            object,
-            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object,
-        )
-        .await
-    }
-
-    pub(crate) async fn begin_get_object_metadata_cache_all_mutation(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
-        self.begin_get_object_metadata_cache_mutation_with_scope(
-            bucket,
-            prefix,
-            rustfs_protos::ObjectMetadataCacheMutationRpcScope::All,
-        )
-        .await
-    }
-
-    async fn begin_get_object_metadata_cache_mutation_with_scope(
-        &self,
-        bucket: &str,
-        object: &str,
-        scope: rustfs_protos::ObjectMetadataCacheMutationRpcScope,
-    ) -> Result<Option<GetObjectMetadataCacheMutationGuard>> {
-        if crate::bucket::utils::is_meta_bucketname(bucket) || !self.ctx.is_dist_erasure().await {
-            return Ok(None);
-        }
-        let local_cache_enabled = is_get_object_metadata_cache_distributed_enabled();
-        let Some(notification_sys) = runtime_sources::notification_sys() else {
-            return if local_cache_enabled {
-                Err(Error::other("object metadata cache configuration cannot be verified before peer setup"))
-            } else {
-                Ok(None)
-            };
-        };
-        match notification_sys
-            .object_metadata_cache_cluster_mode(local_cache_enabled)
-            .await?
-        {
-            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Disabled => return Ok(None),
-            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Inconsistent => {
-                return Err(Error::other("object metadata cache configuration differs across cluster peers"));
-            }
-            crate::services::notification_sys::ObjectMetadataCacheClusterMode::Enabled => {}
-        }
-
-        let mutation_id = Uuid::new_v4();
-        match scope {
-            rustfs_protos::ObjectMetadataCacheMutationRpcScope::Object => {
-                self.begin_get_object_metadata_cache_mutation_local(bucket, object, mutation_id)
-                    .await;
-            }
-            rustfs_protos::ObjectMetadataCacheMutationRpcScope::All => {
-                self.begin_get_object_metadata_cache_all_mutation_local(mutation_id).await;
-            }
-        }
-        if let Err(begin_error) = notification_sys
-            .mutate_object_metadata_cache_on_peers_scoped(
-                rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Begin,
-                mutation_id,
-                bucket,
-                object,
-                scope,
-                local_cache_enabled,
-            )
-            .await
-        {
-            if notification_sys
-                .mutate_object_metadata_cache_on_peers_scoped(
-                    rustfs_protos::ObjectMetadataCacheMutationRpcPhase::Abort,
-                    mutation_id,
-                    bucket,
-                    object,
-                    scope,
-                    local_cache_enabled,
-                )
-                .await
-                .is_ok()
-            {
-                finish_get_object_metadata_cache_mutation_scope(
-                    scope,
-                    &self.get_object_metadata_cache_pending_mutations,
-                    &self.get_object_metadata_cache_pending_all_mutations,
-                    bucket,
-                    object,
-                    mutation_id,
-                );
-            }
-            return Err(begin_error);
-        }
-
-        Ok(Some(GetObjectMetadataCacheMutationGuard {
-            notification_sys,
-            pending_mutations: Arc::clone(&self.get_object_metadata_cache_pending_mutations),
-            pending_all_mutations: Arc::clone(&self.get_object_metadata_cache_pending_all_mutations),
-            bucket: bucket.to_owned(),
-            object: object.to_owned(),
-            scope,
-            mutation_id,
-        }))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_object_metadata_cache_fence_overflowed_for_test(&self) -> bool {
-        self.get_object_metadata_cache_fence_overflowed.load(Ordering::Acquire)
-    }
-
     pub(crate) async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
         let hash = self.get_object_metadata_cache_hash(bucket, object);
         let hash_bytes = hash.to_le_bytes();
@@ -5167,9 +4830,6 @@ impl SetDisks {
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>(),
             ),
-            get_object_metadata_cache_pending_mutations: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            get_object_metadata_cache_pending_all_mutations: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            get_object_metadata_cache_fence_overflowed: Arc::new(AtomicBool::new(false)),
             erasure_cache: Arc::new(ErasureCache::new()),
             lockers,
             shared_lockers,
@@ -6528,11 +6188,6 @@ impl SetDisks {
         }
         ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
 
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
-        let metadata_cache_mutation_guard = self
-            .begin_get_object_metadata_cache_mutation(bucket, object)
-            .await
-            .map_err(|err| Error::other(err.to_string()))?;
         let disks = self.disks.read().await.clone();
         let futures = disks.into_iter().map(|disk| {
             let file_info = fi.clone();
@@ -6554,14 +6209,8 @@ impl SetDisks {
         }
 
         ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
-        let result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
-        if result.is_ok() {
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
-            if let Some(guard) = metadata_cache_mutation_guard {
-                guard.commit().await.map_err(|err| Error::other(err.to_string()))?;
-            }
-        }
-        result
+
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 
     async fn count_decommission_tier_free_version_equivalents(&self, bucket: &str, object: &str, fi: &FileInfo) -> Result<usize> {
@@ -6672,11 +6321,6 @@ impl SetDisks {
                 achieved: 0,
             });
         }
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
-        let metadata_cache_mutation_guard = self
-            .begin_get_object_metadata_cache_mutation(bucket, object)
-            .await
-            .map_err(|err| Error::other(err.to_string()))?;
         // Rebuilt tiered metadata starts with index zero, but shuffling validates
         // each source slot before assigning the shuffled index below.
         let parts_metadata: Vec<FileInfo> = (0..disks.len())
@@ -6709,34 +6353,7 @@ impl SetDisks {
             }
         }
 
-        if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-            || opts
-                .namespace_lock_fence
-                .as_ref()
-                .is_some_and(NamespaceLockFence::is_lock_lost)
-            || opts
-                .bucket_lifecycle_lock_fence
-                .as_ref()
-                .is_some_and(NamespaceLockFence::is_lock_lost)
-            || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-        {
-            return Err(StorageError::NamespaceLockQuorumUnavailable {
-                mode: "decommission_tiered_object_commit",
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                required: 1,
-                achieved: 0,
-            });
-        }
-
-        let result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
-        if result.is_ok() {
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
-            if let Some(guard) = metadata_cache_mutation_guard {
-                guard.commit().await.map_err(|err| Error::other(err.to_string()))?;
-            }
-        }
-        result
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 }
 

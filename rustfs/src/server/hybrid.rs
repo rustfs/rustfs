@@ -79,11 +79,11 @@ where
     /// as a REST request
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         if is_grpc_request(&req) {
-            let observe_rename_data = rename_data_grpc_stage(req.uri().path());
+            let observe_rename_data = rustfs_io_metrics::put_stage_metrics_enabled() && rename_data_grpc_stage(req.uri().path());
             HybridFuture::Grpc {
                 grpc_future: self.grpc.call(req),
                 observe_rename_data,
-                service_future_started: rustfs_io_metrics::put_stage_timer(),
+                service_future_started: observe_rename_data.then(Instant::now),
             }
         } else {
             HybridFuture::Rest {

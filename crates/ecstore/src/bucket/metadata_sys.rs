@@ -4747,6 +4747,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn quota_admission_rejects_stale_cached_no_quota() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("scoped metadata system");
+        let bucket = "stale-no-quota-admission";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let (stale, _) = sys.read().await.get_config(bucket).await.expect("cache initial metadata");
+        store
+            .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+            .await
+            .expect("publish quota to authoritative storage");
+        // Model a peer that has not received the newer configuration snapshot.
+        sys.read().await.set(bucket.to_owned(), stale).await;
+        assert!(
+            get_cached_quota_config_and_incarnation_in(&store.ctx, bucket)
+                .await
+                .expect("read stale cache")
+                .expect("cached bucket identity")
+                .quota
+                .is_none()
+        );
+
+        temp_env::async_with_vars([("RUSTFS_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_FAST_PATH", Some("true"))], async {
+            let error = crate::bucket::quota::reservation::begin(&store.ctx, bucket, "object", &ObjectOptions::default(), 0, 0)
+                .await
+                .err()
+                .expect("persisted quota must reject admission without its snapshot");
+            assert!(matches!(error, Error::PartMissingOrCorrupt), "{error:?}");
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn stale_config_request_cannot_mutate_a_recreated_bucket() {

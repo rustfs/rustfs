@@ -27,7 +27,7 @@ use futures::{StreamExt, stream};
 use rustfs_lock::NamespaceLockGuard;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -41,12 +41,9 @@ const EVENT_QUOTA_LEDGER_SETTLEMENT: &str = "quota_ledger_settlement";
 const EVENT_QUOTA_ADMISSION: &str = "quota_admission";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
-const SAFE_NO_QUOTA_CACHE_FAST_PATH_ENV: &str = "RUSTFS_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_FAST_PATH";
 
 #[cfg(any(test, feature = "test-util"))]
 static FAIL_NEXT_LEDGER_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(any(test, feature = "test-util"))]
-static SAFE_NO_QUOTA_CACHE_FAST_PATH_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Lock order: caller-held destination object/upload, bucket metadata
 // transaction (read), operation reservation, then quota ledger.
@@ -516,51 +513,31 @@ pub(crate) async fn begin(
         metadata_lock_started,
     );
     let cache_lookup_started = rustfs_io_metrics::put_stage_timer();
-    let cached_quota_snapshot = match metadata_sys::get_cached_quota_config_and_incarnation_in(ctx, bucket).await {
-        Ok(Some(snapshot)) => {
-            rustfs_io_metrics::record_put_object_quota_cache_decision("candidate", quota_cache_reason(snapshot.quota.as_ref()));
-            Some(snapshot)
+    let cached_quota_snapshot = if rustfs_io_metrics::put_stage_metrics_enabled() {
+        match metadata_sys::get_cached_quota_config_and_incarnation_in(ctx, bucket).await {
+            Ok(Some(snapshot)) => {
+                rustfs_io_metrics::record_put_object_quota_cache_decision(
+                    "candidate",
+                    quota_cache_reason(snapshot.quota.as_ref()),
+                );
+                Some(snapshot)
+            }
+            Ok(None) => {
+                rustfs_io_metrics::record_put_object_quota_cache_decision("miss", "no_authoritative_cache");
+                None
+            }
+            Err(_) => {
+                rustfs_io_metrics::record_put_object_quota_cache_decision("miss", "invalid_cached_quota");
+                None
+            }
         }
-        Ok(None) => {
-            rustfs_io_metrics::record_put_object_quota_cache_decision("miss", "no_authoritative_cache");
-            None
-        }
-        Err(_) => {
-            rustfs_io_metrics::record_put_object_quota_cache_decision("miss", "invalid_cached_quota");
-            None
-        }
+    } else {
+        None
     };
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP,
         cache_lookup_started,
     );
-    if safe_no_quota_cache_fast_path_enabled()
-        && let Some(cached) = cached_quota_snapshot.as_ref()
-        && cached.quota.is_none()
-        && !cached.bucket_incarnation.is_nil()
-    {
-        let safe_hit_started = rustfs_io_metrics::put_stage_timer();
-        rustfs_io_metrics::record_put_object_quota_cache_decision("safe_fast_path_hit", "no_quota");
-        rustfs_io_metrics::record_put_object_stage_duration_from(
-            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT,
-            safe_hit_started,
-        );
-        return Ok(QuotaContext {
-            store: None,
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            ledger_object: ledger_object(bucket),
-            bucket_incarnation: None,
-            quota_revision: None,
-            quota_limit: None,
-            capability_proof: None,
-            snapshot_admission: None,
-            legacy_data_movement: false,
-            metadata_guard: Some(metadata_guard),
-            pool_index: Some(pool_index),
-            set_index: Some(set_index),
-        });
-    }
     let config_read_started = rustfs_io_metrics::put_stage_timer();
     let (quota, bucket_incarnation, quota_revision) =
         metadata_sys::get_quota_config_and_incarnation_from_disk_for_options_in(ctx, bucket, opts, &metadata_guard).await?;
@@ -689,21 +666,6 @@ pub(crate) async fn begin(
         metadata_guard: Some(metadata_guard),
         pool_index: Some(pool_index),
         set_index: Some(set_index),
-    })
-}
-
-fn safe_no_quota_cache_fast_path_enabled() -> bool {
-    #[cfg(any(test, feature = "test-util"))]
-    if SAFE_NO_QUOTA_CACHE_FAST_PATH_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(SAFE_NO_QUOTA_CACHE_FAST_PATH_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
     })
 }
 
@@ -1052,25 +1014,6 @@ async fn save_ledger_locked(
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn fail_next_quota_ledger_save_for_test() {
     FAIL_NEXT_LEDGER_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(any(test, feature = "test-util"))]
-pub struct SafeNoQuotaCacheFastPathGuard {
-    previous: bool,
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl Drop for SafeNoQuotaCacheFastPathGuard {
-    fn drop(&mut self) {
-        SAFE_NO_QUOTA_CACHE_FAST_PATH_FOR_TEST.store(self.previous, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-#[allow(dead_code, reason = "exercised by integration tests behind `--features test-util`")]
-pub fn enable_safe_no_quota_cache_fast_path_for_test() -> SafeNoQuotaCacheFastPathGuard {
-    let previous = SAFE_NO_QUOTA_CACHE_FAST_PATH_FOR_TEST.swap(true, std::sync::atomic::Ordering::Relaxed);
-    SafeNoQuotaCacheFastPathGuard { previous }
 }
 
 fn log_admission_rejected(bucket: &str, object: &str, state: &'static str) {

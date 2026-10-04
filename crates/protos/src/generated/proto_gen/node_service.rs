@@ -1092,34 +1092,6 @@ pub struct LoadBucketMetadataResponse {
     pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ObjectMetadataCacheMutationRequest {
-    #[prost(uint32, tag = "1")]
-    pub protocol_version: u32,
-    #[prost(uint32, tag = "2")]
-    pub phase: u32,
-    #[prost(bytes = "bytes", tag = "3")]
-    pub mutation_id: ::prost::bytes::Bytes,
-    #[prost(string, tag = "4")]
-    pub bucket: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub object: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "6")]
-    pub scope: u32,
-    #[prost(bool, tag = "7")]
-    pub cache_enabled: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ObjectMetadataCacheMutationResponse {
-    #[prost(bool, tag = "1")]
-    pub success: bool,
-    #[prost(string, optional, tag = "2")]
-    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bytes = "bytes", tag = "3")]
-    pub response_proof: ::prost::bytes::Bytes,
-    #[prost(bool, tag = "4")]
-    pub cache_enabled: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteBucketMetadataRequest {
     #[prost(string, tag = "1")]
     pub bucket: ::prost::alloc::string::String,
@@ -3005,21 +2977,6 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "LoadBucketMetadata"));
             self.inner.unary(req, path, codec).await
         }
-        pub async fn mutate_object_metadata_cache(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ObjectMetadataCacheMutationRequest>,
-        ) -> std::result::Result<tonic::Response<super::ObjectMetadataCacheMutationResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/MutateObjectMetadataCache");
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("node_service.NodeService", "MutateObjectMetadataCache"));
-            self.inner.unary(req, path, codec).await
-        }
         pub async fn delete_bucket_metadata(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteBucketMetadataRequest>,
@@ -3753,10 +3710,6 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::LoadBucketMetadataRequest>,
         ) -> std::result::Result<tonic::Response<super::LoadBucketMetadataResponse>, tonic::Status>;
-        async fn mutate_object_metadata_cache(
-            &self,
-            request: tonic::Request<super::ObjectMetadataCacheMutationRequest>,
-        ) -> std::result::Result<tonic::Response<super::ObjectMetadataCacheMutationResponse>, tonic::Status>;
         async fn delete_bucket_metadata(
             &self,
             request: tonic::Request<super::DeleteBucketMetadataRequest>,
@@ -5952,34 +5905,6 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LoadBucketMetadataSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
-                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/node_service.NodeService/MutateObjectMetadataCache" => {
-                    #[allow(non_camel_case_types)]
-                    struct MutateObjectMetadataCacheSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::ObjectMetadataCacheMutationRequest> for MutateObjectMetadataCacheSvc<T> {
-                        type Response = super::ObjectMetadataCacheMutationResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::ObjectMetadataCacheMutationRequest>) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move { <T as NodeService>::mutate_object_metadata_cache(&inner, request).await };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = MutateObjectMetadataCacheSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

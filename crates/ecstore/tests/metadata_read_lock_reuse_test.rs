@@ -21,8 +21,8 @@ use std::time::Duration;
 use storage_api::contract_compat::ECStore;
 use storage_api::metadata_lock::{
     BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, enable_safe_no_quota_cache_fast_path_for_test,
-    init_bucket_metadata_sys, isolated_store_over_temp_disks,
+    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys,
+    isolated_store_over_temp_disks,
 };
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -172,11 +172,10 @@ async fn reused_metadata_lock_still_enforces_quota() {
 }
 
 #[tokio::test]
-async fn safe_no_quota_cache_fast_path_does_not_ignore_later_quota() {
-    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+async fn authoritative_quota_read_does_not_ignore_later_quota() {
     let (_dirs, store) = isolated_store_over_temp_disks().await;
     init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
-    let bucket = "safe-no-quota-cache-quota-set";
+    let bucket = "authoritative-quota-quota-set";
     store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
@@ -203,11 +202,10 @@ async fn safe_no_quota_cache_fast_path_does_not_ignore_later_quota() {
 }
 
 #[tokio::test]
-async fn safe_no_quota_cache_fast_path_allows_write_after_quota_is_cleared() {
-    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+async fn authoritative_quota_read_allows_write_after_quota_is_cleared() {
     let (_dirs, store) = isolated_store_over_temp_disks().await;
     init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
-    let bucket = "safe-no-quota-cache-quota-cleared";
+    let bucket = "authoritative-quota-quota-cleared";
     store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
@@ -225,7 +223,7 @@ async fn safe_no_quota_cache_fast_path_allows_write_after_quota_is_cleared() {
     store
         .put_object(bucket, "object", &mut data, &ObjectOptions::default())
         .await
-        .expect("cleared quota should allow writes through the no-quota fast path");
+        .expect("authoritatively cleared quota should allow writes");
 
     let mut reader = store
         .get_object_reader(bucket, "object", None, Default::default(), &ObjectOptions::default())
@@ -237,11 +235,10 @@ async fn safe_no_quota_cache_fast_path_allows_write_after_quota_is_cleared() {
 }
 
 #[tokio::test]
-async fn safe_no_quota_cache_fast_path_fails_closed_on_invalid_quota_json() {
-    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+async fn authoritative_quota_read_fails_closed_on_invalid_quota_json() {
     let (_dirs, store) = isolated_store_over_temp_disks().await;
     init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
-    let bucket = "safe-no-quota-cache-invalid-quota";
+    let bucket = "authoritative-quota-invalid-quota";
     store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await

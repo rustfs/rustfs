@@ -57,11 +57,6 @@ mod store;
 
 pub use store::PoolMetaWriteGateStatus;
 
-#[doc(hidden)]
-pub fn object_metadata_cache_distributed_enabled() -> bool {
-    set_disk::is_get_object_metadata_cache_distributed_enabled()
-}
-
 // pub mod checksum;
 mod event;
 

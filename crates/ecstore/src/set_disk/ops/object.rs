@@ -4935,17 +4935,6 @@ impl SetDisks {
             let transaction_epoch =
                 transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&commit_disks, &mut parts_metadatas));
 
-            let metadata_cache_mutation_guard = match self.begin_get_object_metadata_cache_mutation(bucket, object).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    quota_reservation.abort().await;
-                    if let Err(cleanup_err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
-                        warn!(tmp_dir = %tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
-                    }
-                    return Err(err);
-                }
-            };
-
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
             let commit_object = object.to_owned();
@@ -5003,7 +4992,6 @@ impl SetDisks {
             let commit = move |commit_submit_to_closure_enter_started: Option<Instant>,
                                cancellation: Option<CancellationToken>| async move {
                 let write_context = write_context;
-                let mut metadata_cache_mutation_guard = metadata_cache_mutation_guard;
                 let commit_closure_total_started = rustfs_io_metrics::put_stage_timer();
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
@@ -5182,9 +5170,6 @@ impl SetDisks {
                     scanner_scope_check_started,
                 );
                 if let Err(err) = pre_rename_result {
-                    if let Some(guard) = metadata_cache_mutation_guard.take() {
-                        let _ = guard.abort().await;
-                    }
                     SetDisks::abort_quota_reservation_after_fence(
                         quota_reservation,
                         &commit_disks,
@@ -5643,9 +5628,6 @@ impl SetDisks {
                     lock_held_post_rename_started,
                 );
                 let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
-                if let Some(guard) = metadata_cache_mutation_guard.take() {
-                    guard.commit().await?;
-                }
                 if let Some(release) = rename_guard_release.take() {
                     let _ = release.send(true);
                 }
@@ -8509,10 +8491,6 @@ impl SetDisks {
         // quorum-minus-one delete into an apparent success.
         let write_quorum = self.set_drive_count / 2 + 1;
         let rollback_dir = Uuid::new_v4();
-        let metadata_cache_mutation_guard = self
-            .begin_get_object_metadata_cache_mutation(bucket, object)
-            .await
-            .map_err(|err| DiskError::other(err.to_string()))?;
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -8663,11 +8641,6 @@ impl SetDisks {
                     source_bucket_incarnation_id,
                 )
                 .await;
-        }
-        if quorum_result.is_ok()
-            && let Some(guard) = metadata_cache_mutation_guard
-        {
-            guard.commit().await.map_err(|err| DiskError::other(err.to_string()))?;
         }
         quorum_result
     }
@@ -8948,12 +8921,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         }
 
-        let metadata_cache_mutation_guard = if src_info.version_only {
-            self.begin_get_object_metadata_cache_mutation(src_bucket, src_object).await?
-        } else {
-            None
-        };
-
         if src_info.version_only {
             let inline_data = fi.inline_data();
 
@@ -8993,9 +8960,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         self.invalidate_get_object_metadata_cache(src_bucket, src_object).await;
-        if let Some(guard) = metadata_cache_mutation_guard {
-            guard.commit().await?;
-        }
 
         Ok(ObjectInfo::from_file_info(
             &fi,
@@ -9481,25 +9445,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
-        let mut metadata_cache_mutation_guard = if vers.is_empty() {
-            None
-        } else {
-            match self.begin_get_object_metadata_cache_all_mutation(bucket, "").await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let message = err.to_string();
-                    for fi_vers in &vers {
-                        for fi in &fi_vers.versions {
-                            del_errs[fi.idx] = Some(to_object_err(Error::other(message.clone()), vec![bucket, &fi_vers.name]));
-                        }
-                    }
-                    if dist_erasure {
-                        self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
-                    }
-                    return (del_objects, del_errs, accounting);
-                }
-            }
-        };
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -9677,21 +9622,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         join_all(rollback_futures).await;
-
-        if let Some(guard) = metadata_cache_mutation_guard.take()
-            && vers
-                .iter()
-                .flat_map(|fi_vers| &fi_vers.versions)
-                .all(|fi| del_errs[fi.idx].is_none())
-            && let Err(err) = guard.commit().await
-        {
-            let message = err.to_string();
-            for fi_vers in &vers {
-                for fi in &fi_vers.versions {
-                    del_errs[fi.idx] = Some(to_object_err(Error::other(message.clone()), vec![bucket, &fi_vers.name]));
-                }
-            }
-        }
 
         for idx in committed_receipt_indices {
             let Some(candidate) = tier_free_version_receipt_candidates.remove(&idx) else {

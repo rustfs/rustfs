@@ -612,10 +612,6 @@ pub(crate) mod ecstore_erasure {
 /// the root facade's background-startup section.
 pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
-/// Distributed object-metadata cache gate consumed by internode mutation
-/// fencing RPCs.
-pub(crate) use rustfs_ecstore::object_metadata_cache_distributed_enabled;
-
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;

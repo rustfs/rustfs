@@ -243,7 +243,6 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH: &str = "put_ob
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK: &str = "put_object_quota_begin_metadata_lock";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP: &str = "put_object_quota_begin_cache_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ: &str = "put_object_quota_begin_config_read";
-pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT: &str = "put_object_quota_begin_safe_no_quota_cache_hit";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK: &str = "put_object_quota_begin_lock_lost_check";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE: &str = "put_object_quota_begin_policy_evaluate";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF: &str = "put_object_quota_begin_capability_proof";
@@ -3602,7 +3601,6 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CACHE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ,
-            PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_HIT,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF,

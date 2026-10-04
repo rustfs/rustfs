@@ -180,8 +180,6 @@ pub(crate) const GET_METADATA_CACHE_DECISION_SKIP: &str = "skip";
 pub(crate) const GET_METADATA_CACHE_REASON_DATA_MOVEMENT: &str = "data_movement";
 pub(crate) const GET_METADATA_CACHE_REASON_DELETE_MARKER: &str = "delete_marker";
 pub(crate) const GET_METADATA_CACHE_REASON_DIST_ERASURE: &str = "dist_erasure";
-pub(crate) const GET_METADATA_CACHE_REASON_CONFIG_UNVERIFIED: &str = "distributed_config_unverified";
-pub(crate) const GET_METADATA_CACHE_REASON_MUTATION_PENDING: &str = "mutation_pending";
 pub(crate) const GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS: &str = "incl_free_versions";
 pub(crate) const GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM: &str = "insufficient_cached_quorum";
 pub(crate) const GET_METADATA_CACHE_REASON_META_BUCKET: &str = "meta_bucket";
@@ -554,7 +552,6 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_DATA_MOVEMENT, "data_movement");
         assert_eq!(GET_METADATA_CACHE_REASON_DELETE_MARKER, "delete_marker");
         assert_eq!(GET_METADATA_CACHE_REASON_DIST_ERASURE, "dist_erasure");
-        assert_eq!(GET_METADATA_CACHE_REASON_CONFIG_UNVERIFIED, "distributed_config_unverified");
         assert_eq!(GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, "incl_free_versions");
         assert_eq!(GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM, "insufficient_cached_quorum");
         assert_eq!(GET_METADATA_CACHE_REASON_META_BUCKET, "meta_bucket");
