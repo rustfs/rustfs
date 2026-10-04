@@ -1827,6 +1827,34 @@ impl HealManager {
             .await
     }
 
+    #[cfg(test)]
+    pub(super) async fn hold_mrf_admission_for_test(&self) -> impl Send + '_ {
+        self.active_heals.lock().await
+    }
+
+    pub(super) fn try_in_flight_durable_mrf_anchors(
+        &self,
+    ) -> Option<HashSet<rustfs_common::mrf_channel::MrfDurableRepairAnchor>> {
+        // Match admission's active -> queue -> retrying -> notice lock order.
+        // A contended transition is unknown, never evidence of completion.
+        let active = self.active_heals.try_lock().ok()?;
+        let queue = self.heal_queue.try_lock().ok()?;
+        let retrying = self.retrying_heals.try_lock().ok()?;
+        let live_ids: HashSet<&str> = active
+            .keys()
+            .map(String::as_str)
+            .chain(queue.requests().map(|request| request.id.as_str()))
+            .chain(retrying.keys().map(String::as_str))
+            .collect();
+        let anchors = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets)
+            .iter()
+            .filter(|(task_id, _)| live_ids.contains(task_id.as_str()))
+            .flat_map(|(_, targets)| targets.iter())
+            .filter_map(|target| target.durable_anchor.clone())
+            .collect();
+        Some(anchors)
+    }
+
     pub(crate) async fn durable_mrf_repair_anchor(
         &self,
         intent: &rustfs_common::mrf_channel::MrfIntent,
