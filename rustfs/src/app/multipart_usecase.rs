@@ -1523,6 +1523,7 @@ impl DefaultMultipartUsecase {
             key_marker,
             upload_id_marker,
             max_uploads,
+            encoding_type,
             ..
         } = req.input;
 
@@ -1575,7 +1576,12 @@ impl DefaultMultipartUsecase {
                 .map_err(ApiError::from)?,
         };
 
-        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
+        Ok(S3Response::new(build_list_multipart_uploads_output(
+            bucket,
+            prefix,
+            result,
+            encoding_type.as_ref(),
+        )))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
