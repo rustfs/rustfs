@@ -15,7 +15,7 @@
 use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
-use crate::storage_api::owner::ecstore_hold_namespace_commit;
+use crate::storage_api::owner::{WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit};
 use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
@@ -1437,18 +1437,21 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         .await
         .expect("fixture bucket should be created");
     let mut reader = PutObjReader::from_vec(b"first".to_vec());
-    store.pools[0].disk_set[0]
-        .put_object(
-            &bucket,
-            "object",
-            &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("fixture object should finish its rename fanout");
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("fixture object should finish its rename fanout");
+    }
     crate::scanner_io::record_dirty_usage_bucket(&bucket);
     let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
     let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -1509,18 +1512,21 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
 
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
-    store.pools[0].disk_set[0]
-        .put_object(
-            &bucket,
-            "object",
-            &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("the pending tail must change the physical object before it drains");
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("the pending tail must change the physical object before it drains");
+    }
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
     drop(pending);
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());

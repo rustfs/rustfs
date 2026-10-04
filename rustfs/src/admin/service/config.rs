@@ -1121,8 +1121,8 @@ mod tests {
             let transaction_order = transaction_order.clone();
             tokio::spawn(async move {
                 let transaction_store = store.clone();
-                with_admin_server_config_write_lock(store, move || async move {
-                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone()).await?;
+                with_admin_server_config_write_lock(store, move |write_guard| async move {
+                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone(), &write_guard).await?;
                     transaction_order.lock().expect("transaction order lock").push("notify-read");
                     notify_entered.notify_one();
                     release_notify.notified().await;
@@ -1135,7 +1135,7 @@ mod tests {
                         .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
                         .or_default()
                         .insert("concurrent-notify".to_string(), target);
-                    save_admin_server_config_no_lock(transaction_store, &config).await?;
+                    save_admin_server_config_no_lock(transaction_store, &config, &write_guard).await?;
                     transaction_order.lock().expect("transaction order lock").push("notify-save");
                     Ok::<(), StorageError>(())
                 })
@@ -1154,9 +1154,9 @@ mod tests {
             let transaction_order = transaction_order.clone();
             tokio::spawn(async move {
                 let transaction_store = store.clone();
-                let transaction = with_admin_server_config_write_lock(store, move || async move {
+                let transaction = with_admin_server_config_write_lock(store, move |write_guard| async move {
                     let _ = oidc_entered_tx.send(());
-                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone()).await?;
+                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone(), &write_guard).await?;
                     transaction_order.lock().expect("transaction order lock").push("oidc-read");
 
                     let mut provider = KVS::new();
@@ -1170,7 +1170,7 @@ mod tests {
                         .entry(IDENTITY_OPENID_SUB_SYS.to_string())
                         .or_default()
                         .insert("concurrent-oidc".to_string(), provider);
-                    save_admin_server_config_no_lock(transaction_store, &config).await?;
+                    save_admin_server_config_no_lock(transaction_store, &config, &write_guard).await?;
                     transaction_order.lock().expect("transaction order lock").push("oidc-save");
                     Ok::<(), StorageError>(())
                 });
@@ -1449,9 +1449,9 @@ mod tests {
                 let (writer_entered_tx, mut writer_entered_rx) = tokio::sync::oneshot::channel();
                 let writer = tokio::spawn(async move {
                     let transaction_store = writer_store.clone();
-                    let transaction = with_admin_server_config_write_lock(writer_store, move || async move {
+                    let transaction = with_admin_server_config_write_lock(writer_store, move |write_guard| async move {
                         writer_entered_tx.send(()).expect("signal writer entry");
-                        save_admin_server_config_no_lock(transaction_store, &latest).await
+                        save_admin_server_config_no_lock(transaction_store, &latest, &write_guard).await
                     });
                     tokio::pin!(transaction);
                     let mut writer_polled_tx = Some(writer_polled_tx);

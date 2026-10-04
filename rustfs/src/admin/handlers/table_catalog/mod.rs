@@ -1726,8 +1726,18 @@ where
         object: &str,
         data: Vec<u8>,
         precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        write_guards: Vec<crate::admin::storage_api::object::WriteCommitGuard>,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.put_object(bucket, object, data, precondition).await
+        self.authorize(bucket, object, S3Action::PutObjectAction).await?;
+        self.ensure_observation_allowed(bucket, object)?;
+        let observation = TableCommitObservedObject {
+            identity: TableCommitObjectIdentity::ContentSha256(hex_sha256(&data, str::to_string)),
+            max_size: None,
+        };
+        self.backend
+            .put_object_unlocked(bucket, object, data, precondition, write_guards)
+            .await?;
+        self.record_observation(bucket, object, observation)
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {

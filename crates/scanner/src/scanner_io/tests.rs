@@ -23,7 +23,7 @@ use crate::scanner_folder::ScannerItem;
 use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
-    ecstore_hold_namespace_commit,
+    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit,
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
@@ -1424,16 +1424,17 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
         .enumerate()
     {
         let mut reader = ScannerPutObjReader::from_vec(body.to_vec());
-        store.pools[pool_index].disk_set[0]
-            .put_object(
-                &bucket,
-                object,
-                &mut reader,
-                &ScannerObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
+        let set = &store.pools[pool_index].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, object).await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ScannerObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, object, &mut reader, &opts)
             .await
             .expect("fixture objects must finish their rename fanouts before scanning");
     }

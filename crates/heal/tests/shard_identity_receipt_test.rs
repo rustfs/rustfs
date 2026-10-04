@@ -21,11 +21,13 @@ use rustfs_heal::heal::{
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_test_utils::TestECStoreEnv;
 use serial_test::serial;
+use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
 
 mod storage_api;
 use storage_api::integration::{
-    DiskAPI, ObjectIO, ObjectOptions, PutObjReader, ReadOptions, ShardIntegrityWriteMode, WriteCompletion,
+    DiskAPI, NamespaceLocking as _, ObjectIO, ObjectOptions, PutObjReader, ReadOptions, ShardIntegrityWriteMode,
+    WriteCommitGuard, WriteCompletion,
 };
 
 #[tokio::test]
@@ -132,17 +134,18 @@ async fn receipt_requires_independent_deep_verification() {
         let object = format!("target-{corrupt_count}");
         let donor = format!("donor-{corrupt_count}");
         for (name, byte) in [(&object, 0x3c), (&donor, 0xa9)] {
+            let lock = env.ecstore.new_ns_lock(bucket, name).await.expect("fixture namespace lock");
+            let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+                .await
+                .expect("fixture write owner");
+            let mut opts = ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            opts.add_write_commit_guard(&guard);
             env.ecstore
-                .put_object(
-                    bucket,
-                    name,
-                    &mut PutObjReader::from_vec(vec![byte; 1024 * 1024 + 123]),
-                    &ObjectOptions {
-                        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
+                .put_object(bucket, name, &mut PutObjReader::from_vec(vec![byte; 1024 * 1024 + 123]), &opts)
                 .await
                 .expect("commit all fixture shards");
         }

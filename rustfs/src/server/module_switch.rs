@@ -275,11 +275,11 @@ where
     // waiting for the local guard.
     serialize_module_switch_rmw(|| async move {
         let save_store = store.clone();
-        with_config_object_write_lock(store, MODULE_SWITCH_CONFIG_PATH.to_string(), move || async move {
+        with_config_object_write_lock(store, MODULE_SWITCH_CONFIG_PATH.to_string(), move |write_guard| async move {
             save_persisted_module_switches_inner(
                 config,
                 move |data| async move {
-                    save_config_no_lock(save_store, MODULE_SWITCH_CONFIG_PATH, data)
+                    save_config_no_lock(save_store, MODULE_SWITCH_CONFIG_PATH, data, &write_guard)
                         .await
                         .map_err(|e| format!("failed to save module switch config: {e}"))
                 },
@@ -631,14 +631,14 @@ mod tests {
                 async move {
                     writer_started_tx.send(()).expect("signal remote writer start");
                     let save_store = store.clone();
-                    with_config_object_write_lock(store, MODULE_SWITCH_CONFIG_PATH.to_string(), move || async move {
+                    with_config_object_write_lock(store, MODULE_SWITCH_CONFIG_PATH.to_string(), move |write_guard| async move {
                         writer_entered.store(true, AtomicOrdering::SeqCst);
                         let data = serde_json::to_vec(&PersistedModuleSwitches {
                             notify_enabled: false,
                             audit_enabled: false,
                         })
                         .expect("serialize disabled module state");
-                        save_config_no_lock(save_store, MODULE_SWITCH_CONFIG_PATH, data)
+                        save_config_no_lock(save_store, MODULE_SWITCH_CONFIG_PATH, data, &write_guard)
                             .await
                             .map_err(|err| err.to_string())?;
                         publish_order.lock().expect("module publish order lock").push("new-false");
