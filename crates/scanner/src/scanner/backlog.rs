@@ -2168,6 +2168,14 @@ mod tests {
         C: FnOnce() -> F + Send + 'static,
         F: std::future::Future<Output = ()> + 'static,
     {
+        run_native_retirement_test_with_budget(Duration::from_secs(180), case);
+    }
+
+    fn run_native_retirement_test_with_budget<C, F>(budget: Duration, case: C)
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = ()> + 'static,
+    {
         std::thread::Builder::new()
             .name("native-scanner-retirement".to_string())
             .stack_size(8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE)
@@ -2177,7 +2185,7 @@ mod tests {
                     .build()
                     .expect("native retirement test runtime")
                     .block_on(async {
-                        tokio::time::timeout(Duration::from_secs(180), case())
+                        tokio::time::timeout(budget, case())
                             .await
                             .expect("native retirement scenario must finish within its fixed budget");
                     });
@@ -2612,6 +2620,7 @@ mod tests {
 
         register_scanner_pause_backlog_retirement();
         let root = tempfile::tempdir().unwrap();
+        eprintln!("native expansion fixture old_pools={old_pool_count} stage=initialize_old_store");
         let old = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
             root.path(),
             false,
@@ -2621,6 +2630,7 @@ mod tests {
             false,
         )
         .await;
+        eprintln!("native expansion fixture old_pools={old_pool_count} stage=seed_old_authority");
         let fault = unstable_source
             .then(|| NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&old.pools[0].disk_set[0]), "publish", 2));
         let now = unix_now();
@@ -2655,7 +2665,9 @@ mod tests {
         old.pool_meta_write_status()
             .await
             .expect("healthy pool metadata keeps the background recovery loop read-only");
+        eprintln!("native expansion fixture old_pools={old_pool_count} stage=shutdown_old_store");
         shutdown_native_retirement_store(old).await;
+        eprintln!("native expansion fixture old_pools={old_pool_count} stage=initialize_expanded_store");
         let expanded = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
             root.path(),
             false,
@@ -2690,7 +2702,16 @@ mod tests {
     async fn assert_native_writer_expansion_recovers(old_pool_count: usize, failed_pool: usize, failed_write: usize) {
         use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
 
+        let started = std::time::Instant::now();
+        let stage = |name: &str| {
+            eprintln!(
+                "native expansion old_pools={old_pool_count} failed_pool={failed_pool} failed_write={failed_write} stage={name} elapsed={:?}",
+                started.elapsed()
+            );
+        };
+        stage("create_expanded_fixture");
         let (root, store, original) = native_expanded_backlog_store(old_pool_count, false).await;
+        stage("load_old_authority");
         let before = load_scanner_pause_backlog(Arc::clone(&store))
             .await
             .expect("old cohort is authoritative before expansion publication");
@@ -2713,6 +2734,7 @@ mod tests {
             "publish",
             failed_write,
         );
+        stage("publish_with_fault");
         let result = ScannerPauseBacklogController::claim(Arc::clone(&store), now).await;
         if failed_write == 3 {
             let controller = result.expect("a complete new commit survives failed stabilization");
@@ -2724,6 +2746,7 @@ mod tests {
         }
         drop(fault);
 
+        stage("load_partial_commit");
         let recovered = load_scanner_pause_backlog(Arc::clone(&store))
             .await
             .expect("partial publication must leave a native authority or stable rollback point");
@@ -2758,8 +2781,11 @@ mod tests {
             assert_eq!(record.committed.as_ref(), Some(expected_commit));
         }
 
+        stage("check_pool_metadata");
         store.pool_meta_write_status().await.expect("healthy metadata before restart");
+        stage("shutdown");
         shutdown_native_retirement_store(store).await;
+        stage("restart");
         let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
             root.path(),
             false,
@@ -2769,16 +2795,19 @@ mod tests {
             false,
         )
         .await;
+        stage("load_after_restart");
         let reloaded = load_scanner_pause_backlog(Arc::clone(&restarted))
             .await
             .expect("a new store must recover from disk without the failed controller");
         assert_eq!(&reloaded.ledger, expected);
         let retry_now = now.saturating_add(1);
         let retry_ledger = claim_scanner_pause_backlog_writer(expected, retry_now).expect("retry writer generation");
+        stage("retry_writer_claim");
         let retried = ScannerPauseBacklogController::claim(Arc::clone(&restarted), retry_now)
             .await
             .expect("retry must converge the entire expanded membership");
         assert!(!retried.loaded.requires_reload);
+        stage("verify_recovered_membership");
         assert_current_native_writer_ledger(&restarted, &retry_ledger).await;
         assert_eq!(retry_ledger.pending_full_scan, original.pending_full_scan);
         assert_eq!(retry_ledger.dirty_usage_buckets, original.dirty_usage_buckets);
@@ -2786,7 +2815,9 @@ mod tests {
         assert_eq!(retry_ledger.last_finished_attempt_serial, original.current_attempt_serial);
         assert_eq!(retry_ledger.consecutive_failures, original.consecutive_failures + 1);
         drop(retried);
+        stage("final_shutdown");
         shutdown_native_retirement_store(restarted).await;
+        stage("complete");
     }
 
     async fn assert_current_native_writer_ledger(store: &Arc<ECStore>, expected: &ScannerPauseBacklogLedger) {
@@ -2866,12 +2897,35 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn native_writer_expansion_partial_commit_recovers_after_restart() {
-        run_native_retirement_test(async || {
-            for old_pool_count in [1, 2] {
-                for failed_pool in [0, 2] {
-                    assert_native_writer_expansion_recovers(old_pool_count, failed_pool, 2).await;
-                }
-            }
+        // Independently runnable cells let nextest isolate fixture workers
+        // and identify the failing topology. Divide the original 180s
+        // matrix budget across all four cells.
+        run_native_retirement_test_with_budget(Duration::from_secs(45), async || {
+            assert_native_writer_expansion_recovers(1, 0, 2).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_expansion_partial_commit_recovers_after_restart_one_pool_new_member() {
+        run_native_retirement_test_with_budget(Duration::from_secs(45), async || {
+            assert_native_writer_expansion_recovers(1, 2, 2).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_expansion_partial_commit_recovers_after_restart_two_pools_old_member() {
+        run_native_retirement_test_with_budget(Duration::from_secs(45), async || {
+            assert_native_writer_expansion_recovers(2, 0, 2).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_expansion_partial_commit_recovers_after_restart_two_pools_new_member() {
+        run_native_retirement_test_with_budget(Duration::from_secs(45), async || {
+            assert_native_writer_expansion_recovers(2, 2, 2).await;
         });
     }
 

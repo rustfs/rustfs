@@ -1145,6 +1145,9 @@ impl SetDisks {
                     Self::read_version_fanout_barrier(&object, index).await;
                     if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
                         Self::record_metadata_slowtail_fault(&object, index);
+                        #[cfg(test)]
+                        rename_fanout_barrier::checkpoint(&object, index, rename_fanout_barrier::PHASE_METADATA_SLOWTAIL_FAULT)
+                            .await;
                         tokio::time::sleep(delay).await;
                     }
                     read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
