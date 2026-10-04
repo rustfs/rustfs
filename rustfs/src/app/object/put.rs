@@ -971,6 +971,7 @@ pub(super) enum PutObjectOrigin<'a> {
         emit_events: bool,
         preserve_delete_marker: bool,
         expected_bucket_incarnation_id: Option<Uuid>,
+        table_publication_guard: Option<table_catalog::TableCatalogLockGuard>,
     },
 }
 
@@ -992,6 +993,33 @@ impl PutObjectOrigin<'_> {
                 opts.expected_bucket_incarnation_id = *expected_bucket_incarnation_id;
                 Ok(())
             }
+        }
+    }
+
+    fn add_lock_loss_fence(&self, opts: &mut ObjectOptions) {
+        if let Self::Internal {
+            table_publication_guard: Some(guard),
+            ..
+        } = self
+            && let Some(signal) = guard.lock_lost_signal()
+        {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+    }
+
+    fn take_table_publication_guard(&mut self) -> Option<table_catalog::TableCatalogLockGuard> {
+        match self {
+            Self::Internal {
+                table_publication_guard, ..
+            } => table_publication_guard.take(),
+            Self::S3 { .. } => None,
+        }
+    }
+
+    fn table_data_plane_publication_guards(&self) -> Option<TableDataPlanePublicationGuards> {
+        match self {
+            Self::S3 { req, .. } => retained_table_data_plane_publication_guards(req),
+            Self::Internal { .. } => None,
         }
     }
 
@@ -1439,7 +1467,7 @@ impl DefaultObjectUsecase {
             object_lock,
             content_md5,
             preserve_etag,
-            origin,
+            mut origin,
         } = write;
         let PutObjectSseInput {
             server_side_encryption,
@@ -1648,6 +1676,7 @@ impl DefaultObjectUsecase {
         }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
         origin.apply_bucket_generation_guard(&bucket, &mut opts)?;
+        origin.add_lock_loss_fence(&mut opts);
         apply_put_request_object_lock_opts(
             &bucket,
             &object_lock_config_state,
@@ -1966,7 +1995,11 @@ impl DefaultObjectUsecase {
             let request_id = request_id.clone();
             let put_path = put_path.to_string();
             let put_admission = put_admission;
+            let table_publication_guard = origin.take_table_publication_guard();
+            let table_data_plane_publication_guards = origin.table_data_plane_publication_guards();
             async move {
+                let _table_publication_guard = table_publication_guard;
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let _put_admission = put_admission;
                 let object_traffic_progress = object_traffic_health
                     .as_deref()

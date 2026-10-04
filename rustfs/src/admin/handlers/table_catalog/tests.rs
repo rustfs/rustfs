@@ -540,7 +540,11 @@ fn catalog_config_response_reports_durable_strong_backing_override() {
             .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
     );
     assert!(response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
-    assert_eq!(response.endpoints.as_slice(), TABLE_CATALOG_ENDPOINTS);
+    assert!(response.endpoints.ends_with(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS));
+    assert_eq!(
+        response.endpoints.len(),
+        TABLE_CATALOG_ENDPOINTS.len() + TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS.len()
+    );
 }
 
 #[test]
@@ -686,6 +690,8 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
         ("GetTableCatalogMigrationHandler", "AdminAction::GetTableCatalogAction"),
+        ("CreateTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("RestoreTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
         ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
         ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
@@ -1065,6 +1071,8 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &GetTableCatalogMigrationHandler = &GET_TABLE_CATALOG_MIGRATION_HANDLER;
     let _: &MaterializeTableCatalogMigrationHandler = &MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER;
     let _: &CancelTableCatalogMigrationHandler = &CANCEL_TABLE_CATALOG_MIGRATION_HANDLER;
+    let _: &CreateTableCatalogBackupHandler = &CREATE_TABLE_CATALOG_BACKUP_HANDLER;
+    let _: &RestoreTableCatalogBackupHandler = &RESTORE_TABLE_CATALOG_BACKUP_HANDLER;
     let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
     let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
     let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;

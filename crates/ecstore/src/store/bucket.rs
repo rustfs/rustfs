@@ -121,14 +121,27 @@ async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceC
 }
 
 async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<()> {
-    let table_bucket_enabled = metadata_sys::get_in(ctx, bucket)
-        .await
-        .is_ok_and(|metadata| metadata.table_bucket_enabled());
+    let table_bucket_enabled = table_bucket_enabled_in(ctx, bucket).await?;
     if table_bucket_enabled {
         validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await?)?;
     }
 
     Ok(())
+}
+
+async fn table_bucket_enabled_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
+    match metadata_sys::get_in(ctx, bucket).await {
+        Ok(metadata) => Ok(metadata.table_bucket_enabled()),
+        // A live bucket may be absent from the metadata cache during lazy
+        // startup. Re-read persisted metadata before deciding that it is an
+        // ordinary bucket; an actual metadata backend failure must never turn
+        // a protected-bucket check into a best-effort operation.
+        Err(Error::ConfigNotFound) => {
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(ctx, bucket).await?;
+            Ok(persisted && metadata.table_bucket_enabled())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> [String; 2] {
@@ -298,6 +311,10 @@ impl ECStore {
         Ok(tags)
     }
 
+    pub async fn table_bucket_enabled(&self, bucket: &str) -> Result<bool> {
+        table_bucket_enabled_in(&self.ctx, bucket).await
+    }
+
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get_bucket_policy(bucket).await
@@ -413,6 +430,26 @@ impl ECStore {
                         mode: "bucket_lifecycle_write",
                         bucket: bucket.to_string(),
                         object: BUCKET_LIFECYCLE_LOCK_OBJECT.to_string(),
+                        required,
+                        achieved,
+                    }
+                }
+                other => StorageError::Lock(other),
+            })
+    }
+
+    async fn acquire_bucket_publication_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        let lock = self
+            .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await?;
+        lock.get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|err| match err {
+                rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                    StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "table_bucket_publication_write",
+                        bucket: bucket.to_string(),
+                        object: rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH.to_string(),
                         required,
                         achieved,
                     }
@@ -1041,7 +1078,7 @@ impl ECStore {
         &self,
         bucket: &str,
         opts: &DeleteBucketOptions,
-        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+        diagnostic_budget: BucketDeleteDiagnosticBudget,
     ) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
@@ -1051,6 +1088,33 @@ impl ECStore {
             return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
+        // Bucket deletion is a publication mutation too: a durable catalog
+        // backup must not enumerate or verify table objects while their
+        // containing bucket is being physically removed. Acquire this fence
+        // before the lifecycle and namespace locks to match object writers.
+        // `no_lock` is reserved for callers that already own the enclosing
+        // mutation locks (for example, failed bucket-creation rollback).
+        let publication_guard = if !opts.no_lock {
+            Some(self.acquire_bucket_publication_write_lock(bucket).await?)
+        } else {
+            None
+        };
+
+        await_bucket_namespace_operation(
+            publication_guard.as_ref(),
+            bucket,
+            "table-bucket publication fence during bucket deletion",
+            self.handle_delete_bucket_under_publication_lock(bucket, opts, diagnostic_budget),
+        )
+        .await
+    }
+
+    async fn handle_delete_bucket_under_publication_lock(
+        &self,
+        bucket: &str,
+        opts: &DeleteBucketOptions,
+        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+    ) -> Result<()> {
         let bucket_lifecycle_guard = if !opts.no_lock {
             Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
         } else {
@@ -1212,9 +1276,9 @@ mod tests {
         BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
         BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, BucketMetadataLessResidue, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
         await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
-        bucket_deleted_marker_volume, bucket_list_set_concurrency, record_bucket_delete_blocker, run_bucket_usage_cleanup,
-        run_physical_bucket_deletion, scan_metadata_less_residue, scan_metadata_less_residue_with_budget,
-        should_override_created_from_metadata, validate_table_bucket_delete_allowed,
+        bucket_deleted_marker_volume, bucket_list_set_concurrency, get_lock_acquire_timeout, record_bucket_delete_blocker,
+        run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
+        scan_metadata_less_residue_with_budget, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::{BucketMetadata, table_bucket_catalog_metadata_prefix};
     use crate::bucket::metadata_sys;
@@ -3279,6 +3343,40 @@ mod tests {
             .await
             .expect("retried MarkDelete should recreate a missing tombstone");
         assert!(any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_waits_for_table_publication_readers() {
+        let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-publication-fence-{}", Uuid::new_v4().simple());
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock should be created");
+        let publication_reader = publication_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication reader should be acquired");
+
+        let delete_store = Arc::clone(&ecstore);
+        let mut delete = tokio::spawn(async move { delete_store.delete_bucket(&bucket, &DeleteBucketOptions::default()).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut delete).await.is_err(),
+            "bucket deletion must remain behind the table publication reader"
+        );
+
+        drop(publication_reader);
+        tokio::time::timeout(Duration::from_secs(10), &mut delete)
+            .await
+            .expect("bucket deletion should proceed after publication reader release")
+            .expect("bucket deletion task should join")
+            .expect("empty bucket deletion should succeed");
     }
 
     #[tokio::test]

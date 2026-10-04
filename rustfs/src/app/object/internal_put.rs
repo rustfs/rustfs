@@ -24,6 +24,7 @@
 use super::*;
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
+use crate::app::runtime_sources::current_app_context;
 use crate::app::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _};
 use crate::app::storage_api::object_usecase::compression::is_multipart_disk_compression_enabled;
 use crate::app::storage_api::object_usecase::io::WriteEncryption;
@@ -35,6 +36,10 @@ use crate::app::storage_api::object_usecase::sse::{
 };
 use crate::capacity::record_capacity_write;
 use crate::runtime_sources::NotifyInterface;
+use crate::table_catalog::{
+    EcStoreTableCatalogObjectBackend, TableCatalogLockGuard, TableCatalogObjectBackend, TableCatalogStoreError,
+    default_table_bucket_publication_lock_path,
+};
 use http::HeaderName;
 
 /// Inputs of an internal object write. Content and user metadata follow the
@@ -227,6 +232,34 @@ impl InternalPutObjectEvent {
 }
 
 impl DefaultObjectUsecase {
+    async fn acquire_table_bucket_publication_guard(&self, bucket: &str) -> Result<Option<TableCatalogLockGuard>, ApiError> {
+        let store = self.object_store().ok_or_else(not_initialized)?;
+        if !store.table_bucket_enabled(bucket).await.map_err(ApiError::from)? {
+            return Ok(None);
+        }
+
+        let context = self
+            .context
+            .clone()
+            .or_else(current_app_context)
+            .ok_or_else(not_initialized)?;
+        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+            context.object_store(),
+            context.table_catalog_strong_runtime(),
+        );
+        let guard = backend
+            .acquire_read_lock(bucket, &default_table_bucket_publication_lock_path())
+            .await
+            .map_err(|err: TableCatalogStoreError| {
+                let code = match err {
+                    TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
+                    _ => S3ErrorCode::InternalError,
+                };
+                api_error_from_s3(S3Error::with_message(code, "failed to acquire table publication guard"))
+            })?;
+        Ok(Some(guard))
+    }
+
     /// Write one object through the ordinary PutObject path on behalf of a
     /// trusted internal caller.
     ///
@@ -265,6 +298,7 @@ impl DefaultObjectUsecase {
             headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         }
         validate_internal_write_target(&key, &bucket, &headers).await?;
+        let table_publication_guard = self.acquire_table_bucket_publication_guard(&bucket).await?;
         remove_source_replication_bookkeeping(&mut internal_metadata);
 
         let write = PutObjectWriteRequest {
@@ -300,6 +334,7 @@ impl DefaultObjectUsecase {
                 emit_events,
                 preserve_delete_marker,
                 expected_bucket_incarnation_id,
+                table_publication_guard,
             },
         };
         let committed = self
@@ -319,6 +354,7 @@ impl DefaultObjectUsecase {
     pub(crate) async fn internal_create_multipart_upload(&self, ctx: &InternalPutContext) -> Result<String, ApiError> {
         let headers = internal_put_headers(&ctx.content_headers)?;
         validate_internal_write_target(&ctx.key, &ctx.bucket, &headers).await?;
+        let table_publication_guard = self.acquire_table_bucket_publication_guard(&ctx.bucket).await?;
         let store = self.object_store().ok_or_else(not_initialized)?;
 
         let mut metadata = ctx.user_metadata.clone();
@@ -372,6 +408,11 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
+        if let Some(guard) = table_publication_guard.as_ref()
+            && let Some(signal) = guard.lock_lost_signal()
+        {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
 
         let dsc = must_replicate_object(
             &ctx.bucket,
@@ -543,6 +584,7 @@ impl DefaultObjectUsecase {
         validate_table_catalog_object_mutation(&bucket, &key)
             .await
             .map_err(api_error_from_s3)?;
+        let table_publication_guard = self.acquire_table_bucket_publication_guard(&bucket).await?;
         let store = self.object_store().ok_or_else(not_initialized)?;
 
         let mut headers = HeaderMap::new();
@@ -552,6 +594,11 @@ impl DefaultObjectUsecase {
         let mut opts =
             get_complete_multipart_upload_opts_with_replication_authorization(&headers, false).map_err(ApiError::from)?;
         opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
+        if let Some(guard) = table_publication_guard.as_ref()
+            && let Some(signal) = guard.lock_lost_signal()
+        {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
         opts.preserve_etag = ctx.preserve_etag.clone();
         opts.preserve_delete_marker = ctx.preserve_delete_marker;
         let (versioned, version_suspended) = BucketVersioningSys::write_state(&bucket, &key)
@@ -667,7 +714,9 @@ impl DefaultObjectUsecase {
             let key = key.clone();
             let upload_id = upload_id.to_string();
             let opts = opts.clone();
+            let table_publication_guard = table_publication_guard;
             async move {
+                let _table_publication_guard = table_publication_guard;
                 let obj_info = store
                     .clone()
                     .complete_multipart_upload(&bucket, &key, &upload_id, parts, &opts)

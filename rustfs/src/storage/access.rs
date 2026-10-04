@@ -138,7 +138,7 @@ struct InternalObjectAuthorization;
 struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
-struct TableDataPlanePublicationGuards {
+pub(crate) struct TableDataPlanePublicationGuards {
     state: Arc<parking_lot::Mutex<TableDataPlanePublicationState>>,
 }
 
@@ -146,8 +146,18 @@ struct TableDataPlanePublicationGuards {
 struct TableDataPlanePublicationState {
     keys: BTreeSet<(String, String)>,
     guards: Vec<Box<dyn Send>>,
+    lock_lost_signals: Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     resources: HashMap<(String, String), crate::table_catalog::TableDataPlaneResource>,
     missing_resources: BTreeSet<(String, String)>,
+}
+
+impl TableDataPlanePublicationGuards {
+    pub(crate) fn add_lock_loss_fences(&self, options: &mut ObjectOptions) {
+        let state = self.state.lock();
+        for signal in &state.lock_lost_signals {
+            options.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
+    }
 }
 
 pub(crate) const TABLE_DATA_PLANE_LIST_CURSOR_PREFIX: &str = "rustfs-table-list:v1:";
@@ -569,13 +579,23 @@ pub(crate) fn apply_bucket_generation_guard<T>(req: &S3Request<T>, bucket: &str,
         if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "bucket generation guard is missing"));
         }
+        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+            publication_guards.add_lock_loss_fences(opts);
+        }
         return Ok(());
     };
     if guard.bucket != bucket {
         return Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"));
     }
     opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+        publication_guards.add_lock_loss_fences(opts);
+    }
     Ok(())
+}
+
+pub(crate) fn retained_table_data_plane_publication_guards<T>(req: &S3Request<T>) -> Option<TableDataPlanePublicationGuards> {
+    req.extensions.get::<TableDataPlanePublicationGuards>().cloned()
 }
 
 pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
@@ -587,6 +607,9 @@ pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
         if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "copy source bucket generation guard is missing"));
         }
+        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+            publication_guards.add_lock_loss_fences(opts);
+        }
         return Ok(());
     };
     if guard.bucket != bucket {
@@ -596,6 +619,9 @@ pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
         ));
     }
     opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+        publication_guards.add_lock_loss_fences(opts);
+    }
     Ok(())
 }
 
@@ -1654,9 +1680,13 @@ async fn retain_table_data_plane_publication_guard<T>(
     let guard = crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, table_bucket, lock_object)
         .await
         .map_err(table_publication_guard_error)?;
+    let lock_lost_signal = guard.lock_lost_signal();
     let mut state = retained.state.lock();
     state.keys.insert(key);
     state.guards.push(Box::new(guard));
+    if let Some(signal) = lock_lost_signal {
+        state.lock_lost_signals.push(signal);
+    }
     drop(state);
     req.extensions.insert(retained);
     Ok(())
@@ -1702,9 +1732,8 @@ async fn table_bucket_enabled_for_data_plane<T>(req: &S3Request<T>, bucket: &str
         return Ok(false);
     }
 
-    match request_object_store(req)?.get_bucket_metadata(bucket).await {
-        Ok(metadata) => Ok(metadata.table_bucket_enabled()),
-        Err(StorageError::ConfigNotFound) => Ok(false),
+    match request_object_store(req)?.table_bucket_enabled(bucket).await {
+        Ok(table_bucket_enabled) => Ok(table_bucket_enabled),
         Err(err) if is_err_bucket_not_found(&err) => Ok(false),
         Err(err) => {
             tracing::warn!(

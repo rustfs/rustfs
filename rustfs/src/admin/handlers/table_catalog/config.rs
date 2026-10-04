@@ -119,6 +119,55 @@ impl Operation for CancelTableCatalogMigrationHandler {
     }
 }
 
+pub struct CreateTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for CreateTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body_or_default::<CatalogBackupRequest>(std::mem::take(&mut req.input)).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .create_durable_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestoreTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestoreTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body::<CatalogRestoreRequest>(std::mem::take(&mut req.input)).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .restore_durable_catalog_backup(
+                &warehouse,
+                &request.backup_id,
+                request.expected_snapshot_etag.as_deref(),
+                request.allow_replace,
+            )
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-restore", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct BackfillTableWarehouseIndexHandler {}
 
 #[async_trait::async_trait]

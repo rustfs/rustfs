@@ -472,9 +472,11 @@ impl DefaultObjectUsecase {
         }
 
         let restore_worker_guard = restore_worker_guard.take();
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
         spawn_traced(async move {
             let _restore_worker_guard = restore_worker_guard;
-            let opts = ObjectOptions {
+            let _table_data_plane_publication_guards = table_data_plane_publication_guards;
+            let mut opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
                     restore_expiry,
@@ -487,6 +489,9 @@ impl DefaultObjectUsecase {
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
+            if let Some(guards) = _table_data_plane_publication_guards.as_ref() {
+                guards.add_lock_loss_fences(&mut opts);
+            }
 
             if let Err(err) = store_clone
                 .restore_transitioned_object(&bucket_clone, &object_clone, &opts)
