@@ -128,9 +128,17 @@ pub(crate) mod kms {
 
 pub(crate) mod protocols {
     pub(crate) mod client {
-        pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+        pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+        #[cfg(test)]
+        pub(crate) use s3s::dto::ListObjectsV2Input;
 
         /// WebDAV quota reporting surface (`session_capacity_view`): bucket
         /// quota config, cached usage, and the console's erasure-aware usable

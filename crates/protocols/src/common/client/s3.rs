@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use rustfs_credentials::Credentials;
 use s3s::dto::*;
 
-#[cfg(feature = "webdav")]
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 
 /// Per-bucket capacity inputs for WebDAV quota reporting.
@@ -51,6 +51,30 @@ pub struct SessionCapacityView {
 pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
     type Error: std::error::Error + Send + Sync + 'static;
+    /// Authorize a protocol operation against the backend's policy domain.
+    /// Backends with resource policies must override this identity-policy fallback.
+    /// Use `authorize_list_objects` for ListObjectsV2 requests.
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
+    /// Authorize listing with the exact parameters passed to `list_objects_v2`.
+    /// Backends with resource or request-condition policies must override this fallback.
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        self.authorize_operation(session, &S3Action::ListBucket, &input.bucket, input.prefix.as_deref())
+            .await
+    }
+
     /// Get object content and metadata
     async fn get_object(
         &self,
