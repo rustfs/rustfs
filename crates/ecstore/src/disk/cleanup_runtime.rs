@@ -32,6 +32,7 @@ const BLOCKING_THREADS: &str = "RUSTFS_CLEANUP_BLOCKING_THREADS";
 const ASYNC_THREADS: &str = "RUSTFS_CLEANUP_ASYNC_THREADS";
 const CPUS: &str = "RUSTFS_CLEANUP_CPUS";
 const WORKERS: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS";
+const RENAME_TAIL_CLEANUP_LANE_ENABLE: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_ENABLE";
 const DISK_PENDING: &str = "RUSTFS_CLEANUP_DISK_MAX_PENDING";
 const DISK_WORKERS: &str = "RUSTFS_CLEANUP_DISK_WORKERS";
 const GC_WORKERS: &str = "RUSTFS_CLEANUP_GC_WORKERS";
@@ -202,6 +203,7 @@ impl Config {
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP",
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER",
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP",
+            RENAME_TAIL_CLEANUP_LANE_ENABLE,
         ] {
             if rustfs_utils::get_env_bool(name, false) {
                 return Err(io::Error::new(
@@ -659,6 +661,8 @@ mod tests {
             ("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP", "true"),
             ("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER", "true"),
             ("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP", "true"),
+            (RENAME_TAIL_CLEANUP_LANE_ENABLE, "true"),
+            (RENAME_TAIL_CLEANUP_LANE_ENABLE, "True"),
         ] {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -679,6 +683,7 @@ mod tests {
                 .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
                 .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
                 .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                .env_remove(RENAME_TAIL_CLEANUP_LANE_ENABLE)
                 .env(name, value)
                 .output()
                 .unwrap();
