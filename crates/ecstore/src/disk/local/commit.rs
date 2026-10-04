@@ -276,7 +276,7 @@ async fn prepare_rename_destination_metadata(
     rename_commit_guard: &os::RenameCommitGuard,
     mutation_lease: Arc<os::NamespaceMutationLease>,
 ) -> Result<Option<Bytes>> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let result = {
         let file_path = file_path.to_path_buf();
         let rename_commit_guard = rename_commit_guard.clone();
@@ -285,9 +285,9 @@ async fn prepare_rename_destination_metadata(
         })
         .await
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = (rename_commit_guard, mutation_lease);
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let result = match fs::read(file_path).await {
         Ok(data) => Ok(Some(data)),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),

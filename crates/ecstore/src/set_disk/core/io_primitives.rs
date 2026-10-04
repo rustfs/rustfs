@@ -12561,7 +12561,8 @@ mod tests {
         let bucket = "dangling-invalid-meta-bucket";
         let object = "object";
         let set = io_primitives_test_set(vec![None, None, None, None], 1).await;
-        let cached_generation = set.get_object_metadata_cache_generation(bucket, object)
+        let cached_generation = set
+            .get_object_metadata_cache_generation(bucket, object)
             .expect("local cache generation should be enabled");
         let mut data_errs_by_part = HashMap::new();
         data_errs_by_part.insert(
@@ -12597,8 +12598,10 @@ mod tests {
             .expect("invalid metadata should be cleanable when part results prove the object is dangling");
 
         assert!(!deleted.is_valid());
-        assert!(!set.is_get_object_metadata_cache_generation_current(cached_generation),
-            "dangling cleanup must retire locally cached metadata before deletion");
+        assert!(
+            !set.is_get_object_metadata_cache_generation_current(cached_generation),
+            "dangling cleanup must retire locally cached metadata before deletion"
+        );
     }
 
     #[tokio::test]

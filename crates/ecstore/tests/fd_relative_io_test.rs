@@ -150,6 +150,46 @@ async fn inline_and_non_inline_overwrites_remain_readable_after_reopen() {
     }
 }
 
+#[tokio::test]
+async fn rename_rejects_symlinked_destination_metadata() {
+    for inline in [true, false] {
+        let temp = tempfile::tempdir().expect("disk directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let disk = disk_at(temp.path()).await;
+        disk.make_volume("bucket").await.expect("bucket");
+        put(&disk, "seed", Bytes::from_static(b"old object"), inline).await;
+        let destination = temp.path().join("bucket/object/xl.meta");
+        let original = std::fs::read(&destination).expect("valid existing metadata");
+        let external_metadata = outside.path().join("xl.meta");
+        std::fs::write(&external_metadata, &original).expect("external valid metadata");
+        std::fs::remove_file(&destination).expect("replace destination metadata");
+        std::os::unix::fs::symlink(&external_metadata, &destination).expect("metadata escape link");
+
+        let directory = Uuid::new_v4();
+        let data = Bytes::from_static(b"replacement");
+        if !inline {
+            disk.write_all(RUSTFS_META_TMP_BUCKET, &format!("replacement/{directory}/part.1"), data.clone())
+                .await
+                .expect("stage non-inline data");
+        }
+        let result = disk
+            .rename_data(
+                RUSTFS_META_TMP_BUCKET,
+                "replacement",
+                metadata(data, inline, directory),
+                "bucket",
+                "object",
+            )
+            .await;
+        assert!(
+            matches!(result, Err(DiskError::InvalidPath)),
+            "symlinked metadata must be rejected: {result:?}"
+        );
+        assert_eq!(std::fs::read_link(&destination).expect("link must remain"), external_metadata);
+        assert_eq!(std::fs::read(&external_metadata).expect("external metadata must survive"), original);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_publication_rejects_source_or_directory_replacement() {
     for replace_directory in [false, true] {
