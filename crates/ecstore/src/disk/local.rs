@@ -165,12 +165,13 @@ fn is_delete_transaction_marker(entry: &str, prefix: &str) -> bool {
         .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok_and(|uuid| !uuid.is_nil()))
 }
 
-/// Whether a `list_dir` entry inside a UUID data dir is erasure data or a
-/// delete-transaction marker. Anything else (a subdirectory, an `xl.meta`, an
-/// unknown file) means the directory is not plain delete residue.
+/// Whether a `list_dir` entry inside a UUID data dir is erasure data, a rollback
+/// metadata backup, or a delete-transaction marker. Anything else (a subdirectory,
+/// an `xl.meta`, an unknown file) means the directory is not plain delete residue.
 fn is_metadata_less_data_dir_entry(entry: &str) -> bool {
     !entry.ends_with(SLASH_SEPARATOR)
         && (metadata_less_part_file(entry)
+            || entry == STORAGE_FORMAT_FILE_BACKUP
             || is_delete_transaction_marker(entry, DELETE_DATA_DIR_MARKER_PREFIX)
             || is_delete_transaction_marker(entry, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
 }
@@ -8601,9 +8602,9 @@ impl LocalDisk {
 
     /// Whether the metadata-less directory `dir_name` holds nothing that a
     /// listing could show: every leaf under it is the data dir of a deleted
-    /// version (a non-nil UUID directory of `part.N` files and
-    /// delete-transaction markers) or an empty directory. That is what an
-    /// interrupted or deferred version delete leaves behind once the `xl.meta`
+    /// version (a non-nil UUID directory of `part.N` files, rollback metadata
+    /// backups, and delete-transaction markers) or an empty directory. That is
+    /// what an interrupted or deferred version delete leaves behind once the `xl.meta`
     /// is gone, and neither the object directory nor the date-style ancestors
     /// above it may surface as prefixes (#6898). Real objects are directories
     /// carrying their own `xl.meta`, so the first file met outside a UUID data
@@ -19796,13 +19797,42 @@ mod test {
             .await
             .expect("delete marker should be written");
 
+        // Inline deletes can leave only a rollback backup; non-inline deletes
+        // can leave the backup alongside parts. Neither has listable metadata.
+        for (prefix, has_parts) in [("backup-only", false), ("backup-parts", true)] {
+            let backup = bucket_dir
+                .join(prefix)
+                .join("2026/08/28/23/object.parquet")
+                .join(Uuid::new_v4().to_string());
+            fs::create_dir_all(&backup).await.expect("backup residue should be created");
+            fs::write(backup.join(STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("rollback backup should be written");
+            if has_parts {
+                fs::write(backup.join("part.1"), b"stale")
+                    .await
+                    .expect("stale part beside backup should be written");
+            }
+        }
+
         // A user prefix made of UUID-named directories holding real objects.
         let upload = Uuid::new_v4().to_string();
         write_object(&bucket_dir.join("uploads").join(&upload).join("file"), &format!("uploads/{upload}/file")).await;
+        write_object(
+            &bucket_dir.join("uploads").join(&upload).join(STORAGE_FORMAT_FILE_BACKUP),
+            &format!("uploads/{upload}/{STORAGE_FORMAT_FILE_BACKUP}"),
+        )
+        .await;
 
         // An object whose key is itself a UUID.
         let named = Uuid::new_v4().to_string();
         write_object(&bucket_dir.join("named").join(&named), &format!("named/{named}")).await;
+        fs::write(
+            bucket_dir.join("named").join(&named).join(STORAGE_FORMAT_FILE_BACKUP),
+            b"rollback metadata",
+        )
+        .await
+        .expect("backup beside live metadata should be written");
 
         // Residue next to a live child object.
         let mixed_residue = bucket_dir.join("mixed").join(Uuid::new_v4().to_string());
@@ -19859,10 +19889,25 @@ mod test {
         assert_eq!(scan_names(&disk, bucket, "residue/2026/").await, Vec::<String>::new());
         assert_eq!(scan_names(&disk, bucket, "residue/").await, Vec::<String>::new());
         assert_eq!(scan_names(&disk, bucket, "committed/").await, Vec::<String>::new());
+        for prefix in ["backup-only", "backup-parts"] {
+            assert_eq!(
+                scan_names(&disk, bucket, &format!("{prefix}/2026/08/28/23/")).await,
+                Vec::<String>::new(),
+                "rollback backups must not surface as object prefixes"
+            );
+            assert_eq!(scan_names(&disk, bucket, &format!("{prefix}/")).await, Vec::<String>::new());
+        }
 
         // UUID-named directories holding real objects, an object keyed by a
         // UUID, and residue beside a live child all remain visible.
         assert_eq!(scan_names(&disk, bucket, "uploads/").await, vec![format!("uploads/{upload}/")]);
+        assert_eq!(
+            scan_names(&disk, bucket, &format!("uploads/{upload}/")).await,
+            vec![
+                format!("uploads/{upload}/file"),
+                format!("uploads/{upload}/{STORAGE_FORMAT_FILE_BACKUP}")
+            ]
+        );
         assert_eq!(scan_names(&disk, bucket, "named/").await, vec![format!("named/{named}")]);
         assert_eq!(scan_names(&disk, bucket, "mixed/").await, vec!["mixed/child".to_owned()]);
         assert_eq!(
@@ -19952,6 +19997,9 @@ mod test {
         fs::write(bucket_dir.join("stray/2026/08/notes.txt"), b"?")
             .await
             .expect("stray file should be written");
+        fs::write(bucket_dir.join("stray/2026/08").join(STORAGE_FORMAT_FILE_BACKUP), b"?")
+            .await
+            .expect("backup outside a UUID data directory should be written");
 
         // A UUID directory holding a subdirectory is not a data dir shape the
         // probe understands, so it surfaces even when the subdirectory is empty.

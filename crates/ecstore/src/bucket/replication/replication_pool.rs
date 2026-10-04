@@ -44,7 +44,7 @@ use super::replication_resyncer::{
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
     HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
-    ReplicationStorage,
+    ReplicationStorage, WriteCommitGuard,
 };
 use super::replication_target_boundary::{BucketTargetError, ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
@@ -513,7 +513,7 @@ where
             // Lock order is transaction namespace lock -> force-delete journal object lock.
             // Keep the transaction guard alive through the conditional write so legacy
             // writers cannot interleave a read-modify-write transition within this process.
-            let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+            let guard = WriteCommitGuard::acquire(&lock, ReplicationLockTiming::acquire_timeout()).await?;
             let (mut entries, preconditions, exists) = read_force_delete_intents(storage.clone(), file).await?;
             if !update(&mut entries, exists)? {
                 return Ok(());
@@ -565,7 +565,7 @@ async fn read_force_delete_intents<S: ReplicationObjectIO>(
 async fn save_force_delete_intents<S: ReplicationStorage>(
     storage: Arc<S>,
     file: &str,
-    guard: &rustfs_lock::NamespaceLockGuard,
+    guard: &WriteCommitGuard,
     entries: Vec<MrfReplicateEntry>,
     preconditions: HTTPPreconditions,
 ) -> Result<(), EcstoreError> {
@@ -628,7 +628,7 @@ async fn acknowledge_mrf_recovery<S: ReplicationStorage>(
         let lock = storage
             .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
             .await?;
-        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+        let guard = WriteCommitGuard::acquire(&lock, ReplicationLockTiming::acquire_timeout()).await?;
         let current = ReplicationConfigStore::read_no_lock_with_metadata_preserve_empty(storage.clone(), file).await;
         let (current_data, current_etag, current_exists) = match current {
             Ok((data, object_info)) => (data, object_info.etag, true),
@@ -658,7 +658,7 @@ async fn acknowledge_mrf_recovery<S: ReplicationStorage>(
         } else {
             encode_mrf_file(&retained)?
         };
-        match ReplicationConfigStore::save_conditional_no_lock(storage.clone(), file, data, preconditions).await {
+        match ReplicationConfigStore::save_conditional_no_lock(storage.clone(), file, data, preconditions, &guard).await {
             Ok(()) => return Ok(retained),
             Err(EcstoreError::PreconditionFailed) => continue,
             Err(error) => return Err(error),
@@ -2522,7 +2522,7 @@ async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8
                 continue;
             }
         };
-        let guard = match lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+        let guard = match WriteCommitGuard::acquire(&lock, ReplicationLockTiming::acquire_timeout()).await {
             Ok(guard) => guard,
             Err(error) => {
                 warn!(
@@ -2573,6 +2573,7 @@ async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8
                     ReplicationMetadataStore::MRF_REPLICATION_FILE,
                     Vec::new(),
                     preconditions,
+                    &guard,
                 )
                 .await
                 {
@@ -2627,13 +2628,12 @@ async fn recover_corrupt_mrf_generation<S: ReplicationStorage>(
     entries: &[MrfReplicateEntry],
     preconditions: Option<HTTPPreconditions>,
     storage: &Arc<S>,
-    guard: &rustfs_lock::NamespaceLockGuard,
+    guard: &WriteCommitGuard,
     pending_payload: &mut Option<PendingMrfAppend>,
     started: Instant,
 ) -> Option<MrfAppendResult> {
     let quarantine_file = format!("{MRF_CORRUPT_FILE_PREFIX}.{}.bin", OffsetDateTime::now_utc().unix_timestamp_nanos());
-    if let Err(error) = ReplicationConfigStore::save_no_lock(storage.clone(), &quarantine_file, corrupt_generation.to_vec()).await
-    {
+    if let Err(error) = ReplicationConfigStore::save(storage.clone(), &quarantine_file, corrupt_generation.to_vec()).await {
         warn!(
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -2688,6 +2688,7 @@ async fn recover_corrupt_mrf_generation<S: ReplicationStorage>(
         ReplicationMetadataStore::MRF_REPLICATION_FILE,
         data,
         preconditions,
+        guard,
     )
     .await
     {
@@ -2735,7 +2736,7 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
             return None;
         }
     };
-    let guard = match lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+    let guard = match WriteCommitGuard::acquire(&lock, ReplicationLockTiming::acquire_timeout()).await {
         Ok(guard) => guard,
         Err(error) => {
             warn!(
@@ -2862,6 +2863,7 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
         ReplicationMetadataStore::MRF_REPLICATION_FILE,
         data,
         preconditions,
+        &guard,
     )
     .await
     {

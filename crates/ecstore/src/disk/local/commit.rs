@@ -234,7 +234,6 @@ pub(super) fn create_local_inline_rollback_backup(
     Ok(backup_path)
 }
 
-#[cfg(test)]
 pub(super) async fn lock_rename_commit_directories(
     source_parent: &Path,
     destination_parent: &Path,
@@ -273,41 +272,32 @@ pub(super) async fn lock_rename_commit_directories(
 }
 
 async fn prepare_rename_destination_metadata(
-    source_parent: &Path,
     file_path: &Path,
-    base_dir: &Path,
-    publication_root: &os::PublicationRoot,
+    rename_commit_guard: &os::RenameCommitGuard,
     mutation_lease: Arc<os::NamespaceMutationLease>,
-) -> Result<(os::RenameCommitGuard, Option<Bytes>)> {
-    let source_parent = source_parent.to_path_buf();
-    let file_path = file_path.to_path_buf();
-    let base_dir = base_dir.to_path_buf();
-    let publication_root = publication_root.clone();
-    os::run_blocking_namespace_operation(mutation_lease, move || {
-        let parent = file_path
-            .parent()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing metadata parent"))?;
-        let guard = os::prepare_rename_commit_guard(&source_parent, parent, &base_dir, &publication_root).map_err(|err| {
-            match std::fs::symlink_metadata(&base_dir) {
-                Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
-                _ => err,
-            }
-        })?;
-        #[cfg(all(test, windows))]
-        run_destination_commit_directory_preparation(parent);
-        #[cfg(any(windows, target_os = "linux"))]
-        let data = os::read_destination_file_with_commit_guard(&file_path, &guard)?;
-        #[cfg(not(any(windows, target_os = "linux")))]
-        let data = match std::fs::read(&file_path) {
-            Ok(data) => Some(data),
-            Err(err) if err.kind() == ErrorKind::NotFound => None,
-            Err(err) => return Err(err),
-        };
-        Ok((guard, data.map(Bytes::from)))
-    })
-    .await
-    .map_err(to_file_error)
-    .map_err(DiskError::from)
+) -> Result<Option<Bytes>> {
+    #[cfg(windows)]
+    let result = {
+        let file_path = file_path.to_path_buf();
+        let rename_commit_guard = rename_commit_guard.clone();
+        os::run_blocking_namespace_operation(mutation_lease, move || {
+            os::read_destination_file_with_commit_guard(&file_path, &rename_commit_guard)
+        })
+        .await
+    };
+    #[cfg(not(windows))]
+    let _ = (rename_commit_guard, mutation_lease);
+    #[cfg(not(windows))]
+    let result = match fs::read(file_path).await {
+        Ok(data) => Ok(Some(data)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    };
+
+    result
+        .map(|data| data.map(Bytes::from))
+        .map_err(to_file_error)
+        .map_err(DiskError::from)
 }
 
 /// Proof produced only when the local rename returns at an existing access
@@ -489,11 +479,11 @@ impl LocalDisk {
         if !no_inline {
             fs::create_dir_all(src_file_parent).await.map_err(to_file_error)?;
         }
-        // Open the commit directories and read the old metadata in one blocking
-        // operation. The returned guard owns the same identities through publish.
-        let (rename_commit_guard, has_dst_buf) = prepare_rename_destination_metadata(
+        // Acquire the common trees before reading destination metadata. On
+        // Windows this pins the object directory identity across publication.
+        let rename_commit_guard = lock_rename_commit_directories(
             src_file_parent,
-            &dst_file_path,
+            dst_file_parent,
             &dst_volume_dir,
             &self.publication_root,
             mutation_lease.clone(),
@@ -508,6 +498,12 @@ impl LocalDisk {
             source_volume_dir: &src_volume_dir,
             data_paths: has_data_dir_path.as_ref(),
         };
+        let has_dst_buf = prepare_rename_destination_metadata(
+            commit.destination_metadata,
+            &commit.directory_guard,
+            commit.mutation_lease.clone(),
+        )
+        .await?;
 
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta

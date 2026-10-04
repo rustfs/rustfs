@@ -1122,9 +1122,11 @@ pub(crate) async fn resume_recovery_disposition(
     // Lock order is control record, then legacy source. Disposition revisions
     // use ETag CAS and never acquire either namespace lock internally.
     let control_lock = api.new_ns_lock(RUSTFS_META_BUCKET, &control_object).await?;
-    let control_guard = control_lock
-        .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
-        .await?;
+    let control_guard = Arc::new(
+        control_lock
+            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await?,
+    );
     let source_lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &initial.disposition.identity.canonical_source_path)
         .await?;
@@ -1504,7 +1506,7 @@ fn control_is_abandoned_successor(disposition: &IlmRecoveryDisposition, control:
 async fn abandon_recovery_control_fenced(
     api: Arc<ECStore>,
     disposition: &IlmRecoveryDisposition,
-    control_guard: &rustfs_lock::NamespaceLockGuard,
+    control_guard: &Arc<rustfs_lock::NamespaceLockGuard>,
     source_guard: &rustfs_lock::NamespaceLockGuard,
     proof: &IlmRecoveryExportFleetProofToken,
 ) -> EcstoreResult<()> {
@@ -1557,7 +1559,7 @@ async fn abandon_recovery_control_fenced(
         }),
         ..Default::default()
     };
-    options.add_namespace_lock_guard(control_guard);
+    options.add_owned_write_lock(Arc::clone(control_guard), RUSTFS_META_BUCKET, &object);
     options.add_namespace_lock_guard(source_guard);
     let write_result = config_boundary::save_config_with_opts(api.clone(), &object, encoded, &options).await;
     let observed = match load_recovery_control_no_lock(api.clone(), disposition).await {
@@ -1630,7 +1632,7 @@ async fn delete_exact_local_recovery_copy(
     api: Arc<ECStore>,
     copy: &IlmRecoverySourceCopy,
     source_schema: &str,
-    control_guard: &rustfs_lock::NamespaceLockGuard,
+    control_guard: &Arc<rustfs_lock::NamespaceLockGuard>,
     source_guard: &rustfs_lock::NamespaceLockGuard,
 ) -> EcstoreResult<()> {
     let set = recovery_copy_set(&api, &copy.authority)?;
@@ -1704,7 +1706,7 @@ async fn save_recovery_disposition_step_fenced(
     api: Arc<ECStore>,
     current: &ObservedIlmRecoveryDisposition,
     next: &IlmRecoveryDisposition,
-    control_guard: &rustfs_lock::NamespaceLockGuard,
+    control_guard: &Arc<rustfs_lock::NamespaceLockGuard>,
     source_guard: &rustfs_lock::NamespaceLockGuard,
     proof: &IlmRecoveryExportFleetProofToken,
 ) -> EcstoreResult<ObservedIlmRecoveryDisposition> {

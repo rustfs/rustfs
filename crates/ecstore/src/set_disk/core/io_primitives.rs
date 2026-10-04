@@ -10659,10 +10659,68 @@ mod tests {
         .await;
     }
 
+    const CLOSED_HEAL_RECEIVER_CHILD: &str = "RUSTFS_TEST_ROLLBACK_CLOSED_HEAL_RECEIVER_CHILD";
+
+    #[test]
+    fn rename_rollback_closed_heal_receiver_preserves_recovery_material() {
+        // The shared test binary has one heal receiver owner. Use a fresh process
+        // to close the real receiver without replacing its process-wide sender.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "set_disk::core::io_primitives::tests::rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging",
+                "--nocapture",
+            ])
+            .env(CLOSED_HEAL_RECEIVER_CHILD, "1")
+            .output()
+            .expect("isolated closed-receiver test should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "closed-receiver child failed: {stdout} {stderr}");
+        assert!(stdout.contains("1 passed"), "child must execute the selected regression: {stdout}");
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| {
+                    line.contains(EVENT_SET_DISK_RENAME_ROLLBACK)
+                        && line.contains("stage=\"inspection_admission\"")
+                        && line.contains("outcome=Failed(\"Failed to send heal command:")
+                })
+                .count(),
+            10,
+            "every actual rollback inspection must encounter the closed-channel send error: {stderr}"
+        );
+        assert_eq!(
+            stderr.matches("rollback inspection sender=closed,").count(),
+            10,
+            "all rollback fault and early-ACK combinations must run with the closed sender: {stderr}"
+        );
+        eprint!("{stderr}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging() {
+        let _closed_receiver_logs = if std::env::var_os(CLOSED_HEAL_RECEIVER_CHILD).is_some() {
+            assert!(
+                rustfs_heal_contracts::heal_channel::get_heal_channel_sender().is_none(),
+                "the isolated child must own a fresh heal channel"
+            );
+            let receiver = rustfs_heal_contracts::heal_channel::init_heal_channel().expect("isolated heal receiver");
+            drop(receiver);
+            let sender = rustfs_heal_contracts::heal_channel::get_heal_channel_sender().expect("initialized heal sender");
+            assert!(sender.is_closed(), "the initialized heal receiver must be closed");
+            Some(tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(std::io::stderr)
+                    .finish(),
+            ))
+        } else {
+            None
+        };
         let heal_sender_state = match rustfs_heal_contracts::heal_channel::get_heal_channel_sender() {
             None => "not_initialized",
             Some(sender) => {

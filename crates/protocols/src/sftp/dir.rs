@@ -56,6 +56,22 @@ pub(super) fn dot_entries() -> Vec<File> {
     ]
 }
 
+fn directory_listing_input(
+    bucket: &str,
+    prefix: &str,
+    continuation: &ListingContinuation,
+) -> Result<ListObjectsV2Input, SftpError> {
+    let mut builder = ListObjectsV2Input::builder()
+        .bucket(bucket.to_owned())
+        .prefix(Some(prefix.to_owned()))
+        .delimiter(Some("/".to_owned()))
+        .max_keys(Some(READDIR_PAGE_MAX_KEYS));
+    if let ListingContinuation::Next(token) = continuation {
+        builder = builder.continuation_token(Some(token.clone()));
+    }
+    builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))
+}
+
 impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// Fetch one S3 ListObjectsV2 page for a Listing cursor, convert it to
     /// File entries (subdirectories from common_prefixes, objects from
@@ -89,17 +105,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // list_objects_v2 wire call. Matching that means a policy
         // revoked mid-iteration takes effect on the next page rather
         // than at session end.
-        self.authorize(&S3Action::ListBucket, bucket, None).await?;
-
-        let mut builder = ListObjectsV2Input::builder()
-            .bucket(bucket.clone())
-            .prefix(Some(prefix.clone()))
-            .delimiter(Some("/".to_string()))
-            .max_keys(Some(READDIR_PAGE_MAX_KEYS));
-        if let ListingContinuation::Next(token) = continuation {
-            builder = builder.continuation_token(Some(token.clone()));
-        }
-        let input = builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+        let input = directory_listing_input(bucket, prefix, continuation)?;
+        self.authorize_list_objects(&input).await?;
 
         let out = self
             .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
@@ -169,10 +176,6 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// must not fall through to a destructive call when this returns
     /// Err.
     pub(super) async fn validate_directory_empty(&self, bucket: &str, prefix: &str) -> Result<(), SftpError> {
-        let prefix_for_authorization = if prefix.is_empty() { None } else { Some(prefix) };
-        self.authorize(&S3Action::ListBucket, bucket, prefix_for_authorization)
-            .await?;
-
         // For sub-directory prefixes, max_keys=2 because the backend
         // may return the directory's own __XLDIR__ marker (decoded to
         // the prefix itself, e.g. "subdir/") as a content entry.
@@ -189,6 +192,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             builder = builder.prefix(Some(prefix.to_string()));
         }
         let input = builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+
+        self.authorize_list_objects(&input).await?;
 
         // Issue list_objects_v2. On Err the destructive caller never
         // runs because validate_directory_empty returns the Err.
@@ -382,12 +387,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 Some(k) if k.ends_with('/') => k.clone(),
                 Some(k) => format!("{k}/"),
             };
-            self.authorize(
-                &S3Action::ListBucket,
-                &bucket,
-                if prefix.is_empty() { None } else { Some(prefix.as_str()) },
-            )
-            .await?;
+            let input = directory_listing_input(&bucket, &prefix, &ListingContinuation::Initial)?;
+            self.authorize_list_objects(&input).await?;
             self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.credentials()))
                 .await?;
             DirCursor::Listing {
@@ -451,6 +452,57 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tracing::Level;
+
+    #[tokio::test]
+    async fn opendir_and_readdir_authorize_the_same_listing_parameters() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_head_bucket_ok();
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        let handle = with_test_auth_override(
+            |_, bucket, prefix| bucket == "bucket" && prefix == Some("private/"),
+            driver.opendir_inner(1, "/bucket/private"),
+        )
+        .await
+        .expect("OPENDIR conditional allow");
+        let mut cursor = DirCursor::Listing {
+            bucket: "bucket".into(),
+            prefix: "private/".into(),
+            continuation: ListingContinuation::Initial,
+            dots_emitted: true,
+        };
+        with_test_auth_override(|_, _, prefix| prefix == Some("private/"), driver.next_listing_page(&mut cursor))
+            .await
+            .expect("READDIR conditional allow");
+        cursor = DirCursor::Listing {
+            bucket: "bucket".into(),
+            prefix: "private/".into(),
+            continuation: ListingContinuation::Next("next-page".into()),
+            dots_emitted: true,
+        };
+        with_test_auth_override(|_, _, prefix| prefix == Some("private/"), driver.next_listing_page(&mut cursor))
+            .await
+            .expect("continued READDIR conditional allow");
+        let authorized = backend.list_authorizations();
+        let executed = backend.list_objects_calls();
+        assert_eq!(authorized.len(), 3);
+        assert_eq!(executed.len(), 2);
+        for input in &authorized {
+            assert_eq!(input.prefix.as_deref(), Some("private/"));
+            assert_eq!(input.delimiter.as_deref(), Some("/"));
+            assert_eq!(input.max_keys, Some(super::READDIR_PAGE_MAX_KEYS));
+        }
+        for (auth, call) in authorized[1..].iter().zip(&executed) {
+            assert_eq!(auth.prefix, call.prefix);
+            assert_eq!(auth.delimiter, call.delimiter);
+            assert_eq!(auth.max_keys, call.max_keys);
+            assert_eq!(auth.continuation_token, call.continuation_token);
+        }
+        assert_eq!(authorized[2].continuation_token.as_deref(), Some("next-page"));
+        let denied =
+            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.readdir_inner(2, handle.handle)).await;
+        assert!(denied.is_err(), "policy change must deny the next READDIR");
+        assert_eq!(backend.list_objects_calls().len(), 2, "denied READDIR cannot reach storage");
+    }
 
     #[tokio::test]
     async fn validate_directory_empty_propagates_list_error() {

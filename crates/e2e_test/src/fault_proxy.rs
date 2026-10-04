@@ -61,6 +61,8 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,19 +110,33 @@ pub struct FaultProxy {
     mode_tx: watch::Sender<FaultMode>,
     shutdown_tx: watch::Sender<bool>,
     accept_task: JoinHandle<()>,
+    traffic: Arc<ProxyTraffic>,
+}
+
+#[derive(Default)]
+struct ProxyTraffic {
+    forwarded_bytes: AtomicUsize,
+    dropped_bytes: AtomicUsize,
 }
 
 impl FaultProxy {
     /// Bind a listener on `127.0.0.1:0` and start forwarding accepted
     /// connections to `target`. Starts in [`FaultMode::Pass`].
     pub async fn start(target: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), target).await
+    }
+
+    /// Bind a specific address so advertised volume endpoints can retain the
+    /// server's port and authenticated RPC identity on another loopback IP.
+    pub async fn start_on(listen: SocketAddr, target: SocketAddr) -> io::Result<Self> {
+        let listener = TcpListener::bind(listen).await?;
         let listen_addr = listener.local_addr()?;
 
         let (mode_tx, mode_rx) = watch::channel(FaultMode::Pass);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let accept_task = tokio::spawn(accept_loop(listener, target, mode_rx, shutdown_rx));
+        let traffic = Arc::new(ProxyTraffic::default());
+        let accept_task = tokio::spawn(accept_loop(listener, target, mode_rx, shutdown_rx, traffic.clone()));
 
         Ok(Self {
             listen_addr,
@@ -128,7 +144,18 @@ impl FaultProxy {
             mode_tx,
             shutdown_tx,
             accept_task,
+            traffic,
         })
+    }
+
+    /// Bytes actually forwarded in either direction, excluding dropped traffic.
+    pub fn forwarded_bytes(&self) -> usize {
+        self.traffic.forwarded_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes actually discarded by a blackhole or one-way partition.
+    pub fn dropped_bytes(&self) -> usize {
+        self.traffic.dropped_bytes.load(Ordering::Relaxed)
     }
 
     /// Local address the proxy is listening on. Point clients here instead of
@@ -171,6 +198,7 @@ async fn accept_loop(
     target: SocketAddr,
     mode_rx: watch::Receiver<FaultMode>,
     mut shutdown_rx: watch::Receiver<bool>,
+    traffic: Arc<ProxyTraffic>,
 ) {
     loop {
         tokio::select! {
@@ -188,6 +216,7 @@ async fn accept_loop(
                             target,
                             mode_rx.clone(),
                             shutdown_rx.clone(),
+                            traffic.clone(),
                         ));
                     }
                     // A transient accept error should not tear the proxy down.
@@ -205,6 +234,7 @@ async fn handle_connection(
     target: SocketAddr,
     mode_rx: watch::Receiver<FaultMode>,
     shutdown_rx: watch::Receiver<bool>,
+    traffic: Arc<ProxyTraffic>,
 ) {
     let server = match TcpStream::connect(target).await {
         Ok(s) => s,
@@ -221,8 +251,9 @@ async fn handle_connection(
         server_wr,
         mode_rx.clone(),
         shutdown_rx.clone(),
+        traffic.clone(),
     ));
-    let down = tokio::spawn(pump(Direction::ServerToClient, server_rd, client_wr, mode_rx, shutdown_rx));
+    let down = tokio::spawn(pump(Direction::ServerToClient, server_rd, client_wr, mode_rx, shutdown_rx, traffic));
 
     let _ = up.await;
     let _ = down.await;
@@ -237,6 +268,7 @@ async fn pump<R, W>(
     mut to: W,
     mut mode_rx: watch::Receiver<FaultMode>,
     mut shutdown_rx: watch::Receiver<bool>,
+    traffic: Arc<ProxyTraffic>,
 ) where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -257,15 +289,22 @@ async fn pump<R, W>(
         let mode = *mode_rx.borrow_and_update();
         match mode {
             // Whole connection is a black hole: drain and drop.
-            FaultMode::Blackhole => continue,
+            FaultMode::Blackhole => {
+                traffic.dropped_bytes.fetch_add(n, Ordering::Relaxed);
+                continue;
+            }
             // This direction is partitioned off: drop its bytes; the peer keeps
             // reading nothing while the other direction may still flow.
-            FaultMode::Partition(blocked) if blocked == dir => continue,
+            FaultMode::Partition(blocked) if blocked == dir => {
+                traffic.dropped_bytes.fetch_add(n, Ordering::Relaxed);
+                continue;
+            }
             FaultMode::Latency(delay) => {
                 tokio::time::sleep(delay).await;
                 if to.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
+                traffic.forwarded_bytes.fetch_add(n, Ordering::Relaxed);
                 if to.flush().await.is_err() {
                     break;
                 }
@@ -274,6 +313,7 @@ async fn pump<R, W>(
                 if to.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
+                traffic.forwarded_bytes.fetch_add(n, Ordering::Relaxed);
                 if to.flush().await.is_err() {
                     break;
                 }
@@ -285,7 +325,6 @@ async fn pump<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::Mutex;
 
@@ -375,6 +414,8 @@ mod tests {
 
         assert_eq!(got, payload, "pass mode must forward bytes unchanged");
         assert_eq!(echo.received().await, payload, "server must have received the bytes");
+        assert_eq!(proxy.forwarded_bytes(), payload.len() * 2);
+        assert_eq!(proxy.dropped_bytes(), 0);
 
         proxy.shutdown().await;
     }
@@ -414,6 +455,8 @@ mod tests {
 
         assert!(got.is_empty(), "blackhole mode must not return any bytes, got {got:?}");
         assert!(echo.received().await.is_empty(), "blackhole must not forward to the server");
+        assert_eq!(proxy.forwarded_bytes(), 0);
+        assert_eq!(proxy.dropped_bytes(), b"into-the-void".len());
 
         // Proxy is still alive and steerable after a blackholed connection.
         proxy.set_mode(FaultMode::Pass);

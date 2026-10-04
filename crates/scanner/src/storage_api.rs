@@ -150,6 +150,8 @@ pub(crate) mod owner {
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
 
     #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::object::{WriteCommitGuard, WriteCompletion};
+    #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{

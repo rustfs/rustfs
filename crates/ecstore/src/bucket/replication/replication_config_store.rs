@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::replication_error_boundary::Result;
-use super::replication_storage_boundary::{HTTPPreconditions, ObjectInfo, ObjectOptions, ReplicationObjectIO};
+use super::replication_storage_boundary::{
+    HTTPPreconditions, ObjectInfo, ObjectOptions, ReplicationObjectIO, WriteCommitGuard, WriteCompletion,
+};
 use crate::config::{com, storageclass};
 use std::sync::Arc;
 
@@ -77,13 +79,6 @@ impl ReplicationConfigStore {
         com::save_config(api, file, data).await
     }
 
-    pub(crate) async fn save_no_lock<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
-    where
-        S: ReplicationObjectIO,
-    {
-        com::save_config_no_lock(api, file, data).await
-    }
-
     pub(crate) async fn save_conditional<S>(
         api: Arc<S>,
         file: &str,
@@ -111,21 +106,18 @@ impl ReplicationConfigStore {
         file: &str,
         data: Vec<u8>,
         http_preconditions: HTTPPreconditions,
+        guard: &WriteCommitGuard,
     ) -> Result<()>
     where
         S: ReplicationObjectIO,
     {
-        com::save_config_with_opts_quiet(
-            api,
-            file,
-            data,
-            &ObjectOptions {
-                max_parity: true,
-                no_lock: true,
-                http_preconditions: Some(http_preconditions),
-                ..Default::default()
-            },
-        )
-        .await
+        let mut opts = ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(http_preconditions),
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(guard);
+        com::save_config_with_opts_quiet(api, file, data, &opts).await
     }
 }
