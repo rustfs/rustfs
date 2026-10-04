@@ -836,7 +836,9 @@ impl LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) = os::fsync_dst_dir_group_commit(parent, Some(commit.mutation_lease.clone())).await {
+                if let Err(err) =
+                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), None).await
+                {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
@@ -1201,10 +1203,11 @@ impl LocalDisk {
                     && let Some(dst_parent) = dst_file_path.parent()
                 {
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
-                    if let Err(err) = os::fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
+                    if let Err(err) = os::fsync_commit_directory(
                         dst_parent,
+                        &commit.directory_guard,
                         commit.mutation_lease.clone(),
-                        admission,
+                        Some(admission),
                     )
                     .await
                     {
