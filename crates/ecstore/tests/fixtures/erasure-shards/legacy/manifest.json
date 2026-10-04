@@ -1,0 +1,66 @@
+{
+  "block_size": 1048576,
+  "bucket": "erasure-fixtures",
+  "capture": {
+    "command": "rustfs --address 127.0.0.1:$PORT backend/disk{1..12}",
+    "disk_count": 12,
+    "environment": {
+      "RUSTFS_CONSOLE_ENABLE": "false",
+      "RUSTFS_STORAGE_CLASS_STANDARD": "EC:6"
+    },
+    "inline_threshold_per_shard": 131072,
+    "payload": "SHA256(b'RustFS backlog #2248 E10 pinned fixture v1' + counter.to_bytes(8, 'little')), concatenated and truncated to 786433 bytes",
+    "producer_get_equals_oracle": true,
+    "producer_stopped_before_copy": true,
+    "shutdown": {
+      "forced_kill_after_seconds": 20,
+      "initial_signal": "SIGTERM",
+      "process_reaped_before_copy": true,
+      "returncode": -9
+    },
+    "storage_class_standard": "EC:6"
+  },
+  "data_shards": 6,
+  "files": {
+    "disk1/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "125f8204f39211fed4a5a7b927de9c7c4d7d39544cfc5a93602daf86a8298225",
+    "disk1/erasure-fixtures/non-inline.bin/xl.meta": "acf42a683c1e81ec8925189c693574d74e6b5682a5091884974722bd3edd5f4f",
+    "disk10/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "39d226f036a22a0099dd3cf3f0d6c5eb8902e7a9560642528d46e002ab01b3db",
+    "disk10/erasure-fixtures/non-inline.bin/xl.meta": "73e1f9a2f86f7214d3e76bb906a4c657e375e992d178ee23f967be289f464f81",
+    "disk11/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "d56d32d1eb32bdb32b77e6458205f8c42bd4b59d692e084330344deab7e48810",
+    "disk11/erasure-fixtures/non-inline.bin/xl.meta": "67392bea6c1c9d8e6a13afa3540633c6ff9bfa0caa6a49b019bfc9e707adbb62",
+    "disk12/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "c64d7c5eb33aef912913dbc85692ae291c61cb67fcacda9abe87de8059c369b5",
+    "disk12/erasure-fixtures/non-inline.bin/xl.meta": "9d327a0e6d101f11ad8db0fa693eb81ce8e893a200c44aafd436b4b6e0e38f2a",
+    "disk2/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "ae4209ab1e4d7ce8e26da414e4d0e21490c81b39e475e768a664a4e000b0fe16",
+    "disk2/erasure-fixtures/non-inline.bin/xl.meta": "6570482acc478529dce1af0525f05e4bf617c57e7f775ced8b4b0b80dea20a40",
+    "disk3/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "e0abbab5f232c0b4fe1744b9e78d94ce477514766fd475dbefe2e712b1b4d87b",
+    "disk3/erasure-fixtures/non-inline.bin/xl.meta": "dfb141d97bb6b43a8f4b96b43d7f214ceea4b447bec1fa12a3fdd2f36f76a299",
+    "disk4/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "870a31918d708e83583f0dbc5fad3941af603d602b134672aad84c018b1506e2",
+    "disk4/erasure-fixtures/non-inline.bin/xl.meta": "63e9d7462e12930f003f416954514108e231cde4813f5cf7b804b3f7546c1ab1",
+    "disk5/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "07b5c7b23fd43fb7f8bbba22f32fdb430895929ef702a2453ee3c26ef9e3d28d",
+    "disk5/erasure-fixtures/non-inline.bin/xl.meta": "b10bc26f2f92ca59a50f25315f9ba5ce614b1de627c6edb366109367f3b905cd",
+    "disk6/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "623f6131ab6c6b8d5cb5962f7c88a8b289da08c65fbd91a99c591a27b16298da",
+    "disk6/erasure-fixtures/non-inline.bin/xl.meta": "dc351b240b90baf19bd3684709157b02aa330bcb0c42bd404ef3938c9a1b0782",
+    "disk7/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "2795b0d98bd5026ad765e276a8f22b1d601b8f699258d9b3a1663186c7a300ce",
+    "disk7/erasure-fixtures/non-inline.bin/xl.meta": "0add42e3251e057c10637786e9e3060bacb95e0b084b21ad7acc369e1f6c89aa",
+    "disk8/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "254ef640d6a193bb23673a19116861280649e6255f63800baf4595c8b4815a7b",
+    "disk8/erasure-fixtures/non-inline.bin/xl.meta": "8ed8e05d9a9013b1cfd8ba5c816727f5ca6bfa888f3af76a97ca1127a73e7c9a",
+    "disk9/erasure-fixtures/non-inline.bin/8a24d3f4-dbc3-4c77-8e6d-10ceecbd5a71/part.1": "ac754f505a62ccbf29046324ed9fd4172b5cdd44bdb1d78f0e3150322acc45cc",
+    "disk9/erasure-fixtures/non-inline.bin/xl.meta": "47d021868d9f5580934adfd3321e9c618d1357758890eaa81f5d27af0c324ad5"
+  },
+  "object": "non-inline.bin",
+  "parity_shards": 6,
+  "plaintext_sha256": "b5a83332327961a31b65a8731c64559fd04ff8ac9f6124022201dbbdba5ffa01",
+  "plaintext_size": 786433,
+  "schema_version": 1,
+  "source": {
+    "archive_sha256": "c7d1d5b060fad53ea3c9eac9deb6d1ea20a22d441ec3494cd5a18fe6f7bbb215",
+    "archive_url": "https://github.com/rustfs/rustfs/releases/download/1.0.0-alpha.37/rustfs-macos-aarch64-v1.0.0-alpha.37.zip",
+    "binary_sha256": "158b5e0a96c6caf201a72e8c20e417124c190f295160e7c8610bf54228b5292a",
+    "binary_version": "rustfs 1.0.0-alpha.37\nbuild time   : 2025-07-24 09:05:37 +00:00\nbuild profile: release\nbuild os     : macos-aarch64\nrust version : rustc 1.88.0 (6b00bc388 2025-06-23)\nrust channel : stable-aarch64-apple-darwin\ngit branch   : \ngit commit   : 371119f7336b74fdbcee37a8fcccb9d91c276f47\ngit tag      : 1.0.0-alpha.37\ngit status   :",
+    "codec": "gf16",
+    "producer": "RustFS",
+    "release": "1.0.0-alpha.37",
+    "source_commit": "371119f7336b74fdbcee37a8fcccb9d91c276f47",
+    "uses_legacy": true
+  }
+}

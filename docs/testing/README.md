@@ -21,6 +21,8 @@ Pick the lowest layer that can prove the change; add a higher-layer test only wh
 
 Every script named above is indexed with status and wiring in [`scripts/README.md`](../../scripts/README.md). Fixed GHSA advisories map to named regression tests in [security-regressions.md](security-regressions.md).
 
+The [ECStore core invariant gates](ecstore-core-invariants.md) map required native commit, rollback, lock, read, multipart and metadata regressions to the existing CI run and distinguish them from process and network fault evidence.
+
 The [scanner checkpoint fixture](scanner-checkpoint-fixture.md) diagnoses retained subtree coverage across budget interruption, persistence, reload, and plan invalidation.
 
 The [scanner cache cost profile](scanner-cache-cost.md) separates clone, subtree copy, encoding, and counted save costs without changing production cache behavior.
