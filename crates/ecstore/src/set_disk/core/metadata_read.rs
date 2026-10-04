@@ -575,6 +575,7 @@ impl MetadataFanoutDiagnostics {
 
     pub(in crate::set_disk) fn record_quorum_candidate_latency(&self, path: &'static str, read_quorum: usize) {
         if let Some(latency) = self.quorum_candidate_latency(read_quorum) {
+            rustfs_io_metrics::record_get_object_metadata_quorum_result(path, "reached");
             rustfs_io_metrics::record_get_object_quorum_reached_latency(path, latency.as_secs_f64());
         }
     }

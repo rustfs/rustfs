@@ -741,7 +741,16 @@ pub fn record_get_object_request_start(concurrent_requests: usize) {
     gauge!("rustfs_io_get_object_concurrent_requests").set(concurrent_requests as f64);
 }
 
-/// Record GetObject request start without concurrency context.
+/// Record one timeout-wrapped GetObject storage operation start.
+#[inline(always)]
+pub fn record_get_object_timeout_operation_start() {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_timeout_operations_total").increment(1);
+}
+
+/// Record a GetObject request start without concurrency context.
 #[inline(always)]
 pub fn record_get_object_request_started() {
     if !get_stage_metrics_enabled() {
@@ -758,6 +767,16 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
     }
     counter!("rustfs_io_get_object_request_results_total", "status" => status.to_string()).increment(1);
     histogram!("rustfs_io_get_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
+}
+
+/// Record the result of one timeout-wrapped GetObject storage operation.
+#[inline(always)]
+pub fn record_get_object_timeout_operation_result(status: &str, duration_secs: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_timeout_operation_results_total", "status" => status.to_string()).increment(1);
+    histogram!("rustfs_io_get_object_timeout_operation_duration_seconds", "status" => status.to_string()).record(duration_secs);
 }
 
 /// Record PutObject request start.
@@ -1114,6 +1133,15 @@ pub fn record_get_object_metadata_response(path: &'static str, outcome: &'static
         return;
     }
     counter!("rustfs_io_get_object_metadata_response_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record whether metadata resolution selected an object identity at read quorum.
+#[inline(always)]
+pub fn record_get_object_metadata_quorum_result(path: &'static str, outcome: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_quorum_results_total", "path" => path, "outcome" => outcome).increment(1);
 }
 
 /// Record one bounded metadata cache decision.
@@ -4165,6 +4193,35 @@ mod tests {
         set_put_stage_metrics_enabled(true);
         assert!(put_stage_timer().is_some());
         set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn get_timeout_operation_and_metadata_quorum_metrics_have_separate_scopes() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_get_stage_metrics_enabled(true);
+            record_get_object_request_start(1);
+            record_get_object_request_result("ok", 0.01);
+            record_get_object_timeout_operation_start();
+            record_get_object_timeout_operation_result("success", 0.005);
+            record_get_object_metadata_quorum_result("legacy_duplex", "reached");
+            record_get_object_metadata_quorum_result("legacy_duplex", "not_reached");
+            set_get_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_requests_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_request_results_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_timeout_operations_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_timeout_operation_results_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_metadata_quorum_results_total"), Some(2));
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_io_get_object_timeout_operation_duration_seconds"),
+            vec![0.005]
+        );
     }
 
     #[test]
