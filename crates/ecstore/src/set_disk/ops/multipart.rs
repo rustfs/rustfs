@@ -21,6 +21,7 @@
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
 use crate::core::pools::DecommissionCapacityAdmission;
+use crate::object_api::write_commit_context::WriteCommitContext;
 
 #[cfg(test)]
 use super::super::GetObjectMetadataCacheKey;
@@ -2125,7 +2126,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         if object_parts.len() > ret.parts.len() {
             ret.is_truncated = true;
-            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num).unwrap_or_default();
+            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num);
         }
 
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
@@ -2446,17 +2447,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         crate::hp_guard!("SetDisks::complete_multipart_upload");
+        let write_context = WriteCommitContext::from_options(opts, bucket, object, false)?;
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
-        let range_seek_rollout_enabled = crate::object_api::legacy_encrypted_range_seek_enabled() && !opts.no_lock;
+        let range_seek_rollout_enabled =
+            crate::object_api::legacy_encrypted_range_seek_enabled() && write_context.acquires_namespace();
         let mut object_lock_guard = None;
         let mut decommission_object_lock_guard = None;
         let mut decommission_target_lock_covered = false;
         let mut decommission_capacity_guard = None;
 
         if opts.http_preconditions.is_some() {
-            if !opts.no_lock {
+            if write_context.acquires_namespace() {
                 object_lock_guard = Some(
                     self.acquire_write_lock_diag("complete_multipart_upload_precondition", bucket, object)
                         .await?,
@@ -2479,7 +2482,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     self.pool_index,
                     bucket,
                     object,
-                    opts.no_lock || object_lock_guard.is_some(),
+                    !write_context.acquires_namespace() || object_lock_guard.is_some(),
                     DecommissionCapacityAdmission::ExistingMultipart,
                 )
                 .await?;
@@ -2487,7 +2490,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             decommission_target_lock_covered = target_lock_covered;
             decommission_capacity_guard = capacity_guard;
         }
-        if !opts.no_lock && object_lock_guard.is_none() && !decommission_target_lock_covered {
+        if write_context.acquires_namespace() && object_lock_guard.is_none() && !decommission_target_lock_covered {
             object_lock_guard = Some(
                 self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
                     .await?,
@@ -3354,8 +3357,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // usable as a CopyObject source. Do not return on rename quorum while
         // a tail owner may still hold the object guard and finish shard moves.
         let commit_allows_early_ack = false;
-        let detach_commit_owner = commit_allows_early_ack || upload_guard.is_some() || quota_mutation_fence;
+        let detach_commit_owner =
+            write_context.has_borrowed_owner() || commit_allows_early_ack || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
+            let write_context = write_context;
             let mut _object_lock_guard = commit_object_lock_guard;
             let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
             let mut _upload_guard = upload_guard;
@@ -3377,6 +3382,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeQuotaRename).await;
                 if quota_reservation.is_lock_lost()
                     || !quota_reservation.capability_proof_matches()
+                    || write_context.is_lock_lost()
                     || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                     || _decommission_object_lock_guard
                         .as_ref()
@@ -3431,6 +3437,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 }
                 if quota_reservation.is_lock_lost()
                     || !quota_reservation.capability_proof_matches()
+                    || write_context.is_lock_lost()
                     || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                     || _decommission_object_lock_guard
                         .as_ref()
@@ -3761,6 +3768,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use crate::set_disk::core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+    use crate::set_disk::get_lock_acquire_timeout;
     // No-locker helpers resolve to the isolated-context variants (see
     // `hermetic_set_disks_isolated`); the guard-based tests build through
     // `hermetic_set_disks_with_lockers`, which stays on the bootstrap context
@@ -4502,6 +4510,54 @@ mod tests {
             part_num: part.part_num,
             etag: part.etag,
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_parts_pagination_preserves_sparse_markers_and_terminates() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-pagination";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let opts = ObjectOptions::default();
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &opts)
+            .await
+            .expect("multipart upload should be created");
+
+        let empty = set_disks
+            .list_object_parts(bucket, object, &upload.upload_id, None, 2, &opts)
+            .await
+            .expect("empty upload should be listable");
+        assert!(empty.parts.is_empty());
+        assert!(!empty.is_truncated);
+        assert_eq!(empty.next_part_number_marker, None);
+
+        for part_number in [10, 1, 3] {
+            put_test_part(&set_disks, bucket, object, &upload.upload_id, part_number, b"part", 4).await;
+        }
+
+        for (marker, max_parts, expected_parts, next_marker) in [
+            (None, 0, vec![], None),
+            (None, 1, vec![1], Some(1)),
+            (None, 2, vec![1, 3], Some(3)),
+            (None, 3, vec![1, 3, 10], None),
+            (None, MAX_PARTS_COUNT + 1, vec![1, 3, 10], None),
+            (Some(1), 2, vec![3, 10], None),
+            (Some(2), 1, vec![3], Some(3)),
+            (Some(3), 2, vec![10], None),
+            (Some(10), 2, vec![], None),
+            (Some(11), 2, vec![], None),
+        ] {
+            let page = set_disks
+                .list_object_parts(bucket, object, &upload.upload_id, marker, max_parts, &opts)
+                .await
+                .expect("uploaded parts should be listable");
+            assert_eq!(page.part_number_marker, marker.unwrap_or_default());
+            assert_eq!(page.max_parts, max_parts.min(MAX_PARTS_COUNT));
+            assert_eq!(page.parts.iter().map(|part| part.part_num).collect::<Vec<_>>(), expected_parts);
+            assert_eq!(page.is_truncated, next_marker.is_some());
+            assert_eq!(page.next_part_number_marker, next_marker);
         }
     }
 
@@ -7072,6 +7128,54 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn borrowed_complete_keeps_namespace_owner_after_caller_cancel() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "multipart-borrowed-cancel";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set, bucket, object, &[0x53; 4096], &ObjectOptions::default()).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
+        let writer = Arc::clone(&set);
+        let complete = tokio::spawn(async move {
+            let outer_guard = crate::object_api::WriteCommitGuard::acquire(
+                &writer.new_ns_lock(bucket, object).await.expect("namespace wrapper"),
+                get_lock_acquire_timeout(),
+            )
+            .await
+            .expect("outer MPU namespace guard");
+            let mut opts = ObjectOptions::default();
+            opts.add_write_commit_guard(&outer_guard);
+            writer
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &opts)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("borrowed completion reaches committed cleanup");
+        complete.abort();
+        assert!(complete.await.expect_err("completion caller canceled").is_cancelled());
+        let mut probe = Box::pin(set.acquire_write_lock_diag("borrowed_complete_probe", bucket, object));
+        assert!(
+            futures::poll!(probe.as_mut()).is_pending(),
+            "borrowed completion retains the real outer namespace owner"
+        );
+        barrier.release();
+        drop(
+            tokio::time::timeout(Duration::from_secs(30), probe)
+                .await
+                .expect("completion owner finishes cleanup")
+                .expect("next writer obtains namespace"),
+        );
+        let info = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("borrowed MPU result remains readable");
+        assert_eq!(info.size, 4096);
     }
 
     #[tokio::test(flavor = "multi_thread")]

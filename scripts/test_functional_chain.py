@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -270,6 +271,34 @@ class EnvelopeTests(unittest.TestCase):
             with mock.patch.object(Path, "write_text", side_effect=OSError("disk full")), self.assertRaises(OSError):
                 evidence.record(self.chain, "kms", report, self.root / "new" / "kms.json")
             self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+
+    def test_record_uses_workspace_testing_checkout_for_nested_lane(self):
+        lane_checkout = self.root / "rustfs-repo"
+        lane_checkout.mkdir()
+        private_checkout = self.root / "auto-testing"
+        private_checkout.mkdir()
+        subprocess.run(["git", "init", "--quiet", str(private_checkout)], check=True)
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgSign=false", "commit", "--allow-empty", "-qm", "fixture"],
+                       cwd=private_checkout, check=True)
+        private_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=private_checkout, text=True).strip()
+        chain = {**self.chain, "testing_sha": private_head}
+        report = self.root / "security.md"
+        report.write_text("| Case | Status |\n| --- | --- |\n| SEC-1 | PASS |\n")
+        env = {**self.env, "GITHUB_WORKSPACE": str(self.root)}
+        output = self.root / "nested-success" / "security.json"
+        with mock.patch.object(evidence, "ROOT", lane_checkout), mock.patch.dict(evidence.os.environ, env):
+            evidence.record(chain, "security", report, output)
+            self.assertTrue(json.loads(output.read_text())["valid"])
+            wrong_pin_output = self.root / "nested-wrong-pin" / "security.json"
+            with self.assertRaisesRegex(ValueError, "suite used a different private script revision"):
+                evidence.record({**chain, "testing_sha": "f" * 40}, "security", report, wrong_pin_output)
+            self.assertFalse(json.loads(wrong_pin_output.read_text())["valid"])
+        fallback_output = self.root / "local-success" / "security.json"
+        with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, self.env):
+            evidence.os.environ.pop("GITHUB_WORKSPACE", None)
+            evidence.record(chain, "security", report, fallback_output)
+            self.assertTrue(json.loads(fallback_output.read_text())["valid"])
 
     def test_unknown_status_cannot_hide_among_passing_cases(self):
         text = "| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n| KMS-2 | fixture | NOT RUN |\n"

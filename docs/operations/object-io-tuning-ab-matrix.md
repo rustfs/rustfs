@@ -69,6 +69,7 @@ iostat -xz 5 > telemetry/iostat.txt &
 | Knob | Default | Controls | Validating stage | Risk if widened |
 | --- | --- | --- | --- | --- |
 | `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` | 32MiB (`crates/ecstore/src/erasure/coding/encode.rs`) | EC encode producer/consumer memory budget (blocks queued between encode and shard write) | `set_disk_encode` P95 + `rustfs_ec_encode_inflight_bytes_current` | RSS growth under high concurrency |
+| `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST` | `true` | Streaming encode reads into an owned, EC-sized buffer, avoiding the input-to-encoder block copy. Set `false` to select the previous streaming Vec ingest path; batched encode always uses owned buffers. Cached at first use. | `erasure_encode_cpu`, PUT throughput and RSS | No disk-format change; queue budget does not bound total process memory |
 | `RUSTFS_OBJECT_IO_BUFFER_SIZE` | 128KiB (`crates/config/src/constants/object.rs`) | Streaming read-in / write-out block size | `ingress_prepare`, `set_disk_encode` | Larger buffers = fewer polls, more resident memory |
 | `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB (`crates/config/src/constants/object.rs`) | Duplex pipe capacity (shared; PUT uses it less than GET) | `set_disk_encode` feed smoothness | Memory per in-flight request |
 | `RUSTFS_DURABILITY_MODE` / `RUSTFS_DRIVE_SYNC_ENABLE` | mode-dependent | Per-shard fsync/sync discipline on commit | `set_disk_rename` P99 | Weakening it changes the durability contract — a deliberate tradeoff, never a free win |

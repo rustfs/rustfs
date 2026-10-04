@@ -30,8 +30,20 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
+    use futures::{StreamExt, stream};
     use std::collections::HashSet;
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::time::{Instant, error::Elapsed, timeout_at};
     use tracing::info;
+
+    const PAGINATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+    // Fixture population can require thousands of durable PUTs. Bound the
+    // listing traversal itself with one deadline shared by every page.
+    async fn listing_request_before<T>(deadline: Instant, request: impl Future<Output = T>) -> Result<T, Elapsed> {
+        timeout_at(deadline, request).await
+    }
 
     /// Helper function to create an S3 client for testing
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -55,6 +67,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_deadline_rejects_unresponsive_peer() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unresponsive listing peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listing peer address"));
+        let (received_tx, received_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept listing request");
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).await.expect("read listing request") > 0);
+            received_tx.send(()).expect("signal received listing request");
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let client = Client::from_conf(
+            crate::common::build_test_s3_config(&endpoint, "test-access", "test-secret", None, "pagination-deadline")
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let request = client.list_objects_v2().bucket("deadline-test").send();
+        tokio::pin!(request);
+        tokio::select! {
+            response = &mut request => panic!("unresponsive listing peer unexpectedly returned: {response:?}"),
+            received = timeout(Duration::from_secs(10), received_rx) => {
+                received.expect("listing request must reach peer").expect("listing peer must remain alive");
+            }
+        }
+
+        // Expire the same absolute deadline after the real request is observed;
+        // this tests a stalled response without relying on transport timing.
+        let result = timeout(Duration::from_secs(1), listing_request_before(Instant::now(), request))
+            .await
+            .expect("expired pagination deadline must stop the in-flight request");
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_err(),
+            "an unresponsive ListObjectsV2 request must exceed the pagination deadline"
+        );
     }
 
     /// Test for Issue #2775: continuation forwarding must not
@@ -514,12 +574,12 @@ mod tests {
                 .expect("Failed to put object");
         }
 
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .max_keys(1001)
-            .send()
+        eprintln!("Seeded {object_count} objects in {bucket}; starting ListObjectsV2 pagination");
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
+        let output = listing_request_before(deadline, client.list_objects_v2().bucket(bucket).max_keys(1001).send())
             .await
+            .expect("ListObjectsV2 pagination exceeded its deadline after fixture population")
             .expect("Failed to list objects");
 
         assert_eq!(output.contents().len(), 1000);
@@ -535,14 +595,18 @@ mod tests {
             .expect("NextContinuationToken should be present when capped response is truncated")
             .to_string();
 
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .max_keys(1001)
-            .continuation_token(next_token)
-            .send()
-            .await
-            .expect("Failed to list objects with continuation token");
+        let output = listing_request_before(
+            deadline,
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1001)
+                .continuation_token(next_token)
+                .send(),
+        )
+        .await
+        .expect("ListObjectsV2 continuation exceeded the shared pagination deadline")
+        .expect("Failed to list objects with continuation token");
 
         assert_eq!(output.contents().len(), 2);
         assert!(!output.is_truncated().unwrap_or(false));
@@ -747,23 +811,28 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        // Create 1000 objects: 100 directories with 10 files each
-        let mut all_keys = Vec::new();
-        let dirs: Vec<String> = (0..100).map(|i| format!("dir-{:03}/", i)).collect();
-        for dir in &dirs {
-            for i in 0..10 {
-                let key = format!("{dir}file{:02}.txt", i);
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .body(ByteStream::from_static(b"x"))
-                    .send()
-                    .await
-                    .expect("Failed to put object");
-                all_keys.push(key);
-            }
-        }
+        // Keep every fixture key while overlapping durable PUTs within a bounded fanout.
+        let all_keys: Vec<String> = (0..100)
+            .flat_map(|dir| (0..10).map(move |file| format!("dir-{dir:03}/file{file:02}.txt")))
+            .collect();
+        stream::iter(&all_keys)
+            .for_each_concurrent(16, |key| {
+                let client = &client;
+                async move {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                }
+            })
+            .await;
+
+        eprintln!("Seeded {} objects in {bucket}; starting ListObjectsV2 pagination", all_keys.len());
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
 
         // Paginate with delimiter="/" and max_keys=50
         // Visible per page: up to 50 CommonPrefixes
@@ -780,7 +849,10 @@ mod tests {
                 request = request.continuation_token(token);
             }
 
-            let output = request.send().await.expect("Failed to list objects");
+            let output = listing_request_before(deadline, request.send())
+                .await
+                .expect("ListObjectsV2 delimiter traversal exceeded the shared pagination deadline")
+                .expect("Failed to list objects");
             last_page_is_truncated = output.is_truncated().unwrap_or(false);
 
             for obj in output.contents() {
@@ -971,32 +1043,48 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        // 12 dirs × 100 files = 1200 raw keys
+        // Keep all 1200 raw keys while bounding upload concurrency so fixture setup
+        // leaves the test's timeout budget available for the listing regression.
         let dir_count = 12;
         let files_per_dir = 100;
-        for d in 0..dir_count {
-            for f in 0..files_per_dir {
-                let key = format!("dir-{:02}/file{:03}.txt", d, f);
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .body(ByteStream::from_static(b"x"))
-                    .send()
-                    .await
-                    .expect("Failed to put object");
-            }
-        }
+        let fixture_started = std::time::Instant::now();
+        stream::iter((0..dir_count).flat_map(|d| (0..files_per_dir).map(move |f| (d, f))))
+            .for_each_concurrent(16, |(d, f)| {
+                let client = &client;
+                async move {
+                    let key = format!("dir-{d:02}/file{f:03}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                }
+            })
+            .await;
+        info!(
+            event = "pagination_fixture_ready",
+            component = "e2e_test",
+            subsystem = "list_objects_v2",
+            object_count = dir_count * files_per_dir,
+            elapsed_ms = fixture_started.elapsed().as_millis(),
+            "Pagination fixture ready"
+        );
+
+        eprintln!(
+            "Seeded {} objects in {bucket}; starting ListObjectsV2 pagination",
+            dir_count * files_per_dir
+        );
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
 
         // With delimiter: 12 CommonPrefixes visible, all fit within capped 1000
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .delimiter("/")
-            .max_keys(2000)
-            .send()
-            .await
-            .expect("Failed to list objects");
+        let output =
+            listing_request_before(deadline, client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(2000).send())
+                .await
+                .expect("ListObjectsV2 delimiter listing exceeded its deadline after fixture population")
+                .expect("Failed to list objects");
 
         assert_eq!(
             output.common_prefixes().len(),
@@ -1005,7 +1093,20 @@ mod tests {
             dir_count,
             output.common_prefixes().len()
         );
+        let prefixes = output
+            .common_prefixes()
+            .iter()
+            .map(|entry| entry.prefix().expect("each CommonPrefix must carry its prefix").to_owned())
+            .collect::<Vec<_>>();
+        let expected_prefixes = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect::<Vec<_>>();
+        assert_eq!(prefixes, expected_prefixes);
+        assert!(output.contents().is_empty(), "all fixture objects must collapse into prefixes");
+        assert_eq!(output.key_count(), Some(i32::try_from(dir_count).expect("fixture count fits i32")));
         assert_eq!(output.max_keys(), Some(1000));
+        assert!(
+            output.next_continuation_token().is_none(),
+            "a complete listing must not return a continuation token"
+        );
         // 12 visible < 1000 capped MaxKeys → not truncated
         assert!(
             !output.is_truncated().unwrap_or(false),

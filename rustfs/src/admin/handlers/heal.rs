@@ -57,7 +57,11 @@ const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const LEGACY_ROOT_HEAL_RESPONSE_ID: &str = ".";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MRF_RESPONSIBILITY_LIST_DEFAULT_LIMIT: usize = 100;
+const MRF_RESPONSIBILITY_LIST_MAX_LIMIT: usize = 256;
 pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
+pub(crate) const MRF_LEGACY_RESPONSIBILITIES_ROUTE_SUFFIX: &str = "/v4/heal/mrf/responsibilities";
+pub(crate) const MRF_LEGACY_RESPONSIBILITIES_ACTIONS_ROUTE_SUFFIX: &str = "/v4/heal/mrf/responsibilities/actions";
 const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -219,6 +223,18 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
         AdminOperation(&BackgroundHealStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, MRF_LEGACY_RESPONSIBILITIES_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&MrfLegacyResponsibilitiesHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, MRF_LEGACY_RESPONSIBILITIES_ACTIONS_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&MrfLegacyResponsibilitiesActionHandler {}),
     )?;
 
     r.insert(
@@ -1414,7 +1430,7 @@ fn encode_replacement_recovery_status(response: &ReplacementRecoveryStatusRespon
     })
 }
 
-async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+async fn authenticate_heal_admin_request(req: &S3Request<Body>) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
@@ -1429,7 +1445,12 @@ async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
     )
-    .await
+    .await?;
+    Ok(cred.access_key)
+}
+
+async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+    authenticate_heal_admin_request(req).await.map(|_| ())
 }
 
 pub struct HealHandler {}
@@ -1576,6 +1597,248 @@ impl Operation for HealHandler {
 
 pub struct BackgroundHealStatusHandler {}
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MrfLegacyResponsibilityActionRequest {
+    action: MrfLegacyResponsibilityAction,
+    responsibility_id: uuid::Uuid,
+    expected_bucket_incarnation_id: uuid::Uuid,
+    #[serde(default)]
+    acknowledge_unverified_data_risk: Option<bool>,
+    #[serde(default)]
+    acknowledge_unknown_source_incarnation: Option<bool>,
+    #[serde(default)]
+    acknowledge_bucket_incarnation_mismatch: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    request_id: Option<uuid::Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MrfLegacyResponsibilityAction {
+    Refresh,
+    Recheck,
+    AcceptUnverifiedRisk,
+}
+
+fn validate_mrf_legacy_responsibility_action(action: &MrfLegacyResponsibilityActionRequest) -> Result<(), &'static str> {
+    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_nil() {
+        return Err("responsibility and bucket incarnation IDs must be non-nil");
+    }
+    match action.action {
+        MrfLegacyResponsibilityAction::Refresh | MrfLegacyResponsibilityAction::Recheck => {
+            if action.acknowledge_unverified_data_risk.is_some()
+                || action.acknowledge_unknown_source_incarnation.is_some()
+                || action.acknowledge_bucket_incarnation_mismatch.is_some()
+                || action.reason.is_some()
+                || action.reference.is_some()
+            {
+                return Err("recheck does not accept risk-acknowledgment fields");
+            }
+        }
+        MrfLegacyResponsibilityAction::AcceptUnverifiedRisk => {
+            if action.acknowledge_unverified_data_risk != Some(true) {
+                return Err("acknowledgeUnverifiedDataRisk must be true");
+            }
+            if action.acknowledge_unknown_source_incarnation.is_none() || action.acknowledge_bucket_incarnation_mismatch.is_none()
+            {
+                return Err("both source-incarnation acknowledgment fields are required");
+            }
+            if action
+                .reason
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty() || value.len() > 1024)
+            {
+                return Err("reason is required and limited to 1024 UTF-8 bytes");
+            }
+            if action
+                .reference
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty() || value.len() > 256)
+            {
+                return Err("reference is required and limited to 256 UTF-8 bytes");
+            }
+            if action.request_id.is_none_or(|request_id| request_id.is_nil()) {
+                return Err("requestId must be non-nil");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_mrf_legacy_responsibility_query(uri: &Uri) -> S3Result<(Option<uuid::Uuid>, usize)> {
+    let mut cursor = None;
+    let mut limit = MRF_RESPONSIBILITY_LIST_DEFAULT_LIMIT;
+    let mut seen = HashSet::with_capacity(2);
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "cursor" if seen.insert("cursor") => {
+                    cursor = Some(
+                        value
+                            .parse()
+                            .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "cursor must be a UUID"))?,
+                    );
+                }
+                "limit" if seen.insert("limit") => {
+                    limit = value
+                        .parse::<usize>()
+                        .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "limit must be an integer between 1 and 256"))?;
+                    if limit == 0 || limit > MRF_RESPONSIBILITY_LIST_MAX_LIMIT {
+                        return Err(admin_error(S3ErrorCode::InvalidArgument, "limit must be between 1 and 256"));
+                    }
+                }
+                "cursor" | "limit" => {
+                    return Err(admin_error(S3ErrorCode::InvalidArgument, "duplicate MRF responsibility query parameter"));
+                }
+                _ => return Err(admin_error(S3ErrorCode::InvalidArgument, "unknown MRF responsibility query parameter")),
+            }
+        }
+    }
+    Ok((cursor, limit))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MrfLegacyResponsibilityActionResponse {
+    responsibility_id: uuid::Uuid,
+    state: &'static str,
+    data_verified: bool,
+    durable_responsibility_retained: bool,
+}
+
+fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
+    use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+    match error {
+        MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
+            admin_error(S3ErrorCode::ServiceUnavailable, "MRF lifecycle operation could not be completed")
+        }
+        MrfLifecycleControlError::StaleGeneration => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility generation changed")
+        }
+        MrfLifecycleControlError::NotHeld => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility is not held as unverified legacy")
+        }
+        MrfLifecycleControlError::IncarnationChanged => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "bucket incarnation changed; refresh the MRF responsibility listing",
+        ),
+        MrfLifecycleControlError::InvalidAction(reason) => admin_error(S3ErrorCode::InvalidRequest, reason),
+    }
+}
+
+pub struct MrfLegacyResponsibilitiesHandler {}
+
+#[async_trait::async_trait]
+impl Operation for MrfLegacyResponsibilitiesHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_heal_admin_request(&req).await?;
+        let (cursor, limit) = parse_mrf_legacy_responsibility_query(&req.uri)?;
+        let snapshot = timeout(
+            Duration::from_secs(5),
+            rustfs_heal::heal::mrf_queue::list_legacy_responsibilities(cursor, limit),
+        )
+        .await
+        .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility listing timed out"))?
+        .map_err(map_mrf_lifecycle_control_error)?;
+        let body = serde_json::to_vec(&snapshot)
+            .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility listing"))?;
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
+pub struct MrfLegacyResponsibilitiesActionHandler {}
+
+#[async_trait::async_trait]
+impl Operation for MrfLegacyResponsibilitiesActionHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let actor = authenticate_heal_admin_request(&req).await?;
+        let bytes = req
+            .input
+            .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility action body is too large or unreadable"))?;
+        let action: MrfLegacyResponsibilityActionRequest = serde_json::from_slice(&bytes)
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "invalid MRF responsibility action body"))?;
+        validate_mrf_legacy_responsibility_action(&action).map_err(|reason| admin_error(S3ErrorCode::InvalidRequest, reason))?;
+        let (state, data_verified, durable_responsibility_retained) = match action.action {
+            MrfLegacyResponsibilityAction::Refresh => {
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::refresh_legacy_responsibility(
+                        action.responsibility_id,
+                        action.expected_bucket_incarnation_id,
+                    ),
+                )
+                .await
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility refresh timed out"))?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("refreshed", false, true)
+            }
+            MrfLegacyResponsibilityAction::Recheck => {
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::recheck_legacy_responsibility(
+                        action.responsibility_id,
+                        action.expected_bucket_incarnation_id,
+                    ),
+                )
+                .await
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility recheck timed out"))?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("active", false, true)
+            }
+            MrfLegacyResponsibilityAction::AcceptUnverifiedRisk => {
+                let reason = action
+                    .reason
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reason is required"))?;
+                let reference = action
+                    .reference
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reference is required"))?;
+                let request_id = action
+                    .request_id
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "requestId is required"))?;
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
+                        rustfs_heal::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest {
+                            responsibility_id: action.responsibility_id,
+                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id,
+                            acknowledge_unknown_source_incarnation: action.acknowledge_unknown_source_incarnation == Some(true),
+                            acknowledge_incarnation_mismatch: action.acknowledge_bucket_incarnation_mismatch == Some(true),
+                            actor,
+                            reason,
+                            reference,
+                            request_id,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    admin_error(
+                        S3ErrorCode::ServiceUnavailable,
+                        "MRF risk disposition timed out; read status before retrying",
+                    )
+                })?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("operatorAcceptedUnverified", false, true)
+            }
+        };
+        let body = serde_json::to_vec(&MrfLegacyResponsibilityActionResponse {
+            responsibility_id: action.responsibility_id,
+            state,
+            data_verified,
+            durable_responsibility_retained,
+        })
+        .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility action response"))?;
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -1667,13 +1930,14 @@ mod tests {
     use super::extract_heal_init_params;
     use super::{
         BackgroundHealCoverage, BackgroundHealCoverageReason, BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState,
-        aggregate_cluster_heal_status, aggregate_replacement_recovery_cluster_status, background_heal_runtime_state,
-        build_heal_channel_request, build_replacement_recovery_status_response, encode_background_heal_status,
-        encode_heal_control_path, encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight,
-        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id,
-        json_response, map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
-        query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission, validate_heal_request_mode,
-        validate_heal_target,
+        MrfLegacyResponsibilityAction, MrfLegacyResponsibilityActionRequest, aggregate_cluster_heal_status,
+        aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
+        encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
+        map_heal_response, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query, peer_topology_complete,
+        query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission,
+        validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
     };
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
@@ -1692,6 +1956,92 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use uuid::Uuid;
+
+    #[test]
+    fn mrf_legacy_risk_action_requires_explicit_acknowledgment_and_audit_fields() {
+        let base = json!({
+            "action": "acceptUnverifiedRisk",
+            "responsibilityId": Uuid::new_v4(),
+            "expectedBucketIncarnationId": Uuid::new_v4(),
+            "acknowledgeUnverifiedDataRisk": true,
+            "acknowledgeUnknownSourceIncarnation": false,
+            "acknowledgeBucketIncarnationMismatch": false,
+            "reason": "Verified against the retained canonical backup",
+            "reference": "INC-1234",
+            "requestId": Uuid::new_v4(),
+        });
+        let action: MrfLegacyResponsibilityActionRequest = serde_json::from_value(base.clone()).expect("valid risk action");
+        assert!(validate_mrf_legacy_responsibility_action(&action).is_ok());
+
+        let mut missing_ack = base.clone();
+        missing_ack["acknowledgeUnverifiedDataRisk"] = json!(false);
+        let missing_ack: MrfLegacyResponsibilityActionRequest = serde_json::from_value(missing_ack).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_ack).is_err());
+
+        let mut missing_reference = base.clone();
+        missing_reference.as_object_mut().expect("request object").remove("reference");
+        let missing_reference: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(missing_reference).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_reference).is_err());
+
+        let mut missing_source_ack = base.clone();
+        missing_source_ack
+            .as_object_mut()
+            .expect("request object")
+            .remove("acknowledgeUnknownSourceIncarnation");
+        let missing_source_ack: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(missing_source_ack).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_source_ack).is_err());
+
+        let mut oversized_reason = base.clone();
+        oversized_reason["reason"] = json!("x".repeat(1025));
+        let oversized_reason: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(oversized_reason).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&oversized_reason).is_err());
+
+        let mut unknown_field = base;
+        unknown_field["clearJournal"] = json!(true);
+        assert!(serde_json::from_value::<MrfLegacyResponsibilityActionRequest>(unknown_field).is_err());
+
+        let recheck = MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::Recheck,
+            responsibility_id: Uuid::new_v4(),
+            expected_bucket_incarnation_id: Uuid::new_v4(),
+            acknowledge_unverified_data_risk: None,
+            acknowledge_unknown_source_incarnation: None,
+            acknowledge_bucket_incarnation_mismatch: None,
+            reason: None,
+            reference: None,
+            request_id: None,
+        };
+        assert!(validate_mrf_legacy_responsibility_action(&recheck).is_ok());
+        let refresh = MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::Refresh,
+            ..recheck
+        };
+        assert!(validate_mrf_legacy_responsibility_action(&refresh).is_ok());
+    }
+
+    #[test]
+    fn mrf_legacy_listing_query_is_bounded_and_rejects_ambiguous_parameters() {
+        let cursor = Uuid::new_v4();
+        let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?cursor={cursor}&limit=256"))
+            .expect("valid responsibility URI");
+        assert_eq!(parse_mrf_legacy_responsibility_query(&uri).expect("valid query"), (Some(cursor), 256));
+
+        for query in [
+            "limit=0",
+            "limit=257",
+            "limit=-1",
+            "cursor=bad",
+            "limit=1&limit=2",
+            "object=secret",
+        ] {
+            let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?{query}")).expect("well-formed URI");
+            assert!(parse_mrf_legacy_responsibility_query(&uri).is_err(), "accepted invalid query {query}");
+        }
+    }
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;

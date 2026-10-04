@@ -33,10 +33,14 @@
 
 use crate::common::rustfs_binary_path_with_features;
 use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};
+use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, admin_request};
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
+use http::Method;
 use reqwest::Client;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::time::sleep;
 use tracing::info;
 
 // Fixed WebDAV port for testing
@@ -768,4 +772,262 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 #[tokio::test]
 async fn test_webdav_core_operations_direct() -> Result<()> {
     test_webdav_core_operations().await
+}
+
+/// Extract the numeric value of the first occurrence of a DAV property in a
+/// PROPFIND multistatus body. Namespace-prefix agnostic; a self-closing
+/// (unreported) property yields None.
+fn quota_prop_value(body: &str, prop: &str) -> Option<u64> {
+    let prop_start = body.find(prop)?;
+    let after_name = &body[prop_start + prop.len()..];
+    let value_start = after_name.find('>')? + 1;
+    let value_end = after_name[value_start..].find('<')? + value_start;
+    after_name[value_start..value_end].trim().parse().ok()
+}
+
+/// PROPFIND `/` at Depth 0 requesting the two quota properties, returning
+/// (quota-available-bytes, quota-used-bytes).
+async fn propfind_root_quota(client: &Client, base_url: &str, auth_header: &str) -> Result<(u64, u64)> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:"><D:prop><D:quota-available-bytes/><D:quota-used-bytes/></D:prop></D:propfind>"#;
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid HTTP method"),
+            base_url,
+        )
+        .header("Authorization", auth_header)
+        .header("Depth", "0")
+        .header("Content-Type", "application/xml")
+        .body(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    anyhow::ensure!(status.as_u16() == 207, "PROPFIND / should return 207, got: {status} body: {text}");
+    let available = quota_prop_value(&text, "quota-available-bytes")
+        .ok_or_else(|| anyhow::anyhow!("quota-available-bytes missing from PROPFIND response: {text}"))?;
+    let used = quota_prop_value(&text, "quota-used-bytes")
+        .ok_or_else(|| anyhow::anyhow!("quota-used-bytes missing from PROPFIND response: {text}"))?;
+    Ok((available, used))
+}
+
+/// Set a HARD bucket quota, retrying while the admin API reports the quota
+/// subsystem as not yet ready (503), mirroring quota_test.rs readiness.
+async fn set_bucket_quota_with_retry(admin_base_url: &str, bucket: &str, quota_bytes: u64) -> Result<()> {
+    let quota_path = format!("/rustfs/admin/v3/quota/{bucket}");
+    let quota_config = serde_json::json!({
+        "quota": quota_bytes,
+        "quota_type": "HARD"
+    })
+    .to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, response) = admin_request(
+            admin_base_url,
+            Method::PUT,
+            &quota_path,
+            Some(quota_config.clone()),
+            DEFAULT_ACCESS_KEY,
+            DEFAULT_SECRET_KEY,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if status != http::StatusCode::SERVICE_UNAVAILABLE {
+            anyhow::bail!("failed to set quota for {bucket}: {status} {response}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("quota readiness did not converge for {bucket} within 30 seconds");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Test WebDAV: PROPFIND quota properties (quota-available-bytes /
+/// quota-used-bytes).
+///
+/// dav-server queries quota once per PROPFIND without a path argument, so the
+/// reported pair is session-scoped:
+///
+/// - Phase A: a visible bucket without quota (or no buckets at all) falls back
+///   to the cluster's usable physical capacity, the console dashboard numbers.
+/// - Phase B: once every visible bucket carries a HARD quota, the pair is the
+///   summed cached bucket usage against the summed quota limits.
+pub async fn test_webdav_quota_reporting() -> Result<()> {
+    // Dedicated ports: the core WebDAV test owns 9010/9080.
+    const QUOTA_S3_ADDRESS: &str = "127.0.0.1:9011";
+    const QUOTA_WEBDAV_PORT: u16 = 9081;
+    const QUOTA_WEBDAV_ADDRESS: &str = "127.0.0.1:9081";
+    const QUOTA_LIMIT: u64 = 1_073_741_824; // 1 GiB
+    const OBJECT_CONTENT: &[u8] = b"Hello, WebDAV!";
+
+    let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let admin_base_url = format!("http://{QUOTA_S3_ADDRESS}");
+
+    info!("Starting WebDAV server on {}", QUOTA_WEBDAV_ADDRESS);
+    let binary_path = rustfs_binary_path_with_features(Some("webdav"));
+    let mut server_command = Command::new(&binary_path);
+    server_command
+        .arg("--address")
+        .arg(QUOTA_S3_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_WEBDAV_ENABLE", "true")
+        .env("RUSTFS_WEBDAV_ADDRESS", QUOTA_WEBDAV_ADDRESS)
+        .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
+        .arg(&env.temp_dir);
+    // Quota-mode reporting reads the data-usage scanner cache; run the scanner
+    // on a fast cycle so the uploaded object converges quickly.
+    for (key, value) in FAST_DATA_USAGE_SCANNER_ENV {
+        server_command.env(key, value);
+    }
+    let mut server_process = server_command.spawn()?;
+
+    // Ensure server is cleaned up even on failure
+    let result = async {
+        ProtocolTestEnvironment::wait_for_port_ready(QUOTA_WEBDAV_PORT, 30)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let client = create_client();
+        let auth_header = basic_auth_header();
+        let base_url = format!("http://{QUOTA_WEBDAV_ADDRESS}");
+
+        // Phase A: physical-capacity fallback (a visible bucket has no quota)
+        info!("Testing WebDAV quota: fallback to physical capacity without bucket quotas");
+        let phase_a_bucket = "quota-fallback-probe";
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{base_url}/{phase_a_bucket}"),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "MKCOL '{phase_a_bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        // Storage info may briefly report zero capacity right after startup
+        // (disks still initializing), which omits the quota properties; poll
+        // until they appear.
+        let phase_a_deadline = Instant::now() + Duration::from_secs(30);
+        let (available, _used) = loop {
+            match propfind_root_quota(&client, &base_url, &auth_header).await {
+                Ok(quota) => break quota,
+                Err(e) if Instant::now() < phase_a_deadline => {
+                    info!("quota properties not reported yet, retrying: {e}");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        assert!(
+            available > 0,
+            "physical-capacity fallback should report positive quota-available-bytes, got: {available}"
+        );
+        info!("PASS: quota fallback reports physical capacity (available={available})");
+
+        let resp = client
+            .delete(format!("{base_url}/{phase_a_bucket}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE bucket '{phase_a_bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        // Phase B: every visible bucket has a HARD quota -> summed usage/quota
+        info!("Testing WebDAV quota: summed bucket quota reporting");
+        let bucket = "quota-probe";
+        let object = "hello.txt";
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{base_url}/{bucket}"),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(resp.status().is_success(), "MKCOL '{bucket}' should succeed, got: {}", resp.status());
+
+        let resp = client
+            .put(format!("{base_url}/{bucket}/{object}"))
+            .header("Authorization", &auth_header)
+            .body(OBJECT_CONTENT)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT '{bucket}/{object}' should succeed, got: {}",
+            resp.status()
+        );
+
+        set_bucket_quota_with_retry(&admin_base_url, bucket, QUOTA_LIMIT).await?;
+
+        // The usage cache trails the scanner; poll PROPFIND until the uploaded
+        // object is reflected (before convergence the missing usage counts as 0).
+        let expected_used = OBJECT_CONTENT.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (available, used) = loop {
+            let (available, used) = propfind_root_quota(&client, &base_url, &auth_header).await?;
+            if used == expected_used {
+                break (available, used);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "quota-used-bytes did not converge to {expected_used} within 60 seconds (last: used={used} available={available})"
+                );
+            }
+            sleep(Duration::from_secs(2)).await;
+        };
+        assert_eq!(
+            available,
+            QUOTA_LIMIT - expected_used,
+            "quota-available-bytes should be the remaining quota"
+        );
+        info!("PASS: summed quota reporting converged (used={used}, available={available})");
+
+        // Cleanup
+        let resp = client
+            .delete(format!("{base_url}/{bucket}/{object}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE '{bucket}/{object}' should succeed, got: {}",
+            resp.status()
+        );
+        let resp = client
+            .delete(format!("{base_url}/{bucket}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE bucket '{bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        info!("WebDAV quota reporting tests passed");
+        Ok(())
+    }
+    .await;
+
+    // Always cleanup server process
+    let _ = server_process.kill().await;
+    let _ = server_process.wait().await;
+
+    result
+}
+
+#[tokio::test]
+async fn test_webdav_quota_reporting_direct() -> Result<()> {
+    test_webdav_quota_reporting().await
 }

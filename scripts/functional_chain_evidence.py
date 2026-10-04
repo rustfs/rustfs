@@ -113,12 +113,27 @@ def fault_tolerance_counts(text):
     return counts
 
 
+def auto_testing_dir():
+    """Locate the auto-testing checkout. Lanes that run this script from a
+    subdirectory checkout (security keeps its rustfs clone in rustfs-repo/)
+    still check auto-testing out at the workspace root, so ROOT alone is not
+    always the right base."""
+    candidates = [ROOT / "auto-testing"]
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        candidates.append(Path(workspace) / "auto-testing")
+    for candidate in candidates:
+        if (candidate / ".git").exists():
+            return candidate
+    return candidates[0]
+
+
 def record(chain, suite, report, output):
     require(suite in SUITES, "unknown suite")
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
     error = None
     try:
-        private_head = subprocess.check_output(["git", "-C", "auto-testing", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        private_head = subprocess.check_output(["git", "-C", str(auto_testing_dir()), "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         require(private_head == chain["testing_sha"], "suite used a different private script revision")
         require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
         data = report.read_bytes()

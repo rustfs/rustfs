@@ -15,7 +15,7 @@
 use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
-use crate::storage_api::owner::ecstore_hold_namespace_commit;
+use crate::storage_api::owner::{WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit};
 use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
@@ -700,6 +700,143 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     global_metrics().set_cycle(None).await;
 }
 
+async fn checkpoint_runtime_handoff(store: Arc<MemoryConfigStore>, expected_cycle: u64, mut epoch: u64) -> (u64, u64) {
+    let (encoded, mut revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("read the previous durable generation");
+    let (mut cycle, saved_epoch) =
+        decode_scanner_cycle_state(&encoded.expect("a preceding generation must exist")).expect("decode preceding cycle");
+    assert_eq!((cycle.next, saved_epoch), (expected_cycle, epoch));
+    cycle.current = cycle.next;
+    let ctx = CancellationToken::new();
+    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone()).await;
+    tokio::time::pause();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let worker = async {
+        budget.token().cancelled().await;
+        assert!(
+            finalize_partial_scan_cycle_for_epoch(&ctx, store.clone(), &mut cycle, &mut revision, epoch, &mut metrics, Some(0),)
+                .await,
+            "runtime expiry must durably advance the partial cycle"
+        );
+        budget.mark_cycle_state_persisted();
+    };
+    let outcome = await_scanner_cycle_with_budget_fence(&ctx, &budget, worker, std::future::pending()).await;
+    tokio::time::resume();
+    assert_eq!(outcome, ScannerCycleWaitOutcome::Deadline { worker_stopped: true });
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+    assert!(budget.cycle_state_persisted());
+    assert!(
+        fence_scanner_epoch_after_cycle_timeout(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            std::future::pending(),
+        )
+        .await
+    );
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
+    let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("read durable takeover fence");
+    let (saved, saved_epoch) = decode_scanner_cycle_state(&persisted).expect("decode takeover fence");
+    assert_eq!((saved.next, saved_epoch), (cycle.next, epoch));
+    (cycle.next, epoch)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
+    // One control store survives every handoff, as it does across real cycles.
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    usage.scanner_epoch = Some(7);
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&usage).expect("usage baseline"),
+    )
+    .await
+    .expect("seed usage fence once");
+    let mut cycle = CurrentCycle {
+        next: 11,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 7).await);
+    let checkpoint = crate::scanner_folder::run_checkpoint_fixture(false, |cycle, epoch| {
+        checkpoint_runtime_handoff(store.clone(), cycle, epoch)
+    })
+    .await;
+    let persisted = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("final durable control state");
+    let (saved, epoch) = decode_scanner_cycle_state(&persisted).expect("final control state");
+    assert_eq!((saved.next, epoch), (checkpoint.info.next_cycle, checkpoint.info.leader_epoch));
+    assert!(saved.next > 11 && epoch > 7);
+    let cache_name = "bucket/.usage-cache.bin";
+    let cache_revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("initial cache revisions");
+    checkpoint
+        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0)
+        .await
+        .expect("publish the current checkpoint into the fenced store");
+    let cache_path = rustfs_utils::path::path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name]);
+    let key = memory_config_key(RUSTFS_META_BUCKET, &cache_path);
+    let before = store.objects.lock().await.get(&key).cloned().expect("saved checkpoint bytes");
+    let mut revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("current cache revisions");
+    let mut stale = checkpoint.clone();
+    stale.info.next_cycle = 11;
+    stale.info.leader_epoch = 7;
+    stale.info.snapshot_complete = false;
+    for late_cycle in [11, saved.next] {
+        let late = crate::scanner_io::persist_scanner_checkpoint(
+            store.clone(),
+            store.clone(),
+            crate::scanner_io::ScannerCheckpointPersistContext {
+                ctx: &ctx,
+                expected_publication_epoch: 0,
+                cycle: late_cycle,
+                leader_epoch: 7,
+            },
+            cache_name,
+            &stale,
+            &mut revisions,
+        )
+        .await;
+        assert!(matches!(late, crate::scanner_io::ScannerCheckpointPersistResult::FenceChanged));
+        assert_eq!(
+            store.objects.lock().await.get(&key),
+            Some(&before),
+            "late writes cannot overwrite the current checkpoint"
+        );
+    }
+}
+
 #[tokio::test]
 async fn scanner_cycle_recovery_wake_survives_wait_registration_race() {
     notify_scanner_cycle_recovery_wake();
@@ -1300,18 +1437,21 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         .await
         .expect("fixture bucket should be created");
     let mut reader = PutObjReader::from_vec(b"first".to_vec());
-    store.pools[0].disk_set[0]
-        .put_object(
-            &bucket,
-            "object",
-            &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("fixture object should finish its rename fanout");
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("fixture object should finish its rename fanout");
+    }
     crate::scanner_io::record_dirty_usage_bucket(&bucket);
     let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
     let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -1372,18 +1512,21 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
 
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
-    store.pools[0].disk_set[0]
-        .put_object(
-            &bucket,
-            "object",
-            &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("the pending tail must change the physical object before it drains");
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("the pending tail must change the physical object before it drains");
+    }
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
     drop(pending);
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());

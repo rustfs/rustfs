@@ -233,16 +233,19 @@ impl ForegroundWriteAdmissionGate {
 
     async fn admit(&self, permits: u32) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
         if self.wait_timeout.is_zero() {
-            return Ok(match self.semaphore.clone().try_acquire_many_owned(permits) {
-                Ok(permit) => ForegroundWriteAdmission::Admitted(permit),
-                Err(tokio::sync::TryAcquireError::NoPermits) => ForegroundWriteAdmission::Rejected,
-                Err(tokio::sync::TryAcquireError::Closed) => ForegroundWriteAdmission::Rejected,
-            });
+            return Ok(self.try_admit(permits));
         }
 
         match tokio::time::timeout(self.wait_timeout, self.semaphore.clone().acquire_many_owned(permits)).await {
             Ok(permit) => Ok(ForegroundWriteAdmission::Admitted(permit?)),
             Err(_) => Ok(ForegroundWriteAdmission::Rejected),
+        }
+    }
+
+    fn try_admit(&self, permits: u32) -> ForegroundWriteAdmission {
+        match self.semaphore.clone().try_acquire_many_owned(permits) {
+            Ok(permit) => ForegroundWriteAdmission::Admitted(permit),
+            Err(_) => ForegroundWriteAdmission::Rejected,
         }
     }
 }
@@ -787,6 +790,27 @@ impl ConcurrencyManager {
             .await
     }
 
+    /// Admit a copy part through the UploadPart pool using its resolved logical length.
+    /// Copy holds source metadata and bucket locks here, so it must never queue
+    /// behind a writer that may need those locks. Saturation returns SlowDown.
+    pub fn try_admit_multipart_part_copy(&self, size: i64) -> ForegroundWriteAdmission {
+        match &self.foreground_write_admission_policy {
+            ForegroundWriteAdmissionPolicy::Disabled | ForegroundWriteAdmissionPolicy::LegacyCounterOnly => {
+                ForegroundWriteAdmission::Disabled
+            }
+            ForegroundWriteAdmissionPolicy::Strict(gate) => gate.try_admit(1),
+            ForegroundWriteAdmissionPolicy::Large {
+                gate,
+                large_request_permits,
+                multipart_part_min_size_bytes,
+                ..
+            } if should_gate_foreground_write(size, *multipart_part_min_size_bytes) => {
+                gate.try_admit(multipart_admission_permits(size, *large_request_permits))
+            }
+            _ => ForegroundWriteAdmission::Disabled,
+        }
+    }
+
     // ============================================
     // Adaptive I/O Strategy Methods
     // ============================================
@@ -1271,9 +1295,9 @@ mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
     use super::super::request_guard::GetObjectGuard;
     use super::{
-        ConcurrencyManager, ForegroundWriteAdmission, ForegroundWriteAdmissionPolicy, SNOWBALL_ARCHIVE_DECODER_LIMIT,
-        SNOWBALL_MEMBER_COMMIT_LIMIT, SNOWBALL_STAGING_BYTES_LIMIT, derive_large_put_admission_limit,
-        derive_multipart_admission_max_pending,
+        ConcurrencyManager, ForegroundWriteAdmission, ForegroundWriteAdmissionGate, ForegroundWriteAdmissionPolicy,
+        SNOWBALL_ARCHIVE_DECODER_LIMIT, SNOWBALL_MEMBER_COMMIT_LIMIT, SNOWBALL_STAGING_BYTES_LIMIT,
+        derive_large_put_admission_limit, derive_multipart_admission_max_pending,
     };
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
@@ -1713,6 +1737,75 @@ mod integration_tests {
             .expect("multipart admission gate must stay open");
         assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)));
         assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multipart_copy_never_queues_with_source_locks() {
+        for (manager, expected_queued) in [
+            (
+                ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 4),
+                Some(0),
+            ),
+            (ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(30)), None),
+        ] {
+            let held = manager
+                .admit_multipart_part(32 * 1024 * 1024)
+                .await
+                .expect("hold write budget");
+            assert!(matches!(
+                manager.try_admit_multipart_part_copy(32 * 1024 * 1024),
+                ForegroundWriteAdmission::Rejected
+            ));
+            assert_eq!(manager.put_object_admission_snapshot().queued, expected_queued);
+            drop(held);
+            let copy = manager.try_admit_multipart_part_copy(32 * 1024 * 1024);
+            assert!(matches!(copy, ForegroundWriteAdmission::Admitted(_)));
+            assert!(matches!(manager.try_admit_multipart_part_copy(1), ForegroundWriteAdmission::Rejected));
+            drop(copy);
+            assert!(matches!(manager.try_admit_multipart_part_copy(1), ForegroundWriteAdmission::Admitted(_)));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_concurrency_manager_multipart_copy_uses_logical_size_threshold_and_weight() {
+        let mut manager = ConcurrencyManager::new();
+        manager.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::Large {
+            gate: ForegroundWriteAdmissionGate::new(4, Duration::from_secs(30)),
+            large_request_permits: 4,
+            put_object_min_size_bytes: 32 * 1024 * 1024,
+            multipart_part_min_size_bytes: 8 * 1024 * 1024,
+            multipart_wait_timeout: Duration::from_secs(30),
+            multipart_max_pending: 4,
+        };
+        assert!(matches!(
+            manager.try_admit_multipart_part_copy(8 * 1024 * 1024 - 1),
+            ForegroundWriteAdmission::Disabled
+        ));
+        let small = manager.try_admit_multipart_part_copy(8 * 1024 * 1024);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(1));
+        assert!(matches!(
+            manager.try_admit_multipart_part_copy(32 * 1024 * 1024),
+            ForegroundWriteAdmission::Rejected
+        ));
+        drop(small);
+        let full = manager.try_admit_multipart_part_copy(32 * 1024 * 1024);
+        assert!(matches!(full, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(4));
+        drop(full);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+        let unknown = manager.try_admit_multipart_part_copy(-1);
+        assert!(matches!(unknown, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(4));
+        drop(unknown);
+        for enabled in [false, true] {
+            let disabled = ConcurrencyManager::with_put_admission_for_test(enabled, 0, Duration::ZERO);
+            assert!(matches!(
+                disabled.try_admit_multipart_part_copy(32 * 1024 * 1024),
+                ForegroundWriteAdmission::Disabled
+            ));
+        }
     }
 
     #[tokio::test(start_paused = true)]

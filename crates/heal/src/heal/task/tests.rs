@@ -18,6 +18,7 @@ use crate::heal::storage::HealStorageObjectResult;
 
 mod concurrent_delete;
 mod deferred_retry;
+mod usage_observation;
 
 mod canonical_outcome {
     use super::*;
@@ -1901,6 +1902,7 @@ fn replacement_identity(
 
 #[derive(Clone)]
 enum MockHealObjectOutcome {
+    MissingObject { outer: bool },
     MissingVersion,
     PermissionDenied,
     RetryableLock,
@@ -2058,6 +2060,14 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2118,6 +2128,14 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2676,6 +2694,25 @@ async fn read_repair_object_heal_sets_read_repair_option() {
     assert_eq!(opts.len(), 1);
     assert!(opts[0].read_repair);
     assert!(!opts[0].no_lock);
+}
+
+#[tokio::test]
+async fn durable_mrf_heal_rejects_a_recreated_bucket_before_storage_heal() {
+    let original_incarnation = Uuid::new_v4();
+    let recreated_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(recreated_incarnation)),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(original_incarnation);
+    let task = HealTask::from_request(request, storage.clone());
+
+    let result = task.heal_object("bucket", "object", None).await;
+
+    assert!(matches!(result, Err(Error::TaskExecutionFailed { .. })));
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -4002,6 +4039,7 @@ async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() 
         HealPriority::Normal,
     );
     request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(incarnation);
     let task = HealTask::from_request(request, storage.clone());
 
     task.execute()

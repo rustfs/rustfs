@@ -468,7 +468,9 @@ impl HealTask {
         {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                    if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
+                        || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
+                    {
                         return Ok(());
                     }
 
@@ -513,7 +515,9 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
+                    || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
+                {
                     return Ok(());
                 }
 
@@ -536,6 +540,45 @@ impl HealTask {
         }
     }
 
+    async fn skip_missing_usage_observation(&self, bucket: &str, object: &str, version_id: Option<&str>, err: &Error) -> bool {
+        // Usage publication may delete an obsolete observation after a degraded
+        // GET has queued read repair. Its absence is not lost user data. Keep
+        // durable MRF completion on its separate, proof-bearing storage path.
+        if self.source != HealRequestSource::ReadRepair
+            || version_id.is_some()
+            || bucket != RUSTFS_META_BUCKET
+            || object
+                .strip_prefix(BUCKET_META_PREFIX)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                != Some(rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME)
+            || !matches!(
+                err,
+                Error::Disk(DiskError::FileNotFound)
+                    | Error::Storage(EcstoreError::FileNotFound | EcstoreError::ObjectNotFound(_, _))
+            )
+        {
+            return false;
+        }
+
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            source = self.source.as_str(),
+            result = "usage_observation_missing",
+            "Heal skipped an absent usage observation"
+        );
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_object_progress(1, 0, 0, 1, 0);
+        progress.update_stage(4, 4);
+        true
+    }
+
     /// Durable MRF partial writes may complete only with an incarnation-fenced storage proof.
     async fn heal_mrf_partial_write_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
         let heal_opts = HealOpts {
@@ -551,12 +594,22 @@ impl HealTask {
             set: self.options.set_index,
         };
         let mut expected = self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
-        let bucket_incarnation_id = self
+        let current_bucket_incarnation_id = self
             .outcome_bucket_incarnation_id(bucket, self.options.dry_run)
             .await?
             .ok_or_else(|| Error::TaskExecutionFailed {
                 message: format!("Missing bucket incarnation for durable MRF repair {bucket}/{object}"),
             })?;
+        let bucket_incarnation_id = self
+            .expected_mrf_bucket_incarnation_id
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing source bucket incarnation for durable MRF repair {bucket}/{object}"),
+            })?;
+        if current_bucket_incarnation_id != bucket_incarnation_id {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Bucket incarnation changed before durable MRF repair {bucket}/{object}"),
+            });
+        }
         expected.bucket_incarnation_id = Some(bucket_incarnation_id);
 
         let storage_result = self

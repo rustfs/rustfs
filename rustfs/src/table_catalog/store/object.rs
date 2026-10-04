@@ -747,13 +747,16 @@ where
         object: &str,
         entry: &T,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()>
     where
         T: Serialize,
     {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
-        self.backend.put_object_unlocked(bucket, object, data, precondition).await
+        self.backend
+            .put_object_unlocked(bucket, object, data, precondition, write_guards)
+            .await
     }
 
     async fn write_exact_entry_unlocked<T>(
@@ -762,11 +765,14 @@ where
         object: &str,
         entry: &T,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<String>
     where
         T: DeserializeOwned + PartialEq + Serialize,
     {
-        let write_result = self.write_entry_unlocked(bucket, object, entry, precondition).await;
+        let write_result = self
+            .write_entry_unlocked(bucket, object, entry, precondition, write_guards)
+            .await;
         let current = self.read_entry_unlocked::<T>(bucket, object).await?;
         match current {
             Some((current, Some(etag))) if current == *entry => Ok(etag),
@@ -878,14 +884,21 @@ where
         intent: &mut TableRenameIntent,
         etag: String,
         state: TableRenameIntentState,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<String> {
         if intent.state >= state {
             return Ok(etag);
         }
         intent.state = state;
         intent.updated_at = OffsetDateTime::now_utc().to_string();
-        self.write_exact_entry_unlocked(self.catalog_bucket(), object, intent, TableCatalogPutPrecondition::IfMatch(etag))
-            .await
+        self.write_exact_entry_unlocked(
+            self.catalog_bucket(),
+            object,
+            intent,
+            TableCatalogPutPrecondition::IfMatch(etag),
+            write_guards,
+        )
+        .await
     }
 
     async fn recover_active_table_rename(
@@ -1027,6 +1040,10 @@ where
                     &source_object,
                     &source_fence,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1039,7 +1056,13 @@ where
             }
         }
         intent_etag = self
-            .advance_table_rename_intent_unlocked(&intent_object, &mut intent, intent_etag, TableRenameIntentState::SourceFenced)
+            .advance_table_rename_intent_unlocked(
+                &intent_object,
+                &mut intent,
+                intent_etag,
+                TableRenameIntentState::SourceFenced,
+                _intent_guard.write_commit_guards(),
+            )
             .await?;
 
         let mut destination_fence = intent.destination.clone();
@@ -1055,6 +1078,10 @@ where
                     &destination_object,
                     &destination_fence,
                     TableCatalogPutPrecondition::IfAbsent,
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1067,6 +1094,10 @@ where
                     &destination_object,
                     &destination_fence,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1084,6 +1115,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::DestinationWritten,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
 
@@ -1098,6 +1130,10 @@ where
                     &source_object,
                     &source_tombstone,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1115,6 +1151,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::SourceTombstoned,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
 
@@ -1139,6 +1176,10 @@ where
                 &index_object,
                 &destination_index,
                 TableCatalogPutPrecondition::IfMatch(intent.warehouse_index_etag.clone()),
+                _catalog_guards
+                    .iter()
+                    .flat_map(TableCatalogLockGuard::write_commit_guards)
+                    .collect(),
             )
             .await?;
         }
@@ -1148,6 +1189,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::IndexPublished,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
         match self
@@ -1161,6 +1203,10 @@ where
                     &destination_object,
                     &intent.destination,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1178,10 +1224,17 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::DestinationPublished,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
-        self.advance_table_rename_intent_unlocked(&intent_object, &mut intent, intent_etag, TableRenameIntentState::Completed)
-            .await?;
+        self.advance_table_rename_intent_unlocked(
+            &intent_object,
+            &mut intent,
+            intent_etag,
+            TableRenameIntentState::Completed,
+            _intent_guard.write_commit_guards(),
+        )
+        .await?;
 
         let Some((mut bucket_entry, bucket_etag)) = self.read_table_bucket_with_etag_unlocked(table_bucket).await? else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
@@ -1196,12 +1249,17 @@ where
             &bucket_object,
             &bucket_entry,
             TableCatalogPutPrecondition::IfMatch(bucket_etag),
+            _bucket_guard.write_commit_guards(),
         )
         .await?;
         Ok(())
     }
 
-    async fn write_warehouse_index_state_unlocked(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+    async fn write_warehouse_index_state_unlocked(
+        &self,
+        table_bucket: &str,
+        write_guards: Vec<WriteCommitGuard>,
+    ) -> TableCatalogStoreResult<()> {
         let state = TableWarehouseIndexStateEntry {
             version: TABLE_WAREHOUSE_INDEX_STATE_VERSION,
             table_bucket: table_bucket.to_string(),
@@ -1212,6 +1270,7 @@ where
             &self.paths.warehouse_index_state_path(table_bucket),
             &state,
             TableCatalogPutPrecondition::Any,
+            write_guards,
         )
         .await
     }
@@ -1324,6 +1383,7 @@ where
             object,
             replacement,
             TableCatalogPutPrecondition::IfMatch(current_etag),
+            _guard.write_commit_guards(),
         )
         .await?;
         Ok(true)
@@ -1606,7 +1666,13 @@ where
             .await?
         else {
             return self
-                .write_entry_unlocked(self.catalog_bucket(), &object, &tombstone, TableCatalogPutPrecondition::IfAbsent)
+                .write_entry_unlocked(
+                    self.catalog_bucket(),
+                    &object,
+                    &tombstone,
+                    TableCatalogPutPrecondition::IfAbsent,
+                    _guard.write_commit_guards(),
+                )
                 .await;
         };
         validate_table_warehouse_index_entry_object(&self.paths, &object, &current)?;
@@ -1626,6 +1692,7 @@ where
             &object,
             &tombstone,
             TableCatalogPutPrecondition::IfMatch(current_etag),
+            _guard.write_commit_guards(),
         )
         .await
     }
@@ -1927,7 +1994,8 @@ where
             )
             .await?;
         }
-        self.write_warehouse_index_state_unlocked(table_bucket).await
+        self.write_warehouse_index_state_unlocked(table_bucket, _guard.write_commit_guards())
+            .await
     }
 
     async fn require_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
@@ -2178,7 +2246,13 @@ where
             ));
         }
         let result = self
-            .write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
+            .write_entry_unlocked(
+                self.catalog_bucket(),
+                &table_path,
+                &entry,
+                precondition,
+                _table_guard.write_commit_guards(),
+            )
             .await;
         if result.is_err() {
             self.rollback_table_warehouse_index_reservation(&entry, reservation, "table entry write failed")
@@ -2244,7 +2318,7 @@ where
                 "view creation publication fence was lost before catalog update".to_string(),
             ));
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
+        self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition, _view_guard.write_commit_guards())
             .await
     }
 
@@ -2424,6 +2498,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn plan_table_commit_recovery(
         &self,
         table_bucket: &str,
@@ -4076,6 +4151,17 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await
+            .map(|(catalog, _)| catalog)
+    }
+
+    async fn table_catalog_export_with_recovery(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
 
@@ -4110,12 +4196,15 @@ where
         let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
         let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
     }
 
     pub(crate) async fn diagnose_table_catalog(
@@ -4125,82 +4214,10 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
-        let parsed_namespace = parse_namespace_for_store(namespace)?;
-        let parsed_table = parse_table_for_store(table)?;
-        let catalog = self.export_table_catalog_entry(table_bucket, namespace, table).await?;
-        let current_metadata_location = catalog.table.metadata_location.clone();
-
-        let mut retained = BTreeSet::new();
-        let mut current_metadata_for_refs = None;
-        let current_metadata_status =
-            if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
-                retained.insert(current_metadata_location.clone());
-                match read_table_metadata_value(&self.backend, table_bucket, &current_metadata_location).await {
-                    Ok(Some(current_metadata)) => {
-                        retained.extend(metadata_log_locations(
-                            &current_metadata,
-                            table_bucket,
-                            &parsed_namespace,
-                            &parsed_table,
-                        ));
-                        current_metadata_for_refs = Some(current_metadata);
-                        TableMetadataPointerStatus::Valid
-                    }
-                    Ok(None) => TableMetadataPointerStatus::MissingObject,
-                    Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
-                    Err(err) => return Err(err),
-                }
-            } else {
-                TableMetadataPointerStatus::InvalidLocation
-            };
-
-        let mut metadata_locations = Vec::new();
-        let metadata_prefix = format!("{}/", default_table_metadata_dir_path(&parsed_namespace, &parsed_table));
-        for object in self.backend.list_objects(table_bucket, &metadata_prefix).await? {
-            if let Some(metadata_location) = metadata_location_from_metadata_file_path(&parsed_namespace, &parsed_table, &object)
-            {
-                metadata_locations.push(metadata_location);
-            }
-        }
-        metadata_locations.sort();
-        metadata_locations.dedup();
-
-        for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
-            retained.insert(metadata_location.clone());
-        }
-        if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
-            retained.extend(
-                metadata_locations_for_protected_snapshot_refs(
-                    &self.backend,
-                    table_bucket,
-                    &parsed_namespace,
-                    &parsed_table,
-                    current_metadata,
-                    &metadata_locations,
-                )
-                .await?,
-            );
-        }
-
-        let orphan_metadata_candidate_locations = metadata_locations
-            .into_iter()
-            .filter(|metadata_location| !retained.contains(metadata_location))
-            .collect();
-
-        let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
-        let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
-        let backing_manifest =
-            table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
-
-        Ok(TableCatalogDiagnosticsReport {
-            catalog,
-            current_metadata_status,
-            recovery_status,
-            recommended_actions,
-            commit_recovery,
-            backing_manifest,
-            orphan_metadata_candidate_locations,
-        })
+        let (catalog, commit_recovery) = self
+            .table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await?;
+        diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
     }
 
     pub(crate) async fn plan_table_metadata_maintenance(
@@ -4856,8 +4873,14 @@ where
             }
             entry.updated_at = Some(next_table_catalog_update_time(current.updated_at.as_deref()));
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::Any)
-            .await
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            TableCatalogPutPrecondition::Any,
+            _guard.write_commit_guards(),
+        )
+        .await
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
@@ -4906,8 +4929,14 @@ where
                 TableCatalogPutPrecondition::IfAbsent
             }
         };
-        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
-            .await
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            precondition,
+            _namespace_guard.write_commit_guards(),
+        )
+        .await
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
@@ -5011,8 +5040,14 @@ where
         if before == next {
             return Ok(result);
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &namespace_path, &next, precondition)
-            .await?;
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &namespace_path,
+            &next,
+            precondition,
+            _namespace_guard.write_commit_guards(),
+        )
+        .await?;
         Ok(result)
     }
 
@@ -5370,6 +5405,7 @@ where
                         &index_object,
                         &source_index,
                         TableCatalogPutPrecondition::IfAbsent,
+                        _index_guard.write_commit_guards(),
                     )
                     .await?
                 }
@@ -5395,6 +5431,7 @@ where
                 &intent_object,
                 &intent,
                 TableCatalogPutPrecondition::IfAbsent,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
             bucket_entry.active_rename_id = Some(rename_id);
@@ -5404,6 +5441,7 @@ where
                 &bucket_object,
                 &bucket_entry,
                 TableCatalogPutPrecondition::IfMatch(bucket_etag),
+                _bucket_guard.write_commit_guards(),
             )
             .await?;
         }
@@ -5853,6 +5891,7 @@ where
                 &table_path,
                 &next,
                 TableCatalogPutPrecondition::IfMatch(current_etag),
+                _guard.write_commit_guards(),
             )
             .await;
         record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
@@ -6148,6 +6187,7 @@ where
                 &view_path,
                 &next,
                 TableCatalogPutPrecondition::IfMatch(current_etag),
+                _guard.write_commit_guards(),
             )
             .await;
         if let Err(err) = write_result {

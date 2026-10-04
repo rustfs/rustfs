@@ -17,6 +17,8 @@ rules. A skill cannot expand the user's requested scope or grant authorization.
 
 - Inquiry, diagnosis, review, and planning tasks are read-only unless the user
   explicitly requests changes.
+- Ordinary diff/commit reviews use the finding standard below directly; no
+  generic review skill is required. PR and high-risk reviews retain their workflows.
 - For implementation, read the relevant code, tests, and local guidance, then
   make the smallest change that satisfies the request.
 - State assumptions only when they affect behavior or verification. Ask only
@@ -88,6 +90,9 @@ runtime/build output:
 
 - Run `cargo fmt --all --check` for Rust changes.
 - Run the narrowest test that exercises the changed behavior.
+- For an explicitly requested coverage assessment, use the
+  [coverage guide](docs/testing/README.md#coverage); a regression test alone does
+  not require coverage measurement.
 - Add package-scoped `cargo check` or Clippy only for targets, features, public
   APIs, error handling, or control flow not compiled by the focused test.
 - Use `make pre-commit` only when its repository-wide fast checks add confidence
@@ -150,13 +155,18 @@ For every added or edited `tracing` call:
 
 - Reuse the module's `EVENT_*`, `LOG_COMPONENT_*`, and `LOG_SUBSYSTEM_*`
   constants and field shape.
-- Put fields first and a short label last.
+- Put stable fields first (`event`, `component`, `subsystem`, `state`/`result`,
+  then context when available) and a short label last.
 - Use `error` for behavior/security failure, `warn` for degradation/fallback,
   `info` for low-frequency lifecycle, `debug` for diagnostics, and `trace` for
   repetitive request/object success paths.
-- Never log secrets, credential payloads, or merged configs.
+- Never log secrets, credential payloads, raw untrusted bodies, or merged configs,
+  including through error strings and `Debug` output.
+- Prefer one aggregate summary over inventories or startup banners.
 
-Use `.agents/skills/rustfs-logging-governance/SKILL.md` for logging changes.
+Run `./scripts/check_logging_guardrails.sh` for changed logging sites. For a broad
+logging audit, event-model migration, or guardrail expansion, read
+[logging governance](docs/operations/logging-governance.md).
 
 ## Cross-Cutting Storage Invariants
 

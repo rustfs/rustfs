@@ -137,6 +137,8 @@ This release reports rather than refuses, because flipping straight to a rejecti
 - `RUSTFS_SSE_C_REQUIRE_TLS=true` (default `false`) refuses those requests now, with the same `400 InvalidRequest` wording AWS uses. Confirm the counter reads zero before enabling it.
 - The default is expected to flip in a later release.
 
+The guard covers both the object's own SSE-C headers and the `x-amz-copy-source-server-side-encryption-customer-*` headers that `CopyObject` and `UploadPartCopy` use to read an SSE-C source: either set carries a customer key.
+
 The verdict is per connection: a listener that terminates TLS satisfies it, and so does an `https` protocol forwarded by a proxy the trusted-proxy configuration accepts. A direct plaintext client asserts nothing, and a forwarded protocol from an untrusted peer is not consulted.
 
 ## Object ciphertext format: what the v1 frame layout does and does not authenticate
@@ -178,6 +180,12 @@ No coordinated format cutover is required; the compatibility is deliberate and c
 Historically the KV2 and Local backends sealed only the DEK plaintext; the `encryption_context` rode in the envelope unauthenticated and was checked by field comparison alone, so a party able to rewrite the stored envelope could rewrite the context. With `RUSTFS_KMS_ENVELOPE_AAD=true`, newly wrapped envelopes bind the canonical context bytes as AES-GCM additional data and carry `context_binding: 1`; rewriting the stored context, or stripping the flag, then fails authentication. Static, Vault Transit and AWS already bound the context through their own mechanisms and are unaffected.
 
 Rollout constraint: reading bound envelopes needs no switch, but **a node that predates the field cannot open them** — its unwrap runs without the additional data and fails authentication. The switch defaults off (`ENV_KMS_ENVELOPE_AAD` in `crates/kms/src/config.rs`); enable it only after every node runs a release that understands `context_binding`, mirroring the `RUSTFS_ENCRYPTION_FRAME_V2` rollout. With the switch on, a rewrap sweep upgrades unbound envelopes to the bound format (converging to zero writes on re-run); a bound envelope never regresses to the unbound shape, and an envelope carrying an unrecognized `context_binding` value is refused rather than decrypted without its binding.
+
+### Location entry in the encryption context
+
+Every SSE-S3 and SSE-KMS data key is wrapped under an encryption context that includes the entry `{"<bucket>": "<bucket>/<object>"}`. Only the client-supplied part of the context (`x-amz-server-side-encryption-context`) is stored with the object; the location entry is rebuilt from the object's current location on every read, so a data key does not open at another location. How strongly that is enforced depends on the backend, as described above.
+
+A client context entry whose key equals the bucket name would replace the location entry, so SSE-KMS writes refuse it with `400 InvalidArgument`. Other keys, including the names of other buckets, are accepted. Objects that an earlier release stored with such an entry remain readable. Builds with the `rio-v2` feature additionally bind each object key to its location when sealing it.
 
 ### Guarantees that hold only once every node is upgraded
 

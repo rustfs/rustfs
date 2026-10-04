@@ -96,13 +96,17 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
+async fn acquire_self_copy_namespace_lock<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> S3Result<crate::app::storage_api::object_usecase::WriteCommitGuard>
 where
     S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
 {
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
-    lock.get_write_lock(get_lock_acquire_timeout())
+    crate::app::storage_api::object_usecase::WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
         .await
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
@@ -420,7 +424,8 @@ impl DefaultObjectUsecase {
             None
         };
         if let Some(guard) = _self_copy_lock_guard.as_ref() {
-            dst_opts.add_namespace_lock_guard(guard);
+            dst_opts.add_write_commit_guard(guard);
+            dst_opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
@@ -1098,7 +1103,7 @@ mod tests {
         let payload = b"object whose key equals its bucket".to_vec();
         let mut reader = PutObjReader::from_vec(payload.clone());
         let setup_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
             ..Default::default()
         };
         store

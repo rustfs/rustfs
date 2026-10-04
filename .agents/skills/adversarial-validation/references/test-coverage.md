@@ -19,7 +19,8 @@
   serialization is required.
 - Internal metadata tests assert both RustFS and MinIO keys, not only read-back
   through a helper that prefers one key.
-- Boundary companions are distinct coverage: `n == max` vs `max + 1`, and
+- Avoid duplicate tests of the same production path and poison-value class.
+  Boundary companions are distinct coverage: `n == max` vs `max + 1`, and
   absent vs empty vs nil UUID.
 - A focused test proves only the targets/features it builds. Add compilation or
   Clippy only for uncovered changed targets.

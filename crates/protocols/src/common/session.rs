@@ -68,6 +68,10 @@ pub struct SessionContext {
     pub protocol: Protocol,
     /// The source IP address
     pub source_ip: IpAddr,
+    /// Policy-relevant request headers, excluding authentication secrets.
+    pub request_headers: http::HeaderMap,
+    /// Whether the client transport protects both authentication and data.
+    pub secure_transport: bool,
 }
 
 impl SessionContext {
@@ -77,6 +81,8 @@ impl SessionContext {
             principal,
             protocol,
             source_ip,
+            request_headers: http::HeaderMap::new(),
+            secure_transport: protocol == Protocol::Sftp,
         }
     }
 

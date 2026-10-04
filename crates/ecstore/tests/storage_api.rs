@@ -60,3 +60,15 @@ pub(crate) mod minio_generated_read {
         DiskAPI, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
     };
 }
+
+pub(crate) mod pinned_erasure_fixtures {
+    pub(crate) use super::storage_contracts::{BucketOperations, HTTPRangeSpec, MakeBucketOptions, ObjectIO};
+    pub(crate) use super::{ECStore, Endpoint, Erasure, Error, ObjectOptions};
+    pub(crate) use rustfs_ecstore::api::{
+        bucket::metadata_sys::init_bucket_metadata_sys,
+        erasure::BitrotReader,
+        layout::{EndpointServerPools, Endpoints, PoolEndpoints},
+        runtime::InstanceContext,
+        storage::init_local_disks_with_instance_ctx,
+    };
+}

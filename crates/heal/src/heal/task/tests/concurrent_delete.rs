@@ -123,7 +123,7 @@ async fn admin_dry_run_can_observe_without_bucket_identity() {
 #[tokio::test(start_paused = true)]
 async fn admin_traversal_never_converts_unproven_errors_to_absence() {
     for (error, class) in [
-        (MockHealObjectOutcome::MissingVersion, HealFailureClass::Permanent),
+        (MockHealObjectOutcome::MissingVersion, HealFailureClass::RetryExhausted),
         (MockHealObjectOutcome::PermissionDenied, HealFailureClass::Permanent),
         (MockHealObjectOutcome::ErrOther("file not found"), HealFailureClass::Permanent),
         (MockHealObjectOutcome::RetryableReadQuorum, HealFailureClass::RetryExhausted),
@@ -146,4 +146,74 @@ async fn admin_traversal_never_converts_unproven_errors_to_absence() {
         assert_eq!(outcome.counters.unchanged, 0);
         assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Failed(class));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_traversal_retries_unproven_absence_until_storage_certifies_it() {
+    let incarnation = Uuid::new_v4();
+    let receipt = object_receipt("object-a", None, HealObjectDisposition::AuthoritativelyAbsent, incarnation);
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        heal_object_outcomes: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([MockHealObjectOutcome::MissingVersion]),
+        )])),
+        heal_object_receipts: Mutex::new(HashMap::from([("object-a".to_string(), VecDeque::from([receipt.clone(), receipt]))])),
+        ..Default::default()
+    });
+    let task = admin_traversal(HealType::Cluster, storage.clone(), false);
+    task.execute()
+        .await
+        .expect("unproven absence must use the existing retry budget");
+    let outcome = task.get_outcome().await;
+    let object = outcome
+        .objects
+        .iter()
+        .find(|item| item.identity.object == "object-a")
+        .expect("object outcome");
+    assert_eq!(object.disposition, HealObjectDisposition::AuthoritativelyAbsent);
+    assert_eq!(object.identity.bucket_incarnation_id, Some(incarnation));
+    assert_eq!(outcome.counters.attempt_failures, 1, "the errored receipt cannot certify absence");
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a", "object-b", "object-a"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_traversal_unproven_absence_exhausts_retries_without_positive_outcome() {
+    let incarnation = Uuid::new_v4();
+    let attempts = MAX_BUCKET_OBJECT_HEAL_RETRIES + 1;
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        heal_object_outcomes: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            (0..attempts).map(|_| MockHealObjectOutcome::MissingVersion).collect(),
+        )])),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            (0..attempts)
+                .map(|_| object_receipt("object-a", None, HealObjectDisposition::AuthoritativelyAbsent, incarnation))
+                .collect(),
+        )])),
+        ..Default::default()
+    });
+    let task = admin_traversal(HealType::Cluster, storage.clone(), false);
+    task.execute().await.expect_err("unproven absence cannot finish successfully");
+    let outcome = task.get_outcome().await;
+    let object = outcome
+        .objects
+        .iter()
+        .find(|item| item.identity.object == "object-a")
+        .expect("object outcome");
+    assert_eq!(object.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
+    assert_eq!(outcome.counters.attempt_failures, u64::from(attempts));
+    assert_eq!((outcome.counters.failed, outcome.counters.healed), (1, 0));
+    let calls = storage.heal_object_calls.lock().expect("object calls");
+    assert_eq!(
+        calls.iter().filter(|object| object.as_str() == "object-a").count(),
+        usize::try_from(attempts).expect("attempts fit")
+    );
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
 }
