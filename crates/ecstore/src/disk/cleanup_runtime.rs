@@ -171,6 +171,11 @@ fn positive_env(name: &str, default: usize) -> io::Result<usize> {
     }
 }
 
+// Keep the guard's accepted values aligned with the lane's existing parser.
+fn legacy_rename_tail_cleanup_lane_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+}
+
 fn parse_cpus(value: &str) -> io::Result<Vec<usize>> {
     let invalid = || {
         io::Error::new(
@@ -203,7 +208,6 @@ impl Config {
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP",
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER",
             "RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP",
-            RENAME_TAIL_CLEANUP_LANE_ENABLE,
         ] {
             if rustfs_utils::get_env_bool(name, false) {
                 return Err(io::Error::new(
@@ -211,6 +215,12 @@ impl Config {
                     format!("{name} cannot be combined with cleanup isolation"),
                 ));
             }
+        }
+        if legacy_rename_tail_cleanup_lane_enabled(std::env::var(RENAME_TAIL_CLEANUP_LANE_ENABLE).ok().as_deref()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{RENAME_TAIL_CLEANUP_LANE_ENABLE} cannot be combined with cleanup isolation"),
+            ));
         }
         let workers = positive_env(WORKERS, 2)?;
         let pending = positive_env(BUDGET, 1024)?;
@@ -638,6 +648,24 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_lane_guard_matches_legacy_boolean_values() {
+        for (value, expected) in [
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("YES"), true),
+            (Some("on"), true),
+            (Some("ON"), true),
+            (Some("True"), false),
+            (Some("enabled"), false),
+            (None, false),
+        ] {
+            assert_eq!(legacy_rename_tail_cleanup_lane_enabled(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
     fn invalid_environment_is_rejected_before_admission() {
         const CHILD: &str = "RUSTFS_CLEANUP_CONFIG_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -662,7 +690,6 @@ mod tests {
             ("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER", "true"),
             ("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP", "true"),
             (RENAME_TAIL_CLEANUP_LANE_ENABLE, "true"),
-            (RENAME_TAIL_CLEANUP_LANE_ENABLE, "True"),
         ] {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
