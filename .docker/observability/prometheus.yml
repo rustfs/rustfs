@@ -61,6 +61,7 @@ scrape_configs:
 otlp:
   promote_resource_attributes:
     - service.instance.id
+    - process.pid
     - service.name
     - service.namespace
     - cloud.availability_zone
