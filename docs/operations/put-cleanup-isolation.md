@@ -41,6 +41,12 @@ Do not combine isolation with cleanup counterfactuals
 `RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP`. These combinations
 are rejected because they deliberately suppress cleanup or stop queue progress.
 
+Do not enable `RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_ENABLE` together with
+`RUSTFS_CLEANUP_ISOLATE_ENABLE`. The legacy per-disk lane adds a second queue
+inside the isolated coordinator budget, so a slow lane can hold coordinator
+capacity while unrelated cleanup waits. This combination is rejected before
+PUT admission; either scheduler can still be enabled on its own.
+
 ## Ownership and execution
 
 PUT attempts admission before staging. Full admission returns `SlowDown`, so
