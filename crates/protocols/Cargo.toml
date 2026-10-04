@@ -85,7 +85,6 @@ swift = [
     "dep:rustfs-ecstore",
     "dep:rustfs-rio",
     "dep:axum",
-    "dep:http",
     "dep:tower",
     "dep:regex",
     "dep:percent-encoding",
@@ -106,7 +105,7 @@ swift = [
     "dep:base64-simd",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http", "dep:http-body-util", "dep:tokio-rustls", "dep:base64-simd", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64-simd", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
@@ -132,6 +131,7 @@ thiserror = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 
 # Utilities
+http = { workspace = true }
 async-trait = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytes = { workspace = true, features = ["serde"] }
@@ -149,7 +149,6 @@ rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-http = { workspace = true, optional = true }
 tower = { workspace = true, optional = true, features = ["timeout"] }
 regex = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
@@ -183,7 +182,6 @@ subtle = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true, features = ["all"] }
 
 [dev-dependencies]
-http = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1"
 rustfs-test-utils = { workspace = true }
