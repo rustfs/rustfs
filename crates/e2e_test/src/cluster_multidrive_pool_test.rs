@@ -33,6 +33,10 @@
 //! tracked separately.
 
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
+use crate::fault_proxy::FaultMode;
+use aws_sdk_s3::Client;
+use std::time::Duration;
+use tokio::time::{Instant, timeout};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -144,7 +148,99 @@ async fn cluster_volume_fault_proxy_pass_smoke() -> TestResult {
         cluster.start().await?;
         cluster.create_test_bucket(BUCKET).await?;
         let payload = vec![0x6Du8; 256 * 1024];
-        put_get_roundtrip(&cluster, "volume-proxy/object", &payload).await
+        put_get_roundtrip(&cluster, "volume-proxy/object", &payload).await?;
+
+        // Node 1 owns only two disks; a successful three-vote write must
+        // authenticate at least one disk mutation through node 0's proxy.
+        let client = cluster.create_s3_client(1)?;
+        let client = Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let forwarded_before = proxy.forwarded_bytes();
+        client
+            .put_object()
+            .bucket(BUCKET)
+            .key("volume-proxy/authenticated")
+            .body(bytes::Bytes::copy_from_slice(&payload).into())
+            .send()
+            .await?;
+        assert!(
+            proxy.forwarded_bytes() > forwarded_before,
+            "successful peer-disk publication must traverse the proxy"
+        );
+
+        let dropped_before = proxy.dropped_bytes();
+        proxy.set_mode(FaultMode::Blackhole);
+        assert_eq!(proxy.mode(), FaultMode::Blackhole);
+        let error = timeout(
+            Duration::from_secs(30),
+            client
+                .put_object()
+                .bucket(BUCKET)
+                .key("volume-proxy/rejected")
+                .body(bytes::Bytes::copy_from_slice(&payload).into())
+                .send(),
+        )
+        .await?
+        .expect_err("two local disks cannot commit a write while the peer is blackholed");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+        assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+        assert!(
+            proxy.dropped_bytes() > dropped_before,
+            "the injected blackhole must discard actual peer traffic"
+        );
+
+        proxy.set_mode(FaultMode::Pass);
+        assert_eq!(proxy.mode(), FaultMode::Pass);
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = http.get(format!("{}/health/ready", cluster.nodes[1].url)).send().await?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await?;
+            // Reachable peers can still have Returning disk handles that reject
+            // writes. Wait for this node's live writer inventory to be Online.
+            if status.as_u16() == 200
+                && body["details"]["storage"]["source"] == "local_runtime"
+                && body["details"]["storage"]["writeQuorum"] == true
+                && body["details"]["storage"]["unavailableDrives"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+                && body["details"]["lock"]["ready"] == true
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "peer write quorum did not recover: HTTP {status}, {body}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client
+            .put_object()
+            .bucket(BUCKET)
+            .key("volume-proxy/recovered")
+            .body(bytes::Bytes::copy_from_slice(&payload).into())
+            .send()
+            .await?;
+        for key in ["volume-proxy/object", "volume-proxy/authenticated", "volume-proxy/recovered"] {
+            let got = client.get_object().bucket(BUCKET).key(key).send().await?;
+            let body = got.body.collect().await?.into_bytes();
+            assert_eq!(body.as_ref(), payload, "proxy recovery must preserve the full object body for {key}");
+        }
+        let rejected = client
+            .head_object()
+            .bucket(BUCKET)
+            .key("volume-proxy/rejected")
+            .send()
+            .await
+            .expect_err("a rejected proxied write must never become visible after recovery");
+        assert_eq!(rejected.raw_response().map(|response| response.status().as_u16()), Some(404));
+        Ok(())
     }
     .await;
 
