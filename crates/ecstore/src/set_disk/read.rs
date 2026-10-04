@@ -207,6 +207,16 @@ use tokio::time::timeout;
 #[cfg(test)]
 use uuid::Uuid;
 
+fn metadata_quorum_outcome(error: &StorageError) -> &'static str {
+    if error.is_not_found() {
+        "not_found"
+    } else if error.is_quorum_error() {
+        "not_reached"
+    } else {
+        "unavailable"
+    }
+}
+
 pub(super) struct GetObjectDownstreamWriter<W> {
     inner: W,
 }
@@ -570,6 +580,11 @@ impl SetDisks {
         allow_read_version_coalescing: bool,
     ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
+        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
+            GET_OBJECT_PATH_INTERNAL_META
+        } else {
+            GET_OBJECT_PATH_LEGACY_DUPLEX
+        };
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
@@ -584,6 +599,7 @@ impl SetDisks {
         } else if vid.is_empty() {
             match self.lookup_cached_get_object_fileinfo(bucket, object).await {
                 MetadataCacheLookup::Hit(cached) => {
+                    rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "reached");
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_HIT,
@@ -632,7 +648,7 @@ impl SetDisks {
         // read_metadata_observed (see read_all_fileinfo_early_stop in
         // core/metadata_read.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let metadata_read = if allow_read_version_coalescing {
+        let metadata_read_result = if allow_read_version_coalescing {
             Self::read_metadata_for_get_object(
                 &disks,
                 "",
@@ -644,7 +660,7 @@ impl SetDisks {
                 allow_early_stop,
                 self.default_parity_count,
             )
-            .await?
+            .await
         } else {
             Self::read_metadata_observed(
                 &disks,
@@ -658,15 +674,18 @@ impl SetDisks {
                 allow_early_stop,
                 self.default_parity_count,
             )
-            .await?
+            .await
+        };
+        let metadata_read = match metadata_read_result {
+            Ok(metadata_read) => metadata_read,
+            Err(err) => {
+                let err = StorageError::from(err);
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&err));
+                return Err(err);
+            }
         };
         let metadata_fanout_complete = metadata_read.is_complete();
         let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
-        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
-            GET_OBJECT_PATH_INTERNAL_META
-        } else {
-            GET_OBJECT_PATH_LEGACY_DUPLEX
-        };
         metadata_fanout_diagnostics.record(metadata_metrics_path);
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
@@ -679,6 +698,7 @@ impl SetDisks {
         {
             Ok(v) => v,
             Err(e) => {
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&e));
                 // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
                 record_get_stage_duration_if_enabled(
                     GET_OBJECT_PATH_SET_DISK,
@@ -693,6 +713,7 @@ impl SetDisks {
         let write_quorum = usize::try_from(write_quorum)
             .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "not_reached");
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
             record_get_stage_duration_if_enabled(
                 GET_OBJECT_PATH_SET_DISK,
@@ -703,7 +724,17 @@ impl SetDisks {
         }
 
         let (op_online_disks, mut fi, fileinfo_selection_quorum) =
-            Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)?;
+            match Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    let err = StorageError::from(err);
+                    rustfs_io_metrics::record_get_object_metadata_quorum_result(
+                        metadata_metrics_path,
+                        metadata_quorum_outcome(&err),
+                    );
+                    return Err(err);
+                }
+            };
         let include_part_checksums =
             opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
         if include_part_checksums {
@@ -4165,6 +4196,16 @@ mod tests {
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
     static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn metadata_quorum_outcome_uses_bounded_error_categories() {
+        assert_eq!(metadata_quorum_outcome(&StorageError::ErasureReadQuorum), "not_reached");
+        assert_eq!(metadata_quorum_outcome(&StorageError::FileNotFound), "not_found");
+        assert_eq!(
+            metadata_quorum_outcome(&StorageError::Io(std::io::Error::other("disk unavailable"))),
+            "unavailable"
+        );
+    }
 
     fn capture_read_repair_submitter(
         _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
