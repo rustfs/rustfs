@@ -1,0 +1,66 @@
+{
+  "block_size": 1048576,
+  "bucket": "erasure-fixtures",
+  "capture": {
+    "command": "minio server --address 127.0.0.1:$PORT --console-address 127.0.0.1:0 backend/disk{1..12}",
+    "disk_count": 12,
+    "environment": {
+      "MINIO_CI_CD": "1",
+      "MINIO_STORAGE_CLASS_STANDARD": "EC:6"
+    },
+    "inline_threshold_per_shard": 131072,
+    "payload": "SHA256(b'RustFS backlog #2248 E10 pinned fixture v1' + counter.to_bytes(8, 'little')), concatenated and truncated to 786433 bytes",
+    "producer_get_equals_oracle": true,
+    "producer_stopped_before_copy": true,
+    "shutdown": {
+      "forced_kill_after_seconds": null,
+      "initial_signal": "SIGTERM",
+      "process_reaped_before_copy": true,
+      "returncode": 0
+    },
+    "storage_class_standard": "EC:6"
+  },
+  "data_shards": 6,
+  "files": {
+    "disk1/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "8e9d24c2762b5388f44f1f055b2c7abaef4b4ed5dcc8d7f7ef0c276110c3a245",
+    "disk1/erasure-fixtures/non-inline.bin/xl.meta": "f70f0c6372fa0948fa01d8e67660efc8dd6b0aef044900f11e3880edbacc8f17",
+    "disk10/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "e5aa98934500c67cfb400df62e0559f9e616b9840b1f1f32dc01b7e37d97269b",
+    "disk10/erasure-fixtures/non-inline.bin/xl.meta": "ea32b1b2b2bd97d4392e3ddef22b39e615e686658bdee62c40a451866da0d0e9",
+    "disk11/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "3a4b00c571f9ab20b883f0f49d4660d0b3ab627a849426a24ae7caf05066128f",
+    "disk11/erasure-fixtures/non-inline.bin/xl.meta": "935c2c5099259771b74dd0ee50703215c586a819aca56288f0401f7c98ca4643",
+    "disk12/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "1471c1ab6f7e23ba356586b0316d16d43d3a36c6a9044830af8e0120d734d57a",
+    "disk12/erasure-fixtures/non-inline.bin/xl.meta": "fab8f55f7f963ffd21d450e38cad7c308428a7d8a80796e4f5857c724354e7fc",
+    "disk2/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "bdbb60059c63d689b8ff4d5f2b455fe41c609adacfc85ba8ead7bda775899547",
+    "disk2/erasure-fixtures/non-inline.bin/xl.meta": "d5b663daaf6792fb2b7fc8371a2dce3b8a36c2afe0d2decdcc7e5a1a272846ca",
+    "disk3/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "cc52eca6c0a5224984dfdad0ef44a228aec021d353248599e9f422e7ed1d23de",
+    "disk3/erasure-fixtures/non-inline.bin/xl.meta": "88b5d4abab47448edb434ce4929be1854d1803b5b103b10a96f90d7ac66c7ff1",
+    "disk4/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "e557cdf771923e0ff8ac4af951aa2a002b963647cefa547b5a1bf3ab646718fe",
+    "disk4/erasure-fixtures/non-inline.bin/xl.meta": "f81ca7009b274dcdb58e094175e7ec12e7e2a0937a6b8082e20a8f9dadfaaf48",
+    "disk5/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "be63b337c86fdb99e53496fc3e9bc3657ba1274175f12ea319e03cdde5d0f38d",
+    "disk5/erasure-fixtures/non-inline.bin/xl.meta": "25865e2195f190af28f50f555b14f66dc05efcf8826e13994ef9830ec6dcae82",
+    "disk6/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "c7ad2137d8d886d5b83139acdb359d5916bb49541bad4febfa555a888f1e1e2d",
+    "disk6/erasure-fixtures/non-inline.bin/xl.meta": "2df65a8b9bddcac4d136ac2ef96189eecf13e8974c8f76e7cb2f95abd063a7a1",
+    "disk7/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "58ea9a83ede34f0dafe9f1d163dea88b6262b65c31b1da2bcf4c88cfa4e86912",
+    "disk7/erasure-fixtures/non-inline.bin/xl.meta": "210c11e3f59ff7b3f6cf6e31e59e247dee9b68eed9d8fe7c7bb058f2385b69b8",
+    "disk8/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "1dec3b901b2add4bc143288b8f1a706e1b6b5cad1b5fb0082da280c2aedb829c",
+    "disk8/erasure-fixtures/non-inline.bin/xl.meta": "c57b57c9d0845c610d31a5d109744d0f2020ac63dfb8209accf38e4db45f3cb0",
+    "disk9/erasure-fixtures/non-inline.bin/6acc300d-4557-4eb3-8d50-c70923243c2a/part.1": "c261ddd5ec1c2aa77771185b6de547c9bd23af10311096c5f41c17085509c42c",
+    "disk9/erasure-fixtures/non-inline.bin/xl.meta": "b03bbec380fc0444975466624e239a0be0dbc178b8a0f613cf73f7c935068f9e"
+  },
+  "object": "non-inline.bin",
+  "parity_shards": 6,
+  "plaintext_sha256": "b5a83332327961a31b65a8731c64559fd04ff8ac9f6124022201dbbdba5ffa01",
+  "plaintext_size": 786433,
+  "schema_version": 1,
+  "source": {
+    "archive_sha256": "0939ce5553ce9e6451b69e049fbf399794368276b61da8166f84cbd8c7f2d641",
+    "archive_url": "https://github.com/minio/minio/releases/download/RELEASE.2025-07-23T15-54-02Z/minio.darwin-arm64.RELEASE.2025-07-23T15-54-02Z",
+    "binary_sha256": "0939ce5553ce9e6451b69e049fbf399794368276b61da8166f84cbd8c7f2d641",
+    "binary_version": "minio version RELEASE.2025-07-23T15-54-02Z (commit-id=7ced9663e6a791fef9dc6be798ff24cda9c730ac)\nRuntime: go1.24.5 darwin/arm64\nLicense: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html\nCopyright: 2015-2025 MinIO, Inc.",
+    "codec": "gf8",
+    "producer": "MinIO",
+    "release": "RELEASE.2025-07-23T15-54-02Z",
+    "source_commit": "7ced9663e6a791fef9dc6be798ff24cda9c730ac",
+    "uses_legacy": false
+  }
+}
