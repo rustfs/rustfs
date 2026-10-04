@@ -271,6 +271,9 @@ mod ssec_copy_test;
 mod multipart_storage_class_test;
 
 #[cfg(test)]
+mod list_multipart_uploads_encoding_test;
+
+#[cfg(test)]
 mod storage_class_capability_test;
 
 // S3 dummy-compat bucket API tests
