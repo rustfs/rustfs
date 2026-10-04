@@ -11,6 +11,8 @@
 
 ## Open Items
 
+- `backlog-2253-metadata-observation-adapter` metadata observations: preserve aligned metadata/error slices for existing layout, shard and exact-version PUT, MPU and delete consumers while read/heal scheduling uses typed disk observations. Pending slots acquire empty placeholders only in this adapter. Remove after those remaining consumers use typed observations; delete the adapter and old facade in a separate cleanup.
+
 - `connect-894` pending Connect heartbeats: replay the exact preceding producer-capability list, with or without jobs, when upgrading to the memory-service capability. Preserve request ID, sequence, and persisted body rather than inserting the new capability into a retry. Remove after upgrades from the pre-service-memory capability set are unsupported.
 
 - `backlog-2539` administrator erasure-set scope: decode historical pending intents whose empty bucket list omitted the all-buckets marker. Normalize that representation to the explicit scope before replay or checkpoint comparison. Remove after all pre-marker administrator ErasureSet intents are retired; deployment verification must confirm that no such pending records remain on coordinator disks.

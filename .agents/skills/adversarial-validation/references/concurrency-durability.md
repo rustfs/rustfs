@@ -2,8 +2,12 @@
 
 - For every changed lock, enumerate overlapping lock sets and construct the
   ABBA interleaving. Multiple-lock order must be documented and consistent.
-- Mark guard lifetimes and every `.await`, disk, and RPC call inside them.
-  Estimate contention and timeout behavior under concurrent requests.
+- Mark guard lifetimes and every `.await`, disk,
+  and RPC call; estimate contention/timeouts. Tokio read/write guards across
+  `.await` need bounded hold time; long-lived reads can wedge writers (#4195).
+  Keep `std::sync::Mutex` holds brief and never across `.await`.
+- Use direct `fetch_*` for unconditional atomic read-modify-write and
+  `compare_exchange` for conditional updates.
 - Object commits remain fenced if the distributed lock is lost after shard
   writes and before metadata rename.
 - For write/rename changes, trace `write tmp -> sync tmp -> rename -> sync parent

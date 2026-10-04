@@ -94,3 +94,6 @@ A flaky test fails non-deterministically without a corresponding code change. Re
 - `make coverage` (`.config/make/coverage.mak`) is the local equivalent; it writes `target/llvm-cov/lcov.info` and `coverage.json` and prints the same table via `scripts/coverage_per_crate.py`.
 - Not measured: doctests (`ci.yml` runs them uninstrumented) and the `e2e_test` crate.
 - A baseline change needs a linked coverage run and a reviewed explanation in the PR.
+- For requested coverage assessments, reuse a report only when its revision, scope, and format match. If measurement is necessary, check disk/tool availability and use package/test-scoped `cargo llvm-cov` with the repository nextest configuration; whole-workspace measurement requires that requested scope.
+- Missing branch/changed-line metrics are unknown, not zero. If measurement cannot run, mark coverage unverified and propose tests from inspected code without invented percentages.
+- Rank evidenced gaps by changed behavior, data loss/security/compatibility risk, and uncovered branches. Pair each gap with a focused test, failure criterion, and scoped verification; do not introduce a threshold unless required.

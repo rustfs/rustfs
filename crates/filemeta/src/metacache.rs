@@ -618,6 +618,7 @@ impl MetaCacheEntries {
         }
 
         let mut dir_exists = 0;
+        let mut directory = None;
         let mut selected = None;
 
         params.candidates.clear();
@@ -633,7 +634,7 @@ impl MetaCacheEntries {
             }
             if entry.is_dir() {
                 dir_exists += 1;
-                selected = Some(entry.clone());
+                directory = Some(entry.clone());
                 debug!(entry = %entry.name, "metacache resolve observed directory candidate");
                 continue;
             }
@@ -664,6 +665,10 @@ impl MetaCacheEntries {
             }
         }
 
+        // A prefix and an explicit directory-marker object can share a name.
+        // Keep directory evidence separate so its arrival cannot displace an
+        // object that meets the metadata quorum.
+        let directory = directory.filter(|_| dir_exists >= params.dir_quorum);
         let Some(selected) = selected else {
             debug!(
                 bucket = %params.bucket,
@@ -671,18 +676,8 @@ impl MetaCacheEntries {
                 obj_quorum = params.obj_quorum,
                 "metacache resolve could not select any candidate entry"
             );
-            return None;
+            return directory;
         };
-
-        if selected.is_dir() && dir_exists >= params.dir_quorum {
-            debug!(
-                entry = %selected.name,
-                dir_exists,
-                dir_quorum = params.dir_quorum,
-                "metacache resolve selected directory candidate after quorum reconciliation"
-            );
-            return Some(selected);
-        }
 
         // If we would never be able to reach the required object quorum.
         if objs_valid < params.obj_quorum {
@@ -691,7 +686,7 @@ impl MetaCacheEntries {
                 obj_quorum = params.obj_quorum,
                 "metacache resolve did not have enough valid object candidates to satisfy quorum"
             );
-            return None;
+            return directory;
         }
 
         if objs_agree == objs_valid {
@@ -724,7 +719,7 @@ impl MetaCacheEntries {
 
         let Some(cached) = selected.cached else {
             debug!(selected = %selected.name, "metacache resolve could not merge because selected candidate had no cached metadata");
-            return None;
+            return directory;
         };
 
         let versions = if enforce_write_quorum {
@@ -744,7 +739,7 @@ impl MetaCacheEntries {
                 requested_versions = params.requested_versions,
                 "metacache resolve produced no merged versions after reconciliation"
             );
-            return None;
+            return directory;
         }
 
         let merged_cached = FileMeta {
@@ -761,7 +756,7 @@ impl MetaCacheEntries {
                     error = ?e,
                     "metacache resolve failed to marshal merged metadata entry"
                 );
-                return None;
+                return directory;
             }
         };
 
@@ -2532,6 +2527,57 @@ mod tests {
         });
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_directory_marker_and_prefix_preserve_quorum_in_both_orders() {
+        let modified = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut object = metacache_entry_with_erasure(modified, "marker-etag", 2, 2);
+        object.name = "folder/".to_string();
+        let directory = metacache_dir_entry("folder/");
+        for enforce_write_quorum in [false, true] {
+            for (object_copies, directory_copies) in [(3, 1), (3, 3), (2, 3), (0, 3), (2, 2)] {
+                for reverse in [false, true] {
+                    let mut entries = vec![Some(object.clone()); object_copies];
+                    entries.extend(vec![Some(directory.clone()); directory_copies]);
+                    if reverse {
+                        entries.reverse();
+                    }
+                    let entries = MetaCacheEntries(entries);
+                    let params = MetadataResolutionParams {
+                        dir_quorum: 3,
+                        obj_quorum: 3,
+                        requested_versions: 1,
+                        bucket: "bucket".to_string(),
+                        strict: true,
+                        ..Default::default()
+                    };
+                    let resolved = if enforce_write_quorum {
+                        entries.resolve_with_write_quorum(params)
+                    } else {
+                        entries.resolve(params)
+                    };
+                    let context = format!(
+                        "objects={object_copies}, directories={directory_copies}, reverse={reverse}, write={enforce_write_quorum}"
+                    );
+                    if object_copies >= 3 {
+                        let resolved = resolved.expect("metadata at quorum must shadow a same-named prefix");
+                        assert!(resolved.is_object(), "{context}");
+                        assert_eq!(
+                            resolved
+                                .to_fileinfo("bucket")
+                                .expect("marker metadata should decode")
+                                .mod_time,
+                            Some(modified)
+                        );
+                    } else if directory_copies >= 3 {
+                        assert!(resolved.expect("prefix at quorum must remain a fallback").is_dir(), "{context}");
+                    } else {
+                        assert!(resolved.is_none(), "{context}");
+                    }
+                }
+            }
+        }
     }
 
     fn build_hashmap_cache(update_size: usize) -> Arc<Cache<HashMap<usize, usize>>> {

@@ -814,6 +814,10 @@ impl ObjectStore {
 
 #[async_trait::async_trait]
 impl Store for ObjectStore {
+    async fn load_bucket_tags(&self, bucket: &str) -> Result<HashMap<String, String>> {
+        Ok(self.object_api.get_bucket_tags_for_policy(bucket).await?)
+    }
+
     fn has_watcher(&self) -> bool {
         false
     }

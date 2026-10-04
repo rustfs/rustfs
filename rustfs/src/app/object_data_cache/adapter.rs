@@ -21,6 +21,10 @@ use rustfs_object_data_cache::{
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
+const IGNORED_OBJECT_CACHE_ENABLE_ENV: &str = "RUSTFS_OBJECT_CACHE_ENABLE";
+const IGNORED_OBJECT_CACHE_TTL_SECS_ENV: &str = "RUSTFS_OBJECT_CACHE_TTL_SECS";
+const IGNORED_OBJECT_CACHE_ENV_KEYS: [&str; 2] = [IGNORED_OBJECT_CACHE_ENABLE_ENV, IGNORED_OBJECT_CACHE_TTL_SECS_ENV];
+
 #[derive(Debug, Default)]
 struct ObjectDataCacheEnvValues {
     enabled: Option<bool>,
@@ -64,6 +68,7 @@ impl ObjectDataCacheAdapter {
     /// or an unparseable numeric override) disables the whole cache rather than
     /// silently starting with defaults the operator never chose.
     pub(crate) fn from_env_or_disabled() -> Arc<Self> {
+        warn_ignored_object_cache_env_keys();
         match object_data_cache_config_from_env() {
             Ok(config) => Self::from_config_or_disabled(config, "env"),
             Err(invalid_keys) => {
@@ -282,6 +287,26 @@ where
     }
 }
 
+fn ignored_object_cache_env_keys() -> Vec<&'static str> {
+    IGNORED_OBJECT_CACHE_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect()
+}
+
+fn warn_ignored_object_cache_env_keys() {
+    let ignored_keys = ignored_object_cache_env_keys();
+    if ignored_keys.is_empty() {
+        return;
+    }
+    warn!(
+        ignored_env_keys = %ignored_keys.join(","),
+        replacement_prefix = "RUSTFS_OBJECT_DATA_CACHE_",
+        "ignored unrecognized object cache environment variables"
+    );
+}
+
 fn object_data_cache_config_from_env() -> Result<ObjectDataCacheConfig, Vec<&'static str>> {
     let mut invalid_keys: Vec<&'static str> = Vec::new();
 
@@ -386,8 +411,9 @@ fn parse_object_data_cache_mode(value: &str) -> Option<ObjectDataCacheMode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectDataCacheAdapter, ObjectDataCacheEnvValues, object_data_cache_config_from_env,
-        object_data_cache_config_from_values, parse_object_data_cache_mode,
+        IGNORED_OBJECT_CACHE_ENABLE_ENV, IGNORED_OBJECT_CACHE_TTL_SECS_ENV, ObjectDataCacheAdapter, ObjectDataCacheEnvValues,
+        ignored_object_cache_env_keys, object_data_cache_config_from_env, object_data_cache_config_from_values,
+        parse_object_data_cache_mode,
     };
     use rustfs_object_data_cache::{ObjectDataCacheConfig, ObjectDataCacheMode};
     use std::time::Duration;
@@ -408,6 +434,8 @@ mod tests {
             (rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU, None),
             (rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX, None),
             (rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX, None),
+            (IGNORED_OBJECT_CACHE_ENABLE_ENV, None),
+            (IGNORED_OBJECT_CACHE_TTL_SECS_ENV, None),
         ]
     }
 
@@ -661,6 +689,21 @@ mod tests {
         temp_env::with_vars(all_env_unset(), || {
             let config = object_data_cache_config_from_env().expect("absent env should build the default config");
 
+            assert_eq!(config, ObjectDataCacheConfig::default());
+        });
+    }
+
+    #[test]
+    fn unrecognized_object_cache_env_vars_are_reported_but_do_not_enable_data_cache() {
+        let vars = with_env_overrides(&[
+            (IGNORED_OBJECT_CACHE_ENABLE_ENV, "true"),
+            (IGNORED_OBJECT_CACHE_TTL_SECS_ENV, "300"),
+        ]);
+        temp_env::with_vars(vars, || {
+            let ignored_keys = ignored_object_cache_env_keys();
+            let config = object_data_cache_config_from_env().expect("ignored cache env should not invalidate config");
+
+            assert_eq!(ignored_keys, vec![IGNORED_OBJECT_CACHE_ENABLE_ENV, IGNORED_OBJECT_CACHE_TTL_SECS_ENV]);
             assert_eq!(config, ObjectDataCacheConfig::default());
         });
     }

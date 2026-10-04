@@ -1350,6 +1350,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1414,6 +1416,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -1427,6 +1431,11 @@ mod prepared_get_object_metadata_tests {
                     .expect("late parity should restore the exact GET body");
                 assert_eq!(restored, payload);
                 assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 7);
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_READ_VERSION, order[3]),
+                    1,
+                    "the omitted parity disk must only be read by the late metadata refresh"
+                );
             },
         )
         .await;
@@ -1491,6 +1500,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Isolate late body recovery from the independent metadata slow-tail hedge.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
@@ -5516,12 +5527,29 @@ fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
     parts_metadata: &'a [FileInfo],
     fi: &FileInfo,
     data_shards: usize,
+    disk_is_online: impl FnMut(usize) -> bool,
+) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
+    collect_inline_data_shard_fileinfos_from_observations(
+        parts_metadata
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| (index, Some(metadata))),
+        fi,
+        data_shards,
+        disk_is_online,
+    )
+}
+
+fn collect_inline_data_shard_fileinfos_from_observations<'a>(
+    observations: impl IntoIterator<Item = (usize, Option<&'a FileInfo>)>,
+    fi: &FileInfo,
+    data_shards: usize,
     mut disk_is_online: impl FnMut(usize) -> bool,
 ) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
     let distribution = &fi.erasure.distribution;
     let mut data_files = vec![None; data_shards];
 
-    for (disk_index, file_info) in parts_metadata.iter().enumerate() {
+    for (disk_index, file_info) in observations {
         if !disk_is_online(disk_index) {
             continue;
         }
@@ -5531,9 +5559,9 @@ fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
         if block_index == 0 || block_index > data_shards {
             continue;
         }
-        if file_info.name.is_empty() {
+        let Some(file_info) = file_info.filter(|metadata| !metadata.name.is_empty()) else {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD);
-        }
+        };
         if file_info.erasure.index != block_index {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
         }
@@ -7171,10 +7199,10 @@ fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Opti
         return Some(part_numbers);
     }
 
-    part_numbers
-        .iter()
-        .position(|&part_number| part_number != 0 && part_number == part_number_marker)
-        .map(|index| &part_numbers[index + 1..])
+    // reduce_quorum_part_numbers returns sorted numbers; the marker need not exist.
+    part_numbers.last().filter(|&&last| part_number_marker <= last)?;
+    let index = part_numbers.partition_point(|&part_number| part_number <= part_number_marker);
+    Some(&part_numbers[index..])
 }
 
 pub fn canonicalize_etag(etag: &str) -> String {
@@ -13970,6 +13998,24 @@ mod tests {
         let part_numbers = vec![1, 2, 3];
 
         assert!(parts_after_marker(&part_numbers, 4).is_none());
+    }
+
+    #[test]
+    fn parts_after_marker_uses_exclusive_numeric_boundary_for_sparse_parts() {
+        let part_numbers = [1, 3, 10];
+        for (marker, expected) in [
+            (0, Some(&part_numbers[..])),
+            (1, Some(&part_numbers[1..])),
+            (2, Some(&part_numbers[1..])),
+            (3, Some(&part_numbers[2..])),
+            (9, Some(&part_numbers[2..])),
+            (10, Some(&part_numbers[3..])),
+            (11, None),
+            (usize::MAX, None),
+        ] {
+            assert_eq!(parts_after_marker(&part_numbers, marker), expected, "marker {marker}");
+        }
+        assert_eq!(parts_after_marker(&[], 1), None);
     }
 
     #[test]

@@ -47,6 +47,39 @@ This PUT-tail protection requires every writer node to be upgraded. It does not
 prove that a failed tail replica has healed, and it does not extend the same
 in-flight tracking to multipart or other namespace mutation paths.
 
+## Dirty producer replay ownership
+
+The dirty producer journal is partitioned by the configured node RPC authority.
+A domain-separated SHA-256 owner identifier selects
+`scanner/durable-dirty-producer-replay/<owner>.json`; the record also binds that
+owner, which must match before replay. The same endpoint reuses its record after
+a process restart. Changing the endpoint selects a new record and retains the
+existing full-scan and peer-instance fences.
+
+The legacy shared `scanner/durable-dirty-producer-replay.json` is retained without
+being imported or deleted: it cannot prove which node owns all pending entries.
+Mixed-version nodes therefore cannot overwrite or clear upgraded nodes' records.
+Rollback leaves the owned records available for a subsequent upgrade.
+
+Committed mutation callbacks coalesce into bounded node-local state. A single
+worker snapshots that state at most once per second and retries failed storage
+operations after five seconds. It holds no state lock during storage I/O and
+confirms only the snapshot revision it saved. Dropping the last journal handle
+releases its worker. This asynchronous hint is not a per-S3-commit durability
+receipt; initial full scans and peer-instance changes still fence restart gaps.
+
+The complete owned JSON record must fit the replay reader's 64 KiB limit.
+Oversized prefix scopes become whole-bucket hints; if the resulting complete
+record still cannot fit, an explicit unverified marker prevents truncated
+coverage from becoming producer authority. Invalid or unknown mutations remain
+unverified until a verified dirty acknowledgement clears all pending work.
+
+Publication logs preserve the existing retry and ACK semantics while exposing
+`stage`, `blocker`, `partial_cause`, and `snapshot_kind`. A successful `observed`
+save does not imply authoritative publication or dirty acknowledgement. Cold
+bucket traversal still requires complete distributed invalidation evidence;
+node-local journal ownership does not relax the cluster activity proof.
+
 ## Fences
 
 The protocol uses separate fences because they exclude different stale inputs.

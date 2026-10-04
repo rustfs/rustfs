@@ -35,7 +35,7 @@ use tokio::time::{Duration, timeout};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type TestResult = Result<(), BoxError>;
-const OPA_AUTH_TOKEN: &str = "sts-opa-token";
+pub(crate) const OPA_AUTH_TOKEN: &str = "sts-opa-token";
 
 fn sts_client(url: &str, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Client {
     build_test_sts_client(url, access_key, secret_key, session_token, "e2e-sts-query-compat")
@@ -100,6 +100,25 @@ async fn create_user(env: &RustFSTestEnvironment, user: &str, secret: &str) -> T
         Some(serde_json::json!({ "secretKey": secret, "status": "enabled" }).to_string()),
     )
     .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_department(client: &aws_sdk_s3::Client, bucket: &str, department: &str) -> TestResult {
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("department")
+                        .value(department)
+                        .build()?,
+                )
+                .build()?,
+        )
+        .send()
+        .await?;
     Ok(())
 }
 
@@ -240,15 +259,19 @@ async fn handle_opa_request(
                 .as_ref()
                 .and_then(|value| value.pointer("/input/action"))
                 .and_then(Value::as_str);
-            let bucket = payload
+            let department = payload
                 .as_ref()
-                .and_then(|value| value.pointer("/input/resource/bucket"))
+                .and_then(|value| value.pointer("/input/context/conditions/ExistingBucketTag~1department/0"))
                 .and_then(Value::as_str);
             matches!(
-                (action, bucket),
-                (Some("s3:ListBucket"), Some("opa-list-visible")) | (Some("s3:GetBucketLocation"), Some("opa-list-location"))
+                (action, department),
+                (Some("s3:ListBucket"), Some("finance")) | (Some("s3:GetBucketLocation"), Some("legal"))
             )
         }
+        Some(Value::String(account)) if account == "opabuckettags" => payload.as_ref().is_some_and(|value| {
+            value["input"]["action"] == "s3:CreateBucket"
+                || value["input"]["context"]["conditions"]["ExistingBucketTag/department"] == serde_json::json!(["finance"])
+        }),
         None => true,
         _ => false,
     };
@@ -270,15 +293,15 @@ enum OpaValidationMode {
     Unavailable,
 }
 
-struct OpaMock {
-    url: String,
+pub(crate) struct OpaMock {
+    pub(crate) url: String,
     requests: mpsc::UnboundedReceiver<Value>,
     validation_started: mpsc::UnboundedReceiver<()>,
     task: JoinHandle<()>,
 }
 
 impl OpaMock {
-    async fn start() -> Result<Self, BoxError> {
+    pub(crate) async fn start() -> Result<Self, BoxError> {
         Self::start_with_mode(OpaValidationMode::Ready, Some(OPA_AUTH_TOKEN)).await
     }
 
@@ -333,6 +356,16 @@ impl OpaMock {
         timeout(Duration::from_secs(5), self.requests.recv())
             .await?
             .ok_or_else(|| "OPA request channel closed".into())
+    }
+
+    pub(crate) async fn expect_bucket_tags(&mut self, action: &str, bucket: &str, department: Option<&str>) -> TestResult {
+        let payload = self.next_request().await?;
+        let input = &payload["input"];
+        assert_eq!(input["action"], action);
+        assert_eq!(input["resource"]["bucket"], bucket);
+        let expected = department.map(|value| serde_json::json!([value]));
+        assert_eq!(input["context"]["conditions"].get("ExistingBucketTag/department"), expected.as_ref());
+        Ok(())
     }
 
     async fn wait_for_validation(&mut self) -> TestResult {
@@ -571,8 +604,13 @@ async fn test_list_buckets_opa_contract() -> TestResult {
     .await?;
 
     let admin_client = env.create_s3_client();
-    for bucket in ["opa-list-hidden", "opa-list-location", "opa-list-visible"] {
+    for (bucket, department) in [
+        ("opa-list-hidden", "engineering"),
+        ("opa-list-location", "legal"),
+        ("opa-list-visible", "finance"),
+    ] {
         admin_client.create_bucket().bucket(bucket).send().await?;
+        set_department(&admin_client, bucket, department).await?;
     }
 
     let user = "opalistbuckets";
@@ -636,6 +674,240 @@ async fn test_list_buckets_opa_contract() -> TestResult {
         "ListBuckets should not make redundant OPA evaluations"
     );
 
+    env.stop_server();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bucket_tags_opa_contract() -> TestResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, VersioningConfiguration,
+    };
+
+    init_logging();
+    let mut opa = OpaMock::start().await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_without_cleanup_with_env(&[
+        ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+        ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+    ])
+    .await?;
+    let secret = uuid::Uuid::new_v4().to_string();
+    create_user(&env, "opabuckettags", &secret).await?;
+    let client = aws_sdk_s3::Client::from_conf(build_test_s3_config(&env.url, "opabuckettags", &secret, None, "e2e-bucket-tags"));
+    let admin = env.create_s3_client();
+    let source = "opa-tags-source";
+    let destination = "opa-tags-destination";
+
+    client.create_bucket().bucket(source).send().await?;
+    opa.expect_bucket_tags("s3:CreateBucket", source, None).await?;
+    set_department(&admin, source, "finance").await?;
+    admin
+        .put_bucket_versioning()
+        .bucket(source)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+    let written = client
+        .put_object()
+        .bucket(source)
+        .key("report")
+        .tagging("department=engineering")
+        .body(ByteStream::from_static(b"report"))
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:PutObject", source, Some("finance")).await?;
+    let version = written.version_id().ok_or("versioned PUT must return a version ID")?;
+    let read = client
+        .get_object()
+        .bucket(source)
+        .key("report")
+        .version_id(version)
+        .send()
+        .await?;
+    assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+    client
+        .head_object()
+        .bucket(source)
+        .key("report")
+        .version_id(version)
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:GetObject", source, Some("finance")).await?;
+    client.list_objects_v2().bucket(source).send().await?;
+    opa.expect_bucket_tags("s3:ListBucket", source, Some("finance")).await?;
+    client.list_object_versions().bucket(source).send().await?;
+    opa.expect_bucket_tags("s3:ListBucketVersions", source, Some("finance"))
+        .await?;
+
+    admin.create_bucket().bucket(destination).send().await?;
+    set_department(&admin, destination, "engineering").await?;
+    let copy_source = format!("{source}/report?versionId={version}");
+    let error = client
+        .copy_object()
+        .bucket(destination)
+        .key("copied")
+        .copy_source(&copy_source)
+        .send()
+        .await
+        .expect_err("source tags must not authorize a different destination");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("engineering"))
+        .await?;
+    set_department(&admin, destination, "finance").await?;
+    client
+        .copy_object()
+        .bucket(destination)
+        .key("copied")
+        .copy_source(&copy_source)
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+
+    let upload = client
+        .create_multipart_upload()
+        .bucket(destination)
+        .key("multipart")
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+    let upload_id = upload.upload_id().ok_or("multipart upload ID")?;
+    client
+        .upload_part()
+        .bucket(destination)
+        .key("multipart")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part"))
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+    let copied_part = client
+        .upload_part_copy()
+        .bucket(destination)
+        .key("multipart")
+        .upload_id(upload_id)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+    let part = copied_part.copy_part_result().ok_or("copied part result")?;
+    client
+        .complete_multipart_upload()
+        .bucket(destination)
+        .key("multipart")
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().ok_or("part ETag")?)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+    let read = client.get_object().bucket(destination).key("multipart").send().await?;
+    assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
+    opa.expect_bucket_tags("s3:GetObject", destination, Some("finance")).await?;
+
+    // Mutation authorization uses the old tags, not the proposed replacement.
+    set_department(&client, source, "engineering").await?;
+    opa.expect_bucket_tags("s3:PutBucketTagging", source, Some("finance")).await?;
+    let error = client
+        .list_objects_v2()
+        .bucket(source)
+        .send()
+        .await
+        .expect_err("updated tags revoke access");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+    opa.expect_bucket_tags("s3:ListBucket", source, Some("engineering")).await?;
+    let error = client
+        .copy_object()
+        .bucket(destination)
+        .key("denied-source")
+        .copy_source(&copy_source)
+        .send()
+        .await
+        .expect_err("destination tags must not authorize a denied source");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("engineering"))
+        .await?;
+    set_department(&client, source, "finance")
+        .await
+        .expect_err("requested tags must not authorize their own mutation");
+    opa.expect_bucket_tags("s3:PutBucketTagging", source, Some("engineering"))
+        .await?;
+    set_department(&admin, source, "finance").await?;
+    client.delete_bucket_tagging().bucket(source).send().await?;
+    opa.expect_bucket_tags("s3:PutBucketTagging", source, Some("finance")).await?;
+    let error = client
+        .list_objects_v2()
+        .bucket(source)
+        .send()
+        .await
+        .expect_err("untagged bucket is denied by this policy");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+    opa.expect_bucket_tags("s3:ListBucket", source, None).await?;
+
+    // Ambiguous stored tags must not turn into an implicit IAM denial that a
+    // separate bucket-policy Allow can override.
+    admin
+        .put_bucket_policy()
+        .bucket(destination)
+        .policy(
+            serde_json::json!({
+                "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
+                    "Action": "s3:GetObject", "Resource": format!("arn:aws:s3:::{destination}/*")}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await?;
+    // A normal OPA denial retains the existing bucket-policy Allow fallback;
+    // a metadata lookup error must abort that same authorization path.
+    set_department(&admin, destination, "engineering").await?;
+    let read = client.get_object().bucket(destination).key("multipart").send().await?;
+    assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
+    opa.expect_bucket_tags("s3:GetObject", destination, Some("engineering"))
+        .await?;
+    admin
+        .put_bucket_tagging()
+        .bucket(destination)
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("department").value("finance").build()?)
+                .tag_set(Tag::builder().key("department").value("engineering").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    let error = client
+        .get_object()
+        .bucket(destination)
+        .key("multipart")
+        .send()
+        .await
+        .expect_err("metadata failure must not fall back to a bucket-policy Allow");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert!(
+        matches!(opa.requests.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "invalid tags must not be sent to OPA as absent"
+    );
     env.stop_server();
     Ok(())
 }

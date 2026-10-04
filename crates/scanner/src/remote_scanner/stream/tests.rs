@@ -16,7 +16,9 @@ use super::super::*;
 use super::*;
 use std::io::Cursor;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::task::Poll;
+use tokio::io::ReadBuf;
 
 const TEST_SOURCE: DataUsageCacheSource = DataUsageCacheSource::new(1, 2);
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([5; 32]);
@@ -326,6 +328,229 @@ async fn external_cancellation_interrupts_a_stalled_frame_read() {
         .expect("cancelled frame read task should not panic")
         .expect_err("cancelled frame read must fail");
 
+    assert!(error.to_string().contains("cancelled"));
+}
+
+fn eof_test_terminal(case: usize) -> RemoteScannerFrameResult {
+    match case {
+        0 => RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
+            source: TEST_SOURCE,
+            scan_plan_digest: TEST_PLAN_DIGEST,
+            usage: test_usage("bucket", 1),
+            pending_maintenance_work: false,
+        })),
+        1 => RemoteScannerFrameResult::Partial,
+        2 => RemoteScannerFrameResult::NamespaceNotFound,
+        3 => RemoteScannerFrameResult::CycleAhead {
+            required_cycle: TEST_NEXT_CYCLE + 1,
+        },
+        4 => RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
+            scope: RemoteScannerErrorScope::Bucket,
+            message: "expected remote failure".to_string(),
+        }),
+        _ => panic!("unexpected terminal test case"),
+    }
+}
+
+struct DropObservedReader<R> {
+    inner: R,
+    dropped: Arc<AtomicBool>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for DropObservedReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R> Drop for DropObservedReader<R> {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn encoded_eof_test_terminal(case: usize, authenticator: &FrameAuthenticator) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_frame(
+        &mut bytes,
+        authenticator,
+        &mut 0,
+        &RemoteScannerFrame::terminal(RemoteScannerProgress::default(), eof_test_terminal(case)),
+    )
+    .await
+    .expect("terminal test frame must encode");
+    bytes
+}
+
+#[tokio::test]
+async fn every_terminal_outcome_waits_for_clean_response_eof() {
+    for case in 0..5 {
+        let request_id = Uuid::new_v4();
+        let writer_auth = FrameAuthenticator::for_test(request_id);
+        let reader_auth = FrameAuthenticator::for_test(request_id);
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = DropObservedReader {
+            inner: reader,
+            dropped: dropped.clone(),
+        };
+        writer
+            .write_all(&encoded_eof_test_terminal(case, &writer_auth).await)
+            .await
+            .expect("terminal frame must reach response body");
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+        let mut task = tokio::spawn(async move {
+            consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task).await.is_err(),
+            "terminal case {case} returned before the response body finished"
+        );
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "terminal case {case} dropped the response body before EOF"
+        );
+        writer.shutdown().await.expect("response body must finish cleanly");
+        let result = task.await.expect("consumer must not panic");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "terminal case {case} retained the response body after EOF"
+        );
+        match (case, result) {
+            (0, Ok(RemoteScannerOutcome::Complete { .. }))
+            | (1, Ok(RemoteScannerOutcome::Partial))
+            | (2, Ok(RemoteScannerOutcome::NamespaceNotFound))
+            | (3, Ok(RemoteScannerOutcome::CycleAhead(_))) => {}
+            (4, Err(error)) if error.to_string().contains("expected remote failure") => {}
+            (_, result) => panic!("unexpected terminal case {case} result: {result:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn trailing_bytes_after_terminal_frame_are_rejected() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let mut bytes = encoded_eof_test_terminal(1, &writer_auth).await;
+    bytes.push(0);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let error =
+        consume_remote_scanner_stream(Cursor::new(bytes), parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+            .await
+            .expect_err("trailing protocol byte must fail");
+    assert!(error.to_string().contains("trailing bytes"));
+}
+
+#[tokio::test]
+async fn terminal_frame_without_eof_still_obeys_rpc_deadline() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    writer
+        .write_all(&encoded_eof_test_terminal(1, &writer_auth).await)
+        .await
+        .expect("terminal frame must reach response body");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let error = consume_remote_scanner_stream_until(
+        reader,
+        parent,
+        budget,
+        RemoteScannerResponseExpectation {
+            bucket: "bucket",
+            source: TEST_SOURCE,
+            next_cycle: TEST_NEXT_CYCLE,
+            scan_plan_digest: TEST_PLAN_DIGEST,
+            tier_registry_generation: 0,
+        },
+        reader_auth,
+        Instant::now() + Duration::from_millis(20),
+    )
+    .await
+    .expect_err("terminal frame without EOF must not succeed");
+    assert!(error.to_string().contains("RPC lifetime exceeded"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_frame_without_eof_still_obeys_semantic_stall_timeout() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    writer
+        .write_all(&encoded_eof_test_terminal(1, &writer_auth).await)
+        .await
+        .expect("terminal frame must reach response body");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let error = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+        .await
+        .expect_err("terminal frame without EOF must hit semantic stall limit");
+    assert!(error.to_string().contains("no semantic progress"));
+}
+
+struct ResetAfterFrame {
+    bytes: Vec<u8>,
+    position: usize,
+}
+
+impl AsyncRead for ResetAfterFrame {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.position == self.bytes.len() {
+            return Poll::Ready(Err(std::io::Error::new(ErrorKind::ConnectionReset, "injected stream reset")));
+        }
+        let end = (self.position + buf.remaining()).min(self.bytes.len());
+        buf.put_slice(&self.bytes[self.position..end]);
+        self.position = end;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn disconnect_after_terminal_frame_is_not_success() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let reader = ResetAfterFrame {
+        bytes: encoded_eof_test_terminal(0, &writer_auth).await,
+        position: 0,
+    };
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let error = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+        .await
+        .expect_err("reset after terminal frame must fail");
+    assert!(error.to_string().contains("injected stream reset"));
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_terminal_eof_wait() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    writer
+        .write_all(&encoded_eof_test_terminal(1, &writer_auth).await)
+        .await
+        .expect("terminal frame must reach response body");
+    let parent = CancellationToken::new();
+    let cancel = parent.clone();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let task = tokio::spawn(async move {
+        consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth).await
+    });
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("cancelled EOF wait must finish promptly")
+        .expect("consumer must not panic")
+        .expect_err("cancelled EOF wait must fail");
     assert!(error.to_string().contains("cancelled"));
 }
 
