@@ -503,7 +503,7 @@ pub(crate) async fn begin(
 
     let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
     let (quota, bucket_incarnation, quota_revision) =
-        metadata_sys::get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await?;
+        metadata_sys::get_quota_config_and_incarnation_from_disk_for_options_in(ctx, bucket, opts, &metadata_guard).await?;
     if metadata_guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "quota_config",

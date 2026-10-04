@@ -22533,6 +22533,119 @@ mod body_cache_hook_e2e_tests {
 }
 
 #[cfg(test)]
+mod marker_purge_receipt_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use super::*;
+    use crate::disk::ReadOptions;
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn quorum_marker_purge_receipt_survives_reopen_with_stale_member() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "marker-purge-receipt";
+        let object = "explicit-marker-version";
+        let version = Uuid::new_v4();
+        let incarnation = Uuid::new_v4();
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let mut marker = FileInfo {
+            name: object.to_string(),
+            version_id: Some(version),
+            deleted: true,
+            mark_deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(incarnation);
+        let owner = set
+            .acquire_write_lock_diag("marker_purge_receipt_test", bucket, object)
+            .await
+            .expect("own the deleted object namespace");
+        set.delete_object_version_with_purge(bucket, object, &marker, true, None, Some(incarnation))
+            .await
+            .expect("seed the real marker on every disk");
+        let marker = disks[0]
+            .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+            .await
+            .expect("read the persisted marker identity");
+        let purge = delete_marker_purge_candidate(&marker, Some(incarnation))
+            .expect("the canonical marker must authorize its exact purge");
+        let request = FileInfo {
+            name: object.to_string(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+
+        // A member that misses the explicit DELETE retains its original
+        // marker. The other three disks still satisfy configured write quorum.
+        set.disks.write().await[0] = None;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            set.delete_object_version_with_purge(bucket, object, &request, false, Some(purge.clone()), Some(incarnation)),
+        )
+        .await
+        .expect("the receipt must not reacquire the deleted object's owner")
+        .expect("the explicit marker purge must reach write quorum");
+        drop(owner);
+        for disk in &disks[1..] {
+            assert!(
+                matches!(
+                    disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                        .await,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ),
+                "acknowledging members must remove the exact marker"
+            );
+        }
+        let stale = disks[0]
+            .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+            .await
+            .expect("the offline member must retain its marker");
+        assert!(stale.deleted);
+        assert_eq!(stale.version_id, Some(version));
+
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        let reopened = SetDisks::new_with_instance_ctx(
+            set.locker_owner.clone(),
+            Arc::new(tokio::sync::RwLock::new(disks.iter().cloned().map(Some).collect())),
+            set.set_drive_count,
+            set.default_parity_count,
+            set.set_index,
+            set.pool_index,
+            set.set_endpoints.clone(),
+            set.format.clone(),
+            Vec::new(),
+            ctx,
+        )
+        .await;
+        assert!(
+            reopened.has_marker_purge_receipt(bucket, object, version, &purge).await,
+            "a successful explicit DELETE must leave durable proof for stale-marker cleanup after reopen"
+        );
+        let receipt = crate::set_disk::marker_purge_receipt_path(bucket, object, version, &purge);
+        assert_eq!(
+            crate::config::com::read_config_limited_preserve_empty(reopened.clone(), &receipt, 128)
+                .await
+                .expect("read the physical quorum receipt"),
+            b"rustfs-marker-purge-receipt-v1"
+        );
+        assert!(
+            !reopened
+                .has_marker_purge_receipt(bucket, object, Uuid::new_v4(), &purge)
+                .await,
+            "the receipt must not authorize another marker version"
+        );
+        reopened.consume_marker_purge_receipt(bucket, object, version, &purge).await;
+        assert!(
+            !reopened.has_marker_purge_receipt(bucket, object, version, &purge).await,
+            "cleanup must be able to consume the persisted receipt"
+        );
+    }
+}
+
+#[cfg(test)]
 mod single_delete_namespace_owner_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
     use super::*;
