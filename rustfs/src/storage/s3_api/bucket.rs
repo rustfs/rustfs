@@ -52,7 +52,7 @@ fn encode_s3_name(name: &str) -> String {
         .join("/")
 }
 
-fn encode_list_output_value(value: String, encoding_type: Option<&EncodingType>) -> String {
+pub(super) fn encode_list_output_value(value: String, encoding_type: Option<&EncodingType>) -> String {
     if should_encode_url(encoding_type) {
         encode_s3_name(&value)
     } else {
