@@ -972,7 +972,7 @@ static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 mod core;
 #[cfg(test)]
 pub(crate) use core::io_primitives::disk_call_counters;
-#[cfg(all(test, feature = "test-util"))]
+#[cfg(test)]
 pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
 mod ctx;
 mod metadata;
@@ -4097,7 +4097,6 @@ impl SetDisks {
             b"rustfs-marker-purge-receipt-v1".to_vec(),
             &ObjectOptions {
                 max_parity: true,
-                no_lock: true,
                 ..Default::default()
             },
         )

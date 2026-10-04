@@ -15,19 +15,17 @@
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
-#[cfg(feature = "webdav")]
 use crate::shared_types::RemoteAddr;
 #[cfg(feature = "webdav")]
 use crate::storage_api::protocols::client::capacity;
-use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
+use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-#[cfg(feature = "webdav")]
 use rustfs_protocols::common::SessionContext;
 #[cfg(feature = "webdav")]
 use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
-#[cfg(feature = "webdav")]
+use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
@@ -211,6 +209,22 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
 }
 
+fn build_list_objects_uri(input: &ListObjectsV2Input) -> S3Result<http::Uri> {
+    let max_keys = input.max_keys.map(|value| value.to_string());
+    let query: Vec<_> = [
+        ("list-type", Some("2")),
+        ("prefix", input.prefix.as_deref()),
+        ("delimiter", input.delimiter.as_deref()),
+        ("max-keys", max_keys.as_deref()),
+        ("continuation-token", input.continuation_token.as_deref()),
+        ("start-after", input.start_after.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .collect();
+    build_bucket_uri(&input.bucket, &query)
+}
+
 /// Request parameters for creating S3 requests
 #[derive(Debug)]
 struct RequestParams<'a> {
@@ -230,6 +244,52 @@ impl ProtocolStorageClient {
     /// Create a new protocol storage client
     pub fn new(fs: FS) -> Self {
         Self { fs }
+    }
+
+    async fn authorize_protocol_request(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+        listing: Option<&ListObjectsV2Input>,
+    ) -> S3Result<()> {
+        let context = self.fs.server_ctx().app_context();
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), context.as_deref()).await?;
+        let uri = if let Some(input) = listing {
+            build_list_objects_uri(input)?
+        } else if let Some(key) = object {
+            build_object_uri(bucket, key, &[])?
+        } else {
+            build_bucket_uri(bucket, &[])?
+        };
+        let mut request = Self::create_request(
+            (),
+            Method::GET,
+            uri,
+            RequestParams {
+                bucket: Some(bucket.to_owned()),
+                object: object.map(str::to_owned),
+                credentials: &credentials,
+            },
+        )?;
+        request.extensions.insert(self.fs.server_ctx().clone());
+        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
+            info.is_owner = is_owner;
+        }
+        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
+        request.extensions.insert(Some(RemoteAddr(remote_addr)));
+        let mut client_info = ClientInfo::direct(remote_addr);
+        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
+        request.extensions.insert(client_info);
+        request.headers = session.request_headers.clone();
+        let policy_action = if matches!(action, S3Action::HeadBucket) {
+            S3Action::ListBucket.into()
+        } else {
+            action.clone().into()
+        };
+        authorize_request(&mut request, policy_action).await
     }
 
     /// Create a proper S3Request with ReqInfo extension for authorization
@@ -277,6 +337,41 @@ impl ProtocolStorageClient {
 #[async_trait::async_trait]
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
     type Error = s3s::S3Error;
+
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        // ListBucket requires the complete listing input to evaluate request conditions.
+        if matches!(action, S3Action::ListBucket) || !is_operation_supported(session.protocol, action) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, action, bucket, object, None)
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
+
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        if !is_operation_supported(session.protocol, &S3Action::ListBucket) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, &S3Action::ListBucket, &input.bucket, None, Some(input))
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
 
     async fn get_object(
         &self,
@@ -483,7 +578,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("list_objects_v2", Some(&input.bucket), None);
 
         let bucket = input.bucket.clone();
-        let uri = build_bucket_uri(&bucket, &[("list-type", Some("2"))])?;
+        let uri = build_list_objects_uri(&input)?;
         let req = Self::create_request(
             input,
             Method::GET,

@@ -276,7 +276,7 @@ impl QuotaContext {
             reap_stale_reservations(Arc::clone(&store), &ledger_data.bucket, &ledger_data.ledger_object).await?;
 
             let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_data.ledger_object).await?;
-            let ledger_guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+            let ledger_guard = Arc::new(ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?);
             fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &ledger_data.ledger_object, None).await?;
             let mut ledger = load_current_ledger_locked(
                 Arc::clone(&store),
@@ -563,7 +563,7 @@ pub(crate) async fn begin(
     }
     let config_read_started = rustfs_io_metrics::put_stage_timer();
     let (quota, bucket_incarnation, quota_revision) =
-        metadata_sys::get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await?;
+        metadata_sys::get_quota_config_and_incarnation_from_disk_for_options_in(ctx, bucket, opts, &metadata_guard).await?;
     if let Some(cached) = cached_quota_snapshot.as_ref() {
         let reason = quota_cache_reason(quota.as_ref());
         if cached.quota == quota && cached.bucket_incarnation == bucket_incarnation && cached.quota_revision == quota_revision {
@@ -758,7 +758,7 @@ async fn mark_commit_started(data: &LedgerReservationData) -> Result<()> {
     let data = data.clone();
     tokio::spawn(async move {
         let ledger_lock = data.store.new_ns_lock(RUSTFS_META_BUCKET, &data.ledger_object).await?;
-        let ledger_guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let ledger_guard = Arc::new(ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         fence_namespace_mutations(&data.store, RUSTFS_META_BUCKET, &data.ledger_object, None).await?;
         let mut ledger = load_ledger_locked(Arc::clone(&data.store), &data.ledger_object).await?;
         ledger.mark_commit_started(data.operation_id, &data.reservation)?;
@@ -779,7 +779,7 @@ async fn settle(data: &LedgerReservationData, committed: bool) -> Result<()> {
         // object lock is released and would otherwise revoke a later write's
         // newly acquired fence for the same object.
         let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_object).await?;
-        let ledger_guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let ledger_guard = Arc::new(ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &ledger_object, None).await?;
         let mut ledger = load_ledger_locked(Arc::clone(&store), &ledger_object).await?;
         if committed {
@@ -862,7 +862,7 @@ async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_objec
     }
 
     let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, ledger_object).await?;
-    let ledger_guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+    let ledger_guard = Arc::new(ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?);
     fence_namespace_mutations(&store, RUSTFS_META_BUCKET, ledger_object, None).await?;
     let mut ledger = load_ledger_locked(Arc::clone(&store), ledger_object).await?;
     let cursor_changed = next_cursor.is_some() && ledger.reap_cursor != next_cursor;
@@ -1022,7 +1022,7 @@ async fn save_ledger_locked(
     store: Arc<ECStore>,
     ledger_object: &str,
     ledger: &QuotaLedger,
-    ledger_guard: &NamespaceLockGuard,
+    ledger_guard: &Arc<NamespaceLockGuard>,
 ) -> Result<()> {
     if ledger_guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
@@ -1043,7 +1043,8 @@ async fn save_ledger_locked(
         ..Default::default()
     };
     let _ = opts.set_quota_admission(0, u64::MAX);
-    opts.add_namespace_lock_guard(ledger_guard);
+    opts.add_owned_write_lock(Arc::clone(ledger_guard), RUSTFS_META_BUCKET, ledger_object);
+    opts.write_completion = crate::object_api::WriteCompletion::TailDrained;
     save_config_with_opts(store, ledger_object, serde_json::to_vec(ledger)?, &opts).await
 }
 

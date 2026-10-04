@@ -9307,7 +9307,7 @@ mod tests {
                 "object",
                 &mut reader,
                 &ObjectOptions {
-                    no_lock: true,
+                    write_completion: crate::storage::storage_api::ecstore_object::WriteCompletion::TailDrained,
                     ..Default::default()
                 },
             ),

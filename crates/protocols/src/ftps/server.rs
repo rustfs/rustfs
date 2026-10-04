@@ -115,9 +115,11 @@ where
         let storage_clone = self.storage.clone();
         let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
             Box::new(move || FtpsDriver::new(storage_clone.clone())),
-            Arc::new(FtpsUserDetailProvider),
+            Arc::new(ConnectionUserDetailProvider),
         )
-        .authenticator(Arc::new(FtpsAuthenticator::new()));
+        .authenticator(Arc::new(ConnectionAuthenticator {
+            require_data_tls: self.config.tls_enabled && self.config.ftps_required,
+        }));
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -376,6 +378,44 @@ impl UserDetailProvider for FtpsUserDetailProvider {
         };
 
         Ok(ftps_user)
+    }
+}
+
+// libunftp passes only Principal between authentication and user construction.
+// Encode the verified connection attributes in that private handoff so concurrent
+// logins for the same account cannot overwrite each other's source address.
+#[derive(Debug)]
+struct ConnectionAuthenticator {
+    require_data_tls: bool,
+}
+
+#[async_trait::async_trait]
+impl Authenticator for ConnectionAuthenticator {
+    async fn authenticate(&self, username: &str, creds: &Credentials) -> Result<Principal, AuthenticationError> {
+        let principal = FtpsAuthenticator::new().authenticate(username, creds).await?;
+        let secure =
+            self.require_data_tls && matches!(creds.command_channel_security, unftp_core::auth::ChannelEncryptionState::Tls);
+        let username = serde_json::to_string(&(principal.username, creds.source_ip, secure)).map_err(|error| {
+            AuthenticationError::ImplPropagated("Connection context unavailable".to_owned(), Some(Box::new(error)))
+        })?;
+        Ok(Principal { username })
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionUserDetailProvider;
+
+#[async_trait::async_trait]
+impl UserDetailProvider for ConnectionUserDetailProvider {
+    type User = FtpsUser;
+
+    async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+        let (username, source_ip, secure_transport): (String, IpAddr, bool) = serde_json::from_str(&principal.username)
+            .map_err(|error| UserDetailError::with_source("Invalid connection context", error))?;
+        let mut user = FtpsUserDetailProvider.provide_user_detail(&Principal { username }).await?;
+        user.session_context.source_ip = source_ip;
+        user.session_context.secure_transport = secure_transport;
+        Ok(user)
     }
 }
 
