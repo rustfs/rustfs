@@ -75,6 +75,7 @@ impl ObjectIO for CountingStore {
         options: &Self::ObjectOptions,
     ) -> StorageResult<Self::ObjectInfo> {
         assert_eq!(bucket, RUSTFS_META_BUCKET);
+        assert!(options.max_parity, "cache writes must preserve the metadata parity policy");
         let started = WallInstant::now();
         let mut bytes = Vec::new();
         (&mut data.stream).take(MAX_WIRE_BYTES + 1).read_to_end(&mut bytes).await?;
