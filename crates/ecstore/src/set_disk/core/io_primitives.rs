@@ -6844,6 +6844,7 @@ pub(crate) mod rename_fanout_barrier {
         Cleanup,
         Rollback,
         ReadVersion,
+        MetadataSlowtailFault,
         NonInlineHedgeTimer,
     }
 
@@ -6854,6 +6855,7 @@ pub(crate) mod rename_fanout_barrier {
                 super::rename_fanout_barrier_phase::CLEANUP => Self::Cleanup,
                 super::rename_fanout_barrier_phase::ROLLBACK => Self::Rollback,
                 super::rename_fanout_barrier_phase::READ_VERSION => Self::ReadVersion,
+                "metadata_slowtail_fault" => Self::MetadataSlowtailFault,
                 "non_inline_hedge_timer" => Self::NonInlineHedgeTimer,
                 _ => panic!("unknown commit fault phase: {label}"),
             }
@@ -6864,6 +6866,7 @@ pub(crate) mod rename_fanout_barrier {
     pub const PHASE_CLEANUP: Phase = Phase::Cleanup;
     pub const PHASE_ROLLBACK: Phase = Phase::Rollback;
     pub const PHASE_READ_VERSION: Phase = Phase::ReadVersion;
+    pub const PHASE_METADATA_SLOWTAIL_FAULT: Phase = Phase::MetadataSlowtailFault;
 
     /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
     pub const PHASE_NON_INLINE_HEDGE_TIMER: Phase = Phase::NonInlineHedgeTimer;
@@ -7728,18 +7731,46 @@ mod tests {
                 (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
             ],
             async {
+                let slow_fault =
+                    rename_fanout_barrier::arm(object, slow_disk, rename_fanout_barrier::PHASE_METADATA_SLOWTAIL_FAULT);
+                // Park the initial healthy reads until the slowtail hook is active,
+                // so cancellation cannot race ahead of fault injection on a busy runner.
+                let initial_reads = order
+                    .iter()
+                    .take(DISKS - 1)
+                    .copied()
+                    .filter(|&index| index != slow_disk)
+                    .map(|index| rename_fanout_barrier::arm(object, index, rename_fanout_barrier::PHASE_READ_VERSION))
+                    .collect::<Vec<_>>();
                 let calls = disk_call_counters::observe(object);
-                let read_with_data =
-                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2);
-                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_millis(300), read_with_data)
+                let tracker = rename_fanout_barrier::observe_tasks(object);
+                let disks_for_read = disks.clone();
+                let mut read = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed(&disks_for_read, bucket, bucket, object, "", true, false, false, true, 2)
+                        .await
+                });
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, slow_fault.wait_until_paused())
                     .await
-                    .expect("gated metadata read should hedge the initial slow shard")
+                    .expect("initial slow shard should reach the slowtail fault hook");
+                for initial_read in &initial_reads {
+                    initial_read.release();
+                }
+
+                // Keep the slow shard parked: only a successful hedge can finish
+                // this read. The timeout bounds a hang, not disk or scheduler latency.
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read)
+                    .await
+                    .expect("gated metadata read should hedge the paused initial slow shard")
+                    .expect("metadata read task should join")
                     .expect("gated metadata fanout should resolve");
-                assert!(parts_metadata.iter().filter(|fi| fi.name == object).count() >= 3);
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS - 1);
+                assert!(parts_metadata[slow_disk].name.is_empty(), "the slow shard must not supply a response");
+                assert_eq!(parts_metadata[spare_disk].name, object);
                 assert!(errs.iter().all(Option::is_none));
-                assert!(diagnostics.total_responses() < DISKS);
+                assert_eq!(diagnostics.total_responses(), DISKS - 1);
                 assert_eq!(calls.for_disk(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT, slow_disk), 1);
                 assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, spare_disk), 1);
+                assert_eq!(tracker.running(), 0, "early-stop must cancel and drain the paused slow shard");
             },
         )
         .await;
