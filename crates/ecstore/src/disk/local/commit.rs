@@ -234,7 +234,6 @@ pub(super) fn create_local_inline_rollback_backup(
     Ok(backup_path)
 }
 
-#[cfg(test)]
 pub(super) async fn lock_rename_commit_directories(
     source_parent: &Path,
     destination_parent: &Path,
