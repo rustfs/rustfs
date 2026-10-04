@@ -170,10 +170,11 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 # Registration, inventory delivery, and real drive/object probes include
-# durable filesystem IO in short deadlines. Reserve capacity so sibling test
+# filesystem or HTTP IO in short deadlines. Reserve capacity so sibling test
 # processes cannot exhaust those budgets. Keep deadlines and assertions intact.
+# The short HTTP fixtures are tracked in rustfs/backlog#2714.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|oversized_response_is_rejected_without_buffering_it)$/)))'
 threads-required = "num-test-threads"
 
 # This cancellation probe hashes the serving executable before acquiring its
@@ -428,7 +429,7 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|oversized_response_is_rejected_without_buffering_it)$/)))'
 threads-required = "num-test-threads"
 
 # Preserve the cancellation probe's startup budget and assertions in CI too.
