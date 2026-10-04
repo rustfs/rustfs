@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bucket::{
-    metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
+    metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
 use crate::error::is_err_bucket_not_found;
@@ -270,6 +270,32 @@ impl ECStore {
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
+    }
+
+    /// Resolve stored tags for authorization. Only confirmed absence returns an
+    /// empty map; unavailable, fabricated or malformed metadata must not grant access.
+    pub async fn get_bucket_tags_for_policy(&self, bucket: &str) -> Result<HashMap<String, String>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let metadata = match sys.read().await.get_authoritative_metadata(bucket).await {
+            Ok(metadata) => metadata,
+            Err(Error::ConfigNotFound) => return Ok(HashMap::new()),
+            Err(err) => return Err(err),
+        };
+        let Some(tagging) =
+            ConfigState::of(&metadata.tagging_config_xml, &metadata.tagging_config).require(bucket, BUCKET_TAGGING_CONFIG)?
+        else {
+            return Ok(HashMap::new());
+        };
+        let mut tags = HashMap::with_capacity(tagging.tag_set.len());
+        for tag in &tagging.tag_set {
+            let (Some(key), Some(value)) = (&tag.key, &tag.value) else {
+                return Err(Error::other("stored bucket tag is missing a key or value"));
+            };
+            if key.is_empty() || tags.insert(key.clone(), value.clone()).is_some() {
+                return Err(Error::other("stored bucket tags contain empty or duplicate keys"));
+            }
+        }
+        Ok(tags)
     }
 
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -1212,6 +1238,7 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileMeta, TRANSITION_COMPLETE};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1569,12 +1596,27 @@ mod tests {
         disk_indexes: &[usize],
     ) -> Vec<(usize, crate::disk::DiskStore)> {
         let offline = {
-            let mut disks = set.disks.write().await;
+            let disks = set.disks.read().await;
             disk_indexes
                 .iter()
-                .map(|index| (*index, disks[*index].take().expect("fault-injection disk should start online")))
+                .map(|index| (*index, disks[*index].clone().expect("fault-injection disk should start online")))
                 .collect::<Vec<_>>()
         };
+        for (_, disk) in &offline {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_offline_for_test();
+        }
+        // Empty slots can be renewed from the still-present disk paths by the endpoint monitor.
+        // Keep the original handles and prove reconnect cannot clear their injected IO failure.
+        set.connect_disks().await;
+        {
+            let disks = set.disks.read().await;
+            for (index, disk) in &offline {
+                let current = disks[*index].as_ref().expect("fault-injection slot should remain populated");
+                assert!(Arc::ptr_eq(current, disk), "reconnect must preserve the fault-injection handle");
+                assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            }
+        }
         let local_disk_map = ecstore.ctx.local_disk_map();
         let mut local_disks = local_disk_map.write().await;
         for (_, disk) in &offline {
@@ -1595,9 +1637,61 @@ mod tests {
                 local_disks.insert(disk.endpoint().to_string(), Some(Arc::clone(disk)));
             }
         }
-        let mut disks = set.disks.write().await;
+        let disks = set.disks.read().await;
         for (index, disk) in offline {
-            assert!(disks[index].replace(disk).is_none(), "fault-injection disk slot should remain empty");
+            let current = disks[index].as_ref().expect("fault-injection slot should remain populated");
+            assert!(Arc::ptr_eq(current, &disk), "fault-injection disk handle should remain unchanged");
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.reset_health_for_store_init_retry();
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_tags_for_policy_distinguish_absence_from_corrupt_metadata() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        assert!(
+            store
+                .get_bucket_tags_for_policy("not-created")
+                .await
+                .expect("confirmed missing bucket")
+                .is_empty()
+        );
+
+        let bucket = "policy-bucket-tags";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create tagged bucket");
+        let original = store.get_bucket_metadata(bucket).await.expect("read bucket metadata");
+        let cases = &[
+            (b"".as_slice(), Some(HashMap::new())),
+            (b"<Tagging><TagSet/></Tagging>", Some(HashMap::new())),
+            (
+                b"<Tagging><TagSet><Tag><Key>Department</Key><Value>Finance</Value></Tag><Tag><Key>note</Key><Value></Value></Tag></TagSet></Tagging>",
+                Some(HashMap::from([("Department".to_string(), "Finance".to_string()), ("note".to_string(), String::new())])),
+            ),
+            (b"<Tagging><TagSet>", None),
+            (b"<Tagging><TagSet><Tag><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key>department</Key></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key></Key><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (
+                b"<Tagging><TagSet><Tag><Key>department</Key><Value>finance</Value></Tag><Tag><Key>department</Key><Value>engineering</Value></Tag></TagSet></Tagging>",
+                None,
+            ),
+        ];
+        for (xml, expected) in cases {
+            let mut metadata = (*original).clone();
+            metadata.tagging_config_xml = xml.to_vec();
+            metadata.tagging_config = crate::bucket::utils::deserialize(xml).ok();
+            metadata_sys::set_bucket_metadata_in(&store.ctx, metadata)
+                .await
+                .expect("inject persisted tag state");
+            let result = store.get_bucket_tags_for_policy(bucket).await;
+            match expected {
+                Some(tags) => assert_eq!(&result.expect("valid tag configuration"), tags),
+                None => assert!(result.is_err(), "corrupt tags must not become an untagged bucket: {xml:?}"),
+            }
         }
     }
 
@@ -1608,6 +1702,10 @@ mod tests {
         let expected = "bucket metadata sys not initialized for this instance";
         let errors = [
             store.get_bucket_metadata("bucket").await.unwrap_err(),
+            store
+                .get_bucket_tags_for_policy("bucket")
+                .await
+                .expect_err("uninitialized metadata must deny tag lookup"),
             store.get_bucket_policy("bucket").await.unwrap_err(),
             store.get_bucket_policy_raw("bucket").await.unwrap_err(),
             store.restricts_public_bucket_access("bucket").await.unwrap_err(),
@@ -1854,8 +1952,12 @@ mod tests {
         assert_eq!(residue.diagnostic_bytes_read, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bucket_residue_scan_distinguishes_visible_and_tier_free_xlmeta() {
+        // Classification keeps the production budget, but real filesystem
+        // scheduling must not advance the clock before classification finishes.
+        let (clock_guard_tx, clock_guard_rx) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || clock_guard_rx.recv());
         let root = tempfile::tempdir().expect("temporary bucket root should be created");
         let bucket_path = root.path().join("bucket");
         let visible_path = bucket_path.join("visible").join(STORAGE_FORMAT_FILE);
@@ -1877,6 +1979,7 @@ mod tests {
         let visible_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("visible xl.meta scan should succeed");
+        assert!(!visible_scan.diagnostic_truncated, "{visible_scan:?}");
         assert_eq!(visible_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::VisibleVersion));
 
         tokio::fs::remove_dir_all(bucket_path.join("visible"))
@@ -1913,6 +2016,7 @@ mod tests {
         let free_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("free-version xl.meta scan should succeed");
+        assert!(!free_scan.diagnostic_truncated, "{free_scan:?}");
         assert_eq!(free_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::TierFreeVersion));
 
         tokio::fs::remove_dir_all(bucket_path.join("free"))
@@ -1933,6 +2037,7 @@ mod tests {
         let exact_limit_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("exact-limit xl.meta scan should remain fail closed");
+        assert!(!exact_limit_scan.diagnostic_truncated, "{exact_limit_scan:?}");
         assert_eq!(exact_limit_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
         assert_eq!(exact_limit_scan.diagnostic_bytes_read, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
         tokio::fs::remove_dir_all(bucket_path.join("exact-limit"))
@@ -1953,9 +2058,31 @@ mod tests {
         let oversized_scan = scan_metadata_less_residue(&bucket_path)
             .await
             .expect("oversized xl.meta scan should remain fail closed");
+        assert!(!oversized_scan.diagnostic_truncated, "{oversized_scan:?}");
         assert_eq!(oversized_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
         assert_eq!(oversized_scan.diagnostic_bytes_read, 0);
         assert!(oversized_scan.diagnostic_bytes_read <= BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
+
+        drop(clock_guard_tx);
+        let _ = clock_guard
+            .await
+            .expect("classification clock guard should exit after its sender is dropped");
+
+        // An exhausted diagnostic budget may return before observing xl.meta.
+        // It must report truncation rather than inventing a classification.
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let mut budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+        let truncated = scan_metadata_less_residue_with_budget(&bucket_path, &mut budget)
+            .await
+            .expect("a diagnostic timeout should return a partial scan");
+        assert!(first_io_started.load(Ordering::SeqCst));
+        assert!(truncated.diagnostic_truncated, "{truncated:?}");
+        assert_eq!(truncated.xlmeta_blocker, None);
+        assert_eq!(truncated.entries_scanned, 0);
+        assert_eq!(truncated.diagnostic_bytes_read, 0);
     }
 
     #[tokio::test]
@@ -2425,6 +2552,99 @@ mod tests {
                 .await
                 .expect_err("bucket mutations must retain their majority namespace check"),
             StorageError::ErasureWriteQuorum
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    /// EC 2+2 with two disks offline still has object read quorum and has lost
+    /// write quorum. A node that has not cached the bucket must still serve
+    /// HEAD bucket, GET, HEAD object, and List; a write must fail.
+    #[tokio::test]
+    #[serial]
+    async fn cold_bucket_reads_succeed_below_write_quorum() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("cold-read-quorum-{}", Uuid::new_v4().simple());
+        let object = "seed-object";
+        let body = b"cold bucket reads must survive lost write quorum".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy namespace should accept bucket creation");
+        store
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &ObjectOptions::default())
+            .await
+            .expect("healthy erasure set should accept the seed object");
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_err(),
+            "the replacement metadata system must start without this bucket"
+        );
+        let set = &store.pools[0].disk_set[0];
+        let lock = set
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("seed namespace lock should resolve");
+        drop(
+            lock.get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("seed physical fanout must finish before taking disks offline"),
+        );
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+
+        let info = store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("HEAD bucket must succeed at read quorum before the bucket is cached");
+        assert_eq!(info.name, bucket);
+
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET must succeed for a bucket that was not loaded at startup");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("quorum read should reconstruct the body");
+        assert_eq!(restored, body);
+        drop(reader);
+
+        let object_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("HEAD object must succeed at read quorum");
+        assert_eq!(object_info.name, object);
+        assert_eq!(object_info.size, i64::try_from(body.len()).expect("body length fits i64"));
+
+        let listed = store
+            .clone()
+            .list_objects_v2(&bucket, "", None, None, 100, false, None, false)
+            .await
+            .expect("List must succeed at read quorum");
+        assert!(
+            listed.objects.iter().any(|item| item.name == object),
+            "list should include the seed object, got {:?}",
+            listed.objects.iter().map(|item| item.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_ok(),
+            "the cold load should publish authoritative metadata"
+        );
+
+        let write_error = store
+            .put_object(&bucket, "rejected-object", &mut PutObjReader::from_vec(body), &ObjectOptions::default())
+            .await
+            .expect_err("writes must still fail without write quorum");
+        assert!(
+            matches!(
+                write_error,
+                StorageError::InsufficientWriteQuorum(_, _) | StorageError::ErasureWriteQuorum
+            ),
+            "writes must fail with a write-quorum error, got {write_error}"
         );
 
         restore_set_disks(&store, set, offline).await;
@@ -3283,7 +3503,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn make_bucket_seeds_new_bucket_durability_override() {
+    async fn make_bucket_inherits_default_durability() {
         temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
             let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
             let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
@@ -3296,10 +3516,7 @@ mod tests {
             let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
                 .await
                 .expect("metadata should load for the new bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
         })
         .await;
     }

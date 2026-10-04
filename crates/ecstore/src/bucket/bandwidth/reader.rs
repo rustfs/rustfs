@@ -41,6 +41,8 @@ pub struct MonitoredReader<R> {
     m: Arc<Monitor>,
     opts: MonitorReaderOptions,
     wait_state: std::sync::Mutex<Option<WaitState>>,
+    // Payload limit and unpaid tokens for the read retained across Pending polls.
+    pending_read: Option<(usize, u64)>,
     temp_buf: Vec<u8>,
 }
 
@@ -63,6 +65,7 @@ impl<R> MonitoredReader<R> {
             m,
             opts,
             wait_state: std::sync::Mutex::new(None),
+            pending_read: None,
             temp_buf: Vec::new(),
         }
     }
@@ -90,17 +93,30 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
 
         let throttle = match this.m.throttle(&this.opts.bucket_options) {
             Some(t) => t,
-            None => return Pin::new(&mut this.r).poll_read(cx, buf),
+            None => {
+                this.pending_read = None;
+                return Pin::new(&mut this.r).poll_read(cx, buf);
+            }
         };
 
         let b = throttle.burst();
         debug_assert!(b >= 1, "burst must be at least 1");
-        let (need, tokens) = calc_need_and_tokens(b, buf.remaining(), &mut this.opts.header_size);
-        let (deficit, rate, consumed) = throttle.consume(tokens);
-        let need = need.min(consumed as usize);
+        let (need, tokens) = match this.pending_read {
+            Some(reservation) => reservation,
+            None => calc_need_and_tokens(b, buf.remaining(), &mut this.opts.header_size),
+        };
+        // A lower limit may discard unpaid payload, but must retain paid
+        // payload and any header tokens still owed by this pending read.
+        let excess_payload = need.saturating_sub(usize::try_from(b).unwrap_or(usize::MAX));
+        let reduction = tokens.min(u64::try_from(excess_payload).unwrap_or(u64::MAX));
+        let need = need.saturating_sub(usize::try_from(reduction).unwrap_or(usize::MAX));
+        let tokens = tokens - reduction;
+        let (deficit, rate, _) = throttle.consume(tokens);
+        this.pending_read = Some((need, deficit));
 
         if deficit > 0 && rate > 0.0 {
-            let duration = std::time::Duration::from_secs_f64(deficit as f64 / rate);
+            // A changed limit may reduce the burst while this read is pending.
+            let duration = std::time::Duration::from_secs_f64(deficit.min(b) as f64 / rate);
             debug!(
                 tokens = tokens,
                 deficit = deficit,
@@ -115,14 +131,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
                         warn!("MonitoredReader wait_state mutex poisoned, recovering");
                         e.into_inner()
                     }) = Some(WaitState { sleep });
-                    return Poll::Pending;
                 }
-                Poll::Ready(()) => {}
+                Poll::Ready(()) => cx.waker().wake_by_ref(),
             }
+            return Poll::Pending;
         }
 
         let filled_before = buf.filled().len();
         let result = poll_limited_read(&mut this.r, cx, buf, need, &mut this.temp_buf);
+        if result.is_ready() {
+            this.pending_read = None;
+        }
         if let Poll::Ready(Ok(())) = result {
             let read_bytes = buf.filled().len().saturating_sub(filled_before) as u64;
             if read_bytes > 0 {

@@ -73,6 +73,7 @@ hotpath-cpu = [
 [dependencies]
 hotpath.workspace = true
 rustfs-config = { workspace = true }
+rustfs-data-usage = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-lock = { workspace = true }
@@ -99,6 +100,7 @@ crc-fast = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tonic = { workspace = true }
 rustfs-filemeta = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rustfs-test-utils = { workspace = true }

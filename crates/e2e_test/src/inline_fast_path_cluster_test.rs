@@ -886,6 +886,8 @@ fn configure_reader_metric_cluster(cluster: &mut RustFSTestClusterEnvironment, c
     cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "true");
     cluster.set_env("RUSTFS_OBS_TRACES_EXPORT_ENABLED", "false");
     cluster.set_env("RUSTFS_OBS_LOGS_EXPORT_ENABLED", "false");
+    // Keep startup diagnostics available when OTLP log export is disabled.
+    cluster.set_env("RUSTFS_OBS_LOG_STDOUT_ENABLED", "true");
     cluster.set_env("RUSTFS_OBS_METER_INTERVAL", "1");
     cluster.set_env("RUSTFS_OBS_USE_STDOUT", "false");
     cluster.set_env("RUSTFS_GET_CODEC_STREAMING_ENABLE", "false");

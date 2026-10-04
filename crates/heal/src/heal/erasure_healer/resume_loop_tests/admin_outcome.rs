@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::*;
-use crate::heal::outcome::{HealObjectDisposition, HealTaskOutcome};
-use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+use crate::heal::outcome::{HealDeferredReason, HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealTaskOutcome};
+use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType, MAX_BUCKET_OBJECT_HEAL_RETRIES};
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 
 fn request() -> HealRequest {
@@ -59,6 +59,144 @@ fn assert_partition(outcome: &HealTaskOutcome) {
     let c = &outcome.counters;
     assert_eq!(c.processed, c.healed + c.unchanged + c.skipped + c.failed);
     assert!(c.unknown <= c.skipped);
+}
+
+fn admin_object_identity() -> HealObjectIdentity {
+    HealObjectIdentity {
+        kind: HealObjectKind::Object,
+        bucket: "a".to_owned(),
+        object: "object".to_owned(),
+        version_id: Some("null".to_owned()),
+        bucket_incarnation_id: Some(uuid::Uuid::from_u128(42)),
+        pool_index: None,
+        set_index: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_object_rpc_cancelled_retries_require_verified_receipt() {
+    for failures in [1, MAX_BUCKET_OBJECT_HEAL_RETRIES] {
+        for verified in [true, false] {
+            let storage = FakeStorage::default();
+            storage.set_outcome("object", Some("null"), HealOutcome::RpcCancelled(failures));
+            storage
+                .receipts
+                .lock()
+                .expect("receipt fixture")
+                .insert(compose_key("object", Some("null")), verified.then_some(HealObjectDisposition::Repaired));
+            let options = HealOpts::default();
+            let cancel = CancellationToken::new();
+            let identity = admin_object_identity();
+            let heal = super::super::admin::heal_object(&storage, &options, identity.clone(), "rpc-retry", &cancel);
+            tokio::pin!(heal);
+            for attempt in 1..=failures {
+                assert!(matches!(futures::poll!(heal.as_mut()), std::task::Poll::Pending));
+                assert_eq!(storage.calls().len(), usize::try_from(attempt).expect("attempt fits"));
+                tokio::time::advance(HealTask::bucket_object_retry_delay("rpc-retry", attempt)).await;
+            }
+            let ((_, result), record) = heal.await;
+            assert!(matches!(result, Ok(true)));
+            assert_eq!(storage.calls().len(), usize::try_from(failures + 1).expect("attempts fit"));
+            let (outcome, attempt_failures) = record.expect("completed attempt records its disposition");
+            assert_eq!(outcome.identity, identity);
+            assert_eq!(attempt_failures, failures);
+            assert_eq!(
+                outcome.disposition,
+                if verified {
+                    HealObjectDisposition::Repaired
+                } else {
+                    HealObjectDisposition::Unknown
+                },
+                "only a matching positive receipt proves repair after retries"
+            );
+            assert!(outcome.detail.is_none());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_object_rpc_cancelled_exhausts_bounded_retries_as_deferred() {
+    let storage = FakeStorage::default();
+    storage.set_outcome("object", Some("null"), HealOutcome::RpcCancelled(MAX_BUCKET_OBJECT_HEAL_RETRIES + 1));
+    let options = HealOpts::default();
+    let cancel = CancellationToken::new();
+    let identity = admin_object_identity();
+    let heal = super::super::admin::heal_object(&storage, &options, identity.clone(), "rpc-exhausted", &cancel);
+    tokio::pin!(heal);
+    for attempt in 1..=MAX_BUCKET_OBJECT_HEAL_RETRIES {
+        assert!(matches!(futures::poll!(heal.as_mut()), std::task::Poll::Pending));
+        assert_eq!(storage.calls().len(), usize::try_from(attempt).expect("attempt fits"));
+        tokio::time::advance(HealTask::bucket_object_retry_delay("rpc-exhausted", attempt)).await;
+    }
+    let ((_, result), record) = heal.await;
+    assert!(matches!(result, Err(Error::TransientSkip { .. })));
+    assert_eq!(
+        storage.calls().len(),
+        usize::try_from(MAX_BUCKET_OBJECT_HEAL_RETRIES + 1).expect("attempts fit")
+    );
+    let (outcome, attempt_failures) = record.expect("exhausted retry records a deferred outcome");
+    assert_eq!(outcome.identity, identity);
+    assert_eq!(attempt_failures, MAX_BUCKET_OBJECT_HEAL_RETRIES + 1);
+    assert_eq!(
+        outcome.disposition,
+        HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::TransientExistenceCheck,
+            retry_not_before: None,
+        }
+    );
+    assert!(outcome.detail.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_object_rpc_cancelled_backoff_honors_task_cancellation() {
+    let storage = FakeStorage::default();
+    storage.set_outcome("object", Some("null"), HealOutcome::RpcCancelled(MAX_BUCKET_OBJECT_HEAL_RETRIES + 1));
+    let options = HealOpts::default();
+    let cancel = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    let heal = super::super::admin::heal_object(&storage, &options, admin_object_identity(), "rpc-cancel", &cancel);
+    tokio::pin!(heal);
+    assert!(matches!(futures::poll!(heal.as_mut()), std::task::Poll::Pending));
+    assert_eq!(storage.calls().len(), 1, "the first peer cancellation has reached retry backoff");
+    cancel.cancel();
+    let ((_, result), record) = heal.await;
+    assert!(matches!(result, Err(Error::TaskCancelled)));
+    assert!(record.is_none(), "task cancellation must not publish an object disposition");
+    assert_eq!(storage.calls().len(), 1, "cancellation must prevent another storage call");
+    assert_eq!(tokio::time::Instant::now(), started, "cancellation must not wait for backoff");
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_object_task_cancellation_and_timeout_remain_terminal() {
+    for timeout in [false, true] {
+        let storage = FakeStorage::default();
+        storage.set_outcome(
+            "object",
+            Some("null"),
+            if timeout {
+                HealOutcome::Timeout
+            } else {
+                HealOutcome::Cancelled
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let ((_, result), record) = super::super::admin::heal_object(
+            &storage,
+            &HealOpts::default(),
+            admin_object_identity(),
+            "task-terminal",
+            &CancellationToken::new(),
+        )
+        .await;
+        if timeout {
+            assert!(matches!(result, Err(Error::TaskTimeout)));
+        } else {
+            assert!(matches!(result, Err(Error::TaskCancelled)));
+        }
+        assert!(record.is_none());
+        assert_eq!(storage.calls().len(), 1, "terminal task errors must not retry");
+        assert_eq!(tokio::time::Instant::now(), started);
+    }
 }
 
 #[tokio::test]
@@ -197,9 +335,23 @@ async fn admin_erasure_dispositions_do_not_invent_success_and_retries_count_once
         .expect_err("unhealed objects must retain the failed task status");
     let outcome = task.get_outcome().await;
     let c = &outcome.counters;
-    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 1, 2, 1));
-    assert_eq!(c.attempt_failures, 5);
+    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 0, 3, 1));
+    assert_eq!(c.attempt_failures, 8);
+    assert_eq!(storage.calls().iter().filter(|(name, _)| name == "gone").count(), 4);
     assert_eq!(storage.calls().iter().filter(|(name, _)| name == "offline").count(), 4);
+    let gone = outcome
+        .objects
+        .iter()
+        .find(|item| item.identity.object == "gone")
+        .expect("missing version outcome");
+    assert_eq!(
+        gone.disposition,
+        HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::TransientExistenceCheck,
+            retry_not_before: None,
+        },
+        "exhausting retries cannot certify the missing version as absent"
+    );
     assert_partition(&outcome);
 }
 

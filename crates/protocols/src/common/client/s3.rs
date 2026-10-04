@@ -19,6 +19,34 @@ use s3s::dto::*;
 #[cfg(feature = "webdav")]
 use crate::common::session::SessionContext;
 
+/// Per-bucket capacity inputs for WebDAV quota reporting.
+#[cfg(feature = "webdav")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketCapacity {
+    /// Configured hard quota in bytes; `None` when the bucket has no quota.
+    pub quota_limit: Option<u64>,
+    /// Cached logical usage in bytes; `None` when no scanner snapshot covers
+    /// the bucket yet (fresh deploy, new bucket, or a degraded load window).
+    pub usage: Option<u64>,
+}
+
+/// Session-scoped capacity inputs for WebDAV quota reporting.
+///
+/// dav-server queries quota once per PROPFIND with no path argument, so the
+/// driver can only report a single filesystem-wide (used, total) pair; this
+/// view carries the inputs needed to compute it under the session's
+/// authorization scope.
+#[cfg(feature = "webdav")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCapacityView {
+    /// Buckets visible to the session with their quota limits and cached usage.
+    pub buckets: Vec<BucketCapacity>,
+    /// Cluster usable capacity as `(used_bytes, total_bytes)`, the same
+    /// erasure-aware numbers the console dashboard shows. `None` when the
+    /// object store is not initialized.
+    pub cluster_usable: Option<(u64, u64)>,
+}
+
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
@@ -70,6 +98,20 @@ pub trait StorageBackend: Send + Sync {
             s3s::S3ErrorCode::AccessDenied,
             "Session-aware bucket listing is not supported",
         ))
+    }
+    /// Gather the capacity view backing WebDAV quota properties.
+    ///
+    /// `Ok(None)` means the backend cannot report capacity, in which case the
+    /// driver omits quota properties from PROPFIND responses. The default
+    /// keeps backends that predate quota reporting capacity-transparent.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> s3s::S3Result<Option<SessionCapacityView>> {
+        Ok(None)
     }
     /// Create a new bucket
     async fn create_bucket(&self, bucket: &str, credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error>;

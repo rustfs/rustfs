@@ -58,6 +58,13 @@ are repository-relative. Read only the relevant sections during read-only review
 - Attach error context once where it is actionable. Do not erase typed errors
   below aggregation or quorum layers.
 
+## Rust Boundaries
+
+- Production `unwrap`/`expect` must follow a type guarantee or checked invariant; explain only non-obvious guarantees.
+- Public APIs do not return `Result<_, String>`. Library APIs use domain errors unless intentional erasure is part of the boundary contract; expose a stored inner error through `Error::source()`.
+- Numeric conversions must not silently truncate. Use fallible conversions for untrusted values; validate finiteness, sign, and range before float-to-integer conversion. Clamp/saturate only when required by the domain.
+- Do not add crate-root `#![allow(dead_code)]`.
+
 ## Naming
 
 Use Rust API naming: `SCREAMING_SNAKE_CASE` constants/statics, `snake_case`

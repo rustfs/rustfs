@@ -929,7 +929,7 @@ install_python_package() {
 }
 
 if ! command -v awscurl >/dev/null 2>&1; then
-    install_python_package awscurl || {
+    install_python_package "awscurl==0.44" || {
         log_error "Failed to install awscurl"
         exit 1
     }
@@ -1021,15 +1021,18 @@ fi
 
 cd "${PROJECT_ROOT}/s3-tests"
 
-# Install tox if not available
-if ! command -v tox >/dev/null 2>&1; then
-    install_python_package tox || {
-        log_error "Failed to install tox"
+# Match the weekly compatibility workflow even on runners with an older tox.
+TOX_VERSION="$(tox --version 2>/dev/null || true)"
+if [[ "${TOX_VERSION%% *}" != "4.60.0" ]]; then
+    install_python_package "tox==4.60.0" || {
+        log_error "Failed to install tox 4.60.0"
         exit 1
     }
-    # Add common Python user bin directories to PATH (same as awscurl)
-    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
-    export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
+fi
+TOX_VERSION="$(tox --version 2>/dev/null || true)"
+if [[ "${TOX_VERSION%% *}" != "4.60.0" ]]; then
+    log_error "Expected tox 4.60.0, found: ${TOX_VERSION:-unavailable}"
+    exit 1
 fi
 
 # Step 9: Run ceph s3-tests
@@ -1039,10 +1042,11 @@ mkdir -p "${ARTIFACTS_DIR}"
 XDIST_ARGS=""
 if [ "${XDIST}" != "0" ]; then
     # Add pytest-xdist to requirements.txt so tox installs it inside its virtualenv
-    grep -qxF "pytest-xdist" requirements.txt || echo "pytest-xdist" >> requirements.txt
+    grep -qxF "pytest-xdist==3.8.0" requirements.txt || echo "pytest-xdist==3.8.0" >> requirements.txt
     XDIST_ARGS="-n ${XDIST} --dist=loadgroup"
 fi
-grep -qxF "pytest-timeout" requirements.txt || echo "pytest-timeout" >> requirements.txt
+grep -qxF "pytest-timeout==2.4.0" requirements.txt || echo "pytest-timeout==2.4.0" >> requirements.txt
+grep -qxF "tox==4.60.0" requirements.txt || echo "tox==4.60.0" >> requirements.txt
 
 # Resolve config path (absolute path for tox)
 if [[ "${S3TESTS_CONF}" = /* ]]; then

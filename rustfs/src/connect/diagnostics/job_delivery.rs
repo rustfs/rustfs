@@ -44,6 +44,9 @@ const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 524_288;
 const MAX_STATE_FILES: usize = 65_536;
 
+// The executable identity is stable for this process; avoid hashing the full binary for every profile request.
+static EXECUTABLE_PROVENANCE: tokio::sync::OnceCell<ProfileProvenance> = tokio::sync::OnceCell::const_new();
+
 #[derive(Clone)]
 pub(crate) struct DiagnosticJobRuntime {
     config: HeartbeatConfig,
@@ -385,17 +388,22 @@ fn target_and_identity(config: &HeartbeatConfig) -> Result<(DiagnosticJobTarget,
     ))
 }
 
-async fn executable_provenance() -> Result<ProfileProvenance, &'static str> {
-    let digest = tokio::task::spawn_blocking(hash_current_executable)
-        .await
-        .map_err(|_| "PROVENANCE_FAILED")?
-        .map_err(|_| "PROVENANCE_FAILED")?;
-    Ok(ProfileProvenance::new(
-        crate::version::build::COMMIT_HASH,
-        digest,
-        env!("CARGO_PKG_VERSION"),
-        enabled_build_features(),
-    ))
+pub(super) async fn executable_provenance() -> Result<ProfileProvenance, &'static str> {
+    let provenance = EXECUTABLE_PROVENANCE
+        .get_or_try_init(|| async {
+            let digest = tokio::task::spawn_blocking(hash_current_executable)
+                .await
+                .map_err(|_| "PROVENANCE_FAILED")?
+                .map_err(|_| "PROVENANCE_FAILED")?;
+            Ok::<_, &'static str>(ProfileProvenance::new(
+                crate::version::build::COMMIT_HASH,
+                digest,
+                env!("CARGO_PKG_VERSION"),
+                enabled_build_features(),
+            ))
+        })
+        .await?;
+    Ok(provenance.clone())
 }
 
 fn hash_current_executable() -> Result<String, ()> {

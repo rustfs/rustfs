@@ -59,6 +59,9 @@ const EXPECTED_CERTIFICATE_LIFETIME_SECONDS: i64 = 86_400;
 const EXPECTED_ROTATION_THRESHOLD_SECONDS: i64 = 120;
 #[cfg(not(feature = "connect-e2e-short-credentials"))]
 const EXPECTED_ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
+// Allow durable state and real TLS setup independently of transport and cancellation deadlines.
+const STATUS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
@@ -207,6 +210,19 @@ struct TestServer {
     client_certificates: Arc<Mutex<Vec<Option<String>>>>,
     request_notify: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl TestServer {
+    fn request_diagnostics(&self) -> String {
+        match self.paths.try_lock() {
+            Ok(paths) => format!(
+                "request_count={} request_paths={paths:?} server_task_finished={}",
+                paths.len(),
+                self.task.is_finished()
+            ),
+            Err(error) => format!("request_paths_unavailable={error} server_task_finished={}", self.task.is_finished()),
+        }
+    }
 }
 
 impl Drop for TestServer {
@@ -678,7 +694,7 @@ async fn explicit_proxy_carries_registration_rotation_and_heartbeat_with_mtls() 
         .expect("configured heartbeat runtime");
     let mut status = runtime.status();
     assert!(matches!(
-        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for_heartbeat_status(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
         HeartbeatStatus::Online { .. }
     ));
     runtime.shutdown().await;
@@ -872,20 +888,33 @@ async fn wait_for_requests(server: &TestServer, count: usize) {
 }
 
 async fn wait_for_heartbeat_status(
+    server: &TestServer,
     status: &mut watch::Receiver<HeartbeatStatus>,
     predicate: impl Fn(&HeartbeatStatus) -> bool,
 ) -> HeartbeatStatus {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(STATUS_OBSERVATION_TIMEOUT, async {
         loop {
             let current = status.borrow_and_update().clone();
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("heartbeat status channel");
+            status.changed().await.unwrap_or_else(|error| {
+                panic!(
+                    "heartbeat status channel: {error}; last status: {:?}; {}",
+                    *status.borrow(),
+                    server.request_diagnostics()
+                );
+            });
         }
     })
     .await
-    .expect("heartbeat status")
+    .unwrap_or_else(|error| {
+        panic!(
+            "heartbeat status: {error}; last status: {:?}; {}",
+            *status.borrow(),
+            server.request_diagnostics()
+        )
+    })
 }
 
 fn rotation_response(pki: &TestPki, identity: &rustfs::connect::DeviceIdentity, serial: u8) -> (Value, Value) {
@@ -1299,7 +1328,25 @@ async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartb
         .expect("configured runtime");
     let mut status = runtime.status();
 
-    wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await;
+    // Start the progress bound after the durable rotation claim reaches the server.
+    // Heartbeats must still proceed before the five-second rotation Retry-After expires.
+    wait_for_requests(&server, 1).await;
+    assert!(
+        server.paths.lock().expect("paths lock")[0].ends_with(":rotateCredential"),
+        "rotation request must precede heartbeat progress"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_heartbeat_status(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "heartbeat progress blocked after rotation: {error}; last status: {:?}; {}",
+            *status.borrow(),
+            server.request_diagnostics()
+        )
+    });
     wait_for_requests(&server, 4).await;
     runtime.shutdown().await;
 
@@ -1351,7 +1398,7 @@ async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
     let mut status = runtime.status();
 
     assert!(matches!(
-        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for_heartbeat_status(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
         HeartbeatStatus::Online { .. }
     ));
     runtime.shutdown().await;
@@ -1391,7 +1438,8 @@ async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
         .expect("configured runtime");
         let mut corrupted_status = corrupted_runtime.status();
         assert_eq!(
-            wait_for_heartbeat_status(&mut corrupted_status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+            wait_for_heartbeat_status(&server, &mut corrupted_status, |status| matches!(status, HeartbeatStatus::Failed { .. }))
+                .await,
             HeartbeatStatus::Failed {
                 reason: HeartbeatError::StateConflict.to_string(),
             }
@@ -1460,7 +1508,7 @@ async fn heartbeat_retries_with_the_new_credential_after_concurrent_rotation() {
         .expect("concurrent rotation")
         .expect("rotation due");
     assert!(matches!(
-        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for_heartbeat_status(&server, &mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
         HeartbeatStatus::Online { .. }
     ));
     runtime.shutdown().await;
@@ -1545,7 +1593,7 @@ async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
         .expect("concurrent rotation")
         .expect("rotation due");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(STATUS_OBSERVATION_TIMEOUT, async {
             loop {
                 let current = status.borrow_and_update().clone();
                 if matches!(current, InventoryStatus::BackingOff { .. }) {
@@ -1640,18 +1688,37 @@ async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
     .expect("start inventory runtime")
     .expect("configured inventory runtime");
     let mut inventory_status = inventory.status();
+    let startup_diagnostics = || {
+        format!(
+            "{}; pending_registration={} staged_identity={} completed_registration={}",
+            telemetry.request_diagnostics(),
+            temp.path().join("credential/registration.pending.json").exists(),
+            temp.path().join("identity/device.key.next").exists(),
+            temp.path().join("credential/registration.completed.json").exists()
+        )
+    };
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(STATUS_OBSERVATION_TIMEOUT, async {
             loop {
                 let current = inventory_status.borrow_and_update().clone();
                 if matches!(current, InventoryStatus::Online { .. }) {
                     break current;
                 }
-                inventory_status.changed().await.expect("inventory status channel");
+                inventory_status.changed().await.unwrap_or_else(|error| {
+                    panic!(
+                        "inventory status channel: {error}; last status: {:?}; {}",
+                        *inventory_status.borrow(),
+                        startup_diagnostics()
+                    );
+                });
             }
         })
         .await
-        .expect("inventory online status"),
+        .unwrap_or_else(|error| panic!(
+            "inventory online status: {error}; last status: {:?}; {}",
+            *inventory_status.borrow(),
+            startup_diagnostics()
+        )),
         InventoryStatus::Online { .. }
     ));
 
@@ -1680,7 +1747,11 @@ async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
     .expect("configured heartbeat runtime");
     let mut heartbeat_status = heartbeat.status();
     assert!(matches!(
-        wait_for_heartbeat_status(&mut heartbeat_status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        wait_for_heartbeat_status(&telemetry, &mut heartbeat_status, |status| matches!(
+            status,
+            HeartbeatStatus::Online { .. }
+        ))
+        .await,
         HeartbeatStatus::Online { .. }
     ));
     heartbeat.shutdown().await;
@@ -1743,7 +1814,11 @@ async fn heartbeat_runtime_stops_when_rotation_reports_revocation() {
     let mut status = runtime.status();
 
     assert_eq!(
-        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::AuthenticationStopped { .. })).await,
+        wait_for_heartbeat_status(&server, &mut status, |status| matches!(
+            status,
+            HeartbeatStatus::AuthenticationStopped { .. }
+        ))
+        .await,
         HeartbeatStatus::AuthenticationStopped {
             status: 401,
             reason: Some("DEVICE_REVOKED".to_owned()),

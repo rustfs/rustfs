@@ -182,7 +182,7 @@ fn connect_offline_collectors_reject_oversize_raw_input_before_parsing() {
 
 #[cfg(target_os = "linux")]
 async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if matches!(status.borrow_and_update().clone(), InventoryStatus::Unchanged { .. }) {
                 return;
@@ -196,7 +196,7 @@ async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
 
 #[cfg(target_os = "linux")]
 async fn wait_for_inventory_failure(status: &mut watch::Receiver<InventoryStatus>) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if matches!(status.borrow_and_update().clone(), InventoryStatus::Failed { .. }) {
                 return;

@@ -18,6 +18,7 @@ use crate::heal::storage::HealStorageObjectResult;
 
 mod concurrent_delete;
 mod deferred_retry;
+mod usage_observation;
 
 mod canonical_outcome {
     use super::*;
@@ -1901,6 +1902,7 @@ fn replacement_identity(
 
 #[derive(Clone)]
 enum MockHealObjectOutcome {
+    MissingObject { outer: bool },
     MissingVersion,
     PermissionDenied,
     RetryableLock,
@@ -2058,6 +2060,14 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2118,6 +2128,14 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2679,6 +2697,25 @@ async fn read_repair_object_heal_sets_read_repair_option() {
 }
 
 #[tokio::test]
+async fn durable_mrf_heal_rejects_a_recreated_bucket_before_storage_heal() {
+    let original_incarnation = Uuid::new_v4();
+    let recreated_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(recreated_incarnation)),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(original_incarnation);
+    let task = HealTask::from_request(request, storage.clone());
+
+    let result = task.heal_object("bucket", "object", None).await;
+
+    assert!(matches!(result, Err(Error::TaskExecutionFailed { .. })));
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
     let storage = Arc::new(MockStorage {
         block_heal_object: Mutex::new(true),
@@ -2687,31 +2724,23 @@ async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
     let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     request.source = HealRequestSource::ReadRepair;
     request.options.timeout = Some(Duration::from_millis(1));
-    let task = Arc::new(HealTask::from_request(request, storage.clone()));
-    let execution = tokio::spawn({
-        let task = task.clone();
-        async move { task.execute().await }
-    });
+    let task = HealTask::from_request(request, storage.clone());
+    // Isolate the storage boundary from preflight's separately enforced budget.
+    let execution = task.heal_object("bucket", "object", None);
+    tokio::pin!(execution);
+    assert!(futures::poll!(&mut execution).is_pending());
+    assert!(storage.object_heal_opts.lock().expect("heal options")[0].read_repair);
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if !storage.object_heal_opts.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("read-repair object heal should start");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!execution.is_finished(), "read repair must not be failed by the flat task timeout");
-
-    execution.abort();
-    assert!(execution.await.is_err(), "aborted mock execution should not join successfully");
-    assert!(storage.object_heal_opts.lock().unwrap()[0].read_repair);
+    *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_millis(2));
+    assert!(matches!(task.remaining_timeout().await, Err(Error::TaskTimeout)));
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(
+        futures::poll!(&mut execution).is_pending(),
+        "read repair must remain in storage after the flat task budget expires"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_read_repair_object_heal_still_uses_flat_timeout() {
     let storage = Arc::new(MockStorage {
         block_heal_object: Mutex::new(true),
@@ -2719,13 +2748,26 @@ async fn non_read_repair_object_heal_still_uses_flat_timeout() {
     });
     let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     request.options.timeout = Some(Duration::from_millis(1));
-    let task = HealTask::from_request(request, storage);
+    let task = HealTask::from_request(request, storage.clone());
+    let execution = task.heal_object("bucket", "object", None);
+    tokio::pin!(execution);
+    assert!(futures::poll!(&mut execution).is_pending());
+    assert!(!storage.object_heal_opts.lock().expect("heal options")[0].read_repair);
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(matches!(futures::poll!(&mut execution), std::task::Poll::Ready(Err(Error::TaskTimeout))));
+}
 
-    let result = tokio::time::timeout(Duration::from_secs(1), task.execute())
-        .await
-        .expect("flat timeout should finish the task");
+#[tokio::test]
+async fn read_repair_preflight_still_rejects_an_expired_task_budget() {
+    let storage = Arc::new(MockStorage::default());
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::ReadRepair;
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = HealTask::from_request(request, storage.clone());
+    *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_millis(2));
 
-    assert!(matches!(result, Err(Error::TaskTimeout)));
+    assert!(matches!(task.heal_object("bucket", "object", None).await, Err(Error::TaskTimeout)));
+    assert!(storage.object_heal_opts.lock().expect("heal options").is_empty());
 }
 
 async fn make_resume_disk(temp: &TempDir) -> DiskStore {
@@ -3997,6 +4039,7 @@ async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() 
         HealPriority::Normal,
     );
     request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(incarnation);
     let task = HealTask::from_request(request, storage.clone());
 
     task.execute()

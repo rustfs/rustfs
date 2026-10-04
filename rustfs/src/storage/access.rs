@@ -49,9 +49,9 @@ use rustfs_policy::policy::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
     SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, force_delete_header, get_header,
 };
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
@@ -118,9 +118,14 @@ pub(crate) fn recursive_force_delete_has_authenticated_caller(
     authenticated: bool,
     replica_request: bool,
 ) -> bool {
-    !get_header(headers, SUFFIX_FORCE_DELETE).is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || authenticated
-        || replica_request
+    match force_delete_header(headers) {
+        Ok(Some(true)) => authenticated || replica_request,
+        _ => true,
+    }
+}
+
+fn invalid_force_delete_header() -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")
 }
 
 #[derive(Clone, Debug)]
@@ -1287,13 +1292,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 claims,
                 deny_only: false,
             };
-            let allowed = iam_store.eval_prepared(&prepared, &final_args).await;
+            let allowed = iam_store
+                .try_eval_prepared(&prepared, &final_args)
+                .await
+                .map_err(ApiError::from)?;
             if !allowed
                 && matches!(
                     action,
                     Action::S3Action(
                         S3Action::DeleteObjectAction
                             | S3Action::DeleteObjectVersionAction
+                            | S3Action::ForceDeleteBucketAction
+                            | S3Action::ForceDeleteObjectAction
                             | S3Action::ListBucketVersionsAction
                             | S3Action::BypassGovernanceRetentionAction
                             | S3Action::ReplicateDeleteAction
@@ -1304,7 +1314,11 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 // Bucket policy Allow may supplement an implicit IAM denial,
                 // but must not override an explicit deletion-policy Deny.
                 final_args.deny_only = true;
-                if !iam_store.eval_prepared(&prepared, &final_args).await {
+                if !iam_store
+                    .try_eval_prepared(&prepared, &final_args)
+                    .await
+                    .map_err(ApiError::from)?
+                {
                     return Err(denial.deny("iam_explicit_deny", action));
                 }
             }
@@ -2262,7 +2276,13 @@ impl S3Access for FS {
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
 
-        if req.input.force_delete.is_some_and(|v| v) {
+        // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
+        // including the value `false`. Only a parsed `true` later skips the
+        // emptiness check. `s3:*` does not grant this action.
+        if force_delete_header(&req.headers)
+            .map_err(|_| invalid_force_delete_header())?
+            .is_some()
+        {
             authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
         Ok(())
@@ -2411,11 +2431,21 @@ impl S3Access for FS {
 
         authorize_request(req, action).await?;
 
+        let force_delete = match force_delete_header(&req.headers) {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return Err(invalid_force_delete_header()),
+        };
         let replica_request = req
             .headers
             .get(AMZ_BUCKET_REPLICATION_STATUS)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
+        // The REPLICA header is caller-supplied, so it must not skip this
+        // check. s3:ReplicateDelete is still required separately for replica
+        // deletes; s3:* does not grant s3:ForceDeleteObject.
+        if force_delete {
+            authorize_request(req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
+        }
         if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
             return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
         }

@@ -25,6 +25,7 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rustfs_utils::HashAlgorithm;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use std::vec;
@@ -42,7 +43,7 @@ const ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: &str = "RUSTFS_ERASURE_ENCODE_B
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: usize = 4;
-const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = true;
 
 pub(crate) enum IntegrityEncodeMode {
     Inline(usize),
@@ -325,6 +326,80 @@ impl Default for WriteProgressPolicy {
     }
 }
 
+/// After write quorum is already in hand, how long a slower shard may still
+/// finish before it is dropped. The per-shard stall budget (30s by default)
+/// is what a black-hole peer is allowed to consume *before* quorum exists.
+/// Once quorum exists, waiting out that whole budget pins the caller for as
+/// long as the client request timeout, so the client gives up on a write the
+/// remaining disks have already accepted.
+const WRITE_QUORUM_STRAGGLER_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn post_quorum_straggler_grace(stall_timeout: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    stall_timeout.map(|stall| stall.min(WRITE_QUORUM_STRAGGLER_GRACE))
+}
+
+/// Drive shard ops until write quorum has succeeded and stragglers have had
+/// [`post_quorum_straggler_grace`] to finish. Returns `true` for each slot
+/// whose future completed; `false` means the caller must fail that slot.
+async fn await_write_quorum<F>(
+    write_quorum: usize,
+    stall_timeout: Option<std::time::Duration>,
+    slot_count: usize,
+    mut futures: FuturesUnordered<F>,
+) -> Vec<bool>
+where
+    F: std::future::Future<Output = (usize, bool)>,
+{
+    let mut saw = vec![false; slot_count];
+    let mut successes = 0usize;
+    let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    loop {
+        if futures.is_empty() {
+            break;
+        }
+        let completed = match grace.as_mut() {
+            Some(sleep) => {
+                tokio::select! {
+                    biased;
+                    item = futures.next() => item,
+                    () = sleep.as_mut() => break,
+                }
+            }
+            None => futures.next().await,
+        };
+        let Some((index, succeeded)) = completed else {
+            break;
+        };
+        if let Some(slot) = saw.get_mut(index) {
+            *slot = true;
+        }
+        if succeeded {
+            successes = successes.saturating_add(1);
+            if successes >= write_quorum
+                && grace.is_none()
+                && let Some(delay) = post_quorum_straggler_grace(stall_timeout)
+            {
+                grace = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+        }
+    }
+    saw
+}
+
+fn abandon_unfinished_writers(writers: &mut [Option<BitrotWriterWrapper>], errs: &mut [Option<Error>], saw: &[bool]) {
+    for (index, seen) in saw.iter().enumerate() {
+        if *seen || errs.get(index).and_then(Option::as_ref).is_some() {
+            continue;
+        }
+        if let Some(err) = errs.get_mut(index) {
+            *err = Some(Error::Timeout);
+        }
+        if let Some(writer) = writers.get_mut(index) {
+            *writer = None;
+        }
+    }
+}
+
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     integrity: Option<&'a mut IntegrityBuilder>,
@@ -418,9 +493,12 @@ impl<'a> MultiWriter<'a> {
         assert_eq!(shards.len(), self.writers.len());
 
         let budget = self.next_progress_budget();
-        {
-            let mut futures = FuturesUnordered::new();
-            for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(shards) {
+        let stall_timeout = self.policy.stall_timeout;
+        let write_quorum = self.write_quorum;
+        let slot_count = self.writers.len();
+        let saw = {
+            let futures = FuturesUnordered::new();
+            for (index, ((writer_opt, err), shard)) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(shards).enumerate() {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
@@ -428,7 +506,9 @@ impl<'a> MultiWriter<'a> {
                 // failed and its disk dropped, so a stalled peer cannot pin an
                 // otherwise-healthy write quorum (rustfs/backlog#1319). `budget`
                 // is recomputed per block, so it bounds a stall — not the total
-                // transfer time — and a slow-but-honest writer is never killed.
+                // transfer time — and a slow-but-honest writer is never killed
+                // while quorum is still open. Once quorum has succeeded, a
+                // straggler only gets `WRITE_QUORUM_STRAGGLER_GRACE` more time.
                 futures.push(async move {
                     match budget {
                         Some(budget) => match tokio::time::timeout(budget, Self::write_shard(writer_opt, err, shard)).await {
@@ -440,10 +520,13 @@ impl<'a> MultiWriter<'a> {
                         },
                         None => Self::write_shard(writer_opt, err, shard).await,
                     }
+                    let succeeded = err.is_none() && writer_opt.is_some();
+                    (index, succeeded)
                 });
             }
-            while let Some(()) = futures.next().await {}
-        }
+            await_write_quorum(write_quorum, stall_timeout, slot_count, futures).await
+        };
+        abandon_unfinished_writers(self.writers, &mut self.errs, &saw);
 
         let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
         if nil_count >= self.write_quorum {
@@ -490,9 +573,12 @@ impl<'a> MultiWriter<'a> {
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         crate::hp_guard!("MultiWriter::shutdown");
         let budget = self.next_progress_budget();
-        {
-            let mut futures = FuturesUnordered::new();
-            for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
+        let stall_timeout = self.policy.stall_timeout;
+        let write_quorum = self.write_quorum;
+        let slot_count = self.writers.len();
+        let saw = {
+            let futures = FuturesUnordered::new();
+            for (index, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter_mut()).enumerate() {
                 if err.is_some() {
                     continue;
                 }
@@ -501,6 +587,8 @@ impl<'a> MultiWriter<'a> {
                 // here forever for a small object whose bytes were fully buffered
                 // (so `write` never blocked). Bound it with the same progress
                 // budget and drop the stalled writer before the quorum check.
+                // After quorum has shut down, do not keep waiting out the rest of
+                // that budget for a peer that has stopped answering.
                 futures.push(async move {
                     match budget {
                         Some(budget) => match tokio::time::timeout(budget, Self::shutdown_writer(writer_opt, err)).await {
@@ -512,10 +600,13 @@ impl<'a> MultiWriter<'a> {
                         },
                         None => Self::shutdown_writer(writer_opt, err).await,
                     }
+                    let succeeded = err.is_none() && writer_opt.is_some();
+                    (index, succeeded)
                 });
             }
-            while let Some(()) = futures.next().await {}
-        }
+            await_write_quorum(write_quorum, stall_timeout, slot_count, futures).await
+        };
+        abandon_unfinished_writers(self.writers, &mut self.errs, &saw);
 
         let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
         if nil_count >= self.write_quorum {
@@ -799,8 +890,6 @@ impl Erasure {
                 // capacity and never reallocates. Reading into uninitialized spare capacity
                 // (instead of resize + slice read) also skips zero-filling each fresh buffer.
                 let ingest_capacity = expanded_block_bytes.max(block_size);
-                // Pre-allocate buffer pool for this encoding session
-                let mut buf_pool: Vec<BytesMut> = Vec::with_capacity(4);
                 let mut buf = BytesMut::with_capacity(ingest_capacity);
                 loop {
                     match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
@@ -810,8 +899,6 @@ impl Erasure {
                             total += n;
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
-                            // Try to reuse buffer from pool, or allocate new one
-                            buf = buf_pool.pop().unwrap_or_else(|| BytesMut::with_capacity(ingest_capacity));
                             let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -819,11 +906,8 @@ impl Erasure {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
-                            // Return buffer to pool if it has sufficient capacity
-                            if buf.capacity() >= ingest_capacity && buf_pool.len() < 4 {
-                                buf_pool.push(buf);
-                                buf = BytesMut::with_capacity(ingest_capacity);
-                            }
+                            // Encoded shards own the previous allocation until writing completes.
+                            buf = BytesMut::with_capacity(ingest_capacity);
                         }
                         Ok(None) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -963,18 +1047,18 @@ impl Erasure {
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
-            let mut buf = vec![0u8; block_size];
+            let ingest_capacity = expanded_block_bytes.max(block_size);
+            let mut buf = BytesMut::with_capacity(ingest_capacity);
             let mut pending_batch = Vec::with_capacity(batch_blocks);
             let mut pending_batch_bytes = 0usize;
             let mut pending_batch_stage = None;
             loop {
-                match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
+                match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
                     Ok(Some(n)) => {
                         debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                         total += n;
-                        let encode_buf = std::mem::take(&mut buf);
-                        let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
-                        buf = returned_buf;
+                        let res = self.clone().encode_block_bytes_mut(buf, n).await?;
+                        buf = BytesMut::with_capacity(ingest_capacity);
                         let queued_bytes = res.queued_bytes();
                         pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
                         pending_batch.push(res);
@@ -1150,6 +1234,42 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides() {
+        const CHILD_CASE: &str = "RUSTFS_TEST_BYTESMUT_INGEST_SELECTOR_CASE";
+        if let Ok(case) = std::env::var(CHILD_CASE) {
+            let expected = match case.as_str() {
+                "default" | "true" => true,
+                "false" => false,
+                _ => panic!("unexpected ingest selector case: {case}"),
+            };
+            assert_eq!(use_bytesmut_ingest(), expected, "ingest selector case: {case}");
+            return;
+        }
+
+        // Each selector probe needs a fresh OnceLock and an isolated environment.
+        for case in ["default", "true", "false"] {
+            let mut child = std::process::Command::new(std::env::current_exe().expect("ingest selector test executable"));
+            child.args([
+                "--exact",
+                "erasure::coding::encode::tests::bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides",
+                "--nocapture",
+            ]);
+            child.env(CHILD_CASE, case);
+            child.env_remove(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST);
+            if case != "default" {
+                child.env(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, case);
+            }
+            let output = child.output().expect("start isolated ingest selector test");
+            assert!(
+                output.status.success(),
+                "ingest selector case {case} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 
     struct PendingReader {
         entered: Option<oneshot::Sender<()>>,
@@ -2132,6 +2252,68 @@ mod tests {
 
         assert!(writers[0].is_none(), "the black-hole writer must be failed and dropped before commit");
         assert!(writers[1].is_some() && writers[2].is_some() && writers[3].is_some());
+    }
+
+    /// Quorum is met by the three healthy writers at t=0. The black-hole peer
+    /// must be abandoned after the post-quorum grace, not after the full 5s
+    /// stall budget. Waiting out the stall makes a 30s default stall consume
+    /// the whole client request budget.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_quorum_abandons_black_hole_after_straggler_grace() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_write(0), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[2].clone()), 64)),
+        ];
+
+        let started = tokio::time::Instant::now();
+        {
+            let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            mw.write(four_shards())
+                .await
+                .expect("quorum must succeed without waiting out the black-hole stall");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "post-quorum grace must cut the black-hole wait short of the 5s stall, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed >= WRITE_QUORUM_STRAGGLER_GRACE,
+            "the healthy quorum must still give the straggler its grace window, elapsed {elapsed:?}"
+        );
+        assert!(writers[0].is_none(), "the black-hole writer must be dropped once grace expires");
+        assert!(writers[1].is_some() && writers[2].is_some() && writers[3].is_some());
+    }
+
+    /// A slow-but-honest shard that finishes inside the post-quorum grace keeps
+    /// its writer. The grace exists to drop peers that have stopped, not to
+    /// discard a disk that is merely behind the fastest quorum.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_quorum_keeps_straggler_that_finishes_within_grace() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..4).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_millis(200)), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[2].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[3].clone()), 64)),
+        ];
+
+        {
+            let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            mw.write(four_shards())
+                .await
+                .expect("a straggler inside the grace window must still satisfy the write");
+        }
+
+        assert!(
+            writers.iter().all(Option::is_some),
+            "a shard that finishes within the grace window must not be dropped"
+        );
     }
 
     // Two black-hole writers drop the healthy count to 2/4, below the quorum of

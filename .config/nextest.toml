@@ -64,6 +64,26 @@ command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
 command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
 
 # --- default profile (local): serialize the flaky groups, never retry --------
+# These real-disk progress oracles exercise fsync, quorum IO, and crash/replay
+# boundaries. Reserve the run's capacity so unrelated fixtures cannot starve
+# their existing deadlines and typed-failure assertions (rustfs/backlog#2706).
+# Keep each test's internal concurrency and zero-retry policy unchanged.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^set_disk::tests::streaming_get_blocks_concurrent_/) | test(=store::object::tests::retired_marker_converges_after_bucket_recreation_on_sixteen_disks))'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(rustfs-heal) & (binary(mrf_partial_write_test) | (binary(mrf_pipeline_test) & test(/^journal_replay_survives_/)) | test(=admin_selector_survives_sigkill_with_original_scope_and_receipts))'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_(writer|retirement)_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
+threads-required = "num-test-threads"
+
 [[profile.default.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(batch_transitioned_delete_uses_free_version_per_item|decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|dispatched_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|force_tier_remove_blocks_on_physical_free_version_hidden_by_other_pool|legacy_unknown_transition_delete_falls_back_for_single_batch_and_blocks_prefix|multi_pool_(recursive_prefix_rejects_legacy_or_hidden_merge_loser_before_delete|same_remote_tuple_(batch|single)_delete_waits_for_all_sources|same_tuple_recursive_prefix_uses_one_journal_owner|transitioned_delete_persists_one_free_version_per_remote_tuple)|recursive_prefix_partial_(pool|set)_failure_keeps_prepared_cleanup_owners|restored_transitioned_delete_uses_free_version_as_cleanup_owner|stable_transitioned_recursive_prefix_delete_uses_journal_owners|suspended_null_transition_delete_uses_free_version_as_sole_owner|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)|transitioned_delete_(free_version_replays_after_store_restart|local_quorum_failure_rolls_back_without_cleanup_owner|uses_free_version_as_cleanup_owner)|versioned_delete_marker_keeps_transitioned_source_and_remote_object|versioned_explicit_transition_delete_preserves_other_version_then_allows_bucket_delete))$/)'
 setup = 'ecstore-large-stack'
@@ -81,6 +101,13 @@ setup = 'lifecycle-large-stack'
 [[profile.default.scripts]]
 filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
 setup = 'ecstore-large-stack'
+
+# These real-disk scanner fixtures assert quiet-workload publication and
+# durable MRF admission. Reserve the pool while their bounded CAS/fsync
+# handoffs run so unrelated disk fanouts cannot consume that fixture budget.
+[[profile.default.overrides]]
+filter = 'package(rustfs-scanner) & (test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(=scanner_io::tests::multi_pool_scanner_cycle_publishes_combined_usage) | test(=scanner_io::tests::pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage) | test(=scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail))'
+threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
@@ -105,6 +132,16 @@ test-group = 'ecstore-serial-flaky'
 # retries. The matching ci-profile override is after [profile.ci].
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the replacement bucket metadata heal test. It builds a real-disk
+# hermetic erasure set, writes bucket metadata, then asserts byte-identical
+# xl.meta readback after a rejected delayed repair. Under parallel load,
+# concurrent ecstore tests mutate the process-wide disk registry and alter
+# the serialized timestamp/disk-identity fields, flipping the assertion.
+# Preventive serialization only, no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the metadata-cache generation-retirement pair. Both carry
@@ -132,10 +169,37 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
-# The real object probe includes bucket creation and cleanup in its short
-# measurement budget. Keep competing storage fixtures outside that budget.
+# Registration, inventory delivery, and real drive/object probes include
+# durable filesystem IO in short deadlines. Reserve capacity so sibling test
+# processes cannot exhaust those budgets. Keep deadlines and assertions intact.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+threads-required = "num-test-threads"
+
+# This cancellation probe hashes the serving executable before acquiring its
+# collector lease. Keep competing test processes out of its 30s startup budget.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
+threads-required = "num-test-threads"
+
+# These real IAM/state fixtures keep production lock-acquisition limits while
+# peers complete durable IO. Reserve capacity from unrelated test processes;
+# the shared fixture's durable_iam_state_ prefix keeps the whole family together.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+threads-required = "num-test-threads"
+
+# Real target-repair and rebalance-stop fixtures commit durable metadata while
+# peers wait on production locks or bounded cancellation checks. Reserve IO
+# capacity for each fixture; its internal races and deadlines remain intact.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
+threads-required = "num-test-threads"
+
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
+# Their existing deadlines, assertions, and retry policy remain in force.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test across nextest's
@@ -218,6 +282,13 @@ test-group = 'e2e-cluster-nightly'
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
+# These server-heavy smoke cases perform 1k+ sequential S3 writes or run the
+# scanner and a remote tier server together. Reserve the full test budget so
+# unrelated E2E processes cannot starve their storage and polling deadlines.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+threads-required = "num-test-threads"
+
 # This four-disk, 65-member rollback probe already drives up to 32 concurrent
 # durable deletions. Reserve this nextest run's capacity for its progress oracle.
 [[profile.default.overrides]]
@@ -239,6 +310,24 @@ fail-fast = false
 # marker is the observable signal the flake policy is built around.
 path = "junit.xml"
 
+# Match the local durable-progress reservations. All members, deadlines,
+# assertions, and internal concurrency remain enabled without retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
+threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^set_disk::tests::streaming_get_blocks_concurrent_/) | test(=store::object::tests::retired_marker_converges_after_bucket_recreation_on_sixteen_disks))'
+threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-heal) & (binary(mrf_partial_write_test) | (binary(mrf_pipeline_test) & test(/^journal_replay_survives_/)) | test(=admin_selector_survives_sigkill_with_original_scope_and_receipts))'
+threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_(writer|retirement)_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
+threads-required = "num-test-threads"
+
 [[profile.ci.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(batch_transitioned_delete_uses_free_version_per_item|decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|dispatched_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|force_tier_remove_blocks_on_physical_free_version_hidden_by_other_pool|legacy_unknown_transition_delete_falls_back_for_single_batch_and_blocks_prefix|multi_pool_(recursive_prefix_rejects_legacy_or_hidden_merge_loser_before_delete|same_remote_tuple_(batch|single)_delete_waits_for_all_sources|same_tuple_recursive_prefix_uses_one_journal_owner|transitioned_delete_persists_one_free_version_per_remote_tuple)|recursive_prefix_partial_(pool|set)_failure_keeps_prepared_cleanup_owners|restored_transitioned_delete_uses_free_version_as_cleanup_owner|stable_transitioned_recursive_prefix_delete_uses_journal_owners|suspended_null_transition_delete_uses_free_version_as_sole_owner|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)|transitioned_delete_(free_version_replays_after_store_restart|local_quorum_failure_rolls_back_without_cleanup_owner|uses_free_version_as_cleanup_owner)|versioned_delete_marker_keeps_transitioned_source_and_remote_object|versioned_explicit_transition_delete_preserves_other_version_then_allows_bucket_delete))$/)'
 setup = 'ecstore-large-stack'
@@ -256,6 +345,13 @@ setup = 'lifecycle-large-stack'
 [[profile.ci.scripts]]
 filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
 setup = 'ecstore-large-stack'
+
+# These real-disk scanner fixtures assert quiet-workload publication and
+# durable MRF admission. Reserve the pool while their bounded CAS/fsync
+# handoffs run so unrelated disk fanouts cannot consume that fixture budget.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-scanner) & (test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(=scanner_io::tests::multi_pool_scanner_cycle_publishes_combined_usage) | test(=scanner_io::tests::pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage) | test(=scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail))'
+threads-required = "num-test-threads"
 
 # ===========================================================================
 # QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.
@@ -281,13 +377,6 @@ retries = 2
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes))'
 test-group = 'ecstore-serial-flaky'
-
-# QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
-# on producer/consumer timing windows that stretch past the budget on loaded
-# CI runners (regression test for rustfs#4644; failed on a zero-Rust-diff PR).
-[[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
-retries = 2
 
 # Serialize the relocated-pool GET resume regression under the ci profile too
 # (see the matching default-profile override near the top). No longer a
@@ -320,6 +409,11 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the replacement bucket metadata heal test under the ci profile too.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the metadata-cache generation-retirement pair under the ci
 # profile too (see the matching default-profile override near the top). Not a
 # quarantine: no retries.
@@ -334,7 +428,30 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+threads-required = "num-test-threads"
+
+# Preserve the cancellation probe's startup budget and assertions in CI too.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
+threads-required = "num-test-threads"
+
+# Keep the same IAM/state fixture capacity reservation in CI without changing the
+# production lock deadline, internal concurrency, assertions, or retry policy.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+threads-required = "num-test-threads"
+
+# Match the real admin fixture capacity reservation without retries or changes
+# to production lock deadlines, cancellation barriers, or assertions.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
+threads-required = "num-test-threads"
+
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
+# Their existing deadlines, assertions, and retry policy remain in force.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test under the ci profile
@@ -468,6 +585,7 @@ default-filter = """
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
+        | test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
         | test(/^on_demand_migration::(get_basic_test::(get_miss_pulls_inline_and_serves_locally_afterwards|head_miss_answers_from_the_source_without_persisting)|interaction_test::test_odm_admin_config_is_redacted_and_status_counts_match_the_source)$/)
     )
 """
@@ -476,13 +594,16 @@ fail-fast = false
 [profile.e2e-smoke.junit]
 path = "junit.xml"
 
-# The pagination boundary cases can stall when a server/listing regression
-# prevents the continuation request from completing. Keep the timeout scoped
-# to those known failure modes so legitimate lifecycle/tiering waits retain
-# their test-level timing budget.
+# Bound the whole pagination fixture, including startup, seeding, and cleanup;
+# its LIST deadline begins only after the seed objects have been written.
 [[profile.e2e-smoke.overrides]]
 filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
 slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
+threads-required = "num-test-threads"
+
+[[profile.e2e-smoke.overrides]]
+filter = 'package(e2e_test) & test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry)'
+threads-required = "num-test-threads"
 
 # ---------------------------------------------------------------------------
 # e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)
@@ -692,6 +813,7 @@ default-filter = """
     & !test(/^replication_extension_test::/)
     & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)
+    & !test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
 """
 fail-fast = false
 
@@ -720,3 +842,9 @@ test-group = 'e2e-cluster-nightly'
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
+
+# Keep the storage-heavy smoke cases isolated in the full suite too. They
+# start multiple server fixtures and issue many sequential S3 operations.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+threads-required = "num-test-threads"

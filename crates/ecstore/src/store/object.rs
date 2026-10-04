@@ -985,6 +985,19 @@ impl PreparedGetObjectReader {
         reader.body_source = crate::object_api::GetObjectBodySource::HookMissed;
         Ok(ECStore::attach_read_lock_guard(reader, self.read_lock_guard))
     }
+
+    /// Open the prepared source with bounded copy prefetch and request-owned
+    /// cancellation, including cancellation during reader construction.
+    pub async fn into_reader_for_copy(self) -> Result<(GetObjectReader, tokio_util::sync::DropGuard)> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let reader = crate::set_disk::with_get_object_read_cancellation(
+            cancellation,
+            crate::set_disk::with_get_object_read_policy(crate::set_disk::GetObjectReadPolicy::CopySource, self.into_reader()),
+        )
+        .await?;
+        Ok((reader, guard))
+    }
 }
 
 struct LockGuardedReader {
@@ -4693,6 +4706,14 @@ impl ECStore {
     /// the caller falls back to surfacing the original NotFound.
     pub(super) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
         let prefix = decode_dir_object(object);
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                if !set.orphan_purge_has_complete_disk_set().await {
+                    return false;
+                }
+            }
+        }
+
         let mut purged = false;
         for pool in self.pools.iter() {
             for set in pool.disk_set.iter() {
@@ -4708,6 +4729,27 @@ impl ECStore {
                         );
                     }
                 }
+            }
+        }
+        purged
+    }
+
+    pub(super) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
+        if is_meta_bucketname(bucket) {
+            return false;
+        }
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                if !set.orphan_purge_has_complete_disk_set().await {
+                    return false;
+                }
+            }
+        }
+
+        let mut purged = false;
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                purged |= set.purge_orphan_dir_objects_in_bucket(bucket).await;
             }
         }
         purged

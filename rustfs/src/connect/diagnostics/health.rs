@@ -19,7 +19,9 @@
 //! raw admin responses and object data never enter the result.
 
 use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Write as _};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -36,8 +38,8 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use super::ProfileProvenance;
 use crate::connect::DeviceIdentity;
-use crate::storage::storage_api::contract::admin::{DiskSetSelector, StorageAdminApi};
-use crate::storage::storage_api::{DiskInfoOptions, StorageDiskRpcExt};
+use crate::storage_api::connect::contract::admin::{DiskSetSelector, StorageAdminApi};
+use crate::storage_api::connect::{DiskInfoOptions, StorageDiskRpcExt};
 
 pub const HEALTH_SCHEMA_VERSION: u16 = 1;
 pub const HEALTH_TOOL_ID: &str = "health.check";
@@ -300,6 +302,20 @@ pub enum HealthError {
     Signing,
     #[error("health_export_encoding_failed")]
     Encoding,
+}
+
+#[derive(Debug, Error)]
+pub enum HealthSaveError {
+    #[error("health_export_invalid_request")]
+    InvalidRequest,
+    #[error("health_export_limit_exceeded")]
+    LimitExceeded,
+    #[error("health_export_cancelled")]
+    Cancelled,
+    #[error("health_export_io_failed")]
+    Io(#[source] std::io::Error),
+    #[error("health_export_durability_failed_after_commit")]
+    DurabilityAfterCommit(#[source] std::io::Error),
 }
 
 struct CollectorLease;
@@ -598,6 +614,55 @@ pub fn sign_health_export(
     })
 }
 
+pub fn save_signed_health_export(
+    output: &Path,
+    archive: &[u8],
+    artifact_uid: &str,
+    cancel: &CancellationToken,
+) -> Result<(), HealthSaveError> {
+    if cancel.is_cancelled() {
+        return Err(HealthSaveError::Cancelled);
+    }
+    if archive.is_empty() || archive.len() as u64 > MAX_HEALTH_OUTPUT_BYTES {
+        return Err(HealthSaveError::LimitExceeded);
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = output.file_name().ok_or(HealthSaveError::InvalidRequest)?.to_string_lossy();
+    let temporary = parent.join(format!(".{filename}.{artifact_uid}.partial"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(HealthSaveError::Io)?;
+    let result = (|| {
+        file.write_all(archive).map_err(HealthSaveError::Io)?;
+        if cancel.is_cancelled() {
+            return Err(HealthSaveError::Cancelled);
+        }
+        file.sync_all().map_err(HealthSaveError::Io)?;
+        if cancel.is_cancelled() {
+            return Err(HealthSaveError::Cancelled);
+        }
+        fs::hard_link(&temporary, output).map_err(HealthSaveError::Io)?;
+        fs::remove_file(&temporary).map_err(HealthSaveError::DurabilityAfterCommit)?;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(HealthSaveError::DurabilityAfterCommit)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn result_reason(freshness: HealthFreshness, observation: &HealthSourceObservation) -> HealthResultReason {
     match freshness {
         HealthFreshness::Stale => HealthResultReason::EvidenceStale,
@@ -642,7 +707,7 @@ fn flags_check(observation: &HealthSourceObservation, freshness: HealthFreshness
             Some(flags) if flags.iter().any(|flag| !ALLOWED_FLAGS.contains(&flag.as_str())) => {
                 (HealthRuleOutcome::Unknown, "INVALID_EVIDENCE")
             }
-            Some(flags) if flags.is_empty() => (HealthRuleOutcome::Pass, "NO_COARSE_CONDITION_REPORTED"),
+            Some([]) => (HealthRuleOutcome::Pass, "NO_COARSE_CONDITION_REPORTED"),
             Some(_) => (HealthRuleOutcome::Fail, "COARSE_CONDITION_REPORTED"),
             None => (HealthRuleOutcome::Unknown, "EVIDENCE_MISSING"),
         },
@@ -823,5 +888,34 @@ mod tests {
         assert!(matches!(CollectorLease::acquire(), Err(HealthError::Busy)));
         drop(active);
         CollectorLease::acquire().expect("collector lease should be released");
+    }
+
+    #[test]
+    fn offline_health_archive_is_private_and_never_replaces_existing_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("health.zip");
+        let cancel = CancellationToken::new();
+        save_signed_health_export(&output, b"signed archive", "019e3ae0-0000-7000-8000-000000000025", &cancel).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"signed archive");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(matches!(
+            save_signed_health_export(&output, b"different", "019e3ae0-0000-7000-8000-000000000026", &cancel),
+            Err(HealthSaveError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&output).unwrap(), b"signed archive");
+        cancel.cancel();
+        assert!(matches!(
+            save_signed_health_export(
+                &directory.path().join("cancelled.zip"),
+                b"data",
+                "019e3ae0-0000-7000-8000-000000000027",
+                &cancel
+            ),
+            Err(HealthSaveError::Cancelled)
+        ));
     }
 }

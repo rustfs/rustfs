@@ -131,6 +131,22 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+
+        /// WebDAV quota reporting surface (`session_capacity_view`): bucket
+        /// quota config, cached usage, and the console's erasure-aware usable
+        /// capacity, all read from caches/snapshots only.
+        #[cfg(feature = "webdav")]
+        pub(crate) mod capacity {
+            pub(crate) use super::super::super::storage_contracts::StorageAdminApi;
+            pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::get_quota_config;
+            pub(crate) use crate::storage::storage_api::ecstore_capacity::{
+                get_total_usable_capacity, get_total_usable_capacity_free,
+            };
+            pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
+                get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline,
+            };
+            pub(crate) use crate::storage::storage_api::ecstore_error::{Error as BucketConfigError, is_err_bucket_not_found};
+        }
     }
 }
 
@@ -170,11 +186,17 @@ pub(crate) mod server {
         }
 
         pub(crate) mod metadata_route {
-            pub(crate) fn with_metadata_route<A>(admin: A, host: Option<s3s::host::MultiDomain>) -> impl s3s::route::S3Route
+            pub(crate) fn with_metadata_route<A>(
+                admin: A,
+                host: Option<s3s::host::MultiDomain>,
+                website_domains: Vec<String>,
+                website_scheme: &'static str,
+                server_ctx: std::sync::Arc<super::ServerContextSlot>,
+            ) -> impl s3s::route::S3Route
             where
                 A: s3s::route::S3Route,
             {
-                crate::app::metadata_route::with_metadata_route(admin, host)
+                crate::app::metadata_route::with_metadata_route(admin, host, website_domains, website_scheme, server_ctx)
             }
         }
 
@@ -184,6 +206,8 @@ pub(crate) mod server {
 
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
+            #[cfg(test)]
+            pub(crate) use s3s::Body;
         }
 
         pub(crate) mod tonic_service {
@@ -240,6 +264,19 @@ pub(crate) mod server {
     pub(crate) mod runtime_sources {
         pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
     }
+}
+
+/// Storage surface of the connect diagnostics module
+/// (`crate::connect::diagnostics`): disk info and admin API primitives used
+/// by the health-check observation path.
+pub(crate) mod connect {
+    pub(crate) mod contract {
+        pub(crate) mod admin {
+            pub(crate) use super::super::super::storage_contracts::{DiskSetSelector, StorageAdminApi};
+        }
+    }
+
+    pub(crate) use crate::storage::storage_api::{DiskInfoOptions, StorageDiskRpcExt};
 }
 
 /// Storage surface of the site-replication service module

@@ -17,12 +17,11 @@ use crate::storage::storage_api::options_consumer::contract::{object::HTTPPrecon
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
-    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
-    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
-    SUFFIX_TAGGING_TIMESTAMP, get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
+    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
     insert_header_map, insert_str,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, starts_with_ignore_ascii_case},
@@ -219,9 +218,17 @@ pub fn del_opts_with_versioning(
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
 
-    opts.delete_prefix = get_header(headers, SUFFIX_FORCE_DELETE)
-        .map(|v| v.as_ref() == "true")
-        .unwrap_or_default();
+    opts.delete_prefix = match rustfs_utils::http::force_delete_header(headers) {
+        Ok(Some(true)) => true,
+        Ok(_) => false,
+        Err(_) => {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                "invalid force-delete header".to_owned(),
+            ));
+        }
+    };
 
     opts.version_id = synthetic_version_id.then(|| Uuid::nil().to_string()).or(vid);
     opts.synthetic_version_id = synthetic_version_id;
@@ -1387,12 +1394,10 @@ mod tests {
         let opts = result.unwrap();
         assert!(!opts.delete_prefix);
 
-        // Test with RUSTFS_FORCE_DELETE header set to other value
+        // A non-boolean force-delete header is rejected rather than ignored.
         insert_header(&mut headers, SUFFIX_FORCE_DELETE, "maybe");
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
-        assert!(result.is_ok());
-        let opts = result.unwrap();
-        assert!(!opts.delete_prefix);
+        assert!(result.is_err());
     }
 
     #[tokio::test]

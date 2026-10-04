@@ -1,0 +1,22 @@
+[package]
+name = "rustfs-connect-symbol-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hex-simd.workspace = true
+object = { workspace = true, features = ["read", "std", "elf"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+# Match pyroscope's pprof-rs frame normalization exactly.
+symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"] }
+
+[dev-dependencies]
+object = { workspace = true, features = ["write", "elf"] }
+
+[lints]
+workspace = true

@@ -87,7 +87,8 @@ pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_st
 pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
-    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus,
+    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogReplicaId,
+    ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState, ScannerPauseBacklogStatus,
     ScannerPauseBacklogThresholds, ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord,
     ScannerRecoveryIntentRequest, ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent,
     get_scanner_usage_recovery_intent, init_data_scanner, init_scanner_with_recovery, register_scanner_pause_backlog_retirement,
@@ -102,8 +103,9 @@ pub use scanner_io::{
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
+    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_bucket_generation,
+    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
+    set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 pub use segment_invalidation::SegmentInvalidationProducerIdentity;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};

@@ -38,6 +38,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - ".config/nextest.toml"
+      - ".config/e2e-distributed-selection.txt"
       - ".github/workflows/e2e-distributed.yml"
       - "crates/audit/**"
       - "crates/common/**"
@@ -200,7 +201,7 @@ jobs:
     name: Alert on scheduled failure
     needs: [distributed]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

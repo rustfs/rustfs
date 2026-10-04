@@ -1113,22 +1113,11 @@ mod tests {
 
     #[test]
     fn list_through_static_namespace_boundary_matrix() {
-        let corpus = [
-            "a",
-            "a/",
-            "a/b",
-            "a/b/child",
-            "a0",
-            "b",
-            "b/leaf",
-            "quote\"&<",
-            "space key",
-            "z",
-            "é",
-            "中/文",
-        ];
+        let corpus: Vec<String> =
+            serde_json::from_str(include_str!("../../../crates/ecstore/tests/fixtures/list_namespace_keys.json"))
+                .expect("shared LIST namespace corpus should decode");
         for count in [0, 1, 3, 4, corpus.len()] {
-            let keys: Vec<String> = corpus[..count].iter().map(|key| (*key).to_string()).collect();
+            let keys = corpus[..count].to_vec();
             for placement in 0..3 {
                 let (local, source): (Vec<_>, Vec<_>) =
                     keys.iter()

@@ -16,12 +16,12 @@ use super::*;
 use crate::storage_api::EcstoreHealResultItem as HealItem;
 use crate::storage_api::scanner_io::BucketInfo;
 use rustfs_common::mrf_channel::{
-    MrfIngressResult, MrfKind, MrfScope, note_mrf_repaired, take_mrf_repaired_events_for, try_send_mrf_intent_typed,
+    MrfScope, note_mrf_repaired, persist_partial_write_intent_with_incarnation, take_mrf_repaired_events_for,
 };
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     mrf_queue::spawn_mrf_consumer,
-    storage::{HealListItem, HealObjectInfo, HealStorageAPI},
+    storage::{HealListItem, HealObjectInfo, HealStorageAPI, HealStorageObjectResult},
 };
 use rustfs_heal_contracts::heal_channel::HealOpts;
 
@@ -219,6 +219,7 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
 struct NoticeStorage {
     calls: std::sync::Mutex<HashMap<String, u32>>,
     retry_started: tokio::sync::Notify,
+    first_started: tokio::sync::Notify,
     bucket_incarnation_id: Uuid,
 }
 
@@ -239,11 +240,25 @@ impl HealStorageAPI for NoticeStorage {
     async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
         Ok(Some(self.bucket_incarnation_id))
     }
+    async fn bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
+        Ok(Some(self.bucket_incarnation_id))
+    }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }
     async fn object_exists(&self, _: &str, _: &str) -> rustfs_heal::Result<bool> {
         Ok(true)
+    }
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> rustfs_heal::Result<HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
     }
     async fn heal_object(
         &self,
@@ -258,6 +273,9 @@ impl HealStorageAPI for NoticeStorage {
             *count += 1;
             *count
         };
+        if call == 1 {
+            self.first_started.notify_one();
+        }
         if call > 1 {
             if call == 2 {
                 self.retry_started.notify_one();
@@ -296,27 +314,106 @@ impl HealStorageAPI for NoticeStorage {
     }
 }
 
+/// Singleton channels need a fresh process. Reuse nextest isolation when its
+/// startup environment already satisfies the fixture; otherwise configure it
+/// before launching the single-test child, including the cargo-test fallback.
+fn run_isolated_mrf_fixture(test_name: &str, environment: &[(&str, &str)]) -> bool {
+    const CHILD: &str = "RUSTFS_MRF_FIXTURE_CHILD";
+    let child = std::env::var(CHILD).ok().as_deref() == Some(test_name);
+    let isolated = std::env::var("NEXTEST_EXECUTION_MODE").ok().as_deref() == Some("process-per-test")
+        && std::env::var("NEXTEST_TEST_NAME").ok().as_deref() == Some(test_name);
+    let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_MRF_ENABLE, rustfs_config::DEFAULT_HEAL_MRF_ENABLE);
+    let configured = environment
+        .iter()
+        .all(|(key, value)| std::env::var(key).ok().as_deref() == Some(*value));
+    if child || (isolated && enabled && configured) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name)
+        .env(rustfs_config::ENV_HEAL_MRF_ENABLE, "true")
+        .envs(environment.iter().copied())
+        .output()
+        .expect("isolated MRF fixture process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_metadata_heal_reaches_budgeted_tail() {
+    // Required metadata repair is independent of probabilistic object sampling.
+    if run_isolated_mrf_fixture(
+        "scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail",
+        &[
+            ("RUSTFS_HEAL_OBJECT_SELECT_PROB", "0"),
+            ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ],
+    ) {
+        return;
+    }
+    let journal_root = tempfile::tempdir().expect("repair-tail MRF journal");
+    let _journal_env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(journal_root.path())
+        .build()
+        .await;
+    let storage = Arc::new(NoticeStorage {
+        bucket_incarnation_id: Uuid::from_u128(1),
+        ..Default::default()
+    });
+    let manager = Arc::new(HealManager::new(
+        storage.clone(),
+        Some(HealConfig {
+            enable_auto_heal: false,
+            mainline_throttle_enable: false,
+            ..Default::default()
+        }),
+    ));
+    manager.start().await.expect("start real heal manager");
+    spawn_mrf_consumer(manager.clone());
+    let saved = super::checkpoint_fixture::scan_budgeted_metadata_repair_tail().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if storage
+                .calls
+                .lock()
+                .expect("repair calls")
+                .get("static/zz-failed")
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                break;
+            }
+            storage.first_started.notified().await;
+        }
+    })
+    .await
+    .expect("the real MRF consumer must dispatch the discovered tail repair");
+    assert!(
+        saved
+            .info
+            .pending_heals
+            .iter()
+            .any(|entry| { entry.bucket == "bucket" && entry.object.as_deref() == Some("static/zz-failed") }),
+        "the dispatched repair must already be recorded in the saved scanner ledger"
+    );
+    manager.stop().await.expect("stop repair-tail manager");
+}
+
 #[tokio::test]
 #[serial]
 async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
-    const CHILD: &str = "RUSTFS_MRF_OWNERSHIP_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("RUSTFS_HEAL_MRF_ENABLE", "true")
-            .output()
-            .expect("isolated ingress test process");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed;"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if run_isolated_mrf_fixture(
+        "scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending",
+        &[],
+    ) {
         return;
     }
     // The production ingress channel is a process singleton; isolation keeps
@@ -365,30 +462,41 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
             1,
             1,
         ));
-        let scope = Some(MrfScope {
+        let scope = MrfScope {
             pool_index: 0,
             set_index: 0,
-        });
-        assert_eq!(
-            try_send_mrf_intent_typed(MrfKind::PartialWrite, &bucket, object, Some(version), scope),
-            MrfIngressResult::Enqueued
-        );
-        // Re-admission establishes that the first terminal callback released
-        // its ingress lease. Statistics alone precede notice publication.
+        };
+        let before = manager.get_statistics().await;
+        let completed_before = before.successful_tasks + before.failed_tasks;
+        persist_partial_write_intent_with_incarnation(&bucket, object, Some(version), scope, Some(storage.bucket_incarnation_id))
+            .await
+            .expect("persist the partial write with its actual source incarnation");
+        // The scheduler publishes terminal repair notices before updating these
+        // counters. Earlier objects can only enter their blocked retry here.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match try_send_mrf_intent_typed(MrfKind::PartialWrite, &bucket, object, Some(version), scope) {
-                    MrfIngressResult::Enqueued => break,
-                    MrfIngressResult::Coalesced => tokio::task::yield_now().await,
-                    other => panic!("unexpected retry ingress result: {other:?}"),
+                let called = storage
+                    .calls
+                    .lock()
+                    .expect("fixture calls")
+                    .get(*object)
+                    .copied()
+                    .unwrap_or(0);
+                let stats = manager.get_statistics().await;
+                if called > 0 && stats.successful_tasks + stats.failed_tasks > completed_before {
+                    break;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("production terminal releases its ingress lease");
+        .expect("production terminal publishes its repair notices and completion");
+        persist_partial_write_intent_with_incarnation(&bucket, object, Some(version), scope, Some(storage.bucket_incarnation_id))
+            .await
+            .expect("persist another generation for the same source incarnation");
         tokio::time::timeout(Duration::from_secs(5), storage.retry_started.notified())
             .await
-            .expect("the real consumer starts the second generation");
+            .expect("the real consumer starts the second object call");
         assert!(
             take_mrf_repaired_events_for(&bucket).is_empty(),
             "{object}: task completion must not emit an unproved repair"
@@ -396,14 +504,14 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
         if *object == "unknown" {
             assert_eq!(
                 manager.get_statistics().await.total_objects_healed,
-                1,
-                "legacy healed count is not repair proof"
+                0,
+                "unproved durable repairs must not increment the healed count"
             );
         }
         assert_eq!(
-            try_send_mrf_intent_typed(MrfKind::PartialWrite, &bucket, object, Some(version), scope),
-            MrfIngressResult::Coalesced,
-            "the in-flight retry retains its new ingress lease"
+            storage.calls.lock().expect("fixture calls").get(*object).copied(),
+            Some(2),
+            "the second object call remains blocked without a duplicate execution"
         );
         note_mrf_repaired(&bucket, object, Some(*version.as_bytes()));
         let syncs_before_retry = scanner.pending_heal_sync_count;

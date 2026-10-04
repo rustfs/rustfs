@@ -4,8 +4,8 @@
 # ci.yml's migration gate selects tests BY NAME SUBSTRING. A rename that drops
 # a test out of the filter silently thins the gate — potentially to zero —
 # without any CI signal (this is how the layered gate died when #878 closed).
-# This script owns the filter expression so the count check and the test run
-# cannot drift, and fails fast when the number of selected tests drops below
+# The shared filter keeps the count check, evidence check, and test run aligned.
+# Fail fast when the number of selected tests drops below
 # the committed floor in .config/migration-gate-floor.txt.
 #
 # NAMING CONVENTION DEPENDENCY: migration-gate tests are matched by these
@@ -28,24 +28,34 @@
 #   scripts/check_migration_gate_count.sh          # count check + run the gate
 #   scripts/check_migration_gate_count.sh check    # count check only
 #   scripts/check_migration_gate_count.sh run      # run the gate only
+#   scripts/check_migration_gate_count.sh evidence CORE_LISTING JUNIT
+#       Verify the same selection already passed in the workspace test run.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Single source of truth for the migration-gate target and filter. The
+# Single source of truth for the migration-gate target and shared filter. The
 # test-util feature activates migration-critical tests that otherwise leave
 # their shared fixtures compiled but unused. ci.yml must invoke this script
 # instead of inlining either selection.
 MIGRATION_GATE_TARGET_ARGS=(-p rustfs-ecstore --lib --features test-util)
-MIGRATION_GATE_FILTER='test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
+MIGRATION_GATE_FILTER="$(python3 scripts/check_migration_gate_evidence.py --filter)"
 FLOOR_FILE=".config/migration-gate-floor.txt"
 
 mode="${1:-all}"
 case "$mode" in
     all | check | run) ;;
+    evidence)
+        if [[ "$#" -ne 3 ]]; then
+            echo "usage: $0 evidence CORE_LISTING JUNIT" >&2
+            exit 2
+        fi
+        python3 scripts/check_migration_gate_evidence.py "$2" "$3" "$FLOOR_FILE"
+        exit
+        ;;
     *)
-        echo "usage: $0 [all|check|run]" >&2
+        echo "usage: $0 [all|check|run|evidence CORE_LISTING JUNIT]" >&2
         exit 2
         ;;
 esac

@@ -2230,6 +2230,7 @@ where
                 cycle = cycle_info.current,
                 required_cycle,
                 state = "cache_cycle_ahead",
+                partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
@@ -2257,7 +2258,7 @@ where
                 emit_scan_cycle_deferred(cycle_start.elapsed());
                 ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
-                ScannerCycleOutcome::Failed
+                ScannerCycleOutcome::StatePersistenceFailed
             };
         }
         Some(ScannerCyclePreCommitOutcome::Deferred(reason)) => {
@@ -2336,11 +2337,20 @@ where
             emit_scan_cycle_deferred(cycle_start.elapsed());
             ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
         } else {
-            ScannerCycleOutcome::Failed
+            ScannerCycleOutcome::StatePersistenceFailed
         };
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
+    let partial_cause = if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        ) {
+        "activity_unverified_observation"
+    } else {
+        "incomplete_coverage"
+    };
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2371,7 +2381,7 @@ where
     };
     let pending_maintenance_work = scanner_pending_maintenance_work || unresolved_heal_work || remote_dirty_usage_pending;
     match completion_outcome {
-        ScannerCycleOutcome::Failed => {
+        ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -2405,6 +2415,7 @@ where
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     cycle = cycle_info.current,
                     state = "incomplete",
+                    partial_cause,
                     "Scanner cycle ended without a complete usage snapshot"
                 );
             }
@@ -2430,7 +2441,7 @@ where
                 emit_scan_cycle_deferred(cycle_start.elapsed());
                 ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
-                ScannerCycleOutcome::Failed
+                ScannerCycleOutcome::StatePersistenceFailed
             };
         }
         ScannerCycleOutcome::Deferred(reason) => {
@@ -2483,7 +2494,7 @@ where
                 return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            return ScannerCycleOutcome::Failed;
+            return ScannerCycleOutcome::StatePersistenceFailed;
         }
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => {}
     }
@@ -2531,7 +2542,7 @@ where
         }
         cycle_metrics_guard.finish(cycle_info.clone()).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        return ScannerCycleOutcome::Failed;
+        return ScannerCycleOutcome::StatePersistenceFailed;
     }
     cycle_budget.mark_cycle_state_persisted();
 
@@ -3045,6 +3056,12 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, initial_pause_backlog_attempt, initial_outcome).await;
+        if initial_outcome == ScannerCycleOutcome::StatePersistenceFailed {
+            global_metrics().set_cycle(None).await;
+            let error = "scanner cycle state persistence failed; retrying from durable state".to_string();
+            finish_scanner_leader_iteration(false, "state_persist_failed", error.clone()).await;
+            return Err(ScannerError::Other(error));
+        }
         if usage_bootstrap_rebuild.record_cycle(initial_outcome) {
             clean_idle_backoff.reset();
         }
@@ -3362,6 +3379,12 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, pause_backlog_attempt, outcome).await;
+        if outcome == ScannerCycleOutcome::StatePersistenceFailed {
+            global_metrics().set_cycle(None).await;
+            let error = "scanner cycle state persistence failed; retrying from durable state".to_string();
+            finish_scanner_leader_iteration(false, "state_persist_failed", error.clone()).await;
+            return Err(ScannerError::Other(error));
+        }
         if usage_bootstrap_rebuild.record_cycle(outcome) {
             clean_idle_backoff.reset();
         }
@@ -3514,8 +3537,26 @@ where
     // Pending namespace commits invalidate this publication attempt, but only
     // storage movement creates durable, rate-limited catch-up debt.
     if storeapi.scanner_data_movement_pause_status().await.paused {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "data_movement",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::DataMovement)
     } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "pending_namespace_commit",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     }
 }
@@ -3531,7 +3572,24 @@ fn scanner_post_lease_activity_defer_reason(
         {
             None
         }
-        Ok(_) | Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        observed => {
+            let blocker = match &observed {
+                Err(_) => "probe_failed",
+                Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
+                Ok(_) if expected_digest.is_none() => "baseline_missing",
+                Ok(_) => "activity_changed",
+            };
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                stage = "post_lease_activity",
+                blocker,
+                "Scanner usage publication deferred"
+            );
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
     }
 }
 
@@ -3788,6 +3846,7 @@ mod usage_store;
 
 use activity::*;
 use backlog::*;
+pub use backlog::{ScannerPauseBacklogReplicaId, ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState};
 use cycle_state::*;
 use leadership::*;
 pub(crate) use usage_store::RootPublicationProof;

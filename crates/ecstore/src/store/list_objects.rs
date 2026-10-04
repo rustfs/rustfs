@@ -33,8 +33,7 @@ use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
 use crate::error::{
-    Error, Result, StorageError, is_all_disk_not_found, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found,
-    to_object_err,
+    Error, Result, StorageError, is_all_disk_not_found, is_all_not_found, is_all_volume_not_found, to_object_err,
 };
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
@@ -355,6 +354,15 @@ fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool>
     state
 }
 
+fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
+    !options.versioned
+        && (options.include_directories
+            || options
+                .separator
+                .as_deref()
+                .is_some_and(|separator| !separator.is_empty() && separator != SLASH_SEPARATOR))
+}
+
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
     if options.recursive || options.incl_deleted || options.versioned {
         return false;
@@ -380,6 +388,24 @@ fn should_purge_empty_directory_listing(
 ) -> bool {
     !prefix.is_empty()
         && prefix.ends_with(SLASH_SEPARATOR)
+        && marker.is_none()
+        && max_keys > 0
+        && !incl_deleted
+        && !result.is_truncated
+        && result.objects.is_empty()
+        && result.prefixes.is_empty()
+}
+
+fn should_purge_empty_recursive_bucket_listing(
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max_keys: i32,
+    incl_deleted: bool,
+    result: &ListObjectsInfo,
+) -> bool {
+    prefix.is_empty()
+        && delimiter.is_none()
         && marker.is_none()
         && max_keys > 0
         && !incl_deleted
@@ -2423,6 +2449,12 @@ where
             let suffix = key.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    if collect_stats {
+                        stats.skipped_keys += 1;
+                    }
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     if collect_stats {
                         stats.common_prefixes += 1;
@@ -2525,6 +2557,10 @@ fn list_objects_from_metadata_snapshot_candidates(
             let suffix = object.name.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    stats.skipped_keys += 1;
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     stats.common_prefixes += 1;
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
@@ -4007,108 +4043,91 @@ impl ECStore {
         // key sorting between `<marker>` and `<marker>[` is silently skipped on
         // the continuation page (backlog#1047).
         opts.parse_marker();
-        if let Some(mode) = list_objects_index_mode_from_env()
-            && let Some(result) = self
-                .clone()
+        let key_only_result = if let Some(mode) = list_objects_index_mode_from_env() {
+            self.clone()
                 .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
                 .await?
-        {
-            if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
-                && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
-                    .await
-                    .unwrap_or(false)
-            {
-                self.purge_orphan_dir_object(bucket, prefix).await;
-            }
-            return Ok(result);
-        }
+        } else {
+            None
+        };
 
-        // Optimization: use get for single object lookup with exact prefix
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
+        let result = if let Some(result) = key_only_result {
+            result
+        } else {
+            let mut list_result = self
+                .clone()
+                .list_path(&opts)
                 .await
+                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                    err: Some(to_filemeta_err(err)),
+                    ..Default::default()
+                });
+            let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+
+            // err=None means gather_results filled its limit → disk has more data
+            let disk_has_more = list_result.err.is_none();
+
+            if let Some(err) = list_result.err.take()
+                && err != rustfs_filemeta::Error::Unexpected
             {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Err(err) if is_err_bucket_not_found(&err) => {
-                    return Err(err);
-                }
-                _ => {}
-            };
+                return Err(to_object_err(err.into(), vec![bucket, prefix]));
+            }
+
+            if let Some(result) = list_result.entries.as_mut() {
+                result.forward_past(opts.marker.clone());
+            }
+
+            // Last RAW scanned key, captured before folding, so `list_objects_paginate`
+            // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
+            let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
+            let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+                &list_result.entries.unwrap_or_default(),
+                bucket,
+                prefix,
+                delimiter.clone(),
+            )
+            .await;
+
+            let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+                get_objects,
+                &delimiter,
+                max_keys,
+                disk_has_more,
+                next_cache_id.as_deref(),
+                false,
+                last_scanned_key.as_deref(),
+            );
+            let _ = next_version_idmarker;
+
+            ListObjectsInfo {
+                is_truncated,
+                next_marker,
+                objects,
+                prefixes,
+            }
         };
 
-        let mut list_result = self
-            .clone()
-            .list_path(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        // err=None means gather_results filled its limit → disk has more data
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker.clone());
-        }
-
-        // contextCanceled
-
-        // Last RAW scanned key, captured before folding, so `list_objects_paginate`
-        // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
+        let purge_exact_prefix =
+            should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result);
+        let purge_empty_bucket = should_purge_empty_recursive_bucket_listing(
             prefix,
-            delimiter.clone(),
-        )
-        .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
+            delimiter.as_deref(),
+            opts.marker.as_deref(),
             max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
+            incl_deleted,
+            &result,
         );
-        let _ = next_version_idmarker;
-
-        let result = ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        };
-        if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
+        if (purge_exact_prefix || purge_empty_bucket)
             && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
                 .await
                 .unwrap_or(false)
         {
-            self.purge_orphan_dir_object(bucket, prefix).await;
+            if purge_exact_prefix {
+                self.purge_orphan_dir_object(bucket, prefix).await;
+            } else {
+                self.purge_orphan_dir_objects_in_bucket(bucket).await;
+            }
         }
         Ok(result)
     }
@@ -4962,6 +4981,8 @@ async fn gather_results(
     let gather_started = list_metrics_enabled.then(std::time::Instant::now);
     let mut scanned_entries = 0usize;
     let mut candidate_entries = 0usize;
+    let mut previous_prefix = String::new();
+    let folds_prefixes = list_path_folds_common_prefixes(&opts);
 
     while let Some(mut entry) = recv.recv().await {
         scanned_entries += 1;
@@ -4999,6 +5020,34 @@ async fn gather_results(
 
         if !opts.incl_deleted && is_latest_delete_marker {
             continue;
+        }
+
+        // Version LIST projections omit cleanup-only free versions. They must
+        // not consume the lookahead budget before a later visible version.
+        // Cleanup walks consume the raw set stream without this collector.
+        if opts.versioned
+            && is_object
+            && entry
+                .xl_meta()
+                .is_ok_and(|meta| !meta.versions.is_empty() && meta.versions.iter().all(|version| version.header.free_version()))
+        {
+            continue;
+        }
+
+        if folds_prefixes
+            && let Some(separator) = opts.separator.as_deref().filter(|separator| !separator.is_empty())
+            && let Some(offset) = entry.name[opts.prefix.len()..].find(separator)
+        {
+            let common_prefix = &entry.name[..opts.prefix.len() + offset + separator.len()];
+            if common_prefix == previous_prefix
+                || opts.marker.as_deref().is_some_and(|marker| {
+                    (!opts.include_marker && common_prefix <= marker) || (opts.include_marker && common_prefix < marker)
+                })
+            {
+                continue;
+            }
+            previous_prefix.clear();
+            previous_prefix.push_str(common_prefix);
         }
 
         // TODO(backlog): integrate lifecycle evaluation during object listing
@@ -5533,31 +5582,6 @@ impl Sets {
         // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
-
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Err(err) if is_err_bucket_not_found(&err) => {
-                    return Err(err);
-                }
-                _ => {}
-            };
-        }
 
         let mut list_result = self
             .list_path(&opts)
@@ -6448,33 +6472,6 @@ impl SetDisks {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
-                }
-            };
-        }
-
         let mut list_result = self
             .list_path_result(&opts)
             .await
@@ -7075,7 +7072,9 @@ impl SetDisks {
         );
 
         let limit = {
-            if opts.limit > 0 && opts.stop_disk_at_limit {
+            // A raw scan budget can be consumed entirely by keys folding into
+            // one common prefix. Let the logical collector stop these walks.
+            if opts.limit > 0 && opts.stop_disk_at_limit && !list_path_folds_common_prefixes(&opts) {
                 opts.limit + 4 + (opts.limit / 16)
             } else {
                 0
@@ -7299,6 +7298,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 }
 
 // list_path_raw
+
+#[cfg(test)]
+mod differential_tests;
 
 #[cfg(test)]
 mod test {
@@ -7976,6 +7978,117 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::LimitReached);
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_counts_common_prefixes_before_page_limit() {
+        for separator in ["/", "-"] {
+            for extra_object in [false, true] {
+                let prefix_name = format!("a{separator}");
+                let first = if separator == "/" {
+                    prefix_name.clone()
+                } else {
+                    format!("{prefix_name}first")
+                };
+                let mut input = vec![test_object_meta_entry(&first)];
+                if separator == "/" {
+                    input.push(test_dir_meta_entry(&prefix_name));
+                } else {
+                    input.push(test_object_meta_entry(&format!("{prefix_name}second")));
+                }
+                input.push(test_object_meta_entry("b"));
+                if extra_object {
+                    input.push(test_object_meta_entry("c"));
+                }
+                let (entry_tx, entry_rx) = mpsc::channel(input.len());
+                let (result_tx, mut result_rx) = mpsc::channel(1);
+                for entry in input {
+                    entry_tx.send(entry).await.expect("delimiter candidates should queue");
+                }
+                drop(entry_tx);
+                let state = gather_results(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: "bucket".to_owned(),
+                        separator: Some(separator.to_owned()),
+                        recursive: separator != "/",
+                        include_directories: separator == "/",
+                        limit: 3,
+                        ..Default::default()
+                    },
+                    entry_rx,
+                    result_tx,
+                )
+                .await
+                .expect("delimiter collection should succeed");
+                let result = result_rx.recv().await.expect("delimiter page should arrive");
+                let mut expected = vec![first, "b".to_owned()];
+                if extra_object {
+                    expected.push("c".to_owned());
+                }
+                assert_eq!(
+                    result
+                        .entries
+                        .expect("delimiter entries should exist")
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "delimiter={separator}, extra={extra_object}"
+                );
+                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
+                assert_eq!(
+                    state,
+                    if extra_object {
+                        GatherResultsState::LimitReached
+                    } else {
+                        GatherResultsState::InputClosed
+                    }
+                );
+            }
+        }
+        for include_marker in [false, true] {
+            let (entry_tx, entry_rx) = mpsc::channel(2);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            for name in ["a/child", "b"] {
+                entry_tx
+                    .send(test_object_meta_entry(name))
+                    .await
+                    .expect("marker candidates should queue");
+            }
+            drop(entry_tx);
+            gather_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    separator: Some("/".to_owned()),
+                    recursive: true,
+                    include_directories: true,
+                    marker: Some("a/".to_owned()),
+                    include_marker,
+                    limit: 3,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            )
+            .await
+            .expect("logical marker collection should succeed");
+            let entries = result_rx
+                .recv()
+                .await
+                .expect("logical marker page should arrive")
+                .entries
+                .expect("logical marker entries should exist");
+            let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
+            let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
+            assert_eq!(
+                names,
+                if include_marker { vec!["a/", "b"] } else { vec!["b"] },
+                "a folded prefix equal to the marker must follow include_marker={include_marker}"
+            );
+        }
     }
 
     #[test]
@@ -9029,6 +9142,29 @@ mod test {
         assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
         assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
         assert!(!result.info.is_truncated);
+
+        let resumed = list_objects_from_metadata_snapshot_candidates(
+            "bucket",
+            "photos/2026/",
+            Some("photos/2026/nested/"),
+            &Some("/".to_string()),
+            1,
+            &objects,
+        );
+        assert!(
+            resumed.info.prefixes.is_empty(),
+            "metadata-fast cursors must not replay an emitted prefix"
+        );
+        assert_eq!(
+            resumed
+                .info
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["photos/2026/z.jpg"]
+        );
+        assert!(!resumed.info.is_truncated);
     }
 
     #[test]
@@ -9586,6 +9722,38 @@ mod test {
         assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
     }
 
+    #[test]
+    fn recursive_bucket_orphan_purge_requires_an_empty_complete_root_scan() {
+        let empty = ListObjectsInfo::default();
+        assert!(super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing(
+            "ghost/", None, None, 1, false, &empty
+        ));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", Some("/"), None, 1, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing(
+            "",
+            None,
+            Some("marker"),
+            1,
+            false,
+            &empty
+        ));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 0, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, true, &empty));
+
+        let live = ListObjectsInfo {
+            objects: vec![ObjectInfo::default()],
+            ..Default::default()
+        };
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &live));
+
+        let incomplete = ListObjectsInfo {
+            is_truncated: true,
+            ..Default::default()
+        };
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &incomplete));
+    }
+
     #[tokio::test]
     async fn empty_recursive_listing_purges_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
@@ -9638,6 +9806,154 @@ mod test {
     }
 
     #[tokio::test]
+    async fn empty_recursive_bucket_listing_purges_orphan_directory_prefixes() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "recursive-bucket-orphan-purge";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+
+        for dir in &dirs {
+            tokio::fs::create_dir_all(dir.path().join(bucket).join("ghost").join("nested").join("leaf"))
+                .await
+                .expect("metadata-less orphan directory tree should be created");
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive bucket listing should succeed");
+
+        assert!(result.objects.is_empty(), "orphan directories are not S3 objects");
+        assert!(result.prefixes.is_empty(), "a delimiter-less listing has no CommonPrefixes");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("ghost").exists(),
+                "an empty recursive bucket scan should reclaim its metadata-less orphan prefix"
+            );
+        }
+
+        let versioned_bucket = "recursive-bucket-versioned-orphan";
+        store
+            .make_bucket(versioned_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("versioned test bucket should be created");
+        store
+            .update_bucket_metadata_config(
+                versioned_bucket,
+                crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("bucket versioning should be enabled");
+        for dir in &dirs {
+            tokio::fs::create_dir_all(dir.path().join(versioned_bucket).join("ghost").join("nested").join("leaf"))
+                .await
+                .expect("versioned bucket orphan tree should be created");
+        }
+
+        store
+            .clone()
+            .list_objects_generic(versioned_bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive versioned bucket listing should succeed");
+        for dir in &dirs {
+            assert!(
+                dir.path().join(versioned_bucket).join("ghost").exists(),
+                "root recursive LIST must not purge orphan residue in a versioned bucket"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_objects_exact_prefix_paginates_across_storage_layers() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "exact-prefix-pagination-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("exact-prefix pagination bucket should be created");
+        for name in ["a", "ab"] {
+            store.pools[0]
+                .put_object(
+                    bucket,
+                    name,
+                    &mut PutObjReader::from_vec(b"pagination fixture".to_vec()),
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pagination fixture object should be written");
+            let info = store
+                .get_object_info(
+                    bucket,
+                    name,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact-prefix fixture must be readable by object lookup");
+            assert!(!info.delete_marker && info.version_purge_status.is_empty());
+        }
+
+        for layer in 0..3 {
+            for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
+                let mut marker = None;
+                for page in 0..expected.len().max(1) {
+                    let result = match layer {
+                        0 => {
+                            store
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                        1 => {
+                            store.pools[0]
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                        _ => {
+                            store.pools[0].disk_set[0]
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                    }
+                    .expect("exact-prefix page should list successfully");
+                    let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
+                    let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
+                    assert_eq!(names, expected_page, "layer {layer}, prefix {prefix}, page {page}");
+                    assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
+                    let has_more = page + 1 < expected.len();
+                    assert_eq!(result.is_truncated, has_more, "layer {layer}, prefix {prefix}, page {page}");
+                    assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
+                    if has_more {
+                        assert_ne!(result.next_marker, marker, "pagination marker must advance");
+                    }
+                    marker = result.next_marker;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn list_objects_hides_pending_version_purge_across_walk_and_exact_prefix() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -9685,7 +10001,7 @@ mod test {
             .expect("exact-prefix listing should succeed");
         assert!(
             exact.objects.is_empty(),
-            "exact-prefix max_keys=1 shortcut should hide pending version-purge entries"
+            "exact-prefix max_keys=1 listing should hide pending version-purge entries"
         );
         assert!(exact.prefixes.is_empty());
     }
@@ -9961,6 +10277,23 @@ mod test {
         assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
         assert!(result.is_truncated);
         assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
+
+        let resumed = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            result.next_marker.as_deref(),
+            &Some("/".to_string()),
+            1,
+            &candidates,
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
+        )
+        .await
+        .expect("verified prefix continuation should succeed");
+        assert!(resumed.prefixes.is_empty(), "verified cursors must not replay an emitted prefix");
+        assert_eq!(
+            resumed.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            ["photos/2026/d.jpg"]
+        );
+        assert!(!resumed.is_truncated);
     }
 
     #[tokio::test]

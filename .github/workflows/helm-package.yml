@@ -130,6 +130,21 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          yq_version="4.54.1"
+          yq_sha256="8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f"
+          tools_dir="$RUNNER_TEMP/rustfs-helm-tools"
+          mkdir -p "$tools_dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/mikefarah/yq/releases/download/v${yq_version}/yq_linux_amd64" \
+            --output "$tools_dir/yq"
+          printf '%s  %s\n' "$yq_sha256" "$tools_dir/yq" | sha256sum --check -
+          chmod +x "$tools_dir/yq"
+          echo "$tools_dir" >> "$GITHUB_PATH"
+          "$tools_dir/yq" --version
+
       - name: Test Helm Chart Templates
         run: ./scripts/test_helm_templates.sh
 
@@ -145,7 +160,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: helm-package
-          path: helm/rustfs/*.tgz
+          path: |
+            helm/rustfs/*.tgz
+            helm/rustfs/README.md
           retention-days: 1
 
   publish-helm-package:
