@@ -19699,6 +19699,282 @@ mod put_object_tmp_cleanup_tests {
         .expect("three disks must publish metadata while the fourth rename remains paused");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn seeded_put_completion_pressure_drains_every_real_tail() {
+        use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+        use crate::disk::os;
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use tokio::time::{Instant, timeout_at};
+
+        const SEED: u64 = 0x2248_0009;
+        let mut rng = StdRng::seed_from_u64(SEED);
+        for (round, (completion, cancel)) in [
+            (WriteCompletion::Quorum, false),
+            (WriteCompletion::Quorum, true),
+            (WriteCompletion::TailDrained, false),
+            (WriteCompletion::TailDrained, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "seeded-put-pressure";
+            make_completion_test_bucket(&disks, bucket).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let objects: Vec<_> = (0..3).map(|slot| format!("pressure-{round}-{slot}")).collect();
+            let mut bodies = Vec::with_capacity(3);
+            let mut barriers = Vec::with_capacity(3);
+            let mut trackers = Vec::with_capacity(3);
+            let mut puts = Vec::with_capacity(3);
+            let mut paused_disks = Vec::with_capacity(3);
+            let quorum_barrier = (completion == WriteCompletion::Quorum && cancel)
+                .then(|| PutObjectCommitBarrier::install(bucket, &objects[0], PutObjectCommitPause::AfterRenameQuorum));
+            let handoff_barrier = (completion == WriteCompletion::Quorum && cancel)
+                .then(|| PutObjectCommitBarrier::install(bucket, &objects[0], PutObjectCommitPause::AfterRenameHandoff));
+            for (slot, object) in objects.iter().enumerate() {
+                let mut body = vec![0; TEST_OBJECT_SIZE + 17 + 16 * slot];
+                rng.fill_bytes(&mut body);
+                let disk = usize::try_from(rng.next_u32() % 4).expect("four-disk schedule slot");
+                paused_disks.push(disk);
+                trackers.push(rename_fanout_barrier::observe_tasks(object));
+                barriers.push(Some(rename_fanout_barrier::arm(object, disk, rename_fanout_barrier::PHASE_RENAME)));
+                bodies.push(body.clone());
+                let writer = Arc::clone(&set);
+                let object = object.clone();
+                let write_completion = if slot == 0 { completion } else { WriteCompletion::TailDrained };
+                puts.push(tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(body);
+                    writer
+                        .put_object(
+                            bucket,
+                            &object,
+                            &mut reader,
+                            &ObjectOptions {
+                                write_completion,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }));
+            }
+            for (slot, object) in objects.iter().enumerate() {
+                barriers[slot]
+                    .as_ref()
+                    .expect("armed real-disk checkpoint")
+                    .wait_until_paused_before(deadline)
+                    .await;
+                timeout_at(deadline, wait_for_paused_tail_metadata_quorum(&disks, bucket, object))
+                    .await
+                    .expect("target and both pressure writes must publish three real metadata records");
+                assert!(trackers[slot].running() >= 1, "round {round} key {slot}: parked rename remains owned");
+            }
+            assert!(
+                set.instance_ctx().namespace_commits_pending(),
+                "parked real mutations must remain pending"
+            );
+            assert!(
+                !puts[1].is_finished() && !puts[2].is_finished(),
+                "pressure full-tail callers remain parked"
+            );
+            let mut target = Some(puts.remove(0));
+            let mut written = None;
+            if let Some(barrier) = quorum_barrier.as_ref() {
+                timeout_at(deadline, barrier.wait_until_paused())
+                    .await
+                    .expect("cancelled Quorum write reaches its actual quorum boundary");
+            }
+            if cancel {
+                let caller = target.take().expect("target ACK waiter");
+                assert!(!caller.is_finished(), "cancellation must reach an owned, still-pending ACK waiter");
+                caller.abort();
+                assert!(caller.await.expect_err("cancel target ACK waiter").is_cancelled());
+            } else if completion == WriteCompletion::Quorum {
+                written = Some(
+                    timeout_at(deadline, target.take().expect("Quorum ACK waiter"))
+                        .await
+                        .expect("Quorum ACK must precede the parked tail")
+                        .expect("Quorum caller joins")
+                        .expect("three real disk publications acknowledge the target"),
+                );
+            } else {
+                assert!(
+                    !target.as_ref().expect("full-tail ACK waiter").is_finished(),
+                    "full-tail ACK waits past metadata quorum"
+                );
+            }
+            if let Some(barrier) = quorum_barrier {
+                barrier.release();
+                drop(barrier);
+                timeout_at(
+                    deadline,
+                    handoff_barrier
+                        .as_ref()
+                        .expect("Quorum handoff checkpoint")
+                        .wait_until_paused(),
+                )
+                .await
+                .expect("cancelled Quorum continuation installs its tail owner");
+            }
+            let mut probe = Box::pin(set.acquire_write_lock_diag("seeded_pressure_owner_probe", bucket, &objects[0]));
+            assert!(
+                futures::poll!(probe.as_mut()).is_pending(),
+                "round {round}: target owner survives ACK or cancellation"
+            );
+            assert!(trackers[0].running() >= 1, "target tail survives its caller");
+            if let Some(barrier) = handoff_barrier {
+                barrier.release();
+                drop(barrier);
+            }
+
+            // One pressure rename races the target; the other stays parked to
+            // distinguish per-object full-tail completion from global quiescence.
+            let first_pressure = 1 + usize::try_from(rng.next_u32() % 2).expect("two pressure keys");
+            let held_pressure = 3 - first_pressure;
+            let release_order = if rng.next_u32() & 1 == 0 {
+                [first_pressure, 0]
+            } else {
+                [0, first_pressure]
+            };
+            for slot in release_order {
+                let barrier = barriers[slot].take().expect("release reached checkpoint once");
+                barrier.release();
+                drop(barrier);
+                tokio::task::yield_now().await;
+            }
+            if let Some(caller) = target.take() {
+                written = Some(
+                    timeout_at(deadline, caller)
+                        .await
+                        .expect("full-tail ACK follows target rename drain")
+                        .expect("full-tail caller joins")
+                        .expect("target full-tail write commits"),
+                );
+                assert_eq!(trackers[0].running(), 0, "full-tail ACK follows every target rename task");
+            }
+            drop(
+                timeout_at(deadline, probe)
+                    .await
+                    .expect("target tail releases its actual namespace owner")
+                    .expect("next target writer acquires the namespace"),
+            );
+            assert_eq!(trackers[0].running(), 0, "target rename owner has drained");
+            assert!(
+                barriers[held_pressure]
+                    .as_ref()
+                    .expect("held pressure checkpoint")
+                    .is_paused()
+                    && trackers[held_pressure].running() >= 1,
+                "target must hand off while the other real pressure mutation remains parked"
+            );
+            {
+                let mut read = timeout_at(
+                    deadline,
+                    set.get_object_reader(bucket, &objects[0], None, HeaderMap::new(), &ObjectOptions::default()),
+                )
+                .await
+                .expect("target reader acquires within the round deadline")
+                .expect("ACKed or cancelled-owned target remains readable");
+                let mut actual = Vec::new();
+                timeout_at(deadline, read.stream.read_to_end(&mut actual))
+                    .await
+                    .expect("target body drains before the round deadline")
+                    .expect("target body streams");
+                assert_eq!(actual, bodies[0], "round {round}: exact target bytes survive the handoff");
+            }
+            if let Some(written) = written {
+                let etag = written.etag.expect("successful target ACK must supply the CAS ETag");
+                assert!(!etag.is_empty(), "same-key CAS must carry an actual If-Match condition");
+                let mut successor = vec![0; TEST_OBJECT_SIZE + 65];
+                rng.fill_bytes(&mut successor);
+                let mut reader = PutObjReader::from_vec(successor.clone());
+                timeout_at(
+                    deadline,
+                    set.put_object(
+                        bucket,
+                        &objects[0],
+                        &mut reader,
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            http_preconditions: Some(HTTPPreconditions {
+                                if_match: Some(etag),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("same-key CAS acquires the handed-off owner under pressure")
+                .expect("same-key CAS accepts the exact target ETag");
+                bodies[0] = successor;
+            }
+            let barrier = barriers[held_pressure].take().expect("final pressure checkpoint");
+            barrier.release();
+            drop(barrier);
+            for caller in puts {
+                timeout_at(deadline, caller)
+                    .await
+                    .expect("pressure writer drains within the finite round")
+                    .expect("pressure caller joins")
+                    .expect("pressure full-tail write commits");
+            }
+            for (slot, object) in objects.iter().enumerate() {
+                let mut read = timeout_at(
+                    deadline,
+                    set.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+                )
+                .await
+                .expect("every reader acquires within the finite round")
+                .expect("every pressure and target object is readable");
+                let mut actual = Vec::new();
+                timeout_at(deadline, read.stream.read_to_end(&mut actual))
+                    .await
+                    .expect("complete body drains within the round")
+                    .expect("complete body streams");
+                assert_eq!(actual, bodies[slot], "round {round} key {slot}: exact production GET oracle");
+                for disk in &disks {
+                    let fi = timeout_at(deadline, disk.read_version("", bucket, object, "", &ReadOptions::default()))
+                        .await
+                        .expect("physical metadata read remains bounded")
+                        .expect("every healthy disk publishes the object");
+                    assert!(!fi.inline_data(), "pressure must write actual external shards");
+                    assert_eq!(fi.parts[0].size, bodies[slot].len());
+                    let root = disk.path();
+                    let path = root.join(bucket).join(object);
+                    let part = path
+                        .join(fi.data_dir.expect("non-inline data directory").to_string())
+                        .join("part.1");
+                    assert!(
+                        timeout_at(deadline, tokio::fs::metadata(part))
+                            .await
+                            .expect("external shard inspection remains bounded")
+                            .expect("actual external shard file")
+                            .len()
+                            > 32
+                    );
+                    drop(
+                        timeout_at(deadline, os::acquire_rename_data_mutation_lease(&root, bucket, &path))
+                            .await
+                            .expect("physical mutation owner must release every real disk and key"),
+                    );
+                }
+                assert_eq!(trackers[slot].running(), 0, "round {round} key {slot}: no fan-out task remains");
+            }
+            timeout_at(deadline, async {
+                while set.instance_ctx().namespace_commits_pending() || !non_trash_tmp_entries(&dirs).await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all real mutation owners and staging entries must drain");
+            assert!(!set.instance_ctx().namespace_commits_pending());
+            eprintln!(
+                "seed={SEED:#x} round={round} completion={completion:?} cancel={cancel} paused_disks={paused_disks:?} drained"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn tail_drained_put_waits_for_tail_and_allows_immediate_cas() {

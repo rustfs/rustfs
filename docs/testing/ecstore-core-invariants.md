@@ -15,6 +15,7 @@ shown. The manifest contains their complete module paths.
 | Write quorum | `inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one` | W commits; W-1 fails without exposing a fresh object. |
 | Metadata rollback | `write_unique_file_info_reverts_metadata_when_write_quorum_fails` | A failed write preserves the previous metadata. |
 | Rollback inspection | `rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging` | Real failed undo records rejected inspection admission and retains incomplete receipts, old shards, backups, and staging across reopen. |
+| Closed inspection channel | `rename_rollback_closed_heal_receiver_preserves_recovery_material` | A fresh child closes the real heal receiver; all five rollback faults under both completion policies retain recovery material and record the actual failed send. |
 | Cancelled undo | `rename_rollback_incomplete_cancelled_task_is_not_success` | A cancelled undo remains incomplete. |
 | Fault schedule | `commit_fault_schedule_keeps_multiple_disk_phases_independent` | Two armed phases remain independently paused and are released by their own handles. |
 | Fault checkpoint owner | `commit_fault_schedule_rejects_duplicate_checkpoint_without_disarming_owner` | A duplicate checkpoint cannot replace the current handle. |
@@ -22,6 +23,7 @@ shown. The manifest contains their complete module paths.
 | Physical undo ownership | `rename_rollback_children_keep_namespace_ownership_after_coordinator_panic` | A coordinator panic cannot retire a running physical undo. |
 | Late tail failure | `rename_data_early_ack_post_mutation_tail_error_never_rolls_back_commit` | A late error cannot reverse an acknowledged quorum commit. |
 | Control-plane completion | `tail_drained_put_waits_for_tail_and_allows_immediate_cas` | TailDrained waits for the tail before a same-key CAS. |
+| Seeded completion pressure | `seeded_put_completion_pressure_drains_every_real_tail` | Four rounds with seed `0x2248_0009` retain target ownership under two real pressure PUTs, check complete bodies and same-key CAS for normal callers, and drain all tails and staging after normal or cancelled callers. |
 | Borrowed lock | `no_lock_put_waits_for_rename_tail_under_outer_guard` | A borrowed write does not reacquire the same key and waits for its tail. |
 | Borrowed capability | `borrowed_write_context_rejects_wrong_namespace_and_cache_flag` | A different namespace or cache flag cannot manufacture a write owner. |
 | Quota read ownership | `quota_snapshot_reuses_same_name_owner_and_rereads_disk_authority` | A same-named write reuses its actual owner without recursive acquisition; stale cache and corrupt disk metadata cannot replace disk authority. |
@@ -51,6 +53,9 @@ shown. The manifest contains their complete module paths.
 | Legacy metadata | `rustfs-filemeta`: `test_issue_2288_legacy_xlmeta_compatibility` | The fixed legacy fixture decodes with its expected object fields. |
 | Legacy null version | `rustfs-filemeta`: `test_into_fileinfo_reads_legacy_nil_uuid_inline_key` | Legacy nil UUID inline data retains null-version semantics. |
 | Corrupt part arrays | `rustfs-filemeta`: `crc_valid_but_part_arrays_corrupt_into_fileinfo_errors_not_panics` | CRC-valid inconsistent arrays return an error rather than panic. |
+| External erasure shards | `pinned_erasure_fixtures_test`: `pinned_minio_shards_decode_and_reconstruct_plaintext` and `pinned_legacy_shards_decode_and_reconstruct_plaintext` | Public GET dispatch returns the complete independent body and exact Range bytes, including after a real data shard is removed before the first GET. |
+| External shard bitrot | `pinned_erasure_fixtures_test`: `pinned_erasure_shards_reject_bitrot_corruption` | Corrupt captured shards fail verification before changing the caller's buffer. |
+| External shard quorum and codec | `pinned_erasure_fixtures_test`: `pinned_erasure_shards_reject_insufficient_quorum_and_wrong_codec` | Five shards cannot satisfy the six-shard read quorum; the opposite codec cannot reproduce the oracle. |
 
 The same manifest retains the S3, Azure and GCS source-contract tests for ODM.
 The static LIST keys in `crates/ecstore/tests/fixtures/list_namespace_keys.json`
@@ -61,6 +66,14 @@ Fixture provenance is recorded in
 [`crates/ecstore/tests/fixtures/minio/README.md`](../../crates/ecstore/tests/fixtures/minio/README.md).
 These metadata fixtures do not establish compatibility for an external legacy
 erasure-shard corpus.
+
+The separate [external shard corpus](../../crates/ecstore/tests/fixtures/erasure-shards/README.md)
+contains non-inline object files from released MinIO GF8 and historical RustFS
+GF16 processes. The manifest and plaintext hashes are required by the same
+gate; each integration test validates all captured metadata and shard hashes.
+Missing or changed files fail rather than skip. Historical RustFS is upgrade
+compatibility evidence, not an independently implemented GF16 codec. These
+reads do not establish live MinIO drive-set migration or crash durability.
 
 ## Historical LIST regressions
 
@@ -75,9 +88,16 @@ walk must contain each visible identity exactly once.
 | [#7049](https://github.com/rustfs/rustfs/pull/7049) | `a/first`, `a/nested/second`, `a0`, `b/final`; raw and paged limits 1 through 4 exercise a child reaching its limit before a later sibling. | `list_objects_shared_corpus_cross_subdirectory_limit` |
 | [#7010](https://github.com/rustfs/rustfs/pull/7010) | Four disks first retain three committed metadata copies, then a different disk goes offline. Two readable copies remain among three online disks; plain and slash-delimited pages use the same visible-namespace oracle. | `list_objects_shared_corpus_offline_corrupt_and_minority_stale` |
 
-This mapping identifies the current corpus and its oracle. It does not claim
-that reverting either historical fix was tested against this corpus on the
-latest main, or that concurrent writes provide a cross-page snapshot.
+Native negative controls use the unchanged corpus at main `68ad1a1d7bb`.
+Removing only the two old #7049 limit guards still passes because the recursive
+child's stop result provides another protection. Removing those guards and
+ignoring that result in the same stack-draining loop makes raw limit 1 return
+`a/first` and `a0` instead of only `a/first`. This tests the historical invariant,
+not a literal revert of #7049. Setting the current offline write-quorum
+allowance to zero makes the #7010 corpus return `InsufficientReadQuorum` where
+the independent oracle requires visible objects. Restoring both production
+files passes both tests. These local controls do not establish a concurrent
+cross-page snapshot or process-crash safety.
 
 ## Write owner and completion routes
 
@@ -115,6 +135,10 @@ not evidence for a required fixture.
 The `test-and-lint` artifact contains the native log, listing, JUnit and
 execution receipt. A native test that reopens a disk in the same process does
 not establish process-crash or power-loss durability.
+
+The closed-receiver child uses the existing rollback matrix and is reaped on
+normal exit. Its harness has no independent total deadline; a hang is not
+covered by the passing matrix.
 
 ## Process and network faults
 

@@ -62,6 +62,11 @@
       "name": "set_disk::core::io_primitives::tests::rename_rollback_incomplete_preserves_overwrite_data_dirs_and_staging"
     },
     {
+      "invariant": "rollback-closed-inspection-channel",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::rename_rollback_closed_heal_receiver_preserves_recovery_material"
+    },
+    {
       "invariant": "rollback-cancellation",
       "suite": "rustfs-ecstore",
       "name": "set_disk::core::io_primitives::tests::rename_rollback_incomplete_cancelled_task_is_not_success"
@@ -85,6 +90,11 @@
       "invariant": "tail-drained-cas",
       "suite": "rustfs-ecstore",
       "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::tail_drained_put_waits_for_tail_and_allows_immediate_cas"
+    },
+    {
+      "invariant": "seeded-put-tail-pressure",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::seeded_put_completion_pressure_drains_every_real_tail"
     },
     {
       "invariant": "borrowed-lock-tail",
@@ -280,6 +290,26 @@
       "invariant": "marker-purge-receipt-reopen",
       "suite": "rustfs-ecstore",
       "name": "set_disk::ops::object::marker_purge_receipt_tests::quorum_marker_purge_receipt_survives_reopen_with_stale_member"
+    },
+    {
+      "invariant": "external-minio-shards",
+      "suite": "rustfs-ecstore::pinned_erasure_fixtures_test",
+      "name": "pinned_minio_shards_decode_and_reconstruct_plaintext"
+    },
+    {
+      "invariant": "external-legacy-shards",
+      "suite": "rustfs-ecstore::pinned_erasure_fixtures_test",
+      "name": "pinned_legacy_shards_decode_and_reconstruct_plaintext"
+    },
+    {
+      "invariant": "external-shard-bitrot",
+      "suite": "rustfs-ecstore::pinned_erasure_fixtures_test",
+      "name": "pinned_erasure_shards_reject_bitrot_corruption"
+    },
+    {
+      "invariant": "external-shard-quorum-codec",
+      "suite": "rustfs-ecstore::pinned_erasure_fixtures_test",
+      "name": "pinned_erasure_shards_reject_insufficient_quorum_and_wrong_codec"
     }
   ],
   "fixtures": [
@@ -322,6 +352,21 @@
       "path": "crates/ecstore/tests/fixtures/list_namespace_keys.json",
       "sha256": "5afddb60565deba0938e617470255563f0e15a15fab699645c59bb7ccc84898e",
       "source": "Shared static LIST namespace corpus; ECStore differential tests and ODM list_through_static_namespace_boundary_matrix"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/erasure-shards/minio/manifest.json",
+      "sha256": "c398f8dcb76903f6cf8eee07931c76592895ced201ff9d59ed4ff9b0ead2b13c",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/erasure-shards/README.md"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/erasure-shards/legacy/manifest.json",
+      "sha256": "dce397d5b2f42748eb5091b4355bb9d133a50cbba003626fafac28095dbe540b",
+      "source": "RustFS 1.0.0-alpha.37; crates/ecstore/tests/fixtures/erasure-shards/README.md"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/erasure-shards/plaintext.bin",
+      "sha256": "b5a83332327961a31b65a8731c64559fd04ff8ac9f6124022201dbbdba5ffa01",
+      "source": "Independent fixed SHA256 counter-stream oracle; crates/ecstore/tests/fixtures/erasure-shards/README.md"
     }
   ]
 }
