@@ -762,7 +762,10 @@ impl HealTask {
                                 error = %err,
                                 "Heal bucket object repair skipped due to transient metadata error"
                             );
-                        } else if !age_exhausted && err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
+                        } else if !age_exhausted
+                            && err.is_recoverable_object_heal()
+                            && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES
+                        {
                             terminal_outcome = false;
                             debug!(
                                 target: "rustfs::heal::task",
@@ -782,13 +785,13 @@ impl HealTask {
                                 inline_retry = Some(item);
                             }
                         } else {
-                            disposition = HealObjectDisposition::Failed(if age_exhausted || err.is_recoverable_heal() {
+                            disposition = HealObjectDisposition::Failed(if age_exhausted || err.is_recoverable_object_heal() {
                                 HealFailureClass::RetryExhausted
                             } else {
                                 HealFailureClass::Permanent
                             });
                             telemetry_unknown |= !increment_counter(&mut failed);
-                            if age_exhausted || err.is_recoverable_heal() {
+                            if age_exhausted || err.is_recoverable_object_heal() {
                                 retryable_failed = retryable_failed.saturating_add(1);
                             } else {
                                 permanent_failed = permanent_failed.saturating_add(1);

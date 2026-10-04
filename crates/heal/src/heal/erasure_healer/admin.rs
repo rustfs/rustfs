@@ -196,7 +196,7 @@ pub(super) async fn heal_object(
             return ((size, Err(error.unwrap_or(Error::TaskCancelled))), None);
         }
         if let Some(error) = error.as_ref()
-            && error.is_recoverable_heal()
+            && error.is_recoverable_object_heal()
             && failures < MAX_BUCKET_OBJECT_HEAL_RETRIES
         {
             failures += 1;
@@ -224,7 +224,7 @@ pub(super) async fn heal_object(
             None => Ok(!matches!(disposition, HealObjectDisposition::AuthoritativelyAbsent)),
             Some(error) => {
                 failures += 1;
-                if error.is_recoverable_heal() {
+                if error.is_recoverable_object_heal() {
                     disposition = HealObjectDisposition::Deferred {
                         reason: if error.is_dangling_delete_grace() {
                             HealDeferredReason::DanglingDeleteGrace

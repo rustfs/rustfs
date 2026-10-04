@@ -8,6 +8,9 @@ collection:
 
 ## Operations
 
+- [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
+- [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
+
 - [Multipart upload memory diagnosis](operations/multipart-memory.md) — allocator attribution, Docker reproduction and sustained upload checks.
 
 For the logical per-operation io_uring read cap, see

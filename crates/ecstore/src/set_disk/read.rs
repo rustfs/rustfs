@@ -113,7 +113,28 @@ use super::GetCodecStreamingObjectClass;
 use super::GetCodecStreamingRollout;
 #[cfg(test)]
 use super::classify_get_codec_streaming_object_class;
-use super::core::io_primitives::*;
+use super::core::io_primitives::{
+    BitrotReaderSetup, BitrotReaderSetupAttribution, BitrotReaderSetupMode, DeferredReaderReopener, EVENT_SET_DISK_READ,
+    GetCodecStreamingReaderBuildOutcome, MetadataCacheLookup, ObjectBitrotReader, ReadRepairAdmissionSubmitter,
+    ReadRepairHealSubmission, SLOW_OBJECT_READ_LOG_THRESHOLD, codec_streaming_reader_setup_fallback_reason,
+    create_bitrot_readers_until_quorum_with_preference, create_data_block_bitrot_readers, resolved_read_repair_version_id,
+    send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal, submit_read_repair_heal_with_submitter,
+};
+#[cfg(test)]
+use super::core::io_primitives::{
+    ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+    MultipartCodecStreamingReader, ReadRepairAdmissionFuture, ReadRepairAdmissionOutcome, collect_read_multiple_results,
+    collect_read_parts_results, create_bitrot_readers_until_quorum, create_bitrot_readers_until_quorum_all_shards,
+    release_read_repair_heal_reservation, reserve_read_repair_heal, resolve_read_part_from_responses, shard_read_cost_for_disk,
+    shard_read_cost_for_endpoint,
+};
+#[cfg(test)]
+use super::core::metadata_quorum::{MetadataEarlyStopDecision, MetadataQuorumAccumulator};
+#[cfg(test)]
+use super::core::metadata_read::{
+    MetadataFanoutDiagnostics, MetadataFanoutObservation, metadata_early_stop_permitted, should_allow_metadata_early_stop,
+};
+use super::core::metadata_read::{late_materialization_candidate_is_safe, non_inline_data_read_early_stop_allowed};
 #[cfg(test)]
 use super::get_codec_streaming_config_cached_core;
 #[cfg(test)]
@@ -607,11 +628,11 @@ impl SetDisks {
         };
 
         // Early-stop for safe metadata reads is handled inside
-        // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
-        // core/io_primitives.rs); unsafe requests and callers that opt out
+        // read_metadata_observed (see read_all_fileinfo_early_stop in
+        // core/metadata_read.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = if allow_read_version_coalescing {
-            Self::read_all_fileinfo_observed_for_get_object(
+        let metadata_read = if allow_read_version_coalescing {
+            Self::read_metadata_for_get_object(
                 &disks,
                 "",
                 bucket,
@@ -624,7 +645,7 @@ impl SetDisks {
             )
             .await?
         } else {
-            Self::read_all_fileinfo_observed(
+            Self::read_metadata_observed(
                 &disks,
                 "",
                 bucket,
@@ -638,13 +659,14 @@ impl SetDisks {
             )
             .await?
         };
+        let metadata_fanout_complete = metadata_read.is_complete();
+        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
         let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
             GET_OBJECT_PATH_INTERNAL_META
         } else {
             GET_OBJECT_PATH_LEGACY_DUPLEX
         };
         metadata_fanout_diagnostics.record(metadata_metrics_path);
-        let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -2117,7 +2139,7 @@ impl SetDisks {
         expected: &LateMetadataIdentity,
         metrics_path: &'static str,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
-        let (mut parts_metadata, errs, diagnostics) = SetDisks::read_all_fileinfo_observed(
+        let metadata_read = SetDisks::read_metadata_observed(
             fallback_disks,
             "",
             bucket,
@@ -2130,6 +2152,7 @@ impl SetDisks {
             expected.parity_blocks,
         )
         .await?;
+        let (mut parts_metadata, errs, diagnostics) = metadata_read.into_legacy();
         diagnostics.record(metrics_path);
 
         let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)

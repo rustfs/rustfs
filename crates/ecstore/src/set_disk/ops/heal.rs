@@ -598,17 +598,18 @@ impl SetDisks {
         }
 
         scope.check()?;
-        let (_, errors) =
-            Self::read_all_fileinfo(disks.as_slice(), "", bucket, object, &version.to_string(), false, false, false).await?;
+        let metadata_read =
+            Self::read_metadata(disks.as_slice(), "", bucket, object, &version.to_string(), false, false, false).await?;
+        let all_absent = metadata_read
+            .slots
+            .iter()
+            .all(|slot| matches!(&slot.result, Some(Err(DiskError::FileNotFound | DiskError::FileVersionNotFound))));
+
         let selected = self.get_disks_internal().await;
         let same_targets = selected.len() == disks.len() && selected.iter().zip(&disks).all(|(current, original)| {
             matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
         });
-        if !same_targets
-            || !errors
-                .iter()
-                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
-        {
+        if !same_targets || !all_absent {
             return Err(StorageError::SlowDown);
         }
         scope.check()?;
@@ -734,7 +735,7 @@ impl SetDisks {
         object: &str,
         version_id: &str,
     ) -> disk::error::Result<ReadRepairCommitFingerprint> {
-        let (parts_metadata, errs, _) = Self::read_all_fileinfo_observed(
+        let metadata_read = Self::read_metadata_observed(
             disks,
             "",
             bucket,
@@ -747,6 +748,7 @@ impl SetDisks {
             self.default_parity_count,
         )
         .await?;
+        let (parts_metadata, errs, _) = metadata_read.into_legacy();
         let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
         let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
         let (_, quorum_mod_time, quorum_etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
@@ -931,8 +933,9 @@ impl SetDisks {
             }
         };
 
-        let (mut parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true, false).await?;
+        let (mut parts_metadata, errs, _) = Self::read_metadata(&disks, "", bucket, object, version_id, true, true, false)
+            .await?
+            .into_legacy();
 
         trace!(
             event = EVENT_SET_DISK_HEAL,
@@ -1284,8 +1287,10 @@ impl SetDisks {
                             // in `parts_metadata` to defaults. Re-read only before
                             // destructive cleanup so the guard sees every original
                             // identity.
-                            let (delete_guard_metadata, delete_guard_errs) =
-                                Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true, false).await?;
+                            let (delete_guard_metadata, delete_guard_errs, _) =
+                                Self::read_metadata(&disks, "", bucket, object, version_id, true, true, false)
+                                    .await?
+                                    .into_legacy();
                             if self
                                 .dangling_delete_safety(bucket, object, &delete_guard_metadata, &delete_guard_errs, &disks)
                                 .await?
@@ -2316,16 +2321,16 @@ impl SetDisks {
                 return Err(DiskError::retired_marker_deferred(format!("conditional marker deletion failed: {error}")));
             }
         }
-        let (_, errors) = Self::read_all_fileinfo(disks, "", bucket, object, &version.to_string(), false, false, false).await?;
+        let metadata_read = Self::read_metadata(disks, "", bucket, object, &version.to_string(), false, false, false).await?;
+        let all_absent = metadata_read
+            .slots
+            .iter()
+            .all(|slot| matches!(&slot.result, Some(Err(DiskError::FileNotFound | DiskError::FileVersionNotFound))));
         let selected = self.get_disks_internal().await;
         let same_targets = selected.len() == disks.len() && selected.iter().zip(disks).all(|(current, original)| {
             matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
         });
-        if !same_targets
-            || !errors
-                .iter()
-                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
-        {
+        if !same_targets || !all_absent {
             return Err(DiskError::retired_marker_deferred(
                 "complete marker absence could not be verified under the original target set",
             ));
@@ -3383,9 +3388,10 @@ impl SetDisks {
         // The inner heal and missing-object report read the registry again;
         // release this snapshot guard before a topology writer can queue between reads.
         let disks = self.get_disks_internal().await;
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
+        let (_, errs, _) = Self::read_metadata(&disks, "", bucket, object, version_id, false, false, false)
             .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
+            .into_legacy();
         if DiskError::is_all_not_found(&errs) {
             debug!(
                 event = EVENT_SET_DISK_HEAL,
