@@ -498,7 +498,11 @@ async fn cleanup_uses_a_budget_independent_of_the_measurement_window() {
         "target result: {:?}",
         measurement.target
     );
-    tokio::time::timeout(Duration::from_secs(3), server)
+    // The cleanup budget is two sequential requests, each allowed to use the
+    // probe's bounded cleanup timeout. Leave scheduler and CI runner headroom
+    // here while keeping the assertion independent from the one-second
+    // measurement window above.
+    tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect("cleanup requests should complete")
         .expect("response server");
