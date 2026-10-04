@@ -519,7 +519,7 @@ pub mod object {
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
         RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
-        ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCompletion,
+        ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCommitGuard, WriteCompletion,
         get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
         register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };

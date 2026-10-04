@@ -118,13 +118,13 @@ pub async fn reload_site_replication_runtime_state_for_context(context: Option<&
     // fan-out cannot overwrite a concurrent state writer. IO must be the
     // no-lock variants — the boundary already holds the object lock.
     let lock_store = store.clone();
-    with_site_replication_state_lock_on(lock_store, move || async move {
+    with_site_replication_state_lock_on(lock_store, move |write_guard| async move {
         match read_config_no_lock(store.clone(), SITE_REPLICATION_STATE_PATH).await {
             Ok(data) => {
                 if let Some(normalized) = normalize_site_replication_state_json(&data)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e))?
                 {
-                    save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, normalized)
+                    save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, normalized, &write_guard)
                         .await
                         .map_err(|e| {
                             S3Error::with_message(

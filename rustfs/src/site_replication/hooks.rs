@@ -46,7 +46,7 @@ where
         store,
         SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH.to_string(),
         move || async move {
-            with_config_object_write_lock(mutation_store, mutation_path, operation)
+            with_config_object_write_lock(mutation_store, mutation_path, move |_write_guard| operation())
                 .await
                 .map_err(|err| S3Error::from(ApiError::from(err)))
         },
@@ -68,9 +68,13 @@ where
     Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    with_config_object_write_lock(store, SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH.to_string(), operation)
-        .await
-        .map_err(|err| S3Error::from(ApiError::from(err)))?
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH.to_string(),
+        move |_write_guard| operation(),
+    )
+    .await
+    .map_err(|err| S3Error::from(ApiError::from(err)))?
 }
 
 #[derive(Debug, Default)]
@@ -978,9 +982,11 @@ pub(crate) async fn commit_site_replication_delete_bucket(intent: &SiteReplicati
         reservations: intent.reservations.clone(),
         displaced: Vec::new(),
     };
-    match with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        broadcast_site_replication_delete_bucket(&delivery_intent).await
-    })
+    match with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
+        move |_write_guard| async move { broadcast_site_replication_delete_bucket(&delivery_intent).await },
+    )
     .await
     {
         Ok(result) => result,

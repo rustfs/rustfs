@@ -88,6 +88,80 @@ async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Respons
 }
 
 #[tokio::test]
+async fn commit_backend_borrowed_put_preserves_owner_authorization_and_precondition() {
+    use crate::admin::storage_api::object::WriteCommitGuard;
+    use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+    use crate::table_catalog::{EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, TableCatalogPutPrecondition};
+    use std::time::Duration;
+
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = "catalog-borrowed-owner";
+    let object = "metadata.json";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create catalog object bucket");
+    let lock = store.new_ns_lock(bucket, object).await.expect("target namespace wrapper");
+    let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(5))
+        .await
+        .expect("hold actual target owner");
+    let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
+    let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let commit = TableCommitObjectBackend::test(backend.clone(), Arc::clone(&authorized), None);
+    let payload = br#"{"version":1}"#.to_vec();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit.put_object_unlocked(
+            bucket,
+            object,
+            payload.clone(),
+            TableCatalogPutPrecondition::IfAbsent,
+            vec![guard.clone()],
+        ),
+    )
+    .await
+    .expect("borrowed catalog write must not acquire the held target lock again")
+    .expect("borrowed catalog publication succeeds");
+    assert!(
+        authorized
+            .lock()
+            .await
+            .contains(&(object.to_string(), S3Action::PutObjectAction))
+    );
+    let stored = backend
+        .read_object_unlocked(bucket, object)
+        .await
+        .expect("read under outer write owner")
+        .expect("object exists");
+    assert_eq!(stored.data, payload);
+    assert!(!guard.is_lock_lost());
+    let conflict = tokio::time::timeout(
+        Duration::from_secs(5),
+        commit.put_object_unlocked(
+            bucket,
+            object,
+            b"replacement".to_vec(),
+            TableCatalogPutPrecondition::IfAbsent,
+            vec![guard],
+        ),
+    )
+    .await
+    .expect("conflicting borrowed write must also avoid recursive acquisition")
+    .expect_err("IfAbsent must reject an existing object");
+    assert!(matches!(conflict, crate::table_catalog::TableCatalogStoreError::Conflict(_)));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), backend.read_object(bucket, object))
+            .await
+            .expect("failed borrowed write releases its last namespace owner")
+            .expect("read after owner release")
+            .expect("original remains")
+            .data,
+        payload
+    );
+}
+
+#[tokio::test]
 async fn table_catalog_authentication_and_credentials_use_the_request_context() {
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     rustfs_iam::store::object::ObjectStore::new(store.clone())

@@ -14,6 +14,7 @@
 
 use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
+use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
 mod migration;
 mod object;
@@ -573,6 +574,7 @@ pub(crate) struct TableCatalogObjectMetadata {
 pub(crate) struct TableCatalogLockGuard {
     _guard: Box<dyn Send>,
     lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    write_commit_guard: Option<WriteCommitGuard>,
 }
 
 impl TableCatalogLockGuard {
@@ -584,6 +586,7 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(guard),
             lock_lost: None,
+            write_commit_guard: None,
         }
     }
 
@@ -592,11 +595,25 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(guard),
             lock_lost,
+            write_commit_guard: None,
         }
+    }
+
+    fn write_namespace(guard: WriteCommitGuard) -> Self {
+        Self {
+            _guard: Box::new(()),
+            lock_lost: None,
+            write_commit_guard: Some(guard),
+        }
+    }
+
+    fn write_commit_guards(&self) -> Vec<WriteCommitGuard> {
+        self.write_commit_guard.iter().cloned().collect()
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.lock_lost.as_ref().is_some_and(|signal| signal.is_lost())
+            || self.write_commit_guard.as_ref().is_some_and(WriteCommitGuard::is_lock_lost)
     }
 }
 
@@ -722,6 +739,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
+        _write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()> {
         self.put_object(bucket, object, data, precondition).await
     }
@@ -1946,7 +1964,7 @@ where
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, false).await
+        self.put_object_with_options(bucket, object, data, precondition, None).await
     }
 
     async fn put_object_unlocked(
@@ -1955,8 +1973,10 @@ where
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, true).await
+        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards))
+            .await
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -2043,11 +2063,10 @@ where
             .new_ns_lock(bucket, object)
             .await
             .map_err(|err| storage_error_to_catalog("create catalog table lock", err))?;
-        let guard = lock
-            .get_write_lock(get_lock_acquire_timeout())
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
             .await
             .map_err(|err| catalog_lock_acquisition_error("acquire catalog table lock", err))?;
-        Ok(TableCatalogLockGuard::namespace(guard))
+        Ok(TableCatalogLockGuard::write_namespace(guard))
     }
 
     async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
@@ -2120,14 +2139,22 @@ where
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
-        no_lock: bool,
+        write_guards: Option<Vec<WriteCommitGuard>>,
     ) -> TableCatalogStoreResult<()> {
         let mut reader = PutObjReader::from_vec(data);
-        let opts = ObjectOptions {
+        let mut opts = ObjectOptions {
             http_preconditions: http_preconditions_for_catalog_put(precondition),
-            no_lock,
             ..Default::default()
         };
+        if let Some(write_guards) = write_guards {
+            if write_guards.is_empty() {
+                return Err(TableCatalogStoreError::Internal("catalog write has no namespace owner".to_string()));
+            }
+            for guard in &write_guards {
+                opts.add_write_commit_guard(guard);
+            }
+            opts.write_completion = WriteCompletion::TailDrained;
+        }
         self.store
             .put_object(bucket, object, &mut reader, &opts)
             .await
