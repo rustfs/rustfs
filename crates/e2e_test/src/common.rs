@@ -2475,7 +2475,7 @@ mod tests {
         assert_ne!(proxy.local_addr().ip(), proxy.target_addr().ip());
         assert_eq!(env.nodes[0].address, direct, "S3 clients must retain the direct address");
         let mut endpoint =
-            rustfs_ecstore::api::disk::Endpoint::try_from(volumes.as_str()).expect("proxied volume should be a valid endpoint");
+            crate::storage_api::Endpoint::try_from(volumes.as_str()).expect("proxied volume should be a valid endpoint");
         endpoint
             .update_is_local(proxy.target_addr().port())
             .expect("proxied endpoint locality should resolve");
