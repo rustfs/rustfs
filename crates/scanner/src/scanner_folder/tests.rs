@@ -2979,6 +2979,8 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
         cache.prepare_bucket_checkpoint("bucket", 7, 3, source, plan, identity),
         crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
     );
+    cache.replace("bucket", "", DataUsageEntry::default());
+    let retained_key_ptr = cache.cache.keys().next().expect("existing root key").as_ptr() as usize;
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
@@ -3000,6 +3002,11 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
         Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
         other => panic!("expected raw enumeration partial cache after cancellation, got {other:?}"),
     };
+    assert_eq!(
+        partial_cache.cache.keys().next().expect("retained root key").as_ptr() as usize,
+        retained_key_ptr,
+        "enumeration cancellation must transfer the existing cache allocation"
+    );
 
     assert!(
         partial_cache
@@ -3192,6 +3199,7 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
             ..Default::default()
         },
     );
+    let retained_key_ptr = cache.cache.keys().next().expect("durable root key").as_ptr() as usize;
 
     let result = scan_data_folder(
         budget.token(),
@@ -3209,6 +3217,11 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
         Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
         other => panic!("missing bucket should keep the scan incomplete, got {other:?}"),
     };
+    assert_eq!(
+        partial.cache.keys().next().expect("returned durable root key").as_ptr() as usize,
+        retained_key_ptr,
+        "a missing namespace must return the owned cache without a deep copy"
+    );
     assert!(!partial.info.snapshot_complete);
     assert_eq!(partial.info.next_cycle, 9);
     let root = partial
