@@ -450,6 +450,8 @@ pub async fn check_key_valid_with_context(
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             }
 
+            check_session_token(session_token, &u.credentials)?;
+
             warn!(
                 event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                 component = LOG_COMPONENT_AUTH,
@@ -468,8 +470,7 @@ pub async fn check_key_valid_with_context(
         cred = u.credentials;
     }
 
-    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {e}")))?;
+    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
@@ -481,30 +482,39 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     check_claims_from_token_with_context(token, cred, None)
 }
 
+fn check_session_token(token: &str, cred: &Credentials) -> S3Result<()> {
+    // Session identity survives expiration; is_temp() only describes active credentials.
+    let has_session_token = !cred.session_token.is_empty();
+
+    if !token.is_empty() && cred.access_key.is_empty() {
+        return Err(s3_error!(InvalidRequest, "no access key"));
+    }
+
+    if token.is_empty() && has_session_token && !cred.is_service_account() {
+        return Err(s3_error!(InvalidRequest, "invalid token1"));
+    }
+
+    if !token.is_empty() && !has_session_token {
+        return Err(s3_error!(InvalidRequest, "invalid token2"));
+    }
+
+    if !cred.is_service_account() && has_session_token && !constant_time_eq(token, &cred.session_token) {
+        return Err(s3_error!(InvalidRequest, "invalid token3"));
+    }
+
+    if has_session_token && !cred.is_service_account() && cred.is_expired() {
+        return Err(s3_error!(ExpiredToken, "The provided token has expired."));
+    }
+
+    Ok(())
+}
+
 fn check_claims_from_token_with_context(
     token: &str,
     cred: &Credentials,
     ctx: Option<&AppContext>,
 ) -> S3Result<HashMap<String, Value>> {
-    if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
-    }
-
-    if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token1"));
-    }
-
-    if !token.is_empty() && !cred.is_temp() {
-        return Err(s3_error!(InvalidRequest, "invalid token2"));
-    }
-
-    if !cred.is_service_account() && cred.is_temp() && !constant_time_eq(token, &cred.session_token) {
-        return Err(s3_error!(InvalidRequest, "invalid token3"));
-    }
-
-    if cred.is_temp() && cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
-    }
+    check_session_token(token, cred)?;
 
     let sys_cred = match ctx {
         Some(context) => context.action_credentials().get(),
@@ -1611,22 +1621,118 @@ mod tests {
     #[test]
     fn test_check_claims_from_token_expired_credentials() {
         let mut cred = create_temp_credentials();
-        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1)); // Expired
-        cred.claims = None; // Make sure it's not a service account
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
 
-        let result = check_claims_from_token(&cred.session_token, &cred);
+        let error = check_claims_from_token(&cred.session_token, &cred).unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::ExpiredToken);
+        let response = error.to_http_response().expect("serialize the S3 error");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        let body = response.body().bytes().expect("error XML body");
+        let xml = std::str::from_utf8(&body).expect("UTF-8 error XML");
+        assert!(xml.contains("<Code>ExpiredToken</Code>"));
+        assert!(!xml.contains(&cred.session_token));
+        assert!(!xml.contains(&cred.secret_key));
+    }
 
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    #[test]
+    fn expired_sts_credentials_require_the_matching_token() {
+        let mut cred = create_temp_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+        for token in ["", "wrong-session-token"] {
+            let error = check_claims_from_token(token, &cred).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        }
+    }
 
-        // The function checks various conditions in order. An expired temp credential
-        // might trigger other validation errors first (like token mismatch)
-        let msg = error.message().unwrap_or("");
-        let is_valid_error = msg.contains("invalid access key is temp and expired")
-            || msg.contains("invalid token")
-            || msg.contains("action cred not init");
-        assert!(is_valid_error, "Unexpected error message: '{msg}'");
+    #[tokio::test]
+    async fn check_key_valid_preserves_sts_error_codes() {
+        use rustfs_iam::{cache::Cache, manager::IamCache};
+        use rustfs_policy::auth::UserIdentity;
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let (send_chan, _receiver) = tokio::sync::mpsc::channel(1);
+        let iam_cache = Arc::new(IamCache {
+            cache: Cache::default(),
+            api: ObjectStore::new(store.clone()),
+            state: Default::default(),
+            loading: Default::default(),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: Default::default(),
+            sync_failures: Default::default(),
+            sync_successes: Default::default(),
+            last_sync_duration_millis: Default::default(),
+        });
+        let iam = Arc::new(IamSys::new(iam_cache.clone()));
+        let context = AppContext::new(store, Arc::new(ContextIam { handle: iam }), Arc::new(TestKms));
+        let root = Credentials {
+            access_key: "sts-test-root".to_string(),
+            secret_key: "sts-test-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(context.publish_action_credentials(root.clone()));
+        let now = OffsetDateTime::now_utc();
+        let claims = HashMap::from([("exp".to_string(), json!((now + time::Duration::hours(1)).unix_timestamp()))]);
+        let mut valid = get_new_credentials_with_metadata(&claims, &root.secret_key).expect("signed STS credentials");
+        valid.parent_user = root.access_key.clone();
+        iam_cache
+            .cache
+            .add_or_update_sts_account(&valid.access_key, &UserIdentity::new(valid.clone()), now);
+        assert!(
+            check_key_valid_with_context(&valid.session_token, &valid.access_key, Some(&context))
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_key_valid_with_context("", &root.access_key, Some(&context))
+                .await
+                .is_ok()
+        );
+
+        // Seed the state of an issued identity after expiration without sleeping
+        // or changing the clock used by signature verification.
+        let expired_claims = HashMap::from([("exp".to_string(), json!((now - time::Duration::hours(1)).unix_timestamp()))]);
+        let mut expired =
+            get_new_credentials_with_metadata(&expired_claims, &root.secret_key).expect("expired signed STS credentials");
+        expired.parent_user = root.access_key.clone();
+        let mut disabled = expired.clone();
+        disabled.status = "off".to_string();
+        let mut service_account = create_service_account_credentials();
+        service_account.expiration = expired.expiration;
+        let mut invalid_key = create_test_credentials();
+        invalid_key.secret_key = "short".to_string();
+        for (name, credential, token, expected) in [
+            ("expired", &expired, expired.session_token.as_str(), S3ErrorCode::ExpiredToken),
+            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest),
+            ("expired with wrong token", &expired, "wrong-token", S3ErrorCode::InvalidRequest),
+            (
+                "disabled expired",
+                &disabled,
+                disabled.session_token.as_str(),
+                S3ErrorCode::InvalidAccessKeyId,
+            ),
+            ("expired service account", &service_account, "", S3ErrorCode::InvalidRequest),
+            ("active without token", &valid, "", S3ErrorCode::InvalidRequest),
+            ("active with wrong token", &valid, "wrong-token", S3ErrorCode::InvalidRequest),
+            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest),
+        ] {
+            iam_cache.cache.add_or_update_sts_account(
+                &credential.access_key,
+                &UserIdentity::new(credential.clone()),
+                OffsetDateTime::now_utc(),
+            );
+            let error = check_key_valid_with_context(token, &credential.access_key, Some(&context))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), &expected, "{name}");
+            if expected == S3ErrorCode::ExpiredToken {
+                let response = error.to_http_response().expect("serialize the S3 error");
+                assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+                let body = response.body().bytes().expect("error XML body");
+                assert!(std::str::from_utf8(&body).unwrap().contains("<Code>ExpiredToken</Code>"));
+            }
+        }
     }
 
     #[test]
@@ -1690,12 +1796,10 @@ mod tests {
             verified.claims.as_ref().and_then(|claims| claims.get("context")),
             Some(&json!("matching"))
         );
-        assert!(
-            check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
-                .await
-                .is_err(),
-            "a different server context must not validate the token"
-        );
+        let error = check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
+            .await
+            .expect_err("a different server context must not validate the token");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]

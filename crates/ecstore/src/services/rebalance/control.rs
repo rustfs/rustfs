@@ -521,11 +521,12 @@ impl ECStore {
                 .map_err(|err| rebalance_meta_lock_error(err, "write"))
         })
         .await?;
+        let guard = Arc::new(guard);
         let mut opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             ..Default::default()
         };
-        opts.add_namespace_lock_guard(&guard);
+        opts.add_owned_write_lock(Arc::clone(&guard), crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME);
 
         merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, opts, None, expected_id).await?;
         if guard.is_lock_lost() {

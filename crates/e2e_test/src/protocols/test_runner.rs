@@ -21,7 +21,7 @@ use crate::protocols::sftp_compliance::{
     test_sftp_compliance_readonly, test_sftp_compliance_standalone, test_sftp_compliance_suite,
 };
 use crate::protocols::sftp_core::{test_sftp_core_operations, test_sftp_idle_timeout_disconnects};
-use crate::protocols::webdav_core::test_webdav_core_operations;
+use crate::protocols::webdav_core::{test_webdav_core_operations, test_webdav_quota_reporting};
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
@@ -99,6 +99,10 @@ impl ProtocolTestSuite {
                     info!("=== Starting WebDAV Core Test ===");
                     "WebDAV core operations (MKCOL, PUT, GET, DELETE, PROPFIND)"
                 }
+                "test_webdav_quota_reporting" => {
+                    info!("=== Starting WebDAV Quota Reporting Test ===");
+                    "WebDAV quota reporting (PROPFIND quota properties: bucket-quota sum and physical-capacity fallback)"
+                }
                 "test_sftp_core_operations" => {
                     info!("=== Starting SFTP Core Test ===");
                     "SFTP core operations (banner, mkdir, put, get with SHA compare, rename, delete, rmdir)"
@@ -158,6 +162,7 @@ impl ProtocolTestSuite {
         match test_def.name {
             "test_ftps_core_operations" => test_ftps_core_operations().await.map_err(|e| e.into()),
             "test_webdav_core_operations" => test_webdav_core_operations().await.map_err(|e| e.into()),
+            "test_webdav_quota_reporting" => test_webdav_quota_reporting().await.map_err(|e| e.into()),
             "test_sftp_core_operations" => test_sftp_core_operations().await.map_err(|e| e.into()),
             "test_sftp_compliance_suite" => test_sftp_compliance_suite().await.map_err(|e| e.into()),
             "test_sftp_compliance_readonly" => test_sftp_compliance_readonly().await.map_err(|e| e.into()),
@@ -201,6 +206,10 @@ fn all_protocol_tests() -> Vec<TestDefinition> {
         },
         TestDefinition {
             name: "test_webdav_core_operations",
+            required_feature: "webdav",
+        },
+        TestDefinition {
+            name: "test_webdav_quota_reporting",
             required_feature: "webdav",
         },
         TestDefinition {
@@ -253,9 +262,10 @@ mod tests {
     fn schedules_all_protocol_tests_without_feature_filter() {
         let names = scheduled_names(ProtocolTestSuite::with_requested_features(None));
 
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"test_ftps_core_operations"));
         assert!(names.contains(&"test_webdav_core_operations"));
+        assert!(names.contains(&"test_webdav_quota_reporting"));
         assert!(names.contains(&"test_sftp_core_operations"));
         assert!(names.contains(&"test_sftp_compliance_standalone"));
     }
@@ -264,7 +274,14 @@ mod tests {
     fn schedules_only_requested_non_sftp_protocols() {
         let names = scheduled_names(ProtocolTestSuite::with_requested_features(Some("ftps, webdav")));
 
-        assert_eq!(names, vec!["test_ftps_core_operations", "test_webdav_core_operations"]);
+        assert_eq!(
+            names,
+            vec![
+                "test_ftps_core_operations",
+                "test_webdav_core_operations",
+                "test_webdav_quota_reporting"
+            ]
+        );
     }
 
     #[test]
@@ -295,9 +312,10 @@ mod tests {
     fn full_feature_schedules_all_protocol_tests() {
         let names = scheduled_names(ProtocolTestSuite::with_requested_features(Some("full")));
 
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"test_ftps_core_operations"));
         assert!(names.contains(&"test_webdav_core_operations"));
+        assert!(names.contains(&"test_webdav_quota_reporting"));
         assert!(names.contains(&"test_sftp_core_operations"));
         assert!(names.contains(&"test_sftp_compliance_standalone"));
     }

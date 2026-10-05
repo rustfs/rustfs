@@ -69,11 +69,11 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
-use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
@@ -352,6 +352,15 @@ fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool>
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     options.producer_limit_reached = Some(state.clone());
     state
+}
+
+fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
+    !options.versioned
+        && (options.include_directories
+            || options
+                .separator
+                .as_deref()
+                .is_some_and(|separator| !separator.is_empty() && separator != SLASH_SEPARATOR))
 }
 
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
@@ -2440,6 +2449,12 @@ where
             let suffix = key.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    if collect_stats {
+                        stats.skipped_keys += 1;
+                    }
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     if collect_stats {
                         stats.common_prefixes += 1;
@@ -2542,6 +2557,10 @@ fn list_objects_from_metadata_snapshot_candidates(
             let suffix = object.name.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    stats.skipped_keys += 1;
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     stats.common_prefixes += 1;
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
@@ -4315,96 +4334,15 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
         ensure_producer_limit_state(&mut o);
 
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-
         let (sender, recv) = mpsc::channel(o.limit as usize);
-
         let store = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("store", "list_merged", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("store", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = {
-            // receiver result
-            tokio::select! {
-               res = err_rx.recv() =>{
-
-                match res{
-                    Ok(err) => {
-                        log_list_path_worker_error("store", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("store", "error_channel_closed", &log_context, &err);
-
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-               },
-               Some(result) = result_rx.recv()=>{
-                result
-               }
-            }
-        };
-
-        // wait spawns exit
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("store", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { store.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -4950,6 +4888,68 @@ impl ECStore {
     }
 }
 
+/// Own every page worker until completion, including when the request is dropped.
+async fn collect_list_path_results<P>(
+    component: &'static str,
+    context: &ListPathLogContext,
+    cancel: CancellationToken,
+    opts: ListPathOptions,
+    recv: Receiver<MetaCacheEntry>,
+    producer: P,
+) -> MetaCacheEntriesSortedResult
+where
+    P: Future<Output = Result<()>> + Send + 'static,
+{
+    let _cancel_guard = cancel.clone().drop_guard();
+    let (result_tx, mut result_rx) = mpsc::channel(1);
+    let mut workers = JoinSet::new();
+    workers.spawn(async move { producer.await.map(|()| None) }.instrument(tracing::Span::current()));
+    let gather_cancel = cancel.clone();
+    workers.spawn(
+        async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) }.instrument(tracing::Span::current()),
+    );
+
+    let mut failure = None;
+    let mut stopping = false;
+    while let Some(completion) = workers.join_next().await {
+        let error = match completion {
+            Ok(Ok(Some(GatherResultsState::LimitReached | GatherResultsState::ConsumerGone))) => {
+                stopping = true;
+                None
+            }
+            // EOF is only authoritative after the producer also succeeds.
+            Ok(Ok(None | Some(GatherResultsState::InputClosed))) => None,
+            Ok(Err(err)) => Some(err),
+            Err(err) if stopping && err.is_cancelled() => None,
+            // Do not expose a panic payload through the S3 error or logs.
+            Err(err) if err.is_panic() => Some(Error::other("listing worker panicked")),
+            Err(_) => Some(Error::other("listing worker unexpectedly cancelled")),
+        };
+        if let Some(error) = error {
+            failure.get_or_insert(error);
+            stopping = true;
+        }
+        if stopping {
+            cancel.cancel();
+            workers.abort_all();
+        }
+        // Drain even after abort: a completed error/panic must not be hidden
+        // by a page limit becoming ready at the same time.
+    }
+
+    // gather_results sends at most one page into a capacity-1 channel, so it
+    // never needs this receiver to make progress. Read only after both joins.
+    let mut result = result_rx.try_recv().unwrap_or_else(|_| MetaCacheEntriesSortedResult {
+        entries: None,
+        err: Some(rustfs_filemeta::Error::other("listing worker exited without a page")),
+    });
+    if let Some(error) = failure {
+        log_list_path_worker_error(component, "worker_error", context, &error);
+        result.err = Some(to_filemeta_err(error));
+    }
+    result
+}
+
 async fn gather_results(
     rx: CancellationToken,
     opts: ListPathOptions,
@@ -4962,6 +4962,8 @@ async fn gather_results(
     let gather_started = list_metrics_enabled.then(std::time::Instant::now);
     let mut scanned_entries = 0usize;
     let mut candidate_entries = 0usize;
+    let mut previous_prefix = String::new();
+    let folds_prefixes = list_path_folds_common_prefixes(&opts);
 
     while let Some(mut entry) = recv.recv().await {
         scanned_entries += 1;
@@ -4999,6 +5001,34 @@ async fn gather_results(
 
         if !opts.incl_deleted && is_latest_delete_marker {
             continue;
+        }
+
+        // Version LIST projections omit cleanup-only free versions. They must
+        // not consume the lookahead budget before a later visible version.
+        // Cleanup walks consume the raw set stream without this collector.
+        if opts.versioned
+            && is_object
+            && entry
+                .xl_meta()
+                .is_ok_and(|meta| !meta.versions.is_empty() && meta.versions.iter().all(|version| version.header.free_version()))
+        {
+            continue;
+        }
+
+        if folds_prefixes
+            && let Some(separator) = opts.separator.as_deref().filter(|separator| !separator.is_empty())
+            && let Some(offset) = entry.name[opts.prefix.len()..].find(separator)
+        {
+            let common_prefix = &entry.name[..opts.prefix.len() + offset + separator.len()];
+            if common_prefix == previous_prefix
+                || opts.marker.as_deref().is_some_and(|marker| {
+                    (!opts.include_marker && common_prefix <= marker) || (opts.include_marker && common_prefix < marker)
+                })
+            {
+                continue;
+            }
+            previous_prefix.clear();
+            previous_prefix.push_str(common_prefix);
         }
 
         // TODO(backlog): integrate lifecycle evaluation during object listing
@@ -5317,8 +5347,8 @@ fn spawn_listing_merge(
     rx: CancellationToken,
     inputs: Vec<Receiver<MetaCacheEntry>>,
     sender: Sender<MetaCacheEntry>,
-) -> JoinHandle<Result<()>> {
-    tokio::spawn(
+) -> AbortOnDropHandle<Result<()>> {
+    AbortOnDropHandle::new(tokio::spawn(
         async move {
             let result = merge_entry_channels(rx.clone(), inputs, sender, 1).await;
             if result.is_err() {
@@ -5327,7 +5357,7 @@ fn spawn_listing_merge(
             result
         }
         .instrument(tracing::Span::current()),
-    )
+    ))
 }
 
 async fn merge_entry_channels(
@@ -5727,85 +5757,14 @@ impl Sets {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-
         ensure_producer_limit_state(&mut o);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
         let sets = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = sets.list_merged(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("sets", "list_merged", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("sets", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = tokio::select! {
-            res = err_rx.recv() => {
-                match res {
-                    Ok(err) => {
-                        log_list_path_worker_error("sets", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("sets", "error_channel_closed", &log_context, &err);
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-            }
-            Some(result) = result_rx.recv() => result,
-        };
-
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("sets", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -6744,85 +6703,14 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-
         ensure_producer_limit_state(&mut o);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
         let set = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = set.list_path(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("set_disks", "list_path", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("set_disks", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = tokio::select! {
-            res = err_rx.recv() => {
-                match res {
-                    Ok(err) => {
-                        log_list_path_worker_error("set_disks", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("set_disks", "error_channel_closed", &log_context, &err);
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-            }
-            Some(result) = result_rx.recv() => result,
-        };
-
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("set_disks", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { set.list_path(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -7023,7 +6911,9 @@ impl SetDisks {
         );
 
         let limit = {
-            if opts.limit > 0 && opts.stop_disk_at_limit {
+            // A raw scan budget can be consumed entirely by keys folding into
+            // one common prefix. Let the logical collector stop these walks.
+            if opts.limit > 0 && opts.stop_disk_at_limit && !list_path_folds_common_prefixes(&opts) {
                 opts.limit + 4 + (opts.limit / 16)
             } else {
                 0
@@ -7247,6 +7137,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 }
 
 // list_path_raw
+
+#[cfg(test)]
+mod differential_tests;
 
 #[cfg(test)]
 mod test {
@@ -7924,6 +7817,117 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::LimitReached);
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_counts_common_prefixes_before_page_limit() {
+        for separator in ["/", "-"] {
+            for extra_object in [false, true] {
+                let prefix_name = format!("a{separator}");
+                let first = if separator == "/" {
+                    prefix_name.clone()
+                } else {
+                    format!("{prefix_name}first")
+                };
+                let mut input = vec![test_object_meta_entry(&first)];
+                if separator == "/" {
+                    input.push(test_dir_meta_entry(&prefix_name));
+                } else {
+                    input.push(test_object_meta_entry(&format!("{prefix_name}second")));
+                }
+                input.push(test_object_meta_entry("b"));
+                if extra_object {
+                    input.push(test_object_meta_entry("c"));
+                }
+                let (entry_tx, entry_rx) = mpsc::channel(input.len());
+                let (result_tx, mut result_rx) = mpsc::channel(1);
+                for entry in input {
+                    entry_tx.send(entry).await.expect("delimiter candidates should queue");
+                }
+                drop(entry_tx);
+                let state = gather_results(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: "bucket".to_owned(),
+                        separator: Some(separator.to_owned()),
+                        recursive: separator != "/",
+                        include_directories: separator == "/",
+                        limit: 3,
+                        ..Default::default()
+                    },
+                    entry_rx,
+                    result_tx,
+                )
+                .await
+                .expect("delimiter collection should succeed");
+                let result = result_rx.recv().await.expect("delimiter page should arrive");
+                let mut expected = vec![first, "b".to_owned()];
+                if extra_object {
+                    expected.push("c".to_owned());
+                }
+                assert_eq!(
+                    result
+                        .entries
+                        .expect("delimiter entries should exist")
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "delimiter={separator}, extra={extra_object}"
+                );
+                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
+                assert_eq!(
+                    state,
+                    if extra_object {
+                        GatherResultsState::LimitReached
+                    } else {
+                        GatherResultsState::InputClosed
+                    }
+                );
+            }
+        }
+        for include_marker in [false, true] {
+            let (entry_tx, entry_rx) = mpsc::channel(2);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            for name in ["a/child", "b"] {
+                entry_tx
+                    .send(test_object_meta_entry(name))
+                    .await
+                    .expect("marker candidates should queue");
+            }
+            drop(entry_tx);
+            gather_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    separator: Some("/".to_owned()),
+                    recursive: true,
+                    include_directories: true,
+                    marker: Some("a/".to_owned()),
+                    include_marker,
+                    limit: 3,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            )
+            .await
+            .expect("logical marker collection should succeed");
+            let entries = result_rx
+                .recv()
+                .await
+                .expect("logical marker page should arrive")
+                .entries
+                .expect("logical marker entries should exist");
+            let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
+            let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
+            assert_eq!(
+                names,
+                if include_marker { vec!["a/", "b"] } else { vec!["b"] },
+                "a folded prefix equal to the marker must follow include_marker={include_marker}"
+            );
+        }
     }
 
     #[test]
@@ -8977,6 +8981,29 @@ mod test {
         assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
         assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
         assert!(!result.info.is_truncated);
+
+        let resumed = list_objects_from_metadata_snapshot_candidates(
+            "bucket",
+            "photos/2026/",
+            Some("photos/2026/nested/"),
+            &Some("/".to_string()),
+            1,
+            &objects,
+        );
+        assert!(
+            resumed.info.prefixes.is_empty(),
+            "metadata-fast cursors must not replay an emitted prefix"
+        );
+        assert_eq!(
+            resumed
+                .info
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["photos/2026/z.jpg"]
+        );
+        assert!(!resumed.info.is_truncated);
     }
 
     #[test]
@@ -9937,6 +9964,7 @@ mod test {
             .expect("bucket should be created with authoritative metadata");
         let committed_dir = uuid::Uuid::new_v4();
         let unmarked_dir = uuid::Uuid::new_v4();
+        let backup_dir = uuid::Uuid::new_v4();
         let transaction = uuid::Uuid::new_v4();
         for dir in &dirs {
             let committed = dir
@@ -9947,6 +9975,9 @@ mod test {
             tokio::fs::create_dir_all(&committed)
                 .await
                 .expect("committed delete residue should be created");
+            tokio::fs::write(committed.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("committed rollback backup should be written");
             tokio::fs::write(committed.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
@@ -9970,6 +10001,18 @@ mod test {
             tokio::fs::write(unmarked.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
+
+            let backup = dir
+                .path()
+                .join(bucket)
+                .join("metrics/statefulset/2026/08/26/18/object.parquet")
+                .join(backup_dir.to_string());
+            tokio::fs::create_dir_all(&backup)
+                .await
+                .expect("rollback backup directory should be created");
+            tokio::fs::write(backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("rollback backup should be written");
         }
 
         let result = store
@@ -9978,7 +10021,7 @@ mod test {
             .await
             .expect("delimiter listing should succeed");
         assert!(result.objects.is_empty());
-        assert!(result.prefixes.is_empty(), "neither residue subtree may surface as a prefix");
+        assert!(result.prefixes.is_empty(), "residue subtrees may not surface as prefixes");
         for dir in &dirs {
             let metrics = dir.path().join(bucket).join("metrics");
             assert!(
@@ -9992,6 +10035,17 @@ mod test {
                     .join("part.1")
                     .exists(),
                 "residue without a committed marker must survive the purge"
+            );
+            assert_eq!(
+                tokio::fs::read(
+                    metrics
+                        .join("statefulset/2026/08/26/18/object.parquet")
+                        .join(backup_dir.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                )
+                .await
+                .expect("uncommitted rollback backup must survive the listing"),
+                b"rollback metadata"
             );
         }
     }
@@ -10089,6 +10143,23 @@ mod test {
         assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
         assert!(result.is_truncated);
         assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
+
+        let resumed = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            result.next_marker.as_deref(),
+            &Some("/".to_string()),
+            1,
+            &candidates,
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
+        )
+        .await
+        .expect("verified prefix continuation should succeed");
+        assert!(resumed.prefixes.is_empty(), "verified cursors must not replay an emitted prefix");
+        assert_eq!(
+            resumed.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            ["photos/2026/d.jpg"]
+        );
+        assert!(!resumed.is_truncated);
     }
 
     #[tokio::test]
@@ -11789,6 +11860,166 @@ mod test {
             "three marker copies across two EC domains do not form a quorum"
         );
         assert!(!versions.versions[0].deleted);
+    }
+
+    async fn collect_list_path_results<P>(
+        cancel: CancellationToken,
+        opts: ListPathOptions,
+        recv: mpsc::Receiver<MetaCacheEntry>,
+        producer: P,
+    ) -> rustfs_filemeta::MetaCacheEntriesSortedResult
+    where
+        P: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let context = super::ListPathLogContext::from_options(&opts);
+        super::collect_list_path_results("test", &context, cancel, opts, recv, producer).await
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_report_producer_panic_instead_of_empty_eof() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = timeout(
+            Duration::from_secs(1),
+            collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+                let _sender = sender;
+                panic!("test listing producer panic");
+            }),
+        )
+        .await
+        .expect("producer panic must not strand the collector");
+        assert!(
+            result
+                .err
+                .expect("panic must be reported")
+                .to_string()
+                .contains("listing worker panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_preserve_error_after_input_closes() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+            drop(sender);
+            tokio::task::yield_now().await;
+            Err(StorageError::FileCorrupt)
+        })
+        .await;
+        assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_drain_buffer_before_successful_eof() {
+        let (sender, recv) = mpsc::channel(3);
+        let result = collect_list_path_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                limit: 4,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            recv,
+            async move {
+                for name in ["a", "b", "c"] {
+                    sender.try_send(test_meta_entry(name)).expect("queue page");
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.err, Some(rustfs_filemeta::Error::Unexpected));
+        let entries = result.entries.expect("EOF retains entries");
+        assert_eq!(
+            entries.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_abort_stalled_producer_at_page_limit() {
+        let (sender, recv) = mpsc::channel(1);
+        let dropped = CancellationToken::new();
+        let producer_dropped = dropped.clone();
+        let result = timeout(
+            Duration::from_secs(1),
+            collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    let _drop_guard = producer_dropped.drop_guard();
+                    sender.send(test_meta_entry("a")).await.expect("send page");
+                    std::future::pending::<Result<()>>().await
+                },
+            ),
+        )
+        .await
+        .expect("page limit must not wait for a producer that ignores cancellation");
+        assert!(result.err.is_none());
+        assert_eq!(result.entries.expect("page").entries().len(), 1);
+        assert!(dropped.is_cancelled(), "producer must be dropped before the page is returned");
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_parent_abort_drops_both_children() {
+        let (sender, recv) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let dropped = CancellationToken::new();
+        let producer_dropped = dropped.clone();
+        let parent = tokio::spawn(collect_list_path_results(cancel.clone(), ListPathOptions::default(), recv, async move {
+            let _drop_guard = producer_dropped.drop_guard();
+            started_tx.send(()).expect("notify parent");
+            std::future::pending::<Result<()>>().await
+        }));
+        started_rx.await.expect("producer started");
+        parent.abort();
+        assert!(parent.await.expect_err("parent aborted").is_cancelled());
+        timeout(Duration::from_secs(1), dropped.cancelled())
+            .await
+            .expect("producer dropped");
+        timeout(Duration::from_secs(1), sender.closed())
+            .await
+            .expect("collector dropped");
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_path_workers_preserve_ready_error_at_page_limit() {
+        for _ in 0..128 {
+            let (sender, recv) = mpsc::channel(1);
+            let result = collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    sender.try_send(test_meta_entry("a")).expect("queue page");
+                    Err(StorageError::FileCorrupt)
+                },
+            )
+            .await;
+            assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_merge_drop_stops_blocked_inputs() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (output_tx, _output_rx) = mpsc::channel(1);
+        let task = super::spawn_listing_merge(CancellationToken::new(), vec![input_rx], output_tx);
+        drop(task);
+
+        timeout(Duration::from_secs(1), input_tx.closed())
+            .await
+            .expect("dropping the merge owner must release an idle producer");
     }
 
     #[tokio::test]

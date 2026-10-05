@@ -1292,7 +1292,10 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 claims,
                 deny_only: false,
             };
-            let allowed = iam_store.eval_prepared(&prepared, &final_args).await;
+            let allowed = iam_store
+                .try_eval_prepared(&prepared, &final_args)
+                .await
+                .map_err(ApiError::from)?;
             if !allowed
                 && matches!(
                     action,
@@ -1311,7 +1314,11 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 // Bucket policy Allow may supplement an implicit IAM denial,
                 // but must not override an explicit deletion-policy Deny.
                 final_args.deny_only = true;
-                if !iam_store.eval_prepared(&prepared, &final_args).await {
+                if !iam_store
+                    .try_eval_prepared(&prepared, &final_args)
+                    .await
+                    .map_err(ApiError::from)?
+                {
                     return Err(denial.deny("iam_explicit_deny", action));
                 }
             }
