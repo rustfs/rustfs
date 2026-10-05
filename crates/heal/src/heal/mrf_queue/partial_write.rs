@@ -17,9 +17,10 @@ use super::{
     submit_mrf_heal_request,
 };
 use rustfs_common::mrf_channel::{MrfDurableAdmissionError, MrfIngressResult, release_mrf_intent, try_rearm_mrf_replay_intent};
+use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ const MAX_OPERATOR_REASON_BYTES: usize = 1024;
 const MAX_OPERATOR_ACTOR_BYTES: usize = 256;
 const MAX_OPERATOR_REFERENCE_BYTES: usize = 256;
 const LIFECYCLE_CHECKPOINT_RECORD_OVERHEAD_BYTES: usize = 256;
+const MAX_UNVERIFIED_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PartialWriteKey {
@@ -197,6 +199,27 @@ struct Responsibility {
     state: ResponsibilityState,
     retry_queued: bool,
     next_attempt: Instant,
+    // Process-local pacing does not alter the durable proof obligation.
+    attempt_in_flight: bool,
+    consecutive_unverified_attempts: u32,
+}
+
+impl Responsibility {
+    fn defer_unverified_attempt(&mut self, now: Instant, base: Duration) {
+        self.attempt_in_flight = false;
+        self.consecutive_unverified_attempts = self.consecutive_unverified_attempts.saturating_add(1);
+        let shift = self.consecutive_unverified_attempts.saturating_sub(1).min(31);
+        let ceiling = base
+            .saturating_mul(1_u32 << shift)
+            .min(base.max(MAX_UNVERIFIED_RETRY_BACKOFF));
+        let floor = base.max(ceiling / 2);
+        let bytes = self.responsibility_id.as_bytes();
+        let seed = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            .wrapping_add(self.consecutive_unverified_attempts.wrapping_mul(0x9e37_79b9));
+        let phase = (seed ^ (seed >> 16)) & u32::from(u16::MAX);
+        let ratio = f64::from(phase) / f64::from(u16::MAX);
+        self.next_attempt = now + floor + (ceiling - floor).mul_f64(ratio);
+    }
 }
 
 /// Durable storage responsibilities have no guaranteed rediscovery producer.
@@ -288,6 +311,8 @@ impl PartialWrites {
                 state: ResponsibilityState::Active,
                 retry_queued,
                 next_attempt: Instant::now(),
+                attempt_in_flight: false,
+                consecutive_unverified_attempts: 0,
             },
         );
         self.bytes = next_bytes;
@@ -582,6 +607,8 @@ impl PartialWrites {
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         entry.persisted = false;
         entry.next_attempt = Instant::now();
+        entry.attempt_in_flight = false;
+        entry.consecutive_unverified_attempts = 0;
         if !entry.retry_queued {
             let key = PartialWriteKey::new(&entry.intent, entry.source_bucket_incarnation_id);
             if self.retry_index.insert(key.clone()) {
@@ -741,15 +768,31 @@ impl PartialWrites {
     ) -> bool {
         let now = Instant::now();
         let mut lifecycle_changed = false;
-        for key in self.ready_keys(now, config.replay_batch) {
+        let ready = self.ready_keys(now, config.replay_batch);
+        if ready.is_empty() {
+            return false;
+        }
+        let in_flight = manager.try_in_flight_durable_mrf_anchors();
+        for key in ready {
             let Some(entry) = self.entries.get_mut(&key) else {
                 continue;
             };
-            entry.next_attempt = now + config.admission_backoff;
+            entry.next_attempt = Instant::now() + config.admission_backoff;
+            if entry.attempt_in_flight
+                && let Some(in_flight) = in_flight.as_ref()
+            {
+                if entry.anchor.as_ref().is_some_and(|anchor| in_flight.contains(anchor)) {
+                    continue;
+                }
+                // A terminal attempt without proof remains owned by the journal.
+                // Count that completion once, rather than once per consumer tick.
+                entry.defer_unverified_attempt(Instant::now(), config.admission_backoff);
+                continue;
+            }
             // The bucket can be deleted and recreated while an obligation is
             // parked, so every dispatch must compare against a fresh identity.
-            entry.anchor = manager.durable_mrf_repair_anchor(&entry.intent).await;
-            if let Some(anchor) = entry.anchor.clone() {
+            if let Some(anchor) = manager.durable_mrf_repair_anchor(&entry.intent).await {
+                entry.anchor = Some(anchor.clone());
                 if entry.source_bucket_incarnation_id.is_none() {
                     let old_cost = Self::entry_cost(entry);
                     let detected_at_ms = SystemTime::now()
@@ -784,7 +827,15 @@ impl PartialWrites {
                 // Proofless legacy results stay owned by the durable journal;
                 // the lifecycle checkpoint determines whether this process
                 // retries or waits for an explicit operator action.
-                let _ = submit_mrf_heal_request(manager, &entry.intent, Some(anchor)).await;
+                let admission = submit_mrf_heal_request(manager, &entry.intent, Some(anchor)).await;
+                entry.next_attempt = Instant::now() + config.admission_backoff;
+                match admission {
+                    Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => entry.attempt_in_flight = true,
+                    Ok(HealAdmissionResult::Full | HealAdmissionResult::Dropped(_)) => {}
+                    Err(_) => entry.defer_unverified_attempt(Instant::now(), config.admission_backoff),
+                }
+            } else {
+                entry.defer_unverified_attempt(Instant::now(), config.admission_backoff);
             }
         }
         lifecycle_changed
@@ -940,6 +991,338 @@ mod tests {
     }
 
     #[test]
+    fn durable_retry_backoff_is_bounded_staggered_and_not_checkpointed() {
+        let item = intent("retry-backoff");
+        let incarnation = Uuid::new_v4();
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(item.clone(), Some(incarnation), 1, 8192)
+            .expect("admit durable responsibility");
+        writes.mark_persisted();
+        let key = PartialWriteKey::new(&item, Some(incarnation));
+        let checkpoint = writes.checkpoint_records(|_| Some([1; 32]));
+        let retained_bytes = writes.bytes();
+        let now = Instant::now();
+        for (floor, ceiling) in [(5, 5), (5, 10), (10, 20), (20, 40), (30, 60), (30, 60), (30, 60)] {
+            let entry = writes.entries.get_mut(&key).expect("retained responsibility");
+            entry.attempt_in_flight = true;
+            entry.defer_unverified_attempt(now, Duration::from_secs(5));
+            let delay = entry.next_attempt.duration_since(now);
+            assert!(delay >= Duration::from_secs(floor) && delay <= Duration::from_secs(ceiling), "{delay:?}");
+            assert!(!entry.attempt_in_flight);
+            assert_eq!(writes.checkpoint_records(|_| Some([1; 32])), checkpoint);
+            assert_eq!(writes.bytes(), retained_bytes);
+        }
+        let entry = writes.entries.get_mut(&key).expect("retained responsibility");
+        entry.consecutive_unverified_attempts = u32::MAX;
+        entry.responsibility_id = Uuid::from_u128(1_u128 << 120);
+        entry.defer_unverified_attempt(now, Duration::from_secs(5));
+        assert_eq!(entry.consecutive_unverified_attempts, u32::MAX);
+        assert!(entry.next_attempt.duration_since(now) <= MAX_UNVERIFIED_RETRY_BACKOFF);
+        let first_phase = entry.next_attempt;
+        entry.responsibility_id = Uuid::from_u128(2_u128 << 120);
+        entry.defer_unverified_attempt(now, Duration::from_secs(5));
+        assert_ne!(
+            entry.next_attempt, first_phase,
+            "independent obligations should not synchronize retry deadlines"
+        );
+        entry.defer_unverified_attempt(now, Duration::ZERO);
+        assert_eq!(entry.next_attempt, now, "a zero test backoff remains zero");
+        entry.defer_unverified_attempt(now, Duration::from_secs(120));
+        assert_eq!(
+            entry.next_attempt.duration_since(now),
+            Duration::from_secs(120),
+            "do not shorten a larger admission interval"
+        );
+        assert_eq!(writes.depth(), 1, "retry exhaustion cannot release durable responsibility");
+    }
+
+    #[test]
+    fn durable_retry_state_resets_only_for_new_lease_or_replay() {
+        let first = intent("retry-generation");
+        let incarnation = Uuid::new_v4();
+        let key = PartialWriteKey::new(&first, Some(incarnation));
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(first.clone(), Some(incarnation), 1, 8192)
+            .expect("first generation");
+        writes.mark_persisted();
+        let entry = writes.entries.get_mut(&key).expect("first entry");
+        entry.defer_unverified_attempt(Instant::now(), Duration::from_secs(5));
+        let deadline = entry.next_attempt;
+        let checkpoint = writes.checkpoint_records(|_| Some([2; 32])).remove(0);
+        writes
+            .admit_with_source_incarnation(first.clone(), Some(incarnation), 1, 8192)
+            .expect("same-lease duplicate");
+        assert_eq!(writes.entries[&key].next_attempt, deadline);
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 1);
+
+        let mut replay = PartialWrites::default();
+        replay
+            .admit_with_source_incarnation(first.clone(), Some(incarnation), 1, 8192)
+            .expect("replayed responsibility");
+        assert!(replay.restore_state(&first, &checkpoint));
+        assert_eq!(replay.entries[&key].consecutive_unverified_attempts, 0);
+        assert!(!replay.entries[&key].attempt_in_flight);
+        assert!(!replay.entries[&key].persisted, "replay still needs a committed successor checkpoint");
+
+        let replacement = intent("retry-generation");
+        assert_ne!(replacement.lease, first.lease, "new write has a distinct proof lease");
+        writes
+            .admit_with_source_incarnation(replacement, Some(incarnation), 1, 8192)
+            .expect("new generation");
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 0);
+        assert!(!writes.entries[&key].attempt_in_flight);
+        assert!(!writes.entries[&key].persisted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn durable_retry_skips_owned_work_and_backs_off_terminal_without_proof() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("mrf_retry_ownership")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("authoritative bucket identity");
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+        let item = intent("retry-owned");
+        let key = PartialWriteKey::new(&item, Some(incarnation));
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(item.clone(), Some(incarnation), 1, 8192)
+            .expect("committed responsibility");
+        writes.mark_persisted();
+        let config = MrfConsumerConfig::default();
+        assert!(!writes.dispatch_collecting_lifecycle_change(&manager, &config).await);
+        let owned = manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("stable manager ownership view");
+        assert_eq!(owned.len(), 1);
+        for _ in 0..64 {
+            writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+            writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        }
+        let admission = manager.operations_snapshot().await.admission;
+        assert_eq!(
+            (admission.accepted, admission.merged, admission.dropped),
+            (1, 0, 0),
+            "64 due observations must reuse manager ownership without new admission/RPC work"
+        );
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 0);
+        assert_eq!(manager.get_queue_length().await, 1);
+
+        let gate = manager.hold_mrf_admission_for_test().await;
+        assert!(manager.try_in_flight_durable_mrf_anchors().is_none());
+        writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+        let mut contended = Box::pin(writes.dispatch_collecting_lifecycle_change(&manager, &config));
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(contended.as_mut(), cx))).await;
+        assert!(polled.is_pending(), "unknown ownership must retain ordinary admission progress");
+        drop(gate);
+        contended.await;
+        assert_eq!(
+            writes.entries[&key].consecutive_unverified_attempts, 0,
+            "contention is not a failed repair"
+        );
+
+        let mut queued_merge = PartialWrites::default();
+        queued_merge
+            .admit_with_source_incarnation(item.clone(), Some(incarnation), 1, 8192)
+            .expect("same exact queued responsibility");
+        queued_merge.mark_persisted();
+        queued_merge
+            .entries
+            .get_mut(&key)
+            .expect("queued duplicate")
+            .consecutive_unverified_attempts = 3;
+        queued_merge.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert!(
+            queued_merge.entries[&key].attempt_in_flight,
+            "a queued merge owns this exact proof target"
+        );
+        for _ in 0..4 {
+            queued_merge.entries.get_mut(&key).expect("queued duplicate").next_attempt = Instant::now();
+            queued_merge.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        }
+        assert_eq!(
+            manager.operations_snapshot().await.admission.merged,
+            2,
+            "one contention fallback and one queued merge must not repeat during stable observations"
+        );
+        assert_eq!(
+            queued_merge.entries[&key].consecutive_unverified_attempts, 3,
+            "admission is not verified success"
+        );
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path(&format!("{bucket}/retry-owned"))
+                .await
+                .expect("terminalize queued attempt"),
+            1
+        );
+        assert!(
+            manager
+                .try_in_flight_durable_mrf_anchors()
+                .expect("stable ownership view")
+                .is_empty()
+        );
+        writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+        writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 1);
+        assert!(writes.entries[&key].next_attempt > Instant::now());
+        assert_eq!(manager.get_queue_length().await, 0, "terminal attempt must not be immediately recreated");
+        for _ in 0..64 {
+            writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        }
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 1, "one completion is counted once");
+        assert_eq!(writes.depth(), 1);
+        writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+        writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert_eq!(manager.get_queue_length().await, 1, "due responsibility must still retry");
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn durable_retry_identity_failure_keeps_last_anchor_and_uses_backoff() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("mrf_retry_missing_identity")
+            .build()
+            .await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+        let item = intent("missing-bucket");
+        let source = Uuid::new_v4();
+        let anchor = MrfDurableRepairAnchor::from_intent(&item, source).expect("last known proof anchor");
+        let key = PartialWriteKey::new(&item, Some(source));
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(item, Some(source), 1, 8192)
+            .expect("retained checkpoint");
+        writes.mark_persisted();
+        writes.entries.get_mut(&key).expect("entry").anchor = Some(anchor.clone());
+        let before = writes.checkpoint_records(|_| Some([3; 32]));
+        let config = MrfConsumerConfig::default();
+        for (failure, floor) in [(1, 5), (2, 5), (3, 10), (4, 20)] {
+            writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+            let started = Instant::now();
+            writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+            let completed = Instant::now();
+            let entry = &writes.entries[&key];
+            assert_eq!(entry.consecutive_unverified_attempts, failure);
+            assert!(entry.next_attempt >= started + Duration::from_secs(floor));
+            assert!(entry.next_attempt <= completed + MAX_UNVERIFIED_RETRY_BACKOFF);
+            assert_eq!(
+                entry.anchor.as_ref(),
+                Some(&anchor),
+                "an unavailable lookup cannot erase an exact proof target"
+            );
+            assert!(entry.persisted);
+            assert_eq!(writes.checkpoint_records(|_| Some([3; 32])), before);
+            assert_eq!(manager.get_queue_length().await, 0);
+        }
+        writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 4);
+        assert_eq!(writes.depth(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn durable_retry_submission_error_keeps_checkpoint_and_uses_backoff() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("mrf_retry_submit_error")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("authoritative bucket identity");
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+        manager.stop().await.expect("stop admissions before dispatch");
+        let item = intent("stopped-manager");
+        let key = PartialWriteKey::new(&item, Some(incarnation));
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(item, Some(incarnation), 1, 8192)
+            .expect("retained checkpoint");
+        writes.mark_persisted();
+        let before = writes.checkpoint_records(|_| Some([4; 32]));
+        let config = MrfConsumerConfig::default();
+        for (failure, floor) in [(1, 5), (2, 5), (3, 10), (4, 20)] {
+            writes.entries.get_mut(&key).expect("entry").next_attempt = Instant::now();
+            let started = Instant::now();
+            writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+            let completed = Instant::now();
+            let entry = &writes.entries[&key];
+            assert_eq!(entry.consecutive_unverified_attempts, failure);
+            assert!(!entry.attempt_in_flight);
+            assert!(entry.next_attempt >= started + Duration::from_secs(floor));
+            assert!(entry.next_attempt <= completed + MAX_UNVERIFIED_RETRY_BACKOFF);
+            assert!(entry.persisted);
+            assert!(entry.anchor.is_some(), "identity lookup must succeed so this covers submit Err");
+            assert_eq!(writes.checkpoint_records(|_| Some([4; 32])), before);
+            assert_eq!(manager.get_queue_length().await, 0);
+        }
+        writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 4);
+        assert_eq!(writes.depth(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn durable_retry_full_admission_does_not_consume_failure_backoff() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("mrf_retry_full")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("authoritative bucket identity");
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = HealManager::new_without_root_recovery_for_test(
+            storage,
+            Some(crate::heal::manager::HealConfig {
+                queue_size: 1,
+                ..crate::heal::manager::HealConfig::default()
+            }),
+        );
+        let first = intent("full-first");
+        let second = intent("full-second");
+        let key = PartialWriteKey::new(&second, Some(incarnation));
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(first, Some(incarnation), 2, 16384)
+            .expect("first");
+        writes
+            .admit_with_source_incarnation(second, Some(incarnation), 2, 16384)
+            .expect("second");
+        writes.mark_persisted();
+        let config = MrfConsumerConfig::default();
+        writes.dispatch_collecting_lifecycle_change(&manager, &config).await;
+        assert_eq!(manager.get_queue_length().await, 1);
+        assert!(manager.operations_snapshot().await.admission.full > 0);
+        assert!(!writes.entries[&key].attempt_in_flight);
+        assert_eq!(writes.entries[&key].consecutive_unverified_attempts, 0);
+        assert_eq!(writes.depth(), 2);
+        assert!(writes.entries[&key].persisted);
+    }
+
+    #[test]
     fn partial_write_retention_bounds_count_and_bytes_without_evicting_responsibility() {
         let first = intent("a");
         let cost = PartialWrites::cost(&first);
@@ -1083,6 +1466,14 @@ mod tests {
         assert!(next_cursor.is_none());
         assert_eq!(item.status, "operator_accepted_unverified");
 
+        let pacing = restored
+            .entries
+            .values_mut()
+            .find(|entry| entry.responsibility_id == responsibility_id)
+            .expect("held responsibility");
+        pacing.attempt_in_flight = true;
+        pacing.consecutive_unverified_attempts = 4;
+        pacing.next_attempt = Instant::now() + Duration::from_secs(60);
         let (_, accepted) = restored
             .recheck(responsibility_id, incarnation)
             .expect("explicit targeted recheck");
@@ -1092,6 +1483,9 @@ mod tests {
             .entries
             .get(&PartialWriteKey::new(&intent("legacy-lifecycle"), Some(incarnation)))
             .expect("active entry");
+        assert!(!active_entry.attempt_in_flight);
+        assert_eq!(active_entry.consecutive_unverified_attempts, 0);
+        assert!(active_entry.next_attempt <= Instant::now());
         assert_eq!(
             restored.bytes(),
             PartialWrites::cost_with_state_and_audit(
@@ -1100,6 +1494,10 @@ mod tests {
                 active_entry.last_operator_acceptance.as_ref(),
             ),
             "recheck must continue accounting for the retained audit record"
+        );
+        assert!(
+            restored.ready_keys(Instant::now(), 1).is_empty(),
+            "recheck must commit its checkpoint before dispatch"
         );
         restored.mark_persisted();
         assert_eq!(restored.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
@@ -1451,6 +1849,13 @@ mod tests {
             runtime.partial_writes.intent_for_responsibility(current_id).is_some(),
             "a matching G1 proof must not release G2"
         );
+        let current_entry = runtime
+            .partial_writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&replayed_current_intent, Some(current_incarnation)))
+            .expect("current responsibility");
+        current_entry.defer_unverified_attempt(Instant::now(), Duration::from_secs(60));
+        assert!(current_entry.next_attempt > Instant::now());
         rustfs_common::mrf_channel::note_mrf_verified_repair(verified_event(&replayed_current_anchor));
         runtime.discharge_durable_replay_anchors();
         assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
