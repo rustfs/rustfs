@@ -6139,12 +6139,10 @@ where
                 None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
             }
         };
-        if table_bucket_fence_required {
-            if !publication.holds_table_bucket(&request.table_bucket) {
-                return Err(TableCatalogStoreError::Internal(
-                    "view replacement requires a table-bucket publication fence".to_string(),
-                ));
-            }
+        if table_bucket_fence_required && !publication.holds_table_bucket(&request.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement requires a table-bucket publication fence".to_string(),
+            ));
         }
         if publication.holds_table_bucket(&request.table_bucket) {
             self.recover_active_table_rename(&request.table_bucket, publication).await?;

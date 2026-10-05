@@ -4077,13 +4077,13 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
         .seed_object(bucket, &metadata_location, serde_json::to_vec(&metadata).unwrap())
         .await;
     backend
-        .seed_object(bucket, &manifest_list_location, manifest_list_avro_bytes(&[]))
+        .seed_object(bucket, manifest_list_location, manifest_list_avro_bytes(&[]))
         .await;
     backend
-        .seed_object(bucket, &statistics_location, b"PFA1old!PFA1".to_vec())
+        .seed_object(bucket, statistics_location, b"PFA1old!PFA1".to_vec())
         .await;
     backend
-        .seed_object(bucket, &partition_statistics_location, b"ORC".to_vec())
+        .seed_object(bucket, partition_statistics_location, b"ORC".to_vec())
         .await;
     store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
     store
@@ -4099,7 +4099,7 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     assert_eq!(backup.object_count, 4);
 
     backend
-        .seed_object(bucket, &statistics_location, b"PFA1new!PFA1".to_vec())
+        .seed_object(bucket, statistics_location, b"PFA1new!PFA1".to_vec())
         .await;
     let error = store
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
