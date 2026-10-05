@@ -2179,7 +2179,15 @@ where
         let table = parse_table_for_store(&entry.table)?;
         validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         self.require_table_bucket(&entry.table_bucket).await?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None => Some(self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?),
+        };
         publication.begin_table_bucket(&entry.table_bucket).await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -2275,7 +2283,15 @@ where
     ) -> TableCatalogStoreResult<()> {
         validate_view_entry_version_and_id(&entry)?;
         self.require_table_bucket(&entry.table_bucket).await?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None => Some(self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?),
+        };
         publication.begin_table_bucket(&entry.table_bucket).await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -5508,7 +5524,15 @@ where
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?;
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
+        };
         publication.begin_table_bucket(&request.table_bucket).await?;
         if !publication.holds_table_bucket(&request.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -6085,7 +6109,15 @@ where
     ) -> TableCatalogStoreResult<ViewCommitResult> {
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?;
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
+        };
         if table_bucket_fence_required {
             publication.begin_table_bucket(&request.table_bucket).await?;
             if !publication.holds_table_bucket(&request.table_bucket) {

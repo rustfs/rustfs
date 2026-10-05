@@ -1307,6 +1307,7 @@ struct TableCommitPublicationState {
     phase: TableCommitPublicationPhase,
     bucket_fence: Option<String>,
     table_fence: Option<(String, String, String)>,
+    catalog_migration_read_permit: bool,
     observed_objects: BTreeMap<(String, String), TableCommitObservedObject>,
     guards: Vec<crate::table_catalog::TableCatalogLockGuard>,
 }
@@ -1508,15 +1509,27 @@ where
             }
             publication.bucket_fence = Some(table_bucket.to_string());
         }
-        let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
-        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
-            Ok(guard) => guard,
+        let migration_guards = match self.backend.acquire_catalog_migration_read_guards(table_bucket).await {
+            Ok(guards) => guards,
             Err(err) => {
                 self.publication.lock().bucket_fence = None;
                 return Err(err);
             }
         };
-        self.publication.lock().guards.push(guard);
+        let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                let mut publication = self.publication.lock();
+                publication.bucket_fence = None;
+                publication.catalog_migration_read_permit = false;
+                return Err(err);
+            }
+        };
+        let mut publication = self.publication.lock();
+        publication.catalog_migration_read_permit = !migration_guards.is_empty();
+        publication.guards.extend(migration_guards);
+        publication.guards.push(guard);
         Ok(())
     }
 
@@ -1652,6 +1665,7 @@ where
         publication.observed_objects.clear();
         publication.bucket_fence = None;
         publication.table_fence = None;
+        publication.catalog_migration_read_permit = false;
         publication.phase = TableCommitPublicationPhase::Complete;
     }
 
@@ -1832,6 +1846,13 @@ where
             .as_ref()
             .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
             && publication.guards.iter().all(|guard| !guard.is_lock_lost())
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        let publication = self.publication.lock();
+        publication
+            .catalog_migration_read_permit
+            .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
     }
 
     fn complete_table_commit_publication(&self) {

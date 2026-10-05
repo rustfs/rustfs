@@ -1009,6 +1009,23 @@ fn enable_table_bucket_response_fences_before_marker_and_catalog_entry() {
 }
 
 #[test]
+fn table_commit_publication_acquires_migration_permits_before_publication_lock() {
+    let src = table_catalog_handler_source();
+    let block = function_block(&src, "async fn begin_bucket_publication");
+    let migration_permits = block
+        .find("acquire_catalog_migration_read_guards(table_bucket)")
+        .expect("publication should acquire catalog migration permits");
+    let publication_lock = block
+        .find("acquire_write_lock(table_bucket, &publication_lock)")
+        .expect("publication should acquire its bucket lock");
+
+    assert!(
+        migration_permits < publication_lock,
+        "catalog migration permits must be acquired before the table-bucket publication lock"
+    );
+}
+
+#[test]
 fn table_catalog_resource_builds_policy_object_scope() {
     let namespace = crate::table_catalog::Namespace::parse("analytics.daily_events").expect("namespace should parse");
     let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");

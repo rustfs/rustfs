@@ -445,6 +445,10 @@ pub(crate) trait TableCommitPublication: Send + Sync {
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        None
+    }
+
     fn complete(&self);
 }
 
@@ -694,6 +698,13 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         None
     }
 
+    async fn acquire_catalog_migration_read_guards(
+        &self,
+        _table_bucket: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
+        Ok(Vec::new())
+    }
+
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 
     async fn read_object_limited(
@@ -737,7 +748,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
-                size: object.data.len() as u64,
+                size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
             }))
     }
 
@@ -752,7 +763,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
-                size: object.data.len() as u64,
+                size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
             }))
     }
 
@@ -865,6 +876,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     fn table_commit_publication_is_held(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
         false
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        None
     }
 
     fn complete_table_commit_publication(&self) {}
@@ -983,6 +998,10 @@ where
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
         self.table_commit_publication_is_held(table_bucket, namespace, table)
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        TableCatalogObjectBackend::catalog_migration_read_permit_status(self)
     }
 
     fn complete(&self) {
@@ -1969,6 +1988,22 @@ where
 {
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         Some(self.strong_runtime.clone())
+    }
+
+    async fn acquire_catalog_migration_read_guards(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
+        // Handlers discover and publish objects through one publication object. Keep the
+        // migration read permits ahead of its publication lock, matching store mutations.
+        let paths = TableCatalogObjectPaths::default();
+        let global = self
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
+            .await?;
+        let bucket = self
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(table_bucket))
+            .await?;
+        Ok(vec![global, bucket])
     }
 
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
