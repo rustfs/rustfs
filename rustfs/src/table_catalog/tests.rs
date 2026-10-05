@@ -4026,7 +4026,11 @@ async fn durable_catalog_restore_rejects_changed_referenced_object() {
         .unwrap();
     let backup = store.create_durable_catalog_backup(bucket, None).await.unwrap();
 
-    backend.seed_object(bucket, &metadata_location, b"changed".to_vec()).await;
+    let mut changed_metadata = table_metadata_json_for_backup(bucket, "table-id", "table-uuid");
+    changed_metadata["last-updated-ms"] = serde_json::Value::from(2);
+    backend
+        .seed_object(bucket, &metadata_location, serde_json::to_vec(&changed_metadata).unwrap())
+        .await;
     let error = store
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
@@ -4092,9 +4096,7 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     let backup = store.create_durable_catalog_backup(bucket, None).await.unwrap();
     assert_eq!(backup.object_count, 4);
 
-    backend
-        .seed_object(bucket, &statistics_location, b"PFA1changed".to_vec())
-        .await;
+    backend.seed_object(bucket, &statistics_location, b"PFA1new!".to_vec()).await;
     let error = store
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
@@ -4115,6 +4117,7 @@ async fn durable_catalog_backup_rejects_incomplete_snapshot_graph() {
         "snapshot-id": 10,
         "sequence-number": 1,
         "timestamp-ms": 1,
+        "manifest-list": format!("s3://{bucket}/tables/table-id/metadata/missing.avro"),
         "summary": {"operation": "append"}
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
@@ -4137,7 +4140,10 @@ async fn durable_catalog_backup_rejects_incomplete_snapshot_graph() {
         .create_durable_catalog_backup(bucket, None)
         .await
         .expect_err("backup must reject a snapshot without a manifest graph");
-    assert_matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("snapshot manifest-list is required"));
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("snapshot manifest-list object is missing".to_string())
+    );
 }
 
 #[tokio::test]
@@ -4445,7 +4451,7 @@ async fn durable_catalog_restore_replays_after_unrelated_bucket_change() {
     assert_eq!(replay.status, TableCatalogRestoreStatus::Restored);
     assert!(
         store
-            .get_namespace(bucket, changed_namespace.as_str())
+            .get_namespace(bucket, &changed_namespace.public_name())
             .await
             .unwrap()
             .is_none()

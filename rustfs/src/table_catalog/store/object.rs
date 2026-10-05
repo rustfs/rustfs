@@ -2168,6 +2168,39 @@ where
             .await
     }
 
+    async fn begin_table_bucket_with_migration_permit(
+        &self,
+        table_bucket: &str,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<Option<TableCatalogLockGuard>> {
+        let permit_before_publication = publication.catalog_migration_read_permit_status();
+        if permit_before_publication == Some(false) {
+            return Err(TableCatalogStoreError::Conflict(
+                "table-bucket catalog migration read permit was lost".to_string(),
+            ));
+        }
+
+        publication.begin_table_bucket(table_bucket).await?;
+        let result = match (permit_before_publication, publication.catalog_migration_read_permit_status()) {
+            (Some(true), Some(true)) | (None, Some(true)) => self
+                .ensure_object_backed_catalog_write_permit_after_lock(table_bucket)
+                .await
+                .map(|()| None),
+            (None, None) => self.acquire_object_backed_catalog_write_permit(table_bucket).await.map(Some),
+            (Some(true), Some(false)) | (None, Some(false)) => Err(TableCatalogStoreError::Conflict(
+                "table-bucket catalog migration read permit was lost".to_string(),
+            )),
+            (Some(true), None) => Err(TableCatalogStoreError::Internal(
+                "table-bucket catalog migration read permit disappeared during publication".to_string(),
+            )),
+            (Some(false), _) => unreachable!("a lost migration permit is rejected before publication"),
+        };
+        if result.is_err() {
+            publication.complete();
+        }
+        result
+    }
+
     async fn write_table_entry_with_publication(
         &self,
         entry: TableEntry,
@@ -2179,20 +2212,9 @@ where
         let table = parse_table_for_store(&entry.table)?;
         validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         self.require_table_bucket(&entry.table_bucket).await?;
-        let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => {
-                self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
-                    .await?;
-                None
-            }
-            Some(false) => {
-                return Err(TableCatalogStoreError::Conflict(
-                    "table-bucket catalog migration read permit was lost".to_string(),
-                ));
-            }
-            None => Some(self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?),
-        };
-        publication.begin_table_bucket(&entry.table_bucket).await?;
+        let _migration_guard = self
+            .begin_table_bucket_with_migration_permit(&entry.table_bucket, publication)
+            .await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
                 "table registration requires a table-bucket publication fence".to_string(),
@@ -2287,20 +2309,9 @@ where
     ) -> TableCatalogStoreResult<()> {
         validate_view_entry_version_and_id(&entry)?;
         self.require_table_bucket(&entry.table_bucket).await?;
-        let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => {
-                self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
-                    .await?;
-                None
-            }
-            Some(false) => {
-                return Err(TableCatalogStoreError::Conflict(
-                    "table-bucket catalog migration read permit was lost".to_string(),
-                ));
-            }
-            None => Some(self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?),
-        };
-        publication.begin_table_bucket(&entry.table_bucket).await?;
+        let _migration_guard = self
+            .begin_table_bucket_with_migration_permit(&entry.table_bucket, publication)
+            .await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
                 "view creation requires a table-bucket publication fence".to_string(),
@@ -5532,20 +5543,9 @@ where
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
-        let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => {
-                self.ensure_object_backed_catalog_write_permit_after_lock(&request.table_bucket)
-                    .await?;
-                None
-            }
-            Some(false) => {
-                return Err(TableCatalogStoreError::Conflict(
-                    "table-bucket catalog migration read permit was lost".to_string(),
-                ));
-            }
-            None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
-        };
-        publication.begin_table_bucket(&request.table_bucket).await?;
+        let _migration_guard = self
+            .begin_table_bucket_with_migration_permit(&request.table_bucket, publication)
+            .await?;
         if !publication.holds_table_bucket(&request.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
                 "table commit requires a table-bucket publication fence".to_string(),
@@ -6121,21 +6121,25 @@ where
     ) -> TableCatalogStoreResult<ViewCommitResult> {
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
-        let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => {
-                self.ensure_object_backed_catalog_write_permit_after_lock(&request.table_bucket)
-                    .await?;
-                None
+        let _migration_guard = if table_bucket_fence_required {
+            self.begin_table_bucket_with_migration_permit(&request.table_bucket, publication)
+                .await?
+        } else {
+            match publication.catalog_migration_read_permit_status() {
+                Some(true) => {
+                    self.ensure_object_backed_catalog_write_permit_after_lock(&request.table_bucket)
+                        .await?;
+                    None
+                }
+                Some(false) => {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "table-bucket catalog migration read permit was lost".to_string(),
+                    ));
+                }
+                None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
             }
-            Some(false) => {
-                return Err(TableCatalogStoreError::Conflict(
-                    "table-bucket catalog migration read permit was lost".to_string(),
-                ));
-            }
-            None => Some(self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?),
         };
         if table_bucket_fence_required {
-            publication.begin_table_bucket(&request.table_bucket).await?;
             if !publication.holds_table_bucket(&request.table_bucket) {
                 return Err(TableCatalogStoreError::Internal(
                     "view replacement requires a table-bucket publication fence".to_string(),
