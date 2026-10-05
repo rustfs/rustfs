@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::shutdown::shutdown_background_services;
+use crate::storage_api::startup::shutdown::{shutdown_background_services, wait_for_detached_mutations};
 use crate::{
     server::{
         SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier,
@@ -50,6 +50,7 @@ const BACKGROUND_SERVICE_CAPACITY: &str = "capacity";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const DETACHED_MUTATION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn join_failure_reason(error: &tokio::task::JoinError) -> &'static str {
     if error.is_cancelled() {
@@ -420,6 +421,21 @@ pub(crate) async fn run_startup_shutdown_sequence(
     }
     if let Some(console_shutdown_handle) = console_shutdown_handle {
         console_shutdown_handle.shutdown().await;
+    }
+    // A delete whose client disconnected keeps running on its own task; let it
+    // reach the end of its on-disk steps before the runtime is torn down.
+    if !wait_for_detached_mutations(DETACHED_MUTATION_SHUTDOWN_TIMEOUT).await {
+        warn!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "detached_mutations",
+            state = "stop_failed",
+            reason = "timeout",
+            timeout_secs = DETACHED_MUTATION_SHUTDOWN_TIMEOUT.as_secs(),
+            "Background service shutdown timed out"
+        );
     }
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
     // The data plane is drained: record this shutdown as clean so the next

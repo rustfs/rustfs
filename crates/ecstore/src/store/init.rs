@@ -17536,6 +17536,113 @@ mod tests {
             .expect("new-generation object must survive the old batch delete");
     }
 
+    async fn put_detached_delete_fixture(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create detached delete bucket");
+        // Large enough for a data dir, so the delete commit leaves a marked
+        // data dir and a rollback backup until its cleanup pass runs.
+        let mut reader = PutObjReader::from_vec(vec![7u8; 2 * 1024 * 1024]);
+        store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put detached delete fixture");
+    }
+
+    async fn assert_delete_lock_moved_to_detached_task(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let lock = store
+            .handle_new_ns_lock(bucket, object)
+            .await
+            .expect("namespace lock handle for the deleted key");
+        lock.get_write_lock_quiet(Duration::from_millis(200))
+            .await
+            .expect_err("the detached delete must keep its object lock after the caller is dropped");
+    }
+
+    fn assert_no_delete_residue(temp_dir: &std::path::Path, bucket: &str, object: &str, disks: usize) {
+        for disk in 0..disks {
+            let object_dir = temp_dir.join(format!("pool0/set0/disk{disk}")).join(bucket).join(object);
+            assert!(
+                !object_dir.exists(),
+                "disk {disk} must hold neither metadata, rollback backup nor data of the deleted object: {object_dir:?}"
+            );
+        }
+    }
+
+    // #6898: a DeleteObjects request dropped between the per-disk commit and the
+    // cleanup pass (client disconnect) must not leave metadata-less residue.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-batch-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-batch-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/batch.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_objects_with_tier_delete_journal_and_accounting(
+            &bucket,
+            vec![ObjectToDelete {
+                object_name: object.to_string(),
+                ..Default::default()
+            }],
+            ObjectOptions::default(),
+        );
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("batch delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached batch delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_object_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-single-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-single-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/single.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal(&bucket, object, ObjectOptions::default());
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("single delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached single delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn prefix_delete_serializes_with_concurrent_object_lock_metadata_updates() {

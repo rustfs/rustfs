@@ -468,7 +468,7 @@ pub mod event {
 pub mod global {
     pub use crate::runtime::global::{
         set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
-        update_erasure_type,
+        update_erasure_type, wait_for_detached_mutations,
     };
 }
 

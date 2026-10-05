@@ -502,7 +502,7 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, wait_for_detached_mutations,
     };
 }
 
@@ -1338,6 +1338,10 @@ where
 
 pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
+}
+
+pub(crate) async fn wait_for_detached_mutations(timeout: std::time::Duration) -> bool {
+    ecstore_global::wait_for_detached_mutations(timeout).await
 }
 
 pub(crate) fn shutdown_background_monitors() {

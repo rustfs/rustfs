@@ -75,7 +75,7 @@ use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream};
 use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
-use parking_lot::RwLock as ParkingLotRwLock;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     ValidationMode, get_file_info, read_xl_meta_no_data_sync,
@@ -102,7 +102,7 @@ use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -5138,7 +5138,7 @@ pub struct LocalDisk {
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
     file_sync_permits: Arc<Semaphore>,
-    snapshot_leases: Arc<Mutex<SnapshotLeaseRegistry>>,
+    snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -5176,6 +5176,47 @@ impl Drop for QuotaMutationFenceClaim {
 #[derive(Default)]
 struct SnapshotLeaseRegistry {
     entries: HashMap<SnapshotLeaseKey, SnapshotLeaseEntry>,
+}
+
+/// Owns the `deleting` flag of one registry entry while its physical delete
+/// runs. A delete future dropped before it finishes (a timeout or a cancelled
+/// caller) clears the flag, so a later lease release or volume settle retries
+/// the pending delete instead of skipping the entry forever.
+struct SnapshotLeaseDeleteClaim<'a> {
+    registry: &'a ParkingLotMutex<SnapshotLeaseRegistry>,
+    key: SnapshotLeaseKey,
+    finished: bool,
+}
+
+impl<'a> SnapshotLeaseDeleteClaim<'a> {
+    /// The caller must have set `deleting` on `key` under the registry lock.
+    fn new(registry: &'a ParkingLotMutex<SnapshotLeaseRegistry>, key: SnapshotLeaseKey) -> Self {
+        Self {
+            registry,
+            key,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, deleted: bool) {
+        self.finished = true;
+        let mut registry = self.registry.lock();
+        if deleted {
+            registry.entries.remove(&self.key);
+        } else if let Some(entry) = registry.entries.get_mut(&self.key) {
+            entry.deleting = false;
+        }
+    }
+}
+
+impl Drop for SnapshotLeaseDeleteClaim<'_> {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Some(entry) = self.registry.lock().entries.get_mut(&self.key)
+        {
+            entry.deleting = false;
+        }
+    }
 }
 
 impl Drop for LocalDisk {
@@ -5593,7 +5634,7 @@ impl LocalDisk {
             exit_signal: None,
             io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
-            snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
+            snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -6164,7 +6205,7 @@ impl LocalDisk {
             path: path.to_string(),
         };
         {
-            let mut registry = self.snapshot_leases.lock().await;
+            let mut registry = self.snapshot_leases.lock();
             if let Some(entry) = registry.entries.get_mut(&key) {
                 if !entry.tokens.is_empty() {
                     entry.pending_delete.get_or_insert_with(|| opts.clone());
@@ -6187,23 +6228,13 @@ impl LocalDisk {
                 );
             }
         }
+        let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
 
         let result = self
             .delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner)
             .await;
-        let mut registry = self.snapshot_leases.lock().await;
-        match result {
-            Ok(()) => {
-                registry.entries.remove(&key);
-                Ok(DataDirDeleteStatus::Deleted)
-            }
-            Err(err) => {
-                if let Some(entry) = registry.entries.get_mut(&key) {
-                    entry.deleting = false;
-                }
-                Err(err)
-            }
-        }
+        claim.finish(result.is_ok());
+        result.map(|()| DataDirDeleteStatus::Deleted)
     }
 
     async fn delete_version_inner(&self, volume: &str, path: &str, fi: FileInfo, mutation: DeleteVersionMutation) -> Result<()> {
@@ -9035,7 +9066,7 @@ impl LocalDisk {
             path: quota_mutation_fence_path(volume, path),
         };
         let state = {
-            let registry = self.snapshot_leases.lock().await;
+            let registry = self.snapshot_leases.lock();
             let entry = registry.entries.get(&key).ok_or(DiskError::FileNotFound)?;
             let state = entry.mutation_fence.as_ref().ok_or(DiskError::FileNotFound)?;
             if !entry.tokens.contains(&token) || state.revoked.load(Ordering::Acquire) {
@@ -9227,7 +9258,7 @@ impl LocalDisk {
     /// only path-based reopens observe the removal.
     async fn settle_pending_snapshot_deletes(&self, volume: &str) {
         let pending: Vec<(SnapshotLeaseKey, DeleteOptions)> = {
-            let mut registry = self.snapshot_leases.lock().await;
+            let mut registry = self.snapshot_leases.lock();
             registry
                 .entries
                 .iter_mut()
@@ -9238,26 +9269,22 @@ impl LocalDisk {
                 })
                 .collect()
         };
+        let pending: Vec<(SnapshotLeaseDeleteClaim<'_>, DeleteOptions)> = pending
+            .into_iter()
+            .map(|(key, opts)| (SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key), opts))
+            .collect();
 
-        for (key, opts) in pending {
-            let result = self.delete_unleased(&key.volume, &key.path, &opts).await;
-            let mut registry = self.snapshot_leases.lock().await;
-            match result {
-                Ok(()) => {
-                    registry.entries.remove(&key);
-                }
-                Err(err) => {
-                    if let Some(entry) = registry.entries.get_mut(&key) {
-                        entry.deleting = false;
-                    }
-                    warn!(
-                        volume = %key.volume,
-                        path = %key.path,
-                        error = %err,
-                        "failed to settle deferred data-dir deletion before volume removal"
-                    );
-                }
+        for (claim, opts) in pending {
+            let result = self.delete_unleased(&claim.key.volume, &claim.key.path, &opts).await;
+            if let Err(err) = &result {
+                warn!(
+                    volume = %claim.key.volume,
+                    path = %claim.key.path,
+                    error = %err,
+                    "failed to settle deferred data-dir deletion before volume removal"
+                );
             }
+            claim.finish(result.is_ok());
         }
     }
 }
@@ -10652,7 +10679,7 @@ impl DiskAPI for LocalDisk {
             path: path.to_string(),
         };
         if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
-            let mut registry = self.snapshot_leases.lock().await;
+            let mut registry = self.snapshot_leases.lock();
             let entry = registry.entries.entry(key).or_default();
             let state = entry
                 .mutation_fence
@@ -10668,7 +10695,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.io_get_object_path(volume, path)?;
         let _mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, volume, &file_path).await;
         let token = {
-            let mut registry = self.snapshot_leases.lock().await;
+            let mut registry = self.snapshot_leases.lock();
             if registry.entries.get(&key).is_some_and(|entry| entry.deleting) {
                 return Err(DiskError::FileNotFound);
             }
@@ -10696,7 +10723,7 @@ impl DiskAPI for LocalDisk {
         };
         if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
             if !token.is_revoke_all() {
-                let mut registry = self.snapshot_leases.lock().await;
+                let mut registry = self.snapshot_leases.lock();
                 let Some(entry) = registry.entries.get_mut(&key) else {
                     return Ok(());
                 };
@@ -10712,7 +10739,7 @@ impl DiskAPI for LocalDisk {
                 return Ok(());
             }
             let state = {
-                let mut registry = self.snapshot_leases.lock().await;
+                let mut registry = self.snapshot_leases.lock();
                 let Some(entry) = registry.entries.get_mut(&key) else {
                     return Ok(());
                 };
@@ -10733,11 +10760,11 @@ impl DiskAPI for LocalDisk {
                 }
                 notified.await;
             }
-            self.snapshot_leases.lock().await.entries.remove(&key);
+            self.snapshot_leases.lock().entries.remove(&key);
             return Ok(());
         }
         let opts = {
-            let mut registry = self.snapshot_leases.lock().await;
+            let mut registry = self.snapshot_leases.lock();
             let Some(entry) = registry.entries.get_mut(&key) else {
                 return Ok(());
             };
@@ -10753,20 +10780,10 @@ impl DiskAPI for LocalDisk {
             entry.deleting = true;
             opts
         };
+        let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
         let result = self.delete_unleased(volume, path, &opts).await;
-        let mut registry = self.snapshot_leases.lock().await;
-        match result {
-            Ok(()) => {
-                registry.entries.remove(&key);
-                Ok(())
-            }
-            Err(err) => {
-                if let Some(entry) = registry.entries.get_mut(&key) {
-                    entry.deleting = false;
-                }
-                Err(err)
-            }
-        }
+        claim.finish(result.is_ok());
+        result
     }
 
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
@@ -10774,7 +10791,7 @@ impl DiskAPI for LocalDisk {
             volume: volume.to_string(),
             path: path.to_string(),
         };
-        let mut registry = self.snapshot_leases.lock().await;
+        let mut registry = self.snapshot_leases.lock();
         let Some(entry) = registry.entries.get_mut(&key) else {
             return Err(DiskError::FileNotFound);
         };
@@ -15148,7 +15165,6 @@ mod test {
             let fence = disk
                 .snapshot_leases
                 .lock()
-                .await
                 .entries
                 .get(&SnapshotLeaseKey {
                     volume: RUSTFS_META_BUCKET.to_string(),
@@ -22227,6 +22243,79 @@ mod test {
             .await
             .expect("releasing an already released token should be idempotent");
         assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    // A data-dir delete dropped mid-flight (a DiskStore timeout or a cancelled
+    // caller) must hand its cleanup back instead of staying marked as deleting.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cancelled_data_dir_delete_releases_its_snapshot_lease_claim() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "snapshot-lease-cancel";
+        let data_dir = path_join_buf(&["object", &Uuid::new_v4().to_string()]);
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &path_join_buf(&[&data_dir, "part.1"]), Bytes::from_static(b"part"))
+            .await
+            .expect("shard should be written");
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path: data_dir.clone(),
+        };
+        let data_path = disk.io_get_object_path(volume, &data_dir).expect("data dir IO path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &data_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        let mut delete = Box::pin(disk.delete_data_dir(
+            volume,
+            &data_dir,
+            DeleteOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("delete should reach its physical rename"),
+                _ = delete.as_mut() => panic!("delete returned before its physical rename"),
+            }
+        })
+        .await
+        .expect("delete should start its physical rename");
+        assert!(
+            disk.snapshot_leases
+                .lock()
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.deleting)
+        );
+
+        drop(delete);
+        assert!(
+            disk.snapshot_leases
+                .lock()
+                .entries
+                .get(&key)
+                .is_some_and(|entry| !entry.deleting && entry.pending_delete.is_some()),
+            "a dropped delete must hand its pending cleanup back to the registry"
+        );
+        drop(release);
+        disk.settle_pending_snapshot_deletes(volume).await;
+        assert!(
+            !disk.snapshot_leases.lock().entries.contains_key(&key),
+            "the handed-back cleanup must be retried"
+        );
+        assert!(matches!(
+            disk.read_all(volume, &path_join_buf(&[&data_dir, "part.1"])).await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[tokio::test]
