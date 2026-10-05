@@ -13532,3 +13532,249 @@ async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
     assert_eq!(unchanged.metadata_location, current_location);
     assert_eq!(unchanged.generation, current.generation);
 }
+#[derive(Clone)]
+struct ColdStrongRegistrationBackend<B> {
+    inner: B,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    reader_ready: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+impl<B> ColdStrongRegistrationBackend<B> {
+    async fn pause_after_reader(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.reader_ready.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::TableCatalogObjectBackend
+    for ColdStrongRegistrationBackend<B>
+{
+    fn strong_catalog_runtime(&self) -> Option<crate::table_catalog::StrongTableCatalogRuntime> {
+        self.inner.strong_catalog_runtime()
+    }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        self.inner.acquires_catalog_migration_read_permit()
+    }
+
+    async fn acquire_catalog_migration_read_guards(
+        &self,
+        bucket: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableCatalogLockGuard>> {
+        let guards = self.inner.acquire_catalog_migration_read_guards(bucket).await?;
+        self.pause_after_reader().await;
+        Ok(guards)
+    }
+
+    async fn acquire_read_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
+        let guard = self.inner.acquire_read_lock(bucket, object).await?;
+        if object == crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path() {
+            self.pause_after_reader().await;
+        }
+        Ok(guard)
+    }
+
+    async fn acquire_write_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
+        self.inner.acquire_write_lock(bucket, object).await
+    }
+
+    async fn read_object(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        self.inner.read_object(bucket, object).await
+    }
+
+    async fn read_object_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        self.inner.read_object_unlocked(bucket, object).await
+    }
+
+    async fn read_object_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        self.inner.read_object_limited(bucket, object, max_size).await
+    }
+
+    async fn object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObjectMetadata>> {
+        self.inner.object_metadata(bucket, object).await
+    }
+
+    async fn object_exists(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
+        self.inner.object_exists(bucket, object).await
+    }
+
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner.put_object(bucket, object, data, precondition).await
+    }
+
+    async fn put_object_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        guards: Vec<crate::admin::storage_api::object::WriteCommitGuard>,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner
+            .put_object_unlocked(bucket, object, data, precondition, guards)
+            .await
+    }
+
+    async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner.delete_object(bucket, object).await
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner.delete_object_if_match(bucket, object, expected_etag).await
+    }
+
+    async fn list_objects(&self, bucket: &str, prefix: &str) -> crate::table_catalog::TableCatalogStoreResult<Vec<String>> {
+        self.inner.list_objects(bucket, prefix).await
+    }
+}
+
+#[tokio::test]
+async fn cold_strong_registration_completes_while_other_bucket_backup_waits() {
+    use crate::table_catalog::{
+        EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, StrongTableCatalogStore, TableCatalogPutPrecondition,
+    };
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cold-register-{}", Uuid::new_v4().simple());
+    let backup_bucket = format!("other-backup-{}", Uuid::new_v4().simple());
+    for bucket in [&bucket, &backup_bucket] {
+        object_store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create table bucket");
+        enable_table_bucket_marker(&object_store, bucket)
+            .await
+            .expect("enable table bucket marker");
+    }
+    let inner = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(object_store, StrongTableCatalogRuntime::default());
+    let backend = ColdStrongRegistrationBackend {
+        inner: inner.clone(),
+        armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        reader_ready: Arc::new(tokio::sync::Notify::new()),
+        resume: Arc::new(tokio::sync::Notify::new()),
+    };
+    let catalog = StrongTableCatalogStore::new(backend.clone());
+    for bucket in [&bucket, &backup_bucket] {
+        catalog
+            .put_table_bucket(table_bucket_entry_from_metadata_marker(bucket))
+            .await
+            .expect("seed durable table bucket");
+    }
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
+    catalog
+        .create_namespace(crate::table_catalog::NamespaceEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: bucket.clone(),
+            namespace: namespace.public_name(),
+            namespace_id: namespace.storage_id(),
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        })
+        .await
+        .expect("seed namespace");
+    let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table");
+    let location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    inner
+        .put_object(
+            &bucket,
+            &location,
+            serde_json::to_vec(&test_table_metadata_json(
+                "metadata-table-uuid",
+                &format!("s3://{bucket}/tables/table-id"),
+            ))
+            .expect("metadata JSON"),
+            TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .expect("seed valid metadata");
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    backend.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let registration_bucket = bucket.clone();
+    let mut registration = tokio::spawn(async move {
+        let result = register_table_response(
+            &catalog,
+            &publication,
+            &registration_bucket,
+            &namespace,
+            RegisterTableRequest {
+                name: "events".to_string(),
+                metadata_location: location,
+                overwrite: false,
+            },
+            true,
+        )
+        .await;
+        publication.finish(result).await
+    });
+    tokio::time::timeout(StdDuration::from_secs(5), backend.reader_ready.notified())
+        .await
+        .expect("registration holds first real global reader");
+    // The backup targets another bucket, so its documented writer-drain precondition is met.
+    let backup_catalog = StrongTableCatalogStore::new(inner);
+    let mut backup = Box::pin(backup_catalog.create_durable_catalog_backup(&backup_bucket, None));
+    assert!(
+        futures::poll!(backup.as_mut()).is_pending(),
+        "actual backup writer must queue behind held registration reader"
+    );
+    backend.resume.notify_one();
+    let result = tokio::time::timeout(StdDuration::from_secs(2), &mut registration).await;
+    if result.is_err() {
+        // Prove that the queued backup, rather than ECStore I/O latency, caused the stall.
+        drop(backup);
+        tokio::time::timeout(StdDuration::from_secs(5), &mut registration)
+            .await
+            .expect("registration must resume once only the queued backup is cancelled")
+            .expect("registration control joins")
+            .expect("registration control succeeds");
+        panic!("cold registration stalled behind a queued backup while retaining its own global reader");
+    }
+    result
+        .expect("registration should complete without a recursive global read")
+        .expect("registration joins")
+        .expect("registration succeeds");
+    tokio::time::timeout(StdDuration::from_secs(5), backup)
+        .await
+        .expect("the other bucket backup should resume when registration releases its reader")
+        .expect("the other bucket backup succeeds");
+}

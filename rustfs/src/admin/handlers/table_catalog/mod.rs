@@ -1848,6 +1848,10 @@ where
             && publication.guards.iter().all(|guard| !guard.is_lock_lost())
     }
 
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        self.backend.acquires_catalog_migration_read_permit()
+    }
+
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         let publication = self.publication.lock();
         publication

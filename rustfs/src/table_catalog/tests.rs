@@ -2279,7 +2279,7 @@ async fn snapshot_validation_accepts_non_parquet_partition_statistics() {
     current["current-snapshot-id"] = serde_json::Value::from(10);
     current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let mut target = current.clone();
-    let statistics = b"notparquet".to_vec();
+    let statistics = b"ORC".to_vec();
     target["partition-statistics"] = serde_json::json!([{
         "snapshot-id": 10,
         "statistics-path": "s3://warehouse/tables/table-id/metadata/partition-stats.parquet",
@@ -4063,7 +4063,7 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     metadata["statistics"] = serde_json::json!([{
         "snapshot-id": 10,
         "statistics-path": format!("s3://{bucket}/{statistics_location}"),
-        "file-size-in-bytes": 8,
+        "file-size-in-bytes": 12,
         "file-footer-size-in-bytes": 0,
         "blob-metadata": []
     }]);
@@ -4079,7 +4079,9 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     backend
         .seed_object(bucket, &manifest_list_location, manifest_list_avro_bytes(&[]))
         .await;
-    backend.seed_object(bucket, &statistics_location, b"PFA1PFA1".to_vec()).await;
+    backend
+        .seed_object(bucket, &statistics_location, b"PFA1old!PFA1".to_vec())
+        .await;
     backend
         .seed_object(bucket, &partition_statistics_location, b"ORC".to_vec())
         .await;
@@ -4096,7 +4098,9 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     let backup = store.create_durable_catalog_backup(bucket, None).await.unwrap();
     assert_eq!(backup.object_count, 4);
 
-    backend.seed_object(bucket, &statistics_location, b"PFA1new!".to_vec()).await;
+    backend
+        .seed_object(bucket, &statistics_location, b"PFA1new!PFA1".to_vec())
+        .await;
     let error = store
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
@@ -4113,6 +4117,7 @@ async fn durable_catalog_backup_rejects_incomplete_snapshot_graph() {
     let table = IdentifierSegment::parse("orders").unwrap();
     let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
     let mut metadata = table_metadata_json_for_backup(bucket, "table-id", "table-uuid");
+    metadata["last-sequence-number"] = serde_json::Value::from(1);
     metadata["snapshots"] = serde_json::json!([{
         "snapshot-id": 10,
         "sequence-number": 1,

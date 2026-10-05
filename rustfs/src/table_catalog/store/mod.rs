@@ -445,6 +445,11 @@ pub(crate) trait TableCommitPublication: Send + Sync {
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
+    /// Whether bucket publication acquires its own migration read permits.
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
+    }
+
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -609,9 +614,10 @@ impl TableCatalogLockGuard {
     }
 
     fn write_namespace(guard: WriteCommitGuard) -> Self {
+        let lock_lost = guard.lock_lost_signal();
         Self {
             _guard: Box::new(()),
-            lock_lost: None,
+            lock_lost,
             write_commit_guard: Some(guard),
         }
     }
@@ -878,6 +884,11 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         false
     }
 
+    /// Whether bucket publication acquires its own migration read permits.
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
+    }
+
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -998,6 +1009,10 @@ where
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
         self.table_commit_publication_is_held(table_bucket, namespace, table)
+    }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        TableCatalogObjectBackend::acquires_catalog_migration_read_permit(self)
     }
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
@@ -1990,6 +2005,10 @@ where
         Some(self.strong_runtime.clone())
     }
 
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        true
+    }
+
     async fn acquire_catalog_migration_read_guards(
         &self,
         table_bucket: &str,
@@ -2394,5 +2413,121 @@ where
             fence.ensure_held()?;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct RecordingLeaseClient {
+        inner: rustfs_lock::LocalClient,
+        acquired: Mutex<Option<LockId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for RecordingLeaseClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> rustfs_lock::Result<LockResponse> {
+            let response = self.inner.acquire_lock(request).await?;
+            if let Some(info) = response.lock_info.as_ref() {
+                *self.acquired.lock().expect("record lease") = Some(info.id.clone());
+            }
+            Ok(response)
+        }
+        async fn release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.release(id).await
+        }
+        async fn refresh(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.refresh(id).await
+        }
+        async fn force_release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.force_release(id).await
+        }
+        async fn check_status(&self, id: &LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            self.inner.check_status(id).await
+        }
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            self.inner.get_stats().await
+        }
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            self.inner.close().await
+        }
+        async fn is_online(&self) -> bool {
+            self.inner.is_online().await
+        }
+        async fn is_local(&self) -> bool {
+            self.inner.is_local().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_writer_loss_prevents_recovery_storage_commit() {
+        let (_temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let bucket = "catalog-fence-loss-probe";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("make probe bucket");
+        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
+        let client = Arc::new(RecordingLeaseClient {
+            inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+                rustfs_lock::FastObjectLockManager::new(),
+            )))),
+            acquired: Mutex::new(None),
+        });
+        let lock = rustfs_lock::NamespaceLockWrapper::new(
+            rustfs_lock::NamespaceLock::with_clients_and_quorum(
+                "catalog-probe".to_string(),
+                vec![client.clone() as Arc<dyn LockClient>],
+                1,
+            ),
+            rustfs_lock::ObjectKey::new(bucket, default_table_bucket_publication_lock_path()),
+            "catalog-backup-probe".to_string(),
+        );
+        // These are the exact acquisition and conversion used by the production
+        // EcStoreTableCatalogObjectBackend::acquire_write_lock implementation.
+        let owner = WriteCommitGuard::acquire(&lock, Duration::from_secs(5))
+            .await
+            .expect("acquire distributed writer");
+        let guard = TableCatalogLockGuard::write_namespace(owner);
+        let fence = TableCatalogObjectMutationFence::from_signals([guard.lock_lost_signal()]);
+        assert!(!guard.is_lock_lost(), "models backup's last outer fencing check");
+        let id = client
+            .acquired
+            .lock()
+            .expect("lease recorded")
+            .clone()
+            .expect("actual lease acquired");
+        assert!(client.force_release(&id).await.expect("force-release lease"));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !guard.is_lock_lost() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual heartbeat must observe released distributed lease");
+        let result = backend
+            .put_object_fenced(
+                bucket,
+                "recovery-artifact.json",
+                b"stale recovery artifact".to_vec(),
+                TableCatalogPutPrecondition::IfAbsent,
+                &fence,
+            )
+            .await;
+        let persisted = backend
+            .read_object(bucket, "recovery-artifact.json")
+            .await
+            .expect("read real persisted object");
+        assert!(
+            result.is_err() && persisted.is_none(),
+            "lost publication writer must prevent storage commit; result={result:?}, persisted={}",
+            persisted.is_some()
+        );
     }
 }

@@ -2358,6 +2358,7 @@ where
                     "table-bucket catalog migration read permit was lost".to_string(),
                 ));
             }
+            None if publication.acquires_catalog_migration_read_permit() => None,
             None => Some(self.acquire_snapshot_write_permit().await?),
         };
         publication.begin_table_bucket(&entry.table_bucket).await?;
@@ -2670,6 +2671,7 @@ where
                     "table-bucket catalog migration read permit was lost".to_string(),
                 ));
             }
+            None if publication.acquires_catalog_migration_read_permit() => None,
             None => Some(self.acquire_snapshot_write_permit().await?),
         };
         let commit_started = Instant::now();
@@ -2957,6 +2959,7 @@ where
                     "table-bucket catalog migration read permit was lost".to_string(),
                 ));
             }
+            None if publication.acquires_catalog_migration_read_permit() => None,
             None => Some(self.acquire_snapshot_write_permit().await?),
         };
         publication.begin_table_bucket(&entry.table_bucket).await?;
@@ -3089,6 +3092,7 @@ where
                     "table-bucket catalog migration read permit was lost".to_string(),
                 ));
             }
+            None if table_bucket_fence_required && publication.acquires_catalog_migration_read_permit() => None,
             None => Some(self.acquire_snapshot_write_permit().await?),
         };
         if table_bucket_fence_required {
