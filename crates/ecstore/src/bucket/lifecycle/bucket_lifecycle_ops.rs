@@ -5885,6 +5885,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::expiry_worker_count;
+    use super::lifecycle_transition_publication_guard;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -13073,7 +13074,7 @@ mod tests {
     #[serial]
     async fn queued_noncurrent_batch_expiry_does_not_delete_from_table_bucket() {
         let (_disk_paths, ecstore) = setup_test_env().await;
-        let bucket = format!("table-bucket-noncurrent-lifecycle-{}", Uuid::new_v4().simple());
+        let bucket = format!("table-noncurrent-lifecycle-{}", Uuid::new_v4().simple());
         let object = "tables/table-id/data/part-00001.parquet";
         create_test_bucket(&ecstore, &bucket).await;
         metadata_sys::update_in(
@@ -13190,7 +13191,7 @@ mod tests {
     #[serial]
     async fn lifecycle_transition_admission_holds_publication_reader() {
         let (_disk_paths, ecstore) = setup_test_env().await;
-        let bucket = format!("lifecycle-transition-publication-{}", Uuid::new_v4().simple());
+        let bucket = format!("lifecycle-transition-{}", Uuid::new_v4().simple());
         let object = "tables/table-id/data/part-00001.parquet";
         create_test_bucket(&ecstore, &bucket).await;
         let object_info = ObjectInfo {

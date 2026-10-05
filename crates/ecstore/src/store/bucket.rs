@@ -3349,7 +3349,7 @@ mod tests {
     #[serial]
     async fn bucket_delete_waits_for_table_publication_readers() {
         let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
-        let bucket = format!("bucket-delete-publication-fence-{}", Uuid::new_v4().simple());
+        let bucket = format!("bucket-delete-publication-{}", Uuid::new_v4().simple());
         ecstore
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
