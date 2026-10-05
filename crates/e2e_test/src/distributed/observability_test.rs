@@ -184,7 +184,7 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
         let (status, metrics_body) = admin_request(
             &node.url,
             Method::GET,
-            "/rustfs/admin/v3/metrics?n=1&by-host=true&by-disk=true",
+            "/rustfs/admin/v3/realtime?n=1&by-host=true&by-disk=true",
             None,
             &dist.cluster.access_key,
             &dist.cluster.secret_key,
@@ -257,7 +257,7 @@ async fn node_admin_body(dist: &DistCluster, node: usize, path: &str) -> TestRes
 }
 
 async fn http_put_counts(dist: &DistCluster, node: usize) -> TestResult<[u64; 2]> {
-    let body = node_admin_body(dist, node, "/rustfs/admin/v3/metrics?types=512&by-host=true&n=1").await?;
+    let body = node_admin_body(dist, node, "/rustfs/admin/v3/realtime?types=512&by-host=true&n=1").await?;
     let sample: RealtimeMetrics = serde_json::from_str(body.lines().next().ok_or("empty HTTP metrics stream")?)?;
     assert!(sample.errors.is_empty(), "HTTP metrics returned errors: {:?}", sample.errors);
     let http = sample.aggregated.http.ok_or("HTTP metrics missing at WARN log level")?;
@@ -400,17 +400,36 @@ async fn verify_write_observations_during_peer_failure(dist: &DistCluster, bucke
             let observations = storage["info"]["observations"]
                 .as_array()
                 .ok_or("recovery omitted observations")?;
+            let disks = storage["info"]["disks"].as_array().ok_or("recovery omitted disks")?;
             Ok(observations.len() == 4
                 && observations
                     .iter()
-                    .all(|item| item["status"] == "succeeded" && item["cached"] == false))
+                    .all(|item| item["status"] == "succeeded" && item["cached"] == false)
+                && disks.len() == 16
+                && disks.iter().all(|disk| {
+                    disk["state"].as_str().is_some_and(|state| state.eq_ignore_ascii_case("ok"))
+                        && disk["runtimeState"]
+                            .as_str()
+                            .is_some_and(|state| state.eq_ignore_ascii_case("online"))
+                }))
         },
-        "peer probes recover to fresh successful observations",
+        "peer probes and remote disks recover to fresh successful observations",
     )
     .await?;
     wait_for_ready(&dist.cluster).await?;
-    assert!(observed_put(dist, 0, bucket, "recovered").await?.is_success());
-    assert_eq!(http_put_counts(dist, 0).await?, [baseline[0][0] + 1, baseline[0][1] + 2]);
+    let recovered_before = http_put_counts(dist, 0).await?;
+    wait_until(
+        Duration::from_secs(90),
+        || async { Ok(observed_put(dist, 0, bucket, "recovered").await?.is_success()) },
+        "recovered PUT after remote disk and lock convergence",
+    )
+    .await?;
+    let recovered_after = http_put_counts(dist, 0).await?;
+    assert_eq!(recovered_after[0], recovered_before[0] + 1);
+    assert!(
+        recovered_after[1] >= baseline[0][1] + 2,
+        "recovery retries must retain the two intentional sub-quorum failures: before={recovered_before:?}, after={recovered_after:?}"
+    );
     for node in 0..dist.cluster.nodes.len() {
         assert_object_bytes(&dist.client(node)?, bucket, "healthy-0", b"write-observation").await?;
         assert_object_bytes(&dist.client(node)?, bucket, "recovered", b"write-observation").await?;

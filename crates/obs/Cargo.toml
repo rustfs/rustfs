@@ -74,11 +74,11 @@ hotpath-cpu = [
 # Tokio runtime-level telemetry. Requires a `--cfg tokio_unstable` build; the
 # build script fails the compile when that flag is missing. Off by default so
 # ordinary builds neither pay for nor depend on Tokio's unstable API.
-dial9 = ["dep:dial9-tokio-telemetry", "dial9-tokio-telemetry/process-resource"]
+dial9 = ["dep:dial9"]
 #
 # NOTE: there is deliberately no `dial9-taskdump` feature. dial9 only captures a
 # task dump for futures it wrapped itself, i.e. those spawned via
-# `dial9_tokio_telemetry::spawn`. RustFS spawns with `tokio::spawn` throughout,
+# `dial9::spawn`. RustFS spawns with `tokio::spawn` throughout,
 # so enabling `tokio/taskdump` would cost a Linux-only build constraint and
 # record nothing. Measured on an identical workload: 0 dumps via `tokio::spawn`,
 # 14709 via `dial9::spawn`. Re-adding this feature only makes sense together
@@ -139,6 +139,7 @@ opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["gzip-http", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 percent-encoding = { workspace = true }
+reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
@@ -149,7 +150,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "traci
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }
 url.workspace = true
-dial9-tokio-telemetry = { workspace = true, optional = true }
+dial9 = { workspace = true, optional = true, features = ["tokio", "process-resource"] }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 sysinfo = { workspace = true }
@@ -167,3 +168,8 @@ tempfile = { workspace = true }
 temp-env = { workspace = true }
 log.workspace = true
 metrics-util = { workspace = true, features = ["debugging"] }
+rcgen.workspace = true
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-rustls = { workspace = true, default-features = false, features = ["aws-lc-rs"] }

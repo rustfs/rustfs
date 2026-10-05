@@ -243,7 +243,11 @@ pub fn encode_durable_dirty_usage_producer_replay_record(
         entries,
     };
     validate_durable_dirty_usage_replay_record(&record)?;
-    serde_json::to_vec(&record).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)
+    let bytes = serde_json::to_vec(&record).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)?;
+    if bytes.len() > SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
+        return Err(ScannerDurableDirtyUsageReplayError::ByteLimit);
+    }
+    Ok(bytes)
 }
 
 pub fn replay_durable_dirty_usage_producer_record(
@@ -662,6 +666,24 @@ mod scoped_dirty_usage_tests {
     }
 
     #[test]
+    fn durable_dirty_usage_encoder_rejects_unreplayable_byte_size() {
+        let entries = (0..3)
+            .map(|bucket| ScannerDurableDirtyUsageReplayEntry {
+                bucket: format!("bucket-{bucket}"),
+                generation: 7,
+                scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                    entries: (0..128).map(|entry| format!("{entry:03}{}", "x".repeat(197))).collect(),
+                },
+                producers: BTreeSet::from([SegmentInvalidationProducerIdentity::PutObject]),
+            })
+            .collect();
+        assert_eq!(
+            encode_durable_dirty_usage_producer_replay_record(entries),
+            Err(ScannerDurableDirtyUsageReplayError::ByteLimit)
+        );
+    }
+
+    #[test]
     #[serial]
     fn durable_dirty_usage_replay_rejects_invalid_records_without_partial_state() {
         let valid_entry = ScannerDurableDirtyUsageReplayEntry {
@@ -999,6 +1021,11 @@ pub fn scanner_dirty_usage_state() -> ScannerDirtyUsageState {
         generation: DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
         pending: !dirty_buckets.is_empty(),
     }
+}
+
+/// Read one bucket generation without allocating a cluster-wide snapshot.
+pub fn scanner_dirty_usage_bucket_generation(bucket: &str) -> Option<u64> {
+    dirty_usage_buckets().get(bucket).copied()
 }
 
 pub fn scanner_dirty_usage_snapshot(max_entries: usize) -> ScannerDirtyUsageSnapshot {

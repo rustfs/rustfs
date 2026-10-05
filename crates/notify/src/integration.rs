@@ -372,6 +372,19 @@ impl NotificationSystem {
         self.services.config_manager.lifecycle().is_converged()
     }
 
+    /// Validates a bucket notification configuration against the runtime targets
+    /// without publishing it, so callers can reject a request before persisting.
+    pub async fn validate_bucket_notification_config(
+        &self,
+        bucket: &str,
+        cfg: &BucketNotificationConfig,
+    ) -> Result<(), NotificationError> {
+        self.services
+            .bucket_config_manager
+            .validate_bucket_notification_config(bucket, cfg)
+            .await
+    }
+
     /// Loads the bucket notification configuration
     pub async fn load_bucket_notification_config(
         &self,

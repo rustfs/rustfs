@@ -15,7 +15,7 @@ import subprocess
 
 from resolve_functional_candidate import ROOT, positive, require, sha, validate_manifest
 
-SUITES = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication", "performance")
+SUITES = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication", "fault-tolerance", "table", "performance")
 MAX_REPORT = 8 * 1024 * 1024
 
 
@@ -28,7 +28,12 @@ def current_chain():
     require(sha(chain["workflow_sha"]) and chain["workflow_sha"] == os.environ["GITHUB_SHA"], "chain workflow source mismatch")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     require(head == chain["workflow_sha"], "lane checkout differs from chain workflow source")
-    require(chain["testing_sha"] == (ROOT / ".config/functional-script-revision.txt").read_text().strip() and sha(chain["testing_sha"]), "private script pin differs from chain")
+    # testing_sha is either the committed pin or auto-testing main HEAD via
+    # resolve_functional_candidate.py's >24h staleness fallback, so pin
+    # equality is no longer an invariant (the 09-21 chain died on exactly
+    # that check once the fallback finally fired). Lanes check out exactly
+    # this sha, which is what the format check guards.
+    require(sha(chain["testing_sha"]), "private script revision is not a valid commit sha")
     candidate = chain["candidate"]
     require(isinstance(candidate, dict) and set(candidate) == {"manifest", "artifact_id", "artifact_digest", "workflow_sha", "workflow_ref", "build_started_at"}, "invalid candidate envelope")
     manifest = candidate["manifest"]
@@ -85,17 +90,56 @@ def report_counts(text, performance=False):
     return counts
 
 
+def fault_tolerance_counts(text):
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "UNSUPPORTED": 0, "RUNNING": 0}
+    statuses = {"pass": "PASS", "known-divergence": "UNSUPPORTED", "UNEXPECTED": "FAIL"}
+    cases = set()
+    summary = None
+    for line in text.splitlines():
+        if line.startswith("FT-CASE:"):
+            match = re.fullmatch(r"FT-CASE:\s+(\S+)\s+verdict=(\S+)\s+.*", line)
+            require(match is not None and summary is None, "invalid or late fault-tolerance case")
+            case, status = match.groups()
+            require(case not in cases and status in statuses, "duplicate or unknown fault-tolerance case result")
+            cases.add(case)
+            counts[statuses[status]] += 1
+        elif line.startswith("FT-SUMMARY:"):
+            match = re.fullmatch(r"FT-SUMMARY: unexpected=(\d+) known-divergence=(\d+) strict=([01])", line)
+            require(match is not None and summary is None, "invalid or duplicate fault-tolerance summary")
+            summary = tuple(map(int, match.groups()))
+    require(cases and summary is not None, "missing completed fault-tolerance evidence")
+    require(summary[:2] == (counts["FAIL"], counts["UNSUPPORTED"]), "fault-tolerance summary disagrees with cases")
+    require(not summary[2] or not counts["UNSUPPORTED"], "strict fault-tolerance run has known divergence")
+    return counts
+
+
+def auto_testing_dir():
+    """Locate the auto-testing checkout. Lanes that run this script from a
+    subdirectory checkout (security keeps its rustfs clone in rustfs-repo/)
+    still check auto-testing out at the workspace root, so ROOT alone is not
+    always the right base."""
+    candidates = [ROOT / "auto-testing"]
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        candidates.append(Path(workspace) / "auto-testing")
+    for candidate in candidates:
+        if (candidate / ".git").exists():
+            return candidate
+    return candidates[0]
+
+
 def record(chain, suite, report, output):
     require(suite in SUITES, "unknown suite")
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
     error = None
     try:
-        private_head = subprocess.check_output(["git", "-C", "auto-testing", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        private_head = subprocess.check_output(["git", "-C", str(auto_testing_dir()), "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         require(private_head == chain["testing_sha"], "suite used a different private script revision")
         require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
         data = report.read_bytes()
         result["report_sha256"] = hashlib.sha256(data).hexdigest()
-        result["counts"] = report_counts(data.decode("utf-8"), suite == "performance")
+        text = data.decode("utf-8")
+        result["counts"] = fault_tolerance_counts(text) if suite == "fault-tolerance" else report_counts(text, suite == "performance")
         require(result["counts"]["PASS"] > 0 and not result["counts"]["FAIL"] and not result["counts"]["RUNNING"], "no passing executions or incomplete/failed cases")
         require(all(os.environ[key] == "success" for key in ("CHAIN_JOB_STATUS", "CHAIN_TEST_OUTCOME", "CHAIN_REPORT_OUTCOME")), "suite, report or job did not succeed")
         result["valid"] = True

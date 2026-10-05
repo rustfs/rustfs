@@ -23,9 +23,12 @@ use crate::admin::{
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::object_store_from_extensions,
     runtime_sources::{AppContext, app_context_from_req},
     service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
+    storage_api::contract::bucket::{BucketOperations, BucketOptions},
 };
+use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
 use crate::server::{
     ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
 };
@@ -37,8 +40,9 @@ use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::{error, info, warn};
@@ -219,7 +223,99 @@ pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> s
         AdminOperation(&ListTargetsArns {}),
     )?;
 
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/subscriptions").as_str(),
+        AdminOperation(&ListTargetSubscriptions {}),
+    )?;
+
     Ok(())
+}
+
+#[derive(Serialize, Debug)]
+struct TargetSubscription {
+    bucket: String,
+    id: Option<String>,
+    events: Vec<String>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+pub struct ListTargetSubscriptions {}
+
+#[async_trait::async_trait]
+impl Operation for ListTargetSubscriptions {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        let (target_type, target_name) = extract_target_params(&params)?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
+        };
+        let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
+        let target_arn = rustfs_targets::arn::TargetID::new(target_name.to_string(), target_type.to_string())
+            .to_arn(&region)
+            .to_string();
+        let buckets = store
+            .list_bucket(&BucketOptions::default())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to list buckets: {e}")))?;
+        let mut subscriptions = Vec::new();
+        for bucket in buckets {
+            let Some(config) = get_notification_config(&bucket.name).await.map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load notification config: {e}"))
+            })?
+            else {
+                continue;
+            };
+            let value = serde_json::to_value(config).map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
+            })?;
+            for key in [
+                "queue_configurations",
+                "topic_configurations",
+                "lambda_function_configurations",
+            ] {
+                if let Some(entries) = value.get(key).and_then(Value::as_array) {
+                    for entry in entries {
+                        let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
+                            .iter()
+                            .find_map(|field| entry.get(field).and_then(Value::as_str));
+                        if arn != Some(target_arn.as_str()) {
+                            continue;
+                        }
+                        let filters = entry
+                            .get("filter")
+                            .and_then(|v| v.get("key"))
+                            .and_then(|v| v.get("filter_rules"))
+                            .and_then(Value::as_array);
+                        let filter_value = |name: &str| {
+                            filters.and_then(|rules| {
+                                rules.iter().find_map(|rule| {
+                                    (rule.get("name").and_then(Value::as_str) == Some(name))
+                                        .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
+                                        .flatten()
+                                })
+                            })
+                        };
+                        subscriptions.push(TargetSubscription {
+                            bucket: bucket.name.clone(),
+                            id: entry.get("id").and_then(Value::as_str).map(str::to_string),
+                            events: entry
+                                .get("events")
+                                .and_then(Value::as_array)
+                                .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                                .unwrap_or_default(),
+                            prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
+                            suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
+                        });
+                    }
+                }
+            }
+        }
+        let data = serde_json::to_vec(&subscriptions)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+    }
 }
 
 #[derive(Debug, Deserialize)]

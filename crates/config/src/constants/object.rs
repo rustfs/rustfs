@@ -116,6 +116,20 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Create independent shard commitments for new writes after the fleet is upgraded.
+/// Existing protected objects and multipart uploads retain their protection.
+pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
+pub const DEFAULT_SHARD_INTEGRITY_WRITE: bool = false;
+
+/// Operator confirmation that every reader, writer and background coordinator
+/// understands independent shard commitments. This is not capability discovery
+/// or a fence against an old binary rejoining the fleet.
+pub const ENV_SHARD_INTEGRITY_FLEET_CONFIRMED: &str = "RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED";
+pub const DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_WRITE);
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED);
+
 /// How object writes treat a bucket whose stored versioning configuration
 /// cannot be parsed: `permissive` writes as if unversioned (the historical
 /// behavior, recorded by metrics and an error log) and `strict` refuses the
@@ -350,11 +364,14 @@ const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
 
-/// Maximum automatic foreground write requests admitted concurrently per process.
+/// Explicit maximum foreground write requests admitted concurrently per process.
 ///
-/// `0` derives a conservative default from the local disk-read scheduler cap,
-/// currently clamped to protect the commit path without making ordinary high
-/// throughput uploads single-file.
+/// `0` derives up to 32 large-write slots from the local disk-read scheduler.
+/// Each automatic slot has eight units: a gated direct PUT or unknown-size
+/// part uses all eight, while a known-size part uses one unit per 8 MiB,
+/// rounded up and capped at eight. Thus stock settings share one budget across
+/// at most 32 large/unknown writes or 256 parts of up to 8 MiB. A positive
+/// override retains request-count semantics for every gated write.
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: usize = 0;
 
@@ -370,7 +387,9 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 32 * 10
 /// Multipart pressure is often many moderate-sized parts rather than one very
 /// large request. The default gates every multipart part through the same permit
 /// pool as large/unknown-size PutObject while keeping small direct PUTs on the
-/// legacy path.
+/// legacy path. Server-side UploadPartCopy requests use this same multipart
+/// admission path with unknown-size weighting because source metadata and range
+/// validation happen after admission.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
@@ -398,7 +417,9 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
 /// wait with a 10 s request deadline. The wait must leave margin under the
 /// shortest of those, not merely fall below an SDK default, so the part
 /// receives S3 `SlowDown`/503 for the client to retry instead of losing its
-/// connection (issue #7385). `0` rejects immediately when the pool is full.
+/// connection (issue #7385). Server-side UploadPartCopy waits in the same queue
+/// before taking bucket lifecycle locks or opening source readers. `0` rejects
+/// immediately when the pool is full.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_000;
@@ -410,7 +431,7 @@ pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_0
 // the wait past any client timeout.
 const _: () = assert!(DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS * 3 <= 30_000);
 
-/// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
+/// Maximum multipart UploadPart or UploadPartCopy requests waiting for a foreground write permit per process.
 ///
 /// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
 /// waiting, so a genuinely saturated node still fails fast instead of holding
@@ -648,6 +669,15 @@ pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DET
 
 /// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
 pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
+
+/// Environment variable for the maximum number of in-flight lock acquisition
+/// RPCs admitted to one peer. Requests beyond this bound fail fast as
+/// retryable contention so a slow endpoint cannot accumulate an unbounded
+/// queue while its channel remains healthy.
+pub const ENV_OBJECT_LOCK_RPC_REQUEST_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_REQUEST_LIMIT";
+
+/// Default per-peer in-flight lock acquisition RPC admission limit.
+pub const DEFAULT_OBJECT_LOCK_RPC_REQUEST_LIMIT: usize = 128;
 
 /// Environment variable to enable object namespace lock diagnostics.
 ///

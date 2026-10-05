@@ -26,18 +26,20 @@ async fn create_cohort_bucket_objects(store: &ECStore, bucket: &str, objects: us
         .expect("fixture bucket");
     for set in store.all_set_disks() {
         for index in 0..objects {
+            let object = format!("object-{index:04}");
             let mut reader = ScannerPutObjReader::from_vec(b"cohort".to_vec());
-            set.put_object(
-                bucket,
-                &format!("object-{index:04}"),
-                &mut reader,
-                &ScannerObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("fixture object and all rename tails should persist");
+            let lock = set.new_ns_lock(bucket, &object).await.expect("fixture namespace lock");
+            let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+                .await
+                .expect("fixture write owner");
+            let mut opts = ScannerObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            opts.add_write_commit_guard(&guard);
+            set.put_object(bucket, &object, &mut reader, &opts)
+                .await
+                .expect("fixture object and all rename tails should persist");
         }
     }
 }

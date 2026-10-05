@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `dial9-tokio-telemetry` integration, compiled when the `dial9` feature is on.
+//! `dial9` integration, compiled when the `dial9` feature is on.
 //!
 //! Captures Tokio runtime-level events (poll start/end, worker park/unpark,
 //! task spawn/terminate) into rotating binary trace segments. This is an
@@ -23,9 +23,8 @@ use super::config::Dial9Config;
 use super::state::{dial9_runtime_state, measure_disk_usage_bytes};
 use super::{EVENT_DIAL9_STATE, LOG_COMPONENT_OBS, LOG_SUBSYSTEM_DIAL9};
 use crate::TelemetryError;
-use dial9_tokio_telemetry::telemetry::{
-    Dial9Handle, Dial9HandleTokioExt, DiskBuffer, ProcessResourceUsageConfig, RecorderPerfExt, TokioAttachOptions, recorder,
-};
+use dial9::process::ProcessResourceUsageConfig;
+use dial9::{Dial9Handle, Dial9HandleTokioExt, DiskBuffer, RecorderPerfExt, TokioAttachOptions, recorder};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -134,7 +133,7 @@ pub fn build_traced_runtime(
         .map(|runtime| (runtime, guard, shutdown));
 
     // No task dumps here. dial9 captures a task dump only for futures it
-    // wrapped itself, i.e. those spawned via `dial9_tokio_telemetry::spawn`;
+    // wrapped itself, i.e. those spawned via `dial9::spawn`;
     // `tokio::spawn` gets no wrapper. RustFS spawns with `tokio::spawn`
     // throughout, so enabling task dumps records nothing. Measured on an
     // identical workload: 0 dumps via `tokio::spawn`, 14709 via `dial9::spawn`.

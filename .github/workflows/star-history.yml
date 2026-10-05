@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: overtrue/repo-visuals-action@ee2c632f6ce617e851fb46ea935ee8af762ebb93 # v1.4.0

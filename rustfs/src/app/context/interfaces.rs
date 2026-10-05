@@ -73,6 +73,13 @@ pub trait OutboundTlsRuntimeInterface: Send + Sync {
 pub trait NotifyInterface: Send + Sync {
     async fn notify(&self, args: EventArgs);
 
+    async fn validate_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError>;
+
     async fn add_event_specific_rules(
         &self,
         bucket_name: &str,

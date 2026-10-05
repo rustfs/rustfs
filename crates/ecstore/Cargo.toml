@@ -176,7 +176,7 @@ regex = { workspace = true }
 path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
-tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat", "rt"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -208,7 +208,6 @@ aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a",
 urlencoding = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 shadow-rs = { workspace = true, default-features = false }
-async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
@@ -223,11 +222,13 @@ aws-smithy-http-client = { workspace = true, default-features = false, features 
 # Observability and Metrics
 metrics = { workspace = true }
 
-# Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
-# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only.
+# The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.2.2"
+# SharedReadBudget and the bounded read APIs are available in the 0.3.0
+# registry release; keep the application on the published contract.
+rustfs-uring = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
@@ -280,6 +281,10 @@ harness = false
 
 [[bench]]
 name = "single_block_non_inline_benchmark"
+harness = false
+
+[[bench]]
+name = "multipart_read_parts_benchmark"
 harness = false
 
 [lib]

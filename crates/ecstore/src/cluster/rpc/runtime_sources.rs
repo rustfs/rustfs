@@ -14,10 +14,10 @@
 
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_RESPONSE,
-    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM,
-    INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-    global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use std::time::Duration;
 
@@ -69,6 +69,28 @@ pub(crate) fn record_remote_disk_grpc_write_all_request() {
 pub(crate) fn record_remote_disk_grpc_write_all_sent_bytes(bytes: usize) {
     global_internode_metrics().record_sent_bytes_for_operation_and_backend(
         INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        bytes,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_compare_and_update_file_error() {
+    global_internode_metrics().record_error_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_compare_and_update_file_request() {
+    global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_compare_and_update_file_sent_bytes(bytes: usize) {
+    global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
         INTERNODE_TRANSPORT_BACKEND_GRPC,
         bytes,
     );

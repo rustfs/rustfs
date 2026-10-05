@@ -17,7 +17,7 @@ use datafusion::object_store::{Error, Result};
 use futures::{Stream, StreamExt, stream::BoxStream};
 use transform_stream::AsyncTryStream;
 
-use crate::SelectError;
+use crate::{SelectError, input_stream::MAX_SELECT_RECORD_BYTES};
 
 /// Arrow accepts byte-sized CSV controls. Unicode quotes need streaming normalization.
 pub fn csv_input_requires_normalization(quote: Option<&str>, escape: Option<&str>) -> bool {
@@ -32,6 +32,7 @@ pub(crate) struct CsvSyntax<'a> {
     pub field: Option<&'a str>,
     pub record: Option<&'a str>,
     pub comment: Option<u8>,
+    pub allow_quoted_record_delimiter: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,8 +46,9 @@ enum State {
 }
 
 /// Emits ordinary CSV with every field quoted. This avoids reserving a sentinel
-/// byte that might also appear in a UTF-8 field. Only a partial control token is
-/// retained between chunks; neither records nor objects are buffered.
+/// byte that might also appear in a UTF-8 field. Multiline input retains at most
+/// one bounded record so schema inference always receives complete records.
+/// Otherwise only a partial control token is retained between chunks.
 struct CsvInputNormalizer {
     quote: Vec<u8>,
     escape: Vec<u8>,
@@ -54,6 +56,9 @@ struct CsvInputNormalizer {
     record: Vec<u8>,
     comment: Option<u8>,
     default_records: bool,
+    allow_quoted_record_delimiter: bool,
+    record_bytes: usize,
+    pending_record: Vec<u8>,
     state: State,
     record_start: bool,
     carry: Vec<u8>,
@@ -89,6 +94,9 @@ impl CsvInputNormalizer {
             record,
             comment: csv.comment,
             default_records: csv.record.is_none(),
+            allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter,
+            record_bytes: 0,
+            pending_record: Vec::new(),
             state: State::FieldStart,
             record_start: true,
             carry: Vec::new(),
@@ -97,9 +105,11 @@ impl CsvInputNormalizer {
     }
 
     fn record_len(&self, bytes: &[u8]) -> usize {
-        if self.default_records && bytes.starts_with(b"\r\n") {
+        if self.default_records && self.field == b"\r\n" && bytes.starts_with(&self.field) {
+            0
+        } else if self.default_records && bytes.starts_with(b"\r\n") {
             2
-        } else if self.default_records && bytes.starts_with(b"\r") {
+        } else if self.default_records && self.field != b"\r" && bytes.starts_with(b"\r") {
             1
         } else if bytes.starts_with(&self.record) {
             self.record.len()
@@ -108,10 +118,11 @@ impl CsvInputNormalizer {
         }
     }
 
-    fn push_value(output: &mut Vec<u8>, bytes: &[u8]) {
+    fn push_value(&self, output: &mut Vec<u8>, bytes: &[u8]) {
         for byte in bytes {
-            if *byte == b'"' {
-                output.push(b'"');
+            // Schema inference treats backslashes as escapes when delimiting chunks.
+            if *byte == b'"' || (self.allow_quoted_record_delimiter && *byte == b'\\') {
+                output.push(*byte);
             }
             output.push(*byte);
         }
@@ -125,9 +136,12 @@ impl CsvInputNormalizer {
         } else {
             bytes.len().saturating_sub(self.token_size - 1)
         };
-        let mut output = Vec::with_capacity(bytes.len());
+        let mut output = std::mem::take(&mut self.pending_record);
+        output.reserve(bytes.len());
+        let mut complete_records_end = 0;
         let mut pos = 0;
         while pos < end {
+            let start = pos;
             let rest = &bytes[pos..];
             let record_len = self.record_len(rest);
             let field = rest.starts_with(&self.field) && self.field.len() > record_len;
@@ -141,10 +155,10 @@ impl CsvInputNormalizer {
                     }
                 }
                 State::Escaped => {
-                    if record_len > 0 {
+                    if record_len > 0 && !self.allow_quoted_record_delimiter {
                         return Err(SelectError::CsvParsingError);
                     }
-                    Self::push_value(&mut output, &rest[..1]);
+                    self.push_value(&mut output, &rest[..1]);
                     self.state = State::Quoted;
                     pos += 1;
                 }
@@ -157,14 +171,14 @@ impl CsvInputNormalizer {
                     pos += self.escape.len();
                 }
                 State::Quoted => {
-                    if record_len > 0 {
+                    if record_len > 0 && !self.allow_quoted_record_delimiter {
                         return Err(SelectError::CsvParsingError);
                     }
-                    Self::push_value(&mut output, &rest[..1]);
+                    self.push_value(&mut output, &rest[..1]);
                     pos += 1;
                 }
                 State::AfterQuote if rest.starts_with(&self.quote) => {
-                    Self::push_value(&mut output, &self.quote);
+                    self.push_value(&mut output, &self.quote);
                     self.state = State::Quoted;
                     pos += self.quote.len();
                 }
@@ -189,6 +203,9 @@ impl CsvInputNormalizer {
                     output.push(if field { b',' } else { b'\n' });
                     self.state = State::FieldStart;
                     self.record_start = !field;
+                    if !field {
+                        complete_records_end = output.len();
+                    }
                     pos += if field { self.field.len() } else { record_len };
                 }
                 _ => {
@@ -197,8 +214,19 @@ impl CsvInputNormalizer {
                     }
                     self.state = State::Unquoted;
                     self.record_start = false;
-                    Self::push_value(&mut output, &rest[..1]);
+                    self.push_value(&mut output, &rest[..1]);
                     pos += 1;
+                }
+            }
+            if self.allow_quoted_record_delimiter {
+                // Quoted delimiters do not end a logical record or reset its size limit.
+                if self.record_start && self.state != State::Comment {
+                    self.record_bytes = 0;
+                } else {
+                    self.record_bytes += pos - start;
+                    if self.record_bytes > MAX_SELECT_RECORD_BYTES {
+                        return Err(SelectError::OverMaxRecordSize);
+                    }
                 }
             }
         }
@@ -210,6 +238,12 @@ impl CsvInputNormalizer {
                 State::FieldStart if !self.record_start => output.extend_from_slice(b"\"\""),
                 State::FieldStart | State::Comment => {}
             }
+        } else if self.allow_quoted_record_delimiter {
+            if complete_records_end == 0 {
+                self.pending_record = output;
+                return Ok(Vec::new());
+            }
+            self.pending_record = output.split_off(complete_records_end);
         }
         Ok(output)
     }
@@ -275,6 +309,7 @@ mod tests {
             field: Some("界"),
             record: Some("^Y"),
             comment: Some(b'#'),
+            ..Default::default()
         };
         let input = "#skipع界^Yعa界bع界\"literal\"^Yعline\nbreakع界end^Y";
         let expected = "\"a界b\",\"\"\"literal\"\"\"\n\"line\nbreak\",\"end\"\n";
@@ -289,6 +324,167 @@ mod tests {
             let csv = CsvSyntax {
                 quote: Some("ع"),
                 escape: Some("\\"),
+                ..Default::default()
+            };
+            let mut normalizer = CsvInputNormalizer::new(&csv);
+            assert_eq!(normalizer.convert(input.as_bytes(), true), Err(SelectError::CsvParsingError));
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_preserve_values_at_every_chunk_boundary() {
+        let cases = [
+            ("\"", "\"", ",", None, "\"a\nb\",tail\n", "\"a\nb\",\"tail\"\n"),
+            ("\"", "\"", ",", None, "\"a\r\nb\",tail\r\n", "\"a\r\nb\",\"tail\"\n"),
+            ("\"", "\"", ",", Some("\r\n"), "\"a\r\nb\",tail\r\n", "\"a\r\nb\",\"tail\"\n"),
+            ("\"", "\"", ",", Some("|"), "\"a|b\",tail|", "\"a|b\",\"tail\"\n"),
+            ("\"", "\"", ",", Some("^Y"), "\"a^Yb\",tail^Y", "\"a^Yb\",\"tail\"\n"),
+            ("ع", "\\", "界", Some("^Y"), "عa^Ybع界tail^Y", "\"a^Yb\",\"tail\"\n"),
+            ("\"", "\\", ",", None, "\"a\\\nb\",tail\n", "\"a\nb\",\"tail\"\n"),
+            ("\"", "\"", ",", None, "\"a\"\"\nb\",tail", "\"a\"\"\nb\",\"tail\""),
+            ("\"", "\"", ",", None, "#skip\n\"a\n#b\",tail\n", "\"a\n#b\",\"tail\"\n"),
+        ];
+        for (quote, escape, field, record, input, expected) in cases {
+            let csv = CsvSyntax {
+                quote: Some(quote),
+                escape: Some(escape),
+                field: Some(field),
+                record,
+                comment: Some(b'#'),
+                allow_quoted_record_delimiter: true,
+            };
+            for chunk_size in 1..=input.len() {
+                assert_eq!(
+                    normalize_chunks(&csv, input.as_bytes(), chunk_size),
+                    expected.as_bytes(),
+                    "input={input:?}, chunk_size={chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_enforce_logical_record_size_across_chunks() {
+        for size in [
+            MAX_SELECT_RECORD_BYTES - 1,
+            MAX_SELECT_RECORD_BYTES,
+            MAX_SELECT_RECORD_BYTES + 1,
+        ] {
+            let csv = CsvSyntax {
+                allow_quoted_record_delimiter: true,
+                ..Default::default()
+            };
+            let mut input = vec![b'\n'; size];
+            input[0] = b'"';
+            input[size - 1] = b'"';
+            let mut normalizer = CsvInputNormalizer::new(&csv);
+            let result = input
+                .chunks(64 * 1024)
+                .try_for_each(|chunk| normalizer.convert(chunk, false).map(|_| ()))
+                .and_then(|()| normalizer.convert(b"\nnext\n", true));
+            if size > MAX_SELECT_RECORD_BYTES {
+                assert_eq!(result, Err(SelectError::OverMaxRecordSize));
+            } else {
+                assert!(result.is_ok(), "a record of {size} bytes must be accepted: {result:?}");
+                assert!(normalizer.carry.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_count_comment_bytes_across_chunks() {
+        for size in [
+            MAX_SELECT_RECORD_BYTES - 1,
+            MAX_SELECT_RECORD_BYTES,
+            MAX_SELECT_RECORD_BYTES + 1,
+        ] {
+            for record in [None, Some("\r\n"), Some("^Y")] {
+                let delimiter = record.unwrap_or("\n");
+                for terminated in [false, true] {
+                    let csv = CsvSyntax {
+                        record,
+                        comment: Some(b'#'),
+                        allow_quoted_record_delimiter: true,
+                        ..Default::default()
+                    };
+                    let mut input = vec![b'x'; size];
+                    input[0] = b'#';
+                    if terminated {
+                        input.extend_from_slice(delimiter.as_bytes());
+                        input.extend_from_slice(b"#next");
+                        input.extend_from_slice(delimiter.as_bytes());
+                        input.extend_from_slice(b"value");
+                    }
+                    let mut normalizer = CsvInputNormalizer::new(&csv);
+                    let mut output = Vec::new();
+                    let result = input
+                        .chunks(64 * 1024)
+                        .try_for_each(|chunk| normalizer.convert(chunk, false).map(|bytes| output.extend(bytes)))
+                        .and_then(|()| normalizer.convert(b"", true).map(|bytes| output.extend(bytes)));
+                    if size > MAX_SELECT_RECORD_BYTES {
+                        assert_eq!(result, Err(SelectError::OverMaxRecordSize));
+                    } else {
+                        result.expect("comments within the logical-record limit must be accepted");
+                        assert_eq!(output, if terminated { b"\"value\"".as_slice() } else { b"" });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_preserve_carriage_return_fields() {
+        let csv = CsvSyntax {
+            field: Some("\r"),
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        for (input, expected) in [
+            ("a\rb\n", "\"a\",\"b\"\n"),
+            ("a\rb\r\n", "\"a\",\"b\"\n"),
+            ("\"a\rb\"\rtail\n", "\"a\rb\",\"tail\"\n"),
+            ("a\r", "\"a\",\"\""),
+        ] {
+            for size in 1..=input.len() {
+                assert_eq!(
+                    normalize_chunks(&csv, input.as_bytes(), size),
+                    expected.as_bytes(),
+                    "input={input:?}, chunk={size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_preserve_crlf_fields() {
+        let csv = CsvSyntax {
+            field: Some("\r\n"),
+            comment: Some(b'#'),
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        for (input, expected) in [
+            ("a\r\nb\n", "\"a\",\"b\"\n"),
+            ("\"a\r\nb\"\r\ntail\n", "\"a\r\nb\",\"tail\"\n"),
+            ("a\r\n", "\"a\",\"\""),
+            ("#skip\r\na\r\nb\n", "\"a\",\"b\"\n"),
+        ] {
+            for size in 1..=input.len() {
+                assert_eq!(
+                    normalize_chunks(&csv, input.as_bytes(), size),
+                    expected.as_bytes(),
+                    "input={input:?}, chunk={size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_do_not_allow_unterminated_fields() {
+        for input in ["\"a\nb", "\"a\nb\\"] {
+            let csv = CsvSyntax {
+                escape: Some("\\"),
+                allow_quoted_record_delimiter: true,
                 ..Default::default()
             };
             let mut normalizer = CsvInputNormalizer::new(&csv);
@@ -372,6 +568,7 @@ where
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    use futures::TryStreamExt;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -404,6 +601,47 @@ mod stream_tests {
         drop(stream);
         assert!(dropped.load(Ordering::SeqCst), "cancellation must release the source reader");
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_preserve_backslashes_through_schema_chunking() {
+        let data = b"path\\,\"line\nbreak\"\n";
+        let csv = CsvSyntax {
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        for size in 1..=data.len() {
+            let chunks = data
+                .chunks(size)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let stream = normalize_csv_stream(futures::stream::iter(chunks), &csv);
+            let output = datafusion::object_store::delimited::newline_delimited_stream(stream)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_or_else(|error| panic!("schema inference failed at chunk size {size}: {error}"));
+            assert_eq!(output.concat(), b"\"path\\\\\",\"line\nbreak\"\n", "chunk size={size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_report_unterminated_fields_after_partial_output() {
+        let source = futures::stream::iter([Ok(Bytes::from_static(b"first,row\n\"line\nbreak"))]);
+        let csv = CsvSyntax {
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        let mut stream = normalize_csv_stream(source, &csv);
+        let prefix = stream.next().await.expect("partial output").expect("valid prefix");
+        assert!(prefix.starts_with(b"\"first\",\"row\"\n"));
+        let error = stream
+            .next()
+            .await
+            .expect("terminal failure")
+            .expect_err("unclosed field must fail");
+        let Error::Generic { source, .. } = error else { panic!("expected a typed CSV parse error") };
+        assert_eq!(source.downcast_ref::<SelectError>(), Some(&SelectError::CsvParsingError));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

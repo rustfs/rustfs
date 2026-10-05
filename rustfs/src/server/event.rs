@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::spawn;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,12 @@ use tracing::{info, instrument, warn};
 static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
 static NOTIFY_BUCKET_RULES_RECONCILED: AtomicBool = AtomicBool::new(false);
 static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
+
+// Serialize local notification lifecycle publication with the periodic and
+// peer-triggered reconciler. Lock order is this guard before the module-switch
+// RMW/object locks and the server-config read lock; the module-switch handler's
+// preliminary server-config read is released before it takes the RMW lock.
+static NOTIFY_RUNTIME_RECONCILE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 const EVENT_NOTIFIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const EVENT_NOTIFIER_RECONCILE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -53,6 +60,14 @@ pub(crate) fn mark_event_notifier_reconciled() {
 pub(crate) fn mark_event_notifier_unreconciled() {
     NOTIFY_RUNTIME_RECONCILED.store(false, Ordering::Release);
     NOTIFY_BUCKET_RULES_RECONCILED.store(false, Ordering::Release);
+}
+
+pub(crate) async fn with_notify_runtime_reconcile_lock<Fut, T>(operation: Fut) -> T
+where
+    Fut: Future<Output = T>,
+{
+    let _guard = NOTIFY_RUNTIME_RECONCILE_LOCK.lock().await;
+    operation.await
 }
 
 fn are_bucket_notification_rules_reconciled() -> bool {
@@ -160,6 +175,12 @@ fn ensure_event_notifier_converged(system: &NotificationSystem) -> Result<(), No
 }
 
 pub(crate) async fn reconcile_event_notifier_from_store(
+    store: std::sync::Arc<rustfs_notify::NotifyStore>,
+) -> Result<(), NotificationError> {
+    with_notify_runtime_reconcile_lock(reconcile_event_notifier_from_store_unlocked(store)).await
+}
+
+async fn reconcile_event_notifier_from_store_unlocked(
     store: std::sync::Arc<rustfs_notify::NotifyStore>,
 ) -> Result<(), NotificationError> {
     let result = async {
@@ -310,7 +331,7 @@ pub async fn shutdown_event_notifier() -> Result<(), NotificationError> {
 
 #[instrument]
 pub async fn init_event_notifier() -> Result<(), NotificationError> {
-    init_event_notifier_with_store(runtime_sources::current_object_store_handle).await
+    with_notify_runtime_reconcile_lock(init_event_notifier_with_store(runtime_sources::current_object_store_handle)).await
 }
 
 async fn init_event_notifier_with_store<CurrentStore>(current_store: CurrentStore) -> Result<(), NotificationError>
@@ -408,6 +429,7 @@ mod tests {
     use super::{
         convert_ecstore_object_info, init_event_notifier_with_store, mark_bucket_notification_rules_reconciled,
         parse_host_and_port, run_persisted_event_notifier_reconciler, should_reconcile_bucket_notification_rules,
+        with_notify_runtime_reconcile_lock,
     };
     use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
@@ -469,6 +491,43 @@ mod tests {
             set_persisted_module_switches(previous, previous_configured);
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn notify_runtime_reconcile_lock_serializes_overlapping_operations() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let second_attempted = Arc::new(Notify::new());
+        let second_started = Arc::new(AtomicBool::new(false));
+
+        let first_entered = entered.clone();
+        let first_release = release.clone();
+        let first = tokio::spawn(with_notify_runtime_reconcile_lock(async move {
+            first_entered.notify_one();
+            first_release.notified().await;
+        }));
+        entered.notified().await;
+
+        let second_attempted_signal = second_attempted.clone();
+        let second_started_flag = second_started.clone();
+        let second = tokio::spawn(async move {
+            second_attempted_signal.notify_one();
+            with_notify_runtime_reconcile_lock(async move {
+                second_started_flag.store(true, Ordering::Release);
+            })
+            .await;
+        });
+        second_attempted.notified().await;
+        assert!(
+            !second_started.load(Ordering::Acquire),
+            "overlapping reconcile work must wait for the first operation"
+        );
+
+        release.notify_one();
+        first.await.expect("first reconcile operation should finish");
+        second.await.expect("second reconcile operation should finish");
+        assert!(second_started.load(Ordering::Acquire));
     }
 
     #[test]

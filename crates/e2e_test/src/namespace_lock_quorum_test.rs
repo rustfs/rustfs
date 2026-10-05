@@ -300,17 +300,28 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
         }
 
         cluster.stop_node(read_quorum - 1)?;
+        let lock_read_quorum = node_count - node_count / 2;
+        // EC:2 on six nodes still has three shared lock votes after losing
+        // its fourth data shard. Preserve the distinct data-quorum error.
+        let expected_code = if read_quorum - 1 < lock_read_quorum {
+            "ServiceUnavailable"
+        } else {
+            "SlowDownRead"
+        };
         for client in clients.iter().take(read_quorum - 1) {
             match client.get_object().bucket(&bucket).key("below-quorum").send().await {
                 Ok(response) => assert!(
                     response.body.collect().await.is_err(),
                     "fewer than {read_quorum} valid fragments must not reconstruct an uncached object"
                 ),
-                Err(error) => assert_eq!(
-                    error.as_service_error().and_then(|error| error.meta().code()),
-                    Some("ServiceUnavailable"),
-                    "a quorum loss must not be mistaken for a missing object"
-                ),
+                Err(error) => {
+                    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+                    assert_eq!(
+                        error.as_service_error().and_then(|error| error.meta().code()),
+                        Some(expected_code),
+                        "a quorum loss must not be mistaken for a missing object"
+                    );
+                }
             }
         }
 
@@ -425,6 +436,60 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
     Ok(())
 }
 
+fn unavailable_readiness_drive_indices(payload: &serde_json::Value) -> Vec<usize> {
+    let mut indices = payload["details"]["storage"]["unavailableDrives"]
+        .as_array()
+        .expect("node readiness must report unavailable drives")
+        .iter()
+        .map(|drive| {
+            usize::try_from(drive["diskIndex"].as_u64().expect("drive index must be unsigned"))
+                .expect("drive index must fit usize")
+        })
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices
+}
+
+fn assert_node_readiness_contract(payload: &serde_json::Value, survivors: usize) {
+    let read_ready = survivors >= 2;
+    let write_ready = survivors >= 3;
+    let storage = &payload["details"]["storage"];
+    assert_eq!(payload["ready"], read_ready);
+    assert_eq!(storage["ready"], read_ready);
+    assert_eq!(storage["readQuorum"], read_ready);
+    assert_eq!(storage["writeQuorum"], write_ready);
+    assert_eq!(storage["readinessScope"], "read_quorum");
+    assert_eq!(storage["source"], "local_runtime");
+    assert_eq!(storage["status"], if read_ready { "connected" } else { "disconnected" });
+    assert_eq!(payload["details"]["poolMetadata"]["ready"], true);
+    assert_eq!(payload["details"]["iam"]["ready"], true);
+    assert_eq!(payload["details"]["lock"]["ready"], read_ready);
+    assert_eq!(unavailable_readiness_drive_indices(payload), (survivors..4).collect::<Vec<_>>());
+    for drive in storage["unavailableDrives"].as_array().expect("unavailable drives") {
+        assert_eq!(drive["poolIndex"], 0);
+        assert_eq!(drive["setIndex"], 0);
+        let state = drive["runtimeState"].as_str().expect("runtime state must be reported");
+        let host_online = drive["hostOnline"].as_bool().expect("host reachability must be reported");
+        assert!(
+            matches!(state, "online" | "suspect" | "offline" | "returning"),
+            "unknown runtime state: {state}"
+        );
+        assert!(
+            state != "online" || !host_online,
+            "a reachable online drive cannot be excluded from quorum"
+        );
+    }
+    if !read_ready {
+        assert!(
+            payload["degradedReasons"]
+                .as_array()
+                .expect("degraded reasons")
+                .iter()
+                .any(|reason| reason == "storage_and_lock_unavailable")
+        );
+    }
+}
+
 async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
     let clients: Vec<_> = cluster
         .create_all_clients()?
@@ -462,7 +527,10 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
         }
         let write_ready = survivors >= 3;
         let read_quorum = survivors >= 2;
-        let expected_status = if write_ready { 200 } else { 503 };
+        // `/health/ready` keeps a node that can still serve reads in the Service.
+        let node_ready = read_quorum;
+        let node_status = if node_ready { 200 } else { 503 };
+        let cluster_status = if write_ready { 200 } else { 503 };
         for (idx, client) in clients.iter().enumerate().take(survivors) {
             let url = &cluster.nodes[idx].url;
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -472,44 +540,33 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
                 let response = http.get(format!("{url}/health/ready")).send().await?;
                 let status = response.status().as_u16();
                 let payload: serde_json::Value = response.json().await?;
-                if status == expected_status
-                    && payload["ready"] == write_ready
-                    && payload["details"]["storage"]["ready"] == write_ready
+                if status == node_status
+                    && payload["ready"] == node_ready
+                    && payload["details"]["storage"]["ready"] == node_ready
                     && payload["details"]["storage"]["readQuorum"] == read_quorum
                     && payload["details"]["storage"]["writeQuorum"] == write_ready
                     && payload["details"]["poolMetadata"]["ready"] == true
                     && payload["details"]["iam"]["ready"] == true
-                    && payload["details"]["lock"]["ready"] == write_ready
+                    && payload["details"]["lock"]["ready"] == read_quorum
+                    && unavailable_readiness_drive_indices(&payload) == (survivors..4).collect::<Vec<_>>()
                 {
                     break payload;
                 }
                 assert!(Instant::now() < deadline, "node {idx}, survivors={survivors}: HTTP {status}, {payload}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             };
-            assert_eq!(payload["details"]["storage"]["readinessScope"], "write_quorum_and_pool_metadata");
-            assert_eq!(payload["details"]["storage"]["source"], "local_runtime");
-            assert_eq!(
-                payload["details"]["storage"]["status"],
-                if write_ready { "connected" } else { "disconnected" }
-            );
-            if !write_ready {
-                assert!(
-                    payload["degradedReasons"]
-                        .as_array()
-                        .expect("degraded reasons")
-                        .iter()
-                        .any(|reason| reason == "storage_and_lock_unavailable")
-                );
-            }
+            assert_node_readiness_contract(&payload, survivors);
 
             for path in ["/health/ready", "/minio/health/ready"] {
                 let head = http.head(format!("{url}{path}")).send().await?;
-                assert_eq!(head.status().as_u16(), expected_status, "HEAD {path}, survivors={survivors}");
+                assert_eq!(head.status().as_u16(), node_status, "HEAD {path}, survivors={survivors}");
                 assert!(head.bytes().await?.is_empty());
                 let response = http.get(format!("{url}{path}")).send().await?;
-                assert_eq!(response.status().as_u16(), expected_status);
+                assert_eq!(response.status().as_u16(), node_status);
                 let body: serde_json::Value = response.json().await?;
-                assert_eq!(body["details"]["storage"], payload["details"]["storage"]);
+                // Each response samples live diagnostics; suspect -> offline
+                // must not change the quorum contract or excluded topology.
+                assert_node_readiness_contract(&body, survivors);
                 assert_eq!(body["details"]["poolMetadata"], payload["details"]["poolMetadata"]);
             }
             let live = http.get(format!("{url}/health/live")).send().await?;
@@ -526,7 +583,7 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
                     let response = http.get(format!("{url}{path}")).send().await?;
                     let status = response.status().as_u16();
                     let body: serde_json::Value = response.json().await?;
-                    if status == expected_status
+                    if status == cluster_status
                         && body["details"]["storage"]["ready"] == storage_ready
                         && body["details"]["lock"]["ready"] == write_ready
                     {
@@ -559,11 +616,12 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
             let get = client.get_object().bucket(BUCKET).key(seed_key).send().await;
             let get_status = match get {
                 Ok(object) => {
+                    assert!(read_quorum, "GET must fail once read quorum is lost");
                     assert_eq!(object.body.collect().await?.into_bytes().as_ref(), seed_body);
                     200
                 }
                 Err(error) => {
-                    assert!(!write_ready, "GET must succeed on a ready cluster: {error:?}");
+                    assert!(!read_quorum, "GET must succeed while read quorum holds: {error:?}");
                     let status = error
                         .raw_response()
                         .expect("GET should have an HTTP response")
@@ -576,11 +634,12 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
             let list = client.list_objects_v2().bucket(BUCKET).send().await;
             let list_status = match list {
                 Ok(result) => {
+                    assert!(read_quorum, "listing must fail once read quorum is lost");
                     assert!(result.contents().iter().any(|object| object.key() == Some(seed_key)));
                     200
                 }
                 Err(error) => {
-                    assert!(!write_ready, "listing must succeed on a ready cluster: {error:?}");
+                    assert!(!read_quorum, "listing must succeed while read quorum holds: {error:?}");
                     let status = error
                         .raw_response()
                         .expect("LIST should have an HTTP response")

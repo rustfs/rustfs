@@ -207,6 +207,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                group_claim_policies: Vec::new(),
                 groups: if self.with_group {
                     vec!["developers".to_string()]
                 } else {

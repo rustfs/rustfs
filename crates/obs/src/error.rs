@@ -60,6 +60,18 @@ pub enum TelemetryError {
     BuildMetricExporter(String),
     #[error("Log exporter build failed: {0}")]
     BuildLogExporter(String),
+    #[error("RUSTFS_OBS_TLS_CA_FILE must be an absolute path")]
+    OtlpTlsCaPathNotAbsolute,
+    #[error("Failed to read RUSTFS_OBS_TLS_CA_FILE")]
+    OtlpTlsCaRead(#[source] std::io::Error),
+    #[error("RUSTFS_OBS_TLS_CA_FILE does not contain a PEM certificate")]
+    OtlpTlsCaEmpty,
+    #[error("RUSTFS_OBS_TLS_CA_FILE does not contain a valid PEM certificate")]
+    OtlpTlsCaInvalid,
+    #[error("Failed to parse RUSTFS_OBS_TLS_CA_FILE as a PEM certificate bundle")]
+    OtlpTlsCaParse(#[source] reqwest::Error),
+    #[error("Failed to build OTLP HTTP client")]
+    BuildOtlpHttpClient(#[source] reqwest::Error),
     #[error("Install metrics recorder failed: {0}")]
     InstallMetricsRecorder(String),
     #[error("Tracing subscriber init failed: {0}")]

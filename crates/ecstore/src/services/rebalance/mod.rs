@@ -29,7 +29,7 @@ const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
 pub(crate) const REBAL_META_NAME: &str = "rebalance.bin";
 const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
-pub(crate) const REBALANCE_SOURCE_CLEANUP_MAX_DEFERS: usize = 3;
+pub(crate) const REBALANCE_SOURCE_CLEANUP_MAX_DEFERS: usize = 8;
 const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
 const REBALANCE_STOP_PROPAGATION_ERROR_PREFIX: &str = "rebalance stop propagation incomplete: ";
 const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -55,7 +55,7 @@ pub use types::{
     DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
     RebalanceStats, RebalanceStopPropagationRecord,
 };
-use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome};
+use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceDeferKind, RebalanceEntryOutcome};
 
 #[cfg(any(test, feature = "test-util"))]
 pub async fn test_store_with_persisted_rebalance_meta(
@@ -222,10 +222,14 @@ async fn test_pool_stores_with_contexts(
         std::sync::Arc::clone(&ctx)
     };
     let make_store = |store_ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>| {
+        let mut store_pools = pools.clone();
+        for pool in &mut store_pools {
+            std::sync::Arc::make_mut(pool).set_instance_ctx_for_test(std::sync::Arc::clone(&store_ctx));
+        }
         std::sync::Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: std::collections::HashMap::new(),
-            pools: pools.clone(),
+            pools: store_pools,
             peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, std::sync::Arc::clone(&store_ctx)),
             pool_meta: tokio::sync::RwLock::new(pool_meta.clone()),
             rebalance_meta: tokio::sync::RwLock::new(rebalance_meta.clone()),

@@ -308,11 +308,14 @@ async fn wait_for(
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("status channel");
+            status
+                .changed()
+                .await
+                .unwrap_or_else(|error| panic!("inventory status channel closed: {error}; last status: {:?}", *status.borrow()));
         }
     })
     .await
-    .expect("inventory status timeout")
+    .unwrap_or_else(|error| panic!("inventory status timeout: {error}; last status: {:?}", *status.borrow()))
 }
 
 #[test]

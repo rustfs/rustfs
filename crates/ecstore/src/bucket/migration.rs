@@ -280,11 +280,11 @@ where
 
     debug!("Found {} migrating bucket metadata, migrating...", buckets.len());
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         max_parity: true,
-        no_lock: true,
         ..Default::default()
     };
+    opts.use_offline_recovery_write();
     let h = HeaderMap::new();
 
     for bucket in buckets {
@@ -397,11 +397,11 @@ where
         return Ok(());
     }
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         max_parity: true,
-        no_lock: true,
         ..Default::default()
     };
+    opts.use_offline_recovery_write();
     let h = HeaderMap::new();
     let prefix = format!("{IAM_CONFIG_PREFIX}/");
     let mut continuation: Option<String> = None;

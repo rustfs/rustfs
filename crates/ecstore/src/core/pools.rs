@@ -41,13 +41,13 @@ use crate::config::com::{
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
-use crate::data_usage::DATA_USAGE_CACHE_NAME;
+use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_cache};
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, DiskAPI, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_operation_canceled,
-    is_err_version_not_found,
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_invalid_upload_id,
+    is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found,
 };
 use crate::layout::endpoints::EndpointServerPools;
 use crate::object_api::{DecommissionCapacityOptions, GetObjectReader, ObjectInfo, ObjectOptions};
@@ -74,6 +74,7 @@ use futures::{
     stream::FuturesUnordered,
 };
 use http::HeaderMap;
+use rand::RngExt as _;
 #[cfg(test)]
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
@@ -135,9 +136,21 @@ const DECOMMISSION_CAPACITY_RELEASE_FAILED: &str = "failed";
 const DECOMMISSION_CAPACITY_RELEASE_COMPLETED: &str = "completed";
 pub(crate) const DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX: &str = "decommission/capacity-target";
 const DECOMMISSION_CAPACITY_TARGET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS: usize = 12;
+pub(crate) const DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS: usize = 3;
+static DECOMMISSION_OBJECT_ATTEMPTS_MAX: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX: &str = " target capacity mutation gate is busy";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
+const METRIC_DECOMMISSION_CAPACITY_GATE_RETRIES_TOTAL: &str = "rustfs_decommission_capacity_gate_retries_total";
+/// Entry passes and repeated version-copy attempts within a listing and its
+/// deferred replay. Inline gate waits have their own retry counter.
+const METRIC_DECOMMISSION_OBJECT_ATTEMPTS_TOTAL: &str = "rustfs_decommission_object_attempts_total";
+/// Highest per-entry attempt count, including its deferred replay. A new
+/// listing after a durable pause starts a new observation.
+const METRIC_DECOMMISSION_OBJECT_ATTEMPTS_MAX: &str = "rustfs_decommission_object_attempts_max";
+/// Wait time spent inside a single target capacity gate retry.
+const METRIC_DECOMMISSION_CAPACITY_GATE_WAIT_SECONDS: &str = "rustfs_decommission_capacity_gate_wait_seconds";
 const METRIC_DECOMMISSION_CAPACITY_PREDICTED_BYTES: &str = "rustfs_decommission_capacity_predicted_physical_bytes";
 const METRIC_DECOMMISSION_CAPACITY_RESERVED_BYTES: &str = "rustfs_decommission_capacity_reserved_physical_bytes";
 const METRIC_DECOMMISSION_CAPACITY_PREDICTION_ERROR_BYTES: &str = "rustfs_decommission_capacity_prediction_error_bytes";
@@ -147,12 +160,50 @@ const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const DECOMMISSION_ENTRY_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS: usize = 12;
+// A scanner pause backlog handoff conflict is a transient membership
+// transition: the native authority is expected to converge once surviving
+// replicas advance their durable commit. Bound the wait so a genuinely
+// divergent authority still reaches a terminal, attributable failure.
+const DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const DECOMMISSION_CAPACITY_GATE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+const DECOMMISSION_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
 const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS: usize = 3;
+
+fn decommission_capacity_target_gate_retry_exhausted(attempt: usize) -> bool {
+    attempt.saturating_add(1) >= DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS
+}
+
+fn record_decommission_capacity_gate_retry(target_pool_index: usize) {
+    metrics::counter!(
+        METRIC_DECOMMISSION_CAPACITY_GATE_RETRIES_TOTAL,
+        "target_pool_index" => target_pool_index.to_string()
+    )
+    .increment(1);
+}
+
+/// Record one object-processing attempt plus the peak attempts any object
+/// reached, so amplification is visible without reconstructing it from logs.
+fn record_decommission_object_attempt(attempts: &mut usize) {
+    *attempts = attempts.saturating_add(1);
+    metrics::counter!(METRIC_DECOMMISSION_OBJECT_ATTEMPTS_TOTAL).increment(1);
+    let attempt = u64::try_from(*attempts).unwrap_or(u64::MAX);
+    // Serialize publication too: concurrent fetch_max + gauge.set can publish
+    // an older peak after a newer one. This guard never crosses an await.
+    let mut peak = DECOMMISSION_OBJECT_ATTEMPTS_MAX.lock().unwrap_or_else(|err| err.into_inner());
+    if *peak < attempt {
+        *peak = attempt;
+        metrics::gauge!(METRIC_DECOMMISSION_OBJECT_ATTEMPTS_MAX).set(attempt as f64);
+    }
+}
+
+fn record_decommission_capacity_gate_wait(delay: std::time::Duration) {
+    metrics::histogram!(METRIC_DECOMMISSION_CAPACITY_GATE_WAIT_SECONDS).record(delay.as_secs_f64());
+}
 const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
 const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
 const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v2";
@@ -920,6 +971,29 @@ fn capacity_target_physical_bytes(data_bytes: usize, layout: DecommissionErasure
     Ok(capacity_mul_div_ceil(data_bytes, layout.width(), layout.data))
 }
 
+async fn decommission_owned_physical_usage(sets: &Sets, layout: DecommissionErasureLayout) -> HashMap<i32, usize> {
+    let mut usage = HashMap::with_capacity(sets.disk_set.len());
+    for (set_index, set) in sets.disk_set.iter().enumerate() {
+        let Ok(cache) = load_data_usage_cache(set.as_ref(), DATA_USAGE_CACHE_NAME).await else {
+            continue;
+        };
+        let data_usage = cache.dui(DATA_USAGE_ROOT, &[]);
+        if !data_usage.is_complete_bucket_usage_snapshot() {
+            continue;
+        }
+        let Ok(logical_bytes) = usize::try_from(data_usage.objects_total_size) else {
+            continue;
+        };
+        let Ok(set_index) = i32::try_from(set_index) else {
+            continue;
+        };
+        // The data-usage snapshot excludes unrelated files on a shared mount.
+        // Convert logical object bytes to the source set's physical EC footprint.
+        usage.insert(set_index, capacity_mul_div_ceil(logical_bytes, layout.width(), layout.data));
+    }
+    usage
+}
+
 fn worst_decommission_target_layout(targets: &[DecommissionPoolCapacityInfo]) -> Result<DecommissionErasureLayout> {
     targets
         .iter()
@@ -970,7 +1044,7 @@ fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
         || err.to_string().contains("unresolved target capacity intent")
 }
 
-fn decommission_capacity_target_gate_busy_index(err: &Error) -> Option<usize> {
+pub(crate) fn decommission_capacity_target_gate_busy_index(err: &Error) -> Option<usize> {
     if let Error::DecommissionCapacityBlocked { message } = err {
         return message
             .strip_prefix(DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX)?
@@ -981,8 +1055,54 @@ fn decommission_capacity_target_gate_busy_index(err: &Error) -> Option<usize> {
     data_movement::data_movement_stage_source(err).and_then(decommission_capacity_target_gate_busy_index)
 }
 
-fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
+pub(crate) fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
     decommission_capacity_target_gate_busy_index(err).is_some()
+}
+
+/// How the decommission capacity path must treat a failure.
+///
+/// Callers decide between retrying, ignoring, and propagating from this single
+/// classification so the same failure shape cannot be treated differently at
+/// different call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecommissionCapacityFailure {
+    /// The target pool's capacity mutation gate is held by another mutation.
+    /// Transient: the mutation can be retried after a short backoff.
+    TargetGateBusy { target_pool_index: usize },
+    /// Another mutation's durable target capacity intent is still unresolved.
+    /// Transient, but converged on a different retry budget than gate contention.
+    IntentConflict,
+    /// The mutation is no longer needed: the object or version disappeared, or
+    /// an equivalent target already exists. Never counted as a failure.
+    BenignContention,
+    /// A real failure that must propagate to the caller.
+    Fatal,
+}
+
+/// Predicate for the benign-contention class.
+///
+/// Only identity/overwrite shapes belong here: a missing object or version, an
+/// equivalent target that already published the mutation, and an upload id that
+/// a competing mutation already superseded. Everything else must stay fatal so a
+/// genuine migration failure cannot be silently dropped.
+fn is_decommission_benign_contention_error(err: &Error) -> bool {
+    if is_decommission_copy_cleanup_safe_error(err) || is_err_data_movement_overwrite(err) || is_err_invalid_upload_id(err) {
+        return true;
+    }
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_benign_contention_error)
+}
+
+fn classify_decommission_capacity_failure(err: &Error) -> DecommissionCapacityFailure {
+    if let Some(target_pool_index) = decommission_capacity_target_gate_busy_index(err) {
+        return DecommissionCapacityFailure::TargetGateBusy { target_pool_index };
+    }
+    if is_decommission_capacity_intent_conflict(err) {
+        return DecommissionCapacityFailure::IntentConflict;
+    }
+    if is_decommission_benign_contention_error(err) {
+        return DecommissionCapacityFailure::BenignContention;
+    }
+    DecommissionCapacityFailure::Fatal
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -992,8 +1112,32 @@ enum DecommissionCapacityRetryKind {
 
 fn decommission_capacity_retry_kind(err: &Error, intent_conflict_attempt: usize) -> Option<DecommissionCapacityRetryKind> {
     (intent_conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
-        && is_decommission_capacity_intent_conflict(err))
+        && matches!(classify_decommission_capacity_failure(err), DecommissionCapacityFailure::IntentConflict))
     .then_some(DecommissionCapacityRetryKind::IntentConflict)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionScannerBacklogRetryKind {
+    HandoffConflict,
+}
+
+fn is_decommission_scanner_backlog_handoff_conflict(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<data_movement::scanner_backlog::ScannerPauseBacklogRetirementError>(err)
+        .is_some_and(data_movement::scanner_backlog::ScannerPauseBacklogRetirementError::is_retryable_handoff_conflict)
+}
+
+/// Classify a retryable scanner pause backlog handoff conflict.
+///
+/// The typed planner error is the only signal consulted: string matching would
+/// turn unrelated retirement failures into retries. `handoff_conflict_attempt`
+/// is the number of retries already consumed by this entry.
+fn decommission_scanner_backlog_retry_kind(
+    err: &Error,
+    handoff_conflict_attempt: usize,
+) -> Option<DecommissionScannerBacklogRetryKind> {
+    (handoff_conflict_attempt < DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS
+        && is_decommission_scanner_backlog_handoff_conflict(err))
+    .then_some(DecommissionScannerBacklogRetryKind::HandoffConflict)
 }
 
 fn ensure_decommission_capacity_target_fence(
@@ -1830,6 +1974,132 @@ fn ensure_external_decommission_target_admission(
     }
     metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
     Err(Error::SlowDown)
+}
+
+fn grow_decommission_target_reservation(
+    meta: &mut PoolMeta,
+    capacity_infos: &[DecommissionPoolCapacityInfo],
+    source_pool_index: usize,
+    target_pool_index: usize,
+    expected_data_bytes: usize,
+    mutation_id: uuid::Uuid,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let original = meta.clone();
+    let result = (|| {
+        let target_capacity = capacity_infos
+            .iter()
+            .find(|capacity| capacity.pool_index == target_pool_index)
+            .ok_or_else(|| {
+                decommission_capacity_blocked_error("target capacity snapshot is missing during reservation growth")
+            })?;
+        let pool_count = meta.pools.len();
+        let pool = meta
+            .pools
+            .get_mut(source_pool_index)
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
+        let reservation = pool
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .filter(|reservation| reservation.active())
+            .ok_or_else(|| decommission_capacity_blocked_error("active reservation disappeared during reservation growth"))?;
+        let target_layout = reservation
+            .targets
+            .iter()
+            .find(|target| target.pool_index == target_pool_index)
+            .map(|target| target.layout)
+            .unwrap_or(target_capacity.layout);
+        let data_bytes = expected_data_bytes.max(1);
+        let required_target_bytes = capacity_target_physical_bytes(data_bytes, target_layout)?;
+        let required_peak = required_target_bytes.saturating_mul(1usize.saturating_add(reservation.temporary_copies));
+        let existing_target = reservation
+            .targets
+            .iter()
+            .find(|target| target.pool_index == target_pool_index);
+        if let Some(target) = existing_target
+            && target.pending_physical_bytes > 0
+            && target.pending_mutation_id != Some(mutation_id)
+        {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent"
+            )));
+        }
+        let existing_remaining = existing_target
+            .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
+            .unwrap_or_default();
+        if required_peak <= existing_remaining {
+            return Ok(false);
+        }
+        if reservation.source_data_equivalent_bytes > 0 {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} reservation estimate is exhausted"
+            )));
+        }
+        if let Some(target) = existing_target
+            && target_capacity.physical_free <= target.physical_free_at_reservation
+        {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
+            )));
+        }
+        let current_peak = reservation.remaining_peak_physical_bytes();
+        let additional_peak = required_peak.saturating_sub(existing_remaining);
+        let additional_predicted = additional_peak.div_ceil(1usize.saturating_add(reservation.temporary_copies));
+        let additional_source_data = capacity_source_data_equivalent(additional_predicted, target_layout)?;
+        reservation.source_data_equivalent_bytes = reservation
+            .source_data_equivalent_bytes
+            .saturating_add(additional_source_data);
+        reservation.source_physical_bytes = reservation
+            .source_physical_bytes
+            .saturating_add(capacity_target_physical_bytes(additional_source_data, reservation.source_layout)?);
+        reservation.predicted_physical_bytes = reservation
+            .predicted_physical_bytes
+            .saturating_add(additional_predicted)
+            .max(capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, target_layout)?);
+        reservation.temporary_physical_bytes = reservation
+            .predicted_physical_bytes
+            .saturating_mul(reservation.temporary_copies);
+        reservation.peak_physical_bytes = reservation
+            .predicted_physical_bytes
+            .saturating_add(reservation.temporary_physical_bytes);
+        let allocation_growth = reservation.remaining_peak_physical_bytes().saturating_sub(current_peak);
+        if let Some(target) = reservation
+            .targets
+            .iter_mut()
+            .find(|target| target.pool_index == target_pool_index)
+        {
+            target.reserved_physical_bytes = target.reserved_physical_bytes.saturating_add(allocation_growth);
+            target.physical_total_at_reservation = target.physical_total_at_reservation.max(target_capacity.physical_total);
+            target.physical_free_at_reservation = target.physical_free_at_reservation.max(target_capacity.physical_free);
+        } else {
+            reservation.targets.push(DecommissionCapacityTarget {
+                pool_index: target_pool_index,
+                layout: target_layout,
+                physical_total_at_reservation: target_capacity.physical_total,
+                physical_free_at_reservation: target_capacity.physical_free,
+                reserved_physical_bytes: allocation_growth,
+                consumed_physical_bytes: 0,
+                observed_physical_bytes: 0,
+                inflight_physical_bytes: 0,
+                pending_physical_bytes: 0,
+                pending_mutation_id: None,
+                temporary_mutations: Vec::new(),
+            });
+        }
+        renew_decommission_capacity_reservation(reservation, now, true);
+        pool.last_update = pool.last_update.max(now);
+        Ok(true)
+    })();
+    if result.is_ok() {
+        if let Err(err) = ensure_decommission_capacity_reservations_available(meta, capacity_infos, "reservation growth") {
+            *meta = original;
+            return Err(err);
+        }
+    } else {
+        *meta = original;
+    }
+    result
 }
 
 fn ensure_decommission_target_owner_admission(
@@ -3422,8 +3692,8 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
 }
 
 pub(crate) struct PoolRebalanceActivationFence {
-    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
-    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    pool_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
+    rebalance_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     decommission_target_fence_proof: Option<crate::services::notification_sys::DecommissionTargetFenceFleetProofToken>,
     #[cfg(test)]
@@ -3450,7 +3720,12 @@ impl PoolRebalanceActivationFence {
         let forced_lost = self.forced_lost.load(Ordering::Acquire);
         #[cfg(not(test))]
         let forced_lost = false;
-        if forced_lost || self.pool_meta_guard.is_lock_lost() || self.rebalance_meta_guard.is_lock_lost() {
+        if forced_lost
+            || self.pool_meta_guard.is_lock_lost()
+            || self.pool_meta_guard.is_released()
+            || self.rebalance_meta_guard.is_lock_lost()
+            || self.rebalance_meta_guard.is_released()
+        {
             return Err(Error::other("activation lock lost before metadata commit or worker admission"));
         }
         if self
@@ -3472,8 +3747,8 @@ impl PoolRebalanceActivationFence {
     }
 
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.add_namespace_lock_guard(&self.pool_meta_guard);
-        opts.add_namespace_lock_guard(&self.rebalance_meta_guard);
+        opts.add_owned_write_lock(Arc::clone(&self.pool_meta_guard), RUSTFS_META_BUCKET, POOL_META_NAME);
+        opts.add_owned_write_lock(Arc::clone(&self.rebalance_meta_guard), RUSTFS_META_BUCKET, REBAL_META_NAME);
     }
 
     #[cfg(test)]
@@ -3514,8 +3789,8 @@ where
         .map_err(activation_pool_meta_lock_error)?;
 
     Ok(PoolRebalanceActivationFence {
-        pool_meta_guard,
-        rebalance_meta_guard,
+        pool_meta_guard: Arc::new(pool_meta_guard),
+        rebalance_meta_guard: Arc::new(rebalance_meta_guard),
         fleet_proof,
         decommission_target_fence_proof: None,
         #[cfg(test)]
@@ -3797,7 +4072,7 @@ fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool
 }
 
 fn ensure_pool_meta_write_fence(guard: &rustfs_lock::NamespaceLockGuard, operation: &str) -> Result<()> {
-    if guard.is_lock_lost() {
+    if guard.is_lock_lost() || guard.is_released() {
         return Err(Error::other(format!("{operation}: pool metadata distributed fence was lost")));
     }
     Ok(())
@@ -3822,6 +4097,37 @@ fn resolve_decommission_listing_worker_result(
     worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))?
 }
 
+/// A bucket set may only finish once every deferred entry has been resolved.
+///
+/// The deferred round is the last chance for a contended entry; leaving one
+/// unresolved would mark the bucket done and drop the object. This is reported
+/// as a capacity failure so the pool takes the existing durable-pause path
+/// instead of a terminal failure.
+fn ensure_decommission_deferred_drained(bucket: &str, set_idx: usize, deferred_remaining: usize) -> Result<()> {
+    if deferred_remaining == 0 {
+        return Ok(());
+    }
+    Err(decommission_capacity_blocked_error(format!(
+        "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining"
+    )))
+}
+
+fn decommission_entry_budget_acquire_error(err: impl Display) -> Error {
+    Error::other(format!("decommission entry budget permit acquire failed: {err}"))
+}
+
+/// Collapse a single-entry test invocation into a plain result.
+///
+/// A deferred outcome means the entry still needs another round, which the test
+/// callers do not run; surface it as the contention failure that caused it.
+#[cfg(test)]
+fn resolve_decommission_entry_test_outcome(outcome: Result<DecommissionEntryOutcome>) -> Result<()> {
+    match outcome? {
+        DecommissionEntryOutcome::Complete => Ok(()),
+        DecommissionEntryOutcome::Deferred(err) => Err(err),
+    }
+}
+
 fn should_retry_decommission_listing(err: &Error, attempt: usize, max_attempts: usize) -> bool {
     !is_err_bucket_not_found(err) && attempt + 1 < max_attempts
 }
@@ -3833,8 +4139,32 @@ async fn wait_decommission_retry_backoff(rx: &CancellationToken, delay: std::tim
     }
 }
 
+/// Exponential backoff ceiling for a 1-based `attempt`, capped so a long
+/// contention streak cannot turn into a multi-minute stall.
+fn decommission_retry_backoff_ceiling(base: std::time::Duration, attempt: usize) -> std::time::Duration {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX).min(31);
+    base.saturating_mul(1u32 << exponent).min(DECOMMISSION_RETRY_BACKOFF_CAP)
+}
+
+/// Full-jitter exponential decommission retry backoff.
+///
+/// Racing workers keep observing the same target capacity gate. A shared fixed
+/// delay makes them collide again after every round, so each retry draws a
+/// uniform delay from `[0, ceiling]` instead.
 fn decommission_retry_backoff_delay(base: std::time::Duration, attempt: usize) -> std::time::Duration {
-    base.saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX))
+    let ceiling = decommission_retry_backoff_ceiling(base, attempt);
+    if ceiling.is_zero() {
+        return ceiling;
+    }
+    let ceiling_millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(rand::rng().random_range(0..=ceiling_millis))
+}
+
+/// Backoff for retries that wait on another mutation's target capacity gate.
+pub(crate) fn decommission_capacity_gate_retry_delay(attempt: usize) -> std::time::Duration {
+    let delay = decommission_retry_backoff_delay(DECOMMISSION_CAPACITY_GATE_RETRY_BASE, attempt);
+    record_decommission_capacity_gate_wait(delay);
+    delay
 }
 
 #[cfg(test)]
@@ -4038,6 +4368,43 @@ fn should_fail_decommission_pool_after_exhausted_source_changed(exhausted_entrie
 enum DecommissionEntryAttemptOutcome {
     Complete,
     SourceChanged,
+}
+
+/// Compact retry state retained until the listing has drained.
+#[derive(Debug)]
+struct DeferredDecommissionEntry {
+    name: String,
+    attempts: usize,
+}
+
+/// Terminal result of a decommission entry pass.
+#[derive(Debug)]
+enum DecommissionEntryOutcome {
+    Complete,
+    /// The entry is still contended on a transient capacity condition after its
+    /// attempt budget. It must be retried at the end of the current round
+    /// instead of failing the whole bucket. The carried error is the last
+    /// contention failure, which becomes terminal only if the deferred round
+    /// cannot make progress either.
+    Deferred(Error),
+}
+
+/// Decide what a terminal entry-attempt failure means for the current round.
+///
+/// Target-gate and capacity-intent contention is a property of the target pool,
+/// so the entry is deferred to the end of the round instead of failing the
+/// bucket. Benign contention means the mutation is no longer needed (the object
+/// or version disappeared, or a competing mutation already superseded it): the
+/// entry is done and must not be counted as a failure or escalated. Every other
+/// failure stays terminal.
+fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
+    match classify_decommission_capacity_failure(&err) {
+        DecommissionCapacityFailure::TargetGateBusy { .. } | DecommissionCapacityFailure::IntentConflict => {
+            Ok(DecommissionEntryOutcome::Deferred(err))
+        }
+        DecommissionCapacityFailure::BenignContention => Ok(DecommissionEntryOutcome::Complete),
+        DecommissionCapacityFailure::Fatal => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -5977,6 +6344,9 @@ fn encode_pool_meta_v3_envelope(
 }
 
 enum PoolMetaPersistenceFence<'a> {
+    Owned(Arc<rustfs_lock::NamespaceLockGuard>),
+    OfflineRecovery,
+    #[cfg(test)]
     Distributed(Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>),
     Activation(&'a PoolRebalanceActivationFence),
 }
@@ -5984,6 +6354,10 @@ enum PoolMetaPersistenceFence<'a> {
 impl PoolMetaPersistenceFence<'_> {
     fn ensure_held(&self) -> Result<()> {
         match self {
+            Self::Owned(guard) if guard.is_lock_lost() || guard.is_released() => {
+                Err(Error::other("pool metadata distributed fence was lost before a replica write"))
+            }
+            #[cfg(test)]
             Self::Distributed(Some(signal)) if signal.is_lost() => {
                 Err(Error::other("pool metadata distributed fence was lost before a replica write"))
             }
@@ -5992,11 +6366,27 @@ impl PoolMetaPersistenceFence<'_> {
         }
     }
 
-    fn add_to_options(&self, opts: &mut ObjectOptions) {
+    fn add_to_options(&self, opts: &mut ObjectOptions, object: &str) {
         match self {
+            Self::Owned(guard) => opts.add_owned_write_lock(Arc::clone(guard), RUSTFS_META_BUCKET, object),
+            Self::OfflineRecovery => opts.use_offline_recovery_write(),
+            #[cfg(test)]
             Self::Distributed(Some(signal)) => opts.add_namespace_lock_lost_signal(Arc::clone(signal)),
-            Self::Activation(fence) => fence.add_namespace_lock_fence(opts),
+            Self::Activation(fence) => {
+                fence.add_namespace_lock_fence(opts);
+                opts.add_owned_write_lock(Arc::clone(&fence.pool_meta_guard), RUSTFS_META_BUCKET, object);
+            }
+            #[cfg(test)]
             Self::Distributed(None) => {}
+        }
+    }
+
+    fn allows_concurrent_phases(&self) -> bool {
+        match self {
+            Self::Owned(guard) => guard.lock_lost_signal().is_some(),
+            #[cfg(test)]
+            Self::Distributed(signal) => signal.is_some(),
+            _ => false,
         }
     }
 
@@ -6300,7 +6690,7 @@ fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMet
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
     };
-    fence.add_to_options(&mut opts);
+    fence.add_to_options(&mut opts, object);
     Ok(opts)
 }
 
@@ -6687,7 +7077,7 @@ where
         write_state,
         initialized,
         PoolMetaIdentityWriteScope::All,
-        &PoolMetaPersistenceFence::Distributed(None),
+        &PoolMetaPersistenceFence::OfflineRecovery,
         &mut transaction_arm,
     )
     .await?;
@@ -6714,7 +7104,7 @@ where
         write_state,
         false,
         PoolMetaIdentityWriteScope::Pools(pool_indices),
-        &PoolMetaPersistenceFence::Distributed(None),
+        &PoolMetaPersistenceFence::OfflineRecovery,
         &mut transaction_arm,
     )
     .await?;
@@ -7470,6 +7860,20 @@ impl PoolMeta {
             .is_some_and(is_decommission_suspended)
     }
 
+    pub(crate) fn has_active_decommission_capacity_reservation(&self, idx: usize) -> bool {
+        self.pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| {
+                info.has_decommission_state()
+                    && is_decommission_active(info.complete, info.failed, info.canceled)
+                    && info
+                        .capacity_reservation
+                        .as_ref()
+                        .is_some_and(DecommissionCapacityReservation::active)
+            })
+    }
+
     pub(crate) fn scanner_pause_backlog_pool_writable(&self, idx: usize) -> bool {
         self.pools.get(idx).is_some_and(|pool| {
             !pool
@@ -7778,11 +8182,16 @@ impl PoolMeta {
             .cloned()
             .ok_or_else(|| Error::other("pool metadata save failed: no storage pools available"))?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let pool_meta_guard = Arc::new(pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let mut write_state = PoolMetaWriteState::default();
         let indices = (0..self.pools.len()).collect::<Vec<_>>();
         let outcome = self
-            .save_no_lock_armed_scoped(pools, &mut write_state, pool_meta_guard.lock_lost_signal(), Some(&indices))
+            .save_no_lock_armed_scoped(
+                pools,
+                &mut write_state,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                Some(&indices),
+            )
             .await?;
         outcome.disarm();
         Ok(())
@@ -7806,14 +8215,16 @@ impl PoolMeta {
     where
         S: EcstoreObjectIO,
     {
-        let outcome = self.save_no_lock_armed_scoped(pools, write_state, None, None).await?;
+        let outcome = self
+            .save_no_lock_armed_scoped(pools, write_state, PoolMetaPersistenceFence::OfflineRecovery, None)
+            .await?;
         Ok(outcome.into_committed())
     }
 
     async fn save_no_lock_with_fence<S>(
         &self,
         pools: Vec<Arc<S>>,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: &[usize],
     ) -> Result<()>
     where
@@ -7821,7 +8232,7 @@ impl PoolMeta {
     {
         let mut write_state = PoolMetaWriteState::default();
         let outcome = self
-            .save_no_lock_armed_scoped(pools, &mut write_state, lock_lost, Some(indices))
+            .save_no_lock_armed_scoped(pools, &mut write_state, fence, Some(indices))
             .await?;
         outcome.disarm();
         Ok(())
@@ -7857,21 +8268,20 @@ impl PoolMeta {
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: &[usize],
     ) -> Result<PoolMetaSaveOutcome>
     where
         S: EcstoreObjectIO,
     {
-        self.save_no_lock_armed_scoped(pools, write_state, lock_lost, Some(indices))
-            .await
+        self.save_no_lock_armed_scoped(pools, write_state, fence, Some(indices)).await
     }
 
     async fn save_no_lock_armed_scoped<S>(
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        fence: PoolMetaPersistenceFence<'_>,
         indices: Option<&[usize]>,
     ) -> Result<PoolMetaSaveOutcome>
     where
@@ -7882,7 +8292,6 @@ impl PoolMeta {
         // returned outcome is dropped before publication, Drop latches the
         // sticky recovery gate.
         let mut transaction_arm = write_state.arm_transaction();
-        let fence = PoolMetaPersistenceFence::Distributed(lock_lost);
         let committed = self
             .save_no_lock_transaction(pools, write_state, &fence, indices, &mut transaction_arm)
             .await
@@ -8113,7 +8522,7 @@ impl PoolMeta {
             && selection.revision.is_generation_protocol()
             && !selection.replica_state.needs_repair
             && !bootstrap_generation_required
-            && matches!(fence, PoolMetaPersistenceFence::Distributed(Some(_)));
+            && fence.allows_concurrent_phases();
         #[cfg(feature = "e2e-test-hooks")]
         let phase_barrier = if concurrent_phases && pools.len() == 4 {
             PoolMetaPhaseBarrier::bind(&previous, &committed, revision, &durable).await?
@@ -8259,7 +8668,9 @@ impl PoolMeta {
         S: EcstoreObjectIO,
     {
         let indices = (0..self.pools.len()).collect::<Vec<_>>();
-        let outcome = self.save_no_lock_armed(pools, write_state, None, &indices).await?;
+        let outcome = self
+            .save_no_lock_armed(pools, write_state, PoolMetaPersistenceFence::OfflineRecovery, &indices)
+            .await?;
         outcome.disarm();
         Ok(())
     }
@@ -9618,6 +10029,8 @@ struct DecommissionCapacityLockOrderBarrierState {
     external_heal_target_lock_attempted: tokio::sync::Notify,
     target_gate_retry_entered: tokio::sync::Notify,
     target_gate_retry_entries: AtomicUsize,
+    target_gate_inline_retry_entered: tokio::sync::Notify,
+    target_gate_inline_retry_entries: AtomicUsize,
     target_gate_exact_reloads: AtomicUsize,
     target_gate_acquire_pause_target: AtomicUsize,
     target_gate_acquire_entered: tokio::sync::Notify,
@@ -9661,6 +10074,8 @@ impl DecommissionCapacityLockOrderBarrier {
             external_heal_target_lock_attempted: tokio::sync::Notify::new(),
             target_gate_retry_entered: tokio::sync::Notify::new(),
             target_gate_retry_entries: AtomicUsize::new(0),
+            target_gate_inline_retry_entered: tokio::sync::Notify::new(),
+            target_gate_inline_retry_entries: AtomicUsize::new(0),
             target_gate_exact_reloads: AtomicUsize::new(0),
             target_gate_acquire_pause_target: AtomicUsize::new(usize::MAX),
             target_gate_acquire_entered: tokio::sync::Notify::new(),
@@ -9750,6 +10165,11 @@ impl DecommissionCapacityLockOrderBarrier {
         })
         .await
         .expect("decommission entries should observe target gate contention");
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn target_gate_inline_retries(&self) -> usize {
+        self.state.target_gate_inline_retry_entries.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "test-util")]
@@ -9939,6 +10359,21 @@ fn notify_decommission_target_gate_retry(store_id: uuid::Uuid) {
     if let Some(barrier) = barrier {
         barrier.target_gate_retry_entries.fetch_add(1, Ordering::AcqRel);
         barrier.target_gate_retry_entered.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn notify_decommission_target_gate_inline_retry(store_id: uuid::Uuid) {
+    let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission capacity lock-order barrier should not be poisoned")
+        .as_ref()
+        .filter(|state| state.owner_store_id == store_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.target_gate_inline_retry_entries.fetch_add(1, Ordering::AcqRel);
+        barrier.target_gate_inline_retry_entered.notify_one();
     }
 }
 
@@ -10431,7 +10866,7 @@ impl ECStore {
         &self,
         write_state: &mut PoolMetaWriteState,
         operation: &str,
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, PoolMeta)> {
         self.acquire_pool_meta_write_guard_with_lock_error(write_state, operation, activation_pool_meta_lock_error)
             .await
     }
@@ -10441,7 +10876,7 @@ impl ECStore {
         write_state: &mut PoolMetaWriteState,
         operation: &str,
         map_lock_error: F,
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)>
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, PoolMeta)>
     where
         F: FnOnce(rustfs_lock::LockError) -> Error,
     {
@@ -10462,7 +10897,7 @@ impl ECStore {
         let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe(operation)?;
-        Ok((pool_meta_guard, selection.meta))
+        Ok((Arc::new(pool_meta_guard), selection.meta))
     }
 
     async fn acquire_pool_meta_read_guard(
@@ -10520,6 +10955,50 @@ impl ECStore {
                 achieved,
             }),
             Err(err) => Err(Error::Lock(err)),
+        }
+    }
+
+    /// Acquire the target pool's capacity mutation gate, absorbing a transient
+    /// gate-busy result with a small jittered inline retry.
+    ///
+    /// The target gate is acquired before the admitted mutation reads or writes
+    /// any data, so a busy gate guarantees the mutation has not started and can
+    /// be retried in place. A bounded retry here keeps short contention from
+    /// escalating an otherwise healthy object migration to a durable pause.
+    async fn acquire_decommission_capacity_target_guard_retried(
+        &self,
+        target_pool_index: usize,
+    ) -> Result<rustfs_lock::NamespaceLockGuard> {
+        let mut gate_attempt = 0;
+        loop {
+            match self.acquire_decommission_capacity_target_guard(target_pool_index).await {
+                Ok(guard) => return Ok(guard),
+                Err(err) if is_decommission_capacity_target_gate_busy(&err) => {
+                    gate_attempt += 1;
+                    if gate_attempt >= DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS {
+                        return Err(err);
+                    }
+                    #[cfg(test)]
+                    notify_decommission_target_gate_inline_retry(self.id);
+                    record_decommission_capacity_gate_retry(target_pool_index);
+                    let retry_delay = decommission_capacity_gate_retry_delay(gate_attempt);
+                    warn!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        store_id = %self.id,
+                        target_pool_index,
+                        attempt = gate_attempt,
+                        max_attempts = DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        state = "capacity_gate_inline_retry",
+                        error = %err,
+                        "Decommission target capacity gate busy; retrying mutation inline"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -10688,7 +11167,7 @@ impl ECStore {
     pub(crate) async fn acquire_pool_meta_object_heal_fence(
         &self,
         target_pool_indices: &[usize],
-    ) -> Result<(rustfs_lock::NamespaceLockGuard, Vec<Result<()>>)> {
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, Vec<Result<()>>)> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
@@ -10917,7 +11396,12 @@ impl ECStore {
         ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
 
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, write_guard.lock_lost_signal(), &source_pool_indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                &source_pool_indices,
+            )
             .await?;
         ensure_pool_meta_write_fence(&write_guard, "exact delete capacity reconciliation save failed")?;
         for (target_pool_index, target_guard) in &target_guards {
@@ -11026,7 +11510,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 &mut save_guard,
-                pool_meta_guard.lock_lost_signal(),
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 &[source_pool_index],
             )
             .await?;
@@ -11215,7 +11699,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 &mut save_guard,
-                pool_meta_guard.lock_lost_signal(),
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 &[source_pool_index],
             )
             .await?;
@@ -11359,10 +11843,11 @@ impl ECStore {
                     }
                 })
                 .filter(|reservation| {
-                    reservation
-                        .targets
-                        .iter()
-                        .any(|target| target.pool_index == target_pool_index)
+                    !temporary_release
+                        || reservation
+                            .targets
+                            .iter()
+                            .any(|target| target.pool_index == target_pool_index)
                 })
                 .map(|reservation| (owner, reservation.model_version))
         });
@@ -11390,7 +11875,10 @@ impl ECStore {
             DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION => {
                 Some(match take_decommission_capacity_target_permit(self.id, target_pool_index, owner) {
                     Some(guard) => guard,
-                    None => self.acquire_decommission_capacity_target_guard(target_pool_index).await?,
+                    None => {
+                        self.acquire_decommission_capacity_target_guard_retried(target_pool_index)
+                            .await?
+                    }
                 })
             }
             version => {
@@ -11421,10 +11909,11 @@ impl ECStore {
                 } else {
                     reservation.admits_owner(owner, OffsetDateTime::now_utc())
                 }) && reservation.model_version == model_version
-                    && reservation
-                        .targets
-                        .iter()
-                        .any(|target| target.pool_index == target_pool_index)
+                    && (!temporary_release
+                        || reservation
+                            .targets
+                            .iter()
+                            .any(|target| target.pool_index == target_pool_index))
             })
             .is_some();
         if !owner_current {
@@ -11433,9 +11922,22 @@ impl ECStore {
             ));
         }
         let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
-        if !temporary_release {
+        let reservation_grew = if temporary_release {
+            false
+        } else {
+            let data_bytes = expected_data_bytes.unwrap_or(1).max(1);
+            let grew = grow_decommission_target_reservation(
+                &mut snapshot,
+                &capacity_infos,
+                source_pool_index,
+                target_pool_index,
+                data_bytes,
+                mutation_id,
+                OffsetDateTime::now_utc(),
+            )?;
             ensure_decommission_capacity_reservations_available(&snapshot, &capacity_infos, "mutation")?;
-        }
+            grew
+        };
         let target_layout = snapshot
             .pools
             .get(source_pool_index)
@@ -11501,9 +12003,14 @@ impl ECStore {
                 OffsetDateTime::now_utc(),
             )?
         };
-        if pending_added > 0 {
+        if reservation_grew || pending_added > 0 {
             let outcome = snapshot
-                .save_no_lock_armed(self.pools.clone(), &mut save_guard, write_guard.lock_lost_signal(), &[source_pool_index])
+                .save_no_lock_armed(
+                    self.pools.clone(),
+                    &mut save_guard,
+                    PoolMetaPersistenceFence::Owned(Arc::clone(&write_guard)),
+                    &[source_pool_index],
+                )
                 .await?;
             ensure_pool_meta_write_fence(&write_guard, "decommission target capacity intent save failed")?;
             snapshot = outcome.committed.clone();
@@ -11675,7 +12182,12 @@ impl ECStore {
             return result;
         }
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), save_guard, write_guard.lock_lost_signal(), &[source_pool_index])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(write_guard)),
+                &[source_pool_index],
+            )
             .await?;
         ensure_pool_meta_write_fence(write_guard, "decommission target capacity progress save failed")?;
         if let Some(target_guard) = target_guard.as_ref() {
@@ -11810,8 +12322,8 @@ impl ECStore {
             .first()
             .ok_or_else(|| Error::other("pool metadata recovery has no storage pools"))?;
         let lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
-        let fence = PoolMetaPersistenceFence::Distributed(guard.lock_lost_signal());
+        let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await?);
+        let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&guard));
         let mut candidate = PoolMetaWriteState {
             aborted_transaction: Arc::new(AtomicBool::new(false)),
             transaction_failure: Arc::default(),
@@ -11987,7 +12499,12 @@ impl ECStore {
             merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, indices, "pool metadata save failed")?;
         }
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                indices,
+            )
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
@@ -12082,7 +12599,12 @@ impl ECStore {
         };
 
         let outcome = match snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -12148,7 +12670,12 @@ impl ECStore {
         #[cfg(test)]
         decommission_test_wrap_result("bucket_completion_before_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await?;
         #[cfg(test)]
         decommission_test_wrap_result("bucket_completion_after_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
@@ -12282,7 +12809,12 @@ impl ECStore {
             .await?;
         rollback_start_decommission_pool_meta(&mut snapshot, previous_pool_meta, indices);
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                indices,
+            )
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
@@ -12343,7 +12875,11 @@ impl ECStore {
         Ok(())
     }
 
-    async fn get_decommission_pool_capacity_info(&self, idx: usize) -> Result<DecommissionPoolCapacityInfo> {
+    async fn get_decommission_pool_capacity_info(
+        &self,
+        idx: usize,
+        use_owned_usage: bool,
+    ) -> Result<DecommissionPoolCapacityInfo> {
         if let Some(sets) = self.pools.get(idx) {
             let mut info = sets.storage_info_snapshot().await;
             info.backend = StorageAdminApi::backend_info(self).await;
@@ -12375,8 +12911,13 @@ impl ECStore {
                     layout.data, layout.parity
                 )));
             }
+            let owned_physical_used = if use_owned_usage {
+                Some(decommission_owned_physical_usage(sets, layout).await)
+            } else {
+                None
+            };
             let (physical_total, physical_free, physical_used) =
-                decommission_physical_pool_capacity(&info.disks, idx, layout, space);
+                decommission_physical_pool_capacity(&info.disks, idx, layout, space, owned_physical_used.as_ref());
 
             Ok(DecommissionPoolCapacityInfo {
                 pool_index: idx,
@@ -12399,7 +12940,20 @@ impl ECStore {
 
         let mut capacity_infos = Vec::with_capacity(self.pools.len());
         for idx in 0..self.pools.len() {
-            capacity_infos.push(self.get_decommission_pool_capacity_info(idx).await?);
+            capacity_infos.push(self.get_decommission_pool_capacity_info(idx, false).await?);
+        }
+        Ok(capacity_infos)
+    }
+
+    async fn get_decommission_all_pool_capacity_infos_with_owned_usage(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+            return Ok(capacity_infos);
+        }
+
+        let mut capacity_infos = Vec::with_capacity(self.pools.len());
+        for idx in 0..self.pools.len() {
+            capacity_infos.push(self.get_decommission_pool_capacity_info(idx, true).await?);
         }
         Ok(capacity_infos)
     }
@@ -12432,10 +12986,14 @@ impl ECStore {
             .get(idx)
             .and_then(|pool| pool.decommission.as_ref())
             .and_then(|info| info.capacity_reservation.as_ref())
-            .filter(|reservation| reservation.lease_active_at(OffsetDateTime::now_utc()))
         else {
             return Ok(None);
         };
+        if !reservation.lease_active_at(OffsetDateTime::now_utc()) {
+            return Err(decommission_capacity_blocked_error(
+                "decommission capacity reservation lease is not active",
+            ));
+        }
         Ok(Some(DecommissionCapacityOwner {
             source_pool_index: idx,
             operation_id: reservation.operation_id,
@@ -12488,7 +13046,7 @@ impl ECStore {
                 .targets
                 .iter()
                 .find(|target| target.pool_index == permitted_target_pool_index)
-                .and_then(&candidate)
+                .and_then(candidate)
             {
                 return Ok(pool_index);
             }
@@ -12497,15 +13055,37 @@ impl ECStore {
             // different target so one mutation never holds two target gates.
             discard_decommission_capacity_target_permit_except(self.id, owner, None);
         }
-        reservation
+        if let Some((pool_index, _)) = reservation
             .targets
             .iter()
             .filter_map(candidate)
             .max_by_key(|(_, remaining)| *remaining)
-            .map(|(pool_index, _)| pool_index)
+        {
+            return Ok(pool_index);
+        }
+        if reservation.source_data_equivalent_bytes > 0 {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {} has no target allocation for {expected_data_bytes} data bytes",
+                owner.source_pool_index
+            )));
+        }
+        let capacities = self.get_decommission_all_pool_capacity_infos().await?;
+        let active_sources = active_decommission_source_indices(&pool_meta);
+        capacities
+            .into_iter()
+            .filter(|capacity| {
+                capacity.pool_index != owner.source_pool_index
+                    && !active_sources.contains(&capacity.pool_index)
+                    && pool_meta
+                        .pools
+                        .get(capacity.pool_index)
+                        .is_some_and(is_decommission_start_active_pool)
+            })
+            .max_by_key(|capacity| capacity.physical_free)
+            .map(|capacity| capacity.pool_index)
             .ok_or_else(|| {
                 decommission_capacity_blocked_error(format!(
-                    "source pool {} has no target allocation for {expected_data_bytes} data bytes",
+                    "source pool {} has no target pool for {expected_data_bytes} data bytes",
                     owner.source_pool_index
                 ))
             })
@@ -12534,7 +13114,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture + Send + 'static,
+        Save: FnOnce(PoolMeta, PoolMetaPersistenceFence<'static>) -> SaveFuture + Send + 'static,
         SaveFuture: Future<Output = Result<()>> + Send + 'static,
     {
         let store = self.clone();
@@ -12554,7 +13134,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture,
+        Save: FnOnce(PoolMeta, PoolMetaPersistenceFence<'static>) -> SaveFuture,
         SaveFuture: Future<Output = Result<()>>,
     {
         let owner = owner.as_ref();
@@ -12603,9 +13183,17 @@ impl ECStore {
                 ));
             }
         }
-        let pool_meta_fence = _pool_meta_guard
-            .as_ref()
-            .and_then(rustfs_lock::NamespaceLockGuard::lock_lost_signal);
+        let pool_meta_fence = match _pool_meta_guard.as_ref() {
+            Some(guard) => PoolMetaPersistenceFence::Owned(Arc::clone(guard)),
+            None => {
+                #[cfg(test)]
+                {
+                    PoolMetaPersistenceFence::OfflineRecovery
+                }
+                #[cfg(not(test))]
+                return Err(Error::other("runtime pool metadata cancellation requires its write-lock owner"));
+            }
+        };
 
         // Lock order: start gate, target gates, save gate, distributed pool
         // metadata fence, rebalance_meta, decommission_cancelers, then
@@ -13001,7 +13589,7 @@ impl ECStore {
             let capacity_infos = if self.pools.is_empty() {
                 Vec::new()
             } else {
-                self.get_decommission_all_pool_capacity_infos().await?
+                self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?
             };
             let target_fence_proof = crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof();
             let mut pool_meta = self.pool_meta.write().await;
@@ -13044,7 +13632,12 @@ impl ECStore {
             let (save_outcome, save_error) = if changed {
                 ensure_decommission_target_fence_fleet_proof(target_fence_proof.as_ref(), target_fence_proof_required)?;
                 match snapshot
-                    .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &changed_indices)
+                    .save_no_lock_armed(
+                        self.pools.clone(),
+                        &mut save_guard,
+                        PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                        &changed_indices,
+                    )
                     .await
                 {
                     Ok(outcome) => (Some(outcome), None),
@@ -13136,7 +13729,12 @@ impl ECStore {
             .await?;
         snapshot.mark_decommission_capacity_blocked(idx, err.to_string(), OffsetDateTime::now_utc())?;
         let outcome = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
             .await?;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
         {
@@ -13352,6 +13950,7 @@ impl ECStore {
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         queue: Arc<tokio::sync::Mutex<mpsc::Receiver<QueuedDecommissionEntry>>>,
+        deferred: Arc<tokio::sync::Mutex<Vec<DeferredDecommissionEntry>>>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
     ) {
         loop {
@@ -13366,7 +13965,13 @@ impl ECStore {
             let Some(QueuedDecommissionEntry { entry, queue_permit }) = queued else {
                 return;
             };
+            // Only listing entries retain metadata that distinguishes prefixes
+            // from real directory objects. Deferred names are already objects.
+            if entry.is_dir() {
+                continue;
+            }
             let object_name = entry.name.clone();
+            let mut attempts = 0;
 
             if entry_error.lock().await.is_some() {
                 drop(queue_permit);
@@ -13410,7 +14015,7 @@ impl ECStore {
             } {
                 Ok(permit) => permit,
                 Err(err) => {
-                    let err = Error::other(format!("decommission entry budget permit acquire failed: {err}"));
+                    let err = decommission_entry_budget_acquire_error(err);
                     error!(
                         event = EVENT_DECOMMISSION_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
@@ -13433,7 +14038,7 @@ impl ECStore {
                     rx.clone(),
                     idx,
                     generation,
-                    entry,
+                    entry.clone(),
                     bucket.clone(),
                     set.clone(),
                     lifecycle_config.clone(),
@@ -13441,28 +14046,170 @@ impl ECStore {
                     replication_config.clone(),
                     expected_bucket_incarnation_id,
                     Arc::clone(&source_changed_exhaustions),
+                    &mut attempts,
                 )
                 .await;
             drop(entry_budget_permit);
-            drop(queue_permit);
 
-            if let Err(err) = result {
-                error!(
-                    event = EVENT_DECOMMISSION_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    set_index = set_idx,
-                    bucket = %bucket,
-                    object = %object_name,
-                    state = "entry_failed",
-                    error = %err,
-                    "Decommission entry failed"
-                );
-                record_decommission_entry_error(&entry_error, &rx, err).await;
-                return;
+            match result {
+                Ok(DecommissionEntryOutcome::Complete) => drop(queue_permit),
+                Ok(DecommissionEntryOutcome::Deferred(err)) => {
+                    // Release the outstanding permit before deferring: the
+                    // listing drain waits for the full budget to return, and the
+                    // listing has already finished for this round.
+                    drop(queue_permit);
+                    // Only the name and attempt count are retained. A contention streak
+                    // would otherwise pin one metadata buffer per object, and the
+                    // replay reloads the versions it needs from disk anyway.
+                    deferred.lock().await.push(DeferredDecommissionEntry {
+                        name: object_name,
+                        attempts,
+                    });
+                    info!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        set_index = set_idx,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "entry_deferred_to_round_end",
+                        error = %err,
+                        "Decommission entry deferred to the end of the current round"
+                    );
+                }
+                Err(err) => {
+                    drop(queue_permit);
+                    error!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        set_index = set_idx,
+                        bucket = %bucket,
+                        object = %object_name,
+                        state = "entry_failed",
+                        error = %err,
+                        "Decommission entry failed"
+                    );
+                    record_decommission_entry_error(&entry_error, &rx, err).await;
+                    return;
+                }
             }
         }
+    }
+
+    /// Run one deferred entry after the round's listing drained.
+    ///
+    /// The worker loop owns deferral, so this path must never defer again: any
+    /// remaining contention is terminal for the round and fails the bucket.
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_deferred_decommission_entry(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        set_idx: usize,
+        generation: OffsetDateTime,
+        mut deferred_entry: DeferredDecommissionEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        object_lock_config: Option<ObjectLockConfiguration>,
+        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
+        entry_budget: Arc<Semaphore>,
+        entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
+    ) -> Result<DecommissionEntryOutcome> {
+        let object_name = deferred_entry.name;
+        let entry = MetaCacheEntry {
+            name: object_name.clone(),
+            ..Default::default()
+        };
+
+        if entry_error.lock().await.is_some() || rx.is_cancelled() {
+            return Ok(DecommissionEntryOutcome::Complete);
+        }
+
+        if let Err(err) = self.ensure_decommission_generation_current(idx, generation).await {
+            if matches!(err, Error::OperationCanceled) {
+                rx.cancel();
+            } else {
+                record_decommission_entry_error(&entry_error, &rx, err).await;
+            }
+            return Ok(DecommissionEntryOutcome::Complete);
+        }
+
+        if let Err(err) = backpressure::wait_for_data_movement_admission(DataMovementOperation::Decommission, idx, &rx).await {
+            if matches!(err, Error::OperationCanceled) {
+                return Ok(DecommissionEntryOutcome::Complete);
+            }
+            error!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                set_index = set_idx,
+                bucket = %bucket,
+                object = %object_name,
+                state = "entry_admission_failed",
+                error = %err,
+                "Decommission entry admission failed"
+            );
+            record_decommission_entry_error(&entry_error, &rx, err).await;
+            return Ok(DecommissionEntryOutcome::Complete);
+        }
+
+        let entry_budget_permit = match tokio::select! {
+            biased;
+            _ = rx.cancelled() => return Ok(DecommissionEntryOutcome::Complete),
+            permit = entry_budget.clone().acquire_owned() => permit,
+        } {
+            Ok(permit) => permit,
+            Err(err) => {
+                let err = decommission_entry_budget_acquire_error(err);
+                record_decommission_entry_error(&entry_error, &rx, err).await;
+                return Ok(DecommissionEntryOutcome::Complete);
+            }
+        };
+
+        let result = self
+            .decommission_entry(
+                rx.clone(),
+                idx,
+                generation,
+                entry,
+                bucket.clone(),
+                set,
+                lifecycle_config,
+                object_lock_config,
+                replication_config,
+                expected_bucket_incarnation_id,
+                source_changed_exhaustions,
+                &mut deferred_entry.attempts,
+            )
+            .await;
+        drop(entry_budget_permit);
+
+        let err = match result {
+            Ok(DecommissionEntryOutcome::Complete) => return Ok(DecommissionEntryOutcome::Complete),
+            Ok(outcome @ DecommissionEntryOutcome::Deferred(_)) => return Ok(outcome),
+            Err(err) => err,
+        };
+        error!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            set_index = set_idx,
+            bucket = %bucket,
+            object = %object_name,
+            state = "entry_failed",
+            error = %err,
+            "Decommission entry failed"
+        );
+        record_decommission_entry_error(&entry_error, &rx, err).await;
+        Ok(DecommissionEntryOutcome::Complete)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13488,6 +14235,7 @@ impl ECStore {
         let outstanding = Arc::new(Semaphore::new(outstanding_capacity));
         let (tx, rx_queue) = mpsc::channel(queue_capacity);
         let queue = Arc::new(tokio::sync::Mutex::new(rx_queue));
+        let deferred: Arc<tokio::sync::Mutex<Vec<DeferredDecommissionEntry>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         let mut entry_workers = tokio::task::JoinSet::new();
         for _ in 0..worker_count {
@@ -13501,6 +14249,7 @@ impl ECStore {
             let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             let queue = queue.clone();
             let entry_budget = entry_budget.clone();
+            let deferred = deferred.clone();
             let entry_error = entry_error.clone();
             entry_workers.spawn(async move {
                 this.decommission_entry_worker(
@@ -13517,6 +14266,7 @@ impl ECStore {
                     source_changed_exhaustions,
                     entry_budget,
                     queue,
+                    deferred,
                     entry_error,
                 )
                 .await;
@@ -13647,7 +14397,62 @@ impl ECStore {
         if let Some(err) = entry_error.lock().await.clone() {
             return Err(err);
         }
-        listing_result
+        listing_result?;
+
+        // The listing drained, so every entry either completed or was deferred.
+        // Replaying the deferred set is the last chance for this round; a
+        // bucket must not be reported complete while a deferred entry remains.
+        let deferred_entries = std::mem::take(&mut *deferred.lock().await);
+        let deferred_remaining = Arc::new(AtomicUsize::new(0));
+        if !deferred_entries.is_empty() {
+            // The replay keeps the set's own worker bound: a whole-bucket
+            // deferral must not spawn one task per object.
+            futures::stream::iter(deferred_entries)
+                .for_each_concurrent(Some(worker_count), |deferred_entry| {
+                    let this = self.clone();
+                    let rx = rx.clone();
+                    let bucket = bi.name.clone();
+                    let set = set.clone();
+                    let lifecycle_config = lifecycle_config.clone();
+                    let object_lock_config = object_lock_config.clone();
+                    let replication_config = replication_config.clone();
+                    let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
+                    let entry_budget = entry_budget.clone();
+                    let entry_error = entry_error.clone();
+                    let deferred_remaining = Arc::clone(&deferred_remaining);
+                    async move {
+                        let outcome = this
+                            .replay_deferred_decommission_entry(
+                                rx,
+                                idx,
+                                set_idx,
+                                generation,
+                                deferred_entry,
+                                bucket,
+                                set,
+                                lifecycle_config,
+                                object_lock_config,
+                                replication_config,
+                                expected_bucket_incarnation_id,
+                                source_changed_exhaustions,
+                                entry_budget,
+                                entry_error,
+                            )
+                            .await;
+                        if matches!(outcome, Ok(DecommissionEntryOutcome::Deferred(_))) {
+                            deferred_remaining.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+                .await;
+            if let Some(err) = entry_error.lock().await.clone() {
+                return Err(err);
+            }
+        }
+        let deferred_remaining = deferred_remaining.load(Ordering::Relaxed);
+        // A set must not report success while an entry is still deferred: the
+        // bucket would be marked done and the object silently dropped.
+        ensure_decommission_deferred_drained(bi.name.as_str(), set_idx, deferred_remaining)
     }
 
     async fn track_decommission_entry_progress_stage(
@@ -13686,10 +14491,8 @@ impl ECStore {
         notify_decommission_target_gate_retry(self.id);
         let mut wait_attempt = target_busy_attempt;
         let target_guard = loop {
-            let retry_delay = decommission_retry_backoff_delay(
-                DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY,
-                wait_attempt.min(DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS),
-            );
+            let retry_delay =
+                decommission_capacity_gate_retry_delay(wait_attempt.min(DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS));
             if wait_decommission_retry_backoff(rx, retry_delay).await {
                 decommission_cancel_signal_result(rx.is_cancelled())?;
             }
@@ -13702,6 +14505,20 @@ impl ECStore {
             match self.acquire_decommission_capacity_target_guard(target_pool_index).await {
                 Ok(guard) => break guard,
                 Err(err) if is_decommission_capacity_target_gate_busy(&err) => {
+                    if decommission_capacity_target_gate_retry_exhausted(wait_attempt) {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            target_pool_index,
+                            attempts = wait_attempt.saturating_add(1),
+                            state = "capacity_gate_retry_exhausted",
+                            error = %err,
+                            "Decommission target capacity gate remained busy; pausing for supervised retry"
+                        );
+                        return Err(err);
+                    }
                     wait_attempt = wait_attempt.saturating_add(1);
                 }
                 Err(err) => return Err(err),
@@ -14007,14 +14824,20 @@ impl ECStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(
-        self,
-        set,
-        lifecycle_config,
-        object_lock_config,
-        replication_config,
-        source_changed_exhaustions
-    ))]
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "processing",
+            pool_index = idx,
+            bucket = %bucket,
+            object = %entry.name,
+            generation = %generation,
+        )
+    )]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -14028,12 +14851,14 @@ impl ECStore {
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
-    ) -> Result<()> {
+        attempts: &mut usize,
+    ) -> Result<DecommissionEntryOutcome> {
         let mut counted_versions = HashSet::new();
 
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
             let attempt_result = {
                 let mut conflict_attempt = 0;
+                let mut scanner_backlog_handoff_attempt = 0;
                 loop {
                     let result = self
                         .decommission_entry_attempt(
@@ -14048,29 +14873,62 @@ impl ECStore {
                             replication_config.clone(),
                             expected_bucket_incarnation_id,
                             entry_attempt,
+                            scanner_backlog_handoff_attempt,
                             source_changed_exhaustions.as_ref(),
                             &mut counted_versions,
+                            attempts,
                         )
                         .await;
                     let retry = result
                         .as_ref()
                         .err()
                         .and_then(|err| decommission_capacity_retry_kind(err, conflict_attempt));
-                    let retry_attempt = match retry {
-                        Some(DecommissionCapacityRetryKind::IntentConflict) => {
-                            conflict_attempt += 1;
-                            conflict_attempt
+                    if let Some(DecommissionCapacityRetryKind::IntentConflict) = retry {
+                        conflict_attempt += 1;
+                        let retry_delay =
+                            decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, conflict_attempt);
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
                         }
-                        None => break result,
-                    };
-                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, retry_attempt);
-                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
-                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                        continue;
                     }
+                    // Scanner pause backlog handoff conflicts resolve when the
+                    // surviving membership converges. Retry on a bounded
+                    // backoff that never writes failure state, clears
+                    // `start_time`, or releases the capacity reservation.
+                    let scanner_retry = result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| decommission_scanner_backlog_retry_kind(err, scanner_backlog_handoff_attempt));
+                    if let Some(DecommissionScannerBacklogRetryKind::HandoffConflict) = scanner_retry {
+                        scanner_backlog_handoff_attempt += 1;
+                        let retry_delay = decommission_retry_backoff_delay(
+                            DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY,
+                            scanner_backlog_handoff_attempt,
+                        );
+                        info!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "scanner_backlog_handoff_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            attempt = scanner_backlog_handoff_attempt,
+                            max_attempts = DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            "Decommission scanner pause backlog handoff conflict; retrying entry"
+                        );
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
+                        continue;
+                    }
+                    break result;
                 }
             };
             match attempt_result {
-                Ok(DecommissionEntryAttemptOutcome::Complete) => return Ok(()),
+                Ok(DecommissionEntryAttemptOutcome::Complete) => return Ok(DecommissionEntryOutcome::Complete),
                 Ok(DecommissionEntryAttemptOutcome::SourceChanged) => {
                     let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, entry_attempt);
                     warn!(
@@ -14090,7 +14948,43 @@ impl ECStore {
                         decommission_cancel_signal_result(rx.is_cancelled())?;
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    return match resolve_decommission_entry_failure(err) {
+                        Ok(DecommissionEntryOutcome::Deferred(err)) => {
+                            // Contention belongs to the target pool, not to this
+                            // object: failing the entry would discard every
+                            // in-flight object's progress for a condition the
+                            // deferred round can still absorb.
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "entry_deferred",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %entry.name,
+                                attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
+                                error = %err,
+                                "Decommission entry deferred after exhausting its attempts on target capacity contention"
+                            );
+                            Ok(DecommissionEntryOutcome::Deferred(err))
+                        }
+                        Ok(DecommissionEntryOutcome::Complete) => {
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "entry_ignored",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %entry.name,
+                                "Decommission entry ignored because its mutation is no longer needed"
+                            );
+                            Ok(DecommissionEntryOutcome::Complete)
+                        }
+                        Err(err) => Err(err),
+                    };
+                }
             }
         }
 
@@ -14114,9 +15008,12 @@ impl ECStore {
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         entry_attempt: usize,
+        scanner_backlog_handoff_attempt: usize,
         source_changed_exhaustions: &AtomicUsize,
         counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
+        attempts: &mut usize,
     ) -> Result<DecommissionEntryAttemptOutcome> {
+        record_decommission_object_attempt(attempts);
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
@@ -14129,19 +15026,6 @@ impl ECStore {
             max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
             "Decommission entry started"
         );
-        if entry.is_dir() {
-            debug!(
-                event = EVENT_DECOMMISSION_ENTRY,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_POOLS,
-                pool_index = idx,
-                bucket = %bucket,
-                object = %entry.name,
-                state = "skipped_directory",
-                "Decommission entry skipped directory"
-            );
-            return Ok(DecommissionEntryAttemptOutcome::Complete);
-        }
         // Scanner caches describe their own erasure set and are rebuilt there.
         // Copying one onto another set can overwrite unrelated cache contents or
         // leave an unresolvable target-capacity intent after a conditional PUT.
@@ -14173,27 +15057,56 @@ impl ECStore {
         if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
             let outcome = self
                 .retire_scanner_pause_backlog_entry(rx, idx, generation, Arc::clone(&set), fivs.clone(), capacity_owner)
-                .await?;
-            if matches!(outcome, DecommissionEntryAttemptOutcome::Complete) {
-                let mut pool_meta = self.pool_meta.write().await;
-                ensure_decommission_generation(&pool_meta, idx, generation)?;
-                if let Some(version) = fivs.versions.first()
-                    && counted_versions.insert((version.version_id, false))
-                {
-                    count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), false)?;
+                .await;
+            return match outcome {
+                Ok(DecommissionEntryAttemptOutcome::Complete) => {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    ensure_decommission_generation(&pool_meta, idx, generation)?;
+                    if let Some(version) = fivs.versions.first()
+                        && counted_versions.insert((version.version_id, false))
+                    {
+                        count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), false)?;
+                    }
+                    track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
+                    drop(pool_meta);
+                    self.track_decommission_entry_progress_stage(
+                        idx,
+                        generation,
+                        &bucket,
+                        &entry.name,
+                        DECOMMISSION_STAGE_ENTRY_FINISHED,
+                    )
+                    .await?;
+                    Ok(DecommissionEntryAttemptOutcome::Complete)
                 }
-                track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
-                drop(pool_meta);
-                self.track_decommission_entry_progress_stage(
-                    idx,
-                    generation,
-                    &bucket,
-                    &entry.name,
-                    DECOMMISSION_STAGE_ENTRY_FINISHED,
-                )
-                .await?;
-            }
-            return Ok(outcome);
+                Ok(outcome) => Ok(outcome),
+                Err(err) => {
+                    // The retry loop owns the handoff-conflict budget, so a
+                    // retryable conflict must not be attributed here. Once that
+                    // budget is exhausted the failure is terminal and belongs to
+                    // this entry rather than to whichever object was processed
+                    // last.
+                    let retryable_handoff = data_movement::data_movement_stage_source_as::<
+                        data_movement::scanner_backlog::ScannerPauseBacklogRetirementError,
+                    >(&err)
+                    .is_some_and(
+                        data_movement::scanner_backlog::ScannerPauseBacklogRetirementError::is_retryable_handoff_conflict,
+                    );
+                    let terminal = !retryable_handoff
+                        || scanner_backlog_handoff_attempt >= DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS;
+                    if terminal {
+                        let mut pool_meta = self.pool_meta.write().await;
+                        ensure_decommission_generation(&pool_meta, idx, generation)?;
+                        if let Some(version) = fivs.versions.first()
+                            && counted_versions.insert((version.version_id, true))
+                        {
+                            count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), true)?;
+                        }
+                        track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
+                    }
+                    Err(err)
+                }
+            };
         }
 
         let pending_mutations = if let Some(owner) = capacity_owner {
@@ -14247,6 +15160,9 @@ impl ECStore {
                 let mut target_busy_attempt: usize = 0;
                 let mut target_permit = None;
                 while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    if version_attempt > 1 || target_busy_attempt > 0 {
+                        record_decommission_object_attempt(attempts);
+                    }
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                             self.decommission_tiered_object(
@@ -14430,6 +15346,9 @@ impl ECStore {
                 let mut target_busy_attempt: usize = 0;
                 let mut target_permit = None;
                 while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    if version_attempt > 1 || target_busy_attempt > 0 {
+                        record_decommission_object_attempt(attempts);
+                    }
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                             self.delete_object(
@@ -14612,6 +15531,9 @@ impl ECStore {
             let mut target_busy_attempt: usize = 0;
             let mut target_permit = None;
             while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                if version_attempt > 1 || target_busy_attempt > 0 {
+                    record_decommission_object_attempt(attempts);
+                }
                 if version.is_remote() {
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
@@ -15239,7 +16161,7 @@ impl ECStore {
                 .is_some_and(|reservation| !reservation.active())
         };
         if needs_capacity_reservation {
-            let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+            let capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
             let mut pool_meta = self.pool_meta.write().await;
             let version = pool_meta.version;
             pool_meta.version = POOL_META_VERSION;
@@ -15252,20 +16174,23 @@ impl ECStore {
             pool_meta.version = version;
         }
         let generation = self.active_decommission_generation(idx).await?;
-        self.decommission_entry(
-            rx,
-            idx,
-            generation,
-            entry,
-            bucket,
-            set,
-            None,
-            None,
-            None,
-            expected_bucket_incarnation_id,
-            source_changed_exhaustions,
+        resolve_decommission_entry_test_outcome(
+            self.decommission_entry(
+                rx,
+                idx,
+                generation,
+                entry,
+                bucket,
+                set,
+                None,
+                None,
+                None,
+                expected_bucket_incarnation_id,
+                source_changed_exhaustions,
+                &mut 0,
+            )
+            .await,
         )
-        .await
     }
 
     #[cfg(all(test, feature = "test-util"))]
@@ -15282,20 +16207,23 @@ impl ECStore {
             Some(self.bucket_incarnation_id_from_disk(&bucket).await?)
         };
         let generation = self.active_decommission_generation(idx).await?;
-        self.decommission_entry(
-            CancellationToken::new(),
-            idx,
-            generation,
-            entry,
-            bucket,
-            set,
-            None,
-            None,
-            None,
-            expected_bucket_incarnation_id,
-            Arc::new(AtomicUsize::new(0)),
+        resolve_decommission_entry_test_outcome(
+            self.decommission_entry(
+                CancellationToken::new(),
+                idx,
+                generation,
+                entry,
+                bucket,
+                set,
+                None,
+                None,
+                None,
+                expected_bucket_incarnation_id,
+                Arc::new(AtomicUsize::new(0)),
+                &mut 0,
+            )
+            .await,
         )
-        .await
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -16103,7 +17031,7 @@ impl ECStore {
         self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate()
             .await?;
 
-        let all_capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+        let all_capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
         let target_fence_proof_available =
             crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof().is_some();
         // Signal cancellation before waiting for the movement writer so active
@@ -17595,6 +18523,17 @@ impl ECStore {
         }
         self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
             .await?;
+        self.decommission_durable_ilm_receipt_path_for_test(source_pool_idx, source_path, record)
+            .await
+    }
+
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) async fn decommission_durable_ilm_receipt_path_for_test(
+        &self,
+        source_pool_idx: usize,
+        source_path: &str,
+        record: &ValidatedDurableIlmRecord,
+    ) -> Result<String> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
         Ok(decommission_durable_ilm_receipt_path(&run_token, source_path, record.id_kind, &record.id))
     }
@@ -18691,7 +19630,10 @@ mod tests {
             .await
             .expect("second-node activation should not panic")
             .expect_err("the second reservation must observe and reject the committed first reservation");
-        assert!(err.to_string().contains("requires 60 bytes, but 40 bytes are available"));
+        assert!(
+            err.to_string().contains("requires 60 bytes, but 40 bytes are available"),
+            "the second reservation must report the committed capacity rejection, got {err:?}"
+        );
 
         let mut persisted = PoolMeta::default();
         persisted
@@ -19004,9 +19946,9 @@ mod tests {
                 .reload_pool_meta()
                 .await
                 .expect("load the active generation on the remote node");
-            other_store
-                .decommission_cancel(0)
+            tokio::time::timeout(std::time::Duration::from_secs(30), other_store.decommission_cancel(0))
                 .await
+                .expect("remote cancel must persist pool metadata without re-entering its state locks")
                 .expect("the remote node should cancel the old generation");
             other_store
                 .clear_decommission(0)
@@ -19271,9 +20213,9 @@ mod tests {
             .expect("the stale operation should have a valid terminal fence plan")
             .expect("the stale operation should have an active reservation");
 
-        first_node
-            .decommission_cancel(0)
+        tokio::time::timeout(std::time::Duration::from_secs(30), first_node.decommission_cancel(0))
             .await
+            .expect("cancel must persist pool metadata without re-entering its state locks")
             .expect("cancel the first durable operation");
         first_node
             .clear_decommission(0)
@@ -19776,8 +20718,9 @@ mod tests {
             .await
             .expect("second target mutation task should not panic")
             .expect("second target mutation should finalize");
-        cancel
+        tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
             .await
+            .expect("cancel must finish after target mutations release their gates")
             .expect("decommission cancellation task should not panic")
             .expect("decommission cancellation should finish after target mutations");
 
@@ -20024,6 +20967,45 @@ mod tests {
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err)),
             "the reserved first pool must not receive the multipart mutation"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn expired_decommission_capacity_lease_requires_recovery_before_entry() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1, 1),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 2, 2, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 2, 2, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the expired lease reservation");
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("read the active decommission generation");
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("the expired lease reservation should exist");
+            reservation.expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        }
+
+        let err = store
+            .decommission_capacity_owner_for_worker(0, generation)
+            .await
+            .expect_err("an expired capacity lease must not fall back to ownerless migration");
+        assert!(is_decommission_capacity_blocked_error(&err));
     }
 
     #[tokio::test]
@@ -21129,7 +22111,7 @@ mod tests {
             let mut state = store.pool_meta_save_gate.lock().await;
             let (fence, _) = store.acquire_pool_meta_write_guard(&mut state, "test save").await.unwrap();
             let outcome = requested
-                .save_no_lock_armed(store.pools.clone(), &mut state, fence.lock_lost_signal(), &[0])
+                .save_no_lock_armed(store.pools.clone(), &mut state, PoolMetaPersistenceFence::Owned(Arc::clone(&fence)), &[0])
                 .await
                 .unwrap();
             assert_eq!(outcome.committed.pools[0].last_update, requested.pools[0].last_update);
@@ -21449,6 +22431,280 @@ mod tests {
         assert!(err.to_string().contains("failed to apply lifecycle expiry action"));
     }
 
+    /// The capacity failure classification is the single place that decides
+    /// between retrying, ignoring, and propagating a decommission failure.
+    #[test]
+    fn decommission_capacity_failure_classification_covers_each_class() {
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}2{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        assert_eq!(
+            classify_decommission_capacity_failure(&gate_busy),
+            DecommissionCapacityFailure::TargetGateBusy { target_pool_index: 2 }
+        );
+
+        let intent_conflict =
+            decommission_capacity_blocked_error("decommission target mutation has an unresolved target capacity intent");
+        assert_eq!(
+            classify_decommission_capacity_failure(&intent_conflict),
+            DecommissionCapacityFailure::IntentConflict
+        );
+
+        let missing_source = Error::VersionNotFound("bucket".to_string(), "object".to_string(), "version".to_string());
+        assert_eq!(
+            classify_decommission_capacity_failure(&missing_source),
+            DecommissionCapacityFailure::BenignContention
+        );
+
+        let overwrite = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "v1".to_string());
+        assert_eq!(
+            classify_decommission_capacity_failure(&overwrite),
+            DecommissionCapacityFailure::BenignContention
+        );
+
+        let invalid_upload = Error::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload".to_string());
+        assert_eq!(
+            classify_decommission_capacity_failure(&invalid_upload),
+            DecommissionCapacityFailure::BenignContention
+        );
+
+        assert_eq!(
+            classify_decommission_capacity_failure(&Error::SlowDown),
+            DecommissionCapacityFailure::Fatal
+        );
+        assert_eq!(
+            classify_decommission_capacity_failure(&decommission_capacity_blocked_error(
+                "decommission target mutation reservation identity is stale"
+            )),
+            DecommissionCapacityFailure::Fatal
+        );
+    }
+
+    /// A stage wrapper must not hide the underlying capacity class.
+    #[test]
+    fn decommission_capacity_failure_classification_sees_through_a_stage_wrapper() {
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}1{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        let wrapped =
+            data_movement::data_movement_stage_error_for_test("decommission_object", "put_object_part", "b", "o", gate_busy);
+
+        assert_eq!(
+            classify_decommission_capacity_failure(&wrapped),
+            DecommissionCapacityFailure::TargetGateBusy { target_pool_index: 1 }
+        );
+        assert!(matches!(
+            resolve_decommission_entry_failure(wrapped),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_deferred_directory_object_is_copied_and_removed() {
+        use crate::object_api::PutObjReader;
+        let (_temp_dirs, store, _other_store) =
+            Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+        let bucket = "deferred-directory-object";
+        let object = "folder/";
+        Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        Box::pin(store.pools[0].put_object(
+            bucket,
+            &encode_dir_object(object),
+            &mut PutObjReader::from_vec(Vec::new()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed directory object");
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(&encode_dir_object(object))
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded directory object")
+                .is_some()
+        );
+        let retry_object = "retry.bin";
+        Box::pin(store.pools[0].put_object(
+            bucket,
+            retry_object,
+            &mut PutObjReader::from_vec(b"retry contents".to_vec()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed retry object");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+            ]],
+        );
+        Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+            .await
+            .expect("activate reservation");
+        let generation = store.active_decommission_generation(0).await.expect("active generation");
+        let source_set = store.pools[0].get_disks_by_key(&encode_dir_object(object));
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None));
+        let outcome = Box::pin(store.clone().replay_deferred_decommission_entry(
+            CancellationToken::new(),
+            0,
+            0,
+            generation,
+            DeferredDecommissionEntry {
+                name: object.into(),
+                attempts: 2,
+            },
+            bucket.into(),
+            source_set.clone(),
+            None,
+            None,
+            None,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Semaphore::new(1)),
+            entry_error.clone(),
+        ))
+        .await
+        .expect("replay deferred directory object");
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete));
+        assert!(entry_error.lock().await.is_none());
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read exact source versions")
+                .is_none(),
+            "source object must be removed"
+        );
+        let target = store.pools[1]
+            .get_disks_by_key(&encode_dir_object(object))
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read exact target versions")
+            .expect("directory object must reach target");
+        assert_eq!(target.versions.len(), 1);
+        assert_eq!(target.versions[0].size, 0);
+        let faults = Arc::new(AtomicUsize::new(0));
+        let observed = faults.clone();
+        let _fault = DecommissionTestFaultGuard::install(Arc::new(move |stage, b, o, attempt, success| {
+            if stage == "object_read" && b == bucket && o == retry_object && attempt == 1 && success {
+                observed.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            false
+        }));
+        let mut attempts = 2;
+        let result = Box::pin(store.decommission_entry(
+            CancellationToken::new(),
+            0,
+            generation,
+            MetaCacheEntry {
+                name: retry_object.into(),
+                ..Default::default()
+            },
+            bucket.into(),
+            store.pools[0].get_disks_by_key(retry_object),
+            None,
+            None,
+            None,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+            &mut attempts,
+        ))
+        .await
+        .expect("retry migration");
+        assert!(matches!(result, DecommissionEntryOutcome::Complete));
+        assert_eq!(faults.load(Ordering::Relaxed), 1, "inject one actual read failure");
+        assert_eq!(attempts, 4, "carry two attempts, then count the entry pass and copy retry");
+    }
+
+    #[test]
+    fn decommission_object_attempt_metric_keeps_the_peak() {
+        let mut attempts = 0;
+        record_decommission_object_attempt(&mut attempts);
+        record_decommission_object_attempt(&mut attempts);
+        let mut deferred = DeferredDecommissionEntry {
+            name: "object".into(),
+            attempts,
+        };
+        record_decommission_object_attempt(&mut deferred.attempts);
+        assert_eq!(deferred.attempts, 3);
+        assert!(*DECOMMISSION_OBJECT_ATTEMPTS_MAX.lock().expect("attempt peak lock") >= 3);
+    }
+
+    /// Gate-wait durations are recorded on the same jittered path the retry
+    /// uses, so the histogram cannot drift from the actual wait.
+    #[test]
+    fn decommission_capacity_gate_retry_delay_is_bounded_by_its_ceiling() {
+        for attempt in 1..=6 {
+            let delay = decommission_capacity_gate_retry_delay(attempt);
+            assert!(
+                delay <= decommission_retry_backoff_ceiling(DECOMMISSION_CAPACITY_GATE_RETRY_BASE, attempt),
+                "gate wait must stay within its jittered ceiling"
+            );
+        }
+    }
+
+    /// A set that still holds a deferred entry must not report success.
+    #[test]
+    fn decommission_deferred_drain_invariant_rejects_unresolved_entries() {
+        assert!(ensure_decommission_deferred_drained("bucket-a", 2, 0).is_ok());
+
+        let err = ensure_decommission_deferred_drained("bucket-a", 2, 3)
+            .expect_err("a set with deferred entries remaining must not complete");
+        let message = err.to_string();
+        assert!(message.contains("bucket-a"), "{message}");
+        assert!(message.contains('2'), "{message}");
+        assert!(message.contains('3'), "{message}");
+    }
+
+    /// Contention defers, benign contention completes without counting a
+    /// failure, and fatal errors stay terminal. Folding either of the first two
+    /// into the fatal arm would pause a healthy bucket, and folding a fatal
+    /// error into a deferral would hide a real migration failure.
+    #[test]
+    fn decommission_entry_failure_resolution_covers_each_class() {
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}1{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        let intent_conflict =
+            decommission_capacity_blocked_error("decommission target mutation has an unresolved target capacity intent");
+        for err in [gate_busy, intent_conflict] {
+            let outcome = resolve_decommission_entry_failure(err.clone())
+                .expect("transient capacity contention must defer, not fail the entry");
+            match outcome {
+                DecommissionEntryOutcome::Deferred(retained) => assert_eq!(retained, err),
+                DecommissionEntryOutcome::Complete => panic!("contention must not complete the entry"),
+            }
+        }
+
+        for benign in [
+            Error::ObjectNotFound("bucket".to_string(), "object".to_string()),
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "version".to_string()),
+            Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "v1".to_string()),
+            Error::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload".to_string()),
+        ] {
+            assert!(
+                matches!(resolve_decommission_entry_failure(benign.clone()), Ok(DecommissionEntryOutcome::Complete)),
+                "benign contention must complete without failing the entry: {benign}"
+            );
+        }
+
+        assert!(resolve_decommission_entry_failure(Error::SlowDown).is_err());
+        assert!(resolve_decommission_entry_failure(Error::OperationCanceled).is_err());
+    }
+
     #[test]
     fn decommission_copy_cleanup_safe_error_accepts_missing_source_errors() {
         assert!(is_decommission_copy_cleanup_safe_error(&Error::ObjectNotFound(
@@ -21611,6 +22867,45 @@ mod tests {
     #[test]
     fn decommission_target_capacity_error_rejects_unrelated_errors() {
         assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
+    }
+
+    #[test]
+    fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
+        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+
+        let handoff = data_movement::data_movement_context_error(
+            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
+            ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            },
+        );
+        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
+        assert_eq!(
+            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
+        );
+        assert_eq!(
+            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+            None,
+            "a divergent handoff must not retry forever"
+        );
+
+        for non_retryable in [
+            ScannerPauseBacklogRetirementError::AuthorityConflict {
+                reason: "larger source authority".to_string(),
+            },
+            ScannerPauseBacklogRetirementError::InvalidRecord {
+                reason: "unread member".to_string(),
+            },
+        ] {
+            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
+            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&err, 0),
+                None,
+                "only a handoff conflict may be retried"
+            );
+        }
     }
 
     #[test]
@@ -21794,6 +23089,69 @@ mod tests {
         let mut pool_meta = build_pool_meta();
         assert!(pool_meta.decommission_failed(0));
         assert!(!pool_meta.decommission_complete(0));
+    }
+
+    #[test]
+    fn decommission_capacity_reporting_preserves_existing_disk_layout() {
+        // Frozen V2/V3 reader contract from before capacity contention reporting.
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PreContentionDecommissionInfo {
+            #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+            pub start_time: Option<OffsetDateTime>,
+            #[serde(rename = "startSize")]
+            pub start_size: usize,
+            #[serde(rename = "totalSize")]
+            pub total_size: usize,
+            #[serde(rename = "currentSize")]
+            pub current_size: usize,
+            #[serde(rename = "complete")]
+            pub complete: bool,
+            #[serde(rename = "failed")]
+            pub failed: bool,
+            #[serde(rename = "canceled")]
+            pub canceled: bool,
+            #[serde(rename = "queued", default)]
+            pub queued: bool,
+            #[serde(rename = "queuedBuckets", default)]
+            pub queued_buckets: Vec<String>,
+            #[serde(rename = "decommissionedBuckets", default)]
+            pub decommissioned_buckets: Vec<String>,
+            #[serde(rename = "bucket", default)]
+            pub bucket: String,
+            #[serde(rename = "prefix", default)]
+            pub prefix: String,
+            #[serde(rename = "object", default)]
+            pub object: String,
+            #[serde(rename = "objectsDecommissioned")]
+            pub items_decommissioned: usize,
+            #[serde(rename = "objectsDecommissionedFailed")]
+            pub items_decommission_failed: usize,
+            #[serde(rename = "bytesDecommissioned")]
+            pub bytes_done: usize,
+            #[serde(rename = "bytesDecommissionedFailed")]
+            pub bytes_failed: usize,
+            #[serde(rename = "terminalReloadAttemptAt", with = "time::serde::rfc3339::option", default)]
+            pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+            #[serde(rename = "terminalReloadFailures", default)]
+            pub terminal_reload_failures: Vec<String>,
+            #[serde(rename = "unresolvedEntries", default)]
+            pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
+            #[serde(rename = "capacityReservation", default)]
+            pub capacity_reservation: Option<DecommissionCapacityReservation>,
+            #[serde(rename = "capacityBlockedReason", default)]
+            pub capacity_blocked_reason: Option<String>,
+        }
+        let current = PersistedPoolDecommissionInfo {
+            capacity_blocked_reason: Some("target gate busy".into()),
+            ..Default::default()
+        };
+        for bytes in [rmp_serde::to_vec(&current), rmp_serde::to_vec_named(&current)] {
+            let bytes = bytes.expect("serialize current decommission state");
+            let old: PreContentionDecommissionInfo =
+                rmp_serde::from_slice(&bytes).expect("existing V2/V3 readers must accept new writes");
+            assert_eq!(old.capacity_blocked_reason, current.capacity_blocked_reason);
+        }
     }
 
     #[test]
@@ -22448,6 +23806,7 @@ fn decommission_physical_pool_capacity(
     pool_index: usize,
     layout: DecommissionErasureLayout,
     logical: PoolSpaceInfo,
+    owned_physical_used: Option<&HashMap<i32, usize>>,
 ) -> (usize, usize, usize) {
     let width = layout.width();
     let mut sets: HashMap<i32, Vec<&rustfs_madmin::Disk>> = HashMap::new();
@@ -22487,13 +23846,20 @@ fn decommission_physical_pool_capacity(
             .map(|disk| disk.available_space as usize)
             .min()
             .unwrap_or_default();
-        let max_used = set_disks
-            .iter()
-            .map(|disk| (disk.used_space as usize).max((disk.total_space as usize).saturating_sub(disk.available_space as usize)))
-            .max()
-            .unwrap_or_default();
+        let physical_used_for_set = owned_physical_used
+            .and_then(|owned| owned.get(&set_disks[0].set_index).copied())
+            .unwrap_or_else(|| {
+                set_disks
+                    .iter()
+                    .map(|disk| {
+                        (disk.used_space as usize).max((disk.total_space as usize).saturating_sub(disk.available_space as usize))
+                    })
+                    .max()
+                    .unwrap_or_default()
+                    .saturating_mul(width)
+            });
         physical_total = physical_total.saturating_add(min_total.saturating_mul(width));
-        physical_used = physical_used.saturating_add(max_used.saturating_mul(width));
+        physical_used = physical_used.saturating_add(physical_used_for_set);
         if set_disks.len() >= width {
             physical_free = physical_free.saturating_add(min_free.saturating_mul(width));
         }
@@ -22676,6 +24042,8 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 
 #[cfg(test)]
 mod pools_tests {
+    use std::collections::HashMap;
+
     use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
     use super::persist_v3_pool_meta_for_test;
     use super::record_decommission_entry_error;
@@ -22699,8 +24067,8 @@ mod pools_tests {
         classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
         decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
         decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
-        decommission_meta_bucket_options, decommission_physical_pool_capacity, decommission_retry_backoff_delay,
-        decommission_start_pool_state, decommission_unresolved_listing_error, dedup_indices,
+        decommission_meta_bucket_options, decommission_physical_pool_capacity, decommission_retry_backoff_ceiling,
+        decommission_retry_backoff_delay, decommission_start_pool_state, decommission_unresolved_listing_error, dedup_indices,
         default_decommission_bucket_concurrency, default_decommission_entry_concurrency, drain_decommission_entry_queue,
         enqueue_decommission_entry, ensure_decommission_cancel_allowed, ensure_decommission_capacity_reservations_available,
         ensure_decommission_clear_allowed, ensure_decommission_generation, ensure_decommission_listing_disks_available,
@@ -22709,10 +24077,11 @@ mod pools_tests {
         ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_start_target_capacity,
         ensure_decommission_terminal_operation_supported, ensure_decommission_unresolved_verification_disk_count,
         ensure_local_decommission_pool_leaders, ensure_pool_meta_write_fence, ensure_valid_decommission_pool_index, get_by_index,
-        guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
-        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
-        merge_decommission_durable_ilm_receipts, merge_pool_meta_updates_for_save, merge_pool_status_refresh,
-        missing_decommission_worker_prefix, next_decommission_capacity_generation, observe_decommission_terminal_reload_result,
+        grow_decommission_target_reservation, guard_decommission_cancelers, has_active_decommission_canceler,
+        is_decommission_active, is_decommission_cancel_requested, load_decommission_entry_versions,
+        local_decommission_queue_prefix, mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts,
+        merge_pool_meta_updates_for_save, merge_pool_status_refresh, missing_decommission_worker_prefix,
+        next_decommission_capacity_generation, observe_decommission_terminal_reload_result,
         parse_decommission_durable_ilm_receipt_path, pool_meta_has_active_decommission, publish_pool_meta_updates,
         read_pool_meta_replica, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
         record_decommission_unresolved_entry, recover_decommission_capacity_reservations,
@@ -22738,13 +24107,14 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityAdmission, DecommissionCapacityOwner, DecommissionCapacityReleaseProof,
-        DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
-        ensure_decommission_target_owner_admission, ensure_exact_delete_capacity_namespace_fences,
-        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
-        plan_exact_delete_capacity_reconciliations, record_decommission_target_consumption, release_decommission_target_inflight,
-        reserve_decommission_target_pending, resolve_decommission_target_pending,
-        set_decommission_capacity_info_overrides_for_test,
+        DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS, DECOMMISSION_RETRY_BACKOFF_CAP, DecommissionCapacityAdmission,
+        DecommissionCapacityOwner, DecommissionCapacityReleaseProof, DecommissionCapacityReservation,
+        DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
+        decommission_capacity_target_gate_retry_exhausted, ensure_decommission_target_owner_admission,
+        ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
+        is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
+        record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
+        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -22844,6 +24214,17 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[test]
+    fn decommission_target_gate_retry_is_bounded() {
+        assert!(!decommission_capacity_target_gate_retry_exhausted(0));
+        assert!(!decommission_capacity_target_gate_retry_exhausted(
+            DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS - 2
+        ));
+        assert!(decommission_capacity_target_gate_retry_exhausted(
+            DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS - 1
+        ));
     }
 
     #[tokio::test]
@@ -23532,11 +24913,12 @@ mod pools_tests {
             config[3][0].gate = Some(gate.clone());
             let fixture = Fixture::new(config);
             let mut state = fixture.state();
-            let mut save = Box::pin(
-                fixture
-                    .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-            );
+            let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                fixture.pools.clone(),
+                &mut state,
+                PoolMetaPersistenceFence::Distributed(signal()),
+                &[0],
+            ));
             tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("commit crossed the last prepare") }
             assert_eq!(fixture.trace.commit_count(), 0);
             gate.add_permits(1);
@@ -23556,7 +24938,7 @@ mod pools_tests {
             let mut state = fixture.state();
             let err = fixture
                 .desired
-                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                 .await
                 .expect_err("a missing conditional-write revision must fail");
             assert!(err.to_string().contains("without a conditional-write revision"));
@@ -23573,11 +24955,12 @@ mod pools_tests {
             config[3][0].gate = Some(gate.clone());
             let fixture = Fixture::new(config);
             let mut state = fixture.state();
-            let mut save = Box::pin(
-                fixture
-                    .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-            );
+            let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                fixture.pools.clone(),
+                &mut state,
+                PoolMetaPersistenceFence::Distributed(signal()),
+                &[0],
+            ));
             tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("phase returned with a live replica") }
             assert_eq!(fixture.trace.commit_count(), 0);
             gate.add_permits(1);
@@ -23752,11 +25135,12 @@ mod pools_tests {
                 }
                 let fixture = Fixture::new(config);
                 let mut state = fixture.state();
-                let mut save = Box::pin(
-                    fixture
-                        .desired
-                        .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
-                );
+                let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                    fixture.pools.clone(),
+                    &mut state,
+                    PoolMetaPersistenceFence::Distributed(signal()),
+                    &[0],
+                ));
                 tokio::select! { _ = fixture.trace.wait_for(4 * (phase + 1), 4 * phase) => {}, _ = &mut save => panic!("blocked phase finished") }
                 drop(save);
                 assert!(state.ensure_write_safe("cancelled phase").is_err());
@@ -23767,7 +25151,7 @@ mod pools_tests {
             let mut state = fixture.state();
             let outcome = fixture
                 .desired
-                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                 .await
                 .expect("durable save before publication");
             drop(outcome);
@@ -23795,6 +25179,7 @@ mod pools_tests {
                 .await
                 .expect("lease request")
                 .expect("lease acquired");
+            let guard = Arc::new(guard);
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let mut config = steps(6);
             for step in &mut config {
@@ -23803,7 +25188,7 @@ mod pools_tests {
             let fixture = Fixture::new(config);
             let state = fixture.state();
             let mut arm = state.arm_transaction();
-            let fence = PoolMetaPersistenceFence::Distributed(guard.lock_lost_signal());
+            let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&guard));
             let mut pending = Box::pin(prepare(&fixture, &fence, &mut arm));
             tokio::select! { _ = fixture.trace.wait_for(4, 0) => {}, _ = &mut pending => panic!("gate ignored") }
             tokio::time::timeout(StdDuration::from_secs(3), guard.lock_lost_notified())
@@ -23829,7 +25214,7 @@ mod pools_tests {
                 let mut state = fixture.state();
                 let result = fixture
                     .desired
-                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                    .save_no_lock_armed(fixture.pools.clone(), &mut state, PoolMetaPersistenceFence::Distributed(signal()), &[0])
                     .await;
                 assert_eq!(fixture.trace.commit_count(), 4);
                 if matches!(fault, WriteFault::TimeoutAfterWrite) {
@@ -23879,7 +25264,7 @@ mod pools_tests {
                 let mut save = Box::pin(fixture.desired.save_no_lock_armed(
                     fixture.pools.clone(),
                     &mut state,
-                    if legacy || needs_repair { signal() } else { None },
+                    PoolMetaPersistenceFence::Distributed(if legacy || needs_repair { signal() } else { None }),
                     &[0],
                 ));
                 tokio::select! { _ = fixture.trace.wait_for(1, 0) => {}, _ = &mut save => panic!("serial write gate ignored") }
@@ -24439,7 +25824,7 @@ mod pools_tests {
         let save_task = tokio::spawn(async move {
             let mut save_guard = save_store.pool_meta_save_gate.lock().await;
             let outcome = snapshot
-                .save_no_lock_armed(vec![save_committed], &mut save_guard, None, &[0])
+                .save_no_lock_armed(vec![save_committed], &mut save_guard, PoolMetaPersistenceFence::OfflineRecovery, &[0])
                 .await?;
             task_publish_started.notify_one();
             task_publish_release.notified().await;
@@ -24467,6 +25852,73 @@ mod pools_tests {
     }
 
     #[tokio::test]
+    async fn pool_meta_cas_context_retains_actual_owner_for_exact_target() {
+        use crate::object_api::write_commit_context::WriteCommitContext;
+
+        let lock = NamespaceLock::with_local_manager("pool-meta-cas-owner".to_string(), Arc::new(GlobalLockManager::new()));
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "cas-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1));
+        let owner = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("pool metadata lock acquisition should succeed")
+                .expect("pool metadata lock should be available"),
+        );
+        let weak_owner = Arc::downgrade(&owner);
+        let fence = PoolMetaPersistenceFence::Owned(Arc::clone(&owner));
+        let mut contexts = Vec::new();
+        for object in [POOL_META_NAME, POOL_META_IDENTITY_NAME] {
+            let options = super::pool_meta_cas_options(object, &PoolMetaCasToken::Missing, &fence)
+                .expect("a held pool metadata lock should authorize its CAS target");
+            let cloned_options = options.clone();
+            let context = WriteCommitContext::from_options(&cloned_options, super::RUSTFS_META_BUCKET, object, false)
+                .expect("the actual CAS target should retain its borrowed namespace owner");
+            assert!(context.has_borrowed_owner(), "CAS must borrow the real protocol lock owner");
+            assert!(
+                WriteCommitContext::from_options(&cloned_options, super::RUSTFS_META_BUCKET, "unrelated-object", false).is_err(),
+                "a pool metadata CAS capability must not authorize an unrelated object"
+            );
+            drop(options);
+            drop(cloned_options);
+            contexts.push(context);
+        }
+        drop(fence);
+        drop(owner);
+        assert!(
+            weak_owner.upgrade().is_some(),
+            "queued commit contexts must keep the actual lock guard alive"
+        );
+        drop(contexts);
+        assert!(weak_owner.upgrade().is_none(), "the last commit context must release its lock owner");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_cas_rejects_released_owner() {
+        let lock = NamespaceLock::with_local_manager("pool-meta-released-owner".to_string(), Arc::new(GlobalLockManager::new()));
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "released-cas-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1));
+        let mut owner = lock
+            .acquire_guard(&request)
+            .await
+            .expect("pool metadata lock acquisition should succeed")
+            .expect("pool metadata lock should be available");
+        assert!(owner.release(), "the test must release a real namespace owner");
+        let fence = PoolMetaPersistenceFence::Owned(Arc::new(owner));
+        assert!(
+            super::pool_meta_cas_options(POOL_META_NAME, &PoolMetaCasToken::Missing, &fence).is_err(),
+            "a released namespace owner must not dispatch another CAS"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lost_pool_meta_fence_rejects_replica_write() {
         let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
         let lock = NamespaceLock::with_clients_and_quorum("pool-meta-fence-loss".to_string(), vec![client], 1);
@@ -24483,6 +25935,7 @@ mod pools_tests {
             .await
             .expect("pool metadata fence acquisition should not error")
             .expect("the stale writer should acquire the pool metadata fence");
+        let guard = Arc::new(guard);
         tokio::time::timeout(StdDuration::from_secs(2), guard.lock_lost_notified())
             .await
             .expect("the stale writer lease should expire");
@@ -24504,7 +25957,12 @@ mod pools_tests {
         };
         let mut write_state = super::PoolMetaWriteState::default();
         let err = snapshot
-            .save_no_lock_armed(vec![storage.clone()], &mut write_state, guard.lock_lost_signal(), &[0])
+            .save_no_lock_armed(
+                vec![storage.clone()],
+                &mut write_state,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&guard)),
+                &[0],
+            )
             .await
             .expect_err("a writer must not persist after losing the distributed pool metadata fence");
 
@@ -24532,6 +25990,7 @@ mod pools_tests {
             .await
             .expect("pool metadata fence acquisition should not error")
             .expect("the publishing writer should acquire the pool metadata fence");
+        let guard = Arc::new(guard);
         let storage = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
             fail_after_first_write: false,
@@ -24552,7 +26011,7 @@ mod pools_tests {
         current.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
         let mut write_state = super::PoolMetaWriteState::for_test_bootstrap();
         let outcome = saved
-            .save_no_lock_armed(vec![storage], &mut write_state, guard.lock_lost_signal(), &[0])
+            .save_no_lock_armed(vec![storage], &mut write_state, PoolMetaPersistenceFence::Owned(Arc::clone(&guard)), &[0])
             .await
             .expect("the replica save should finish while the fence is valid");
 
@@ -27272,12 +28731,27 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_decommission_retry_backoff_delay_grows_linearly() {
+    fn test_decommission_retry_backoff_ceiling_grows_exponentially_and_caps() {
         let base = StdDuration::from_millis(100);
 
-        assert_eq!(decommission_retry_backoff_delay(base, 1), base);
-        assert_eq!(decommission_retry_backoff_delay(base, 3), StdDuration::from_millis(300));
-        assert_eq!(decommission_retry_backoff_delay(base, usize::MAX), base.saturating_mul(u32::MAX));
+        assert_eq!(decommission_retry_backoff_ceiling(base, 1), StdDuration::from_millis(100));
+        assert_eq!(decommission_retry_backoff_ceiling(base, 2), StdDuration::from_millis(200));
+        assert_eq!(decommission_retry_backoff_ceiling(base, 3), StdDuration::from_millis(400));
+        assert_eq!(decommission_retry_backoff_ceiling(base, 4), StdDuration::from_millis(800));
+        assert_eq!(decommission_retry_backoff_ceiling(base, 5), DECOMMISSION_RETRY_BACKOFF_CAP);
+        assert_eq!(decommission_retry_backoff_ceiling(base, usize::MAX), DECOMMISSION_RETRY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn test_decommission_retry_backoff_delay_stays_within_jittered_ceiling() {
+        let base = StdDuration::from_millis(100);
+
+        for attempt in 1..=6 {
+            let ceiling = decommission_retry_backoff_ceiling(base, attempt);
+            let delay = decommission_retry_backoff_delay(base, attempt);
+            assert!(delay <= ceiling, "delay {delay:?} must not exceed ceiling {ceiling:?}");
+        }
+        assert_eq!(decommission_retry_backoff_delay(StdDuration::ZERO, 3), StdDuration::ZERO);
     }
 
     #[test]
@@ -28268,6 +29742,44 @@ mod pools_tests {
     }
 
     #[test]
+    fn decommission_capacity_reservation_grows_after_stale_empty_snapshot() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        let layout = DecommissionErasureLayout { data: 3, parity: 1 };
+        let capacity_infos = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 0, 0),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 64, 64, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, capacity_infos[0].space).unwrap();
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[0],
+            &capacity_infos,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("an empty scanner snapshot should still start decommission");
+        let grew = grow_decommission_target_reservation(&mut meta, &capacity_infos, 0, 1, 1, uuid::Uuid::new_v4(), now)
+            .expect("the reservation should grow against current target capacity");
+        assert!(grew);
+        let reservation = meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .unwrap();
+        assert_eq!(reservation.source_data_equivalent_bytes, 2);
+        assert_eq!(reservation.predicted_physical_bytes, 3);
+        assert_eq!(reservation.targets.len(), 1);
+        assert_eq!(reservation.targets[0].reserved_physical_bytes, 6);
+    }
+
+    #[test]
     fn decommission_capacity_model_reserves_versions_delete_markers_and_temporary_copies_from_physical_usage() {
         let reservation = build_decommission_capacity_reservation(
             DecommissionPoolCapacityInfo::for_test(0, DecommissionErasureLayout { data: 2, parity: 2 }, 0, 1_024, 1_024),
@@ -28823,9 +30335,44 @@ mod pools_tests {
                 total: 0,
                 used: 0,
             },
+            None,
         );
 
         assert_eq!(capacity, (400, 40, 360));
+    }
+
+    #[test]
+    fn decommission_physical_capacity_prefers_rustfs_owned_usage_over_filesystem_usage() {
+        let disks = [10_u64, 20, 30, 40]
+            .into_iter()
+            .enumerate()
+            .map(|(disk_index, available_space)| rustfs_madmin::Disk {
+                endpoint: format!("http://node-{disk_index}"),
+                drive_path: format!("/disk-{disk_index}"),
+                state: "ok".to_string(),
+                total_space: 100,
+                used_space: 100 - available_space,
+                available_space,
+                pool_index: 0,
+                set_index: 0,
+                disk_index: disk_index as i32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let owned = HashMap::from([(0, 12)]);
+        let capacity = decommission_physical_pool_capacity(
+            &disks,
+            0,
+            DecommissionErasureLayout { data: 2, parity: 2 },
+            PoolSpaceInfo {
+                free: 0,
+                total: 0,
+                used: 0,
+            },
+            Some(&owned),
+        );
+
+        assert_eq!(capacity, (400, 40, 12));
     }
 
     #[test]

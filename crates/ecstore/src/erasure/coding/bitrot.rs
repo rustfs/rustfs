@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
@@ -102,6 +103,7 @@ pin_project! {
         chunks: Vec<bytes::Bytes>,
         skip_verify: bool,
         last_verify_duration: Duration,
+        integrity: Option<crate::io_support::shard_integrity::ShardVerifier>,
     }
 }
 
@@ -119,11 +121,30 @@ where
             chunks: Vec::new(),
             skip_verify,
             last_verify_duration: Duration::ZERO,
+            integrity: None,
         }
     }
 
     pub(crate) fn last_verify_duration(&self) -> Duration {
         self.last_verify_duration
+    }
+
+    pub(crate) fn integrity_proof(&self) -> Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>> {
+        self.integrity
+            .as_ref()
+            .map(crate::io_support::shard_integrity::ShardVerifier::proof)
+    }
+
+    pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) -> std::io::Result<()> {
+        if self.hash_algo != HashAlgorithm::HighwayHash256S {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported protected shard framing",
+            ));
+        }
+        self.integrity = Some(verifier);
+        self.skip_verify = false;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -152,6 +173,9 @@ where
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(data).await?;
+        }
         out.copy_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)
@@ -216,7 +240,7 @@ fn short_shard_read(got: usize, want: usize) -> std::io::Error {
         want,
         "short shard read: got {got} of {want} bytes"
     );
-    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("short shard read: got {got} of {want} bytes"))
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, DiskError::FileCorrupt)
 }
 
 /// Split a `[hash][data]` block, verify the hash (unless `skip_verify`), and
@@ -242,7 +266,7 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
             data_len = data.len(),
             "bitrot hash mismatch"
         );
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
     }
     Ok((data, verify))
 }
@@ -263,6 +287,18 @@ where
     ///
     /// On return `out.len()` has grown by exactly the returned count.
     pub async fn read_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+        let start = out.len();
+        let count = self.read_appending_frame(out, want).await?;
+        if let Some(integrity) = &mut self.integrity
+            && let Err(error) = integrity.verify(&out[start..]).await
+        {
+            out.truncate(start);
+            return Err(error);
+        }
+        Ok(count)
+    }
+
+    async fn read_appending_frame(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
         use bytes::BufMut as _;
         use tokio::io::AsyncReadExt as _;
 
@@ -399,7 +435,7 @@ where
                             data_len = want,
                             "bitrot hash mismatch"
                         );
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
                     }
                     hash_offset += take;
                     remaining -= take;
@@ -768,6 +804,7 @@ impl AsyncWrite for CustomWriter {
 pub struct BitrotWriterWrapper {
     bitrot_writer: BitrotWriter<CustomWriter>,
     writer_type: WriterType,
+    integrity: Option<crate::io_support::shard_integrity::ShardVerifier>,
 }
 
 /// Enum to track the type of writer we're using
@@ -801,12 +838,20 @@ impl BitrotWriterWrapper {
         Self {
             bitrot_writer: BitrotWriter::new(writer, shard_size, checksum_algo),
             writer_type,
+            integrity: None,
         }
     }
 
     /// Write data to the bitrot writer
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(buf).await?;
+        }
         self.bitrot_writer.write(buf).await
+    }
+
+    pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) {
+        self.integrity = Some(verifier);
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
@@ -1096,6 +1141,26 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn bitrot_damage_preserves_typed_repair_evidence() {
+        use crate::disk::error::Error as DiskError;
+        let algo = HashAlgorithm::HighwayHash256;
+        let data = b"repair evidence";
+        let mut frame = algo.hash_encode(data).as_ref().to_vec();
+        frame.extend_from_slice(data);
+        *frame.last_mut().expect("test frame has payload") ^= 1;
+        let error = super::split_and_verify(&algo, false, &frame).expect_err("a hash mismatch must reject the shard");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+        let error = super::short_shard_read(3, 4);
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+        assert!(matches!(
+            DiskError::from(io::Error::new(io::ErrorKind::InvalidData, "unrelated invalid data")),
+            DiskError::Io(_)
+        ));
+    }
 
     struct FragmentedSource {
         chunks: VecDeque<Bytes>,

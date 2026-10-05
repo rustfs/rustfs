@@ -325,7 +325,7 @@ pub(super) fn build_bucket_heal_request(bucket: String, priority: HealChannelPri
         priority,
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 
@@ -345,7 +345,7 @@ pub(super) fn build_object_heal_request(
         remove_corrupted: Some(HEAL_DELETE_DANGLING),
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 

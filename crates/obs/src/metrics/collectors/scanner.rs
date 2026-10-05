@@ -161,6 +161,32 @@ pub struct ScannerStats {
     pub partial_cycles_objects: u64,
     /// Number of scanner cycles stopped by directory budget
     pub partial_cycles_directories: u64,
+    /// Number of buckets with pending scanner dirty-usage acknowledgements
+    pub dirty_usage_pending_buckets: u64,
+    /// Unix timestamp of the last scanner dirty-usage mark
+    pub dirty_usage_last_mark_unix_seconds: u64,
+    /// Unix timestamp of the last scanner dirty-usage clear
+    pub dirty_usage_last_clear_unix_seconds: u64,
+    /// Number of dirty-usage buckets observed by the last scanner cycle
+    pub dirty_usage_last_cycle_buckets: u64,
+    /// Number of dirty-usage buckets cleared by the last scanner cycle
+    pub dirty_usage_last_cycle_cleared_buckets: u64,
+    /// Unix timestamp of the last scanner usage-cache save attempt
+    pub usage_last_save_unix_seconds: u64,
+    /// Last scanner usage-cache save result code
+    pub usage_last_save_result: u64,
+    /// Unix timestamp of the last durable scanner usage-cache publication success
+    pub usage_last_durable_success_unix_seconds: u64,
+    /// Unix timestamp of the last scanner usage-cache publication state update
+    pub usage_last_publication_unix_seconds: u64,
+    /// Last scanner usage-cache publication result code
+    pub usage_last_publication_result: u64,
+    /// Whether scanner usage-cache publication is currently deferred
+    pub usage_deferred_pending: bool,
+    /// Total scanner usage-cache publication deferrals since server start
+    pub usage_deferred_total: u64,
+    /// Unix timestamp of the last scanner usage-cache publication deferral
+    pub usage_last_deferred_unix_seconds: u64,
 }
 
 /// Scanner source-work metrics for a source.
@@ -423,6 +449,40 @@ fn collect_scanner_metrics_with_runtime(stats: &ScannerStats, runtime: Option<&S
             .with_label("reason", "objects"),
         PrometheusMetric::from_descriptor(&SCANNER_PARTIAL_CYCLES_BY_REASON_MD, stats.partial_cycles_directories as f64)
             .with_label("reason", "directories"),
+        PrometheusMetric::from_descriptor(&SCANNER_DIRTY_USAGE_PENDING_BUCKETS_MD, stats.dirty_usage_pending_buckets as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_DIRTY_USAGE_LAST_MARK_UNIX_SECONDS_MD,
+            stats.dirty_usage_last_mark_unix_seconds as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_DIRTY_USAGE_LAST_CLEAR_UNIX_SECONDS_MD,
+            stats.dirty_usage_last_clear_unix_seconds as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_DIRTY_USAGE_LAST_CYCLE_BUCKETS_MD,
+            stats.dirty_usage_last_cycle_buckets as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_DIRTY_USAGE_LAST_CYCLE_CLEARED_BUCKETS_MD,
+            stats.dirty_usage_last_cycle_cleared_buckets as f64,
+        ),
+        PrometheusMetric::from_descriptor(&SCANNER_USAGE_LAST_SAVE_UNIX_SECONDS_MD, stats.usage_last_save_unix_seconds as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_USAGE_LAST_SAVE_RESULT_MD, stats.usage_last_save_result as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_USAGE_LAST_DURABLE_SUCCESS_UNIX_SECONDS_MD,
+            stats.usage_last_durable_success_unix_seconds as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_USAGE_LAST_PUBLICATION_UNIX_SECONDS_MD,
+            stats.usage_last_publication_unix_seconds as f64,
+        ),
+        PrometheusMetric::from_descriptor(&SCANNER_USAGE_LAST_PUBLICATION_RESULT_MD, stats.usage_last_publication_result as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_USAGE_DEFERRED_PENDING_MD, bool_metric_value(stats.usage_deferred_pending)),
+        PrometheusMetric::from_descriptor(&SCANNER_USAGE_DEFERRED_TOTAL_MD, stats.usage_deferred_total as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_USAGE_LAST_DEFERRED_UNIX_SECONDS_MD,
+            stats.usage_last_deferred_unix_seconds as f64,
+        ),
     ];
 
     if let Some(runtime) = runtime {
@@ -670,13 +730,26 @@ mod tests {
                 partial_cycles_runtime: 2,
                 partial_cycles_objects: 3,
                 partial_cycles_directories: 4,
+                dirty_usage_pending_buckets: 5,
+                dirty_usage_last_mark_unix_seconds: 1_700_000_001,
+                dirty_usage_last_clear_unix_seconds: 1_700_000_002,
+                dirty_usage_last_cycle_buckets: 6,
+                dirty_usage_last_cycle_cleared_buckets: 4,
+                usage_last_save_unix_seconds: 1_700_000_003,
+                usage_last_save_result: 1,
+                usage_last_durable_success_unix_seconds: 1_700_000_004,
+                usage_last_publication_unix_seconds: 1_700_000_005,
+                usage_last_publication_result: 2,
+                usage_deferred_pending: true,
+                usage_deferred_total: 7,
+                usage_last_deferred_unix_seconds: 1_700_000_006,
             },
         };
 
         let metrics = collect_scanner_runtime_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 92);
+        assert_eq!(metrics.len(), 105);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -718,6 +791,20 @@ mod tests {
             .find(|m| m.name == SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD.get_full_metric_name())
             .expect("active bucket-drive age metric");
         assert_eq!(active_age.value, 7.0);
+
+        let dirty_pending = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_DIRTY_USAGE_PENDING_BUCKETS_MD.get_full_metric_name())
+            .expect("dirty usage pending buckets metric");
+        assert_eq!(dirty_pending.value, 5.0);
+        assert!(dirty_pending.labels.is_empty());
+
+        let usage_publication_result = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_USAGE_LAST_PUBLICATION_RESULT_MD.get_full_metric_name())
+            .expect("usage publication result metric");
+        assert_eq!(usage_publication_result.value, 2.0);
+        assert!(usage_publication_result.labels.is_empty());
 
         let bucket_drive_result = metrics
             .iter()
@@ -1081,7 +1168,7 @@ mod tests {
         let stats = ScannerStats::default();
         let metrics = collect_scanner_metrics(&stats);
 
-        assert_eq!(metrics.len(), 69);
+        assert_eq!(metrics.len(), 82);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             if metric.name == SCANNER_PARTIAL_CYCLES_BY_REASON_MD.get_full_metric_name() {

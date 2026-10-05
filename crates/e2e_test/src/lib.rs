@@ -232,6 +232,10 @@ mod tier_stats_cluster_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
+// GetObject with partNumber reporting x-amz-mp-parts-count
+#[cfg(test)]
+mod get_object_parts_count_test;
+
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
@@ -258,6 +262,9 @@ mod copy_object_version_restore_test;
 mod copy_object_checksum_test;
 
 #[cfg(test)]
+mod multipart_copy_readiness_test;
+
+#[cfg(test)]
 mod ssec_copy_test;
 
 #[cfg(test)]
@@ -269,6 +276,8 @@ mod storage_class_capability_test;
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
+#[cfg(test)]
+mod website_hosting_test;
 
 // Multipart control API auth regression tests
 #[cfg(test)]

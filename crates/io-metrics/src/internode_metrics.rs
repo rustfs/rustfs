@@ -27,6 +27,7 @@ pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+pub const INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE: &str = "grpc_compare_and_update_file";
 pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
 pub const INTERNODE_OPERATION_GRPC_READ_VERSION: &str = "grpc_read_version";
 pub const INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION: &str = "grpc_batch_read_version";
@@ -1324,6 +1325,7 @@ mod tests {
         assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
         assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");
+        assert_eq!(INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE, "grpc_compare_and_update_file");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_VERSION, "grpc_read_version");
         assert_eq!(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, "grpc_batch_read_version");
         assert_eq!(INTERNODE_OPERATION_GRPC_LOCK, "grpc_lock");

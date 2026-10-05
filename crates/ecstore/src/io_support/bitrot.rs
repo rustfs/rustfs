@@ -252,6 +252,7 @@ impl DeferredObjectReader {
         DeferredReaderStripeHandle {
             state: Arc::clone(&self.state),
             stripe_stride,
+            advanced: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -274,9 +275,14 @@ impl DeferredObjectReader {
 pub(crate) struct DeferredReaderStripeHandle {
     state: Arc<Mutex<DeferredObjectReaderState>>,
     stripe_stride: usize,
+    advanced: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DeferredReaderStripeHandle {
+    pub(crate) fn integrity_position(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.advanced)
+    }
+
     /// Advance the pending source by `stripes` full stripes.
     ///
     /// Returns `false` when the reader has already been opened (or failed):
@@ -297,8 +303,12 @@ impl DeferredReaderStripeHandle {
                 let Some(offset) = source.offset.checked_add(delta) else {
                     return false;
                 };
+                let Some(advanced) = self.advanced.load(std::sync::atomic::Ordering::Acquire).checked_add(stripes) else {
+                    return false;
+                };
                 source.offset = offset;
                 source.length = source.length.saturating_sub(delta);
+                self.advanced.store(advanced, std::sync::atomic::Ordering::Release);
                 true
             }
             _ => false,

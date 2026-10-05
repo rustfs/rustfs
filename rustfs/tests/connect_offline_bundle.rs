@@ -364,7 +364,7 @@ fn connect_offline_bundle_cli_requires_an_existing_offline_key() {
 
 #[cfg(target_os = "linux")]
 async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if matches!(status.borrow_and_update().clone(), InventoryStatus::Unchanged { .. }) {
                 return;

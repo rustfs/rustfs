@@ -74,7 +74,7 @@ fn config_task_join_error(operation: &'static str, error: tokio::task::JoinError
 /// The operation must use the corresponding no-lock read/save functions.
 pub async fn with_server_config_write_lock<F, Fut, T>(store: Arc<ECStore>, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::object_api::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
@@ -85,8 +85,8 @@ where
         let transaction_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
         let _transaction_guard = transaction_lock.get_write_lock(get_lock_acquire_timeout()).await?;
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, SERVER_CONFIG_OBJECT).await?;
-        let _write_guard = namespace_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-        Ok(operation().await)
+        let write_guard = crate::object_api::WriteCommitGuard::acquire(&namespace_lock, get_lock_acquire_timeout()).await?;
+        Ok(operation(write_guard.clone()).await)
     })
     .await
     .map_err(|error| config_task_join_error("server config write", error))?
@@ -119,14 +119,14 @@ where
 /// one metadata config object. The operation must use no-lock object I/O.
 pub async fn with_config_object_write_lock<F, Fut, T>(store: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::object_api::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     tokio::spawn(async move {
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
-        let _write_guard = namespace_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-        Ok(operation().await)
+        let write_guard = crate::object_api::WriteCommitGuard::acquire(&namespace_lock, get_lock_acquire_timeout()).await?;
+        Ok(operation(write_guard.clone()).await)
     })
     .await
     .map_err(|error| config_task_join_error("config object write", error))?
@@ -638,7 +638,12 @@ where
     .await
 }
 
-pub async fn save_config_no_lock<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+pub async fn save_config_no_lock<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    guard: &crate::object_api::WriteCommitGuard,
+) -> Result<()>
 where
     S: ObjectIO<
             Error = Error,
@@ -650,17 +655,13 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
-    save_config_with_opts(
-        api,
-        file,
-        data,
-        &ObjectOptions {
-            max_parity: true,
-            no_lock: true,
-            ..Default::default()
-        },
-    )
-    .await
+    let mut opts = ObjectOptions {
+        max_parity: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
+        ..Default::default()
+    };
+    opts.add_write_commit_guard(guard);
+    save_config_with_opts(api, file, data, &opts).await
 }
 
 /// `delete_config` with `no_lock` set — for callers already holding the
@@ -846,12 +847,12 @@ where
     Ok(cfg)
 }
 
-async fn new_and_save_server_config_no_lock<S>(api: Arc<S>) -> Result<Config>
+async fn new_and_save_server_config_no_lock<S>(api: Arc<S>, guard: &crate::object_api::WriteCommitGuard) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi,
 {
     let cfg = new_server_config();
-    save_server_config_no_lock(api, &cfg).await?;
+    save_server_config_no_lock(api, &cfg, guard).await?;
     Ok(cfg)
 }
 
@@ -2138,14 +2139,18 @@ where
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
-async fn handle_missing_config<S>(api: Arc<S>, context: &str, namespace_lock_held: bool) -> Result<Config>
+async fn handle_missing_config<S>(
+    api: Arc<S>,
+    context: &str,
+    write_guard: Option<&crate::object_api::WriteCommitGuard>,
+) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if runtime_sources::first_cluster_node_is_local().await {
-        if namespace_lock_held {
-            new_and_save_server_config_no_lock(api.clone()).await?
+        if let Some(guard) = write_guard {
+            new_and_save_server_config_no_lock(api.clone(), guard).await?
         } else {
             new_and_save_server_config(api.clone()).await?
         }
@@ -2175,13 +2180,13 @@ where
         > + StorageAdminApi,
     S: NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
-    read_config_without_migrate_inner(api, false).await
+    read_config_without_migrate_inner(api, None).await
 }
 
 /// Reads the server config while an upper layer holds the namespace write lock
 /// for [`SERVER_CONFIG_OBJECT`]. Missing-config initialization uses the matching
 /// no-lock save path and therefore cannot recursively acquire the same lock.
-pub async fn read_config_without_migrate_no_lock<S>(api: Arc<S>) -> Result<Config>
+pub async fn read_config_without_migrate_no_lock<S>(api: Arc<S>, guard: &crate::object_api::WriteCommitGuard) -> Result<Config>
 where
     S: ObjectIO<
             Error = Error,
@@ -2194,7 +2199,7 @@ where
         > + StorageAdminApi
         + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
-    read_config_without_migrate_inner(api, true).await
+    read_config_without_migrate_inner(api, Some(guard)).await
 }
 
 /// Reads an already-initialized server config while a caller owns a namespace
@@ -2204,7 +2209,10 @@ pub async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<Co
     Ok(decode_persisted_server_config(&data)?.merge())
 }
 
-async fn read_config_without_migrate_inner<S>(api: Arc<S>, namespace_lock_held: bool) -> Result<Config>
+async fn read_config_without_migrate_inner<S>(
+    api: Arc<S>,
+    write_guard: Option<&crate::object_api::WriteCommitGuard>,
+) -> Result<Config>
 where
     S: ObjectIO<
             Error = Error,
@@ -2220,19 +2228,23 @@ where
     let config_file = server_config_path();
 
     // Try to read the configuration file.
-    let data = if namespace_lock_held {
+    let data = if write_guard.is_some() {
         read_config_no_lock(api.clone(), &config_file).await
     } else {
         read_config(api.clone(), &config_file).await
     };
     match data {
-        Ok(data) => read_server_config(api, &data, namespace_lock_held).await,
-        Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration", namespace_lock_held).await,
+        Ok(data) => read_server_config(api, &data, write_guard).await,
+        Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration", write_guard).await,
         Err(err) => handle_config_read_error(err, &config_file),
     }
 }
 
-async fn read_server_config<S>(api: Arc<S>, data: &[u8], namespace_lock_held: bool) -> Result<Config>
+async fn read_server_config<S>(
+    api: Arc<S>,
+    data: &[u8],
+    write_guard: Option<&crate::object_api::WriteCommitGuard>,
+) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
@@ -2242,7 +2254,7 @@ where
         warn!("Received empty configuration data, try to reread from '{}'", config_file);
 
         // Try to read the configuration again
-        let data = if namespace_lock_held {
+        let data = if write_guard.is_some() {
             read_config_no_lock(api.clone(), &config_file).await
         } else {
             read_config(api.clone(), &config_file).await
@@ -2253,7 +2265,7 @@ where
                 return Ok(cfg.merge());
             }
             Err(Error::ConfigNotFound) => {
-                return handle_missing_config(api, "Read alternate configuration", namespace_lock_held).await;
+                return handle_missing_config(api, "Read alternate configuration", write_guard).await;
             }
             Err(err) => return handle_config_read_error(err, &config_file),
         }
@@ -2687,7 +2699,7 @@ where
 
 /// Saves the server config while an upper layer holds the namespace write
 /// lock for [`SERVER_CONFIG_OBJECT`].
-pub async fn save_server_config_no_lock<S>(api: Arc<S>, cfg: &Config) -> Result<()>
+pub async fn save_server_config_no_lock<S>(api: Arc<S>, cfg: &Config, guard: &crate::object_api::WriteCommitGuard) -> Result<()>
 where
     S: ObjectIO<
             Error = Error,
@@ -2699,10 +2711,10 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
-    save_server_config_inner(api, cfg, true).await
+    save_server_config_inner(api, cfg, guard).await
 }
 
-async fn save_server_config_inner<S>(api: Arc<S>, cfg: &Config, no_lock: bool) -> Result<()>
+async fn save_server_config_inner<S>(api: Arc<S>, cfg: &Config, guard: &crate::object_api::WriteCommitGuard) -> Result<()>
 where
     S: ObjectIO<
             Error = Error,
@@ -2715,11 +2727,7 @@ where
         >,
 {
     let config_file = get_config_file();
-    let existing = match if no_lock {
-        read_config_no_lock(api.clone(), &config_file).await
-    } else {
-        read_config(api.clone(), &config_file).await
-    } {
+    let existing = match read_config_no_lock(api.clone(), &config_file).await {
         Ok(v) => Some(v),
         Err(Error::ConfigNotFound) => None,
         Err(err) => {
@@ -2743,21 +2751,7 @@ where
         return Ok(());
     }
 
-    if no_lock {
-        save_config_with_opts(
-            api,
-            &config_file,
-            data,
-            &ObjectOptions {
-                max_parity: true,
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    } else {
-        save_config(api, &config_file, data).await
-    }
+    save_config_no_lock(api, &config_file, data, guard).await
 }
 
 pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
@@ -3154,6 +3148,7 @@ mod tests {
                 version_purge_status: Default::default(),
                 replication_decision: String::new(),
                 checksum: None,
+                multipart_completion_replayed: false,
             }
         }
     }

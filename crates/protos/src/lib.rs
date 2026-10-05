@@ -172,7 +172,11 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
+// v4 is an admission boundary, not a transport version bump. A peer that
+// cannot recognize this probe must fail the Admin Heal capability preflight;
+// accepting the older v3 probe would allow an upgraded node to silently lose
+// newly validated request semantics during a rolling upgrade.
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
@@ -318,7 +322,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v4\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -817,6 +821,9 @@ impl_canonical_mutation_body!(
     |request, body| {
         body.push_str(&request.bucket)?;
         body.push_str(&request.options)?;
+        if !request.bucket_incarnation_id.is_empty() {
+            body.push_bytes(&request.bucket_incarnation_id)?;
+        }
     }
 );
 impl_canonical_mutation_body!(
@@ -995,6 +1002,10 @@ pub fn canonical_rename_data_request_body(
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
     }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1010,6 +1021,9 @@ pub fn canonical_delete_version_request_body(
     body.push_str(&request.opts)?;
     body.push_bytes(&request.file_info_bin)?;
     body.push_bytes(&request.opts_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1041,6 +1055,10 @@ pub fn canonical_write_metadata_request_body(
     body.push_str(&request.path)?;
     body.push_str(&request.file_info)?;
     body.push_bytes(&request.file_info_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1069,6 +1087,20 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_compare_and_update_file_request_body(
+    request: &proto_gen::node_service::CompareAndUpdateFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-compare-and-update-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.expected.is_some());
+    body.push_bytes(request.expected.as_deref().unwrap_or_default())?;
+    body.push_bool(request.replacement.is_some());
+    body.push_bytes(request.replacement.as_deref().unwrap_or_default())?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_request_body(
     request: &proto_gen::node_service::DeleteRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1079,6 +1111,10 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.options)?;
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
     }
     Ok(body.finish())
 }
@@ -1139,6 +1175,11 @@ pub fn canonical_rename_file_request_body(
     body.push_str(&request.src_path)?;
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
+    // Preserve the release signature for ordinary renames. An older server
+    // computes a different digest for a durable request and rejects mutation.
+    if request.durable {
+        body.push_bool(true);
+    }
     Ok(body.finish())
 }
 
@@ -1215,10 +1256,10 @@ pub fn canonical_make_volumes_request_body(
 #[cfg(test)]
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
-        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -1235,6 +1276,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn rename_data_canonical_body_binds_every_field() {
         let baseline = RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             src_volume: "src-vol".into(),
             src_path: "src-path".into(),
@@ -1255,6 +1297,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
             |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1285,6 +1328,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn delete_version_canonical_body_binds_every_field() {
         let baseline = DeleteVersionRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             volume: "vol".into(),
             path: "path".into(),
@@ -1304,6 +1348,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
             |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
             |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+            |r: &mut DeleteVersionRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1346,6 +1391,7 @@ mod disk_mutation_canonical_tests {
         // Mutating each field in turn and asserting all bodies differ catches a dropped or
         // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
         let write_metadata = WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1359,6 +1405,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut WriteMetadataRequest| r.path = "p2".into(),
             |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
             |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut WriteMetadataRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = write_metadata.clone();
             mutate(&mut request);
@@ -1410,7 +1457,33 @@ mod disk_mutation_canonical_tests {
         }
         assert_all_distinct(&bodies);
 
+        let compare_and_update_file = CompareAndUpdateFileRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            expected: Some(vec![0xAA, 0xBB].into()),
+            replacement: Some(vec![0xCC, 0xDD].into()),
+        };
+        let mut bodies = vec![canonical_compare_and_update_file_request_body(&compare_and_update_file).unwrap()];
+        for mutate in [
+            |r: &mut CompareAndUpdateFileRequest| r.disk = "d2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.volume = "v2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.path = "p2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = None,
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(vec![0xAA, 0xBC].into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = None,
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(vec![0xCC, 0xDE].into()),
+        ] {
+            let mut request = compare_and_update_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_compare_and_update_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
         let delete = DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1423,6 +1496,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.bucket_incarnation_id = vec![1; 16].into(),
             |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
@@ -1450,6 +1524,7 @@ mod disk_mutation_canonical_tests {
         assert_all_distinct(&bodies);
 
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1458,6 +1533,7 @@ mod disk_mutation_canonical_tests {
         };
         let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
         for mutate in [
+            |r: &mut RenameFileRequest| r.durable = true,
             |r: &mut RenameFileRequest| r.disk = "d2".into(),
             |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
             |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
@@ -1633,9 +1709,27 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn durable_rename_extension_preserves_old_wire_defaults_and_signatures() {
+        use crate::proto_gen::node_service::RenameFileResponse;
+        use prost::Message;
+        // Release wire messages omitted request tag 6 and response tag 3.
+        let mut request =
+            RenameFileRequest::decode(b"\x0a\x01d\x12\x01s\x1a\x01p\x22\x01v\x2a\x01q".as_slice()).expect("release request");
+        assert!(!request.durable);
+        let old_body = b"rustfs-rename-file-request-v1\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\0\x01s\0\0\0\0\0\0\0\x01p\0\0\0\0\0\0\0\x01v\0\0\0\0\0\0\0\x01q";
+        assert_eq!(canonical_rename_file_request_body(&request).expect("body"), old_body);
+        request.durable = true;
+        assert_ne!(canonical_rename_file_request_body(&request).expect("durable body"), old_body);
+        let old_success = RenameFileResponse::decode(b"\x08\x01".as_slice()).expect("release response");
+        assert!(old_success.success);
+        assert!(!old_success.durability_applied, "old success cannot certify durable publication");
+    }
+
+    #[test]
     fn disk_mutation_canonical_domains_are_distinct_per_message() {
         // The same field values must never authenticate one RPC's request as another's.
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1741,7 +1835,7 @@ mod non_disk_mutation_canonical_tests {
 
     #[test]
     fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
-        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
         assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
@@ -2210,10 +2304,10 @@ mod heal_control_tests {
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
         assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v4"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v4\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -2228,6 +2322,8 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+        let legacy_probe = [b"rustfs-heal-control-capability-v3\0".as_slice(), &[7; 16]].concat();
+        assert!(!is_heal_control_capability_probe(&legacy_probe));
     }
 
     #[test]

@@ -22,14 +22,14 @@ pub(crate) use rustfs_ecstore::api::disk::{
     BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes,
     ConditionalFileUpdate as EcstoreConditionalFileUpdate, DeleteOptions as EcstoreDeleteOptions, DiskAPI as EcstoreDiskAPI,
     DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
-    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
-    POOL_META_NAME as ECSTORE_POOL_META_NAME,
+    HealObjectStorageResult as EcstoreHealObjectStorageResult, POOL_META_NAME as ECSTORE_POOL_META_NAME,
 };
 use rustfs_storage_api as storage_contracts;
 
@@ -48,6 +48,7 @@ pub(crate) mod owner {
 }
 
 pub(crate) mod storage {
+    pub(crate) use super::EcstoreHealObjectStorageResult;
     pub(crate) use super::storage_contracts::{
         BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
         StorageAdminApi,

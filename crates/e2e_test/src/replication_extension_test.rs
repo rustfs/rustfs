@@ -3875,11 +3875,10 @@ async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket
         .body(ByteStream::from_static(body))
         .send()
         .await?;
-    assert!(
-        put.version_id()
-            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
-        "a directory marker is the null version even in a versioned bucket: {:?}",
-        put.version_id()
+    assert_eq!(
+        put.version_id(),
+        Some("null"),
+        "a directory marker must expose its null version without leaking the internal nil UUID"
     );
 
     wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
@@ -7195,13 +7194,30 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     assert!(source_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
     assert!(target_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
 
+    let source_deployment_id = source_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == source_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("source site missing from its own replication info")?;
+    let target_deployment_id = target_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("target site missing from its own replication info")?;
     let target_status =
         wait_for_site_replication_status(&target_env, "peer-state=true", |status| status.peer_states.len() == 2).await?;
     let current_updated_at = target_status
         .peer_states
-        .values()
-        .find_map(|state| state.updated_at)
+        .get(&target_deployment_id)
+        .and_then(|state| state.updated_at)
         .ok_or("missing target site replication updated_at")?;
+    let source_updated_at = target_status
+        .peer_states
+        .get(&source_deployment_id)
+        .and_then(|state| state.updated_at)
+        .ok_or("missing source site replication updated_at")?;
 
     let mut stale_peers = BTreeMap::new();
     for peer in target_info.sites {
@@ -7245,16 +7261,23 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     .await?;
     assert!(target_after_fresh.sites.iter().all(|peer| peer.replicate_ilm_expiry));
 
+    // State edits apply only to the addressed site; status reports each site's own state.
     let target_status_after_fresh = wait_for_site_replication_status(&target_env, "peer-state=true", |status| {
         status.peer_states.len() == 2
-            && status.peer_states.values().all(|state| {
-                state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
+            && status.peer_states.get(&target_deployment_id).is_some_and(|state| {
+                state.updated_at == Some(fresh_updated_at)
+                    && state.peers.len() == 2
+                    && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
             })
     })
     .await?;
-    assert!(target_status_after_fresh.peer_states.values().all(|state| {
-        state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
-    }));
+    let source_state_after_fresh = target_status_after_fresh
+        .peer_states
+        .get(&source_deployment_id)
+        .ok_or("missing source site replication state after target edit")?;
+    assert_eq!(source_state_after_fresh.updated_at, Some(source_updated_at));
+    assert_eq!(source_state_after_fresh.peers.len(), 2);
+    assert!(source_state_after_fresh.peers.values().all(|peer| !peer.replicate_ilm_expiry));
 
     let source_after_fresh = site_replication_info(&source_env).await?;
     assert!(source_after_fresh.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
@@ -10506,13 +10529,14 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     let target_bucket = "proxy-tag-dst";
     let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
 
-    target_client
+    let tagged = target_client
         .put_object()
         .bucket(target_bucket)
         .key("proxy-tagged")
         .body(ByteStream::from_static(b"tagged payload"))
         .send()
         .await?;
+    let tagged_version = tagged.version_id().ok_or("versioned target PUT omitted its identity")?;
     target_client
         .put_object_tagging()
         .bucket(target_bucket)
@@ -10536,6 +10560,11 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
     assert_eq!(tags.tag_set[0].key.as_str(), "team");
     assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+    assert_eq!(
+        tags.version_id(),
+        Some(tagged_version),
+        "proxy must preserve the resolved remote identity"
+    );
 
     let record = target
         .requests()
@@ -10548,6 +10577,33 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
         "proxied tagging read must carry the anti-loop marker"
     );
     assert!(record.proxy_headers.replication_check.is_none());
+
+    let empty = target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"new version without tags"))
+        .send()
+        .await?;
+    let empty_version = empty.version_id().ok_or("empty-tag version omitted its identity")?;
+    for selector in [None, Some(empty_version), Some(tagged_version)] {
+        let tags = source_client
+            .get_object_tagging()
+            .bucket(source_bucket)
+            .key("proxy-tagged")
+            .set_version_id(selector.map(str::to_owned))
+            .send()
+            .await?;
+        let expected_version = selector.unwrap_or(empty_version);
+        assert_eq!(tags.version_id(), Some(expected_version));
+        if expected_version == tagged_version {
+            assert_eq!(tags.tag_set().len(), 1);
+            assert_eq!(tags.tag_set()[0].key(), "team");
+            assert_eq!(tags.tag_set()[0].value(), "storage");
+        } else {
+            assert!(tags.tag_set().is_empty());
+        }
+    }
 
     drop(source_env);
     target.shutdown().await;

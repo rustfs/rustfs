@@ -258,10 +258,11 @@ pub(crate) struct TableWarehouseIndexStateEntry {
     pub(super) state: TableCatalogEntryState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WarehouseIndexReservation {
     Created,
     AlreadyReserved,
+    Replaced(TableWarehouseIndexEntry),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1164,6 +1165,10 @@ pub(crate) struct TableCatalogSnapshotState {
     pub includes_namespace: bool,
     pub includes_table_pointer: bool,
     pub includes_backing_manifest: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_version: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

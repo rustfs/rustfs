@@ -66,6 +66,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_parts_sdk_paginator_terminates_and_preserves_completion() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(Vec::new()).await?;
+        let client = env.create_s3_client();
+        let bucket = "multipart-pagination";
+        let key = "sparse-parts.bin";
+        env.create_test_bucket(bucket).await?;
+        let upload = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
+        let upload_id = upload.upload_id().ok_or("CreateMultipartUpload returned no upload ID")?;
+
+        let mut empty_pages = client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .into_paginator()
+            .stop_on_duplicate_token(false)
+            .send();
+        let empty = tokio::time::timeout(std::time::Duration::from_secs(30), empty_pages.next())
+            .await?
+            .ok_or("empty upload must return one page")??;
+        assert!(empty.parts().is_empty());
+        assert_eq!(empty.is_truncated(), Some(false));
+        assert_eq!(empty.next_part_number_marker(), None);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), empty_pages.next())
+                .await?
+                .is_none()
+        );
+
+        let mut expected_body = Vec::new();
+        let mut completed_parts = Vec::new();
+        for (part_number, body) in [(1, vec![b'a'; PART_SIZE]), (3, vec![b'b'; PART_SIZE]), (10, b"tail".to_vec())] {
+            expected_body.extend_from_slice(&body);
+            let uploaded = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(body))
+                .send()
+                .await?;
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .set_e_tag(uploaded.e_tag().map(str::to_owned))
+                    .build(),
+            );
+        }
+
+        for (page_size, expected_pages) in [(1, 3), (2, 2), (3, 1), (1000, 1)] {
+            let mut pages = client
+                .list_parts()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .into_paginator()
+                .page_size(page_size)
+                // The server must terminate pagination even without the SDK's duplicate-token safeguard.
+                .stop_on_duplicate_token(false)
+                .send();
+            let mut page_count = 0;
+            let mut listed_parts = Vec::new();
+            while let Some(page) = tokio::time::timeout(std::time::Duration::from_secs(30), pages.next()).await? {
+                assert!(page_count < expected_pages, "paginator must terminate after the final page");
+                let page = page?;
+                page_count += 1;
+                let truncated = page_count < expected_pages;
+                assert_eq!(page.is_truncated(), Some(truncated));
+                let last_part = page.parts().last().and_then(|part| part.part_number());
+                let expected_marker = truncated.then(|| last_part.expect("truncated page must contain parts").to_string());
+                assert_eq!(page.next_part_number_marker(), expected_marker.as_deref());
+                listed_parts.extend(
+                    page.parts()
+                        .iter()
+                        .map(|part| part.part_number().expect("part number must be present")),
+                );
+            }
+            assert_eq!(page_count, expected_pages);
+            assert_eq!(listed_parts, [1, 3, 10]);
+        }
+
+        let mut resumed_pages = client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number_marker("2")
+            .into_paginator()
+            .page_size(1)
+            .stop_on_duplicate_token(false)
+            .send();
+        for (part_number, next_marker) in [(3, Some("3")), (10, None)] {
+            let page = tokio::time::timeout(std::time::Duration::from_secs(30), resumed_pages.next())
+                .await?
+                .ok_or("parts above a missing marker must still be listed")??;
+            assert_eq!(page.parts().len(), 1);
+            assert_eq!(page.parts()[0].part_number(), Some(part_number));
+            assert_eq!(page.is_truncated(), Some(next_marker.is_some()));
+            assert_eq!(page.next_part_number_marker(), next_marker);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), resumed_pages.next())
+                .await?
+                .is_none()
+        );
+
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+            .send()
+            .await?;
+        assert_completed_object(&client, bucket, key, "STANDARD", &expected_body).await?;
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multipart_upload_preserves_standard_and_rrs_across_retry_and_resume()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();

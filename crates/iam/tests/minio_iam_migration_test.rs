@@ -98,6 +98,9 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         .base_dir(temp_dir.path())
         .build()
         .await;
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("an absent legacy namespace must not prevent startup");
     env.make_bucket(LEGACY_META_BUCKET, false).await;
 
     for (path, body) in [
@@ -127,6 +130,34 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         assert!(detail.to_string().contains(format_path), "failure must identify the supported record");
     }
     seed_legacy_iam_object(&env, format_path, &json!({"version": 1})).await;
+
+    let mapping_path = format!("{}legacy-reader.json", IAM_CONFIG_POLICY_DB_USERS_PREFIX.as_str());
+    env.put_object_bytes(LEGACY_META_BUCKET, &mapping_path, b"invalid IAM policy mapping".to_vec())
+        .await;
+    let error = try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect_err("an existing legacy namespace must reject incompatible IAM policy mappings");
+    let io_error = std::io::Error::from(error);
+    let detail = io_error
+        .get_ref()
+        .and_then(|context| context.source())
+        .expect("failure must retain the malformed policy mapping in its source");
+    assert_eq!(detail.to_string(), format!("incompatible legacy metadata: {mapping_path}"));
+    let migrated_store = ObjectStore::new(env.ecstore.clone());
+    assert!(
+        migrated_store.load_iam_config::<Value>(&mapping_path).await.is_err(),
+        "failed IAM migration must not publish a target policy mapping"
+    );
+    seed_legacy_iam_object(&env, &mapping_path, &json!({"version": 1, "policy": "readonly"})).await;
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("an existing legacy namespace must migrate supported IAM metadata after repair");
+    let mapping: Value = migrated_store
+        .load_iam_config(&mapping_path)
+        .await
+        .expect("read the migrated policy mapping");
+    assert_eq!(mapping["version"], 1);
+    assert_eq!(mapping["policy"], "readonly");
 
     let regular_source = json!({
         "version": 1,

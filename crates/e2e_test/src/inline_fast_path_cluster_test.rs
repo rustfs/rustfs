@@ -886,6 +886,8 @@ fn configure_reader_metric_cluster(cluster: &mut RustFSTestClusterEnvironment, c
     cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "true");
     cluster.set_env("RUSTFS_OBS_TRACES_EXPORT_ENABLED", "false");
     cluster.set_env("RUSTFS_OBS_LOGS_EXPORT_ENABLED", "false");
+    // Keep startup diagnostics available when OTLP log export is disabled.
+    cluster.set_env("RUSTFS_OBS_LOG_STDOUT_ENABLED", "true");
     cluster.set_env("RUSTFS_OBS_METER_INTERVAL", "1");
     cluster.set_env("RUSTFS_OBS_USE_STDOUT", "false");
     cluster.set_env("RUSTFS_GET_CODEC_STREAMING_ENABLE", "false");
@@ -929,7 +931,13 @@ async fn assert_case(
         case.label
     );
     assert_storage_layout(cluster, bucket, &key, version_id.as_deref(), case.stored_inline)?;
-    Ok((key, body, put.e_tag().map(str::to_owned), version_id))
+    // A suspended PUT omits the response version, but reads identify the
+    // stored null version explicitly.
+    let read_version_id = match state {
+        VersionState::Suspended => Some("null".to_owned()),
+        _ => version_id,
+    };
+    Ok((key, body, put.e_tag().map(str::to_owned), read_version_id))
 }
 
 async fn get_and_assert(

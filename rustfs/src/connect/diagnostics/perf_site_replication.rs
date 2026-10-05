@@ -33,7 +33,6 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1317,7 +1316,7 @@ async fn drain_response(
 
 fn object_url(endpoint: &Url, bucket: &str, key: &str, version_id: Option<&str>) -> Result<Url, SiteReplicationProbeError> {
     let mut url = endpoint
-        .join(&format!("{bucket}/{}", encode_path(key)))
+        .join(&format!("{bucket}/{key}"))
         .map_err(|_| SiteReplicationProbeError::ProtocolFailure)?;
     if let Some(version_id) = version_id {
         url.query_pairs_mut().append_pair("versionId", version_id);
@@ -1331,14 +1330,6 @@ fn list_versions_url(endpoint: &Url, bucket: &str, key: &str) -> Result<Url, Sit
         .map_err(|_| SiteReplicationProbeError::ProtocolFailure)?;
     url.query_pairs_mut().append_pair("versions", "").append_pair("prefix", key);
     Ok(url)
-}
-
-fn encode_path(value: &str) -> String {
-    value
-        .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn deployment_endpoint(value: &str) -> Result<Url, SiteReplicationPerformanceError> {
@@ -1655,6 +1646,12 @@ mod tests {
     #[test]
     fn cleanup_queries_are_version_specific_and_task_scoped() {
         let endpoint = Url::parse("https://source.example/").expect("endpoint");
+        let scoped = object_url(&endpoint, "scratch-bucket", "rustfs-connect/site-replication/019c-1234", None)
+            .expect("scoped object URL");
+        assert_eq!(
+            scoped.as_str(),
+            "https://source.example/scratch-bucket/rustfs-connect/site-replication/019c-1234"
+        );
         let object = object_url(&endpoint, "scratch-bucket", "path/a b", Some("version+1")).expect("object URL");
         assert_eq!(object.as_str(), "https://source.example/scratch-bucket/path/a%20b?versionId=version%2B1");
         let list = list_versions_url(&endpoint, "scratch-bucket", "path/a b").expect("list URL");

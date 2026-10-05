@@ -1531,6 +1531,33 @@ where
         Ok(())
     }
 
+    fn require_data_plane_ready_locked(
+        &self,
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let Some(bucket_entry) = state.table_buckets.get(table_bucket) else {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "durable strong catalog has no entry for table-enabled bucket {table_bucket}"
+            )));
+        };
+        if bucket_entry.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table-enabled bucket {table_bucket} has an inactive durable strong catalog entry"
+            )));
+        }
+        if self.snapshot_write_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
+            && state
+                .snapshot_version
+                .is_none_or(|version| version < STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "durable strong catalog data-plane access requires a version 2 snapshot after fleet confirmation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_table_warehouse_prefix_available_locked(
         state: &StrongTableCatalogState,
         candidate: &TableEntry,
@@ -1845,6 +1872,147 @@ where
             )));
         };
         Ok(Self::table_commit_recovery_report_for_entry_locked(&state, entry))
+    }
+
+    fn table_catalog_export_with_recovery_locked(
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
+        Self::ensure_namespace_identifiers_are_unambiguous_locked(state, table_bucket, &namespace.public_name())?;
+        let table_bucket_entry = state
+            .table_buckets
+            .get(table_bucket)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+            .ok_or_else(|| TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")))?;
+        validate_table_bucket_entry(&table_bucket_entry)?;
+
+        let namespace_key = Self::namespace_key(table_bucket, namespace);
+        let namespace_entry = match state
+            .namespaces
+            .get(&namespace_key)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+        {
+            Some(entry) => entry,
+            None if Self::namespace_exists_locked(state, table_bucket, namespace) => {
+                synthetic_namespace_entry(table_bucket, namespace)
+            }
+            None => {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "namespace {}/{}",
+                    table_bucket,
+                    namespace.public_name()
+                )));
+            }
+        };
+        let validated_namespace = validate_namespace_entry_identity(&namespace_entry)?;
+        if validated_namespace != *namespace {
+            return Err(TableCatalogStoreError::Invalid(
+                "strong catalog namespace entry identity does not match its state key".to_string(),
+            ));
+        }
+
+        let table_key = Self::table_key(table_bucket, namespace, table);
+        let table_entry = state
+            .tables
+            .get(&table_key)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+            .ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!("table {}/{}/{}", table_bucket, namespace.public_name(), table.as_str()))
+            })?;
+        validate_table_entry_version_and_id(&table_entry)?;
+        if table_entry.table_bucket != table_bucket
+            || table_entry.namespace != namespace.public_name()
+            || table_entry.table != table.as_str()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "strong catalog table entry identity does not match its state key".to_string(),
+            ));
+        }
+
+        let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(state, &table_entry);
+        let snapshot_etag = state
+            .snapshot_etag
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no etag".to_string()))?;
+        let snapshot_version = state
+            .snapshot_version
+            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no version".to_string()))?;
+        let backing_manifest = durable_strong_table_catalog_backing_manifest(
+            Self::snapshot_object_path(),
+            Some(snapshot_etag),
+            Some(snapshot_version),
+            namespace,
+            table,
+            &table_entry,
+            &commit_recovery,
+        );
+
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
+    }
+
+    pub(crate) async fn export_table_catalog_entry(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let state = self.state.lock().await;
+        Self::table_catalog_export_with_recovery_locked(&state, table_bucket, &namespace, &table).map(|(catalog, _)| catalog)
+    }
+
+    pub(crate) async fn diagnose_table_catalog(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
+        let parsed_namespace = parse_namespace_for_store(namespace)?;
+        let parsed_table = parse_table_for_store(table)?;
+
+        for _ in 0..STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS {
+            self.hydrate_state().await?;
+            let (catalog, commit_recovery, observation) = {
+                let state = self.state.lock().await;
+                let (catalog, commit_recovery) =
+                    Self::table_catalog_export_with_recovery_locked(&state, table_bucket, &parsed_namespace, &parsed_table)?;
+                let observation = (state.snapshot_etag.clone(), state.snapshot_version);
+                (catalog, commit_recovery, observation)
+            };
+
+            let report =
+                diagnose_table_catalog_from_export(&self.object_backend, catalog, commit_recovery, retain_recent_metadata_files)
+                    .await?;
+
+            self.hydrate_state().await?;
+            let current_observation = {
+                let state = self.state.lock().await;
+                (state.snapshot_etag.clone(), state.snapshot_version)
+            };
+            if current_observation == observation {
+                return Ok(report);
+            }
+        }
+
+        Err(TableCatalogStoreError::Conflict(
+            "durable strong catalog changed repeatedly while diagnosing table state".to_string(),
+        ))
     }
 }
 
@@ -2243,6 +2411,16 @@ where
             .collect())
     }
 
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        validate_table_entry_version_and_id(candidate)?;
+        let namespace = parse_namespace_for_store(&candidate.namespace)?;
+        let table = parse_table_for_store(&candidate.table)?;
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        let key = Self::table_key(&candidate.table_bucket, &namespace, &table);
+        Self::ensure_table_warehouse_prefix_available_locked(&state, candidate, &key)
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -2389,44 +2567,53 @@ where
         }
 
         self.hydrate_state().await?;
-        let state = self.state.lock().await;
-        let Some(bucket_entry) = state.table_buckets.get(table_bucket) else {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "durable strong catalog has no entry for table-enabled bucket {table_bucket}"
-            )));
-        };
-        if bucket_entry.state != TableCatalogEntryState::Active {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "table-enabled bucket {table_bucket} has an inactive durable strong catalog entry"
-            )));
-        }
-        if self.snapshot_write_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
-            && state
-                .snapshot_version
-                .is_none_or(|version| version < STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
-        {
-            return Err(TableCatalogStoreError::Internal(
-                "durable strong catalog data-plane access requires a version 2 snapshot after fleet confirmation".to_string(),
-            ));
-        }
+        let active_resource = {
+            let state = self.state.lock().await;
+            self.require_data_plane_ready_locked(&state, table_bucket)?;
 
-        let Some(bucket_index) = state.warehouse_index.get(table_bucket) else {
-            return Ok(None);
-        };
-
-        for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
-            if let Some(table_key) = bucket_index.get(warehouse_object_prefix) {
-                Self::ensure_identifier_is_unambiguous_locked(&state, table_key)?;
-                let Some(table) = state.tables.get(table_key) else {
-                    continue;
-                };
-                return Ok(Some(table_data_plane_resource_from_entry(
-                    table.clone(),
-                    warehouse_object_prefix.to_string(),
-                )));
+            let mut resource = None;
+            if let Some(bucket_index) = state.warehouse_index.get(table_bucket) {
+                for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
+                    if let Some(table_key) = bucket_index.get(warehouse_object_prefix) {
+                        Self::ensure_identifier_is_unambiguous_locked(&state, table_key)?;
+                        let Some(table) = state.tables.get(table_key) else {
+                            continue;
+                        };
+                        resource = Some(table_data_plane_resource_from_entry(table.clone(), warehouse_object_prefix.to_string()));
+                        break;
+                    }
+                }
             }
+            resource
+        };
+        if active_resource.is_some() {
+            return Ok(active_resource);
         }
-        Ok(None)
+
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .resolve_deleted_table_data_plane_resource_from_index(table_bucket, object)
+            .await
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        self.require_data_plane_ready_locked(&state, table_bucket)?;
+        Self::ensure_table_bucket_identifiers_are_unambiguous_locked(&state, table_bucket)?;
+        let entries = state
+            .tables
+            .range((table_bucket.to_string(), String::new(), String::new())..)
+            .take_while(|((bucket, _, _), _)| bucket == table_bucket)
+            .map(|(_, entry)| entry);
+        table_metadata_data_plane_resource_from_entries(entries, table_bucket, object)
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
@@ -2644,11 +2831,22 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let key = Self::table_key(table_bucket, &namespace, &table);
+        let dropped = {
+            let state = self.state.lock().await;
+            state.tables.get(&key).cloned().ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!("table {}/{}/{}", table_bucket, namespace.public_name(), table.as_str()))
+            })?
+        };
+        if dropped.state == TableCatalogEntryState::Active {
+            ObjectTableCatalogStore::new(self.object_backend.clone())
+                .tombstone_table_warehouse_index_for_drop(&dropped, true)
+                .await?;
+        }
         let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
-            if !state.tables.contains_key(&key) {
-                return Err(TableCatalogStoreError::NotFound(format!(
-                    "table {}/{}/{}",
+            if state.tables.get(&key) != Some(&dropped) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table changed while preparing drop: {}/{}/{}",
                     table_bucket,
                     namespace.public_name(),
                     table.as_str()

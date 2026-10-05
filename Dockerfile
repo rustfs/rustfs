@@ -106,7 +106,9 @@ RUN chmod +x /usr/bin/rustfs /entrypoint.sh
 
 RUN addgroup -g 10001 -S rustfs && \
     adduser -u 10001 -G rustfs -S rustfs -D && \
-    mkdir -p /data /logs && \
+    mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs && \
+    ln -s /data/.rustfs/events /opt/rustfs/events && \
+    ln -s /data/.rustfs/audit /opt/rustfs/audit && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 

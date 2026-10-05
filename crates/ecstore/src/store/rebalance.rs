@@ -611,7 +611,18 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
-        self.internal_get_pool_info_existing_with_opts(bucket, object, opts).await
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, false)
+            .await
+    }
+
+    pub(super) async fn get_pool_info_for_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, true)
+            .await
     }
 
     async fn internal_get_pool_info_existing_with_opts(
@@ -619,6 +630,7 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        require_all_pool_reads: bool,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
         let mut futures = Vec::new();
         for pool in self.pools.iter() {
@@ -647,6 +659,15 @@ impl ECStore {
                     });
                 }
                 Err(e) => {
+                    // A readable older pool cannot prove ownership of the
+                    // current version while another pool is unreadable. Check
+                    // both raw and object-scoped quorum errors before sorting.
+                    if require_all_pool_reads && !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                        return Err(match e {
+                            Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => Error::ErasureWriteQuorum,
+                            err => err,
+                        });
+                    }
                     ress.push(PoolObjInfo {
                         index,
                         err: Some(e),
@@ -654,6 +675,34 @@ impl ECStore {
                     });
                 }
             }
+        }
+
+        if require_all_pool_reads {
+            let suspended_pools = {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            };
+            let candidates = ress
+                .iter()
+                .map(|pinfo| LatestObjectInfoCandidate {
+                    info: pinfo.err.is_none().then(|| pinfo.object_info.clone()),
+                    idx: pinfo.index,
+                    err: pinfo.err.clone(),
+                })
+                .collect();
+            let (object_info, index) =
+                resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+            let pools_with_object = self.pools_with_object(&ress, opts).await;
+            return Ok((
+                PoolObjInfo {
+                    index,
+                    object_info,
+                    err: None,
+                },
+                pools_with_object,
+            ));
         }
 
         ress.sort_by(|a, b| {

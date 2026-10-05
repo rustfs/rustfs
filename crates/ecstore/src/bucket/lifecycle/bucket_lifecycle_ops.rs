@@ -515,20 +515,26 @@ impl ExpiryStats {
         Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
     }
 
+    // The pending and active gauges are balanced by design: every increment
+    // has exactly one matching decrement. They must not saturate at zero on
+    // update, because a worker can dequeue (and decrement) before the
+    // enqueuing side has recorded its increment. Clamping that transient -1
+    // to 0 turns the later +1 into a phantom task that never drains
+    // (rustfs#7921). Readers clamp negative snapshots instead.
     fn increment_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, 1);
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, -1);
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, 1);
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, -1);
+        self.active_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_workers(&self) {
@@ -777,7 +783,7 @@ fn free_version_physical_topology_generation(api: &ECStore) -> String {
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+pub(crate) fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
     if candidate.transitioned_object.tier != expected.transitioned_object.tier
         || candidate.transitioned_object.name != expected.transitioned_object.name
     {
@@ -820,7 +826,7 @@ async fn scan_exact_free_version_targets(
     let mut targets = Vec::new();
     for pool in &api.pools {
         for set in &pool.disk_set {
-            let versions = match set.load_file_info_versions_exact(&oi.bucket, &oi.name).await {
+            let versions = match set.load_file_info_versions_for_tier_cleanup(&oi.bucket, &oi.name).await {
                 Ok(Some(versions)) => versions,
                 Ok(None) => continue,
                 Err(err) if is_err_strict_volume_not_found(&err) => continue,
@@ -1074,9 +1080,13 @@ impl ExpiryState {
     }
 
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        // Account for the task before a worker can observe it. The worker
+        // decrements on dequeue, so incrementing after `try_send` would let a
+        // fast dequeue run the gauge through zero first.
+        self.stats.increment_pending_tasks();
         let queued = wrkr.try_send(Some(task)).is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
+        if !queued {
+            self.stats.decrement_pending_tasks();
         }
         queued
     }
@@ -1444,11 +1454,14 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
         return false;
     };
 
+    // Same ordering rule as `ExpiryState::send_expiry_task`: count first, so
+    // a worker that dequeues immediately cannot decrement before this
+    // increment lands.
+    stats.increment_pending_tasks();
     let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
     if !queued {
+        stats.decrement_pending_tasks();
         stats.increment_missed_freevers_tasks();
-    } else {
-        stats.increment_pending_tasks();
     }
     stats.record_scanner_expiry_state();
     queued
@@ -3757,11 +3770,8 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(api) = runtime_sources::object_store_handle() else {
-        return;
-    };
-    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
             observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
@@ -5188,6 +5198,7 @@ pub async fn put_restore_opts(
         // Restore writes stored (possibly encrypted) bytes, so the writer's
         // computed MD5 is not the object's public plaintext ETag.
         preserve_etag: oi.etag.clone(),
+        shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         //expires:           oi.expires,
         ..Default::default()
     })
@@ -5595,6 +5606,11 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
+    let usage_accounting = if lc_event.action == IlmAction::DeleteAction && !versioned && !version_suspended && !oi.is_dir {
+        Some(crate::data_usage::begin_expiry_usage_accounting(&oi.bucket).await)
+    } else {
+        None
+    };
     let mut dobj = match api
         .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
         .await
@@ -5614,6 +5630,14 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
             return false;
         }
     };
+    if let Some(accounting) = usage_accounting
+        && !dobj.name.is_empty()
+        && !dobj.delete_marker
+        && !dobj.is_dir
+        && let Ok(size) = crate::data_usage::quota_object_size(&dobj)
+    {
+        accounting.commit(size).await;
+    }
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
 
     // The object (or all its versions, for delete_all) was expired; evict any
@@ -7572,6 +7596,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiry_pending_gauge_survives_dequeue_landing_before_enqueue_accounting() {
+        // A worker may dequeue and decrement before the enqueuing side records
+        // its increment. The gauge must return to zero afterwards instead of
+        // clamping the transient -1 away and reporting a phantom pending task
+        // that no idle check can ever drain (rustfs#7921).
+        let state = ExpiryState::new();
+        let stats = Arc::clone(&state.read().await.stats);
+
+        stats.decrement_pending_tasks();
+        stats.increment_pending_tasks();
+        assert_eq!(stats.pending_tasks(), 0);
+        assert_eq!(state.read().await.pending_tasks(), 0);
+
+        stats.decrement_active_tasks();
+        stats.increment_active_tasks();
+        assert_eq!(stats.active_tasks(), 0);
+        assert_eq!(state.read().await.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(state.read().await.enqueue_free_version(oi.clone()));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+
+        // The single-slot queue is full for both enqueue paths.
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
+
+        assert!(!state.read().await.enqueue_free_version(oi));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 2);
+
+        // Draining the one real task returns the gauge to zero.
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver.lock().await.recv().await.expect("queued task");
+        assert!(task.is_some());
+        state.read().await.stats.decrement_pending_tasks();
+        assert_eq!(state.read().await.pending_tasks(), 0);
+    }
+
+    #[tokio::test]
     async fn enqueue_recovered_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
         let oi = ObjectInfo {
@@ -8096,6 +8179,75 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_overwrite_cleanup_retains_a_minority_live_remote_reference() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("overwrite-minority-{}", Uuid::new_v4());
+        let object = "still-referenced";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity.clone())).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list persisted cleanup owner");
+        let owner = page.items.into_iter().find(|oi| oi.bucket == bucket).expect("seeded owner");
+        backend
+            .set_put_remote_version(Some(owner.transitioned_object.version_id.clone()))
+            .await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        lease
+            .put(
+                &owner.transitioned_object.name,
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"old")),
+                3,
+            )
+            .await
+            .expect("seed referenced remote bytes");
+        drop(lease);
+        let path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let cleanup_metadata = fs::read(&path).await.expect("save completed replica");
+        let mut live = FileInfo::new(object, 2, 2);
+        live.volume = bucket.clone();
+        live.erasure.index = 1;
+        live.data_dir = Some(Uuid::new_v4());
+        live.mod_time = Some(OffsetDateTime::now_utc());
+        live.size = 3;
+        live.add_object_part(1, "149603e6c03516362a8da23f624db945".to_string(), 3, live.mod_time, 3, None, None);
+        live.transition_status = TRANSITION_COMPLETE.to_string();
+        live.transition_tier = "WARM".to_string();
+        live.transitioned_objname = owner.transitioned_object.name.clone();
+        live.transition_version = Some(owner.transitioned_object.version_id.clone());
+        live.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::insert_str(&mut live.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity);
+        let mut old_metadata = FileMeta::new();
+        old_metadata.add_version(live).expect("prepare minority live source");
+        fs::write(&path, old_metadata.marshal_msg().expect("encode live source"))
+            .await
+            .expect("model one replica retained by an interrupted overwrite");
+
+        let err = super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+            .await
+            .expect_err("quorum free versions cannot erase a minority live reference");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&owner.transitioned_object.name).await);
+
+        fs::write(&path, cleanup_metadata)
+            .await
+            .expect("complete replica convergence");
+        assert!(
+            super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+                .await
+                .expect("converged cleanup can delete the exact remote owner")
+        );
+        assert_eq!(backend.remove_count().await, 1);
+        assert!(!backend.contains(&owner.transitioned_object.name).await);
     }
 
     #[cfg(feature = "test-util")]
@@ -12633,7 +12785,8 @@ mod tests {
                 .push((event, state, reason));
         });
 
-        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &object_info, LcEventSrc::S3PutObject, &ObjectOptions::default())
+            .await;
 
         assert!(
             observed.lock().expect("observed events should not poison").contains(&(
@@ -12749,6 +12902,130 @@ mod tests {
                 .is_ok(),
             "table data must remain readable after lifecycle admission rejects the delete"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ordinary_expiry_accounts_the_committed_receipt_once() {
+        use crate::bucket::quota::{QuotaOperation, checker::QuotaChecker};
+        use crate::data_usage::{apply_bucket_usage_memory_overlay, replace_bucket_usage_memory_from_info};
+        use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for size in [0usize, 42] {
+            let bytes = u64::try_from(size).expect("fixture size fits");
+            let bucket = format!("expiry-accounting-{}", Uuid::new_v4().simple());
+            create_test_bucket(&ecstore, &bucket).await;
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            let mut queued = ecstore
+                .put_object(&bucket, "expire", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create expiring object");
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            ecstore
+                .put_object(&bucket, "keep", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create retained object");
+            let mut baseline = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::now()),
+                usage_snapshot_complete: true,
+                buckets_count: 1,
+                ..Default::default()
+            };
+            baseline.buckets_usage.insert(
+                bucket.clone(),
+                BucketUsageInfo {
+                    objects_count: 2,
+                    versions_count: 2,
+                    size: bytes * 2,
+                    ..Default::default()
+                },
+            );
+            baseline.bucket_sizes.insert(bucket.clone(), bytes * 2);
+            baseline.calculate_totals();
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            // Legacy quota admission consumes the same conservative overlay.
+            // Durable reservations have their own storage-commit accounting.
+            metadata_sys::update(
+                &bucket,
+                rustfs_config::QUOTA_CONFIG_FILE,
+                format!(r#"{{"quota":{},"quota_type":"Hard"}}"#, bytes * 2).into_bytes(),
+            )
+            .await
+            .expect("configure the legacy quota");
+            let checker =
+                QuotaChecker::new(Arc::new(tokio::sync::RwLock::new(metadata_sys::BucketMetadataSys::new(ecstore.clone()))));
+            let attempted_size = bytes.max(1);
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota before expiration");
+            assert!(!quota.allowed);
+            assert!(!quota.uses_durable_reservations);
+            assert_eq!(quota.current_usage, Some(bytes * 2));
+            // Queued metadata is not the accounting receipt from the storage commit.
+            queued.size = 1;
+            let event = lifecycle::Event {
+                action: IlmAction::DeleteAction,
+                ..Default::default()
+            };
+            let incarnation = ecstore
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("bucket incarnation");
+            for (attempt_incarnation, expected) in [(Uuid::new_v4(), false), (incarnation, true), (incarnation, false)] {
+                assert_eq!(
+                    super::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &queued,
+                        &event,
+                        &LcEventSrc::Scanner,
+                        attempt_incarnation,
+                    )
+                    .await,
+                    expected
+                );
+                let mut response = baseline.clone();
+                apply_bucket_usage_memory_overlay(&mut response).await;
+                let remaining = if attempt_incarnation == incarnation { 1 } else { 2 };
+                assert_eq!(response.buckets_usage[&bucket].objects_count, remaining);
+                assert_eq!(response.buckets_usage[&bucket].size, remaining * bytes);
+                let quota = checker
+                    .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                    .await
+                    .expect("check quota before scanner confirmation");
+                assert!(!quota.allowed, "expiry must not release unconfirmed quota credit");
+                assert_eq!(quota.current_usage, Some(bytes * 2));
+            }
+            let mut confirmed = baseline.clone();
+            confirmed.last_update = Some(std::time::SystemTime::now());
+            confirmed.scanner_epoch = Some(7);
+            confirmed.scanner_cycle = Some(10);
+            let usage = confirmed.buckets_usage.get_mut(&bucket).expect("bucket is in the snapshot");
+            usage.size = bytes;
+            usage.objects_count = 1;
+            usage.versions_count = 0; // The scanner does not count unversioned objects as versions.
+            confirmed.bucket_sizes.insert(bucket.clone(), bytes);
+            confirmed.calculate_totals();
+            replace_bucket_usage_memory_from_info(&confirmed).await;
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota after scanner confirmation");
+            assert_eq!(quota.allowed, bytes > 0);
+            assert_eq!(quota.current_usage, Some(bytes));
+            let too_large = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, bytes + 1)
+                .await
+                .expect("check the first byte above the quota limit");
+            assert!(!too_large.allowed);
+            assert!(
+                ecstore
+                    .get_object_info(&bucket, "keep", &ObjectOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
     }
 
     #[tokio::test]

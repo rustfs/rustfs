@@ -203,6 +203,10 @@ impl Operation for RestCommitTableHandler {
         install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_rest_commit_table_request(std::mem::take(&mut req.input)).await?;
+        if request_has_assert_create_requirement(&request) {
+            let namespace_resource = TableCatalogResource::namespace(&warehouse, &namespace);
+            authorize_table_catalog_resource_request(&req, &namespace_resource, AdminAction::CreateTableAction).await?;
+        }
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
@@ -336,13 +340,13 @@ impl Operation for GetTableCatalogDiagnosticsHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_store_from_extensions(&req.extensions)?;
-        let config = store
-            .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
+        let retain_recent_metadata_files = store
+            .get_table_catalog_diagnostics_retention(&warehouse, &namespace.public_name(), &table)
             .await
             .map_err(catalog_store_error)?;
         let started = Instant::now();
         let result = store
-            .diagnose_table_catalog(&warehouse, &namespace.public_name(), &table, config.retain_recent_metadata_files)
+            .diagnose_table_catalog(&warehouse, &namespace.public_name(), &table, retain_recent_metadata_files)
             .await
             .map_err(catalog_store_error);
         record_table_catalog_admin_operation_result(

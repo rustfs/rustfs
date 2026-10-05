@@ -29,33 +29,43 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::{Uuid, Variant, Version};
 
+use super::profile_memory::MEMORY_PROFILE_SERVICE_CAPABILITY;
 use super::{
     CPU_PROFILE_CAPABILITY, DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DriveOutcome, DrivePerformanceError, DrivePerformanceRequest,
     DriveProvenance, LocalDriveConsent, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
     MAX_TOP_EXPORT_VALIDITY, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceError,
     NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest,
-    ProfileOutcome, ProfileProvenance, THREAD_PROFILE_CAPABILITY, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY,
-    TOP_RPC_CAPABILITY, TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits, TopCaptureRequest,
-    TopCaptureScope, TopOutcome, capture_cpu_profile, capture_thread_profile, capture_top_api, capture_top_locks,
-    capture_top_rpc, encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases,
-    sign_drive_export, sign_network_export, sign_top_export_with_nonce,
+    ProfileOutcome, ProfileProvenance, THREAD_PROFILE_CAPABILITY, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_DISK_CAPABILITY,
+    TOP_LOCKS_CAPABILITY, TOP_RPC_CAPABILITY, TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits,
+    TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_thread_profile, capture_top_api,
+    capture_top_disk, capture_top_locks, capture_top_rpc, encode_signed_profile_export, measure_drive, measure_network,
+    runtime_network_peer_aliases, sign_drive_export, sign_network_export, sign_top_export_with_nonce,
+};
+use super::{
+    HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthError, HealthServiceRequest,
+    LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS, MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES,
+    collect_runtime_health,
 };
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
 const PROFILE_THREADS_JOB_TYPE: &str = "profile.threads";
+const PROFILE_MEMORY_JOB_TYPE: &str = "profile.memory";
 const PERFORMANCE_DRIVE_JOB_TYPE: &str = "performance.drive";
 const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
+const TOP_DISK_JOB_TYPE: &str = "top.disk";
 const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
 const TOP_RPC_JOB_TYPE: &str = "top.rpc";
+const HEALTH_JOB_TYPE: &str = "health.check";
 pub const DIAGNOSTIC_JOB_SIGNATURE_DOMAIN: &[u8] = b"rustfs-connect-agent-job-v1\0";
 const MAX_JOB_LIFETIME_SECONDS: i64 = 1_800;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
 const MAX_OUTPUT_BYTES: u64 = 524_288;
 const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CPU_MILLIS: u64 = 30_000;
+const MAX_MEMORY_PROFILE_CPU_MILLIS: u64 = 5_000;
 const MAX_NETWORK_CPU_MILLIS: u64 = 5_000;
 const MIN_NETWORK_MEMORY_BYTES: u64 = 1_048_576;
 const DRIVE_TARGET_ALIAS: &str = "drive-1";
@@ -64,6 +74,8 @@ const DRIVE_SCRATCH_BYTES: u64 = 524_288;
 const DRIVE_BLOCK_BYTES: u64 = 65_536;
 const DRIVE_SAMPLE_PERIOD_MICROS: u64 = 10_000;
 const DRIVE_SCRATCH_DIRECTORY: &str = ".rustfs-connect-drive-scratch";
+const MAX_TOP_DISK_CPU_MILLIS: u64 = 5_000;
+const MIN_TOP_DISK_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_API_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_API_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_LOCKS_CPU_MILLIS: u64 = 5_000;
@@ -73,11 +85,14 @@ const MIN_TOP_RPC_MEMORY_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
+    Health,
     ProfileCpu,
     ProfileThreads,
+    ProfileMemory,
     PerformanceDrive,
     PerformanceNetwork,
     TopApi,
+    TopDisk,
     TopLocks,
     TopRpc,
 }
@@ -105,8 +120,18 @@ pub struct DiagnosticJobParameters {
     pub consent_uid: String,
     pub consent_policy_revision: u64,
     pub consent_expires_at: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub duration_millis: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub sample_period_micros: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_thread_scope"
+    )]
+    pub thread_scope: Option<ThreadProfileScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evidence_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +140,10 @@ pub struct DiagnosticJobParameters {
     pub scratch_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_bytes: Option<u64>,
+}
+
+fn deserialize_thread_scope<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<ThreadProfileScope>, D::Error> {
+    ThreadProfileScope::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -367,6 +396,9 @@ impl DiagnosticJobEnvelope {
 
     fn validate(&self, target: &DiagnosticJobTarget, now: DateTime<Utc>) -> Result<(), DiagnosticJobError> {
         let kind = self.kind()?;
+        if (kind == DiagnosticJobKind::ProfileThreads) != self.parameters.thread_scope.is_some() {
+            return Err(DiagnosticJobError::Invalid);
+        }
         if self.protocol_version != PROTOCOL_VERSION || self.schema_version != PROFILE_SCHEMA_VERSION {
             return Err(DiagnosticJobError::Unsupported);
         }
@@ -411,16 +443,47 @@ impl DiagnosticJobEnvelope {
             || self.limits.max_memory_bytes > MAX_MEMORY_BYTES
             || self.limits.max_cpu_millis == 0
             || self.limits.max_cpu_millis > MAX_CPU_MILLIS
-            || self.parameters.duration_millis == 0
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::Health {
+            if self.limits.timeout_seconds != HEALTH_TIMEOUT_SECONDS
+                || self.limits.max_output_bytes != MAX_HEALTH_OUTPUT_BYTES
+                || self.limits.max_memory_bytes != MAX_HEALTH_MEMORY_BYTES
+                || self.limits.max_cpu_millis != MAX_HEALTH_CPU_MILLIS
+                || self.parameters.duration_millis != 0
+                || self.parameters.sample_period_micros != 0
+                || !matches!(self.parameters.max_evidence_age_seconds, Some(1..=MAX_EVIDENCE_AGE_SECONDS))
+            {
+                return Err(DiagnosticJobError::LimitExceeded);
+            }
+        } else if self.parameters.duration_millis == 0
             || self.parameters.duration_millis > self.limits.timeout_seconds.saturating_mul(1_000)
             || self.parameters.duration_millis > self.limits.max_cpu_millis
             || self.parameters.sample_period_micros == 0
             || self.parameters.sample_period_micros > self.parameters.duration_millis.saturating_mul(1_000)
         {
             return Err(DiagnosticJobError::LimitExceeded);
+        } else if self.parameters.max_evidence_age_seconds.is_some() {
+            return Err(DiagnosticJobError::Invalid);
         }
         if kind == DiagnosticJobKind::TopApi
             && (self.limits.max_cpu_millis > MAX_TOP_API_CPU_MILLIS || self.limits.max_memory_bytes < MIN_TOP_API_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::TopDisk
+            && (self.limits.max_cpu_millis > MAX_TOP_DISK_CPU_MILLIS || self.limits.max_memory_bytes < MIN_TOP_DISK_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::ProfileThreads
+            && (self.limits.max_memory_bytes != MAX_MEMORY_BYTES || self.limits.max_cpu_millis != MAX_CPU_MILLIS)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::ProfileMemory
+            && (self.limits.max_cpu_millis > MAX_MEMORY_PROFILE_CPU_MILLIS || self.limits.max_memory_bytes != MAX_MEMORY_BYTES)
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
@@ -472,11 +535,19 @@ impl DiagnosticJobEnvelope {
 
     fn kind(&self) -> Result<DiagnosticJobKind, DiagnosticJobError> {
         match (self.job_type.as_str(), self.required_capabilities.as_slice(), self.schema_version) {
+            (HEALTH_JOB_TYPE, [capability], HEALTH_SCHEMA_VERSION) if capability == HEALTH_SERVICE_CAPABILITY => {
+                Ok(DiagnosticJobKind::Health)
+            }
             (PROFILE_CPU_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == CPU_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileCpu)
             }
             (PROFILE_THREADS_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == THREAD_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileThreads)
+            }
+            (PROFILE_MEMORY_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION)
+                if capability == MEMORY_PROFILE_SERVICE_CAPABILITY =>
+            {
+                Ok(DiagnosticJobKind::ProfileMemory)
             }
             (PERFORMANCE_DRIVE_JOB_TYPE, [capability], DRIVE_SCHEMA_VERSION) if capability == DRIVE_CAPABILITY => {
                 Ok(DiagnosticJobKind::PerformanceDrive)
@@ -488,6 +559,11 @@ impl DiagnosticJobEnvelope {
                 if capability == TOP_API_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
             {
                 Ok(DiagnosticJobKind::TopApi)
+            }
+            (TOP_DISK_JOB_TYPE, [capability], version)
+                if capability == TOP_DISK_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
+            {
+                Ok(DiagnosticJobKind::TopDisk)
             }
             (TOP_LOCKS_JOB_TYPE, [capability], version)
                 if capability == TOP_LOCKS_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
@@ -516,8 +592,10 @@ pub async fn execute_diagnostic_job(
     let nonce = job.nonce;
     let envelope = job.envelope;
     match envelope.kind()? {
+        DiagnosticJobKind::Health => execute_health_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileThreads => execute_profile_threads_job(envelope, nonce, identity, provenance, cancel).await,
+        DiagnosticJobKind::ProfileMemory => execute_profile_memory_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::PerformanceDrive => {
             let Some(scratch_root) = runtime_drive_scratch_root() else {
                 return Ok(failed_drive_execution(&envelope.job_id, "SOURCE_UNAVAILABLE"));
@@ -530,10 +608,93 @@ pub async fn execute_diagnostic_job(
         DiagnosticJobKind::PerformanceNetwork => {
             execute_performance_network_job(envelope, nonce, identity, provenance, cancel).await
         }
+        DiagnosticJobKind::TopDisk => execute_top_disk_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopRpc => execute_top_rpc_job(envelope, nonce, identity, provenance, cancel).await,
     }
+}
+
+async fn execute_health_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = HealthServiceRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        capability: HEALTH_SERVICE_CAPABILITY.to_owned(),
+        consent: LocalHealthConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            active: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        max_evidence_age_seconds: envelope
+            .parameters
+            .max_evidence_age_seconds
+            .ok_or(DiagnosticJobError::LimitExceeded)?,
+        provenance,
+    };
+    let timeout = Duration::from_secs(envelope.limits.timeout_seconds);
+    let health_cancel = cancel.child_token();
+    let collected = tokio::time::timeout(timeout, collect_runtime_health(&request, identity, &health_cancel)).await;
+    let export = match collected {
+        Ok(Ok(export)) => export,
+        Ok(Err(HealthError::SourceUnavailable)) => {
+            return Ok(DiagnosticJobExecution {
+                job_id: envelope.job_id,
+                outcome: "FAILED".to_owned(),
+                reason: "SOURCE_UNAVAILABLE".to_owned(),
+                artifact_uid: None,
+                artifact_sha256: None,
+                artifact_bytes: None,
+            });
+        }
+        Ok(Err(error)) => return Err(health_failure(error)),
+        Err(_) => {
+            health_cancel.cancel();
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+    };
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: export.outcome.as_str().to_owned(),
+        reason: export.reason_code.as_str().to_owned(),
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+fn health_failure(error: HealthError) -> DiagnosticJobError {
+    match error {
+        HealthError::Cancelled => DiagnosticJobError::Cancelled,
+        HealthError::LimitExceeded | HealthError::Busy => DiagnosticJobError::LimitExceeded,
+        HealthError::SourceUnavailable | HealthError::CollectionFailed => DiagnosticJobError::CollectionFailed,
+        HealthError::Signing | HealthError::Encoding => DiagnosticJobError::ExportFailed,
+        HealthError::ConsentExpired | HealthError::Expired => DiagnosticJobError::Expired,
+        HealthError::Unsupported => DiagnosticJobError::Unsupported,
+        HealthError::ConsentRequired | HealthError::InvalidRequest => DiagnosticJobError::Invalid,
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn runtime_drive_scratch_root() -> Option<std::path::PathBuf> {
@@ -742,6 +903,54 @@ async fn execute_performance_network_job(
     })
 }
 
+async fn execute_profile_memory_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = ProfileCaptureRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        // The service capability gates dispatch; schema-v1 exports retain the
+        // original allocation-aggregate capability and signed artifact format.
+        capability: super::MEMORY_PROFILE_CAPABILITY.to_owned(),
+        consent: LocalProfileConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            confirmed: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        duration: Duration::from_millis(envelope.parameters.duration_millis),
+        sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
+        provenance,
+    };
+    let export = super::export_memory_profile(&request, identity, cancel)
+        .await
+        .map_err(capture_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: "SUCCEEDED".to_owned(),
+        reason: "COMPLETE".to_owned(),
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
 async fn execute_profile_threads_job(
     envelope: DiagnosticJobEnvelope,
     nonce: [u8; 32],
@@ -772,10 +981,16 @@ async fn execute_profile_threads_job(
         sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
         provenance,
     };
+    let scope = envelope.parameters.thread_scope.ok_or(DiagnosticJobError::Invalid)?;
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let timeout = Duration::from_secs(envelope.limits.timeout_seconds);
     let owned_request = request.clone();
     let owned_cancel = cancel.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        capture_thread_profile(&owned_request, ThreadProfileScope::NativeThreads, &owned_cancel)
+    let result = tokio::task::spawn_blocking(move || match scope {
+        ThreadProfileScope::NativeThreads => capture_thread_profile(&owned_request, scope, &owned_cancel),
+        ThreadProfileScope::TokioRuntime => {
+            super::profile_threads::capture_runtime_profile(&owned_request, &metrics, timeout, &owned_cancel)
+        }
     })
     .await
     .map_err(|_| DiagnosticJobError::CollectionFailed)?
@@ -891,6 +1106,71 @@ async fn execute_top_api_job(
     let result = capture_top_api(&request, TopApiOperation::GetObject, cancel)
         .await
         .map_err(top_capture_failure)?;
+    let outcome = result.outcome.as_str().to_owned();
+    let reason = result.reason_code.as_str().to_owned();
+    if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome,
+            reason,
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = sign_top_export_with_nonce(&request, &result, identity, cancel, nonce).map_err(top_export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome,
+        reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+async fn execute_top_disk_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = TopCaptureRequest {
+        scope: TopCaptureScope {
+            organization_name: envelope.organization_name,
+            cluster_name: envelope.cluster_name,
+            device_name: envelope.device_name,
+            run_uid: envelope.job_id.clone(),
+            artifact_uid: envelope.parameters.artifact_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            run_expires_at_unix: expire.timestamp(),
+            executable_sha256: provenance.executable_sha256().to_owned(),
+            build_features: provenance.build_features().to_vec(),
+            consent: LocalTopConsent {
+                uid: envelope.parameters.consent_uid,
+                tool_id: TOP_DISK_JOB_TYPE.to_owned(),
+                classification: TOP_CLASSIFICATION.to_owned(),
+                active: true,
+                expires_at_unix: consent_expire.timestamp(),
+            },
+        },
+        limits: TopCaptureLimits {
+            // Measured sampling time includes scheduling overhead within the signed job timeout.
+            max_duration_millis: envelope.limits.timeout_seconds * 1_000,
+            max_working_memory_bytes: envelope.limits.max_memory_bytes,
+            max_cpu_millis: envelope.limits.max_cpu_millis,
+            ..TopCaptureLimits::default()
+        },
+        window: Duration::from_millis(envelope.parameters.duration_millis),
+        export_validity: MAX_TOP_EXPORT_VALIDITY,
+    };
+    let result = capture_top_disk(&request, cancel).await.map_err(top_capture_failure)?;
     let outcome = result.outcome.as_str().to_owned();
     let reason = result.reason_code.as_str().to_owned();
     if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
@@ -1164,12 +1444,14 @@ mod tests {
                 max_cpu_millis: 30_000,
             },
             parameters: DiagnosticJobParameters {
+                thread_scope: None,
                 artifact_uid: "018cc251-f400-7abc-8def-0123456789ae".to_owned(),
                 consent_uid: "018cc251-f400-7abc-8def-0123456789af".to_owned(),
                 consent_policy_revision: 1,
                 consent_expires_at: "2030-01-01T00:01:00Z".to_owned(),
                 duration_millis: 1_000,
                 sample_period_micros: 10_000,
+                max_evidence_age_seconds: None,
                 traffic_bytes: None,
                 target_alias: None,
                 scratch_bytes: None,
@@ -1212,6 +1494,7 @@ mod tests {
         use clap::CommandFactory;
 
         let expected = [
+            ("health.check.service@1", &[][..]),
             ("performance.client@1", &["performance", "client"][..]),
             ("performance.drive@1", &["performance", "drive"][..]),
             ("performance.network@1", &[][..]),
@@ -1220,6 +1503,7 @@ mod tests {
             ("logs.capture@1", &["logs"][..]),
             ("profile.cpu@1", &["profile"][..]),
             ("profile.memory@1", &["profile"][..]),
+            ("profile.memory.service@1", &[][..]),
             ("profile.threads@1", &["profile"][..]),
             ("telemetry.record@1", &["telemetry", "record"][..]),
             ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
@@ -1240,13 +1524,28 @@ mod tests {
         let connect = command.find_subcommand("connect").expect("connect command");
         for (capability, path) in expected {
             if path.is_empty() {
-                // Network probes use the authenticated service dispatcher and
-                // locally resolved peers, not a standalone CLI command.
                 let mut job = envelope();
-                job.job_type = PERFORMANCE_NETWORK_JOB_TYPE.to_owned();
+                let (job_type, kind) = match capability {
+                    HEALTH_SERVICE_CAPABILITY => (HEALTH_JOB_TYPE, DiagnosticJobKind::Health),
+                    NETWORK_CAPABILITY => (PERFORMANCE_NETWORK_JOB_TYPE, DiagnosticJobKind::PerformanceNetwork),
+                    MEMORY_PROFILE_SERVICE_CAPABILITY => (PROFILE_MEMORY_JOB_TYPE, DiagnosticJobKind::ProfileMemory),
+                    _ => panic!("{capability} is missing service dispatch"),
+                };
+                job.job_type = job_type.to_owned();
                 job.required_capabilities = vec![capability.to_owned()];
                 job.schema_version = NETWORK_SCHEMA_VERSION;
-                assert_eq!(job.kind(), Ok(DiagnosticJobKind::PerformanceNetwork));
+                if capability == HEALTH_SERVICE_CAPABILITY {
+                    job.limits = DiagnosticJobLimits {
+                        timeout_seconds: HEALTH_TIMEOUT_SECONDS,
+                        max_output_bytes: MAX_HEALTH_OUTPUT_BYTES,
+                        max_memory_bytes: MAX_HEALTH_MEMORY_BYTES,
+                        max_cpu_millis: MAX_HEALTH_CPU_MILLIS,
+                    };
+                    job.parameters.duration_millis = 0;
+                    job.parameters.sample_period_micros = 0;
+                    job.parameters.max_evidence_age_seconds = Some(300);
+                }
+                assert_eq!(job.kind(), Ok(kind));
                 continue;
             }
             let mut command = connect;
@@ -1267,9 +1566,74 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_the_bounded_health_service_contract() {
+        let mut health = envelope();
+        health.job_type = HEALTH_JOB_TYPE.to_owned();
+        health.required_capabilities = vec![HEALTH_SERVICE_CAPABILITY.to_owned()];
+        health.limits = DiagnosticJobLimits {
+            timeout_seconds: HEALTH_TIMEOUT_SECONDS,
+            max_output_bytes: MAX_HEALTH_OUTPUT_BYTES,
+            max_memory_bytes: MAX_HEALTH_MEMORY_BYTES,
+            max_cpu_millis: MAX_HEALTH_CPU_MILLIS,
+        };
+        health.parameters.duration_millis = 0;
+        health.parameters.sample_period_micros = 0;
+        health.parameters.max_evidence_age_seconds = Some(300);
+        let (health, signer) = signed_envelope(health);
+        signer
+            .verify(&health, &target(&health), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid health service job");
+
+        let unsigned = serde_json::to_value(health.unsigned()).expect("unsigned health job");
+        assert!(unsigned["parameters"].get("durationMillis").is_none());
+        assert!(unsigned["parameters"].get("samplePeriodMicros").is_none());
+        assert_eq!(unsigned["parameters"]["maxEvidenceAgeSeconds"], 300);
+
+        let mut old_capability = health.clone();
+        old_capability.required_capabilities = vec!["health.check@1".to_owned()];
+        assert_eq!(
+            signer.verify(&old_capability, &target(&old_capability), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Unsupported)
+        );
+
+        let mut oversized = health.clone();
+        oversized.limits.max_output_bytes += 1;
+        let (oversized, oversized_signer) = signed_envelope(oversized);
+        assert_eq!(
+            oversized_signer.verify(&oversized, &target(&oversized), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut missing_freshness = health.clone();
+        missing_freshness.parameters.max_evidence_age_seconds = None;
+        let (missing_freshness, missing_signer) = signed_envelope(missing_freshness);
+        assert_eq!(
+            missing_signer.verify(
+                &missing_freshness,
+                &target(&missing_freshness),
+                "2030-01-01T00:00:10Z".parse().expect("time")
+            ),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut profile_parameter = health;
+        profile_parameter.parameters.duration_millis = 1;
+        let (profile_parameter, profile_parameter_signer) = signed_envelope(profile_parameter);
+        assert_eq!(
+            profile_parameter_signer.verify(
+                &profile_parameter,
+                &target(&profile_parameter),
+                "2030-01-01T00:00:10Z".parse().expect("time")
+            ),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+    }
+
+    #[test]
     fn accepts_only_the_thread_profile_capability_pair() {
         let mut threads = envelope();
         threads.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        threads.parameters.thread_scope = Some(ThreadProfileScope::NativeThreads);
         threads.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
         let (threads, signer) = signed_envelope(threads);
         signer
@@ -1284,33 +1648,206 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn executes_thread_profile_jobs_against_the_service_process() {
-        let now = Utc::now();
-        let mut envelope = envelope();
-        envelope.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
-        envelope.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
-        envelope.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        envelope.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        envelope.parameters.consent_expires_at =
-            (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let execution = execute_diagnostic_job(
-            VerifiedDiagnosticJob {
-                envelope,
-                nonce: [7_u8; 32],
-            },
-            &DeviceIdentity::generate(),
-            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("native thread profile job should execute");
+    #[test]
+    fn thread_scope_is_required_and_forbidden_on_other_jobs() {
+        let now = "2030-01-01T00:00:10Z".parse().unwrap();
+        let mut job = envelope();
+        job.parameters.thread_scope = Some(ThreadProfileScope::TokioRuntime);
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::Invalid));
+        job.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        job.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+        assert!(job.validate(&target(&job), now).is_ok());
+        job.limits.max_memory_bytes = 1;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::LimitExceeded));
+        job.limits.max_memory_bytes = MAX_MEMORY_BYTES;
+        job.parameters.duration_millis = 1;
+        job.parameters.sample_period_micros = 1;
+        job.limits.max_cpu_millis = 1;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::LimitExceeded));
+        job.limits.max_cpu_millis = MAX_CPU_MILLIS;
+        job.parameters.thread_scope = None;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::Invalid));
+        let mut json = serde_json::to_value(&job).unwrap();
+        json["parameters"]["threadScope"] = serde_json::json!("ALL_THREADS");
+        assert!(serde_json::from_value::<DiagnosticJobEnvelope>(json.clone()).is_err());
+        json["parameters"]["threadScope"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<DiagnosticJobEnvelope>(json).is_err());
+        job.parameters.thread_scope = Some(ThreadProfileScope::TokioRuntime);
+        let (mut signed, signer) = signed_envelope(job);
+        signed.parameters.thread_scope = Some(ThreadProfileScope::NativeThreads);
+        assert!(signer.verify(&signed, &target(&signed), now).is_err());
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn executes_thread_profile_jobs_against_the_service_process() {
+        for scope in [ThreadProfileScope::NativeThreads, ThreadProfileScope::TokioRuntime] {
+            let now = Utc::now();
+            let mut envelope = envelope();
+            envelope.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+            envelope.parameters.thread_scope = Some(scope);
+            envelope.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+            envelope.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            envelope.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            envelope.parameters.consent_expires_at =
+                (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let execution = execute_diagnostic_job(
+                VerifiedDiagnosticJob {
+                    envelope,
+                    nonce: [7_u8; 32],
+                },
+                &DeviceIdentity::generate(),
+                ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("thread profile job should execute");
+
+            let supported = match scope {
+                ThreadProfileScope::NativeThreads => cfg!(target_os = "linux"),
+                ThreadProfileScope::TokioRuntime => cfg!(target_has_atomic = "64"),
+            };
+            if supported {
+                assert_eq!(execution.outcome, "SUCCEEDED");
+                assert_eq!(execution.reason, "COMPLETE");
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(execution.artifact_bytes.unwrap())).unwrap();
+                let result: serde_json::Value = serde_json::from_reader(archive.by_name("result.json").unwrap()).unwrap();
+                assert_eq!(result["data"]["scope"], serde_json::to_value(scope).unwrap());
+                if scope == ThreadProfileScope::TokioRuntime {
+                    assert_eq!(result["data"]["workerCount"], 2);
+                    assert_eq!(result["data"]["samples"].as_array().unwrap().len(), 2);
+                }
+                let envelope: serde_json::Value = serde_json::from_reader(archive.by_name("envelope.json").unwrap()).unwrap();
+                assert_eq!(envelope["classification"], "L3");
+            } else {
+                assert_eq!(execution.outcome, "UNSUPPORTED");
+                assert_eq!(execution.reason, "UNSUPPORTED_PLATFORM");
+                assert!(execution.artifact_bytes.is_none());
+            }
+        }
+    }
+
+    fn disk_envelope() -> DiagnosticJobEnvelope {
+        let mut top = envelope();
+        top.job_type = TOP_DISK_JOB_TYPE.to_owned();
+        top.required_capabilities = vec![TOP_DISK_CAPABILITY.to_owned()];
+        top.limits.max_cpu_millis = MAX_TOP_DISK_CPU_MILLIS;
+        top
+    }
+
+    #[test]
+    fn top_disk_job_rejects_mismatched_capabilities_parameters_consent_and_budgets() {
+        let now = "2030-01-01T00:00:10Z".parse().unwrap();
+        let (top, signer) = signed_envelope(disk_envelope());
+        assert!(signer.verify(&top, &target(&top), now).is_ok());
+        for case in 0..11 {
+            let mut invalid = disk_envelope();
+            let expected = match case {
+                0 => {
+                    invalid.required_capabilities = vec![TOP_API_CAPABILITY.to_owned()];
+                    DiagnosticJobError::Unsupported
+                }
+                1 => {
+                    invalid.schema_version = 2;
+                    DiagnosticJobError::Unsupported
+                }
+                2 => {
+                    invalid.parameters.thread_scope = Some(ThreadProfileScope::TokioRuntime);
+                    DiagnosticJobError::Invalid
+                }
+                3 => {
+                    invalid.parameters.traffic_bytes = Some(1);
+                    DiagnosticJobError::Invalid
+                }
+                4 => {
+                    invalid.parameters.target_alias = Some("drive-1".to_owned());
+                    DiagnosticJobError::Invalid
+                }
+                5 => {
+                    invalid.parameters.consent_policy_revision = 0;
+                    DiagnosticJobError::Invalid
+                }
+                6 => {
+                    invalid.parameters.consent_expires_at = invalid.create_time.clone();
+                    DiagnosticJobError::Expired
+                }
+                7 => {
+                    invalid.limits.max_cpu_millis = MAX_TOP_DISK_CPU_MILLIS + 1;
+                    DiagnosticJobError::LimitExceeded
+                }
+                8 => {
+                    invalid.limits.max_memory_bytes = MIN_TOP_DISK_MEMORY_BYTES - 1;
+                    DiagnosticJobError::LimitExceeded
+                }
+                9 => {
+                    invalid.parameters.duration_millis = MAX_TOP_DISK_CPU_MILLIS + 1;
+                    DiagnosticJobError::LimitExceeded
+                }
+                _ => {
+                    invalid.parameters.sample_period_micros = 0;
+                    DiagnosticJobError::LimitExceeded
+                }
+            };
+            let (invalid, signer) = signed_envelope(invalid);
+            assert_eq!(signer.verify(&invalid, &target(&invalid), now), Err(expected), "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn top_disk_job_collects_service_io_and_preserves_signed_nonce() {
+        let now = Utc::now();
+        let mut top = disk_envelope();
+        top.parameters.duration_millis = 1_000;
+        top.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        top.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        top.parameters.consent_expires_at =
+            (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (top, signer) = signed_envelope(top);
+        let verified = signer.verify(&top, &target(&top), now).unwrap();
+        let identity = DeviceIdentity::generate();
+        let cancel = CancellationToken::new();
+        let collect = execute_diagnostic_job(
+            verified,
+            &identity,
+            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+            &cancel,
+        );
+        let workload = async {
+            #[cfg(target_os = "linux")]
+            {
+                use std::io::Write as _;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut file = tempfile::tempfile().unwrap();
+                file.write_all(&[1u8; 65_536]).unwrap();
+                file.sync_all().unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(collect, workload);
+        let execution = result.unwrap();
         #[cfg(target_os = "linux")]
         {
             assert_eq!(execution.outcome, "SUCCEEDED");
-            assert_eq!(execution.reason, "COMPLETE");
-            assert!(execution.artifact_bytes.is_some_and(|bytes| !bytes.is_empty()));
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(execution.artifact_bytes.unwrap())).unwrap();
+            let result: serde_json::Value = serde_json::from_reader(archive.by_name("result.json").unwrap()).unwrap();
+            assert_eq!(result["toolId"], "top.disk");
+            assert_eq!(result["data"]["resourceAlias"], "resource-1");
+            let duration_millis = result["durationMillis"].as_u64().unwrap();
+            assert!(duration_millis >= top.parameters.duration_millis);
+            assert!(duration_millis <= top.limits.timeout_seconds * 1_000);
+            assert_eq!(result["data"]["windowMillis"], duration_millis);
+            assert!(result["data"]["writeBytes"].as_u64().unwrap() >= 65_536);
+            assert!(result["data"]["ioCount"].as_u64().unwrap() > 0);
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            archive.by_name("envelope.json").unwrap().read_to_end(&mut bytes).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(envelope["nonce"], top.nonce);
+            assert_eq!(envelope["classification"], "L3");
+            let signature: serde_json::Value = serde_json::from_reader(archive.by_name("envelope.sig").unwrap()).unwrap();
+            let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+            signed.extend_from_slice(&bytes);
+            assert!(identity.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
         }
         #[cfg(not(target_os = "linux"))]
         {

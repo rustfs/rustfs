@@ -316,6 +316,19 @@ pub(crate) fn metadata_location_from_metadata_file_path(
         .map(|_| object_key.to_string())
 }
 
+pub(crate) fn table_identity_from_metadata_object_key(object_key: &str) -> Option<(Namespace, IdentifierSegment)> {
+    let namespace_root = default_namespace_root_prefix();
+    let relative = object_key.strip_prefix(&namespace_root)?;
+    let (namespace_storage_id, table_path) = relative.rsplit_once(&format!("/{TABLE_ROOT}/"))?;
+    let namespace = Namespace::from_segments(namespace_storage_id.split('/').map(str::to_string).collect()).ok()?;
+    let (table_name, metadata_file_name) = table_path.split_once(&format!("/{METADATA_DIR}/"))?;
+    let table = IdentifierSegment::parse(table_name).ok()?;
+    if !is_valid_table_metadata_file_name(metadata_file_name) {
+        return None;
+    }
+    Some((namespace, table))
+}
+
 fn table_metadata_dir_from_object_key(object_key: &str) -> Option<String> {
     let namespace_root = default_namespace_root_prefix();
     let relative = object_key.strip_prefix(&namespace_root)?;

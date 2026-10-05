@@ -547,6 +547,92 @@ async fn production_cli_writes_a_verifiable_export_with_exact_binary_provenance(
         .expect("public key")
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
+
+    #[cfg(unix)]
+    {
+        // The offline key is separate from the online identity and is selected explicitly.
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private offline state root");
+        let offline = rustfs::connect::OfflineKeyStore::new(&state)
+            .load_or_create()
+            .expect("existing offline identity");
+        let offline_key_id = hex_lower(&Sha256::digest(offline.public_key_der()));
+        let offline_output = temp.path().join("client-offline.zip");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rustfs"));
+        command
+            .args(["connect", "performance", "client", "--state-dir"])
+            .arg(&state)
+            .args([
+                "--offline-key-id",
+                &offline_key_id,
+                "--endpoint",
+                &server.endpoint(),
+                "--access-key-file",
+            ])
+            .arg(&access_key_file)
+            .arg("--secret-key-file")
+            .arg(&secret_key_file)
+            .arg("--output")
+            .arg(&offline_output)
+            .args(["--organization", organization, "--cluster", &cluster, "--device"])
+            .arg(format!("{cluster}/clusterDevices/019e3ae0-0000-7000-8000-000000000012"))
+            .args([
+                "--run-uid",
+                "019e3ae0-0000-7000-8000-000000000016",
+                "--artifact-uid",
+                "019e3ae0-0000-7000-8000-000000000017",
+                "--consent-uid",
+                "019e3ae0-0000-7000-8000-000000000018",
+                "--policy-revision",
+                "7",
+                "--consent-expires-at",
+                &(now() + 120).to_string(),
+                "--expires-at",
+                &(now() + 60).to_string(),
+                "--operation",
+                "get",
+                "--traffic-bytes",
+                "65536",
+                "--duration-millis",
+                "1000",
+                "--acknowledge-l1",
+            ]);
+        let result = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .expect("offline CLI task")
+            .expect("run production rustfs binary");
+        assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("upload=not-performed\n"));
+        let bytes = fs::read(&offline_output).expect("offline signed archive");
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).expect("offline archive");
+        let envelope_bytes = read_archive_member(&mut archive, "envelope.json");
+        let signature_bytes = read_archive_member(&mut archive, "envelope.sig");
+        let result_bytes = read_archive_member(&mut archive, "result.json");
+        let envelope: serde_json::Value = serde_json::from_slice(&envelope_bytes).expect("offline envelope");
+        let signed_result: serde_json::Value = serde_json::from_slice(&result_bytes).expect("offline result");
+        assert_eq!(envelope["classification"], "L1");
+        assert_eq!(envelope["deviceKeyId"], offline_key_id);
+        assert_eq!(
+            signed_result["provenance"]["executableSha256"],
+            sha256_file(Path::new(env!("CARGO_BIN_EXE_rustfs")))
+        );
+        let signature_document: serde_json::Value = serde_json::from_slice(&signature_bytes).expect("offline signature");
+        let raw = URL_SAFE_NO_PAD
+            .decode_to_vec(signature_document["value"].as_str().expect("signature value"))
+            .expect("base64url signature");
+        let signature = Signature::from_slice(&raw).expect("P-256 signature");
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope_bytes);
+        VerifyingKey::from_public_key_der(&offline.public_key_der())
+            .expect("offline public key")
+            .verify(&signed, &signature)
+            .expect("offline ES256 signature");
+        assert!(
+            VerifyingKey::from_public_key_der(&identity.public_key_der())
+                .expect("online public key")
+                .verify(&signed, &signature)
+                .is_err()
+        );
+    }
 }
 
 fn write_credential(path: &Path, value: &str) {

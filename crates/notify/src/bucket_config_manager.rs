@@ -53,7 +53,9 @@ impl NotifyBucketConfigManager {
         self.rule_engine.has_subscriber(bucket, event).await
     }
 
-    pub async fn load_bucket_notification_config(
+    /// Validates that the runtime can accept `cfg` for `bucket` without
+    /// mutating any state.
+    pub async fn validate_bucket_notification_config(
         &self,
         bucket: &str,
         cfg: &BucketNotificationConfig,
@@ -98,6 +100,11 @@ impl NotifyBucketConfigManager {
             );
         }
 
+        Ok(())
+    }
+
+    /// Publishes an already validated `cfg` to the runtime rule state.
+    pub async fn apply_bucket_notification_config(&self, bucket: &str, cfg: &BucketNotificationConfig) {
         self.subscriber_view.apply_bucket_config(bucket, cfg);
         self.rule_engine.set_bucket_rules(bucket, cfg.get_rules_map().clone()).await;
         info!(
@@ -109,6 +116,15 @@ impl NotifyBucketConfigManager {
             rule_count = cfg.get_rules_map().inner().len(),
             "notify bucket config state"
         );
+    }
+
+    pub async fn load_bucket_notification_config(
+        &self,
+        bucket: &str,
+        cfg: &BucketNotificationConfig,
+    ) -> Result<(), NotificationError> {
+        self.validate_bucket_notification_config(bucket, cfg).await?;
+        self.apply_bucket_notification_config(bucket, cfg).await;
         Ok(())
     }
 
@@ -122,7 +138,7 @@ impl NotifyBucketConfigManager {
 mod tests {
     use super::NotifyBucketConfigManager;
     use crate::{
-        BucketNotificationConfig, integration::NotificationMetrics,
+        BucketNotificationConfig, NotificationError, integration::NotificationMetrics,
         notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
     };
     use rustfs_s3_types::EventName;
@@ -155,5 +171,38 @@ mod tests {
 
         manager.remove_bucket_notification_config("bucket").await;
         assert!(!manager.subscriber_view.has_subscriber("bucket", &EventName::ObjectCreatedPut));
+    }
+
+    #[tokio::test]
+    async fn validate_bucket_notification_config_rejects_missing_targets_without_applying_rules() {
+        let manager = build_manager();
+        let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
+        let mut cfg = BucketNotificationConfig::new("us-east-1");
+        cfg.add_rule(&[EventName::ObjectCreatedPut], "*".to_string(), target_id);
+
+        let err = manager
+            .validate_bucket_notification_config("bucket", &cfg)
+            .await
+            .expect_err("validation must fail when the runtime has no notify targets");
+        assert!(matches!(err, NotificationError::Configuration(_)));
+        assert!(!manager.has_subscriber("bucket", &EventName::ObjectCreatedPut).await);
+        assert!(!manager.subscriber_view.has_subscriber("bucket", &EventName::ObjectCreatedPut));
+    }
+
+    #[tokio::test]
+    async fn failed_validation_keeps_previous_bucket_rules() {
+        let manager = build_manager();
+        let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
+        let mut cfg = BucketNotificationConfig::new("us-east-1");
+        cfg.add_rule(&[EventName::ObjectCreatedPut], "*".to_string(), target_id);
+        manager.apply_bucket_notification_config("bucket", &cfg).await;
+        assert!(manager.has_subscriber("bucket", &EventName::ObjectCreatedPut).await);
+
+        let err = manager
+            .validate_bucket_notification_config("bucket", &cfg)
+            .await
+            .expect_err("validation must fail when the runtime has no notify targets");
+        assert!(matches!(err, NotificationError::Configuration(_)));
+        assert!(manager.has_subscriber("bucket", &EventName::ObjectCreatedPut).await);
     }
 }

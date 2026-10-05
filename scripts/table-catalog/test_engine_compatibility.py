@@ -32,7 +32,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(spark["status"], "manual-live-harness")
         self.assertContainsScenario(spark, "create-namespace", "manual-live-harness")
         self.assertContainsScenario(spark, "create-table", "manual-live-harness")
-        self.assertContainsScenario(spark, "append", "manual-live-harness")
+        self.assertContainsScenario(spark, "staged-create", "manual-live-harness")
         self.assertContainsScenario(spark, "reload-table", "manual-live-harness")
         self.assertContainsScenario(spark, "drop-table", "manual-live-harness")
         self.assertContainsScenario(spark, "commit-conflict", "manual-validation-required")
@@ -142,7 +142,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.s3.secret-access-key"], "rustfsadmin")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
-    def test_spark_sql_smoke_covers_lifecycle_append_reload_and_cleanup(self) -> None:
+    def test_spark_sql_smoke_covers_staged_ctas_reload_and_cleanup(self) -> None:
         sql = engine_compatibility.spark_sql_smoke(
             catalog_name="rustfs",
             namespace="sales",
@@ -152,8 +152,9 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertIn("CREATE NAMESPACE IF NOT EXISTS rustfs.`sales`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
-        self.assertIn("CREATE TABLE rustfs.`sales`.`orders`", sql)
-        self.assertIn("INSERT INTO rustfs.`sales`.`orders`", sql)
+        self.assertIn("CREATE TABLE rustfs.`sales`.`orders` USING iceberg AS", sql)
+        self.assertIn("SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta')", sql)
+        self.assertNotIn("INSERT INTO rustfs.`sales`.`orders`", sql)
         self.assertIn("REFRESH TABLE rustfs.`sales`.`orders`", sql)
         self.assertIn("SELECT COUNT(*) AS row_count FROM rustfs.`sales`.`orders`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
@@ -547,7 +548,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         record = engine_compatibility.live_conformance_evidence_record(
             client_name="Spark Iceberg REST catalog",
             client_version="3.5.4/iceberg-1.7.1",
-            scenario="create-namespace-create-table-append-refresh-count-cleanup",
+            scenario="create-namespace-staged-ctas-refresh-count-cleanup",
             rustfs_build="rustfs-test",
             git_sha="abc123",
             catalog_backing="durable-strong",

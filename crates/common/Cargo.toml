@@ -41,6 +41,7 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 metrics = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+thiserror.workspace = true
 
 [lib]
 doctest = false

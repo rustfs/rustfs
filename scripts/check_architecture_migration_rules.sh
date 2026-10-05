@@ -6,7 +6,7 @@
 # #1052 — all closed) and now keep the resulting boundaries from rotting
 # (facade bypasses, compat-shim resurrection, owner-module drift). Closed
 # migration issues are NOT a reason to retire this script or its pins.
-# Runs in ci.yml Quick Checks and .github/workflows/architecture-migration-rules.yml.
+# Runs in ci.yml Quick Checks for every pull request.
 
 set -euo pipefail
 
@@ -2277,7 +2277,7 @@ fi
     rustfs/src/admin/router.rs \
     rustfs/src/admin/console.rs \
     rustfs/src/admin/handlers/heal.rs \
-    rustfs/src/admin/handlers/metrics.rs \
+    rustfs/src/admin/handlers/realtime.rs \
     rustfs/src/admin/handlers/object_zip_download.rs || true
 ) >"$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE"
 

@@ -296,6 +296,7 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
         preserve_etag: object_info.etag.clone(),
         src_pool_idx,
         data_movement: true,
+        shard_integrity_write_mode: Some(object_info.shard_integrity_write_mode()),
         ..ObjectOptions::with_capacity_expected_data_bytes(usize::try_from(object_info.size).ok())
     }
 }
@@ -476,6 +477,7 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         versioned: object_info.version_id.is_some(),
         src_pool_idx,
         data_movement: true,
+        shard_integrity_write_mode: Some(object_info.shard_integrity_write_mode()),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         http_preconditions: Some(data_movement_target_precondition()),
         mod_time: object_info.mod_time,
@@ -638,6 +640,21 @@ pub(crate) fn data_movement_stage_source(err: &Error) -> Option<&Error> {
         .downcast_ref::<DataMovementStageError>()?
         .source
         .downcast_ref::<Error>()
+}
+
+/// Recover a concrete typed error wrapped by [`data_movement_stage_error`].
+pub(crate) fn data_movement_stage_source_as<T>(err: &Error) -> Option<&T>
+where
+    T: std::error::Error + 'static,
+{
+    let Error::Io(io_err) = err else {
+        return None;
+    };
+    io_err
+        .get_ref()?
+        .downcast_ref::<DataMovementStageError>()?
+        .source
+        .downcast_ref::<T>()
 }
 
 fn schedule_data_movement_multipart_abort_cleanup(
@@ -2109,6 +2126,27 @@ async fn migrate_object_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_movement_retains_source_shard_integrity_mode() {
+        use crate::object_api::ShardIntegrityWriteMode;
+        let mut source = ObjectInfo::default();
+        for mode in [ShardIntegrityWriteMode::Legacy, ShardIntegrityWriteMode::Protected] {
+            if mode == ShardIntegrityWriteMode::Protected {
+                // A declaration selects protected I/O; the source reader still
+                // rejects this deliberately incomplete descriptor before commit.
+                rustfs_utils::http::insert_str(
+                    Arc::make_mut(&mut source.user_defined),
+                    rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                    "invalid".to_owned(),
+                );
+            }
+            let put = data_movement_put_object_opts(&source, 0);
+            let multipart = data_movement_new_multipart_opts(&source, 0);
+            assert_eq!(put.shard_integrity_write_mode, Some(mode));
+            assert_eq!(multipart.shard_integrity_write_mode, Some(mode));
+        }
+    }
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
     use rustfs_filemeta::metadata_keys;
     use rustfs_rio::{Checksum, ChecksumType};

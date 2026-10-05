@@ -37,7 +37,7 @@ their issue closes.
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
-| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | arch-checks skill |
+| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
 | `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
@@ -47,7 +47,10 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `diagnose_scanner_enumeration_restart.py` | dev-tool | Strict fixed raw-entry-budget scanner-worker restart diagnostic | [Checkpoint fixture](../docs/testing/scanner-checkpoint-fixture.md) |
+| `prepare_replacement_migration.py` | dev-tool | Prepares digest-bound schema 5/6 replacement maintenance approvals | [Replacement recovery](../docs/operations/replacement-generation-recovery.md) |
+| `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
 | `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
+| `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
@@ -88,6 +91,7 @@ their issue closes.
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
+| `test_package_service_scripts.sh` | ci-gate | Verifies DEB/RPM install, upgrade, removal, and service restart scriptlets | audit.yml `workflow-pin-report` |
 | `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |
 | `windows-sftp-listener-smoke.sh` | dev-tool | Confirms `rustfs.exe --features sftp` binds an SFTP listener on Windows | — |
 
@@ -135,6 +139,7 @@ their issue closes.
 | `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
 | `install-protoc.sh` | dev-tool | Local protoc installer (macOS/Linux) | — |
+| `cargo_publish_workspace.sh` | dev-tool | Generates the workspace crate publish order, checks existing registry versions, and optionally runs ordered `cargo publish` dry-runs or publication | `docs/operations/cargo-publish-workspace.md` |
 | `makefile-header.sh` | dev-tool | Generates the `## —— section ——` header lines used in `.config/make/*.mak` | — |
 | `tls_gen.md` | dev-tool (doc) | Notes on generating local TLS certificates | — |
 

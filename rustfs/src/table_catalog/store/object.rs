@@ -239,6 +239,33 @@ struct ActiveNamespaceEvidence {
     explicit_entry: Option<NamespaceEntry>,
 }
 
+enum TableWarehouseIndexResolution {
+    Active(TableDataPlaneResource),
+    Deleted(TableDataPlaneResource),
+    Missing,
+}
+
+enum TableWarehouseIndexBackfillMode {
+    InitializeIfNeeded,
+    ScanAllTables,
+}
+
+pub(in crate::table_catalog) fn bounded_table_entry_objects_for_data_plane_scan(
+    objects: Vec<String>,
+    is_truncated: bool,
+    max_catalog_objects: usize,
+) -> TableCatalogStoreResult<Vec<String>> {
+    if is_truncated || objects.len() > max_catalog_objects {
+        return Err(TableCatalogStoreError::Unavailable(format!(
+            "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
+        )));
+    }
+    Ok(objects
+        .into_iter()
+        .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+        .collect())
+}
+
 #[derive(Clone)]
 pub(crate) struct ObjectTableCatalogStore<B> {
     pub(in crate::table_catalog) backend: B,
@@ -720,13 +747,16 @@ where
         object: &str,
         entry: &T,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()>
     where
         T: Serialize,
     {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
-        self.backend.put_object_unlocked(bucket, object, data, precondition).await
+        self.backend
+            .put_object_unlocked(bucket, object, data, precondition, write_guards)
+            .await
     }
 
     async fn write_exact_entry_unlocked<T>(
@@ -735,11 +765,14 @@ where
         object: &str,
         entry: &T,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<String>
     where
         T: DeserializeOwned + PartialEq + Serialize,
     {
-        let write_result = self.write_entry_unlocked(bucket, object, entry, precondition).await;
+        let write_result = self
+            .write_entry_unlocked(bucket, object, entry, precondition, write_guards)
+            .await;
         let current = self.read_entry_unlocked::<T>(bucket, object).await?;
         match current {
             Some((current, Some(etag))) if current == *entry => Ok(etag),
@@ -804,6 +837,20 @@ where
         Ok(Some((entry, etag)))
     }
 
+    async fn table_data_plane_read_version(&self, table_bucket: &str) -> TableCatalogStoreResult<String> {
+        let Some((entry, etag)) = self.table_rename_read_snapshot(table_bucket).await? else {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "object-backed catalog has no entry for table-enabled bucket {table_bucket}"
+            )));
+        };
+        if entry.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table-enabled bucket {table_bucket} has an inactive object-backed catalog entry"
+            )));
+        }
+        Ok(etag)
+    }
+
     async fn finish_table_rename_read(&self, table_bucket: &str, expected_version: Option<&str>) -> TableCatalogStoreResult<()> {
         let object = self.paths.table_bucket_entry_path(table_bucket);
         let current_version =
@@ -837,14 +884,21 @@ where
         intent: &mut TableRenameIntent,
         etag: String,
         state: TableRenameIntentState,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<String> {
         if intent.state >= state {
             return Ok(etag);
         }
         intent.state = state;
         intent.updated_at = OffsetDateTime::now_utc().to_string();
-        self.write_exact_entry_unlocked(self.catalog_bucket(), object, intent, TableCatalogPutPrecondition::IfMatch(etag))
-            .await
+        self.write_exact_entry_unlocked(
+            self.catalog_bucket(),
+            object,
+            intent,
+            TableCatalogPutPrecondition::IfMatch(etag),
+            write_guards,
+        )
+        .await
     }
 
     async fn recover_active_table_rename(
@@ -986,6 +1040,10 @@ where
                     &source_object,
                     &source_fence,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -998,7 +1056,13 @@ where
             }
         }
         intent_etag = self
-            .advance_table_rename_intent_unlocked(&intent_object, &mut intent, intent_etag, TableRenameIntentState::SourceFenced)
+            .advance_table_rename_intent_unlocked(
+                &intent_object,
+                &mut intent,
+                intent_etag,
+                TableRenameIntentState::SourceFenced,
+                _intent_guard.write_commit_guards(),
+            )
             .await?;
 
         let mut destination_fence = intent.destination.clone();
@@ -1014,6 +1078,10 @@ where
                     &destination_object,
                     &destination_fence,
                     TableCatalogPutPrecondition::IfAbsent,
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1026,6 +1094,10 @@ where
                     &destination_object,
                     &destination_fence,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1043,6 +1115,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::DestinationWritten,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
 
@@ -1057,6 +1130,10 @@ where
                     &source_object,
                     &source_tombstone,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1074,6 +1151,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::SourceTombstoned,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
 
@@ -1098,6 +1176,10 @@ where
                 &index_object,
                 &destination_index,
                 TableCatalogPutPrecondition::IfMatch(intent.warehouse_index_etag.clone()),
+                _catalog_guards
+                    .iter()
+                    .flat_map(TableCatalogLockGuard::write_commit_guards)
+                    .collect(),
             )
             .await?;
         }
@@ -1107,6 +1189,7 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::IndexPublished,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
         match self
@@ -1120,6 +1203,10 @@ where
                     &destination_object,
                     &intent.destination,
                     TableCatalogPutPrecondition::IfMatch(current_etag),
+                    _catalog_guards
+                        .iter()
+                        .flat_map(TableCatalogLockGuard::write_commit_guards)
+                        .collect(),
                 )
                 .await?;
             }
@@ -1137,10 +1224,17 @@ where
                 &mut intent,
                 intent_etag,
                 TableRenameIntentState::DestinationPublished,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
-        self.advance_table_rename_intent_unlocked(&intent_object, &mut intent, intent_etag, TableRenameIntentState::Completed)
-            .await?;
+        self.advance_table_rename_intent_unlocked(
+            &intent_object,
+            &mut intent,
+            intent_etag,
+            TableRenameIntentState::Completed,
+            _intent_guard.write_commit_guards(),
+        )
+        .await?;
 
         let Some((mut bucket_entry, bucket_etag)) = self.read_table_bucket_with_etag_unlocked(table_bucket).await? else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
@@ -1155,12 +1249,17 @@ where
             &bucket_object,
             &bucket_entry,
             TableCatalogPutPrecondition::IfMatch(bucket_etag),
+            _bucket_guard.write_commit_guards(),
         )
         .await?;
         Ok(())
     }
 
-    async fn write_warehouse_index_state_unlocked(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+    async fn write_warehouse_index_state_unlocked(
+        &self,
+        table_bucket: &str,
+        write_guards: Vec<WriteCommitGuard>,
+    ) -> TableCatalogStoreResult<()> {
         let state = TableWarehouseIndexStateEntry {
             version: TABLE_WAREHOUSE_INDEX_STATE_VERSION,
             table_bucket: table_bucket.to_string(),
@@ -1171,6 +1270,7 @@ where
             &self.paths.warehouse_index_state_path(table_bucket),
             &state,
             TableCatalogPutPrecondition::Any,
+            write_guards,
         )
         .await
     }
@@ -1258,15 +1358,14 @@ where
         Ok(())
     }
 
-    async fn replace_stale_table_warehouse_index(
+    async fn replace_table_warehouse_index(
         &self,
         object: &str,
         stale: &TableWarehouseIndexEntry,
         replacement: &TableWarehouseIndexEntry,
-        reason: &'static str,
     ) -> TableCatalogStoreResult<bool> {
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), object).await?;
-        let Some((current, _)) = self
+        let Some((current, current_etag)) = self
             .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), object)
             .await?
         else {
@@ -1276,9 +1375,17 @@ where
         if current != *stale {
             return Ok(false);
         }
-        self.delete_warehouse_index_object_unlocked(object, stale, reason).await?;
-        self.write_entry_unlocked(self.catalog_bucket(), object, replacement, TableCatalogPutPrecondition::IfAbsent)
-            .await?;
+        let current_etag = current_etag
+            .ok_or_else(|| TableCatalogStoreError::Internal(format!("catalog warehouse index has no etag: {object}")))?;
+        // A missing index would expose residual data during failed prefix reuse.
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            object,
+            replacement,
+            TableCatalogPutPrecondition::IfMatch(current_etag),
+            _guard.write_commit_guards(),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1384,11 +1491,8 @@ where
                             index.warehouse_object_prefix
                         )));
                     }
-                    if self
-                        .replace_stale_table_warehouse_index(&object, &existing, &index, "stale reservation conflict")
-                        .await?
-                    {
-                        return Ok(WarehouseIndexReservation::Created);
+                    if self.replace_table_warehouse_index(&object, &existing, &index).await? {
+                        return Ok(WarehouseIndexReservation::Replaced(existing));
                     }
                 }
                 Err(err) => return Err(err),
@@ -1408,12 +1512,12 @@ where
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to delete stale warehouse index {object}: {err}")))
     }
 
-    async fn fail_closed_for_broken_warehouse_index(
+    async fn fail_closed_for_broken_warehouse_index<T>(
         &self,
         object: &str,
         index: &TableWarehouseIndexEntry,
         reason: &'static str,
-    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+    ) -> TableCatalogStoreResult<Option<T>> {
         Err(TableCatalogStoreError::Internal(format!(
             "active warehouse index {object} for {}/{}/{} ({}) is inconsistent: {reason}",
             index.table_bucket, index.namespace, index.table, index.table_id
@@ -1424,11 +1528,15 @@ where
         &self,
         index_object: &str,
         index: TableWarehouseIndexEntry,
-    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+    ) -> TableCatalogStoreResult<Option<(TableCatalogEntryState, TableDataPlaneResource)>> {
         validate_table_warehouse_index_entry_object(&self.paths, index_object, &index)?;
+        if index.state == TableCatalogEntryState::Deleted {
+            let resource = table_data_plane_resource_from_warehouse_index(&index)?;
+            return Ok(Some((TableCatalogEntryState::Deleted, resource)));
+        }
         if index.state != TableCatalogEntryState::Active {
             return Err(TableCatalogStoreError::Internal(format!(
-                "warehouse index {index_object} for {}/{}/{} is inactive while the index is authoritative",
+                "warehouse index {index_object} for {}/{}/{} has an invalid transient state while the index is authoritative",
                 index.table_bucket, index.namespace, index.table
             )));
         }
@@ -1458,7 +1566,10 @@ where
                 .fail_closed_for_broken_warehouse_index(index_object, &index, "referenced table identity changed")
                 .await;
         }
-        Ok(Some(table_data_plane_resource_from_entry(table, current_prefix)))
+        Ok(Some((
+            TableCatalogEntryState::Active,
+            table_data_plane_resource_from_entry(table, current_prefix),
+        )))
     }
 
     async fn read_warehouse_index_state_unlocked(&self, table_bucket: &str) -> TableCatalogStoreResult<bool> {
@@ -1474,17 +1585,41 @@ where
         table_warehouse_index_state_ready(&state, table_bucket)
     }
 
-    async fn delete_created_table_warehouse_index(
+    async fn rollback_table_warehouse_index_reservation(
         &self,
         entry: &TableEntry,
         reservation: WarehouseIndexReservation,
         reason: &'static str,
     ) {
-        if reservation != WarehouseIndexReservation::Created {
-            return;
+        let result = async {
+            match reservation {
+                WarehouseIndexReservation::AlreadyReserved => Ok(()),
+                WarehouseIndexReservation::Created => self.delete_table_warehouse_index(entry).await,
+                WarehouseIndexReservation::Replaced(previous) => {
+                    let index = table_warehouse_index_entry(entry)?;
+                    // An error response can follow a committed catalog write.
+                    if let Some(current) = self
+                        .load_table_entry(&entry.table_bucket, &entry.namespace, &entry.table)
+                        .await?
+                        && table_warehouse_index_entry(&current)? == index
+                    {
+                        return Ok(());
+                    }
+                    self.replace_table_warehouse_index(
+                        &self
+                            .paths
+                            .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix),
+                        &index,
+                        &previous,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }
         }
+        .await;
         let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
-        if let Err(err) = self.delete_table_warehouse_index(entry).await {
+        if let Err(err) = result {
             tracing::warn!(
                 table_bucket = %entry.table_bucket,
                 namespace = %entry.namespace,
@@ -1513,28 +1648,53 @@ where
         .map(|_| ())
     }
 
-    async fn delete_owned_table_warehouse_index_for_drop(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
+    pub(in crate::table_catalog) async fn tombstone_table_warehouse_index_for_drop(
+        &self,
+        entry: &TableEntry,
+        replace_deleted_owner: bool,
+    ) -> TableCatalogStoreResult<()> {
         let index = table_warehouse_index_entry(entry)?;
+        let mut tombstone = index.clone();
+        tombstone.state = TableCatalogEntryState::Deleted;
         let object = self
             .paths
             .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix);
         validate_table_warehouse_index_entry_object(&self.paths, &object, &index)?;
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
-        let Some((current, _)) = self
+        let Some((current, current_etag)) = self
             .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
             .await?
         else {
-            return Ok(());
+            return self
+                .write_entry_unlocked(
+                    self.catalog_bucket(),
+                    &object,
+                    &tombstone,
+                    TableCatalogPutPrecondition::IfAbsent,
+                    _guard.write_commit_guards(),
+                )
+                .await;
         };
         validate_table_warehouse_index_entry_object(&self.paths, &object, &current)?;
-        if current != index {
+        if current == tombstone {
+            return Ok(());
+        }
+        if current != index && !(replace_deleted_owner && current.state == TableCatalogEntryState::Deleted) {
             return Err(TableCatalogStoreError::Conflict(format!(
                 "table warehouse index owner changed before drop: {}",
                 index.warehouse_object_prefix
             )));
         }
-        self.delete_warehouse_index_object_unlocked(&object, &index, "table warehouse index owner dropped")
-            .await
+        let current_etag = current_etag
+            .ok_or_else(|| TableCatalogStoreError::Internal(format!("catalog warehouse index has no etag: {object}")))?;
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &tombstone,
+            TableCatalogPutPrecondition::IfMatch(current_etag),
+            _guard.write_commit_guards(),
+        )
+        .await
     }
 
     async fn restore_table_warehouse_index_after_failed_drop(&self, entry: &TableEntry, reason: &'static str) {
@@ -1578,8 +1738,10 @@ where
         &self,
         table_bucket: &str,
         object: &str,
-    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
-        let mut matched: Option<TableDataPlaneResource> = None;
+    ) -> TableCatalogStoreResult<TableWarehouseIndexResolution> {
+        let mut active: Option<TableDataPlaneResource> = None;
+        let mut deleted: Option<TableDataPlaneResource> = None;
+        let mut deleted_overlap = None;
         for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
             let index_object = self.paths.warehouse_index_entry_path(table_bucket, warehouse_object_prefix);
             let Some((index, _)) = self
@@ -1593,27 +1755,166 @@ where
                     "warehouse index entry does not match indexed prefix: {index_object}"
                 )));
             }
-            if let Some(resource) = self
+            if let Some((state, resource)) = self
                 .resolve_table_data_plane_resource_from_index_entry(&index_object, index)
                 .await?
             {
+                let matched = match &state {
+                    TableCatalogEntryState::Active => &mut active,
+                    TableCatalogEntryState::Deleted => {
+                        if let Some(current) = deleted.as_ref() {
+                            deleted_overlap =
+                                Some((current.warehouse_object_prefix.clone(), resource.warehouse_object_prefix.clone()));
+                            continue;
+                        }
+                        &mut deleted
+                    }
+                    TableCatalogEntryState::Renaming | TableCatalogEntryState::Deleting => {
+                        unreachable!("transient indexes are rejected above")
+                    }
+                };
                 if let Some(current) = matched.as_ref() {
                     return Err(TableCatalogStoreError::Invalid(format!(
                         "object {object} matches overlapping active table warehouse indexes {} and {}",
                         current.warehouse_object_prefix, resource.warehouse_object_prefix
                     )));
                 }
-                matched = Some(resource);
+                *matched = Some(resource);
             }
+        }
+        if let Some(resource) = active {
+            Ok(TableWarehouseIndexResolution::Active(resource))
+        } else if let Some((left, right)) = deleted_overlap {
+            Err(TableCatalogStoreError::Invalid(format!(
+                "object {object} matches overlapping deleted table warehouse indexes {left} and {right}"
+            )))
+        } else if let Some(resource) = deleted {
+            Ok(TableWarehouseIndexResolution::Deleted(resource))
+        } else {
+            Ok(TableWarehouseIndexResolution::Missing)
+        }
+    }
+
+    async fn resolve_table_data_plane_resource_with_scan(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self
+            .resolve_table_data_plane_resource_from_index(table_bucket, object)
+            .await?
+        {
+            TableWarehouseIndexResolution::Active(resource) => Ok(Some(resource)),
+            TableWarehouseIndexResolution::Deleted(tombstone) => Ok(self
+                .scan_table_data_plane_resource_for_index_miss(table_bucket, object)
+                .await?
+                .or(Some(tombstone))),
+            TableWarehouseIndexResolution::Missing => {
+                self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await
+            }
+        }
+    }
+
+    pub(in crate::table_catalog) async fn resolve_deleted_table_data_plane_resource_from_index(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        let mut matched: Option<TableDataPlaneResource> = None;
+        for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
+            let index_object = self.paths.warehouse_index_entry_path(table_bucket, warehouse_object_prefix);
+            let Some((index, _)) = self
+                .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &index_object)
+                .await?
+            else {
+                continue;
+            };
+            validate_table_warehouse_index_entry_object(&self.paths, &index_object, &index)?;
+            if index.table_bucket != table_bucket || index.warehouse_object_prefix != warehouse_object_prefix {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "warehouse index entry does not match indexed prefix: {index_object}"
+                )));
+            }
+            match &index.state {
+                TableCatalogEntryState::Active => {
+                    return Err(TableCatalogStoreError::Internal(format!(
+                        "active warehouse index {index_object} is absent from the authoritative strong catalog"
+                    )));
+                }
+                TableCatalogEntryState::Deleted => {}
+                TableCatalogEntryState::Renaming | TableCatalogEntryState::Deleting => {
+                    return Err(TableCatalogStoreError::Internal(format!(
+                        "warehouse index {index_object} has an incomplete transient state"
+                    )));
+                }
+            }
+            let resource = table_data_plane_resource_from_warehouse_index(&index)?;
+            if let Some(current) = matched.as_ref() {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "object {object} matches overlapping deleted table warehouse indexes {} and {}",
+                    current.warehouse_object_prefix, resource.warehouse_object_prefix
+                )));
+            }
+            matched = Some(resource);
         }
         Ok(matched)
     }
 
+    async fn scan_table_data_plane_resource_for_index_miss(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        let mut matched: Option<TableDataPlaneResource> = None;
+        for table in self
+            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS))
+            .await?
+        {
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let warehouse_object_prefix = table_warehouse_object_prefix(&table)?;
+            if !object.starts_with(&warehouse_object_prefix) {
+                continue;
+            }
+            if let Some(current) = matched.as_ref() {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "object {object} matches overlapping active table warehouse prefixes {} and {warehouse_object_prefix}",
+                    current.warehouse_object_prefix
+                )));
+            }
+            matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
+        }
+        if let Some(resource) = matched.as_ref() {
+            let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+            self.backfill_active_table_warehouse_index_with_prefix_check(
+                &resource.table_bucket,
+                &resource.namespace,
+                &resource.table,
+                true,
+            )
+            .await?;
+        }
+        Ok(matched)
+    }
+
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn backfill_active_table_warehouse_index(
         &self,
         table_bucket: &str,
         namespace: &str,
         table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        self.backfill_active_table_warehouse_index_with_prefix_check(table_bucket, namespace, table, false)
+            .await
+    }
+
+    async fn backfill_active_table_warehouse_index_with_prefix_check(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        prefix_already_checked: bool,
     ) -> TableCatalogStoreResult<()> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
@@ -1625,21 +1926,40 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Ok(());
         }
-        self.reserve_table_warehouse_index(&current, false).await.map(|_| ())
+        self.reserve_table_warehouse_index(&current, prefix_already_checked)
+            .await
+            .map(|_| ())
     }
 
-    pub(in crate::table_catalog) async fn backfill_table_warehouse_index(
+    pub(crate) async fn backfill_table_warehouse_index(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.backfill_table_warehouse_index_with_limit(table_bucket, None, TableWarehouseIndexBackfillMode::ScanAllTables)
+            .await
+    }
+
+    async fn backfill_table_warehouse_index_for_data_plane(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.backfill_table_warehouse_index_with_limit(
+            table_bucket,
+            Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS),
+            TableWarehouseIndexBackfillMode::InitializeIfNeeded,
+        )
+        .await
+    }
+
+    async fn backfill_table_warehouse_index_with_limit(
         &self,
         table_bucket: &str,
+        max_catalog_objects: Option<usize>,
+        mode: TableWarehouseIndexBackfillMode,
     ) -> TableCatalogStoreResult<()> {
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
         let state_object = self.paths.warehouse_index_state_path(table_bucket);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &state_object).await?;
-        if self.read_warehouse_index_state_unlocked(table_bucket).await? {
+        let index_ready = self.read_warehouse_index_state_unlocked(table_bucket).await?;
+        if matches!(mode, TableWarehouseIndexBackfillMode::InitializeIfNeeded) && index_ready {
             return Ok(());
         }
         let tables = self
-            .list_all_table_entries(table_bucket)
+            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects)
             .await?
             .into_iter()
             .filter(|table| table.state == TableCatalogEntryState::Active)
@@ -1666,10 +1986,16 @@ where
             )));
         }
         for table in tables {
-            self.backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
-                .await?;
+            self.backfill_active_table_warehouse_index_with_prefix_check(
+                &table.table_bucket,
+                &table.namespace,
+                &table.table,
+                true,
+            )
+            .await?;
         }
-        self.write_warehouse_index_state_unlocked(table_bucket).await
+        self.write_warehouse_index_state_unlocked(table_bucket, _guard.write_commit_guards())
+            .await
     }
 
     async fn require_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
@@ -1714,15 +2040,70 @@ where
     }
 
     async fn list_all_table_entries(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        let mut entries = Vec::new();
-        for object in self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
-            .await?
-        {
-            if !object.ends_with(TABLE_ENTRY_FILE) {
-                continue;
+        self.list_all_table_entries_with_limit(table_bucket, None).await
+    }
+
+    async fn list_table_entry_objects_for_data_plane_scan(
+        &self,
+        table_bucket: &str,
+        max_catalog_objects: usize,
+    ) -> TableCatalogStoreResult<Vec<String>> {
+        let mut objects = Vec::new();
+        let mut cursor = None;
+        loop {
+            let remaining = max_catalog_objects.saturating_sub(objects.len());
+            let page_size = remaining.min(TABLE_CATALOG_LIST_MAX_KEYS);
+            let limit = NonZeroUsize::new(page_size).ok_or_else(|| {
+                TableCatalogStoreError::Unavailable(format!(
+                    "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
+                ))
+            })?;
+            let page = self
+                .backend
+                .list_objects_page(
+                    self.catalog_bucket(),
+                    &self.paths.namespace_entries_prefix(table_bucket),
+                    cursor.as_deref(),
+                    limit,
+                )
+                .await?;
+            let next_cursor = page.objects.last().cloned();
+            objects.extend(page.objects);
+            if !page.is_truncated {
+                return bounded_table_entry_objects_for_data_plane_scan(objects, false, max_catalog_objects);
             }
+            if objects.len() >= max_catalog_objects {
+                return bounded_table_entry_objects_for_data_plane_scan(objects, true, max_catalog_objects);
+            }
+            if next_cursor.is_none() || next_cursor == cursor {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog object pagination did not advance during table data-plane index-miss scan".to_string(),
+                ));
+            }
+            cursor = next_cursor;
+        }
+    }
+
+    async fn list_all_table_entries_with_limit(
+        &self,
+        table_bucket: &str,
+        max_catalog_objects: Option<usize>,
+    ) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        let mut entries = Vec::new();
+        let table_objects = match max_catalog_objects {
+            Some(max_catalog_objects) => {
+                self.list_table_entry_objects_for_data_plane_scan(table_bucket, max_catalog_objects)
+                    .await?
+            }
+            None => self
+                .backend
+                .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
+                .await?
+                .into_iter()
+                .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+                .collect(),
+        };
+        for object in table_objects {
             let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
                 continue;
             };
@@ -1858,17 +2239,23 @@ where
         if !publication.holds_table_bucket(&entry.table_bucket)
             || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
         {
-            self.delete_created_table_warehouse_index(&entry, reservation, "table publication fence lost")
+            self.rollback_table_warehouse_index_reservation(&entry, reservation, "table publication fence lost")
                 .await;
             return Err(TableCatalogStoreError::Internal(
                 "table registration publication fence was lost before catalog update".to_string(),
             ));
         }
         let result = self
-            .write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
+            .write_entry_unlocked(
+                self.catalog_bucket(),
+                &table_path,
+                &entry,
+                precondition,
+                _table_guard.write_commit_guards(),
+            )
             .await;
         if result.is_err() {
-            self.delete_created_table_warehouse_index(&entry, reservation, "table entry write failed")
+            self.rollback_table_warehouse_index_reservation(&entry, reservation, "table entry write failed")
                 .await;
         }
         result
@@ -1931,7 +2318,7 @@ where
                 "view creation publication fence was lost before catalog update".to_string(),
             ));
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
+        self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition, _view_guard.write_commit_guards())
             .await
     }
 
@@ -2111,6 +2498,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn plan_table_commit_recovery(
         &self,
         table_bucket: &str,
@@ -3763,6 +4151,17 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await
+            .map(|(catalog, _)| catalog)
+    }
+
+    async fn table_catalog_export_with_recovery(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
 
@@ -3797,12 +4196,15 @@ where
         let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
         let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
     }
 
     pub(crate) async fn diagnose_table_catalog(
@@ -3812,82 +4214,10 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
-        let parsed_namespace = parse_namespace_for_store(namespace)?;
-        let parsed_table = parse_table_for_store(table)?;
-        let catalog = self.export_table_catalog_entry(table_bucket, namespace, table).await?;
-        let current_metadata_location = catalog.table.metadata_location.clone();
-
-        let mut retained = BTreeSet::new();
-        let mut current_metadata_for_refs = None;
-        let current_metadata_status =
-            if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
-                retained.insert(current_metadata_location.clone());
-                match read_table_metadata_value(&self.backend, table_bucket, &current_metadata_location).await {
-                    Ok(Some(current_metadata)) => {
-                        retained.extend(metadata_log_locations(
-                            &current_metadata,
-                            table_bucket,
-                            &parsed_namespace,
-                            &parsed_table,
-                        ));
-                        current_metadata_for_refs = Some(current_metadata);
-                        TableMetadataPointerStatus::Valid
-                    }
-                    Ok(None) => TableMetadataPointerStatus::MissingObject,
-                    Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
-                    Err(err) => return Err(err),
-                }
-            } else {
-                TableMetadataPointerStatus::InvalidLocation
-            };
-
-        let mut metadata_locations = Vec::new();
-        let metadata_prefix = format!("{}/", default_table_metadata_dir_path(&parsed_namespace, &parsed_table));
-        for object in self.backend.list_objects(table_bucket, &metadata_prefix).await? {
-            if let Some(metadata_location) = metadata_location_from_metadata_file_path(&parsed_namespace, &parsed_table, &object)
-            {
-                metadata_locations.push(metadata_location);
-            }
-        }
-        metadata_locations.sort();
-        metadata_locations.dedup();
-
-        for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
-            retained.insert(metadata_location.clone());
-        }
-        if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
-            retained.extend(
-                metadata_locations_for_protected_snapshot_refs(
-                    &self.backend,
-                    table_bucket,
-                    &parsed_namespace,
-                    &parsed_table,
-                    current_metadata,
-                    &metadata_locations,
-                )
-                .await?,
-            );
-        }
-
-        let orphan_metadata_candidate_locations = metadata_locations
-            .into_iter()
-            .filter(|metadata_location| !retained.contains(metadata_location))
-            .collect();
-
-        let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
-        let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
-        let backing_manifest =
-            table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
-
-        Ok(TableCatalogDiagnosticsReport {
-            catalog,
-            current_metadata_status,
-            recovery_status,
-            recommended_actions,
-            commit_recovery,
-            backing_manifest,
-            orphan_metadata_candidate_locations,
-        })
+        let (catalog, commit_recovery) = self
+            .table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await?;
+        diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
     }
 
     pub(crate) async fn plan_table_metadata_maintenance(
@@ -4543,8 +4873,14 @@ where
             }
             entry.updated_at = Some(next_table_catalog_update_time(current.updated_at.as_deref()));
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::Any)
-            .await
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            TableCatalogPutPrecondition::Any,
+            _guard.write_commit_guards(),
+        )
+        .await
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
@@ -4593,8 +4929,14 @@ where
                 TableCatalogPutPrecondition::IfAbsent
             }
         };
-        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
-            .await
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            precondition,
+            _namespace_guard.write_commit_guards(),
+        )
+        .await
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
@@ -4698,8 +5040,14 @@ where
         if before == next {
             return Ok(result);
         }
-        self.write_entry_unlocked(self.catalog_bucket(), &namespace_path, &next, precondition)
-            .await?;
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &namespace_path,
+            &next,
+            precondition,
+            _namespace_guard.write_commit_guards(),
+        )
+        .await?;
         Ok(result)
     }
 
@@ -4853,6 +5201,10 @@ where
         })?;
         self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
         Ok(entries)
+    }
+
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        self.ensure_table_warehouse_prefix_available(candidate).await
     }
 
     async fn list_tables_page(
@@ -5053,6 +5405,7 @@ where
                         &index_object,
                         &source_index,
                         TableCatalogPutPrecondition::IfAbsent,
+                        _index_guard.write_commit_guards(),
                     )
                     .await?
                 }
@@ -5078,6 +5431,7 @@ where
                 &intent_object,
                 &intent,
                 TableCatalogPutPrecondition::IfAbsent,
+                _intent_guard.write_commit_guards(),
             )
             .await?;
             bucket_entry.active_rename_id = Some(rename_id);
@@ -5087,6 +5441,7 @@ where
                 &bucket_object,
                 &bucket_entry,
                 TableCatalogPutPrecondition::IfMatch(bucket_etag),
+                _bucket_guard.write_commit_guards(),
             )
             .await?;
         }
@@ -5102,45 +5457,39 @@ where
         if table_bucket.is_empty() || object.is_empty() {
             return Ok(None);
         }
-        let Some((table_bucket_entry, read_version)) = self.table_rename_read_snapshot(table_bucket).await? else {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "object-backed catalog has no entry for table-enabled bucket {table_bucket}"
-            )));
-        };
-        if table_bucket_entry.state != TableCatalogEntryState::Active {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "table-enabled bucket {table_bucket} has an inactive object-backed catalog entry"
-            )));
-        }
+        let read_version = self.table_data_plane_read_version(table_bucket).await?;
 
         let resource = if self.warehouse_index_ready(table_bucket).await? {
-            match self
-                .resolve_table_data_plane_resource_from_index(table_bucket, object)
-                .await?
-            {
-                Some(resource) => Ok(Some(resource)),
-                None => scan_table_data_plane_resource_for_object(self, table_bucket, object).await,
-            }
+            self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
         } else {
-            match self.backfill_table_warehouse_index(table_bucket).await {
-                Ok(()) => match self
-                    .resolve_table_data_plane_resource_from_index(table_bucket, object)
-                    .await?
-                {
-                    Some(resource) => Ok(Some(resource)),
-                    None => scan_table_data_plane_resource_for_object(self, table_bucket, object).await,
-                },
+            match self.backfill_table_warehouse_index_for_data_plane(table_bucket).await {
+                Ok(()) => self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await,
                 Err(err @ TableCatalogStoreError::Internal(_)) => {
                     tracing::warn!(
                         table_bucket = %table_bucket,
                         error = %err,
                         "failed to backfill table warehouse index; falling back to catalog scan"
                     );
-                    scan_table_data_plane_resource_for_object(self, table_bucket, object).await
+                    self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
                 }
                 Err(err) => Err(err),
             }
         }?;
+        self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
+        Ok(resource)
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+        let read_version = self.table_data_plane_read_version(table_bucket).await?;
+        let entries = self.list_all_table_entries(table_bucket).await?;
+        let resource = table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)?;
         self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
         Ok(resource)
     }
@@ -5504,7 +5853,7 @@ where
         }
         .await;
         if let Err(err) = staged_write_result {
-            self.delete_created_table_warehouse_index(&next, reservation, "commit staging failed")
+            self.rollback_table_warehouse_index_reservation(&next, reservation, "commit staging failed")
                 .await;
             return table_commit_result(
                 &request.table_bucket,
@@ -5520,7 +5869,7 @@ where
         if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table)
             || (warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket))
         {
-            self.delete_created_table_warehouse_index(&next, reservation, "table publication fence lost")
+            self.rollback_table_warehouse_index_reservation(&next, reservation, "table publication fence lost")
                 .await;
             return table_commit_result(
                 &request.table_bucket,
@@ -5542,11 +5891,12 @@ where
                 &table_path,
                 &next,
                 TableCatalogPutPrecondition::IfMatch(current_etag),
+                _guard.write_commit_guards(),
             )
             .await;
         record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
         if let Err(err) = cas_result {
-            self.delete_created_table_warehouse_index(&next, reservation, "table pointer CAS failed")
+            self.rollback_table_warehouse_index_reservation(&next, reservation, "table pointer CAS failed")
                 .await;
             return table_commit_result(
                 &request.table_bucket,
@@ -5612,7 +5962,7 @@ where
                 table.as_str()
             )));
         };
-        self.delete_owned_table_warehouse_index_for_drop(&entry).await?;
+        self.tombstone_table_warehouse_index_for_drop(&entry, false).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
         {
@@ -5837,6 +6187,7 @@ where
                 &view_path,
                 &next,
                 TableCatalogPutPrecondition::IfMatch(current_etag),
+                _guard.write_commit_guards(),
             )
             .await;
         if let Err(err) = write_result {

@@ -108,7 +108,7 @@ impl ResumeUtils {
         Ok(task_ids)
     }
 
-    async fn replacement_recovery_entries(disk: &DiskStore) -> Result<Vec<String>> {
+    pub(super) async fn replacement_recovery_entries(disk: &DiskStore) -> Result<Vec<String>> {
         let recovery_dir = replacement_recovery_dir();
         let recovery_dir = path_to_str(&recovery_dir)?;
         match disk.list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1).await {
@@ -236,7 +236,19 @@ impl ResumeUtils {
                 let state = resume_manager.get_state().await;
                 let age_hours = current_time.saturating_sub(state.last_update) / 3600;
 
-                if !state.completed && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                // Retain handoff authority even after commit: a successor may still
+                // need it to resume marker ownership. Completion proofs carry the
+                // lineage so a future archival policy can verify the whole chain.
+                if state.replacement_handoff.is_some()
+                    || state.replacement_legacy_successor.is_some()
+                    || (!state.completed
+                        && matches!(
+                            state.replacement_phase,
+                            ReplacementPhase::Intent
+                                | ReplacementPhase::OwnershipPending
+                                | ReplacementPhase::HandoffPending
+                                | ReplacementPhase::Rebuilding
+                        ))
                 {
                     continue;
                 }
@@ -279,7 +291,19 @@ impl ResumeUtils {
                 let state = resume_manager.get_state().await;
                 let age_hours = current_time.saturating_sub(state.last_update) / 3600;
 
-                if !state.completed && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                // Retain handoff authority even after commit: a successor may still
+                // need it to resume marker ownership. Completion proofs carry the
+                // lineage so a future archival policy can verify the whole chain.
+                if state.replacement_handoff.is_some()
+                    || state.replacement_legacy_successor.is_some()
+                    || (!state.completed
+                        && matches!(
+                            state.replacement_phase,
+                            ReplacementPhase::Intent
+                                | ReplacementPhase::OwnershipPending
+                                | ReplacementPhase::HandoffPending
+                                | ReplacementPhase::Rebuilding
+                        ))
                 {
                     continue;
                 }

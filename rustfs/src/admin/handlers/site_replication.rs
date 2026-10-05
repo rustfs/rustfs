@@ -7358,32 +7358,36 @@ where
 {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(), move || async move {
-        let fresh = load_site_replication_state().await?;
-        let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
-        if join_request_is_superseded(&fresh, join_req.updated_at) {
-            let peer = fresh
-                .peers
-                .get(&fresh_local_peer.deployment_id)
-                .cloned()
-                .unwrap_or(fresh_local_peer);
-            return Ok(PeerJoinOutcome::Superseded(peer));
-        }
-
-        apply_iam(join_req.clone()).await?;
-
-        let incoming_updated_at = join_req.updated_at;
-        update_site_replication_state_when_changed(move |state| {
-            let local_peer = local_peer_at_endpoint(local_endpoint, state);
-            if join_request_is_superseded(state, incoming_updated_at) {
-                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
-                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(),
+        move |_write_guard| async move {
+            let fresh = load_site_replication_state().await?;
+            let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+            if join_request_is_superseded(&fresh, join_req.updated_at) {
+                let peer = fresh
+                    .peers
+                    .get(&fresh_local_peer.deployment_id)
+                    .cloned()
+                    .unwrap_or(fresh_local_peer);
+                return Ok(PeerJoinOutcome::Superseded(peer));
             }
-            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
-            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
-        })
-        .await
-    })
+
+            apply_iam(join_req.clone()).await?;
+
+            let incoming_updated_at = join_req.updated_at;
+            update_site_replication_state_when_changed(move |state| {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                if join_request_is_superseded(state, incoming_updated_at) {
+                    let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+                    return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+                }
+                apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+                Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+            })
+            .await
+        },
+    )
     .await
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication join admission failed: {e}")))?
 }
@@ -8878,6 +8882,8 @@ mod tests {
     }
 
     /// Publish a ready IAM app context so `apply_iam_item` gets past its IAM guard.
+    /// Tests using this real storage fixture keep the `durable_iam_state_` prefix so
+    /// nextest reserves capacity while their internal races retain production deadlines.
     async fn publish_ready_iam_context() {
         use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
         use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
@@ -9077,7 +9083,7 @@ mod tests {
     /// every gated item type.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
+    async fn durable_iam_state_apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9158,7 +9164,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_group_member_add_preserves_a_disabled_group_status() {
+    async fn durable_iam_state_apply_group_member_add_preserves_a_disabled_group_status() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9193,7 +9199,7 @@ mod tests {
     /// membership-only guard above exists to prevent.
     #[tokio::test]
     #[serial]
-    async fn apply_group_snapshot_propagates_a_disabled_status_with_members() {
+    async fn durable_iam_state_apply_group_snapshot_propagates_a_disabled_status_with_members() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9228,7 +9234,7 @@ mod tests {
     /// the write of one cannot interleave with the other's.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
+    async fn durable_iam_state_apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
@@ -9267,7 +9273,7 @@ mod tests {
     /// applied the delete; a genuinely newer create still lands.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
+    async fn durable_iam_state_apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9312,7 +9318,7 @@ mod tests {
     /// then switched off, and carries the source stamp.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_creates_a_replicated_service_account_with_its_status() {
+    async fn durable_iam_state_apply_iam_item_creates_a_replicated_service_account_with_its_status() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9341,7 +9347,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_accepts_minio_sts_account_item_type() {
+    async fn durable_iam_state_apply_iam_item_accepts_minio_sts_account_item_type() {
         publish_ready_iam_context().await;
 
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The bogus session token
@@ -9363,7 +9369,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_still_accepts_legacy_sts_credential_item_type() {
+    async fn durable_iam_state_apply_iam_item_still_accepts_legacy_sts_credential_item_type() {
         publish_ready_iam_context().await;
 
         // Older RustFS peers emit `sts-credential`; the alias stays accepted permanently
@@ -15400,7 +15406,7 @@ mod tests {
     /// would delete the retry queue and every other field along with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_missed_pending_clear_must_not_rewrite_the_state_object() {
+    async fn durable_iam_state_test_missed_pending_clear_must_not_rewrite_the_state_object() {
         publish_ready_iam_context().await;
 
         // One peer, no pending records: exactly the shape the persist helper's clear
@@ -15461,7 +15467,7 @@ mod tests {
     /// write before A finishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
+    async fn durable_iam_state_test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
         publish_ready_iam_context().await;
 
         // Whole-second timestamps so the RFC3339 round trip through the state
@@ -15565,7 +15571,7 @@ mod tests {
     /// admission: the assertion on the empty IAM log turns red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_join_admission_serializes_across_separate_nodes() {
+    async fn durable_iam_state_test_peer_join_admission_serializes_across_separate_nodes() {
         publish_ready_iam_context().await;
 
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
@@ -15662,7 +15668,7 @@ mod tests {
     /// acked rotation is cleared in the same transaction that reports true.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_finalize_pending_rotation_three_way_contract() {
+    async fn durable_iam_state_test_finalize_pending_rotation_three_way_contract() {
         publish_ready_iam_context().await;
 
         let local_peer = PeerInfo {
@@ -15744,7 +15750,7 @@ mod tests {
     /// update.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_state_object_lock_serializes_writers_from_separate_nodes() {
+    async fn durable_iam_state_test_state_object_lock_serializes_writers_from_separate_nodes() {
         publish_ready_iam_context().await;
 
         let seed = SiteReplicationState {
@@ -15796,7 +15802,7 @@ mod tests {
     /// leave the receiver unable to tell which edit is newer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_edit_generations_are_unique_across_nodes() {
+    async fn durable_iam_state_test_peer_edit_generations_are_unique_across_nodes() {
         publish_ready_iam_context().await;
         // A configured site: `persist_site_replication_state_no_lock` clears
         // the object once a site drops below two peers, and a cleared object
@@ -15847,7 +15853,7 @@ mod tests {
     /// accepts the restarted counter instead of fencing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
+    async fn durable_iam_state_test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
         publish_ready_iam_context().await;
         let seed = || SiteReplicationState {
             peers: ["site-a", "site-b"]
@@ -15912,7 +15918,7 @@ mod tests {
     /// (the red-light commit pinned the exact interleaving).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
+    async fn durable_iam_state_test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
         publish_ready_iam_context().await;
 
         const ROUNDS: usize = 8;

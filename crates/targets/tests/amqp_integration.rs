@@ -32,9 +32,9 @@ use lapin::{
 use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::check_amqp_broker_available;
-use rustfs_targets::target::EntityTarget;
 use rustfs_targets::target::TargetType;
 use rustfs_targets::target::amqp::{AMQPArgs, AMQPTarget};
+use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
 use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -67,7 +67,12 @@ fn entity_for(bucket: &str, object: &str) -> Arc<EntityTarget<serde_json::Value>
         bucket_name: bucket.to_string(),
         object_name: object.to_string(),
         event_name: EventName::ObjectCreatedPut,
-        data: serde_json::json!({"bucket": bucket, "object": object}),
+        data: serde_json::json!({
+            "eventVersion": "2.0",
+            "eventSource": "aws:s3",
+            "eventName": "s3:ObjectCreated:Put",
+            "s3": {"bucket": {"name": bucket}, "object": {"key": object, "size": 42}}
+        }),
     })
 }
 
@@ -102,7 +107,7 @@ async fn bind_queue(queue: &str, routing_key: &str) -> lapin::Channel {
     channel
 }
 
-async fn read_one(channel: &lapin::Channel, queue: &str) -> (Value, BasicProperties) {
+async fn read_one_raw(channel: &lapin::Channel, queue: &str) -> (Vec<u8>, BasicProperties) {
     let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(msg) = channel
@@ -120,8 +125,12 @@ async fn read_one(channel: &lapin::Channel, queue: &str) -> (Value, BasicPropert
     .expect("message should arrive");
 
     let properties = msg.properties.clone();
-    let payload = serde_json::from_slice(&msg.data).expect("message payload should be JSON");
-    (payload, properties)
+    (msg.data.clone(), properties)
+}
+
+async fn read_one(channel: &lapin::Channel, queue: &str) -> (Value, BasicProperties) {
+    let (body, properties) = read_one_raw(channel, queue).await;
+    (serde_json::from_slice(&body).expect("message payload should be JSON"), properties)
 }
 
 #[tokio::test]
@@ -147,7 +156,7 @@ async fn test_direct_publish_delivers_json_payload() {
 
     let (payload, properties) = read_one(&channel, &queue).await;
     assert_eq!(payload["Key"], "bucket1/object-A");
-    assert_eq!(payload["Records"][0]["data"]["bucket"], "bucket1");
+    assert_eq!(payload["Records"], serde_json::json!([entity_for("bucket1", "object-A").data]));
     assert_eq!(properties.content_type().as_ref().map(|s| s.as_str()), Some("application/json"));
     assert_eq!(*properties.delivery_mode(), Some(2));
 
@@ -209,6 +218,7 @@ async fn test_queue_replay_delivers_and_removes_stored_payload() {
 
     let (payload, properties) = read_one(&channel, &queue).await;
     assert_eq!(payload["Key"], "bucket1/object-B");
+    assert_eq!(payload["Records"], serde_json::json!([entity_for("bucket1", "object-B").data]));
     assert_eq!(properties.content_type().as_ref().map(|s| s.as_str()), Some("application/json"));
     assert_eq!(*properties.delivery_mode(), Some(2));
     assert_eq!(target.delivery_snapshot().queue_length, 0);
@@ -218,4 +228,43 @@ async fn test_queue_replay_delivers_and_removes_stored_payload() {
         .await
         .expect("delete queue");
     let _ = std::fs::remove_dir_all(args.queue_dir);
+}
+
+#[tokio::test]
+#[ignore = "requires running RabbitMQ-compatible AMQP broker"]
+async fn test_legacy_queued_notification_replays_original_bytes() {
+    let routing_key = format!("rustfs.legacy.{}", Uuid::new_v4().simple());
+    let queue = format!("rustfs-test-{}", Uuid::new_v4().simple());
+    let channel = bind_queue(&queue, &routing_key).await;
+    let queue_dir = std::env::temp_dir().join(format!("rustfs-amqp-legacy-{}", Uuid::new_v4()));
+    let mut args = test_args(&routing_key);
+    args.queue_dir = queue_dir.to_string_lossy().to_string();
+    let target = AMQPTarget::<Value>::new("legacy".to_string(), args).expect("construct AMQP target");
+    let event = entity_for("example-bucket", "old-object");
+    // Model the pre-upgrade envelope, including whitespace that reserialization would change.
+    let body = serde_json::to_vec_pretty(&serde_json::json!({
+        "EventName": event.event_name,
+        "Key": "example-bucket/old-object",
+        "Records": [event.as_ref()]
+    }))
+    .unwrap();
+    let meta = QueuedPayloadMeta::new(
+        event.event_name,
+        event.bucket_name.clone(),
+        event.object_name.clone(),
+        "application/json",
+        body.len(),
+    );
+    let encoded = QueuedPayload::new(meta, body.clone()).encode().unwrap();
+    let store = target.store().expect("store configured");
+    let key = store.put_raw(&encoded).expect("persist pre-upgrade payload");
+    target.send_from_store(key).await.expect("replay legacy payload");
+    let (received, _) = read_one_raw(&channel, &queue).await;
+    assert_eq!(received, body);
+    assert!(store.list().is_empty());
+    channel
+        .queue_delete(queue.into(), QueueDeleteOptions::default())
+        .await
+        .expect("delete queue");
+    std::fs::remove_dir_all(queue_dir).unwrap();
 }

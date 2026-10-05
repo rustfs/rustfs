@@ -54,7 +54,7 @@ pub(crate) const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/st
 pub(crate) async fn with_site_replication_state_lock<T, F, Fut>(operation: F) -> S3Result<T>
 where
     T: Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::storage_api::site_replication::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
 {
     let store = current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
@@ -91,7 +91,7 @@ where
 pub(crate) async fn with_site_replication_state_lock_on<T, F, Fut>(store: Arc<ECStore>, operation: F) -> S3Result<T>
 where
     T: Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::storage_api::site_replication::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
 {
     with_config_object_write_lock(store, SITE_REPLICATION_STATE_PATH.to_string(), operation)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::NodeService;
+use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
@@ -22,6 +22,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
 use tracing::debug;
+use uuid::Uuid;
 
 impl NodeService {
     pub(super) async fn handle_delete_bucket_metadata(
@@ -252,11 +253,30 @@ impl NodeService {
             }
         };
 
-        match self
-            .local_peer
-            .heal_bucket_with_fence(&request.bucket, &options, &fenced_pools)
-            .await
-        {
+        let result = if request.bucket_incarnation_id.is_empty() {
+            self.local_peer
+                .heal_bucket_with_fence(&request.bucket, &options, &fenced_pools)
+                .await
+        } else {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            store
+                .heal_local_bucket_at_incarnation(
+                    &request.bucket,
+                    expected,
+                    &options,
+                    fenced_pools,
+                    self.local_peer.pools.clone(),
+                )
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))
+        };
+        match result {
             Ok(_) => Ok(Response::new(HealBucketResponse {
                 success: true,
                 error: None,

@@ -208,10 +208,10 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
         Host::Domain(domain) => {
             let ips = resolve_domain(domain)?.into_iter().collect::<Vec<_>>();
 
-            ips.iter().any(|ip| local_set.contains(ip))
+            ips.iter().any(|ip| is_local_ip(&local_set, ip))
         }
-        Host::Ipv4(ip) => local_set.contains(&IpAddr::V4(ip)),
-        Host::Ipv6(ip) => local_set.contains(&IpAddr::V6(ip)),
+        Host::Ipv4(ip) => is_local_ip(&local_set, &IpAddr::V4(ip)),
+        Host::Ipv6(ip) => is_local_ip(&local_set, &IpAddr::V6(ip)),
     };
 
     if port > 0 {
@@ -219,6 +219,31 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
     }
 
     Ok(is_local_host)
+}
+
+/// Whether `ip` belongs to this host: it is either configured on a local
+/// interface or, where the platform routes the full loopback space, a loopback
+/// address.
+fn is_local_ip(local_set: &HashSet<IpAddr>, ip: &IpAddr) -> bool {
+    if local_set.contains(ip) {
+        return true;
+    }
+    is_loopback_local(ip)
+}
+
+#[cfg(not(windows))]
+fn is_loopback_local(ip: &IpAddr) -> bool {
+    // Unix kernels route and bind the entire RFC 1122 loopback space
+    // (127.0.0.0/8 plus ::1), so any loopback address is reachable on this
+    // host even when only 127.0.0.1 is configured on `lo` (e.g. 127.0.5.9).
+    ip.is_loopback()
+}
+
+#[cfg(windows)]
+fn is_loopback_local(_ip: &IpAddr) -> bool {
+    // Windows only allows 127.0.0.1 by default, so loopback acceptance there
+    // is limited to the interface-configured addresses already checked above.
+    false
 }
 
 fn get_custom_dns_resolver() -> Option<Arc<DynDnsResolver>> {
@@ -516,7 +541,16 @@ mod test {
     #[test]
     fn test_check_local_server_addr() {
         // Test valid local addresses
-        let valid_cases = ["localhost:54321", "127.0.0.1:9000", "0.0.0.0:9000", "[::1]:8080", "::1:8080"];
+        let valid_cases = [
+            "localhost:54321",
+            "127.0.0.1:9000",
+            "0.0.0.0:9000",
+            "[::1]:8080",
+            "::1:8080",
+            // Unix binds the whole 127.0.0.0/8 loopback range; Windows only allows 127.0.0.1.
+            #[cfg(not(windows))]
+            "127.0.5.9:9000",
+        ];
 
         for addr in valid_cases {
             let result = check_local_server_addr(addr);
@@ -556,6 +590,13 @@ mod test {
         // Test loopback IP addresses
         let ipv4_loopback = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
         assert!(is_local_host(ipv4_loopback, 0, 0).unwrap());
+
+        // Any 127.0.0.0/8 address is loopback on Unix; Windows only allows 127.0.0.1.
+        #[cfg(not(windows))]
+        {
+            let ipv4_loopback_octet = Host::Ipv4(Ipv4Addr::new(127, 0, 5, 9));
+            assert!(is_local_host(ipv4_loopback_octet, 0, 0).unwrap());
+        }
 
         let ipv6_loopback = Host::Ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
         assert!(is_local_host(ipv6_loopback, 0, 0).unwrap());

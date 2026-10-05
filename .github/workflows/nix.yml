@@ -54,7 +54,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -63,7 +63,7 @@ jobs:
   nix-validation:
     name: Nix Build & Check
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     permissions:
       contents: read
@@ -72,12 +72,12 @@ jobs:
       NIX_CURL_FLAGS: -A cargo/stable
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@4eea0b33e3d1f02ecfe37cf16e7204c424009606 # v3.21.0
+        uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
@@ -86,10 +86,10 @@ jobs:
             max-jobs = 1
 
       - name: Cache Nix
-        uses: DeterminateSystems/flakehub-cache-action@c01e819d047464c3edf6ba778f075952af5a3aa7 # v3.21.0
+        uses: DeterminateSystems/flakehub-cache-action@83282a8aef353db1d659d3bacf4a28b6683de0b3 # v3.22.5
 
       - name: Check Nix Flake Inputs
-        uses: DeterminateSystems/flake-checker-action@3164002371bc90729c68af0e24d5aacf20d7c9f6 # v12
+        uses: DeterminateSystems/flake-checker-action@786422608c7bded2bbc9741ad9f91356842bf520 # v14
         with:
           fail-mode: true
           ignore-missing-flake-lock: false

@@ -29,6 +29,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED: &str = "on_demand_migration_runtime_initialized";
+const EVENT_BUCKET_METADATA_STARTUP_RETRY: &str = "bucket_metadata_startup_retry";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_CANCELED: &str = "replication_resync_startup_background_canceled";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_COMPLETED: &str = "replication_resync_startup_background_completed";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_FAILED: &str = "replication_resync_startup_background_failed";
@@ -36,8 +37,9 @@ const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_STARTED: &str = "replication_r
 const LOG_COMPONENT_STARTUP_BUCKET_METADATA: &str = "startup_bucket_metadata";
 const LOG_SUBSYSTEM_ON_DEMAND_MIGRATION: &str = "on_demand_migration";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
-const IAM_MIGRATION_MAX_RETRIES: usize = 15;
-const IAM_MIGRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_SUBSYSTEM_METADATA_STARTUP: &str = "metadata_startup";
+const METADATA_STARTUP_MAX_RETRIES: usize = 15;
+const METADATA_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const METRIC_REPLICATION_RESYNC_STARTUP_BACKGROUND_DURATION_SECONDS: &str =
     "rustfs_replication_resync_startup_background_duration_seconds";
 const METRIC_REPLICATION_RESYNC_STARTUP_BACKGROUND_EVENTS_TOTAL: &str =
@@ -55,39 +57,45 @@ const STARTUP_BACKGROUND_STATUS_RUNNING: f64 = 2.0;
 const STARTUP_BACKGROUND_STATUS_CANCELED: f64 = 3.0;
 
 pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, ctx: &CancellationToken) -> IoResult<Vec<String>> {
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(|err| IoError::other(format!("list_bucket: {err}")))?;
+    let buckets_list = retry_metadata_startup(ctx, "list_buckets", || async {
+        store
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(IoError::other)
+    })
+    .await?;
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    try_migrate_bucket_metadata(store.clone()).await?;
+    retry_metadata_startup(ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone())).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-    try_migrate_iam_config(store).await?;
+    retry_metadata_startup(ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx.clone(), false);
 
     Ok(buckets)
 }
 
 pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> IoResult<Vec<String>> {
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(IoError::other)?;
+    let buckets_list = retry_metadata_startup(&ctx, "list_buckets", || async {
+        store
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(IoError::other)
+    })
+    .await?;
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    try_migrate_bucket_metadata(store.clone()).await?;
+    retry_metadata_startup(&ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone())).await?;
 
-    retry_iam_config_migration(|| try_migrate_iam_config(store.clone())).await?;
+    retry_metadata_startup(&ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);
@@ -95,45 +103,63 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     Ok(buckets)
 }
 
-async fn retry_iam_config_migration<Operation, OperationFuture>(mut operation: Operation) -> IoResult<()>
+async fn retry_metadata_startup<T, Operation, OperationFuture>(
+    ctx: &CancellationToken,
+    stage: &'static str,
+    mut operation: Operation,
+) -> IoResult<T>
 where
     Operation: FnMut() -> OperationFuture,
-    OperationFuture: Future<Output = IoResult<()>>,
+    OperationFuture: Future<Output = IoResult<T>>,
 {
-    retry_iam_config_migration_with(&mut operation, IAM_MIGRATION_MAX_RETRIES, IAM_MIGRATION_RETRY_INTERVAL).await
+    retry_metadata_startup_with(ctx, stage, &mut operation, METADATA_STARTUP_MAX_RETRIES, METADATA_STARTUP_RETRY_INTERVAL).await
 }
 
-async fn retry_iam_config_migration_with<Operation, OperationFuture>(
+async fn retry_metadata_startup_with<T, Operation, OperationFuture>(
+    ctx: &CancellationToken,
+    stage: &'static str,
     operation: &mut Operation,
     max_retries: usize,
     retry_interval: Duration,
-) -> IoResult<()>
+) -> IoResult<T>
 where
     Operation: FnMut() -> OperationFuture,
-    OperationFuture: Future<Output = IoResult<()>>,
+    OperationFuture: Future<Output = IoResult<T>>,
 {
     let mut retries = 0;
     loop {
-        match operation().await {
-            Ok(()) => return Ok(()),
-            Err(error) if iam_migration_error_is_retryable(&error) && retries < max_retries => {
+        let result = tokio::select! {
+            biased;
+            _ = ctx.cancelled() => return Err(IoError::other(StorageError::OperationCanceled)),
+            result = operation() => result,
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if metadata_startup_error_is_retryable(&error) && retries < max_retries => {
                 retries += 1;
                 tracing::warn!(
+                    event = EVENT_BUCKET_METADATA_STARTUP_RETRY,
                     component = LOG_COMPONENT_STARTUP_BUCKET_METADATA,
-                    subsystem = "iam_migration",
+                    subsystem = LOG_SUBSYSTEM_METADATA_STARTUP,
+                    state = "retrying",
+                    stage,
                     retry_count = retries,
                     max_retries,
                     error = %error,
-                    "IAM config migration hit a transient quorum error; retrying"
+                    "Metadata startup hit a transient quorum error"
                 );
-                tokio::time::sleep(retry_interval).await;
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancelled() => return Err(IoError::other(StorageError::OperationCanceled)),
+                    _ = tokio::time::sleep(retry_interval) => {}
+                }
             }
             Err(error) => return Err(error),
         }
     }
 }
 
-fn iam_migration_error_is_retryable(error: &IoError) -> bool {
+fn metadata_startup_error_is_retryable(error: &IoError) -> bool {
     error
         .get_ref()
         .and_then(|source| source.downcast_ref::<StorageError>())
@@ -331,9 +357,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iam_migration_retries_only_quorum_errors() {
+    async fn metadata_startup_retries_only_quorum_errors() {
         let mut attempts = 0;
-        retry_iam_config_migration_with(
+        retry_metadata_startup_with(
+            &CancellationToken::new(),
+            "bucket_migration",
             &mut || {
                 attempts += 1;
                 std::future::ready(if attempts == 1 {
@@ -353,10 +381,12 @@ mod tests {
         assert_eq!(attempts, 2);
 
         let mut deterministic_attempts = 0;
-        let error = retry_iam_config_migration_with(
+        let error = retry_metadata_startup_with(
+            &CancellationToken::new(),
+            "iam_migration",
             &mut || {
                 deterministic_attempts += 1;
-                std::future::ready(Err(IoError::other("incompatible IAM metadata")))
+                std::future::ready(Err::<(), _>(IoError::other("incompatible IAM metadata")))
             },
             1,
             Duration::ZERO,
@@ -365,5 +395,90 @@ mod tests {
         .expect_err("deterministic migration errors must fail immediately");
         assert_eq!(error.to_string(), "incompatible IAM metadata");
         assert_eq!(deterministic_attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_startup_preserves_quorum_error_when_retries_are_exhausted() {
+        let mut attempts = 0;
+        let error = retry_metadata_startup_with(
+            &CancellationToken::new(),
+            "bucket_migration",
+            &mut || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(IoError::other(StorageError::InsufficientReadQuorum(
+                    ".rustfs.sys".into(),
+                    "buckets/bucket/.metadata.bin".into(),
+                ))))
+            },
+            2,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("an unavailable authority must not become an empty metadata success");
+        assert_eq!(attempts, 3);
+        assert!(metadata_startup_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn metadata_startup_never_retries_corruption_or_string_only_quorum_errors() {
+        for error in [
+            IoError::other(StorageError::FileCorrupt),
+            IoError::other(StorageError::OperationCanceled),
+            IoError::new(std::io::ErrorKind::PermissionDenied, "metadata access denied"),
+            IoError::other("insufficient read quorum"),
+        ] {
+            assert!(!metadata_startup_error_is_retryable(&error));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_startup_cancels_inflight_operations_and_retry_waits() {
+        for pending_operation in [false, true] {
+            let ctx = CancellationToken::new();
+            let cancel = ctx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            });
+            let error = retry_metadata_startup_with(
+                &ctx,
+                "bucket_migration",
+                &mut || async {
+                    if pending_operation {
+                        std::future::pending::<()>().await;
+                    }
+                    Err::<(), _>(IoError::other(StorageError::InsufficientReadQuorum(
+                        ".rustfs.sys".into(),
+                        "buckets/bucket/.metadata.bin".into(),
+                    )))
+                },
+                2,
+                Duration::from_secs(20),
+            )
+            .await
+            .expect_err("shutdown must interrupt both storage I/O and backoff");
+            assert!(matches!(
+                error.get_ref().and_then(|source| source.downcast_ref::<StorageError>()),
+                Some(StorageError::OperationCanceled)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_startup_does_not_cap_healthy_migration_duration() {
+        // Large bucket inventories can legitimately take longer than a fixed
+        // wall-clock deadline. Bound retry count, not a healthy migration.
+        retry_metadata_startup_with(
+            &CancellationToken::new(),
+            "bucket_migration",
+            &mut || async {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok(())
+            },
+            2,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("healthy migration must not be aborted by a fleet readiness deadline");
     }
 }

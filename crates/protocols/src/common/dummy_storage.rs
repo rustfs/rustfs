@@ -29,6 +29,8 @@
 //! driver is dropped. SessionContext fixtures live next to the
 //! SessionContext type in common::session.
 
+#[cfg(feature = "webdav")]
+use crate::common::client::s3::SessionCapacityView;
 use crate::common::client::s3::StorageBackend;
 #[cfg(feature = "webdav")]
 use crate::common::session::SessionContext;
@@ -133,6 +135,8 @@ pub struct DeleteObjectCall {
 }
 
 struct Inner {
+    capture_upload_bodies: bool,
+    upload_bodies: Vec<Vec<u8>>,
     // Response queues. Each method pops from its own queue. Empty queue
     // plus no default means a configured-miss error.
     get_object: VecDeque<Result<GetObjectOutput, DummyError>>,
@@ -145,6 +149,8 @@ struct Inner {
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
     session_list_buckets: VecDeque<s3s::S3Result<ListBucketsOutput>>,
     last_session_list_context: Option<(http::HeaderMap, bool)>,
+    #[cfg(feature = "webdav")]
+    session_capacity_view: VecDeque<s3s::S3Result<Option<SessionCapacityView>>>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -155,6 +161,8 @@ struct Inner {
     upload_part_copy: VecDeque<Result<UploadPartCopyOutput, DummyError>>,
 
     // Observation logs.
+    list_authorizations: Vec<ListObjectsV2Input>,
+    list_objects_calls: Vec<ListObjectsV2Input>,
     abort_multipart_calls: Vec<AbortCall>,
     put_object_calls: Vec<PutObjectCall>,
     create_multipart_calls: Vec<CreateMultipartCall>,
@@ -190,6 +198,8 @@ struct Inner {
 impl Inner {
     fn new() -> Self {
         Self {
+            capture_upload_bodies: false,
+            upload_bodies: Vec::new(),
             get_object: VecDeque::new(),
             get_object_range: VecDeque::new(),
             put_object: VecDeque::new(),
@@ -200,6 +210,8 @@ impl Inner {
             list_buckets: VecDeque::new(),
             session_list_buckets: VecDeque::new(),
             last_session_list_context: None,
+            #[cfg(feature = "webdav")]
+            session_capacity_view: VecDeque::new(),
             create_bucket: VecDeque::new(),
             delete_bucket: VecDeque::new(),
             copy_object: VecDeque::new(),
@@ -208,6 +220,8 @@ impl Inner {
             complete_multipart_upload: VecDeque::new(),
             abort_multipart_upload: VecDeque::new(),
             upload_part_copy: VecDeque::new(),
+            list_authorizations: Vec::new(),
+            list_objects_calls: Vec::new(),
             abort_multipart_calls: Vec::new(),
             put_object_calls: Vec::new(),
             create_multipart_calls: Vec::new(),
@@ -239,6 +253,7 @@ impl Inner {
 #[derive(Clone)]
 pub struct DummyBackend {
     inner: Arc<Mutex<Inner>>,
+    deny_authorization: bool,
 }
 
 // Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
@@ -262,11 +277,57 @@ impl DummyBackend {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
+            deny_authorization: false,
         }
+    }
+
+    pub fn list_authorizations(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list authorization log").list_authorizations.clone()
+    }
+
+    pub fn list_objects_calls(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list call log").list_objects_calls.clone()
+    }
+
+    pub fn deny_authorization(mut self) -> Self {
+        self.deny_authorization = true;
+        self
+    }
+
+    /// Opt in to consuming upload bodies for byte-for-byte protocol tests.
+    pub fn capture_upload_bodies(&self) {
+        self.inner.lock().expect("lock").capture_upload_bodies = true;
+    }
+
+    pub fn upload_bodies(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().expect("lock").upload_bodies.clone()
+    }
+
+    async fn record_upload_body(&self, body: &mut Option<StreamingBlob>) -> Result<(), DummyError> {
+        use futures_util::TryStreamExt;
+        if !self.inner.lock().expect("lock").capture_upload_bodies {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = body.take() {
+            while let Some(chunk) = stream.try_next().await.map_err(|e| DummyError::Injected(e.to_string()))? {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        self.inner.lock().expect("lock").upload_bodies.push(bytes);
+        Ok(())
     }
 
     // Queue-configuration helpers. Each test stages the responses it
     // expects in order. The method pops in FIFO order.
+
+    pub fn queue_head_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("queue bucket metadata")
+            .head_bucket
+            .push_back(Ok(HeadBucketOutput::default()));
+    }
 
     /// Queue a head_object Ok response with the given size and mtime.
     pub fn queue_head_object_ok(&self, size: u64, mtime: Option<Timestamp>) {
@@ -331,6 +392,19 @@ impl DummyBackend {
     /// Return the context from the last session-aware list_buckets request.
     pub fn last_session_list_context(&self) -> Option<(http::HeaderMap, bool)> {
         self.inner.lock().expect("lock").last_session_list_context.clone()
+    }
+
+    /// Queue a session_capacity_view response; `None` models a backend that
+    /// cannot report capacity at all.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_ok(&self, view: Option<SessionCapacityView>) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Ok(view));
+    }
+
+    /// Queue a session_capacity_view error.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_err(&self, error: s3s::S3Error) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Err(error));
     }
 
     /// Queue a put_object error. Used by the commit_write retry tests
@@ -478,6 +552,15 @@ impl DummyBackend {
         self.inner.lock().expect("lock").get_object_range.push_back(Err(err));
     }
 
+    pub fn queue_get_object_bytes(&self, payload: Vec<u8>) {
+        let output = GetObjectOutput {
+            content_length: Some(i64::try_from(payload.len()).expect("test payload length")),
+            body: Some(StreamingBlob::from_bytes(Bytes::from(payload))),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(output));
+    }
+
     /// Queue a get_object_range Ok response carrying the given bytes as
     /// the streaming body. content_length is set to bytes.len().
     pub fn queue_get_object_range_bytes(&self, payload: Vec<u8>) {
@@ -602,6 +685,38 @@ impl DummyBackend {
 impl StorageBackend for DummyBackend {
     type Error = DummyError;
 
+    async fn authorize_operation(
+        &self,
+        session: &crate::common::session::SessionContext,
+        action: &crate::common::gateway::S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        if self.deny_authorization {
+            return Err(crate::common::gateway::AuthorizationError::AccessDenied);
+        }
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
+    async fn authorize_list_objects(
+        &self,
+        session: &crate::common::session::SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        self.inner
+            .lock()
+            .expect("record list authorization")
+            .list_authorizations
+            .push(input.clone());
+        self.authorize_operation(
+            session,
+            &crate::common::gateway::S3Action::ListBucket,
+            &input.bucket,
+            input.prefix.as_deref(),
+        )
+        .await
+    }
+
     async fn get_object(
         &self,
         bucket: &str,
@@ -629,7 +744,8 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, mut input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
@@ -698,7 +814,7 @@ impl StorageBackend for DummyBackend {
 
     async fn list_objects_v2(
         &self,
-        _input: ListObjectsV2Input,
+        input: ListObjectsV2Input,
         _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
@@ -706,6 +822,7 @@ impl StorageBackend for DummyBackend {
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
+            inner.list_objects_calls.push(input);
             let stall = inner.stall_list_objects_v2;
             let entered = inner.list_objects_v2_entered.clone();
             let popped = if stall { None } else { inner.list_objects_v2.pop_front() };
@@ -745,6 +862,23 @@ impl StorageBackend for DummyBackend {
             .session_list_buckets
             .pop_front()
             .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
+    }
+
+    /// Capacity reporting is opt-in; an empty queue models a backend without
+    /// capacity support so unrelated tests keep omitting quota properties.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> s3s::S3Result<Option<SessionCapacityView>> {
+        self.inner
+            .lock()
+            .expect("lock")
+            .session_capacity_view
+            .pop_front()
+            .unwrap_or(Ok(None))
     }
 
     async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
@@ -789,7 +923,8 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn upload_part(&self, input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+    async fn upload_part(&self, mut input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Record the call and decide the control flow while holding the
         // lock. Release the lock before awaiting so the stall path does
         // not hold the Mutex across an await point.

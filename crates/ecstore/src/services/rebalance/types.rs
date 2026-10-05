@@ -51,6 +51,18 @@ pub(super) enum RebalanceEntryOutcome {
     Deferred { last_error: String },
 }
 
+/// Why a rebalance bucket was put back at the end of the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RebalanceDeferKind {
+    /// A transient object-migration failure. Persisting it as `lastError` keeps the pool
+    /// from being completed at the free-space goal while the entry is still retried.
+    Entry,
+    /// A retryable source-cleanup conflict. The bucket stays queued and is retried, so a
+    /// transient lock conflict must not be recorded as a permanent warning that would block
+    /// pool completion for the rest of the run.
+    SourceCleanup,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RebalStatus {
     #[default]

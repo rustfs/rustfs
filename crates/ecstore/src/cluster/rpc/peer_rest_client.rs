@@ -48,14 +48,14 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
-    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
-    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
-    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
-    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
-    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
-    tier_mutation_control_service_client::TierMutationControlServiceClient,
+    LocalStorageInfoRequest, Mss, PingRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
+    ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest,
+    ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+    ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse,
+    ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
+    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
@@ -120,6 +120,13 @@ fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
         Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
         None => Error::other(format!("{op}: peer returned failure without error details")),
     }
+}
+
+fn heal_control_status_error(status: tonic::Status) -> Error {
+    if status.code() == tonic::Code::InvalidArgument {
+        return Error::InvalidArgument("heal".to_string(), "control".to_string(), status.message().to_owned());
+    }
+    Error::from(status)
 }
 
 /// Decode a control-plane response failure. Peers at or above the typed
@@ -575,6 +582,26 @@ fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
                 status.code() == tonic::Code::Unauthenticated && status.message() == "No valid auth token"
             })
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealControlRetryAction {
+    Reconnect,
+    RefreshReplayScope,
+}
+
+fn heal_control_retry_action(
+    err: &Error,
+    reconnect_attempted: bool,
+    replay_scope_refresh_attempted: bool,
+) -> Option<HealControlRetryAction> {
+    if !replay_scope_refresh_attempted && heal_control_auth_may_need_replay_scope_refresh(err) {
+        return Some(HealControlRetryAction::RefreshReplayScope);
+    }
+    if !reconnect_attempted && PeerRestClient::is_network_like_error(err) {
+        return Some(HealControlRetryAction::Reconnect);
+    }
+    None
 }
 
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
@@ -1753,34 +1780,41 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        let result = self
-            .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-            .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(heal_control_auth_may_need_replay_scope_refresh)
-        {
-            self.prepare_heal_control_auth_retry().await;
-            return self
-                .finalize_result(
-                    self.heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-                        .await,
-                )
+        let mut reconnect_attempted = false;
+        let mut replay_scope_refresh_attempted = false;
+        loop {
+            let result = self
+                .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
                 .await;
+            let Some(action) = result
+                .as_ref()
+                .err()
+                .and_then(|err| heal_control_retry_action(err, reconnect_attempted, replay_scope_refresh_attempted))
+            else {
+                return self.finalize_result(result).await;
+            };
+            match action {
+                HealControlRetryAction::Reconnect => reconnect_attempted = true,
+                HealControlRetryAction::RefreshReplayScope => replay_scope_refresh_attempted = true,
+            }
+            self.prepare_heal_control_retry(action).await;
         }
-        self.finalize_result(result).await
     }
 
-    async fn prepare_heal_control_auth_retry(&self) {
-        if let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host) {
+    async fn prepare_heal_control_retry(&self, action: HealControlRetryAction) {
+        if action == HealControlRetryAction::RefreshReplayScope
+            && let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host)
+        {
             debug!(
                 peer = %self.grid_host,
                 error = %err,
                 "could not clear heal control replay state before retry"
             );
         }
-        self.evict_connection().await;
+        // A restart can leave both the local offline gate and the peer replay
+        // epoch stale. Clear the gate on either recovery step so the next
+        // bounded attempt reaches a fresh channel instead of fast-failing.
+        self.prepare_retry().await;
     }
 
     async fn heal_control_once(
@@ -1804,7 +1838,11 @@ impl PeerRestClient {
         });
         request.set_timeout(rustfs_protos::heal_control_execution_timeout());
         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-        let response = client.heal_control(request).await?.into_inner();
+        let response = client
+            .heal_control(request)
+            .await
+            .map_err(heal_control_status_error)?
+            .into_inner();
         if !response.success {
             return Err(Error::other(
                 response
@@ -2722,6 +2760,21 @@ impl PeerRestClient {
 
         let response = match client.load_transition_tier_config(request).await {
             Ok(response) => response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated && status.message() == "RPC peer replay capability changed" =>
+            {
+                // A restart can revoke the pinned capability. A signed read-only probe
+                // lets the peer prove its new epoch without bypassing the mutation guard.
+                let mut probe = Request::new(PingRequest {
+                    version: 1,
+                    body: Bytes::new(),
+                });
+                probe.set_timeout(rustfs_protos::heal_control_execution_timeout());
+                return match client.ping(probe).await {
+                    Ok(_) => TierConfigReloadOutcome::TransientRetrySameChannel(status.into()),
+                    Err(probe_status) => tier_config_reload_status_outcome(probe_status),
+                };
+            }
             Err(status) => return tier_config_reload_status_outcome(status),
         };
         if !response.success {
@@ -2819,6 +2872,7 @@ mod tests {
     use super::*;
     use crate::config::com::STORAGE_CLASS_SUB_SYS;
     use crate::disk::error::DiskError;
+
     use crate::disk::error_reduce::reduce_errs;
     use crate::layout::{disks_layout::DisksLayout, endpoints::SetupType};
     use rustfs_config::{ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_STARTUP_TOPOLOGY_WAIT_MODE};
@@ -2828,6 +2882,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn heal_selector_rpc_error_preserves_invalid_argument_without_retry() {
+        let err = heal_control_status_error(tonic::Status::invalid_argument("heal pool index 99 is out of range"));
+        assert!(matches!(&err, Error::InvalidArgument(_, _, message) if message == "heal pool index 99 is out of range"));
+        assert!(heal_control_retry_action(&err, false, false).is_none());
+        assert!(!PeerRestClient::is_network_like_error(&err));
+
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let err = heal_control_status_error(tonic::Status::new(code, "invalid selector"));
+            assert!(!matches!(err, Error::InvalidArgument(..)), "classify by code, not message");
+            let Error::Io(io_error) = &err else {
+                panic!("non-argument RPC failures must retain their typed transport status: {err:?}");
+            };
+            assert_eq!(
+                embedded_tonic_status(io_error)
+                    .expect("transport status should be preserved")
+                    .code(),
+                code
+            );
+        }
+    }
 
     #[test]
     fn control_plane_failure_prefers_typed_not_initialized_code() {
@@ -3865,6 +3945,51 @@ mod tests {
         assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::other(
             "Io error: code: 'Unauthenticated', message: \"No valid auth token\""
         )));
+    }
+
+    #[test]
+    fn heal_control_retry_plan_allows_one_reconnect_and_one_epoch_refresh() {
+        let offline = Error::RemoteClientUnavailable("peer http://127.0.0.1:9000 is temporarily offline".to_string());
+        let stale_epoch = Error::from(tonic::Status::unauthenticated("No valid auth token"));
+
+        assert_eq!(heal_control_retry_action(&offline, false, false), Some(HealControlRetryAction::Reconnect));
+        assert_eq!(heal_control_retry_action(&offline, true, false), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, true, false),
+            Some(HealControlRetryAction::RefreshReplayScope),
+            "a reconnect may expose the restarted peer's stale replay epoch"
+        );
+        assert_eq!(heal_control_retry_action(&stale_epoch, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, false, false),
+            Some(HealControlRetryAction::RefreshReplayScope)
+        );
+        assert_eq!(
+            heal_control_retry_action(&offline, false, true),
+            Some(HealControlRetryAction::Reconnect),
+            "an epoch refresh may be followed by one bounded reconnect"
+        );
+        assert_eq!(heal_control_retry_action(&offline, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&Error::from(tonic::Status::permission_denied("bad signature")), false, false),
+            None,
+            "authorization failures must never be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_control_epoch_refresh_clears_offline_gate() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        client
+            .prepare_heal_control_retry(HealControlRetryAction::RefreshReplayScope)
+            .await;
+
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "epoch refresh must not leave the following attempt behind the offline gate"
+        );
     }
 
     #[test]

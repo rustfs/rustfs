@@ -827,6 +827,7 @@ mod tests {
         assert_eq!(encoded["cycle_schedule"]["execution_role"], "unknown");
         assert_eq!(encoded["cycle_schedule"]["effective_interval_available"], false);
         assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);
+        assert_eq!(encoded["cycle_schedule"]["usage_bootstrap_rebuild_pending"], false);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_enabled"], false);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_multiplier"], 1);
         assert_eq!(encoded["cycle_recovery"]["state"], "healthy");

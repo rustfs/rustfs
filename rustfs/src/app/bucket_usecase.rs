@@ -19,7 +19,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    TableDataPlaneListAccess, authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
     prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
@@ -71,6 +71,7 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
     current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
@@ -91,12 +92,11 @@ use rustfs_policy::policy::{
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::{
     EventName,
-    arn::{ARN, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
+use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
-use rustfs_utils::string::parse_bool;
 use s3s::dto::{
     BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
     CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
@@ -131,15 +131,67 @@ use std::{
     future::Future,
     io::Write,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{Instrument as _, debug, error, info, instrument, warn};
 
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
 const BUCKET_OPERATION_CONCURRENCY: usize = 8;
-static BUCKET_OPERATION_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(BUCKET_OPERATION_CONCURRENCY)));
+const BUCKET_OPERATION_QUEUE_CAPACITY: usize = 128;
+const BUCKET_OPERATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+static BUCKET_OPERATION_ADMISSION: LazyLock<Arc<BucketOperationAdmission>> = LazyLock::new(|| {
+    Arc::new(BucketOperationAdmission::new(
+        BUCKET_OPERATION_CONCURRENCY,
+        BUCKET_OPERATION_QUEUE_CAPACITY,
+    ))
+});
+
+struct BucketOperationAdmission {
+    active: Arc<Semaphore>,
+    waiting: Semaphore,
+}
+
+impl BucketOperationAdmission {
+    fn new(concurrency: usize, queue_capacity: usize) -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(concurrency)),
+            waiting: Semaphore::new(queue_capacity),
+        }
+    }
+
+    async fn acquire(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
+        match self.active.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => return Err(bucket_admission_closed(operation)),
+            Err(TryAcquireError::NoPermits) => {}
+        }
+
+        // Wait on the request task; only admitted mutations become detached tasks.
+        // The queue permit bounds waiting requests and is released on cancellation.
+        let _waiting = self.waiting.try_acquire().map_err(|err| match err {
+            TryAcquireError::NoPermits => bucket_admission_slow_down(operation, "queue is full"),
+            TryAcquireError::Closed => bucket_admission_closed(operation),
+        })?;
+        tokio::time::timeout(BUCKET_OPERATION_QUEUE_TIMEOUT, self.active.clone().acquire_owned())
+            .await
+            .map_err(|_| bucket_admission_slow_down(operation, "queue wait timed out"))?
+            .map_err(|_| bucket_admission_closed(operation))
+    }
+}
+
+fn bucket_admission_closed(operation: &'static str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} admission closed"))
+}
+
+fn bucket_admission_slow_down(operation: &'static str, reason: &'static str) -> S3Error {
+    let mut error = S3Error::with_message(S3ErrorCode::SlowDown, format!("{operation} {reason}; retry later"));
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+    error.set_headers(headers);
+    error
+}
 use urlencoding::encode;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -505,6 +557,46 @@ fn validate_notification_configuration_filters(notification_configuration: &Noti
         }
     }
     Ok(())
+}
+
+fn parse_notification_target_id(arn_str: &str) -> Result<TargetID, TargetIDError> {
+    ARN::parse(arn_str)
+        .map(|arn| arn.target_id)
+        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+}
+
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
+
+/// Builds the notify runtime rules for a bucket notification configuration
+/// without touching the store or the runtime rule state.
+fn build_notification_event_rules(
+    notification_configuration: &NotificationConfiguration,
+) -> S3Result<Vec<NotificationEventRule>> {
+    let mut event_rules = Vec::new();
+    let invalid_arn = |e: TargetIDError| {
+        S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid ARN in notification configuration: {e}"))
+    };
+
+    process_queue_configurations(
+        &mut event_rules,
+        notification_configuration.queue_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_topic_configurations(
+        &mut event_rules,
+        notification_configuration.topic_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_lambda_configurations(
+        &mut event_rules,
+        notification_configuration.lambda_function_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+
+    Ok(event_rules)
 }
 
 fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
@@ -1267,19 +1359,14 @@ where
 
 async fn await_bucket_usecase_on_fresh_task_with_admission<T, F>(
     operation: &'static str,
-    admission: Arc<Semaphore>,
+    admission: Arc<BucketOperationAdmission>,
     future: F,
 ) -> S3Result<T>
 where
     T: Send + 'static,
     F: Future<Output = S3Result<T>> + Send + 'static,
 {
-    let permit = admission.try_acquire_owned().map_err(|err| match err {
-        TryAcquireError::NoPermits => {
-            S3Error::with_message(S3ErrorCode::SlowDown, format!("{operation} concurrency limit reached; retry later"))
-        }
-        TryAcquireError::Closed => S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} admission closed")),
-    })?;
+    let permit = admission.acquire(operation).await?;
     tokio::spawn(
         async move {
             let _permit = permit;
@@ -1414,11 +1501,10 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let force_str = get_header(&req.headers, SUFFIX_FORCE_DELETE)
-            .map(|v| v.into_owned())
-            .unwrap_or_default();
-
-        let force = parse_bool(&force_str).unwrap_or_default();
+        let force = match force_delete_header(&req.headers) {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")),
+        };
 
         if force {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
@@ -2439,6 +2525,17 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let region = resolve_notification_region(self.global_region(), request_region);
+        let notify = current_notify_interface_for_context(self.context.as_deref());
+        let event_rules = build_notification_event_rules(&notification_configuration)?;
+
+        // Reject the request before the store write so a failure cannot leave a
+        // persisted configuration that the notify runtime refused to activate.
+        notify
+            .validate_event_specific_rules(&bucket, region.as_str(), &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
         let data = serialize_config(&notification_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -2446,40 +2543,10 @@ impl DefaultBucketUsecase {
 
         notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false).await;
 
-        let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = current_notify_interface_for_context(self.context.as_deref());
-        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
-        let parse_rules = async {
-            let mut event_rules = Vec::new();
-
-            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_lambda_configurations(
-                &mut event_rules,
-                notification_configuration.lambda_function_configurations.clone(),
-                |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                },
-            )?;
-
-            Ok::<_, TargetIDError>(event_rules)
-        };
-
-        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
-
-        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
-        let event_rules =
-            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
+        notify
+            .clear_bucket_notification_rules(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
         notify
             .add_event_specific_rules(&bucket, region.as_str(), &event_rules)
@@ -2792,6 +2859,7 @@ impl DefaultBucketUsecase {
         let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
 
         // The on-demand migration envelope is decoded whether or not this
         // bucket still merges: a token handed out under `list_through` must keep
@@ -2800,55 +2868,87 @@ impl DefaultBucketUsecase {
             prepare_odm_read_generation(&store, &mut req, &bucket).await;
         }
         let (merged_token, source_state) = if allow_list_through {
-            (
-                list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
-                list_through::list_through_state(&store, &bucket, &req, &params).await?,
-            )
+            let source_state = list_through::list_through_state(&store, &bucket, &req, &params).await?;
+            if table_list_access.is_some() {
+                if source_state.is_some() {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ServiceUnavailable,
+                        "protected table listings are unavailable while on-demand migration list-through is active".to_string(),
+                    ));
+                }
+                (None, None)
+            } else {
+                (
+                    list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
+                    source_state,
+                )
+            }
         } else {
             (None, None)
         };
-        let (object_infos, degraded) = match (source_state, merged_token.as_ref()) {
-            (None, Some(token)) if params.max_keys == 0 => {
-                // No source was consulted, so retain every unconsumed side and
-                // the original wire format without spending its progress budget.
-                let is_truncated = !token.local_done || !token.source_done;
-                (
-                    StorageListObjectsV2Info {
-                        is_truncated,
-                        next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
-                        ..Default::default()
-                    },
-                    false,
-                )
-            }
-            (None, None) => {
-                let infos = store
-                    .list_objects_v2(
-                        &bucket,
-                        &params.prefix,
-                        params.decoded_continuation_token.clone(),
-                        params.delimiter.clone(),
-                        params.max_keys,
-                        fetch_owner.unwrap_or_default(),
-                        params.start_after_for_query.clone(),
+        let (object_infos, degraded) = if let Some(access) = table_list_access.as_ref() {
+            (
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
                         incl_deleted,
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                (infos, false)
-            }
-            (state, token) => {
-                let outcome = list_through::merged_list_objects_v2(
-                    &store,
-                    state.as_ref(),
-                    &bucket,
-                    &params,
-                    fetch_owner.unwrap_or_default(),
-                    incl_deleted,
-                    token,
+                        opaque_cursor_supported: allow_list_through,
+                    },
                 )
-                .await?;
-                (outcome.info, outcome.degraded)
+                .await?,
+                false,
+            )
+        } else {
+            match (source_state, merged_token.as_ref()) {
+                (None, Some(token)) if params.max_keys == 0 => {
+                    // No source was consulted, so retain every unconsumed side and
+                    // the original wire format without spending its progress budget.
+                    let is_truncated = !token.local_done || !token.source_done;
+                    (
+                        StorageListObjectsV2Info {
+                            is_truncated,
+                            next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                }
+                (None, None) => {
+                    let infos = store
+                        .list_objects_v2(
+                            &bucket,
+                            &params.prefix,
+                            params.decoded_continuation_token.clone(),
+                            params.delimiter.clone(),
+                            params.max_keys,
+                            fetch_owner.unwrap_or_default(),
+                            params.start_after_for_query.clone(),
+                            incl_deleted,
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                    (infos, false)
+                }
+                (state, token) => {
+                    let outcome = list_through::merged_list_objects_v2(
+                        &store,
+                        state.as_ref(),
+                        &bucket,
+                        &params,
+                        fetch_owner.unwrap_or_default(),
+                        incl_deleted,
+                        token,
+                    )
+                    .await?;
+                    (outcome.info, outcome.degraded)
+                }
             }
         };
 
@@ -2897,19 +2997,38 @@ impl DefaultBucketUsecase {
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
-        let object_infos = store
-            .list_objects_v2(
-                &bucket,
-                &params.prefix,
-                params.decoded_continuation_token.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-                fetch_owner.unwrap_or_default(),
-                params.start_after_for_query.clone(),
-                incl_deleted,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
+                        incl_deleted,
+                        opaque_cursor_supported: true,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_objects_v2(
+                    &bucket,
+                    &params.prefix,
+                    params.decoded_continuation_token.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                    fetch_owner.unwrap_or_default(),
+                    params.start_after_for_query.clone(),
+                    incl_deleted,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output = build_list_objects_v2_metadata_output(
@@ -2928,6 +3047,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -2943,17 +3063,34 @@ impl DefaultBucketUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match table_list_access.as_ref() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
@@ -2979,17 +3116,34 @@ impl DefaultBucketUsecase {
         let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output =
@@ -3001,9 +3155,13 @@ impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let request_marker = req.input.marker.clone();
+        let protected_table_list = req.extensions.get::<TableDataPlaneListAccess>().is_some();
         // V1 markers are object keys, so they cannot carry the opaque merged
         // pagination state used by V2 list-through.
-        let v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        let mut v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        if protected_table_list {
+            v2_resp.output.next_continuation_token = None;
+        }
 
         Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }
@@ -3128,7 +3286,7 @@ mod tests {
 
     #[tokio::test]
     async fn bucket_usecase_task_finishes_post_commit_hooks_after_parent_cancellation() {
-        let admission = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
         let committed = Arc::new(Notify::new());
         let committed_wait = committed.notified();
         let release_hook = Arc::new(Notify::new());
@@ -3163,45 +3321,39 @@ mod tests {
             hook_ran.load(Ordering::SeqCst),
             "the fresh task must own both the storage mutation and its post-commit hooks"
         );
-        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(admission.active.available_permits(), 1);
     }
 
-    #[tokio::test]
-    async fn saturated_bucket_usecase_admission_does_not_start_work() {
-        let admission = Arc::new(Semaphore::new(1));
-        let held = admission
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("test admission should remain open");
+    #[tokio::test(start_paused = true)]
+    async fn bucket_usecase_admission_times_out_without_starting_work() {
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+        let held = admission.active.clone().acquire_owned().await.expect("hold active slot");
         let started = Arc::new(AtomicBool::new(false));
         let started_for_task = started.clone();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async move {
-                started_for_task.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-        )
-        .await
-        .expect("saturated admission must fail within the bounded timeout");
+        let result = await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
+            started_for_task.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        let error = result.expect_err("queued request must time out");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
+        assert!(!started.load(Ordering::SeqCst), "timed-out work must not start");
+        assert_eq!(admission.waiting.available_permits(), 1);
         drop(held);
-
-        assert!(
-            !started.load(Ordering::SeqCst),
-            "saturated admission must not start a detached bucket operation"
-        );
-        assert_eq!(result.expect_err("saturated admission must fail fast").code(), &S3ErrorCode::SlowDown);
+        assert_eq!(admission.active.available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn bucket_usecase_admission_rejects_excess_detached_tasks() {
-        let admission = Arc::new(Semaphore::new(BUCKET_OPERATION_CONCURRENCY));
+    async fn bucket_usecase_admission_queues_bursts_with_bounded_execution() {
+        let admission = Arc::new(BucketOperationAdmission::new(
+            BUCKET_OPERATION_CONCURRENCY,
+            BUCKET_OPERATION_QUEUE_CAPACITY,
+        ));
         let release = Arc::new(Semaphore::new(0));
         let started = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::with_capacity(BUCKET_OPERATION_CONCURRENCY);
-
-        for _ in 0..BUCKET_OPERATION_CONCURRENCY {
+        let mut tasks = Vec::with_capacity(100);
+        for _ in 0..100 {
             let admission_for_task = admission.clone();
             let release_for_task = release.clone();
             let started_for_task = started.clone();
@@ -3210,53 +3362,82 @@ mod tests {
                 admission_for_task,
                 async move {
                     started_for_task.fetch_add(1, Ordering::SeqCst);
-                    let _release = release_for_task
-                        .acquire()
-                        .await
-                        .expect("test release gate should remain open");
+                    release_for_task.acquire().await.expect("release gate").forget();
                     Ok(())
                 },
             )));
         }
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while started.load(Ordering::SeqCst) != BUCKET_OPERATION_CONCURRENCY {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.waiting.available_permits() != BUCKET_OPERATION_QUEUE_CAPACITY - 92
+                || started.load(Ordering::SeqCst) != BUCKET_OPERATION_CONCURRENCY
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("all admitted operations should start");
-
-        let ninth_started = Arc::new(AtomicBool::new(false));
-        let ninth_started_for_task = ninth_started.clone();
-        let ninth_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
-                ninth_started_for_task.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-        )
-        .await
-        .expect("an excess bucket transaction must fail within the bounded timeout");
-        assert!(
-            !ninth_started.load(Ordering::SeqCst),
-            "the ninth bucket transaction must not start when admission is saturated"
-        );
-        assert_eq!(
-            ninth_result.expect_err("the ninth bucket transaction must fail fast").code(),
-            &S3ErrorCode::SlowDown
-        );
-
-        release.add_permits(BUCKET_OPERATION_CONCURRENCY);
+        .expect("all excess operations should queue");
+        assert_eq!(started.load(Ordering::SeqCst), BUCKET_OPERATION_CONCURRENCY);
+        release.add_permits(100);
         for task in tasks {
-            task.await
-                .expect("bucket transaction parent should join")
-                .expect("bucket transaction should succeed");
+            task.await.expect("request task joins").expect("burst operation succeeds");
         }
+        assert_eq!(started.load(Ordering::SeqCst), 100);
+        assert_eq!(admission.active.available_permits(), BUCKET_OPERATION_CONCURRENCY);
+        assert_eq!(admission.waiting.available_permits(), BUCKET_OPERATION_QUEUE_CAPACITY);
+    }
 
+    #[tokio::test]
+    async fn bucket_usecase_admission_bounds_queue_and_cancels_waiters() {
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+        let held = admission.active.clone().acquire_owned().await.expect("hold active slot");
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_task = started.clone();
+        let queued = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+            "test bucket operation",
+            admission.clone(),
+            async move {
+                started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.waiting.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should queue");
+        let error = admission
+            .acquire("test bucket operation")
+            .await
+            .expect_err("full queue rejects immediately");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
+        let response = error.to_http_response().expect("serialize admission error");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.expect("read error XML").to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("<Code>SlowDown</Code>"));
+        queued.abort();
+        assert!(queued.await.expect_err("queued request was cancelled").is_cancelled());
+        assert_eq!(admission.waiting.available_permits(), 1);
+        drop(held);
+        assert!(!started.load(Ordering::SeqCst), "cancelled waiter must not mutate storage");
         await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async { Ok(()) })
             .await
-            .expect("admission must recover after active transactions finish");
+            .expect("admission recovers after cancellation");
+    }
+
+    #[tokio::test]
+    async fn bucket_usecase_admission_maps_closed_semaphore_to_internal_error() {
+        let admission = BucketOperationAdmission::new(1, 1);
+        admission.active.close();
+        let error = admission
+            .acquire("test bucket operation")
+            .await
+            .expect_err("closed admission must fail");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

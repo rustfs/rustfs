@@ -1371,14 +1371,18 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
 
     let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
     let mut cache = cache_with_raw_cursor(invalid);
     cache.info.scan_identity = Some(identity);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_cursor.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -1410,13 +1414,17 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
 
     let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
     cache.info.scan_raw_enumeration_page_index = Some(invalid);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 3, 3, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_page_index.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -2031,6 +2039,59 @@ fn data_usage_cache_prepare_for_scan_fences_leader_epochs() {
     assert_eq!(cache.info.leader_epoch, 12);
     assert!(!cache.info.snapshot_complete);
     assert!(cache.cache.is_empty());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(identity.tier_registry_generation),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_resume_after: Some("bucket/a".to_string()),
+            scan_checkpoint: Some(DataUsageScanCheckpoint::new(
+                "bucket/a".to_string(),
+                DataUsageScanCheckpointReason::Objects,
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let legacy_digest = cache
+        .legacy_coverage_prefix_digest("bucket/a")
+        .expect("legacy receipt digest");
+    cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+        through: "bucket/a".to_string(),
+        digest: legacy_digest,
+    });
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.leader_epoch, 2);
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+    assert_ne!(cache.info.scan_coverage_receipt.expect("migrated receipt").digest, legacy_digest);
 }
 
 #[test]

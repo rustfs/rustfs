@@ -65,6 +65,8 @@ get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
 
 `transition_version_id == None` means only that no usable legacy UUID projection exists; it does not prove the remote bucket's versioning model. Only an explicit `KnownDisabled` state authorizes ordinary GET/DELETE to omit `versionId`. A missing state with an absent or empty version key remains `Unknown` and requires the bounded compatibility probe or the approved reconcile workflow; it never directly authorizes cleanup. A nil UUID (`00000000-...`) sent as `?versionId=` causes `NoSuchVersion`. Do not use `Uuid::from_slice(..).unwrap_or_default()` here: it converts an empty metadata value into `Uuid::nil()`, which is exactly that failure.
 
+Opaque remote version IDs, such as those returned by Backblaze B2, are treated as exact remote identifiers only after the operator-attested live fleet capability gate is active. The gate requires both `RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE=true` and `RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED=true`, plus a current fleet proof. Recovery and operator cleanup retain an ambiguous candidate while that proof is absent or stale; they never issue a guessed opaque-version delete. Existing persisted exact opaque IDs remain routable, but new persistence and recovery cleanup fail closed until the gate is current.
+
 ## Inspect xl.meta directly
 
 ```bash

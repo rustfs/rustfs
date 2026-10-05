@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
+use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
 mod migration;
 mod object;
 mod strong;
 
-use migration::table_catalog_backing_manifest;
+use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
 pub(crate) use object::ObjectTableCatalogStore;
+#[cfg(test)]
+pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
 #[cfg(test)]
 pub(super) use strong::{
     STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
@@ -243,6 +247,26 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
+    /// Checks whether an active table already owns any part of the candidate warehouse location.
+    ///
+    /// This is a preflight for clients that write data before catalog registration. Registration
+    /// remains the authoritative atomic check for concurrent creators.
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        let candidate_prefix = table_warehouse_object_prefix(candidate)?;
+        for existing in self.list_all_tables(&candidate.table_bucket).await? {
+            if existing.state != TableCatalogEntryState::Active || existing.table_id == candidate.table_id {
+                continue;
+            }
+            let existing_prefix = table_warehouse_object_prefix(&existing)?;
+            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -280,6 +304,24 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         object: &str,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         scan_table_data_plane_resource_for_object(self, table_bucket, object).await
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+        let Some(table_bucket_entry) = self.get_table_bucket(table_bucket).await? else {
+            return Ok(None);
+        };
+        if table_bucket_entry.state != TableCatalogEntryState::Active {
+            return Ok(None);
+        }
+        let entries = self.list_all_tables(table_bucket).await?;
+        table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)
     }
 
     /// Atomically advances a validated table metadata pointer.
@@ -532,6 +574,7 @@ pub(crate) struct TableCatalogObjectMetadata {
 pub(crate) struct TableCatalogLockGuard {
     _guard: Box<dyn Send>,
     lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    write_commit_guard: Option<WriteCommitGuard>,
 }
 
 impl TableCatalogLockGuard {
@@ -543,6 +586,7 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(guard),
             lock_lost: None,
+            write_commit_guard: None,
         }
     }
 
@@ -551,11 +595,25 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(guard),
             lock_lost,
+            write_commit_guard: None,
         }
+    }
+
+    fn write_namespace(guard: WriteCommitGuard) -> Self {
+        Self {
+            _guard: Box::new(()),
+            lock_lost: None,
+            write_commit_guard: Some(guard),
+        }
+    }
+
+    fn write_commit_guards(&self) -> Vec<WriteCommitGuard> {
+        self.write_commit_guard.iter().cloned().collect()
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.lock_lost.as_ref().is_some_and(|signal| signal.is_lost())
+            || self.write_commit_guard.as_ref().is_some_and(WriteCommitGuard::is_lock_lost)
     }
 }
 
@@ -681,6 +739,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
+        _write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()> {
         self.put_object(bucket, object, data, precondition).await
     }
@@ -741,6 +800,100 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     fn complete_table_commit_publication(&self) {}
+}
+
+pub(super) async fn diagnose_table_catalog_from_export<B>(
+    backend: &B,
+    catalog: TableCatalogExport,
+    commit_recovery: TableCommitRecoveryReport,
+    retain_recent_metadata_files: usize,
+) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport>
+where
+    B: TableCatalogObjectBackend,
+{
+    let current_metadata_location =
+        table_catalog_object_key_from_location(&catalog.table.table_bucket, &catalog.table.metadata_location);
+    let backing_manifest = catalog.backing_manifest.clone();
+    let metadata_prefix = table_metadata_dir_path_for_entry(&catalog.table)
+        .ok()
+        .map(|directory| format!("{directory}/"));
+    let is_valid_location = |location: &str| {
+        metadata_prefix.as_ref().is_some_and(|prefix| {
+            location
+                .strip_prefix(prefix.as_str())
+                .is_some_and(is_valid_table_metadata_file_name)
+        })
+    };
+    let mut retained = BTreeSet::new();
+    let mut current_metadata_for_refs = None;
+    let current_metadata_status =
+        if let Some(current_metadata_location) = current_metadata_location.filter(|location| is_valid_location(location)) {
+            retained.insert(current_metadata_location.clone());
+            match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
+                Ok(Some(current_metadata)) => {
+                    retained.extend(metadata_log_locations_matching(
+                        &current_metadata,
+                        &catalog.table_bucket.table_bucket,
+                        is_valid_location,
+                    ));
+                    current_metadata_for_refs = Some(current_metadata);
+                    TableMetadataPointerStatus::Valid
+                }
+                Ok(None) => TableMetadataPointerStatus::MissingObject,
+                Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
+                Err(err) => return Err(err),
+            }
+        } else {
+            TableMetadataPointerStatus::InvalidLocation
+        };
+
+    let mut metadata_locations = Vec::new();
+    // A renamed or registered table can keep a metadata directory unrelated to its current name.
+    // If the pointer is invalid, no directory can safely be treated as owned by this table.
+    if let Some(metadata_prefix) = metadata_prefix.as_ref() {
+        for object in backend
+            .list_objects(&catalog.table_bucket.table_bucket, metadata_prefix)
+            .await?
+        {
+            if is_valid_location(&object) {
+                metadata_locations.push(object);
+            }
+        }
+    }
+    metadata_locations.sort();
+    metadata_locations.dedup();
+
+    for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
+        retained.insert(metadata_location.clone());
+    }
+    if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
+        retained.extend(
+            metadata_locations_for_protected_snapshot_refs_matching(
+                backend,
+                &catalog.table_bucket.table_bucket,
+                current_metadata,
+                &metadata_locations,
+                is_valid_location,
+            )
+            .await?,
+        );
+    }
+
+    let orphan_metadata_candidate_locations = metadata_locations
+        .into_iter()
+        .filter(|metadata_location| !retained.contains(metadata_location))
+        .collect();
+    let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+
+    Ok(TableCatalogDiagnosticsReport {
+        catalog,
+        current_metadata_status,
+        recovery_status,
+        recommended_actions,
+        commit_recovery,
+        backing_manifest,
+        orphan_metadata_candidate_locations,
+    })
 }
 
 #[async_trait::async_trait]
@@ -1079,6 +1232,23 @@ where
             "{operation} is not supported with {TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing"
         ))
     }
+
+    pub(crate) async fn get_table_catalog_diagnostics_retention(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<usize> {
+        match self {
+            Self::ObjectBacked(store) => Ok(store
+                .get_table_maintenance_config(table_bucket, namespace, table)
+                .await?
+                .retain_recent_metadata_files),
+            // Durable-strong maintenance configuration is not persisted yet. Zero adds no
+            // count-based retention; reachability still protects references, and this API never deletes.
+            Self::DurableStrong(_) => Ok(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1222,6 +1392,13 @@ where
         }
     }
 
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.ensure_table_warehouse_location_available(candidate).await,
+            Self::DurableStrong(store) => store.ensure_table_warehouse_location_available(candidate).await,
+        }
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -1272,6 +1449,17 @@ where
         match self {
             Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
             Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
+        }
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self {
+            Self::ObjectBacked(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
+            Self::DurableStrong(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
         }
     }
 
@@ -1557,7 +1745,7 @@ where
     ) -> TableCatalogStoreResult<TableCatalogExport> {
         match self {
             Self::ObjectBacked(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog export")),
+            Self::DurableStrong(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
         }
     }
 
@@ -1574,7 +1762,11 @@ where
                     .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
                     .await
             }
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog diagnostics")),
+            Self::DurableStrong(store) => {
+                store
+                    .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
+                    .await
+            }
         }
     }
 
@@ -1772,7 +1964,7 @@ where
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, false).await
+        self.put_object_with_options(bucket, object, data, precondition, None).await
     }
 
     async fn put_object_unlocked(
@@ -1781,8 +1973,10 @@ where
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, true).await
+        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards))
+            .await
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -1869,11 +2063,10 @@ where
             .new_ns_lock(bucket, object)
             .await
             .map_err(|err| storage_error_to_catalog("create catalog table lock", err))?;
-        let guard = lock
-            .get_write_lock(get_lock_acquire_timeout())
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
             .await
             .map_err(|err| catalog_lock_acquisition_error("acquire catalog table lock", err))?;
-        Ok(TableCatalogLockGuard::namespace(guard))
+        Ok(TableCatalogLockGuard::write_namespace(guard))
     }
 
     async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
@@ -1946,14 +2139,22 @@ where
         object: &str,
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
-        no_lock: bool,
+        write_guards: Option<Vec<WriteCommitGuard>>,
     ) -> TableCatalogStoreResult<()> {
         let mut reader = PutObjReader::from_vec(data);
-        let opts = ObjectOptions {
+        let mut opts = ObjectOptions {
             http_preconditions: http_preconditions_for_catalog_put(precondition),
-            no_lock,
             ..Default::default()
         };
+        if let Some(write_guards) = write_guards {
+            if write_guards.is_empty() {
+                return Err(TableCatalogStoreError::Internal("catalog write has no namespace owner".to_string()));
+            }
+            for guard in &write_guards {
+                opts.add_write_commit_guard(guard);
+            }
+            opts.write_completion = WriteCompletion::TailDrained;
+        }
         self.store
             .put_object(bucket, object, &mut reader, &opts)
             .await

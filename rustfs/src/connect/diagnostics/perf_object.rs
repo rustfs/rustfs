@@ -64,6 +64,7 @@ const SIGNATURE_PATH: &str = "envelope.sig";
 const RESULT_PATH: &str = "result.json";
 const MAX_OBJECT_RESPONSE_BYTES: usize = 16_384;
 const CLEANUP_RESERVE_MAX: Duration = Duration::from_millis(250);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const OUTPUT_MODE: u32 = 0o600;
 
 static OBJECT_COLLECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -374,7 +375,7 @@ impl S3ObjectProbe {
         let mut builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout);
+            .timeout(timeout.max(CLEANUP_TIMEOUT));
         if let Some(root_ca_pem) = root_ca_pem {
             let certificate =
                 reqwest::Certificate::from_pem(root_ca_pem).map_err(|_| ObjectPerformanceError::InvalidRootCertificate)?;
@@ -403,7 +404,6 @@ impl S3ObjectProbe {
         let started = Instant::now();
         let reserve = CLEANUP_RESERVE_MAX.min(request.duration / 10);
         let operation_deadline = started + request.duration.saturating_sub(reserve);
-        let cleanup_deadline = started + request.duration;
         let bucket = format!("rustfs-connect-perf-{}", request.artifact_uid.replace('-', ""));
         let object = "synthetic-object";
         let bucket_url = self.object_url(&bucket, None)?;
@@ -427,6 +427,9 @@ impl S3ObjectProbe {
             }
             Err(error) => Err(error),
         };
+        // Cleanup owns two sequential requests and must not inherit only the
+        // fractional tail of the caller's measurement window.
+        let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
         let cleanup = self.cleanup(object_url, bucket_url, cleanup_deadline).await;
         if cleanup.is_err() {
             return Err(ObjectProbeError::CleanupFailed);

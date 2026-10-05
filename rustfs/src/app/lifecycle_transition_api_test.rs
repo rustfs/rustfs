@@ -26,7 +26,9 @@ use super::storage_api::test::contract::{
 };
 use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
-use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
+use super::storage_api::test::runtime::{
+    MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
+};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, install_all_v6_fleet_capability_proof,
@@ -1479,7 +1481,10 @@ async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
                 .transition_object(&transition_bucket, object, &transition_opts)
                 .await
         });
-        put_barrier.wait_until_paused().await;
+        tokio::select! {
+            result = &mut transition => panic!("transition ended before reaching the tier PUT barrier: {result:?}"),
+            () = put_barrier.wait_until_paused() => {}
+        }
 
         let prepared_reader = ecstore
             .prepare_get_object_reader(bucket.as_str(), object, None, HeaderMap::new(), &ObjectOptions::default())
@@ -1684,6 +1689,11 @@ async fn compensation_driven_copy_still_completes_transition() {
         .build()
         .unwrap();
 
+    let transition_state = get_global_transition_state();
+    let missed_before = transition_state.missed_immediate_tasks();
+    let compensation_before = transition_state.compensation_scheduled_tasks();
+    let put_barrier = backend.arm_put_barrier().await;
+
     with_forced_immediate_enqueue_timeout(|| async {
         Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
             .await
@@ -1691,13 +1701,34 @@ async fn compensation_driven_copy_still_completes_transition() {
     })
     .await;
 
+    assert!(
+        transition_state.missed_immediate_tasks() > missed_before,
+        "copy should exercise the forced immediate enqueue failure"
+    );
+    assert!(
+        transition_state.compensation_scheduled_tasks() > compensation_before,
+        "copy should schedule automatic compensation backfill"
+    );
+
+    // Observe automatic compensation reaching the tier before timing its final
+    // metadata commit; discovery and queue latency are separate from that commit.
+    put_barrier.wait_until_paused().await;
+    assert_eq!(
+        backend.object_count().await,
+        1,
+        "compensation should store the copied body before committing"
+    );
+    put_barrier.release();
+
     let info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("copied object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the copied version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
+    assert_eq!(read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await, payload);
 }
 
 #[serial]

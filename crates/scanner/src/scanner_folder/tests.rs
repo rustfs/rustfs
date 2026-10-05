@@ -26,8 +26,9 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
 
-mod checkpoint_fixture;
+pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
+mod incremental_enumeration;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -335,11 +336,17 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         prefix_scan_scope: None,
         failed_object_ttl_secs: u64::MAX,
         failed_objects_max: usize::MAX,
+        failed_object_paths_seen: HashSet::new(),
+        resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
         disks: Vec::new(),
         disks_quorum: 0,
         updates: None,
+        checkpoint_tx: None,
         last_update: SystemTime::UNIX_EPOCH,
+        checkpoint_objects: 0,
+        last_checkpoint_objects: 0,
+        last_checkpoint_at: Instant::now(),
         update_current_path,
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
@@ -366,6 +373,65 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
     (scanner, temp_dir)
 }
 
+#[tokio::test]
+async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(checkpoint_tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+        requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+    });
+    scanner.new_cache.info.source = Some(crate::DataUsageCacheSource::new(0, 0));
+    scanner.new_cache.info.scan_identity = Some(crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(1),
+        set_layout: crate::DataUsageScanPlanDigest([2; 32]),
+        publication_epoch: 1,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    });
+    scanner.new_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.new_cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    scanner.coverage_frontier = Some("bucket/a".to_string());
+    scanner.new_cache.info.scan_checkpoint = Some(crate::DataUsageScanCheckpoint::new(
+        "bucket/a".to_string(),
+        crate::DataUsageScanCheckpointReason::Objects,
+    ));
+    scanner.new_cache.info.scan_resume_after = Some("bucket/a".to_string());
+    scanner
+        .new_cache
+        .seal_scan_frontier(Some("bucket/a"))
+        .expect("fixture frontier");
+    assert_eq!(scanner.new_cache.validated_scan_frontier(), Some("bucket/a"));
+
+    scanner.maybe_send_checkpoint();
+
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL * 2;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
+    scanner.maybe_send_checkpoint();
+    assert_eq!(
+        scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL,
+        "a full checkpoint queue must reject before cloning or advancing progress"
+    );
+
+    let checkpoint = checkpoint_rx.try_recv().expect("object threshold emits a bounded checkpoint");
+    assert_eq!(checkpoint.info.name, "bucket");
+    assert!(!checkpoint.info.snapshot_complete);
+    assert_eq!(scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL);
+    assert!(checkpoint_rx.try_recv().is_err(), "checkpoint queue remains bounded");
+    tokio::fs::remove_dir_all(temp_dir)
+        .await
+        .expect("remove test scanner directory");
+}
+
 struct TestGuard {
     temp_dir: Option<std::path::PathBuf>,
 }
@@ -390,7 +456,7 @@ impl Drop for TestGuard {
 
 #[tokio::test]
 #[serial]
-async fn test_should_skip_failed_respects_ttl() {
+async fn test_failed_retry_suppression_respects_ttl() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
     let now = FolderScanner::now_secs();
@@ -406,8 +472,15 @@ async fn test_should_skip_failed_respects_ttl() {
         .failed_objects
         .insert("expired".to_string(), now.saturating_sub(120));
 
-    assert!(scanner.should_skip_failed("recent"));
-    assert!(!scanner.should_skip_failed("expired"));
+    assert!(!scanner.mark_failed_path_seen("recent"), "first observation gets one retry");
+    assert!(
+        scanner.mark_failed_path_seen("recent"),
+        "duplicate observation is eligible for TTL suppression"
+    );
+    assert!(!scanner.mark_failed_path_seen("expired"), "expired failure is observed for a fresh retry");
+    assert!(scanner.mark_failed_path_seen("expired"), "duplicate expired entry is marked in this pass");
+    assert!(scanner.failed_retry_suppressed("recent"));
+    assert!(!scanner.failed_retry_suppressed("expired"));
 }
 
 #[tokio::test]
@@ -421,7 +494,7 @@ async fn test_record_failed_ttl_zero_noop() {
 
     let now = FolderScanner::now_secs();
     scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
-    assert!(!scanner.should_skip_failed("path2"));
+    assert!(!scanner.failed_retry_suppressed("path2"));
 }
 
 #[tokio::test]
@@ -1043,6 +1116,72 @@ async fn test_prune_failed_objects_cache_drops_expired() {
 
 #[tokio::test]
 #[serial]
+async fn test_failed_objects_clear_on_recovery_and_full_scan_reconciliation() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+    let now = FolderScanner::now_secs();
+    scanner
+        .new_cache
+        .info
+        .failed_objects
+        .insert("bucket/recovered/xl.meta".to_string(), now);
+    scanner
+        .new_cache
+        .info
+        .failed_objects
+        .insert("bucket/removed/xl.meta".to_string(), now);
+    scanner
+        .new_cache
+        .info
+        .failed_objects
+        .insert("bucket/still-failed/xl.meta".to_string(), now);
+
+    scanner.clear_failed_path("bucket/recovered/xl.meta");
+    assert!(
+        scanner.new_cache.info.failed_objects.contains_key("bucket/recovered/xl.meta"),
+        "recovery is committed only after the scan completes"
+    );
+    scanner.mark_failed_path_seen("bucket/still-failed/xl.meta");
+    scanner.reconcile_failed_objects_after_full_scan();
+
+    assert_eq!(
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["bucket/still-failed/xl.meta"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_checkpoint_resume_preserves_failed_paths_outside_visited_suffix() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+    scanner.resume_frontier = Some("bucket/resume-after".to_string());
+    scanner
+        .new_cache
+        .info
+        .failed_objects
+        .insert("bucket/prefix-failure/xl.meta".to_string(), FolderScanner::now_secs());
+
+    scanner.reconcile_failed_objects_after_full_scan();
+
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .contains_key("bucket/prefix-failure/xl.meta"),
+        "a resumed suffix scan cannot prune failure state for its unvisited prefix"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_prune_failed_objects_max_zero_keeps_fresh() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
@@ -1070,6 +1209,41 @@ async fn test_prune_failed_objects_max_zero_keeps_fresh() {
     assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
     assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
     assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
+}
+
+#[test]
+fn scanner_heal_request_builders_assign_distinct_identities() {
+    let requests = [
+        build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "first".to_string(),
+            None,
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "second".to_string(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_non_destructive_object_heal_request(
+            "bucket".to_string(),
+            "third".to_string(),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for request in requests {
+        let id = uuid::Uuid::parse_str(&request.id).expect("scanner must assign an ID before publishing its request");
+        assert!(!id.is_nil());
+        assert!(ids.insert(id), "independent scanner requests must not share an identity");
+        assert_eq!(request.clone().id, request.id, "replaying a captured request must preserve its identity");
+        assert_eq!(request.source, HealRequestSource::Scanner);
+    }
 }
 
 #[test]
@@ -2716,6 +2890,57 @@ async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
 
 #[tokio::test]
 #[serial]
+async fn full_scan_clears_failed_cache_for_manually_removed_object() {
+    let (scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir.clone()),
+    };
+    tokio::fs::create_dir_all(temp_dir.join("bucket"))
+        .await
+        .expect("bucket directory should be created");
+    write_test_object_metadata(&temp_dir, "bucket", "repaired").await;
+
+    let mut info = crate::data_usage_define::DataUsageCacheInfo {
+        name: "bucket".to_string(),
+        ..Default::default()
+    };
+    let canonical_root = temp_dir
+        .canonicalize()
+        .expect("test disk root should resolve to the path used by scanner");
+    info.failed_objects.insert(
+        canonical_root.join("bucket/removed/xl.meta").to_string_lossy().into_owned(),
+        FolderScanner::now_secs(),
+    );
+    info.failed_objects.insert(
+        canonical_root.join("bucket/repaired/xl.meta").to_string_lossy().into_owned(),
+        FolderScanner::now_secs(),
+    );
+    let cache = DataUsageCache {
+        info,
+        ..Default::default()
+    };
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+
+    let scanned = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![scanner.local_disk.clone()],
+        scanner.local_disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await
+    .expect("complete bucket scan should succeed");
+
+    assert!(scanned.info.snapshot_complete);
+    assert!(scanned.info.failed_objects.is_empty());
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_root_progress() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2754,6 +2979,8 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
         cache.prepare_bucket_checkpoint("bucket", 7, 3, source, plan, identity),
         crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
     );
+    cache.replace("bucket", "", DataUsageEntry::default());
+    let retained_key_ptr = cache.cache.keys().next().expect("existing root key").as_ptr() as usize;
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
@@ -2775,6 +3002,11 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
         Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
         other => panic!("expected raw enumeration partial cache after cancellation, got {other:?}"),
     };
+    assert_eq!(
+        partial_cache.cache.keys().next().expect("retained root key").as_ptr() as usize,
+        retained_key_ptr,
+        "enumeration cancellation must transfer the existing cache allocation"
+    );
 
     assert!(
         partial_cache
@@ -2967,6 +3199,7 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
             ..Default::default()
         },
     );
+    let retained_key_ptr = cache.cache.keys().next().expect("durable root key").as_ptr() as usize;
 
     let result = scan_data_folder(
         budget.token(),
@@ -2984,6 +3217,11 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
         Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
         other => panic!("missing bucket should keep the scan incomplete, got {other:?}"),
     };
+    assert_eq!(
+        partial.cache.keys().next().expect("returned durable root key").as_ptr() as usize,
+        retained_key_ptr,
+        "a missing namespace must return the owned cache without a deep copy"
+    );
     assert!(!partial.info.snapshot_complete);
     assert_eq!(partial.info.next_cycle, 9);
     let root = partial
@@ -3387,11 +3625,12 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),
     };
-    write_test_object_metadata(&temp_dir, "bucket", "object").await;
+    write_test_object_metadata_bytes(&temp_dir, "bucket", "object", &[]).await;
 
     let failed_path = temp_dir
-        .join("bucket")
-        .join("object")
+        .canonicalize()
+        .expect("test disk root should resolve to the path used by scanner")
+        .join("bucket/object")
         .join(STORAGE_FORMAT_FILE)
         .to_string_lossy()
         .into_owned();
@@ -3403,7 +3642,10 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         },
         ..Default::default()
     };
-    cache.info.failed_objects.insert(failed_path, FolderScanner::now_secs());
+    cache
+        .info
+        .failed_objects
+        .insert(failed_path.clone(), FolderScanner::now_secs());
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new(&parent, Default::default());
@@ -3424,7 +3666,11 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         other => panic!("expected unresolved object to keep the cache partial, got {other:?}"),
     };
     assert!(!partial.info.snapshot_complete);
-    assert!(!partial.info.failed_objects.is_empty());
+    assert!(
+        partial.info.failed_objects.contains_key(&failed_path),
+        "corrupt object failure should remain recorded: {:?}",
+        partial.info.failed_objects
+    );
 }
 
 #[tokio::test]

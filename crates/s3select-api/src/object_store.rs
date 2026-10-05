@@ -16,7 +16,10 @@ use crate::{
     PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
     SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
     SelectStore, SnapshotConsistencyError,
-    input_stream::{CompressionFormat, compressed_input_reader, compressed_input_stream, processed_bytes_limit},
+    input_stream::{
+        CompressionFormat, SELECT_DECODE_CHUNK_BYTES, compressed_input_reader, compressed_input_stream, input_io_error,
+        processed_bytes_limit,
+    },
     query::{
         ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
@@ -46,6 +49,7 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt, TryStreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
+use memchr::{memchr, memmem};
 use rustfs_common::DEFAULT_DELIMITER;
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -351,9 +355,11 @@ impl EcObjectStore {
         S: Stream<Item = Result<Bytes>> + Send + 'static,
     {
         if let Some(csv) = self.input.request.input_serialization.csv.as_ref()
-            && csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+            && (csv.allow_quoted_record_delimiter.unwrap_or(false)
+                || csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref()))
         {
             let syntax = CsvSyntax {
+                allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter.unwrap_or(false),
                 quote: csv.quote_character.as_deref(),
                 escape: csv.quote_escape_character.as_deref(),
                 field: csv.field_delimiter.as_deref(),
@@ -661,11 +667,44 @@ fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
     }
 }
 
-fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
-    if delimiter.is_empty() {
-        return None;
+enum DelimiterSearcher {
+    Empty,
+    Byte(u8),
+    Multi(Box<memmem::Finder<'static>>),
+}
+
+impl DelimiterSearcher {
+    fn new(delimiter: &[u8]) -> Self {
+        match delimiter {
+            [] => Self::Empty,
+            [byte] => Self::Byte(*byte),
+            _ => Self::Multi(Box::new(memmem::Finder::new(delimiter).into_owned())),
+        }
     }
-    bytes.windows(delimiter.len()).position(|window| window == delimiter)
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Byte(_) => 1,
+            Self::Multi(finder) => finder.needle().len(),
+        }
+    }
+
+    fn find(&self, bytes: &[u8]) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Byte(byte) => memchr(*byte, bytes),
+            Self::Multi(finder) => finder.find(bytes),
+        }
+    }
+}
+
+fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
+    match delimiter {
+        [] => None,
+        [byte] => memchr(*byte, bytes),
+        _ => memmem::find(bytes, delimiter),
+    }
 }
 
 fn map_prepare_snapshot_error(bucket: &str, object: &str, err: PrepareSelectObjectSnapshotError) -> o_Error {
@@ -891,6 +930,26 @@ impl ObjectStore for EcObjectStore {
                     self.query_tracker.clone(),
                 );
                 GetResultPayload::Stream(stream)
+            } else if self
+                .input
+                .request
+                .input_serialization
+                .csv
+                .as_ref()
+                .is_some_and(|csv| csv.allow_quoted_record_delimiter.unwrap_or(false))
+            {
+                // The CSV normalizer owns logical-record limits; a physical-line
+                // tracker would count default CRLF terminators as record data.
+                let reader = compressed_input_reader(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    max_processed_bytes,
+                    query_guard,
+                );
+                let stream = ReaderStream::with_capacity(reader, SELECT_DECODE_CHUNK_BYTES).map_err(input_io_error);
+                GetResultPayload::Stream(self.convert_csv_stream(stream))
             } else {
                 let input_record_delimiter = if self.input.request.input_serialization.csv.is_some() {
                     self.record_delimiter()
@@ -1145,7 +1204,7 @@ where
 
 struct ScanRangeState<S> {
     stream: S,
-    delimiter: Vec<u8>,
+    delimiter: DelimiterSearcher,
     range: SelectScanRange,
     include_header: bool,
     offset: u64,
@@ -1169,7 +1228,7 @@ where
 {
     let state = ScanRangeState {
         stream,
-        delimiter,
+        delimiter: DelimiterSearcher::new(&delimiter),
         range,
         include_header,
         offset: base_offset,
@@ -1222,26 +1281,36 @@ impl<S> ScanRangeState<S> {
         if self.record.is_empty() {
             self.record_start = self.offset;
         }
-        let search_start = self.record.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        let delimiter_len = self.delimiter.len();
+        let search_start = self.record.len().saturating_sub(delimiter_len.saturating_sub(1));
         self.record.extend_from_slice(bytes);
         self.offset = self.offset.saturating_add(bytes.len() as u64);
 
+        let mut record_begin = 0;
         let mut search_start = search_start;
-        while let Some(pos) = find_delimiter(&self.record[search_start..], &self.delimiter) {
-            let record_end = search_start + pos + self.delimiter.len();
-            self.finish_record(record_end);
+        while let Some(pos) = self.delimiter.find(&self.record[search_start..]) {
+            let record_end = search_start + pos + delimiter_len;
+            let relative_start = u64::try_from(record_begin).unwrap_or(u64::MAX);
+            let record_start = self.record_start.saturating_add(relative_start);
+            self.finish_record(record_begin..record_end, record_start);
+            record_begin = record_end;
             if self.done {
                 break;
             }
-            search_start = 0;
+            search_start = record_end;
+        }
+
+        if record_begin > 0 {
+            self.record.drain(..record_begin);
+            let consumed = u64::try_from(record_begin).unwrap_or(u64::MAX);
+            self.record_start = self.record_start.saturating_add(consumed);
         }
     }
 
-    fn finish_record(&mut self, record_end: usize) {
-        let record = self.record.drain(..record_end).collect::<Vec<_>>();
-        let record_start = self.record_start;
-        self.record_start = self.record_start.saturating_add(record_end as u64);
-        self.push_record(record, record_start);
+    fn finish_record(&mut self, record_range: Range<usize>, record_start: u64) {
+        if self.should_emit_record(record_start) {
+            self.pending.push_back(Bytes::copy_from_slice(&self.record[record_range]));
+        }
     }
 
     fn finish_pending_record(&mut self) {
@@ -1250,19 +1319,21 @@ impl<S> ScanRangeState<S> {
         }
         let record = std::mem::take(&mut self.record);
         let record_start = self.record_start;
-        self.push_record(record, record_start);
+        if self.should_emit_record(record_start) {
+            self.pending.push_back(Bytes::from(record));
+        }
     }
 
-    fn push_record(&mut self, record: Vec<u8>, record_start: u64) {
+    fn should_emit_record(&mut self, record_start: u64) -> bool {
         let include_header = self.include_header && record_start == 0;
         let include_record = record_start >= self.range.start() && record_start <= self.range.end();
         if include_header || include_record {
-            self.pending.push_back(Bytes::from(record));
-        } else {
-            if record_start > self.range.end() {
-                self.done = true;
-            }
+            return true;
         }
+        if record_start > self.range.end() {
+            self.done = true;
+        }
+        false
     }
 }
 
@@ -2171,6 +2242,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_range_stream_handles_many_records_in_one_chunk() {
+        const RECORDS: usize = 16 * 1024;
+        let input = b"x\n".repeat(RECORDS);
+        let object_size = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input.clone()))]);
+        let output = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, object_size - 1), false, 0, object_size)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect many ScanRange records")
+            .concat();
+
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_matches_reference_across_chunk_boundaries() {
+        fn reference(input: &[u8], delimiter: &[u8], range: SelectScanRange, include_header: bool) -> Vec<u8> {
+            let mut output = Vec::new();
+            let mut record_begin = 0;
+            let mut record_start = 0_u64;
+            loop {
+                let record_end = input[record_begin..]
+                    .windows(delimiter.len())
+                    .position(|window| window == delimiter)
+                    .map(|position| record_begin + position + delimiter.len())
+                    .unwrap_or(input.len());
+                let include_record = record_start >= range.start() && record_start <= range.end();
+                if (include_header && record_start == 0) || include_record {
+                    output.extend_from_slice(&input[record_begin..record_end]);
+                } else if record_start > range.end() {
+                    break;
+                }
+                if record_end == input.len() {
+                    break;
+                }
+                record_start = record_start.saturating_add(u64::try_from(record_end - record_begin).unwrap_or(u64::MAX));
+                record_begin = record_end;
+            }
+            output
+        }
+
+        let fixtures: &[(&[u8], &[u8])] = &[
+            (b"header\none\ntwo\nthree", b"\n"),
+            (b"header\r\none\r\ntwo\r\nthree", b"\r\n"),
+            (b"headeraaoneaaaxaatwo", b"aa"),
+        ];
+        for (input, delimiter) in fixtures {
+            let object_size = u64::try_from(input.len()).expect("fixture length should fit in u64");
+            let ranges = [
+                SelectScanRange::new(0, object_size - 1),
+                SelectScanRange::new(1, object_size / 2),
+                SelectScanRange::new(object_size / 2, object_size - 1),
+            ];
+            for range in ranges {
+                for include_header in [false, true] {
+                    let expected = reference(input, delimiter, range, include_header);
+                    for chunk_size in 1..=input.len() {
+                        let chunks = input
+                            .chunks(chunk_size)
+                            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                            .collect::<Vec<_>>();
+                        let actual =
+                            scan_range_stream(stream::iter(chunks), delimiter.to_vec(), range, include_header, 0, object_size)
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .expect("collect ScanRange output")
+                                .concat();
+
+                        assert_eq!(actual, expected, "delimiter={delimiter:?}, range={range:?}, chunk_size={chunk_size}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_scan_range_stream_converts_custom_delimiter_split_across_chunks() {
         let chunks = stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2^")),
@@ -2296,8 +2443,10 @@ mod test {
 
     #[test]
     fn test_find_delimiter_handles_multi_byte_delimiter() {
+        assert_eq!(find_delimiter(b"one\ntwo", b"\n"), Some(3));
         assert_eq!(find_delimiter(b"one\r\ntwo", b"\r\n"), Some(3));
         assert_eq!(find_delimiter(b"one\ntwo", b"\r\n"), None);
+        assert_eq!(find_delimiter(b"one\ntwo", b""), None);
     }
 
     #[test]
@@ -2884,6 +3033,141 @@ mod test {
         assert_eq!(range, b"id"[..]);
         assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
         assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_preserve_compressed_values_and_metrics() {
+        const BUCKET: &str = "s3select-quoted-record-stream";
+        let data = b"name,kind\n\"line\nbreak\",tail\n";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, compression) in [
+            ("plain.csv", None),
+            ("gzip.csv", Some(CompressionFormat::Gzip)),
+            ("bzip.csv", Some(CompressionFormat::Bzip2)),
+        ] {
+            let bytes = match compression {
+                Some(format) => encode_compressed_fixture(format, data).await,
+                None => data.to_vec(),
+            };
+            let raw_size = bytes.len();
+            let mut reader = SelectPutObjReader::from_vec(bytes);
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("write multiline CSV");
+            let mut input = (*csv_input(BUCKET, object)).clone();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.allow_quoted_record_delimiter = Some(true);
+            input.request.input_serialization.compression_type = compression.map(|format| {
+                CompressionType::from_static(match format {
+                    CompressionFormat::Gzip => CompressionType::GZIP,
+                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                })
+            });
+            let metrics = Arc::new(SelectInputMetrics::default());
+            let store = EcObjectStore::build_with_snapshot(
+                Arc::new(input),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+                Arc::clone(&metrics),
+                prepare_test_snapshot(BUCKET, object).await,
+                JsonSource::default(),
+            )
+            .expect("snapshot store");
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open multiline CSV stream");
+            let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV must remain streaming") };
+            let output = stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("normalize multiline CSV")
+                .concat();
+            assert_eq!(output, b"\"name\",\"kind\"\n\"line\nbreak\",\"tail\"\n", "object={object}");
+            let measured = metrics.snapshot();
+            assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+            assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_record_delimiters_preserve_compressed_crlf_size_boundaries() {
+        use crate::input_stream::MAX_SELECT_RECORD_BYTES;
+
+        const BUCKET: &str = "select-quoted-crlf-limit";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for compression in [None, Some(CompressionFormat::Gzip), Some(CompressionFormat::Bzip2)] {
+            for size in [
+                MAX_SELECT_RECORD_BYTES - 1,
+                MAX_SELECT_RECORD_BYTES,
+                MAX_SELECT_RECORD_BYTES + 1,
+            ] {
+                for multiline in [false, true] {
+                    let mut data = vec![b'a'; size];
+                    if multiline {
+                        data[0] = b'"';
+                        data[size / 2] = b'\n';
+                        data[size - 1] = b'"';
+                    }
+                    data.extend_from_slice(b"\r\n");
+                    let bytes = match compression {
+                        Some(format) => encode_compressed_fixture(format, &data).await,
+                        None => data.clone(),
+                    };
+                    let raw_size = bytes.len();
+                    let object = format!("{compression:?}-{size}-{multiline}");
+                    let mut reader = SelectPutObjReader::from_vec(bytes);
+                    env.ecstore
+                        .put_object(BUCKET, &object, &mut reader, &Default::default())
+                        .await
+                        .expect("write boundary fixture");
+                    let mut input = (*csv_input(BUCKET, &object)).clone();
+                    let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+                    csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+                    csv.allow_quoted_record_delimiter = Some(true);
+                    input.request.input_serialization.compression_type = compression.map(|format| {
+                        CompressionType::from_static(match format {
+                            CompressionFormat::Gzip => CompressionType::GZIP,
+                            CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                        })
+                    });
+                    let metrics = Arc::new(SelectInputMetrics::default());
+                    let store = EcObjectStore::build_with_snapshot(
+                        Arc::new(input),
+                        Arc::new(GreedyMemoryPool::new(4 * MAX_SELECT_RECORD_BYTES)),
+                        None,
+                        Arc::clone(&metrics),
+                        prepare_test_snapshot(BUCKET, &object).await,
+                        JsonSource::default(),
+                    )
+                    .expect("boundary store");
+                    let result = store
+                        .get_opts(&Path::from(object.as_str()), GetOptions::default())
+                        .await
+                        .expect("open boundary stream");
+                    let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV stream") };
+                    let output = stream.try_collect::<Vec<_>>().await;
+                    if size > MAX_SELECT_RECORD_BYTES {
+                        let error = output.expect_err("logical records over 1 MiB must fail, even with embedded newlines");
+                        let object_store::Error::Generic { source, .. } = error else { panic!("typed record size error") };
+                        assert_eq!(source.downcast_ref::<SelectError>(), Some(&SelectError::OverMaxRecordSize));
+                    } else {
+                        let value = if multiline { &data[1..size - 1] } else { &data[..size] };
+                        let mut expected = vec![b'"'];
+                        expected.extend_from_slice(value);
+                        expected.extend_from_slice(b"\"\n");
+                        assert_eq!(output.expect("records within the limit must pass").concat(), expected, "object={object}");
+                        let measured = metrics.snapshot();
+                        assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+                        assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

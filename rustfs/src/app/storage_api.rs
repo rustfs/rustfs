@@ -271,7 +271,8 @@ pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
+        PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
         bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
@@ -1040,7 +1041,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
@@ -1180,6 +1181,7 @@ pub(crate) mod bucket_usecase {
 
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
+    pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 
     pub(crate) mod object_cache {
         #[cfg(test)]
@@ -1231,7 +1233,9 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
-            pub(crate) use super::super::super::storage_contracts::{CompletePart, MultipartOperations, MultipartUploadResult};
+            pub(crate) use super::super::super::storage_contracts::{
+                CompletePart, ListMultipartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
+            };
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 

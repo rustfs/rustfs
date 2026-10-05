@@ -159,6 +159,7 @@ impl ScannerIODisk for Disk {
         let ScannerDiskScanOptions {
             scan_mode,
             prefix_scan_scope,
+            checkpoint_tx,
         } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
@@ -224,6 +225,7 @@ impl ScannerIODisk for Disk {
             scan_mode,
             SCANNER_SLEEPER.clone(),
             prefix_scan_scope,
+            checkpoint_tx,
         )
         .await;
 

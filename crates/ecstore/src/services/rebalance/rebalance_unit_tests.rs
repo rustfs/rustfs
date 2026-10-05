@@ -34,27 +34,29 @@ use super::migration::{
 };
 use super::runtime::{
     RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation,
-    commit_local_rebalance_worker_activation_candidate, should_fail_repeated_rebalance_bucket_defer,
-    source_cleanup_defer_attempt, stage_local_rebalance_worker_activation,
+    commit_local_rebalance_worker_activation_candidate, reached_rebalance_source_cleanup_defer_limit,
+    should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt, stage_local_rebalance_worker_activation,
 };
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
     parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
     resolve_load_rebalance_stats_update_result, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
-    resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-    resolve_rebalance_terminal_error, resolve_rebalance_worker_result, run_rebalance_listing_with_retry,
-    send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
-    should_defer_rebalance_entry_failure, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
-    wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
+    resolve_rebalance_deferred_last_error, resolve_rebalance_entry_cleanup_delete_result,
+    resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+    resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result,
+    resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+    run_rebalance_listing_with_retry, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_retry_rebalance_listing,
+    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
-    RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
-    RebalanceStopPropagationRecord,
+    RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceDeferKind, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta,
+    RebalanceStats, RebalanceStopPropagationRecord,
 };
-use super::{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX};
+use super::{
+    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_MAX_DEFERS,
+};
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
 use crate::data_movement::SourceCleanupError;
@@ -1775,12 +1777,128 @@ fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_not_found() {
 
 #[test]
 fn test_resolve_rebalance_entry_cleanup_delete_result_returns_warning_for_failures() {
-    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown.into()), "bucket-a", "obj.txt");
+    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::FileAccessDenied.into()), "bucket-a", "obj.txt");
     assert!(matches!(
         result,
         RebalanceEntryCleanupResult::Completed { warning: Some(ref message) }
             if message.contains("rebalance cleanup delete failed for bucket-a/obj.txt")
     ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_defers_transient_failures() {
+    let cases = [
+        (Error::SlowDown, "slow down"),
+        (
+            Error::Lock(rustfs_lock::LockError::timeout("bucket-a/obj.txt@latest", Duration::from_secs(5))),
+            "object lock timeout",
+        ),
+        (
+            Error::Lock(rustfs_lock::LockError::network(
+                "peer unavailable",
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            )),
+            "object lock network failure",
+        ),
+        (Error::ErasureWriteQuorum, "write quorum"),
+        (Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)), "io timeout"),
+        (
+            Error::other("Lock error: Lock acquisition timeout for resource 'bucket-a/obj.txt@latest' after 5s"),
+            "rendered lock timeout text",
+        ),
+    ];
+
+    for (err, label) in cases {
+        match resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt") {
+            RebalanceEntryCleanupResult::Deferred { last_error } => {
+                assert!(
+                    last_error.starts_with(REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX),
+                    "{label}: {last_error}"
+                );
+                assert!(last_error.contains("bucket-a/obj.txt"), "{label}: {last_error}");
+            }
+            RebalanceEntryCleanupResult::Completed { warning } => {
+                panic!("{label} must defer source cleanup instead of completing the entry with warning {warning:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_defers_stage_wrapped_lock_timeout() {
+    let err = data_movement::data_movement_stage_error_for_test(
+        "rebalance",
+        "delete_object",
+        "bucket-a",
+        "obj.txt",
+        Error::Lock(rustfs_lock::LockError::timeout("bucket-a/obj.txt@latest", Duration::from_secs(5))),
+    );
+
+    assert!(matches!(
+        resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt"),
+        RebalanceEntryCleanupResult::Deferred { .. }
+    ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_stage_wrapped_not_found() {
+    let err = data_movement::data_movement_stage_error_for_test(
+        "rebalance",
+        "delete_object",
+        "bucket-a",
+        "obj.txt",
+        Error::ObjectNotFound("bucket-a".to_string(), "obj.txt".to_string()),
+    );
+
+    assert_eq!(
+        resolve_rebalance_entry_cleanup_delete_result(Err(err.into()), "bucket-a", "obj.txt"),
+        RebalanceEntryCleanupResult::Completed { warning: None }
+    );
+}
+
+#[test]
+fn test_resolve_rebalance_deferred_last_error_hides_retryable_cleanup_conflicts() {
+    let entry_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} timeout");
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(RebalanceDeferKind::Entry, None, entry_error.as_str()),
+        Some(entry_error.clone()),
+        "transient migration deferrals must stay visible to the completion guards"
+    );
+
+    let cleanup_error = format!("{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} lock acquisition timeout");
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(RebalanceDeferKind::SourceCleanup, None, cleanup_error.as_str()),
+        None,
+        "a retryable source cleanup conflict is progress, not a pool failure"
+    );
+
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(entry_error.as_str()),
+            cleanup_error.as_str()
+        ),
+        Some(entry_error.clone()),
+        "a cleanup deferral for one bucket must not erase an unresolved migration deferral of the same pool"
+    );
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(cleanup_error.as_str()),
+            cleanup_error.as_str()
+        ),
+        None,
+        "a stale retryable cleanup message must not survive as a pool failure"
+    );
+    assert_eq!(
+        resolve_rebalance_deferred_last_error(
+            RebalanceDeferKind::SourceCleanup,
+            Some(entry_error.as_str()),
+            entry_error.as_str()
+        ),
+        Some(entry_error),
+        "repeated cleanup deferrals must keep the pending migration deferral visible"
+    );
 }
 
 #[test]
@@ -1817,6 +1935,89 @@ fn test_source_cleanup_defer_does_not_fail_repeated_bucket_retry() {
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 1);
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 2);
     assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 3);
+
+    let mut bounded_attempts = std::collections::HashMap::new();
+    for expected in 1..REBALANCE_SOURCE_CLEANUP_MAX_DEFERS {
+        assert_eq!(source_cleanup_defer_attempt(&mut bounded_attempts, "bucket-d"), expected);
+        assert!(
+            !reached_rebalance_source_cleanup_defer_limit(expected),
+            "a retryable cleanup conflict must stay retryable at deferral {expected}"
+        );
+    }
+    assert_eq!(
+        source_cleanup_defer_attempt(&mut bounded_attempts, "bucket-d"),
+        REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
+    );
+    assert!(
+        reached_rebalance_source_cleanup_defer_limit(REBALANCE_SOURCE_CLEANUP_MAX_DEFERS),
+        "an unreclaimable source replica must fail the bucket after the bounded deferral budget"
+    );
+}
+
+#[tokio::test]
+async fn test_defer_rebalance_bucket_keeps_pending_entry_defer_without_surfacing_cleanup_conflicts() {
+    let id = "rebalance-defer-last-error";
+    let meta = RebalanceMeta {
+        id: id.to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let cleanup_error = format!("{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} lock acquisition timeout");
+
+    store
+        .defer_rebalance_bucket(0, "bucket-a".to_string(), cleanup_error.clone(), id, RebalanceDeferKind::SourceCleanup)
+        .await
+        .expect("a retryable cleanup conflict must be deferrable");
+    {
+        let meta = store.rebalance_meta.read().await;
+        let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(
+            pool_stat.info.last_error, None,
+            "a retryable cleanup conflict is progress and must not surface as a pool failure"
+        );
+        assert_eq!(pool_stat.buckets, vec!["bucket-b".to_string(), "bucket-a".to_string()]);
+    }
+
+    let entry_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} slow down");
+    {
+        let mut meta = store.rebalance_meta.write().await;
+        meta.as_mut().expect("rebalance metadata should exist").pool_stats[0]
+            .info
+            .last_error = Some(entry_error.clone());
+    }
+    store
+        .defer_rebalance_bucket(0, "bucket-b".to_string(), cleanup_error, id, RebalanceDeferKind::SourceCleanup)
+        .await
+        .expect("a cleanup deferral must be accepted while another bucket still defers an entry");
+    {
+        let meta = store.rebalance_meta.read().await;
+        let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(
+            pool_stat.info.last_error,
+            Some(entry_error),
+            "a cleanup deferral must not erase the pending migration deferral that blocks goal completion"
+        );
+        assert!(has_deferred_rebalance_error(pool_stat));
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
+    }
+
+    let migration_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} i/o timeout");
+    store
+        .defer_rebalance_bucket(0, "bucket-a".to_string(), migration_error.clone(), id, RebalanceDeferKind::Entry)
+        .await
+        .expect("migration deferrals must keep their last error");
+    let meta = store.rebalance_meta.read().await;
+    let pool_stat = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+    assert_eq!(pool_stat.info.last_error, Some(migration_error));
 }
 
 #[test]

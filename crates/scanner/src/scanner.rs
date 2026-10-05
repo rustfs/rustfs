@@ -333,6 +333,7 @@ pub struct ScannerCycleScheduleStatus {
     execution_role: &'static str,
     effective_interval_available: bool,
     effective_interval_seconds: u64,
+    usage_bootstrap_rebuild_pending: bool,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
     superseded_retry_backoff_enabled: bool,
@@ -345,6 +346,7 @@ impl Default for ScannerCycleScheduleStatus {
             execution_role: "unknown",
             effective_interval_available: false,
             effective_interval_seconds: 0,
+            usage_bootstrap_rebuild_pending: false,
             clean_idle_backoff_enabled: false,
             clean_idle_backoff_multiplier: 1,
             superseded_retry_backoff_enabled: false,
@@ -368,6 +370,7 @@ pub fn scanner_cycle_schedule_status() -> ScannerCycleScheduleStatus {
 
 fn record_scanner_cycle_schedule(
     effective_interval: Duration,
+    usage_bootstrap_rebuild_pending: bool,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
     superseded_retry_backoff_enabled: bool,
@@ -383,6 +386,7 @@ fn record_scanner_cycle_schedule(
         execution_role: "leader",
         effective_interval_available: true,
         effective_interval_seconds,
+        usage_bootstrap_rebuild_pending,
         clean_idle_backoff_enabled,
         clean_idle_backoff_multiplier: clean_idle_backoff_multiplier.max(1),
         superseded_retry_backoff_enabled,
@@ -1161,6 +1165,56 @@ impl ScannerMaintenanceFeatures {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerUsageBootstrapRebuild {
+    pending: bool,
+}
+
+impl ScannerUsageBootstrapRebuild {
+    fn from_startup(startup: PersistedUsageFloorStartup) -> Self {
+        Self {
+            pending: startup != PersistedUsageFloorStartup::Authoritative,
+        }
+    }
+
+    fn pending(self) -> bool {
+        self.pending
+    }
+
+    fn wait_plan(self, mut plan: ScannerCycleWaitPlan, convergence_retry_interval: Option<Duration>) -> ScannerCycleWaitPlan {
+        if self.pending && convergence_retry_interval.is_none() {
+            plan.delay = Duration::ZERO;
+        }
+        plan
+    }
+
+    fn clean_idle_backoff_enabled(self, enabled: bool) -> bool {
+        enabled && !self.pending
+    }
+
+    fn requires_full_scan(
+        self,
+        maintenance_features: ScannerMaintenanceFeatures,
+        observed_generation: Option<u64>,
+        current_generation: u64,
+        wake: ScannerCycleWakeReason,
+    ) -> bool {
+        self.pending || maintenance_features.requires_full_scan(observed_generation, current_generation, wake)
+    }
+
+    fn record_cycle(&mut self, outcome: ScannerCycleOutcome) -> bool {
+        if matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ) {
+            let was_pending = self.pending;
+            self.pending = false;
+            return was_pending;
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MaintenanceInspectionDecision {
     Accept,
     Retry,
@@ -1400,13 +1454,32 @@ fn bitrot_scan_cycle() -> Option<Duration> {
     resolve_scanner_runtime_config().bitrot_cycle
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerBitrotPolicy {
+    cycle: Option<Duration>,
+    deep_window_cycles: Option<u64>,
+}
+
+impl ScannerBitrotPolicy {
+    fn new(cycle: Option<Duration>, deep_scan_supported: bool, deep_window_cycles: u64) -> Self {
+        Self {
+            cycle,
+            deep_window_cycles: deep_scan_supported.then_some(deep_window_cycles),
+        }
+    }
+}
+
 fn get_cycle_scan_mode(
     current_cycle: u64,
     bitrot_start_cycle: u64,
     bitrot_start_time: Option<DateTime<Utc>>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> HealScanMode {
-    let Some(bitrot_cycle) = bitrot_cycle else {
+    let Some(bitrot_cycle) = policy.cycle else {
+        return HealScanMode::Normal;
+    };
+
+    let Some(deep_window_cycles) = policy.deep_window_cycles else {
         return HealScanMode::Normal;
     };
 
@@ -1414,7 +1487,7 @@ fn get_cycle_scan_mode(
         return HealScanMode::Deep;
     }
 
-    if current_cycle.saturating_sub(bitrot_start_cycle) < heal_object_select_prob() as u64 {
+    if current_cycle.saturating_sub(bitrot_start_cycle) < deep_window_cycles {
         return HealScanMode::Deep;
     }
 
@@ -1438,10 +1511,9 @@ fn background_heal_info_for_scan_start(
     current_cycle: u64,
     scan_mode: HealScanMode,
     now: DateTime<Utc>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> Option<BackgroundHealInfo> {
-    let reset_bitrot_start =
-        scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, bitrot_cycle);
+    let reset_bitrot_start = scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, policy);
     if info.current_scan_mode == scan_mode && !reset_bitrot_start {
         return None;
     }
@@ -1459,13 +1531,17 @@ fn should_reset_bitrot_start(
     info: &BackgroundHealInfo,
     current_cycle: u64,
     now: DateTime<Utc>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> bool {
     let Some(bitrot_start_time) = info.bitrot_start_time else {
         return true;
     };
 
-    let Some(bitrot_cycle) = bitrot_cycle else {
+    let Some(bitrot_cycle) = policy.cycle else {
+        return false;
+    };
+
+    let Some(deep_window_cycles) = policy.deep_window_cycles else {
         return false;
     };
 
@@ -1473,7 +1549,7 @@ fn should_reset_bitrot_start(
         return true;
     }
 
-    if current_cycle.saturating_sub(info.bitrot_start_cycle) < heal_object_select_prob() as u64 {
+    if current_cycle.saturating_sub(info.bitrot_start_cycle) < deep_window_cycles {
         return false;
     }
 
@@ -1724,18 +1800,21 @@ where
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
-        BackgroundHealInfoReadStatus::ErasureSd
-        | BackgroundHealInfoReadStatus::Loaded
-        | BackgroundHealInfoReadStatus::Missing => {}
+        BackgroundHealInfoReadStatus::Loaded | BackgroundHealInfoReadStatus::Missing => {}
     }
     let mut background_heal_info = background_heal_read.info;
     let background_heal_epoch = background_heal_read.expected_epoch;
+    let bitrot_policy = ScannerBitrotPolicy::new(
+        configured_bitrot_cycle,
+        !storeapi.setup_is_erasure_sd().await,
+        heal_object_select_prob() as u64,
+    );
 
     let scan_mode = get_cycle_scan_mode(
         cycle_info.current,
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
-        configured_bitrot_cycle,
+        bitrot_policy,
     );
     info!(
         target: "rustfs::scanner",
@@ -1753,7 +1832,7 @@ where
         cycle_info.current,
         scan_mode,
         Utc::now(),
-        configured_bitrot_cycle,
+        bitrot_policy,
     ) {
         background_heal_info = new_heal_info.clone();
         save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
@@ -2151,6 +2230,7 @@ where
                 cycle = cycle_info.current,
                 required_cycle,
                 state = "cache_cycle_ahead",
+                partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
@@ -2178,7 +2258,7 @@ where
                 emit_scan_cycle_deferred(cycle_start.elapsed());
                 ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
-                ScannerCycleOutcome::Failed
+                ScannerCycleOutcome::StatePersistenceFailed
             };
         }
         Some(ScannerCyclePreCommitOutcome::Deferred(reason)) => {
@@ -2257,11 +2337,20 @@ where
             emit_scan_cycle_deferred(cycle_start.elapsed());
             ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
         } else {
-            ScannerCycleOutcome::Failed
+            ScannerCycleOutcome::StatePersistenceFailed
         };
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
+    let partial_cause = if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        ) {
+        "activity_unverified_observation"
+    } else {
+        "incomplete_coverage"
+    };
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2292,7 +2381,7 @@ where
     };
     let pending_maintenance_work = scanner_pending_maintenance_work || unresolved_heal_work || remote_dirty_usage_pending;
     match completion_outcome {
-        ScannerCycleOutcome::Failed => {
+        ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -2326,6 +2415,7 @@ where
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     cycle = cycle_info.current,
                     state = "incomplete",
+                    partial_cause,
                     "Scanner cycle ended without a complete usage snapshot"
                 );
             }
@@ -2351,7 +2441,7 @@ where
                 emit_scan_cycle_deferred(cycle_start.elapsed());
                 ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
-                ScannerCycleOutcome::Failed
+                ScannerCycleOutcome::StatePersistenceFailed
             };
         }
         ScannerCycleOutcome::Deferred(reason) => {
@@ -2404,7 +2494,7 @@ where
                 return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            return ScannerCycleOutcome::Failed;
+            return ScannerCycleOutcome::StatePersistenceFailed;
         }
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => {}
     }
@@ -2452,7 +2542,7 @@ where
         }
         cycle_metrics_guard.finish(cycle_info.clone()).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        return ScannerCycleOutcome::Failed;
+        return ScannerCycleOutcome::StatePersistenceFailed;
     }
     cycle_budget.mark_cycle_state_persisted();
 
@@ -2770,6 +2860,7 @@ where
     };
     let (allow_usage_floor_bootstrap_pending, usage_floor_cycle_reset_policy) =
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
+    let mut usage_bootstrap_rebuild = ScannerUsageBootstrapRebuild::from_startup(usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
     match usage_floor_startup {
         PersistedUsageFloorStartup::Authoritative
@@ -2888,7 +2979,13 @@ where
         return Ok(());
     }
 
-    let initial_pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+    let initial_pause_backlog_attempt = if usage_bootstrap_rebuild.pending() {
+        pause_backlog
+            .begin_usage_bootstrap_rebuild_attempt(scanner_pause_backlog_now())
+            .await
+    } else {
+        pause_backlog.begin_attempt(scanner_pause_backlog_now()).await
+    };
     if !ctx.is_cancelled()
         && matches!(
             initial_pause_backlog_attempt,
@@ -2896,6 +2993,7 @@ where
         )
     {
         // Preserve previous behavior: run one cycle immediately after lock acquisition.
+        let usage_bootstrap_pending_before_cycle = usage_bootstrap_rebuild.pending();
         let dirty_generation_before_cycle = dirty_usage_generation();
         let dirty_usage_pending_before_cycle = dirty_usage_buckets_pending();
         let maintenance_generation_before_cycle = scanner_maintenance_generation();
@@ -2958,6 +3056,15 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, initial_pause_backlog_attempt, initial_outcome).await;
+        if initial_outcome == ScannerCycleOutcome::StatePersistenceFailed {
+            global_metrics().set_cycle(None).await;
+            let error = "scanner cycle state persistence failed; retrying from durable state".to_string();
+            finish_scanner_leader_iteration(false, "state_persist_failed", error.clone()).await;
+            return Err(ScannerError::Other(error));
+        }
+        if usage_bootstrap_rebuild.record_cycle(initial_outcome) {
+            clean_idle_backoff.reset();
+        }
         superseded_backoff.record_retryable_cycle(initial_outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(initial_outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -2983,12 +3090,12 @@ where
             scanner_activity_backoff_blocked = true;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -2999,7 +3106,8 @@ where
                 dirty_usage_pending_before_cycle,
                 dirty_generation_before_cycle,
                 dirty_usage_generation(),
-            ) || maintenance_generation_before_cycle != scanner_maintenance_generation()
+            ) || usage_bootstrap_pending_before_cycle
+                || maintenance_generation_before_cycle != scanner_maintenance_generation()
                 || scanner_activity_observed_work(scanner_activity_observation),
         );
         runtime_config_generation_seen = scanner_runtime_config_generation();
@@ -3040,12 +3148,12 @@ where
             scanner_activity_seen = None;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
         let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
@@ -3055,16 +3163,20 @@ where
             wait_plan.effective_interval = retry_interval;
             wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
         }
-        if let Some(pause_backlog_delay) = pause_backlog.scheduling_delay(scanner_pause_backlog_now()) {
+        if let Some(pause_backlog_delay) =
+            pause_backlog.scheduling_delay(scanner_pause_backlog_now(), usage_bootstrap_rebuild.pending())
+        {
             wait_plan.effective_interval = pause_backlog_delay.max(Duration::from_secs(1));
             wait_plan.delay = pause_backlog_delay;
             convergence_retry_interval = Some(pause_backlog_delay.max(Duration::from_secs(1)));
         }
+        wait_plan = usage_bootstrap_rebuild.wait_plan(wait_plan, convergence_retry_interval);
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
         let maintenance_generation_before_wait = scanner_maintenance_generation();
         record_scanner_cycle_schedule(
             wait_plan.effective_interval,
+            usage_bootstrap_rebuild.pending(),
             backoff_enabled,
             u64::from(clean_idle_backoff.interval_multiplier),
             superseded_retry_interval.is_some(),
@@ -3079,6 +3191,7 @@ where
             effective_interval = ?wait_plan.effective_interval,
             clean_idle_max_interval = ?wait_plan.clean_idle_max_interval,
             scheduled_delay = ?wait_plan.delay,
+            usage_bootstrap_rebuild_pending = usage_bootstrap_rebuild.pending(),
             interval_multiplier = clean_idle_backoff.interval_multiplier,
             clean_idle_backoff_enabled = backoff_enabled,
             superseded_retry_backoff_enabled = superseded_retry_interval.is_some(),
@@ -3101,6 +3214,7 @@ where
             movement_changed,
             current_movement_generation: move || movement_store.scanner_data_movement_generation(),
             is_lock_lost: || guard.is_lock_lost(),
+            recovery_wake: Some(&SCANNER_CYCLE_RECOVERY_WAKE),
         };
         let wake_reason = wait_for_next_scanner_cycle_with_activity_and_movement(
             &ctx,
@@ -3149,7 +3263,8 @@ where
             ScannerCycleWakeReason::Timer
             | ScannerCycleWakeReason::DirtyUsage
             | ScannerCycleWakeReason::ClusterActivity
-            | ScannerCycleWakeReason::ClusterActivityUnavailable => {}
+            | ScannerCycleWakeReason::ClusterActivityUnavailable
+            | ScannerCycleWakeReason::Recovery => {}
         }
 
         if wake_reason == ScannerCycleWakeReason::DirtyUsage {
@@ -3191,13 +3306,20 @@ where
         if pause_backlog_observation.paused {
             continue;
         }
-        let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+        let pause_backlog_attempt = if usage_bootstrap_rebuild.pending() {
+            pause_backlog
+                .begin_usage_bootstrap_rebuild_attempt(scanner_pause_backlog_now())
+                .await
+        } else {
+            pause_backlog.begin_attempt(scanner_pause_backlog_now()).await
+        };
         if matches!(
             pause_backlog_attempt,
             ScannerPauseBacklogAttemptDecision::RateLimited | ScannerPauseBacklogAttemptDecision::PersistenceUnavailable
         ) {
             continue;
         }
+        let usage_bootstrap_pending_before_cycle = usage_bootstrap_rebuild.pending();
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
@@ -3212,7 +3334,8 @@ where
                 leader_epoch,
                 cycle_budget.clone(),
                 ScannerCycleScheduling {
-                    requires_full_scan: maintenance_features.requires_full_scan(
+                    requires_full_scan: usage_bootstrap_rebuild.requires_full_scan(
+                        maintenance_features,
                         maintenance_generation_seen,
                         scanner_maintenance_generation(),
                         wake_reason,
@@ -3256,6 +3379,15 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, pause_backlog_attempt, outcome).await;
+        if outcome == ScannerCycleOutcome::StatePersistenceFailed {
+            global_metrics().set_cycle(None).await;
+            let error = "scanner cycle state persistence failed; retrying from durable state".to_string();
+            finish_scanner_leader_iteration(false, "state_persist_failed", error.clone()).await;
+            return Err(ScannerError::Other(error));
+        }
+        if usage_bootstrap_rebuild.record_cycle(outcome) {
+            clean_idle_backoff.reset();
+        }
         superseded_backoff.record_retryable_cycle(outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -3314,12 +3446,12 @@ where
             scanner_activity_backoff_blocked = true;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -3330,7 +3462,8 @@ where
                 dirty_usage_pending_before_wait,
                 dirty_generation_before_wait,
                 dirty_usage_generation(),
-            ) || scanner_activity_observed_work(scanner_activity_observation),
+            ) || usage_bootstrap_pending_before_cycle
+                || scanner_activity_observed_work(scanner_activity_observation),
         );
     }
 
@@ -3404,8 +3537,26 @@ where
     // Pending namespace commits invalidate this publication attempt, but only
     // storage movement creates durable, rate-limited catch-up debt.
     if storeapi.scanner_data_movement_pause_status().await.paused {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "data_movement",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::DataMovement)
     } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "pending_namespace_commit",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     }
 }
@@ -3421,7 +3572,24 @@ fn scanner_post_lease_activity_defer_reason(
         {
             None
         }
-        Ok(_) | Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        observed => {
+            let blocker = match &observed {
+                Err(_) => "probe_failed",
+                Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
+                Ok(_) if expected_digest.is_none() => "baseline_missing",
+                Ok(_) => "activity_changed",
+            };
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                stage = "post_lease_activity",
+                blocker,
+                "Scanner usage publication deferred"
+            );
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
     }
 }
 
@@ -3678,6 +3846,7 @@ mod usage_store;
 
 use activity::*;
 use backlog::*;
+pub use backlog::{ScannerPauseBacklogReplicaId, ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState};
 use cycle_state::*;
 use leadership::*;
 pub(crate) use usage_store::RootPublicationProof;

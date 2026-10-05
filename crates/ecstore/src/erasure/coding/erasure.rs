@@ -657,6 +657,10 @@ pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
 }
 
 impl Erasure {
+    pub(crate) fn uses_legacy_codec(&self) -> bool {
+        self.uses_legacy
+    }
+
     /// Create a new Erasure instance
     ///
     /// # Arguments

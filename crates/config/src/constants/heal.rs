@@ -208,9 +208,9 @@ pub const DEFAULT_HEAL_MRF_REPLAY_BATCH: usize = 256;
 
 /// Environment variable selecting how admin heal starts behave when the
 /// requested path overlaps an already running or queued heal: `merge`
-/// (default, keep today's dedup/merge semantics) or `minio_error` (return a
-/// typed already-running / overlapping-paths rejection like madmin).
+/// (default, merge equivalent starts and reject other overlapping admin
+/// scopes) or `minio_error` (also reject equivalent starts like madmin).
 pub const ENV_HEAL_OVERLAP_POLICY: &str = "RUSTFS_HEAL_OVERLAP_POLICY";
 
-/// Default overlap policy: merge duplicate/overlapping requests.
+/// Default overlap policy: merge equivalent requests, reject overlapping scopes.
 pub const DEFAULT_HEAL_OVERLAP_POLICY: &str = "merge";

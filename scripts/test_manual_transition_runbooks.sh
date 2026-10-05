@@ -182,25 +182,42 @@ if ! rg -q "ERROR: --admin-token cannot be combined with --access-key/--secret-k
   exit 1
 fi
 
-bash scripts/monitor_manual_transition_ci.sh --help >/tmp/monitor_manual_transition_ci.help
-rg -q "Usage:" /tmp/monitor_manual_transition_ci.help
-if bash scripts/monitor_manual_transition_ci.sh --issues >/tmp/monitor_manual_transition_ci.err 2>&1; then
+bash scripts/monitor_manual_transition_ci.sh --help >"$TMP_DIR/monitor.help"
+rg -q "Usage:" "$TMP_DIR/monitor.help"
+mkdir -p "$TMP_DIR/no-monitor-tools"
+if PATH="$TMP_DIR/no-monitor-tools" "$BASH" scripts/monitor_manual_transition_ci.sh --issues >"$TMP_DIR/monitor.err" 2>&1; then
   echo "monitor script should fail when --issues has no value" >&2
   exit 1
 fi
-if ! rg -q "ERROR: missing value for --issues" /tmp/monitor_manual_transition_ci.err; then
+if ! rg -qx "ERROR: missing value for --issues" "$TMP_DIR/monitor.err"; then
   echo "monitor script missing missing-value guard for --issues" >&2
+  cat "$TMP_DIR/monitor.err" >&2
   exit 1
 fi
 
-if bash scripts/monitor_manual_transition_ci.sh --runs 0 >/tmp/monitor_manual_transition_ci.err 2>&1; then
-  echo "monitor script should fail on invalid --runs" >&2
-  exit 1
-fi
-if ! rg -q "ERROR: --runs must be a positive integer" /tmp/monitor_manual_transition_ci.err; then
-  echo "monitor script missing invalid --runs guard output" >&2
-  exit 1
-fi
+for runs in 0 00 -1 abc; do
+  if PATH="$TMP_DIR/no-monitor-tools" "$BASH" scripts/monitor_manual_transition_ci.sh --runs "$runs" >"$TMP_DIR/monitor.err" 2>&1; then
+    echo "monitor script should fail on invalid --runs: $runs" >&2
+    exit 1
+  fi
+  if [[ "$(cat "$TMP_DIR/monitor.err")" != "ERROR: --runs must be a positive integer" ]]; then
+    echo "monitor script missing invalid --runs guard output for: $runs" >&2
+    cat "$TMP_DIR/monitor.err" >&2
+    exit 1
+  fi
+done
+
+for runs in 1 8 100; do
+  if PATH="$TMP_DIR/no-monitor-tools" "$BASH" scripts/monitor_manual_transition_ci.sh --runs "$runs" >"$TMP_DIR/monitor.err" 2>&1; then
+    echo "monitor script should still require its tools for valid --runs: $runs" >&2
+    exit 1
+  fi
+  if [[ "$(cat "$TMP_DIR/monitor.err")" != "ERROR: required command not found: gh" ]]; then
+    echo "monitor script missing dependency guard for valid --runs: $runs" >&2
+    cat "$TMP_DIR/monitor.err" >&2
+    exit 1
+  fi
+done
 
 bash "$FAILURE_SAMPLES" --help >/tmp/manual_transition_failure_samples.help
 rg -q "Usage:" /tmp/manual_transition_failure_samples.help

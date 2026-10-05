@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -92,7 +93,24 @@ class EvidenceTests(unittest.TestCase):
         result = evidence.aggregate(self.chain, self.directory, self.needs)
         self.assertTrue(result["complete"])
         self.assertEqual(result["chain"], self.chain)
-        self.assertEqual(len(result["suites"]), 10)
+        self.assertEqual([suite["suite"] for suite in result["suites"]], [
+            "upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication",
+            "fault-tolerance", "table", "performance"])
+
+    def test_release_suites_cannot_be_missing_failed_or_have_missing_artifacts(self):
+        for suite in ("fault-tolerance", "table"):
+            with self.subTest(suite=suite):
+                missing = {key: value for key, value in self.needs.items() if key != suite}
+                with self.assertRaises(ValueError):
+                    evidence.aggregate(self.chain, self.directory, missing)
+                with self.assertRaises(ValueError):
+                    evidence.aggregate(self.chain, self.directory, {**self.needs, suite: {"result": "failure"}})
+                path = self.directory / (suite + ".json")
+                original = path.read_text()
+                path.unlink()
+                with self.assertRaises(ValueError):
+                    evidence.aggregate(self.chain, self.directory, self.needs)
+                path.write_text(original)
 
     def test_failure_report_preserves_counts_without_weakening_success_gate(self):
         path = self.directory / "s3.json"
@@ -109,10 +127,10 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evidence.aggregate(self.chain, self.directory, needs)
 
-    def test_preparation_failure_still_has_all_ten_lanes(self):
+    def test_preparation_failure_still_has_all_required_lanes(self):
         result = evidence.summarize(None, self.directory / "absent", {"prepare": {"result": "failure"}})
         self.assertFalse(result["complete"])
-        self.assertEqual(len(result["lanes"]), 10)
+        self.assertEqual([lane["suite"] for lane in result["lanes"]], list(evidence.SUITES))
         self.assertIn("| performance | missing | missing |", evidence.render_summary(result))
         self.assertIn("Preparation: failure", evidence.render_summary(result))
 
@@ -164,6 +182,19 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evidence.report_counts(header + "put\t1MiB\t\t\t\t\t\t\n", True)
 
+    def test_fault_tolerance_requires_complete_known_verdicts(self):
+        passing = "FT-CASE: A-read verdict=pass observed expected result\n"
+        divergent = "FT-CASE: C2-read verdict=known-divergence lock majority unavailable\n"
+        summary = "FT-SUMMARY: unexpected=0 known-divergence=1 strict=0\n"
+        counts = evidence.fault_tolerance_counts(passing + divergent + summary)
+        self.assertEqual(counts["PASS"], 1)
+        self.assertEqual(counts["UNSUPPORTED"], 1)
+        for invalid in (passing, passing + passing + summary, passing + divergent + summary.replace("strict=0", "strict=1"),
+                        passing + divergent + summary.replace("known-divergence=1", "known-divergence=0"),
+                        passing.replace("verdict=pass", "verdict=UNKNOWN") + summary):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                evidence.fault_tolerance_counts(invalid)
+
 
 class EnvelopeTests(unittest.TestCase):
     def setUp(self):
@@ -196,6 +227,20 @@ class EnvelopeTests(unittest.TestCase):
                 evidence.current_chain()
         self.assertFalse((self.root / "env").exists())
 
+    def test_testing_sha_fallback_is_accepted_while_garbage_is_rejected(self):
+        # prepare's >24h staleness fallback legitimately sets testing_sha to
+        # auto-testing main HEAD, which differs from the committed pin; only
+        # the sha format is an invariant now.
+        for testing_sha, ok in (("d" * 40, True), ("1" * 40, True), ("xyz", False), ("", False)):
+            chain = dict(self.chain, testing_sha=testing_sha)
+            env = dict(self.env, CHAIN_MANIFEST=json.dumps(chain))
+            if ok:
+                with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, env), mock.patch.object(evidence.subprocess, "check_output", return_value="e" * 40):
+                    evidence.consume(evidence.current_chain())
+            else:
+                with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, env), mock.patch.object(evidence.subprocess, "check_output", return_value="e" * 40), self.assertRaises(ValueError):
+                    evidence.current_chain()
+
     def test_report_or_swallowed_test_failure_cannot_produce_valid_evidence(self):
         report = self.root / "cases.md"
         report.write_text("| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n")
@@ -227,10 +272,58 @@ class EnvelopeTests(unittest.TestCase):
                 evidence.record(self.chain, "kms", report, self.root / "new" / "kms.json")
             self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
 
+    def test_record_uses_workspace_testing_checkout_for_nested_lane(self):
+        lane_checkout = self.root / "rustfs-repo"
+        lane_checkout.mkdir()
+        private_checkout = self.root / "auto-testing"
+        private_checkout.mkdir()
+        subprocess.run(["git", "init", "--quiet", str(private_checkout)], check=True)
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgSign=false", "commit", "--allow-empty", "-qm", "fixture"],
+                       cwd=private_checkout, check=True)
+        private_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=private_checkout, text=True).strip()
+        chain = {**self.chain, "testing_sha": private_head}
+        report = self.root / "security.md"
+        report.write_text("| Case | Status |\n| --- | --- |\n| SEC-1 | PASS |\n")
+        env = {**self.env, "GITHUB_WORKSPACE": str(self.root)}
+        output = self.root / "nested-success" / "security.json"
+        with mock.patch.object(evidence, "ROOT", lane_checkout), mock.patch.dict(evidence.os.environ, env):
+            evidence.record(chain, "security", report, output)
+            self.assertTrue(json.loads(output.read_text())["valid"])
+            wrong_pin_output = self.root / "nested-wrong-pin" / "security.json"
+            with self.assertRaisesRegex(ValueError, "suite used a different private script revision"):
+                evidence.record({**chain, "testing_sha": "f" * 40}, "security", report, wrong_pin_output)
+            self.assertFalse(json.loads(wrong_pin_output.read_text())["valid"])
+        fallback_output = self.root / "local-success" / "security.json"
+        with mock.patch.object(evidence, "ROOT", self.root), mock.patch.dict(evidence.os.environ, self.env):
+            evidence.os.environ.pop("GITHUB_WORKSPACE", None)
+            evidence.record(chain, "security", report, fallback_output)
+            self.assertTrue(json.loads(fallback_output.read_text())["valid"])
+
     def test_unknown_status_cannot_hide_among_passing_cases(self):
         text = "| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n| KMS-2 | fixture | NOT RUN |\n"
         with self.assertRaises(ValueError):
             evidence.report_counts(text)
+
+    def test_release_suite_records_require_successful_execution_and_complete_reports(self):
+        reports = {
+            "table": "| Case | Name | Status |\n| --- | --- | --- |\n| TBL-101 | Iceberg smoke | PASS |\n",
+            "fault-tolerance": "FT-CASE: A-read verdict=pass read succeeded\nFT-SUMMARY: unexpected=0 known-divergence=0 strict=0\n",
+        }
+        for suite, text in reports.items():
+            report = self.root / (suite + ".txt")
+            report.write_text(text)
+            for status in ("success", "failure"):
+                with self.subTest(suite=suite, status=status):
+                    output = self.root / (suite + "-" + status) / (suite + ".json")
+                    with mock.patch.dict(evidence.os.environ, {**self.env, "CHAIN_TEST_OUTCOME": status}), \
+                            mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40):
+                        if status == "success":
+                            evidence.record(self.chain, suite, report, output)
+                        else:
+                            with self.assertRaises(ValueError):
+                                evidence.record(self.chain, suite, report, output)
+                    self.assertEqual(json.loads(output.read_text())["valid"], status == "success")
 
     def test_driver_passes_one_manifest_and_runs_every_lane_after_failure(self):
         from check_test_wiring import yaml_block
@@ -259,16 +352,19 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn("check_functional_runners.py pf-testing", prepare)
         self.assertIn("performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}", prepare)
 
-    def test_every_lane_retains_failed_evidence_and_deduplicates_its_own_attempt(self):
+    def test_every_lane_retains_failed_evidence_and_identifies_its_own_attempt(self):
         paths = list((candidate.ROOT / ".github/workflows").glob("rustfs-*-test.yml"))
         lanes = [path for path in paths if "name: Upload chain evidence" in path.read_text()]
-        self.assertEqual(len(lanes), 10)
+        self.assertEqual(len(lanes), len(evidence.SUITES))
         for path in lanes:
             with self.subTest(path=path.name):
                 text = path.read_text()
                 self.assertIn("if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", text)
-                self.assertIn("attempt ${GITHUB_RUN_ATTEMPT})", text)
-                self.assertIn('select(.title == \\"${TITLE}\\")', text)
+                self.assertIn("python3 auto-testing/scripts/issue_manager.py handle", text)
+                self.assertIn('--run-id "${GITHUB_RUN_ID}"', text)
+                self.assertIn('--attempt "${GITHUB_RUN_ATTEMPT}"', text)
+                run_url = next(line for line in text.splitlines() if "--run-url" in line)
+                self.assertIn('/attempts/${GITHUB_RUN_ATTEMPT}#summary"', run_url)
 
     def test_table_issue_manager_receives_outcome_and_case_evidence(self):
         text = (candidate.ROOT / ".github/workflows/rustfs-table-test.yml").read_text()
@@ -303,6 +399,27 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(runners, "api", side_effect=OSError("forbidden")), self.assertRaises(OSError):
             runners.check(["pf-testing"])
 
+    def test_release_lanes_use_pinned_scripts_and_verified_package_before_recording(self):
+        for suite, report in (("fault-tolerance", "suite.log"), ("table", "cases.md")):
+            with self.subTest(suite=suite):
+                workflow = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
+                self.assertIn("  workflow_call:", workflow)
+                self.assertIn("  workflow_dispatch:", workflow)
+                self.assertIn("group: rustfs-shared-functional-tests-v2", workflow)
+                expected_ref = (
+                    "ref: ${{ steps.chain.outputs.testing_sha || inputs.auto_testing_ref || 'main' }}"
+                    if suite == "fault-tolerance"
+                    else "ref: ${{ steps.chain.outputs.testing_sha || 'main' }}"
+                )
+                self.assertIn(expected_ref, workflow)
+                self.assertIn("steps.chain_package.outputs.package_url || inputs.package_url", workflow)
+                self.assertLess(workflow.index("prepare_functional_package.py prepare"), workflow.index("id: test"))
+                self.assertIn("prepare_functional_package.py cleanup", workflow)
+                self.assertIn(f"functional_chain_evidence.py record --suite {suite}", workflow)
+                self.assertIn('--report "${FUNCTIONAL_ARTIFACTS_DIR}/' + report + '"', workflow)
+                self.assertIn("CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}", workflow)
+                self.assertIn("CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}", workflow)
+
 
 class WorkflowTimeoutTests(unittest.TestCase):
     def test_non_performance_suites_have_hard_and_step_deadlines(self):
@@ -310,17 +427,27 @@ class WorkflowTimeoutTests(unittest.TestCase):
         from test_security_workflow import FunctionalWorkflowTests, named_steps
         jobs = {**FunctionalWorkflowTests.JOBS, "security": "security-test"}
         jobs.pop("performance")
-        self.assertEqual(len(jobs), 10)
+        self.assertEqual(len(jobs), 11)
         for suite, job_id in jobs.items():
             with self.subTest(suite=suite):
                 source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
-                self.assertIn("    timeout-minutes: 60", job)
+                job_timeout = 360 if suite == "pool-expand" else 60
+                self.assertIn(f"    timeout-minutes: {job_timeout}", job)
                 steps = named_steps(job)
                 primary = [step for step in steps.values() if any(
                     line in ("        id: test", "        id: pool_test") for line in step)]
                 self.assertEqual(len(primary), 1)
-                self.assertIn("        timeout-minutes: 45", primary[0])
+                if suite == "pool-expand":
+                    self.assertIn("        timeout-minutes: ${{ fromJSON(inputs.pool_timeout_minutes || '240') }}", primary[0])
+                    for event in ("workflow_call", "workflow_dispatch"):
+                        event_block = yaml_block(source.splitlines(), event, 2)
+                        timeout_input = yaml_block(event_block, "pool_timeout_minutes", 6)
+                        self.assertIsNotNone(timeout_input, event)
+                        self.assertIn("        default: '240'", timeout_input)
+                        self.assertIn("        required: false", timeout_input)
+                else:
+                    self.assertIn("        timeout-minutes: 45", primary[0])
                 cleanup = "Cleanup environment"
                 for phase in ("before", "after"):
                     self.assertIn("        timeout-minutes: 5", steps[f"{cleanup} ({phase})"])

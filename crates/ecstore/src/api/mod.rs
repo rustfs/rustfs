@@ -391,9 +391,12 @@ pub mod data_usage {
     #[cfg(feature = "test-util")]
     pub use crate::data_movement::scanner_backlog::test_util::NativeScannerPauseBacklogWriteFault;
     pub use crate::data_movement::scanner_backlog::{
-        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementPlanner,
-        ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+        ScannerPauseBacklogRetirementPlanner, ScannerPauseBacklogRetirementReplica,
+        register_scanner_pause_backlog_retirement_planner,
     };
+    #[cfg(feature = "test-util")]
+    pub use crate::data_usage::seed_bucket_usage_memory_for_test;
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
@@ -405,13 +408,12 @@ pub mod data_usage {
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
         store_data_usage_in_backend,
     };
-    #[cfg(feature = "test-util")]
-    pub use crate::data_usage::{get_bucket_usage_memory, seed_bucket_usage_memory_for_test};
+    pub use crate::data_usage::{get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline};
 }
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::local::ScanGuard;
+    pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
@@ -447,7 +449,7 @@ pub mod disk {
 pub mod error {
     pub use crate::error::{
         Error, PoolMetadataError, PoolMetadataFailure, Result, StorageError, classify_system_path_failure_reason,
-        is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -503,6 +505,13 @@ pub mod notification {
     };
 }
 
+pub mod integrity {
+    pub use crate::services::integrity::{
+        IntegrityError, InventoryItem, InventoryPage, ItemRequest, ItemResult, ItemState, Job, JobMode, JobRequest, JobState,
+        Protection, Readiness, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
+
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
@@ -510,9 +519,9 @@ pub mod object {
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
         RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
-        ScannerPublicationCommitState, StreamConsumer, WriteCompletion, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCommitGuard, WriteCompletion,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
@@ -599,6 +608,7 @@ pub mod storage {
         all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
         prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
     };
+    pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};
 }
 
 pub mod tier {

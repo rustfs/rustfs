@@ -2835,6 +2835,251 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
+    async fn tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners() {
+        use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
+        use crate::bucket::lifecycle::tier_free_version_recovery::recover_tier_free_versions;
+        use rustfs_filemeta::TransitionVersionState::{Exact, KnownDisabled, SuspendedNull};
+        use rustfs_s3_client::transition_api::ReaderImpl;
+        use rustfs_utils::http::{
+            SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, insert_str,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("create tier overwrite store");
+        let (mut ctx, mut store, mut shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-overwrite", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let tier = "OVERWRITE-TIER";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier)
+            .await
+            .expect("tier identity");
+        let identity = rustfs_utils::crypto::hex(lease.backend_identity());
+        drop(lease);
+
+        for state in [Exact, KnownDisabled, SuspendedNull] {
+            for suspended in [false, true] {
+                for self_copy in [false, true] {
+                    let bucket = format!("tier-overwrite-{}", Uuid::new_v4());
+                    let object = "object";
+                    let remote = format!("remote/{bucket}");
+                    let version = match state {
+                        Exact => "opaque-overwrite-version",
+                        SuspendedNull => "null",
+                        _ => "",
+                    };
+                    let payload = vec![0x5b; if suspended { 512 * 1024 } else { 257 }];
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create bucket");
+                    backend.set_put_remote_version(Some(version.to_string())).await;
+                    let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier)
+                        .await
+                        .expect("seed tier lease");
+                    lease
+                        .put(
+                            &remote,
+                            ReaderImpl::Body(bytes::Bytes::from(payload.clone())),
+                            payload.len().try_into().expect("payload size"),
+                        )
+                        .await
+                        .expect("seed remote bytes");
+                    drop(lease);
+                    let mut metadata = HashMap::from([
+                        ("content-type".to_string(), "application/octet-stream".to_string()),
+                        (
+                            "x-amz-restore".to_string(),
+                            "ongoing-request=\"false\", expiry-date=\"2099-01-01T00:00:00Z\"".to_string(),
+                        ),
+                    ]);
+                    for (suffix, value) in [
+                        (SUFFIX_TRANSITION_STATUS, "complete"),
+                        (SUFFIX_TRANSITION_TIER, tier),
+                        (SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity.as_str()),
+                        (SUFFIX_TRANSITIONED_OBJECTNAME, remote.as_str()),
+                        (SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str()),
+                    ] {
+                        insert_str(&mut metadata, suffix, value.to_string());
+                    }
+                    if !version.is_empty() {
+                        insert_str(&mut metadata, SUFFIX_TRANSITIONED_VERSION_ID, version.to_string());
+                    }
+                    // The commit path acknowledges at write quorum and drains
+                    // the remaining rename fan-out in the background. This
+                    // fixture "crashes" the store right after the overwrite,
+                    // so it must wait for that tail: a disk left with the old
+                    // live transitioned source makes exact cleanup fail closed
+                    // (a minority live owner still references the remote
+                    // tuple) until heal repairs it, which this fixture never
+                    // runs (rustfs#7921).
+                    let options = ObjectOptions {
+                        version_suspended: suspended,
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    };
+                    store
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(payload.clone()),
+                            &ObjectOptions {
+                                user_defined: metadata,
+                                ..options.clone()
+                            },
+                        )
+                        .await
+                        .expect("seed transitioned source with locally restored bytes");
+                    // The overwrite queues its committed cleanup owner right
+                    // away, and from the second iteration on the restarted
+                    // store already runs expiry workers. Fail that first remote
+                    // DELETE so the owner stays durable and the restart below
+                    // still has to rediscover it from xl.meta.
+                    backend.set_remove_failure(true);
+                    let expected = if self_copy {
+                        payload.clone()
+                    } else {
+                        vec![0x73; payload.len()]
+                    };
+                    let new_metadata = HashMap::from([
+                        ("content-type".to_string(), "text/plain".to_string()),
+                        ("x-amz-meta-replacement".to_string(), "kept".to_string()),
+                    ]);
+                    if self_copy {
+                        let mut source = store
+                            .get_object_info(&bucket, object, &options)
+                            .await
+                            .expect("self-copy source");
+                        source.metadata_only = false;
+                        source.user_defined = Arc::new(new_metadata);
+                        source.put_object_reader = Some(PutObjReader::from_vec(expected.clone()));
+                        store
+                            .copy_object(&bucket, object, &bucket, object, &mut source, &options, &options)
+                            .await
+                            .expect("materialized self-copy");
+                    } else {
+                        store
+                            .put_object(
+                                &bucket,
+                                object,
+                                &mut PutObjReader::from_vec(expected.clone()),
+                                &ObjectOptions {
+                                    user_defined: new_metadata,
+                                    ..options.clone()
+                                },
+                            )
+                            .await
+                            .expect("overwrite transitioned null version");
+                    }
+
+                    let set = store.pools[0].get_disks_by_key(object);
+                    let versions = set
+                        .load_file_info_versions_exact(&bucket, object)
+                        .await
+                        .expect("read committed disk metadata")
+                        .expect("replacement metadata exists");
+                    let free: Vec<_> = versions
+                        .versions
+                        .iter()
+                        .chain(versions.free_versions.iter())
+                        .filter(|fi| fi.tier_free_version())
+                        .collect();
+                    assert_eq!(free.len(), 1, "{state:?}, suspended={suspended}, copy={self_copy}");
+                    assert_eq!(free[0].transitioned_objname, remote);
+                    assert_eq!(free[0].transition_version_state, state);
+                    assert_every_disk_holds_only_the_cleanup_owner(&set, &bucket, object, &remote).await;
+                    assert!(backend.contains(&remote).await, "commit must not delete remote bytes before cleanup");
+                    let removed_before = backend.remove_count().await;
+
+                    // Later matrix cases reuse this restarted store. If its
+                    // expiry worker has already dequeued this failed cleanup,
+                    // drain it before cancelling the context so the next
+                    // store cannot inherit object locks that block recovery.
+                    wait_for_expiry_workers_idle(&store).await;
+
+                    // Restart after the failed cleanup attempt. The new
+                    // runtime must reconstruct ownership from committed
+                    // xl.meta regardless of whether the old queue delivered it.
+                    let tier_config = ctx
+                        .tier_config_mgr()
+                        .read()
+                        .await
+                        .tiers
+                        .get(tier)
+                        .expect("tier configuration survives restart")
+                        .clone_with_credentials();
+                    drop(set);
+                    shutdown.cancel();
+                    drop(store);
+                    drop(ctx);
+                    (ctx, store, shutdown) =
+                        without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-overwrite-restart", &[4]))
+                            .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                    {
+                        let manager = ctx.tier_config_mgr();
+                        let mut manager = manager.write().await;
+                        manager.tiers.insert(tier.to_string(), tier_config);
+                        manager
+                            .install_test_driver(tier, Box::new(backend.clone()))
+                            .expect("rebind the same remote destination after restart");
+                    }
+                    let set = store.pools[0].get_disks_by_key(object);
+                    // A deferred first cleanup must retain its durable owner
+                    // until a later recovery scan can retry the operation.
+                    backend.set_remove_failure(true);
+                    ExpiryState::resize_workers(1, Arc::clone(&store)).await;
+                    let recovered = recover_tier_free_versions(Arc::clone(&store), 100, None, None)
+                        .await
+                        .expect("recover persisted cleanup owner");
+                    assert!(recovered.enqueued >= 1);
+                    wait_for_expiry_workers_idle(&store).await;
+                    assert!(backend.contains(&remote).await, "failed cleanup must retain remote bytes");
+                    assert_eq!(backend.remove_count().await, removed_before);
+                    backend.set_remove_failure(false);
+                    // This fixture starts expiry workers without the runtime's
+                    // recovery loop, so drive its durable rescan explicitly.
+                    eprintln!("Recovering overwrite cleanup: state={state:?}, suspended={suspended}, copy={self_copy}");
+                    wait_for_tier_free_version_recovery(Arc::clone(&store), &backend, removed_before + 1).await;
+                    let versions = set
+                        .load_file_info_versions_exact(&bucket, object)
+                        .await
+                        .expect("read cleanup progress")
+                        .expect("new object must survive cleanup");
+                    assert!(
+                        versions
+                            .versions
+                            .iter()
+                            .chain(versions.free_versions.iter())
+                            .all(|fi| !fi.tier_free_version()),
+                        "cleanup must remove its owner: {state:?}, suspended={suspended}, copy={self_copy}"
+                    );
+                    assert!(!backend.contains(&remote).await);
+                    assert_eq!(backend.remove_count().await, removed_before + 1, "one successful remote DELETE per owner");
+                    assert_eq!(backend.remove_versions().await.last(), Some(&(remote.clone(), version.to_string())));
+                    let mut reader = store
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &options)
+                        .await
+                        .expect("replacement remains readable");
+                    let mut actual = Vec::new();
+                    reader.stream.read_to_end(&mut actual).await.expect("read replacement bytes");
+                    assert_eq!(actual, expected);
+                    let current = store
+                        .get_object_info(&bucket, object, &options)
+                        .await
+                        .expect("replacement metadata");
+                    assert_eq!(current.user_defined.get("content-type").map(String::as_str), Some("text/plain"));
+                    assert_eq!(current.user_defined.get("x-amz-meta-replacement").map(String::as_str), Some("kept"));
+                    assert!(current.transitioned_object.status.is_empty());
+                }
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
     async fn copy_object_immediately_reads_small_completed_multipart_source() {
         let temp_dir = tempfile::tempdir().expect("create small multipart copy store dir");
         let (_ctx, store, shutdown) =
@@ -2911,6 +3156,165 @@ mod tests {
             .await
             .expect("target body should stream");
         assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    /// rustfs/rustfs#7674: a bucket carrying a legacy snapshot-protocol quota
+    /// (written before durable reservations existed, so `quota.json` has no
+    /// `reservation_protocol`) must accept a cross-key CopyObject whose
+    /// destination options carry the handler's quota admission. The storage
+    /// layer fails closed with `PartMissingOrCorrupt` when a quota-enforced
+    /// bucket sees a write without admission, so dropping the admission while
+    /// rebuilding the destination options turns every copy into a
+    /// deterministic "part missing or corrupt" failure even though the source
+    /// object is perfectly readable.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn copy_object_forwards_quota_admission_on_legacy_snapshot_quota_bucket() {
+        let temp_dir = tempfile::tempdir().expect("create legacy quota copy store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-quota-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("legacy-quota-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let target_object = "docker/registry/v2/blobs/sha256/a5/digest/data";
+        let payload = vec![0x5A; 8178];
+        let quota_limit = 1u64 << 30;
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for legacy quota copy");
+        // Legacy quota shape: no `reservation_protocol`, so the storage layer
+        // requires the handler-supplied snapshot admission on every write.
+        let legacy_quota = format!(r#"{{"quota":{quota_limit},"quota_type":"Hard"}}"#);
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_QUOTA_CONFIG_FILE,
+            legacy_quota.into_bytes(),
+        )
+        .await
+        .expect("persist legacy snapshot quota");
+        let (quota, _, _) = crate::bucket::metadata_sys::get_quota_config_and_incarnation_from_disk_in(&ctx, &bucket)
+            .await
+            .expect("legacy quota should load");
+        let quota = quota.expect("legacy quota must be persisted");
+        assert_eq!(quota.quota, Some(quota_limit));
+        assert!(!quota.uses_durable_reservations(), "fixture must stay on the snapshot protocol");
+
+        let mut write_opts = ObjectOptions::default();
+        assert!(write_opts.set_quota_admission(0, quota_limit));
+
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &write_opts)
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &write_opts)
+            .await
+            .expect("stage multipart source part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                source_object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &write_opts,
+            )
+            .await
+            .expect("complete the multipart source under the legacy quota");
+
+        let source_reader = store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed multipart source should be readable");
+        let mut copy_info = source_reader.object_info.clone();
+        let actual_size = copy_info.get_actual_size().expect("copy source logical size should resolve");
+        assert_eq!(actual_size, payload.len() as i64);
+        let copy_reader = rustfs_rio::HashReader::from_stream(source_reader.stream, actual_size, actual_size, None, None, false)
+            .expect("copy source hash reader should build");
+        copy_info.put_object_reader = Some(PutObjReader::new(copy_reader));
+
+        let mut dst_opts = ObjectOptions::default();
+        assert!(dst_opts.set_quota_admission(payload.len() as u64, quota_limit));
+        store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                target_object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &dst_opts,
+            )
+            .await
+            .expect("CopyObject must forward the handler quota admission to the destination write");
+
+        let mut target_reader = store
+            .get_object_reader(&bucket, target_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("copied target should be readable");
+        let mut target_body = Vec::new();
+        target_reader
+            .stream
+            .read_to_end(&mut target_body)
+            .await
+            .expect("target body should stream");
+        assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn unfinished_multipart_upload_is_not_copy_source_readable() {
+        let temp_dir = tempfile::tempdir().expect("create unfinished multipart copy store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "unfinished-multipart-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("unfinished-multipart-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let payload = vec![0xCD; 273];
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for unfinished multipart copy source");
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload);
+        store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage unfinished multipart source part");
+
+        let source_err = match store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(_) => panic!("an uncompleted multipart upload must not be readable as a CopyObject source"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                source_err,
+                StorageError::ObjectNotFound(_, _) | StorageError::FileNotFound | StorageError::VersionNotFound(_, _, _)
+            ),
+            "unexpected unfinished multipart source error: {source_err:?}"
+        );
+
         shutdown.cancel();
     }
 
@@ -3686,7 +4090,7 @@ mod tests {
             .collect::<Vec<_>>();
         for disk in &disks {
             disk.close().await.expect("fault injection should stop per-disk monitoring");
-            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.force_offline_for_test();
         }
 
         // Sets has an independent endpoint monitor that renews missing slots.
@@ -3723,7 +4127,7 @@ mod tests {
             .collect::<Vec<_>>();
         for disk in &disks {
             disk.close().await.expect("fault injection should stop per-disk monitoring");
-            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.force_offline_for_test();
         }
         set.connect_disks().await;
         for disk in &disks {
@@ -3958,7 +4362,7 @@ mod tests {
             // successful attempts. Only injected faults spend this global budget.
             // A real failure may consume an attempt, so preserve the final chance.
             faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
                     (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
                         .then_some(faults.saturating_add(1))
                 })
@@ -9425,15 +9829,14 @@ mod tests {
         com::save_config(store.pools[1].clone(), &manual_task_path, manual_task_bytes.clone())
             .await
             .expect("target task rewrite should invalidate cached metadata before the quorum check");
-        let target_task_set = store.pools[1].get_disks_by_key(&manual_task_path);
-        let original_target_task_disks = {
-            let mut disks = target_task_set.disks.write().await;
-            let original = disks.clone();
-            for disk in disks.iter_mut().take(2) {
-                *disk = None;
-            }
-            original
-        };
+        let manual_task_record =
+            validate_durable_ilm_record(&manual_task_path, &manual_task_bytes).expect("manual task should validate");
+        let manual_task_receipt_path = store
+            .decommission_durable_ilm_receipt_path_for_test(0, &manual_task_path, &manual_task_record)
+            .await
+            .expect("manual task receipt path should resolve");
+        let target_task_set = store.pools[1].get_disks_by_key(&manual_task_receipt_path);
+        let offline_target_task_disks = force_set_disk_range_offline_for_test(&target_task_set, 0..2).await;
         let receipt_quorum_error = store
             .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
                 0,
@@ -9442,7 +9845,7 @@ mod tests {
             )
             .await
             .expect_err("target read quorum without receipt write quorum must retain the source");
-        *target_task_set.disks.write().await = original_target_task_disks;
+        drop(offline_target_task_disks);
         let receipt_quorum_error = receipt_quorum_error.to_string();
         assert!(receipt_quorum_error.contains("receipt"));
         assert!(receipt_quorum_error.contains(&manual_task_path));
@@ -9649,9 +10052,18 @@ mod tests {
                 recovered_transition_version.clone(),
             )))
             .await;
-        let transaction_stats = recover_transition_transaction_records(store.clone(), 100, None)
+        let transaction_stats = {
+            let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                ],
+                recover_transition_transaction_records(store.clone(), 100, None),
+            )
             .await
-            .expect("transition recovery should advance and consume the migrated transaction before completion");
+            .expect("transition recovery should advance and consume the migrated transaction before completion")
+        };
         backend.set_transition_candidate_probe_override(None).await;
         assert_eq!(
             (
@@ -10764,9 +11176,17 @@ mod tests {
         const ADMITTED_READS: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create validation-read shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-validation-read-shutdown", &[4]))
-                .await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-validation-read-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-validation-read-shutdown-bucket";
         store
@@ -11298,8 +11718,17 @@ mod tests {
         const ADMITTED_BATCH: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create delete-batch shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-delete-batch-shutdown", &[4])).await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-delete-batch-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-delete-batch-shutdown-bucket";
         store
@@ -12315,19 +12744,34 @@ mod tests {
         expected_removes: usize,
     ) {
         ExpiryState::resize_workers(1, store.clone()).await;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let mut last_progress = None;
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let stats = recover_tier_free_versions(store.clone(), 100, None, None)
                     .await
                     .expect("tier free-version recovery scan should succeed");
-                if backend.remove_versions().await.len() >= expected_removes && stats.enqueued == 0 && stats.failed == 0 {
+                let removes = backend.remove_versions().await.len();
+                let recovered = removes >= expected_removes && stats.enqueued == 0 && stats.failed == 0;
+                last_progress = Some((removes, stats));
+                if recovered {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
-        .await
-        .expect("tier free-version recovery should complete");
+        .await;
+        if result.is_err() {
+            let expiry_state = store.ctx.expiry_state();
+            let workers = expiry_state
+                .try_read()
+                .ok()
+                .map(|state| (state.pending_tasks(), state.active_tasks()));
+            panic!(
+                "tier free-version recovery should complete: expected_removes={expected_removes}, \
+                 last_progress={last_progress:?}, workers(pending, active)={workers:?}"
+            );
+        }
+        wait_for_expiry_workers_idle(&store).await;
     }
 
     /// Unlocked poll for exact metadata absence while asynchronous free-version
@@ -12347,10 +12791,45 @@ mod tests {
         }
     }
 
+    /// Every physical copy must carry the replacement plus its tier
+    /// free-version owner, and none may still hold the pre-overwrite live
+    /// transitioned source. A stale minority copy is exactly what a lost
+    /// early-ACK rename tail leaves behind, and exact cleanup refuses to
+    /// delete remote bytes while such a live reference exists.
+    #[cfg(feature = "test-util")]
+    async fn assert_every_disk_holds_only_the_cleanup_owner(
+        set: &crate::set_disk::SetDisks,
+        bucket: &str,
+        object: &str,
+        remote: &str,
+    ) {
+        use crate::disk::DiskAPI as _;
+
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        for (index, disk) in set.disk_inventory().await.into_iter().enumerate() {
+            let disk = disk.unwrap_or_else(|| panic!("disk{index} should be online"));
+            let raw = disk
+                .read_xl(bucket, &disk_object, false)
+                .await
+                .unwrap_or_else(|err| panic!("disk{index} xl.meta should be readable after the overwrite: {err:?}"));
+            let versions = rustfs_filemeta::FileMeta::load(&raw.buf)
+                .and_then(|meta| meta.get_all_file_info_versions(bucket, object, true))
+                .unwrap_or_else(|err| panic!("disk{index} xl.meta should decode: {err:?}"));
+            let all: Vec<_> = versions.versions.iter().chain(versions.free_versions.iter()).collect();
+            let owners = all.iter().filter(|fi| fi.tier_free_version()).count();
+            let live_sources = all
+                .iter()
+                .filter(|fi| !fi.tier_free_version() && fi.transitioned_objname == remote)
+                .count();
+            assert_eq!(owners, 1, "disk{index} must hold exactly one cleanup owner after the drained overwrite");
+            assert_eq!(live_sources, 0, "disk{index} must not retain the pre-overwrite live transitioned source");
+        }
+    }
+
     #[cfg(feature = "test-util")]
     async fn wait_for_expiry_workers_idle(store: &crate::store::ECStore) {
         let expiry_state = store.ctx.expiry_state();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let idle = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let idle = {
                     let state = expiry_state.read().await;
@@ -12370,8 +12849,15 @@ mod tests {
                 }
             }
         })
-        .await
-        .expect("lifecycle expiry workers should become idle");
+        .await;
+        if idle.is_err() {
+            let state = expiry_state.read().await;
+            panic!(
+                "lifecycle expiry workers should become idle: pending={} active={}",
+                state.pending_tasks(),
+                state.active_tasks()
+            );
+        }
     }
 
     #[cfg(feature = "test-util")]
@@ -12551,12 +13037,25 @@ mod tests {
         assert_eq!((recovered.enqueued, recovered.failed), (1, 0));
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
-                    .get_disks_by_key(object)
-                    .load_file_info_versions_exact(bucket, object)
-                    .await
-                    .expect("free-version cleanup metadata should remain readable")
-                    .is_none();
+                let metadata_absent = {
+                    // Observe one cleanup state, without spanning per-disk marker removal.
+                    let mut read_opts = ObjectOptions::default();
+                    let _guards = store
+                        .acquire_all_physical_object_read_locks(
+                            "transitioned_delete_cleanup_test",
+                            bucket,
+                            object,
+                            &mut read_opts,
+                        )
+                        .await
+                        .expect("free-version cleanup observation should acquire object read locks");
+                    store.pools[0]
+                        .get_disks_by_key(object)
+                        .load_file_info_versions_exact(bucket, object)
+                        .await
+                        .expect("free-version cleanup metadata should remain readable")
+                        .is_none()
+                };
                 if metadata_absent && backend.remove_versions().await.len() == 1 {
                     return;
                 }
@@ -16154,11 +16653,13 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = set
-                    .load_file_info_versions_exact(bucket, object)
-                    .await
-                    .expect("retry cleanup metadata should remain readable")
-                    .is_none();
+                // Cleanup rewrites xl.meta disk by disk, so a read racing it
+                // can briefly miss quorum; any other error is a real failure.
+                let metadata_absent = match set.load_file_info_versions_exact(bucket, object).await {
+                    Ok(versions) => versions.is_none(),
+                    Err(StorageError::InsufficientReadQuorum(..)) => false,
+                    Err(err) => panic!("retry cleanup metadata should remain readable: {err:?}"),
+                };
                 if metadata_absent && backend.remove_count().await == 1 {
                     return;
                 }
@@ -19881,6 +20382,259 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn tier_config_initial_reload_lock_failure_keeps_recovery_worker() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+
+        let temp_dir = tempfile::tempdir().expect("create contended tier startup store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-startup-contention", &[4])).await;
+        let manager = ctx.tier_config_mgr();
+        register_mock_tier(&manager, "COLD-A").await;
+        let candidate = TierConfigMgr::new();
+        let candidate = candidate.read().await;
+        let candidate_digest = tier_config_candidate_digest(&candidate).expect("empty candidate digest should resolve");
+        candidate
+            .save_tiering_config(store.clone())
+            .await
+            .expect("committed removal config should persist");
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{TIER_CONFIG_FILE}", com::CONFIG_PREFIX),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("committed removal config metadata should load");
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.kind = TierMutationIntentKind::Remove;
+        intent.affected_targets[0].new_backend_identity = None;
+        intent
+            .advance(
+                TierMutationIntentState::Committed,
+                Some(config_info.etag.expect("committed config should have an ETag")),
+            )
+            .expect("removal intent should commit");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("committed removal intent should persist");
+
+        let config_lock = format!("{}/{TIER_CONFIG_FILE}.lock", com::CONFIG_PREFIX);
+        let namespace = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &config_lock)
+            .await
+            .expect("tier config namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing recovery should hold the config lock");
+        let initial_error = runtime_sources::init_tier_config_mgr_handle(manager.clone(), store.clone())
+            .await
+            .expect_err("startup must still report the initial recovery lock failure");
+        assert!(initial_error.to_string().contains(&config_lock));
+        match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Err(err) => assert_eq!(err.message, "Remote tier configuration is being replaced"),
+            Ok(_) => panic!("failed initial recovery must retain its mutation fence"),
+        }
+        drop(owner);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if manager.read().await.tiers.is_empty()
+                    && matches!(
+                        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await,
+                        Err(err) if err.code == crate::services::tier::tier_handlers::ERR_TIER_NOT_FOUND.code
+                    )
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery worker must publish and clear its fence without another admin mutation");
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("unexpired committed tombstone must remain durable"),
+            intent
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_prepare_reloads_after_save_and_load_lock_timeouts() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create contended tier prepare store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-prepare-contention", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [9; 32]);
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let prepare_store = store.clone();
+        let payload = intent.encode().expect("prepare intent should encode");
+        let mut prepare = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                prepare_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                &payload,
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        // The competing publisher already owns the namespace. Bypass only its
+        // recursive acquisition and drain the durable tail before releasing it.
+        com::save_config_with_opts(
+            store.clone(),
+            &object,
+            intent.encode().expect("winning intent should encode"),
+            &ObjectOptions {
+                no_lock: true,
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("competing publisher should persist the matching intent under its lock");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        tokio::select! {
+            result = &mut prepare => panic!("Prepare must retry the contended save and load before completing: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(30), async {
+                while timeouts.load(Ordering::Relaxed) - before < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("the save and subsequent load should each exhaust their lock wait"),
+        }
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        drop(owner);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("third prepare round should complete after the competing publisher releases its lock")
+            .expect("prepare task should join")
+            .expect("third prepare round should reload the matching durable intent");
+        assert_eq!(outcome.state, TierMutationPeerState::Prepared);
+        assert!(!outcome.applied, "the retry must reuse the winning record rather than recreate it");
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("winning record should remain readable"),
+            intent
+        );
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_prepare_preserves_lock_timeout_after_three_rounds() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create exhausted tier prepare store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-prepare-exhaustion", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [9; 32]);
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let prepare_store = store.clone();
+        let payload = intent.encode().expect("prepare intent should encode");
+        let prepare = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                prepare_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                &payload,
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let lock_timeout = crate::set_disk::get_lock_acquire_timeout();
+        let owner = namespace
+            .get_write_lock(lock_timeout)
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        let error = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("three contended prepare rounds should exhaust the bounded budget")
+            .expect("prepare task should join")
+            .expect_err("Prepare must fail while the competing publisher keeps the namespace");
+        match error {
+            TierMutationPeerError::Store(Error::Lock(rustfs_lock::LockError::Timeout { resource, timeout })) => {
+                assert_eq!(resource, key.to_string());
+                assert_eq!(timeout, lock_timeout);
+            }
+            other => panic!("Prepare must preserve the final typed lock timeout: {other:?}"),
+        }
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 3, "save and load must share three rounds");
+        drop(owner);
+        assert!(matches!(
+            load_tier_mutation_intent_record(store, mutation_id).await,
+            Err(Error::ConfigNotFound)
+        ));
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn tier_mutation_abort_tombstone_rejects_delayed_prepare() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
@@ -21463,9 +22217,18 @@ mod tests {
             expected_removes.push((transaction.remote_object, put_version));
         }
 
-        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+        let stats = {
+            let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                ],
+                recover_transition_transaction_records(store.clone(), 100, None),
+            )
             .await
-            .expect("transition transaction recovery should run");
+            .expect("transition transaction recovery should run")
+        };
 
         assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (3, 3, 0, 0));
         assert_eq!(transition_transaction_record_count(store.clone()).await, 0);

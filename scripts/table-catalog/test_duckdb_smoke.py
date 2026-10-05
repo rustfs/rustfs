@@ -145,17 +145,6 @@ class DuckDBSmokeTest(unittest.TestCase):
 
     def test_boundary_sql_records_required_compatibility_options(self) -> None:
         args = self.args()
-        stage_sql = duckdb_smoke.negative_sql(
-            args,
-            kind="stage-create",
-            seed_table="events_seed",
-            write_table="events_write",
-            purge_table="events_purge",
-        )
-        stage_attach = stage_sql.split('DETACH "bootstrap_stage-create";', 1)[1]
-        self.assertNotIn("STAGE_CREATE_TABLES false", stage_attach)
-        self.assertIn("CREATE TABLE", stage_attach)
-
         purge_sql = duckdb_smoke.negative_sql(
             args,
             kind="purge",

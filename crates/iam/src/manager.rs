@@ -491,6 +491,27 @@ where
             .ok_or(Error::NoSuchPolicy)
     }
 
+    /// Reports whether `name` is a stored policy, consulting storage on a cache miss.
+    ///
+    /// Unlike [`Self::merge_policies`], which drops names whose load fails, only a confirmed
+    /// `NoSuchPolicy` yields `false`; storage and decode errors are returned so callers that skip
+    /// absent policies can fail closed instead of mistaking an unreadable policy for a missing one.
+    pub async fn policy_exists(&self, name: &str) -> Result<bool> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        if self.cache.snapshot().policy_docs.contains_key(name) {
+            return Ok(true);
+        }
+
+        let mut m = HashMap::new();
+        match self.api.load_policy_doc(name, &mut m).await {
+            Ok(()) => Ok(true),
+            Err(err) if is_err_no_such_policy(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn delete_policy(&self, name: &str, is_from_notify: bool) -> Result<()> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);

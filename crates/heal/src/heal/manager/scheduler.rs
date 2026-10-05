@@ -150,7 +150,7 @@ impl HealManager {
         for _ in 0..available_slots {
             let selected_request = if config.set_bulkhead_enable || mainline_pressure.is_some() {
                 let max_concurrent_per_set = config.max_concurrent_per_set;
-                let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
+                let (selected_request, skipped_sets) = queue.pop_runnable_with_fairness(
                     |request| {
                         let set_allowed = !config.set_bulkhead_enable
                             || can_schedule_request(request, &running_per_set, max_concurrent_per_set);
@@ -164,7 +164,7 @@ impl HealManager {
                 }
                 selected_request
             } else {
-                queue.pop_next()
+                queue.pop_runnable_with_fairness(|_| true, |_| None).0
             };
 
             if let Some(mut request) = selected_request {
@@ -197,7 +197,8 @@ impl HealManager {
                 };
                 let task = Arc::new(
                     HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
-                        .with_mainline_pacer(mainline_pacer),
+                        .with_mainline_pacer(mainline_pacer)
+                        .with_admin_recovery(root_recovery.clone()),
                 );
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
@@ -302,8 +303,8 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
-                    let cancelled_completion = if owns_completion {
-                        false
+                    let cancelled_snapshot = if owns_completion {
+                        None
                     } else {
                         // Cancellation can win while a finished worker waits
                         // for active ownership. It must not resurrect a retry
@@ -313,18 +314,21 @@ impl HealManager {
                             .lock()
                             .await
                             .get(&task_id)
-                            .is_some_and(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .filter(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .cloned()
                     };
-                    if cancelled_completion {
+                    let cancelled_completion = cancelled_snapshot.is_some();
+                    if let Some(cancelled) = &cancelled_snapshot {
                         completed_status = HealTaskStatus::Cancelled;
                         completed_status_entry.status = HealTaskStatus::Cancelled;
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
+                        completed_status_entry.completed_at = cancelled.completed_at;
                     }
                     let terminal_completion = matches!(
                         completed_status,
                         HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
                     );
-                    if owns_completion
+                    if (owns_completion || cancelled_completion)
                         && terminal_completion
                         && root_recovery::is_admin_heal_recovery(&task.heal_type, task.source)
                         && let Err(error) = root_recovery_clone
@@ -344,6 +348,24 @@ impl HealManager {
                             error = %error,
                             "Failed to publish heal terminal receipt"
                         );
+                        // A failed write can already have replaced the report.
+                        // Resolve it from disk instead of assuming the old snapshot won.
+                        if let Some(cancelled) = &cancelled_snapshot {
+                            completed_status_entry = match root_recovery_clone.completed(&task_id).await {
+                                Ok(Some(persisted)) => persisted,
+                                Ok(None) | Err(_) => {
+                                    let mut unavailable = (**cancelled).clone();
+                                    unavailable.outcome = None;
+                                    unavailable.progress = None;
+                                    unavailable.seqed_items = Vec::new();
+                                    unavailable.next_seq = 0;
+                                    unavailable.min_seq = 0;
+                                    unavailable.result_items_truncated = true;
+                                    unavailable.retained_bytes.take();
+                                    unavailable
+                                }
+                            };
+                        }
                     }
                     if owns_completion
                         && !terminal_completion
@@ -416,6 +438,7 @@ impl HealManager {
                             release_mrf_repair_notice_targets(&notice_targets);
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
+                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -505,7 +528,16 @@ impl HealManager {
                                     return;
                                 }
 
+                                #[cfg(test)]
+                                tests::admin_overlap::pause_before_retry_queue(&retry_request_id).await;
                                 let mut queue = retry_heal_queue.lock().await;
+                                let mut retrying = retrying_heals_for_spawn.lock().await;
+                                // Cancellation may win after the backoff checks but
+                                // before queue acquisition. Keep ownership through
+                                // publication so a cancelled retry cannot reappear.
+                                if retry_cancel_token.is_cancelled() || !retrying.contains_key(&retry_request_id) {
+                                    return;
+                                }
                                 let admission_decision =
                                     Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
                                 let admission = admission_decision.result;
@@ -525,7 +557,8 @@ impl HealManager {
                                         // matching operations_snapshot's lock order.
                                         #[cfg(test)]
                                         pause_retry_ownership_transition(&retry_request_id, true).await;
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
                                         drop(queue);
                                         if let (Some(displaced_task_id), Some(displaced_terminal)) =
@@ -565,7 +598,8 @@ impl HealManager {
                                     HealAdmissionResult::Merged => {
                                         let merged_task_id =
                                             queue.queued_request_id_for_dedup_key(&retry_key).map(ToOwned::to_owned);
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         drop(queue);
                                         if let Some(merged_task_id) = merged_task_id {
                                             move_mrf_repair_notice_targets(
@@ -778,6 +812,9 @@ pub(super) fn mrf_verified_repair_event_for_target(
     let disposition = match outcome.disposition {
         HealObjectDisposition::Repaired => MrfVerifiedRepairDisposition::Repaired,
         HealObjectDisposition::VerifiedHealthy => MrfVerifiedRepairDisposition::VerifiedHealthy,
+        HealObjectDisposition::MetadataHealthy if target.kind == MrfKind::MetadataCorruption => {
+            MrfVerifiedRepairDisposition::VerifiedHealthy
+        }
         HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
         _ => return None,
     };
@@ -785,6 +822,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         MrfKind::DecodeFailure => HealObjectKind::Decode,
         MrfKind::MetadataCorruption => HealObjectKind::Metadata,
         MrfKind::PartialWrite => HealObjectKind::Object,
+        MrfKind::DeleteMarkerPurge => HealObjectKind::DeleteMarkerPurge,
     };
     if outcome.identity.kind != expected_kind
         || outcome.identity.bucket.as_str() != target.bucket.as_ref()
@@ -815,6 +853,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         object: target.object.clone(),
         version_id,
         scope,
+        delete_marker_purge: target.delete_marker_purge,
         lease: target.lease,
         bucket_incarnation_id,
         disposition,
@@ -838,6 +877,66 @@ pub(super) fn publish_verified_mrf_repair_events(targets: &[MrfRepairNoticeTarge
             .find_map(|object| mrf_verified_repair_event_for_target(target, object))
         {
             rustfs_common::mrf_channel::note_mrf_verified_repair(event);
+        }
+    }
+}
+
+pub(super) fn unverified_legacy_mrf_event_for_target(
+    target: &MrfRepairNoticeTarget,
+    outcome: &crate::heal::outcome::HealObjectOutcome,
+) -> Option<rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent> {
+    use crate::heal::outcome::{HealObjectDisposition, HealObjectKind};
+    use rustfs_common::mrf_channel::MrfKind;
+
+    let anchor = target.durable_anchor.as_ref()?;
+    if target.kind != MrfKind::PartialWrite
+        || outcome.disposition != HealObjectDisposition::Unknown
+        || outcome.detail.as_deref() != Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+    {
+        return None;
+    }
+    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
+    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    if anchor.kind != target.kind
+        || anchor.bucket != target.bucket
+        || anchor.object != target.object
+        || anchor.version_id != version_id
+        || anchor.scope != target.scope
+        || Some(anchor.lease) != target.lease
+        || outcome.identity.kind != HealObjectKind::Object
+        || outcome.identity.bucket != target.bucket.as_ref()
+        || outcome.identity.object != target.object.as_ref()
+        || outcome.identity.version_id != expected_version
+        || outcome.identity.pool_index != expected_pool
+        || outcome.identity.set_index != expected_set
+        || outcome.identity.bucket_incarnation_id != Some(anchor.bucket_incarnation_id)
+    {
+        return None;
+    }
+    Some(rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent { anchor: anchor.clone() })
+}
+
+pub(super) fn publish_unverified_legacy_mrf_events(targets: &[MrfRepairNoticeTarget], completed: &CompletedHealStatus) {
+    use crate::heal::outcome::HealExecutionOutcome;
+
+    if !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. }) {
+        return;
+    }
+    let Some(outcome) = completed.outcome.as_ref() else {
+        return;
+    };
+    if outcome.execution != HealExecutionOutcome::Completed {
+        return;
+    }
+    for target in targets {
+        if let Some(event) = outcome
+            .objects
+            .iter()
+            .find_map(|object| unverified_legacy_mrf_event_for_target(target, object))
+        {
+            rustfs_common::mrf_channel::note_mrf_unverified_legacy(event);
         }
     }
 }

@@ -178,12 +178,27 @@ The reset does not delete metadata files by hand and does not publish an authori
 |---|---|
 | data movement | wait for decommission or rebalance to leave the scanner metadata path, then retry |
 | invalid scanner cycle state | run `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}` first |
+| scanner leader lock is busy | retry with an async recovery intent or wait for the current leader to restart/release the lock |
+
+When a running scanner leader already holds `leader.lock`, submit a durable async recovery intent instead of repeatedly calling the synchronous reset:
+
+```json
+{
+  "mode": "full-rebuild",
+  "async": true,
+  "idempotency_key": "<stable-operator-request-id>"
+}
+```
+
+The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
+
+A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must run as a full scan until an authoritative usage snapshot replaces the marker.
 
 ## Cleanup With The Scanner Disabled
 
 With `RUSTFS_SCANNER_ENABLED=false`, startup makes one controlled attempt to finish a previously persisted cycle reset whose validated recovery marker is already `cleanup-pending`. This is metadata cleanup only: it does not start the ordinary scanner loop, scan namespaces, accept a new reset request, or automatically perform a usage-state `full-rebuild`. Missing, merely `blocked`, unknown-version, unknown-phase, or corrupt markers do not authorize an automatic reset.
 
-The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. The v3 reset routes remain synchronous and return their existing successful HTTP 200 responses; no asynchronous HTTP 202 acceptance is introduced.
+The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. Cycle-state reset remains a synchronous HTTP 200 operation; usage-state reset also supports the async recovery-intent form described above.
 
 The startup probe is cancellation-aware and uses the existing cache persistence I/O timeout. Shutdown waits only for the existing server shutdown timeout. If the cleanup task cannot join in that window, the `scanner_cleanup_not_joined` warning means completion is unconfirmed, not drained. The task is not force-aborted or force-unlocked while its runtime remains alive; it retains its existing namespace/admission guards, and durable marker/fence state remains authoritative. Inspect status before retrying. This does not establish a hard deadline for an unresponsive storage operation or prove that I/O has drained when the process or runtime subsequently exits. Task-ownership timeout tests are not storage fsync, commit-tail, or process-crash durability evidence.
 
@@ -269,6 +284,40 @@ Reports scanner-driven bitrot state together with heal queue execution state. `h
 
 Use this route when `metrics.source_work` shows `heal` or `bitrot` queued or missed work. Scanner-originated object checks should appear under `scanner/low`, manual admin heal under `admin/high`. If scanner work grows but admin work remains blocked, treat that as heal queue pressure rather than scanner pacing pressure.
 
+Durable partial-write responsibilities also have node-local MRF metrics:
+
+| Metric | Meaning |
+|---|---|
+| `rustfs_heal_mrf_queue_depth` | In-memory MRF work plus retained durable responsibilities, including held and operator-accepted unverified entries. |
+| `rustfs_heal_mrf_unverified_legacy` | Durable `PartialWrite` entries whose completed deep check found healthy legacy data without an independent payload identity proof. The journal entry remains intact; the current process pauses automatic re-dispatch for that entry. |
+| `rustfs_heal_mrf_unverified_legacy_oldest_age_seconds` | Age of the oldest such retained responsibility on this node. |
+| `rustfs_heal_mrf_legacy_generation_unknown` | Durable entries replayed without a source bucket-incarnation binding; they are not dispatched until an operator chooses an explicit disposition. |
+| `rustfs_heal_mrf_bucket_incarnation_changed` | Durable entries whose source bucket incarnation differs from the current bucket; the old intent is parked rather than sent to the recreated bucket. |
+| `rustfs_heal_mrf_operator_accepted_unverified` | Responsibilities for which an administrator explicitly accepted the unresolved data risk. They remain durable and are never reported as repaired or verified. |
+| `rustfs_heal_mrf_operator_accepted_unverified_oldest_age_seconds` | Age of the oldest durable operator-accepted, still-unverified responsibility on this node. |
+
+These gauges are emitted per node through the configured OTLP metrics exporter (`RUSTFS_OBS_ENDPOINT` or `RUSTFS_OBS_METRIC_ENDPOINT`). The background-heal status endpoint reports execution tasks; it does not include durable MRF responsibilities. Use the authenticated node-local `GET /rustfs/admin/v4/heal/mrf/responsibilities?limit=100&cursor=<nextCursor>` endpoint to list held, generation-unknown, incarnation-mismatched, or operator-accepted entries, including the stable responsibility ID, exact object/version/scope, source/current bucket incarnation, checkpoint owner/sequence, and any risk-acceptance record. `limit` is bounded to 1–256 and `nextCursor` is absent on the last page. If the listed bucket incarnation may have changed since the responsibility was parked, call the action endpoint with `action: "refresh"`, the listed `responsibilityId`, and its current `expectedBucketIncarnationId`. Refresh reads the live bucket identity, persists a changed-generation classification, and never dispatches a heal. Then review the fresh listing before taking another action. Use `action: "recheck"` to resume one exact source-bound held generation after restoring a trusted source or preparing an exact-version deletion. A recheck is persisted before the task is dispatched.
+
+An operator may instead choose `action: "acceptUnverifiedRisk"` only with `acknowledgeUnverifiedDataRisk: true`, explicit booleans for both source-incarnation acknowledgments, a non-empty reason, an audit reference, and a non-nil request ID. When `sourceBucketIncarnationId` is absent, set `acknowledgeUnknownSourceIncarnation: true`; when it differs from the current `bucketIncarnationId`, set `acknowledgeBucketIncarnationMismatch: true`. A generation with a known source/current mismatch is parked before dispatch, so its old intent cannot be applied to a recreated bucket. Legacy journal records without a source incarnation are listed as `legacy_generation_unknown` and are not automatically dispatched; refresh can record the live generation but does not bind the old responsibility to it. This does not create a payload proof, delete the object, or remove the durable intent. It persists an `operator_accepted_unverified` disposition that stops automatic retries while leaving the responsibility visible. The actor, reason, reference, time, request ID, target identity, source/current bucket incarnations, and acknowledgment flags are kept in a checksummed lifecycle record in the same disk replica and alternating slot as its committed MRF checkpoint. If that lifecycle record is missing, corrupt, or belongs to another checkpoint, unbound records return to `legacy_generation_unknown`; they are not treated as proof or dispatched against an unbound bucket. Pre-lifecycle binaries ignore this state and can heal a compatibility-journal object into a recreated bucket generation; downgrading while any durable MRF responsibility remains is unsupported. See `backlog-2682` in the compatibility cleanup register.
+
+Example risk-acceptance body (substitute values from the node-local listing):
+
+```json
+{
+  "action": "acceptUnverifiedRisk",
+  "responsibilityId": "<responsibility-id>",
+  "expectedBucketIncarnationId": "<bucket-incarnation-id>",
+  "acknowledgeUnverifiedDataRisk": true,
+  "acknowledgeUnknownSourceIncarnation": false,
+  "acknowledgeBucketIncarnationMismatch": false,
+  "reason": "The source was reviewed and the remaining identity risk is accepted",
+  "reference": "INC-1234",
+  "requestId": "<new-request-uuid>"
+}
+```
+
+A process restart restores lifecycle state only when the checksummed sidecar matches the committed checkpoint. Otherwise the durable intent remains visible and generation-unknown; no record is deleted or certified, and other durable intents on that node replay normally. For source-bound unversioned objects, restore expected content from a trusted canonical source with protected shard integrity enabled, then request a targeted recheck so the exact intent can obtain a receipt. For a legacy record without a source generation, the operator must first establish which bucket generation the responsibility belongs to; if that cannot be established, keep it generation-unknown or explicitly accept the risk. For a versioned object, a protected rewrite creates a new version and does not resolve a responsibility for the old version; preserve the source and only retire that exact version when the intended data is backed up and an authoritative absence proof is appropriate. A successful receipt may discharge only the matching responsibility; an unverified result remains retained and becomes held again. If no trusted copy or expected checksum is available, keep the responsibility held or explicitly accept the risk with the node-local admin operation. The protected-copy migration in the [shard-integrity audit workflow](shard-integrity-audit.md) writes a new key and preserves its source; completing that migration alone does not prove or discharge an intent for the original key. Never remove MRF journal files manually.
+
 ## Heal runtime controls
 
 Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/src/heal/manager.rs`), the MRF queue (`crates/heal/src/heal/mrf_queue.rs`), or the erasure-set healer (`crates/heal/src/heal/erasure_healer.rs`). The admin `heal` config subsystem accepts only `bitrot_cycle` (`HEAL_KEYS`), which is documented in the scanner table above. Constants live in `crates/config/src/constants/heal.rs` unless another file is named.
@@ -277,13 +326,13 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 |---|---|---|
 | `RUSTFS_HEAL_ENABLED` (deprecated alias `RUSTFS_ENABLE_HEAL`) | `true` (`heal_enabled_from_env`, `rustfs/src/module_switches.rs`) | Master switch for the background heal manager. |
 | `RUSTFS_HEAL_AUTO_HEAL_ENABLE` | `true` (`DEFAULT_HEAL_AUTO_HEAL_ENABLE`) | Enables automatic healing of detected issues; `false` leaves healing to manual admin requests. |
-| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. |
+| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. The manager reserves at least one slot per Scanner/ReadRepair/AutoHeal source, or 10% for larger queues, so sustained normal-priority MRF or internal background work cannot consume every slot. |
 | `RUSTFS_HEAL_INTERVAL_SECS` | `10` (`DEFAULT_HEAL_INTERVAL_SECS`) | Heal manager polling interval. |
 | `RUSTFS_HEAL_TASK_TIMEOUT_SECS` | `300` (`DEFAULT_HEAL_TASK_TIMEOUT_SECS`) | Per-task timeout. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_HEALS` | `4` (`DEFAULT_HEAL_MAX_CONCURRENT_HEALS`) | Global concurrent heal task limit. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_PER_SET` | `1` (`DEFAULT_HEAL_MAX_CONCURRENT_PER_SET`) | Per-erasure-set limit; effective value is `min(global, per_set)`, each floored at `1`. |
 | `RUSTFS_HEAL_LOW_PRIORITY_MERGE_ENABLE` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE`) | Merge duplicate low-priority requests with the same dedup key. |
-| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests when the queue is full. |
+| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests only after the reserved best-effort capacity is occupied and the queue is actually full. |
 | `RUSTFS_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE` | `true` (`DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE`) | Notify-driven scheduler wakeups. |
 | `RUSTFS_HEAL_SET_BULKHEAD_ENABLE` | `true` (`DEFAULT_HEAL_SET_BULKHEAD_ENABLE`) | Per-set bulkhead scheduling. |
 | `RUSTFS_HEAL_PAGE_PARALLEL_ENABLE` | `true` (`DEFAULT_HEAL_PAGE_PARALLEL_ENABLE`) | Page-level parallel object healing during erasure-set repair. |
@@ -292,12 +341,24 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running admin waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
-| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` dedups an admin heal start that overlaps a running or queued heal; `minio_error` returns a typed already-running / overlapping-paths rejection like madmin. |
+| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` reuses the token of an equivalent active, queued, or retrying admin heal; incompatible same-target starts and intersecting admin scopes return `already_running` / `overlapping_paths`. Durable-only owners reject until recovered or replaced with `forceStart`. `minio_error` also rejects equivalent starts and preserves overlap rejection against background tasks. |
 | `RUSTFS_HEAL_MRF_ENABLE` | `true` (`DEFAULT_HEAL_MRF_ENABLE`) | MRF intent pipeline: error paths deliver repair intents to the heal runtime and unconsumed intents replay from the durable journal after restart. |
 | `RUSTFS_HEAL_MRF_QUEUE_SIZE` | `100000` (`DEFAULT_HEAL_MRF_QUEUE_SIZE`) | MRF in-memory queue capacity. |
 | `RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES` | `8388608` (`DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES`, 8 MiB) | MRF journal size at which compaction runs. |
 | `RUSTFS_HEAL_MRF_REPLAY_BATCH` | `256` (`DEFAULT_HEAL_MRF_REPLAY_BATCH`) | Intents per replay push round. |
 | `RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS` | `3600` (`DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS`, `crates/ecstore/src/set_disk/core/io_primitives.rs`) | A recently modified object is never deleted as dangling inside this window; `0` disables the grace window. |
+
+The heal scheduler preserves priority ordering for urgent, high, and ordinary
+work, but applies a bounded fairness quantum to a continuously refilled MRF
+normal backlog: after four MRF/normal dispatches, a runnable Scanner,
+ReadRepair, or AutoHeal request gets a service opportunity. This protects
+integrity progress without weakening durable MRF admission or receipt
+requirements. Queue capacities from 4 through 9 reserve three slots, one per
+best-effort source, while still leaving one slot for MRF; capacities below 4
+cannot isolate all work classes and
+should only be used for diagnostic tests. Normal-priority non-best-effort submissions are deferred at the
+reserve boundary; high and urgent requests, including admin or MRF recovery,
+retain their priority and may use that space.
 
 ### Admin heal start, retries, and budgets
 
@@ -341,7 +402,17 @@ Rediscovery and admission observations update the recorded result but do not pos
 |---|---|---|
 | Scanner corrupt metadata | Metadata kind with no invented version/set; an existing pending-cache hint remains available for bounded retries. | Cache publication is separate from MRF ingress. Its age/count limits mean it is not an irrevocable repair-obligation ledger. |
 | Read decode failure | Decode kind, available version and erasure-set scope; a later failing read can rediscover the repair. | Nonblocking ingress and in-memory read-repair admission do not acknowledge durable acceptance. |
-| Partial write | Partial-write kind, available version and erasure-set scope; an in-memory heal request is the fast path. | The caller's documented restart-survival requirement is not fulfilled by ignoring the ingress result or by removing the unaccepted journal record at manager admission. Verified durable ownership remains pending. |
+| Partial write | Partial-write kind, version and erasure-set scope; each committed write receives a fresh responsibility lease. PUT rename convergence, partial delete-marker creation, and explicit partial-write producers use the durable MRF channel. | A successful durable-admission receipt follows committed checkpoint publication. The record remains after manager admission and retries until an exact verified storage receipt discharges it. Restart re-arms retained records even when the target is still offline. |
+
+With MRF enabled, a partial commit waits up to ten seconds for its checkpoint receipt. Fully converged writes do not enter this path or add MRF journal writes. The consumer batches available submissions and uses the existing count/byte budgets; an offline member or exhausted hint retry count does not evict an admitted partial-write obligation. New responsibility for the same unversioned object invalidates the previous lease, and a task that already started cannot accept that new responsibility as a merged proof target.
+
+Durable partial-write replay uses the manager's full proof anchor (including bucket incarnation and ingress lease) to observe queued, running, and retrying ownership. A due record already owned by the manager is not submitted again. Ownership is observed at the existing admission-backoff interval, which defaults to five seconds. Task-ID changes caused by retry merging do not change the responsibility identity. A notice is treated as in-flight only while its task has a live queued, running, or retrying owner. If those state locks are busy, the consumer falls back to ordinary manager admission rather than assuming that a task completed or indefinitely suppressing a retry.
+
+After an admitted attempt ends without verified proof, the responsibility remains in the journal and its next attempt uses bounded exponential backoff with per-responsibility jitter. With the default five-second base, successive delay ranges are 5 seconds, 5–10, 10–20, 20–40, then 30–60 seconds. A larger explicitly supplied admission interval is not shortened. Full or already-running admission uses the existing admission interval and does not increment the unverified-completion streak. Bucket identity lookup or submission errors use the same bounded failure pacing.
+
+Verified-proof and unverified-legacy events are consumed on the existing checkpoint tick even while a responsibility is backing off. A matching proof can therefore discharge responsibility without waiting for the next retry deadline. This is a retry delay bound, not a repair-completion deadline. New leases, replay after restart, and explicit operator rechecks start fresh runtime pacing; same-lease duplicate admission retains it. Rechecks still require their successor checkpoint before dispatch. Pacing state is not added to the journal format, does not consume the best-effort hint attempt limit, and never authorizes dropping a durable obligation.
+
+Disabled/unavailable delivery, full queues, invalid identities, persistence failures and receipt timeouts are not durable admission. An already committed object is not rolled back: when its source bucket incarnation is known, the producer falls back to the in-memory Heal channel with that same generation fence. If the source incarnation is unavailable, it does not dispatch an unfenced heal that could mutate a recreated bucket. When MRF is enabled, a failed admission attempt also records `mrf_durable_admission_failed`. An admission timeout does not cancel a record already retained by the consumer. These failure cases therefore do not promise that every successful S3 response has a durable repair obligation. Early-ACK PUTs can also return before their rename tail settles; the tail submits responsibility when its final outcome requires repair. The MRF switch is independent of automatic disk scanning, so returning members can be repaired with scanner and auto-heal disabled.
 
 Legacy notices carry only bucket/object/version, not a verified storage disposition, incarnation, scope, or durable responsibility generation. They are drained without clearing hints. Terminal callbacks release only their exact node-local ingress lease so rediscovery remains possible; lease generations are not durable successor receipts. Pending migration staging is not activated, and this change does not enable durable tombstones or garbage collection. Positive cleanup requires a storage-owner receipt with the complete responsibility identity and validated commit/fence evidence; neither task status nor the bounded diagnostic outcome window supplies it.
 
@@ -450,7 +521,7 @@ Read this snapshot before changing scanner controls: `blocked_source` with `life
 
 ## Reading Distributed Metrics
 
-`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
+`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/realtime` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
 
 ```bash
 for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
@@ -462,7 +533,7 @@ for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
     --access_key "$RUSTFS_ACCESS_KEY" \
     --secret_key "$RUSTFS_SECRET_KEY" \
     --request GET \
-    "${endpoint}/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" \
+    "${endpoint}/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" \
     > "artifacts/scanner-metrics.${node}.$(date -u +%Y%m%dT%H%M%SZ).ndjson"
 done
 ```

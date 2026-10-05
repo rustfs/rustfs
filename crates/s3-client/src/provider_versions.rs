@@ -83,13 +83,11 @@ impl ProviderVersionCapabilities {
         if tier_type.eq_ignore_ascii_case("s3")
             || tier_type.eq_ignore_ascii_case("rustfs")
             || tier_type.eq_ignore_ascii_case("minio")
-            || tier_type.eq_ignore_ascii_case("r2")
             || tier_type.eq_ignore_ascii_case("wasabi")
         {
             let list_object_versions = tier_type.eq_ignore_ascii_case("s3")
                 || tier_type.eq_ignore_ascii_case("rustfs")
-                || tier_type.eq_ignore_ascii_case("minio")
-                || tier_type.eq_ignore_ascii_case("r2");
+                || tier_type.eq_ignore_ascii_case("minio");
             Self {
                 raw_version_header: Some(X_AMZ_VERSION_ID),
                 bucket_versioning_state: list_object_versions,
@@ -100,6 +98,17 @@ impl ProviderVersionCapabilities {
                     ConditionalCreateCapability::Unsupported
                 },
                 exact_get_delete: true,
+            }
+        } else if tier_type.eq_ignore_ascii_case("r2") {
+            // R2 exposes an x-amz-version-id on some PUT responses, but it does
+            // not provide routable S3 object versions. GET/DELETE must therefore
+            // use the unversioned object path and must not call version APIs.
+            Self {
+                raw_version_header: None,
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::IfNoneMatchStar,
+                exact_get_delete: false,
             }
         } else if tier_type.eq_ignore_ascii_case("aliyun") {
             Self {
@@ -210,8 +219,6 @@ mod tests {
             ("RustFS", "x-amz-version-id"),
             ("minio", "x-amz-version-id"),
             ("MinIO", "x-amz-version-id"),
-            ("r2", "x-amz-version-id"),
-            ("R2", "x-amz-version-id"),
             ("wasabi", "x-amz-version-id"),
             ("Wasabi", "x-amz-version-id"),
             ("aliyun", "x-oss-version-id"),
@@ -256,6 +263,26 @@ mod tests {
     }
 
     #[test]
+    fn r2_ignores_non_routable_put_version_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-version-id", HeaderValue::from_static("r2-response-token"));
+        let capabilities = ProviderVersionCapabilities::for_tier_type("r2");
+
+        assert_eq!(
+            capabilities
+                .raw_version_id(&headers)
+                .expect("R2 header parsing should succeed"),
+            None
+        );
+        assert_eq!(
+            capabilities
+                .remote_version(&headers, BucketVersioningState::Disabled)
+                .expect("R2 uses unversioned routing"),
+            RemoteVersion::Disabled
+        );
+    }
+
+    #[test]
     fn provider_version_missing_header_is_unknown_until_bucket_state_is_known() {
         let headers = HeaderMap::new();
         let capabilities = ProviderVersionCapabilities::for_tier_type("aliyun");
@@ -280,7 +307,7 @@ mod tests {
             ("s3", true, true, ConditionalCreateCapability::IfNoneMatchStar, true),
             ("rustfs", true, true, ConditionalCreateCapability::Unsupported, true),
             ("minio", true, true, ConditionalCreateCapability::Unsupported, true),
-            ("r2", true, true, ConditionalCreateCapability::IfNoneMatchStar, true),
+            ("r2", false, false, ConditionalCreateCapability::IfNoneMatchStar, false),
             ("wasabi", false, false, ConditionalCreateCapability::Unsupported, true),
             ("aliyun", false, false, ConditionalCreateCapability::Unsupported, true),
             ("tencent", false, false, ConditionalCreateCapability::Unsupported, true),

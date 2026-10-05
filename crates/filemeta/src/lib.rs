@@ -29,3 +29,4 @@ pub use filemeta::*;
 pub use filemeta_inline::*;
 pub use metacache::*;
 pub use replication::*;
+pub mod shard_integrity;

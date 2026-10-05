@@ -30,6 +30,8 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::{info_commands::DiskMetrics, metrics::TimedAction};
 #[cfg(not(test))]
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -628,6 +630,8 @@ pub struct DiskHealthTracker {
     /// Authoritative atomically published runtime/status pair.
     state_snapshot: AtomicU64,
     transition_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    test_forced_offline: AtomicBool,
 }
 
 fn pack_health_state(runtime_state: RuntimeDriveHealthState, status: u32) -> u64 {
@@ -975,6 +979,8 @@ impl DiskHealthTracker {
             last_capacity_probe_unix_secs: AtomicI64::new(0),
             state_snapshot: AtomicU64::new(pack_health_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK)),
             transition_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_forced_offline: AtomicBool::new(false),
         }
     }
 
@@ -1043,6 +1049,13 @@ impl DiskHealthTracker {
             DISK_HEALTH_OK
         };
         self.publish_state(state, status);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.test_forced_offline.store(true, Ordering::Release);
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_state(RuntimeDriveHealthState::Offline, DISK_HEALTH_FAULTY);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
@@ -1123,6 +1136,8 @@ impl DiskHealthTracker {
     /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
     /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
     pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        #[cfg(test)]
+        self.test_forced_offline.store(false, Ordering::Release);
         self.reset_for_store_init_retry_at(endpoint, current_unix_time());
     }
 
@@ -1142,6 +1157,10 @@ impl DiskHealthTracker {
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        #[cfg(test)]
+        if self.test_forced_offline.load(Ordering::Acquire) {
+            return false;
+        }
         let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         let next = match current {
@@ -1217,6 +1236,17 @@ impl DiskHealthTracker {
                 record_drive_recovery_class(classify_drive_recovery(duration));
             }
             self.offline_since_unix_secs.store(0, Ordering::Release);
+            info!(
+                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                endpoint = %endpoint,
+                state = "recovered",
+                previous_state = current.as_str(),
+                runtime_state = next.as_str(),
+                reason,
+                "Disk recovered"
+            );
         } else if let Some(duration) = self.offline_duration() {
             record_drive_offline_duration(endpoint, duration);
         }
@@ -1440,6 +1470,11 @@ impl LocalDiskWrapper {
         self.health.force_runtime_state_for_test(state);
     }
 
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.health.force_offline_for_test();
+    }
+
     /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
     pub fn reset_health_for_store_init_retry(&self) {
         self.health.reset_for_store_init_retry(&self.disk.endpoint());
@@ -1597,6 +1632,7 @@ impl LocalDiskWrapper {
                     undo_write: false,
                     undo_delete: false,
                     old_data_dir: None,
+                    expected_delete_marker: None,
                 },
             )
             .await?;
@@ -2049,7 +2085,9 @@ impl DiskAPI for LocalDiskWrapper {
                     }
                     let result = self.disk.disk_info(opts).await?;
 
-                    if let Some(current_disk_id) = *self.disk_id.read().await
+                    // Fresh capacity snapshots omit the disk ID; the stale-disk precheck above already verified it.
+                    if !opts.fresh_capacity
+                        && let Some(current_disk_id) = *self.disk_id.read().await
                         && Some(current_disk_id) != result.id
                     {
                         return Err(DiskError::DiskNotFound);
@@ -2071,11 +2109,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
+        // Scoped heal must drain directory creation before releasing its lifecycle owner.
+        let timeout = if crate::store::bucket_heal_scope(volume).is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "make_volume",
             DiskMetricMutation::Write,
             || async { self.disk.make_volume(volume).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
@@ -2223,21 +2267,39 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "delete_data_dir",
             DiskMetricMutation::Delete,
             || async { self.disk.delete_data_dir(volume, path, opts).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "write_metadata",
             DiskMetricMutation::Write,
             || async { self.disk.write_metadata(org_volume, volume, path, fi).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
@@ -2396,6 +2458,20 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.track_disk_health_mutation(
+            "rename_file",
+            DiskMetricMutation::Write,
+            || async {
+                self.disk
+                    .rename_file_durable(src_volume, src_path, dst_volume, dst_path)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn prepare_part_transaction(
         &self,
         src_volume: &str,
@@ -2497,7 +2573,9 @@ impl DiskAPI for LocalDiskWrapper {
 mod tests {
     use super::*;
     use crate::disk::endpoint::Endpoint;
+    use crate::disk::format::FormatV3;
     use crate::disk::health_state::RuntimeDriveHealthState;
+    use crate::disk::{FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET};
     use std::{
         io,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -2850,6 +2928,56 @@ mod tests {
         let snapshot = wrapper.metrics_snapshot();
         assert_eq!(snapshot.api_calls.get("write_all"), Some(&1));
         assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_capacity_keeps_disk_identity_precheck_without_requiring_id_in_snapshot() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta_dir = dir.path().join(RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&meta_dir)
+            .await
+            .expect("metadata directory should be created");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(meta_dir.join(FORMAT_CONFIG_FILE), format.to_json().expect("format should serialize"))
+            .await
+            .expect("format should be written");
+
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("formatted disk should open"));
+        let disk_id = disk
+            .get_disk_id()
+            .await
+            .expect("disk ID should be readable")
+            .expect("formatted disk should have an ID");
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        wrapper.set_disk_id_state(Some(disk_id)).await;
+
+        let snapshot = wrapper
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fresh capacity should pass when the disk identity matches");
+        assert!(snapshot.fresh_capacity);
+        assert!(snapshot.total > 0);
+        assert!(snapshot.id.is_none(), "capacity-only snapshots should not expose the disk ID");
+
+        let stale_wrapper = LocalDiskWrapper::new(disk, false);
+        stale_wrapper.set_disk_id_state(Some(Uuid::nil())).await;
+        let error = stale_wrapper
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a stale disk identity must still be rejected before the capacity probe");
+        assert_eq!(error, DiskError::DiskNotFound);
     }
 
     #[tokio::test]

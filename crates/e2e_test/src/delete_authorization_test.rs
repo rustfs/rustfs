@@ -282,7 +282,7 @@ async fn sdk_list_bucket_and_list_bucket_versions_permissions_are_independent() 
 }
 
 #[tokio::test]
-async fn console_admin_force_delete_removes_prefix_versions_and_delete_markers() -> TestResult {
+async fn explicit_force_delete_permission_removes_prefix_versions_and_delete_markers() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
@@ -300,7 +300,14 @@ async fn console_admin_force_delete_removes_prefix_versions_and_delete_markers()
     put(&root, bucket, "folder-sibling/keep.txt").await?;
     let keep = versions(&root, bucket, "keep.txt").await?;
     let sibling = versions(&root, bucket, "folder-sibling/").await?;
-    let user = policy_user(&env, "consoleAdmin", None).await?;
+    let user = policy_user(
+        &env,
+        "explicit-force-delete",
+        Some(json!({"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
+        ]})),
+    )
+    .await?;
 
     force_delete(&user, bucket, "folder/").await?;
     assert!(
@@ -323,6 +330,126 @@ async fn console_admin_force_delete_removes_prefix_versions_and_delete_markers()
 }
 
 #[tokio::test]
+async fn force_delete_header_requires_explicit_permission() -> TestResult {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let root = env.create_s3_client();
+    let admin = policy_user(&env, "consoleAdmin", None).await?;
+
+    let owner_bucket = "force-owner-bucket";
+    root.create_bucket().bucket(owner_bucket).send().await?;
+    put(&root, owner_bucket, "kept-until-force.txt").await?;
+    force_delete_bucket(&root, owner_bucket, "x-rustfs-force-delete").await?;
+    assert!(
+        head_bucket_missing(&root, owner_bucket).await?,
+        "root force-delete must remove a non-empty bucket"
+    );
+
+    let denied_bucket = "force-admin-denied";
+    root.create_bucket().bucket(denied_bucket).send().await?;
+    put(&root, denied_bucket, "folder/child.txt").await?;
+    put(&root, denied_bucket, "plain.txt").await?;
+    assert_boxed_denied(force_delete(&admin, denied_bucket, "folder/").await);
+    assert!(
+        !versions(&root, denied_bucket, "folder/").await?.is_empty(),
+        "consoleAdmin without s3:ForceDeleteObject must not recursively delete"
+    );
+    assert_boxed_denied(force_delete_bucket(&admin, denied_bucket, "x-rustfs-force-delete").await);
+    assert_boxed_denied(force_delete_bucket(&admin, denied_bucket, "x-minio-force-delete").await);
+    assert!(
+        !head_bucket_missing(&root, denied_bucket).await?,
+        "consoleAdmin without s3:ForceDeleteBucket must not force-delete a non-empty bucket"
+    );
+    let not_empty = admin.delete_bucket().bucket(denied_bucket).send().await;
+    let not_empty = not_empty.expect_err("plain delete of a non-empty bucket must fail");
+    assert_eq!(
+        not_empty.as_service_error().and_then(|error| error.code()),
+        Some("BucketNotEmpty"),
+        "plain delete must keep the emptiness check, got {not_empty:?}"
+    );
+    admin.delete_object().bucket(denied_bucket).key("plain.txt").send().await?;
+    assert!(
+        versions(&root, denied_bucket, "plain.txt").await?.is_empty(),
+        "plain DeleteObject without the force header must stay allowed for consoleAdmin"
+    );
+
+    let object_bucket = "force-explicit-object";
+    root.create_bucket().bucket(object_bucket).send().await?;
+    put(&root, object_bucket, "folder/child.txt").await?;
+    put(&root, object_bucket, "keep.txt").await?;
+    let keep = versions(&root, object_bucket, "keep.txt").await?;
+    let object_user = policy_user(
+        &env,
+        "explicit-object-force",
+        Some(json!({"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{object_bucket}/*")}
+        ]})),
+    )
+    .await?;
+    force_delete(&object_user, object_bucket, "folder/").await?;
+    assert!(versions(&root, object_bucket, "folder/").await?.is_empty());
+    assert_eq!(versions(&root, object_bucket, "keep.txt").await?, keep);
+
+    let allowed_bucket = "force-explicit-bucket";
+    root.create_bucket().bucket(allowed_bucket).send().await?;
+    put(&root, allowed_bucket, "inside.txt").await?;
+    let bucket_user = policy_user(
+        &env,
+        "explicit-bucket-force",
+        Some(json!({"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:DeleteBucket","s3:ForceDeleteBucket"],"Resource":[
+                format!("arn:aws:s3:::{allowed_bucket}"), format!("arn:aws:s3:::{allowed_bucket}/*")
+            ]}
+        ]})),
+    )
+    .await?;
+    force_delete_bucket(&bucket_user, allowed_bucket, "x-minio-force-delete").await?;
+    assert!(
+        head_bucket_missing(&root, allowed_bucket).await?,
+        "an explicit s3:ForceDeleteBucket grant must remove a non-empty bucket"
+    );
+    Ok(())
+}
+
+async fn force_delete_bucket(
+    client: &Client,
+    bucket: &str,
+    header: &str,
+) -> Result<(), Box<SdkError<aws_sdk_s3::operation::delete_bucket::DeleteBucketError>>> {
+    let header: &'static str = match header {
+        "x-rustfs-force-delete" => "x-rustfs-force-delete",
+        "x-minio-force-delete" => "x-minio-force-delete",
+        other => panic!("unexpected force-delete header {other}"),
+    };
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .customize()
+        .mutate_request(move |request| {
+            request.headers_mut().insert(header, "true");
+        })
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(Box::new)
+}
+
+async fn head_bucket_missing(client: &Client, bucket: &str) -> TestResult<bool> {
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(false),
+        Err(error) => {
+            let code = error.as_service_error().and_then(|service| service.code());
+            if matches!(code, Some("NotFound" | "NoSuchBucket")) {
+                Ok(true)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn force_delete_authorizes_only_its_path_scope_without_list_permissions() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -339,7 +466,7 @@ async fn force_delete_authorizes_only_its_path_scope_without_list_permissions() 
         &env,
         "delete-only",
         Some(json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":[
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":[
                 format!("arn:aws:s3:::{bucket}/selected.txt"), format!("arn:aws:s3:::{bucket}/selected.txt/*")
             ]},
             {"Effect":"Deny","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/selected.txt-sibling")}
@@ -376,7 +503,7 @@ async fn force_directory_delete_cannot_remove_an_unauthorized_colliding_parent()
         &env,
         "parent-denier",
         Some(json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
             {"Effect":"Deny","Action":"s3:DeleteObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/collision.txt"),
              "Condition":{"StringEquals":{"s3:VersionId":protected_parent_version}}}
         ]})),
@@ -409,7 +536,7 @@ async fn force_unversioned_directory_requires_only_delete_object() -> TestResult
         &env,
         "unversioned-deleter",
         Some(json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":"s3:DeleteObject","Resource":format!("arn:aws:s3:::{bucket}/*")},
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
             {"Effect":"Deny","Action":"s3:DeleteObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/*")}
         ]})),
     )
@@ -438,7 +565,7 @@ async fn force_delete_denied_child_preserves_every_object_despite_bucket_allow()
         &env,
         "child-denier",
         Some(json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ReplicateDelete"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject","s3:ReplicateDelete"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
             {"Effect":"Deny","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ReplicateDelete"],"Resource":format!("arn:aws:s3:::{bucket}/folder/z-denied.txt")}
         ]})),
     )
@@ -468,7 +595,7 @@ async fn force_delete_denied_child_preserves_every_object_despite_bucket_allow()
         &env,
         "replica-deleter",
         Some(json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":"s3:DeleteObject","Resource":format!("arn:aws:s3:::{bucket}/*")},
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
             {"Effect":"Allow","Action":"s3:ReplicateDelete","Resource":format!("arn:aws:s3:::{bucket}/*")}
         ]})),
     )
@@ -500,7 +627,7 @@ async fn force_delete_denied_historical_version_preserves_versions_and_markers()
     put(&root, bucket, "folder/a-allowed.txt").await?;
     let policy = |version: &str| {
         json!({"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
+            {"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")},
             {"Effect":"Deny","Action":"s3:DeleteObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/folder/*"),
              "Condition":{"StringEquals":{"s3:VersionId":version}}}
         ]})
@@ -628,7 +755,7 @@ async fn force_delete_checks_every_version_page_before_mutation() -> TestResult 
         .try_collect::<Vec<_>>()
         .await?;
     put(&root, bucket, "folder/z-denied.txt").await?;
-    let allow = json!({"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/*")});
+    let allow = json!({"Effect":"Allow","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")});
     let user = policy_user(
         &env,
         "paged-deleter",

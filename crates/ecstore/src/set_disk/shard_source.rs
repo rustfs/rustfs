@@ -18,12 +18,42 @@ use crate::diagnostics::get::{
 use crate::disk::error::Error;
 use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
 use smallvec::SmallVec;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Generic codec callers may exceed the production set limit; `SmallVec` then
 /// spills without changing slot semantics.
 pub(crate) const INLINE_SHARD_SLOTS: usize = MAX_ERASURE_SET_DRIVE_COUNT;
 pub(crate) type ShardBuffers = SmallVec<[Option<Vec<u8>>; INLINE_SHARD_SLOTS]>;
 pub(crate) type ShardErrors = SmallVec<[Option<Error>; INLINE_SHARD_SLOTS]>;
+
+/// Repair evidence is independent of reconstruction quorum. Successful shards
+/// must not vote away a minority's observed corruption. Streaming decoders
+/// share this small accumulator with the reader that completes the response.
+#[derive(Debug, Default)]
+pub(crate) struct ShardReadRepair {
+    observed: AtomicU8,
+}
+
+impl ShardReadRepair {
+    pub(crate) fn observe(&self, errors: &[Option<Error>]) {
+        let flags = errors.iter().flatten().fold(0, |flags, error| {
+            flags
+                | match error {
+                    Error::FileCorrupt => 1,
+                    Error::FileNotFound => 2,
+                    _ => 0,
+                }
+        });
+        if flags != 0 {
+            self.observed.fetch_or(flags, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn needed(&self, allow_missing: bool) -> bool {
+        let mask = if allow_missing { 3 } else { 1 };
+        self.observed.load(Ordering::Relaxed) & mask != 0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShardReadCost {
@@ -56,6 +86,7 @@ pub(crate) struct StripeReadState {
     shards: ShardBuffers,
     errors: ShardErrors,
     read_quorum: usize,
+    pub(crate) integrity: Option<crate::io_support::shard_integrity::ReconstructionProof>,
 }
 
 impl StripeReadState {
@@ -70,6 +101,7 @@ impl StripeReadState {
             shards,
             errors,
             read_quorum,
+            integrity: None,
         }
     }
 
@@ -78,6 +110,7 @@ impl StripeReadState {
             shards: SmallVec::new(),
             errors: SmallVec::new(),
             read_quorum,
+            integrity: None,
         };
         state.reset(slot_count, read_quorum);
         state
@@ -89,6 +122,7 @@ impl StripeReadState {
         self.errors.clear();
         self.errors.resize_with(slot_count, || None);
         self.read_quorum = read_quorum;
+        self.integrity = None;
     }
 
     pub(crate) fn available_shards(&self) -> usize {
@@ -124,6 +158,13 @@ impl StripeReadState {
         &mut self.shards
     }
 
+    pub(crate) fn verify_reconstructed_integrity(&self) -> std::io::Result<()> {
+        if let Some(proof) = &self.integrity {
+            proof.verify(&self.shards)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_parts(self) -> (ShardBuffers, ShardErrors) {
         (self.shards, self.errors)
     }
@@ -152,6 +193,19 @@ pub(crate) trait ShardStripeSource: Send {
 mod tests {
     use super::*;
     use std::mem::size_of;
+
+    #[test]
+    fn repair_evidence_survives_healthy_stripes_and_excludes_unproven_failures() {
+        let evidence = ShardReadRepair::default();
+        evidence.observe(&[None, Some(Error::Timeout), Some(Error::DiskNotFound)]);
+        assert!(!evidence.needed(true));
+        evidence.observe(&[None, None, Some(Error::FileNotFound)]);
+        assert!(!evidence.needed(false), "unattempted reader slots do not prove a missing shard");
+        assert!(evidence.needed(true));
+        evidence.observe(&[None, None, Some(Error::FileCorrupt)]);
+        evidence.observe(&[None, None, None]);
+        assert!(evidence.needed(false), "a later healthy stripe must not erase observed corruption");
+    }
 
     #[test]
     fn stripe_scratch_capacity_matches_the_production_set_limit() {

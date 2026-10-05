@@ -16,9 +16,9 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk,
-    acquire_scanner_cache_locks, cache_root_entry_info, current_cache_root_or_prepare_with_generation,
-    scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
+    ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
+    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -43,7 +43,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -709,7 +709,7 @@ async fn scan_and_persist_local_bucket(
             }
         })?;
     let mut cache = DataUsageCache::default();
-    let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
+    let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
     // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
@@ -779,6 +779,7 @@ async fn scan_and_persist_local_bucket(
     cache.info.skip_healing = skip_healing;
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
     let scan_ctx = ctx.child_token();
     let scan = ScannerIODisk::nsscanner_disk(
         disk.clone(),
@@ -790,6 +791,7 @@ async fn scan_and_persist_local_bucket(
         ScannerDiskScanOptions {
             scan_mode,
             prefix_scan_scope: None,
+            checkpoint_tx: Some(checkpoint_tx),
         },
     );
     tokio::pin!(scan);
@@ -797,6 +799,7 @@ async fn scan_and_persist_local_bucket(
     tokio::pin!(fence_watch);
     let mut lock_watch = tokio::time::interval(NS_SCANNER_LOCK_POLL_INTERVAL);
     lock_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut checkpoint_channel_closed = false;
     let outcome = loop {
         tokio::select! {
             result = &mut scan => {
@@ -821,6 +824,54 @@ async fn scan_and_persist_local_bucket(
                     return Err(RemoteScannerServerError::worker(
                         "remote namespace scanner cache lock was lost during bucket scan",
                     ));
+                }
+            }
+            checkpoint = checkpoint_rx.recv(), if !checkpoint_channel_closed => {
+                let Some(checkpoint) = checkpoint else {
+                    checkpoint_channel_closed = true;
+                    continue;
+                };
+                if guard.is_lock_lost() {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(RemoteScannerServerError::worker(
+                        "remote namespace scanner cache lock was lost before checkpoint save",
+                    ));
+                }
+                match persist_scanner_checkpoint(
+                    set.clone(),
+                    store.clone(),
+                    ScannerCheckpointPersistContext {
+                        ctx: &scan_ctx,
+                        expected_publication_epoch,
+                        cycle: next_cycle,
+                        leader_epoch,
+                    },
+                    &cache_name,
+                    &checkpoint,
+                    &mut revisions,
+                )
+                .await
+                {
+                    ScannerCheckpointPersistResult::Saved => {
+                        if guard.is_lock_lost() {
+                            scan_ctx.cancel();
+                            let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                            return Err(RemoteScannerServerError::retry_bucket(
+                                "remote namespace scanner cache lock was lost after checkpoint save",
+                            ));
+                        }
+                    }
+                    ScannerCheckpointPersistResult::FenceChanged => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(
+                            "remote namespace scanner cache fence changed during checkpoint save",
+                        ));
+                    }
+                    ScannerCheckpointPersistResult::Failed(_error) => {
+                        checkpoint_channel_closed = true;
+                    }
                 }
             }
             result = &mut fence_watch => {
@@ -1196,11 +1247,12 @@ where
                 bounded_remote_scanner_deadline(Instant::now(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT, rpc_deadline);
         }
 
-        match frame.result {
+        let terminal = match frame.result {
             RemoteScannerFrameResult::Progress => {
                 if budget.budget_elapsed() && frame.phase == RemoteScannerPhase::Scanning {
                     return Ok(RemoteScannerOutcome::Partial);
                 }
+                None
             }
             RemoteScannerFrameResult::Complete(complete) => {
                 if complete.usage.name != expected.bucket || complete.usage.parent != crate::DATA_USAGE_ROOT {
@@ -1229,22 +1281,23 @@ where
                     )));
                 }
                 if budget.budget_elapsed() {
-                    return Ok(RemoteScannerOutcome::Partial);
+                    Some(Ok(RemoteScannerOutcome::Partial))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::Complete {
+                        usage: Box::new(complete.usage),
+                        pending_maintenance_work: complete.pending_maintenance_work,
+                    }))
                 }
-                return Ok(RemoteScannerOutcome::Complete {
-                    usage: Box::new(complete.usage),
-                    pending_maintenance_work: complete.pending_maintenance_work,
-                });
             }
-            RemoteScannerFrameResult::Partial => return Ok(RemoteScannerOutcome::Partial),
-            RemoteScannerFrameResult::NamespaceNotFound => return Ok(RemoteScannerOutcome::NamespaceNotFound),
+            RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
+            RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
             RemoteScannerFrameResult::CycleAhead { required_cycle } => {
                 if required_cycle <= expected.next_cycle || required_cycle == u64::MAX {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an invalid required cycle",
                     )));
                 }
-                return Ok(RemoteScannerOutcome::CycleAhead(required_cycle));
+                Some(Ok(RemoteScannerOutcome::CycleAhead(required_cycle)))
             }
             RemoteScannerFrameResult::Error(error_frame) => {
                 let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);
@@ -1255,12 +1308,45 @@ where
                     .unwrap_or(error_frame.message.as_str());
                 let error =
                     StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(message.to_string())));
-                return Err(match error_frame.scope {
+                Some(Err(match error_frame.scope {
                     RemoteScannerErrorScope::Bucket if retry_bucket => RemoteScannerStreamError::retry_bucket(error),
                     RemoteScannerErrorScope::Bucket => RemoteScannerStreamError::bucket(error),
                     RemoteScannerErrorScope::Worker => RemoteScannerStreamError::reconciled(error),
-                });
+                }))
             }
+        };
+
+        if let Some(result) = terminal {
+            let mut trailing = [0_u8; 1];
+            let read_deadline = rpc_deadline.min(semantic_progress_deadline);
+            let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
+            let eof = tokio::select! {
+                biased;
+                _ = ctx.cancelled(), if budget.reason().is_none() => {
+                    return Err(RemoteScannerStreamError::for_phase(
+                        StorageError::other("remote namespace scanner cancelled"), last_phase,
+                    ));
+                }
+                read = tokio::time::timeout_at(read_deadline, reader.read(&mut trailing)) => match read {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase)),
+                    Err(_) => {
+                        let message = if lifetime_limited {
+                            "remote namespace scanner RPC lifetime exceeded"
+                        } else {
+                            "remote namespace scanner made no semantic progress"
+                        };
+                        return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
+                    }
+                }
+            };
+            if eof != 0 {
+                return Err(RemoteScannerStreamError::for_phase(
+                    StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
+                    last_phase,
+                ));
+            }
+            return result;
         }
     }
 }

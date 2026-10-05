@@ -61,7 +61,7 @@ pub struct ListPartsInfo {
     pub upload_id: String,
     pub storage_class: String,
     pub part_number_marker: usize,
-    pub next_part_number_marker: usize,
+    pub next_part_number_marker: Option<usize>,
     pub max_parts: usize,
     pub is_truncated: bool,
     pub parts: Vec<PartInfo>,

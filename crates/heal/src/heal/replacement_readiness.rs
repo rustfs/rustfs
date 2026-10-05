@@ -106,7 +106,7 @@ fn local_replacement_endpoint(target: &str, local_grid_hosts: &[String]) -> Opti
     Some(endpoint)
 }
 
-async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
+pub(super) async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
     if let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == target) {
         return Some(disk.clone());
     }

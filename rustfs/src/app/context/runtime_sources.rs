@@ -71,6 +71,14 @@ pub async fn notify(args: EventArgs) {
     notifier_global::notify(args).await;
 }
 
+pub async fn validate_event_specific_rules(
+    bucket_name: &str,
+    region: &str,
+    event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+) -> Result<(), NotificationError> {
+    notifier_global::validate_event_specific_rules(bucket_name, region, event_rules).await
+}
+
 pub async fn add_event_specific_rules(
     bucket_name: &str,
     region: &str,

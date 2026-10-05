@@ -69,6 +69,15 @@ pub fn record_remote_lock_rpc_timeout(peer: &str, op: &'static str) {
     counter!("rustfs_remote_lock_rpc_timeouts_total", "peer" => peer.to_string(), "op" => op).increment(1);
 }
 
+/// Record a lock acquisition rejected by the per-peer request breaker or
+/// in-flight admission limit.
+#[inline(always)]
+pub fn record_remote_lock_request_suppressed(peer: &str, op: &'static str, reason: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_request_suppressed_total", "peer" => peer.to_string(), "op" => op, "reason" => reason)
+        .increment(1);
+}
+
 /// Record the cached lock channel to `peer` being evicted after an RPC failure.
 #[inline(always)]
 pub fn record_remote_lock_channel_eviction(peer: &str, trigger: &'static str) {
@@ -229,6 +238,7 @@ mod tests {
             record_early_release();
             record_contention_event();
             record_remote_lock_rpc_timeout("http://peer:9000", "lock");
+            record_remote_lock_request_suppressed("http://peer:9000", "lock", "breaker_open");
             record_remote_lock_channel_eviction("http://peer:9000", "timeout");
             record_remote_lock_channel_eviction_suppressed("http://peer:9000", "peer_recently_served");
             record_remote_lock_rpc_detached("lock", "detached");
@@ -251,6 +261,7 @@ mod tests {
             "rustfs_lock_early_releases",
             "rustfs_lock_contentions",
             "rustfs_remote_lock_rpc_timeouts_total",
+            "rustfs_remote_lock_request_suppressed_total",
             "rustfs_remote_lock_channel_evictions_total",
             "rustfs_remote_lock_channel_evictions_suppressed_total",
             "rustfs_remote_lock_rpc_detached_total",

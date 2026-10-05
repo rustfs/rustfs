@@ -50,6 +50,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-g8w9-qw9q-fghr` and `GHSA-xm99-m3gq-83g8`: a valid presigned `PutObject` accepted extra `x-amz-*` headers omitted from `SignedHeaders`; `x-amz-copy-source` could turn that upload capability into a cross-bucket read performed as the signer. Lesson: a presigned URL is a bounded capability; inspect all received security-sensitive headers and reject unsigned ones before selecting the S3 operation or reaching storage.
 - `GHSA-3ppv-fx5m-m749`: explicit `versionId` reads and copy sources authorized `s3:GetObject` instead of `s3:GetObjectVersion`. Lesson: version-specific object access must select version-specific actions for direct reads, `CopyObject`, and `UploadPartCopy`, with tests proving the backend is not reached on denial.
+- `GHSA-gjph-xcgw-4p7w`: `PutObject` and browser POST accepted a caller-supplied `versionId` and replaced an unlocked historical version with only `s3:PutObject`. Lesson: only replication-authorized writes may choose an existing version ID; ordinary uploads must not rewrite version history.
 - `GHSA-x298-9x87-fvjq`: anonymous `ListObjectVersions` fell back to `ListBucket` and returned before public-access-block gates. Lesson: compatibility fallbacks must converge on the same post-authorization checks as direct grants, especially `RestrictPublicBuckets` and anonymous data-plane denies.
 - `GHSA-mx42-j6wv-px98`: `UploadPartCopy` missed source authorization and allowed cross-bucket object exfiltration. Lesson: multipart copy must enforce the same source and destination contract as `CopyObject`.
 - `GHSA-wfxj-ph3v-7mjf`: `UploadPartCopy` checked source and destination independently but missed destination copy-source policy constraints. Lesson: source read and destination write checks are not sufficient when policy constrains allowed copy sources.
@@ -60,12 +61,14 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 - `GHSA-3g29-xff2-92vp`: FTP `RETR` and `SIZE`/`MDTM` read paths authenticated the user but skipped IAM before calling storage. Lesson: non-HTTP protocol frontends must enforce the same per-operation authorization as the S3 API before backend access.
 - `GHSA-g3vq-vv42-f647`: FTPS `MKD` called `create_bucket` without checking `s3:CreateBucket`. Lesson: protocol command handlers need action-specific checks even when sibling handlers already authorize correctly.
 - `GHSA-3p3x-734c-h5vx`: FTPS and WebDAV compared secret keys with early-return string equality, while FTPS also returned distinguishable invalid-user and invalid-password failures. Lesson: password-style protocol auth needs constant-time secret comparison, indistinguishable failures where practical, and rate limiting.
+- `GHSA-rhg6-jrf2-29c4`: WebDAV, FTP/FTPS, and SFTP used identity-policy checks with empty conditions and bypassed S3 bucket-policy explicit denies and condition-key denies. Lesson: alternate listeners must evaluate the same effective policy and trustworthy request context before storage access.
 
 ### Filesystem paths and object key traversal
 
 - `GHSA-pq29-69jg-9mxc`: RPC `read_file_stream` joined untrusted paths under a volume directory without canonical boundary checks. Lesson: `PathBuf::join` plus length checks are not path security.
 - `GHSA-8r6f-hmq2-28rg`: object keys containing traversal sequences bypassed bucket/object authorization when mapped to filesystem paths. Lesson: reject traversal at object-key parsing and verify final storage paths remain under the expected bucket/key root.
 - `GHSA-f4vq-9ffr-m8m3`: Snowball auto-extract accepted archive entries such as `../victim-bucket/object`, authorized the raw attacker-bucket path, then storage path cleaning crossed bucket boundaries. Lesson: archive entries become object keys and need traversal rejection plus consistent authz/storage normalization before writes.
+- `GHSA-g7fq-6xjm-mxf4`: versioned `DeleteObjects` accepted dot-segment keys, authorized the literal prefix, then wrote delete markers under a resolved sibling prefix. Lesson: validate each batch key before authorization and storage normalization, using the same object-name rules as single delete.
 
 ### Secrets, defaults, and cryptographic misuse
 
@@ -101,10 +104,12 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 ### SSE and on-disk storage invariants
 
 - `GHSA-xrrf-67jm-3c2r`: SSE metadata reported encryption while reader composition bypassed `EncryptReader` and stored plaintext. Lesson: test actual bytes on disk and wrapper order, not only API metadata.
+- `GHSA-wqmc-vjgv-jrpw`: SSE-C persisted and listed the plaintext MD5 as the ETag, allowing list-only users to confirm or brute-force low-entropy content and correlate equal plaintext across keys. Lesson: encrypted-object ETags must not expose deterministic plaintext fingerprints; protect them with per-object key material and keep listing, conditional, copy, and multipart semantics consistent.
 
 ### Object Lock and retention invariants
 
 - `GHSA-j548-9grx-fh4f`: Object Lock enforcement treated unreadable, fabricated, or unparsable bucket metadata as absent configuration and allowed retained objects to be deleted or expired. Lesson: retention must fail closed unless Object Lock absence is authoritative, and every delete, lifecycle, scanner, force-delete, and default-retention path needs the same state distinction.
+- `GHSA-28w4-rp2p-636w` and `GHSA-c7hx-vr97-45rg`: an authorized `DeleteBucket` with `x-rustfs-force-delete: true` removed active COMPLIANCE-retained versions even though ordinary version deletion was denied. Lesson: bucket force-delete must enforce retention across every version, including against root/owner callers.
 
 ### Serde deserialization and input validation
 
@@ -126,7 +131,7 @@ rg -n "normalize_extract_entry_key|Snowball|auto-extract|PathBuf::join|canonical
 rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECRET" rustfs crates
 rg -n "TONIC_RPC_PREFIX|verify_rpc_signature|check_auth|NodeServiceServer|x-rustfs-signature" rustfs crates
 rg -n "debug!|trace!|info!|error!|\\?resp|\\?merged_config|session_token|secret_key" rustfs crates
-rg -n "HashReader|EncryptReader|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
+rg -n "HashReader|EncryptReader|try_resolve_etag|ETag|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
 rg -n "ObjectLock|object_lock|retention|COMPLIANCE|GOVERNANCE|delete_prefix|lifecycle|scanner" rustfs crates
 rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ```
@@ -134,16 +139,17 @@ rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ## Minimum Regression Test Expectations
 
 - Authz fixes: include unauthenticated, valid low-privilege, wrong-action, correct-action, owner, non-owner, and root/admin cases as applicable.
-- Protocol frontend authz fixes: include denied `RETR`, `SIZE`/`MDTM`, `MKD`, bucket probe, and sibling allowed-operation cases, and assert denied paths do not reach the storage backend.
+- Protocol frontend authz fixes: include denied `RETR`, `SIZE`/`MDTM`, `MKD`, bucket probe, and sibling allowed-operation cases; test bucket-policy explicit denies and condition-key denies on each enabled listener against an S3 control, and assert denied paths do not reach storage.
 - IAM fixes: include import/update/list service-account cases with attacker-controlled parent, claims, access key, secret key, and policy.
 - Copy/upload fixes: include cross-bucket, cross-user, source-denied, destination-denied, copy-source-condition, and multipart completion cases.
 - Presigned upload fixes: include a valid presign with extra unsigned tagging, redirect, storage-class, and cross-bucket copy-source headers; require rejection before source or destination storage access, and verify explicitly signed equivalents still work.
 - Version-action fixes: include historical UUID, explicit current version, `null`, range, partNumber, presigned, STS/session, service-account, anonymous bucket-policy, copy source, and multipart-copy source cases.
+- Version-write fixes: a `PutObject`-only principal must not replace an existing version through `PutObject` or browser POST `?versionId=`; verify replication-authorized writes and versioned, suspended, and unversioned buckets separately.
 - Policy-condition fixes: include reserved-key header collisions, missing keys, partially overlapping multi-value sets, plugin mode, and built-in policy mode.
-- Path fixes: include encoded traversal, absolute path, nested traversal, archive entries with `..`, valid object keys that resemble traversal text but should be rejected, and canonical bucket/prefix boundary checks.
+- Path fixes: include encoded traversal, absolute path, nested traversal, archive entries with `..`, valid object keys that resemble traversal text but should be rejected, and canonical bucket/prefix boundary checks; test per-key `DeleteObjects` errors and prefix-scoped denials on versioned buckets.
 - Logging fixes: assert redacted output for structs and response bodies that may contain credentials.
 - IAM export fixes: assert exported archives omit plaintext user and service-account secrets unless the format deliberately encrypts or seals them.
 - RPC auth fixes: include captured metadata replay across two concrete methods, stale timestamps, wrong path, wrong method surrogate, wrong secret, and valid same-method calls.
 - Browser/CORS fixes: assert no credentials on reflected/default origins, correct behavior for explicit allowlists, and no same-origin script execution for previewed object content.
-- SSE fixes: inspect stored bytes and verify API metadata, read-back behavior, and on-disk ciphertext together.
-- Object Lock fixes: include unreadable metadata, fabricated metadata defaults, unparsable config, confirmed absent config, COMPLIANCE/GOVERNANCE retention, lifecycle expiry, scanner sweeps, and force-delete paths.
+- SSE fixes: inspect stored bytes and verify API metadata, read-back behavior, and on-disk ciphertext together; for ETags, upload equal plaintext under different keys and assert list-only callers cannot derive or correlate the plaintext digest, including multipart objects.
+- Object Lock fixes: include unreadable metadata, fabricated metadata defaults, unparsable config, confirmed absent config, COMPLIANCE/GOVERNANCE retention, lifecycle expiry, scanner sweeps, and force-delete paths; an authorized force-delete must preserve active COMPLIANCE versions.
