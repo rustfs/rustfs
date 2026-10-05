@@ -86,6 +86,7 @@ use rustfs_utils::path::{
     GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
     path_join, path_join_buf,
 };
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -159,10 +160,15 @@ pub(crate) fn metadata_less_part_file(entry: &str) -> bool {
         .is_some_and(|part_number| part_number.parse::<usize>().is_ok_and(|part_number| part_number > 0))
 }
 
-fn is_delete_transaction_marker(entry: &str, prefix: &str) -> bool {
+fn delete_transaction_marker_id(entry: &str, prefix: &str) -> Option<Uuid> {
     entry
         .strip_prefix(prefix)
-        .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok_and(|uuid| !uuid.is_nil()))
+        .and_then(|transaction| Uuid::parse_str(transaction).ok())
+        .filter(|uuid| !uuid.is_nil())
+}
+
+fn is_delete_transaction_marker(entry: &str, prefix: &str) -> bool {
+    delete_transaction_marker_id(entry, prefix).is_some()
 }
 
 /// Whether a `list_dir` entry inside a UUID data dir is erasure data, a rollback
@@ -835,6 +841,8 @@ const EVENT_DISK_LOCAL_URING_READ_BUDGET: &str = "disk_local_uring_read_budget";
 const EVENT_DISK_LOCAL_URING_RESULT_BUDGET: &str = "disk_local_uring_result_budget";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
+/// A delete retry found committed delete residue of this object and ran its cleanup pass.
+const EVENT_DISK_LOCAL_DELETE_RESIDUE_FINISHED: &str = "disk_local_delete_residue_finished";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
@@ -843,6 +851,9 @@ const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_fa
 /// to replace. Best effort — the rename that follows fails closed — but a
 /// recurring signal means heal is stuck on that drive.
 const EVENT_DISK_LOCAL_HEAL_PURGE_FAILED: &str = "disk_local_heal_purge_failed";
+/// Delete transactions whose committed residue a repeated delete finished on
+/// a local disk (#6898), counted instead of logged per object.
+const METRIC_DISK_DELETE_RESIDUE_FINISHED_TOTAL: &str = "rustfs_disk_delete_residue_finished_total";
 #[cfg(unix)]
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 #[cfg(unix)]
@@ -6297,6 +6308,8 @@ impl LocalDisk {
                 if err != DiskError::FileNotFound {
                     return Err(err);
                 }
+                self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                    .await;
 
                 if fi.deleted && force_del_marker {
                     return self
@@ -7242,6 +7255,8 @@ impl LocalDisk {
         let (data, _) = match self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await {
             Ok(data) => data,
             Err(DiskError::FileNotFound) => {
+                self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                    .await;
                 // `deleted` alone can be an explicit marker purge; only
                 // `mark_deleted` may create metadata that was not present.
                 let Some(delete_marker) = fis.iter().find(|fi| fi.deleted && fi.mark_deleted).cloned() else {
@@ -9179,6 +9194,150 @@ impl LocalDisk {
             }
         }
         Ok(())
+    }
+
+    /// Run the cleanup pass of delete transactions that committed on this disk
+    /// but never cleaned up, for example because an older build stopped the
+    /// delete when its client disconnected (#6898). Returns how many were
+    /// finished.
+    ///
+    /// Called only where `path` was just found without `xl.meta`, under the
+    /// object's metadata lease. A `delete-data.<T>` marker proves that `T`
+    /// removed the object's metadata on this disk and committed, so the data
+    /// it marked can no longer be read, healed or rolled back here. Finishing
+    /// removes what `T`'s own cleanup pass would have removed. Reserved
+    /// markers, rollback backups without a committed marker, and object
+    /// directories that hold `xl.meta` are left alone.
+    async fn finish_committed_delete_residue(
+        &self,
+        volume: &str,
+        path: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> usize {
+        let transactions = match self.committed_delete_transactions(volume, path).await {
+            Ok(transactions) => transactions,
+            Err(err) => {
+                warn!(
+                    event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume,
+                    path,
+                    operation = "scan_committed_delete_residue",
+                    error = ?err,
+                    "Disk local delete failed"
+                );
+                return 0;
+            }
+        };
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            ..Default::default()
+        };
+        let mut finished = 0;
+        for transaction in transactions {
+            // Unlike the delete's own pass, drop the rollback backup before the
+            // marked data: if this is cut short, the marker that proves the
+            // transaction is still in place for the next attempt.
+            let result = match self
+                .delete_unleased_with_namespace_owner(volume, &format!("{path}/{transaction}"), &opts, namespace_owner.clone())
+                .await
+            {
+                Ok(()) | Err(DiskError::FileNotFound) => self
+                    .finish_version_delete(volume, path, transaction, namespace_owner.clone())
+                    .await
+                    .map(|_| ()),
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(()) => finished += 1,
+                Err(err) => warn!(
+                    event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume,
+                    path,
+                    transaction = %transaction,
+                    operation = "finish_committed_delete_residue",
+                    error = ?err,
+                    "Disk local delete failed"
+                ),
+            }
+        }
+        if finished > 0 {
+            counter!(METRIC_DISK_DELETE_RESIDUE_FINISHED_TOTAL).increment(u64::try_from(finished).unwrap_or(u64::MAX));
+            debug!(
+                event = EVENT_DISK_LOCAL_DELETE_RESIDUE_FINISHED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
+                state = "finished",
+                transactions = finished,
+                "Disk local delete residue finished"
+            );
+        }
+        finished
+    }
+
+    /// Transactions with a committed `delete-data.<T>` marker in a data dir of
+    /// the metadata-less object directory `path`. Empty when the directory is
+    /// absent or holds anything but UUID data dirs, `xl.meta` included.
+    async fn committed_delete_transactions(&self, volume: &str, path: &str) -> Result<BTreeSet<Uuid>> {
+        let object_path = self.io_get_object_path(volume, path)?;
+        let mut entries = match fs::read_dir(&object_path).await {
+            Ok(entries) => entries,
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(BTreeSet::new()),
+            Err(err) => return Err(to_file_error(err).into()),
+        };
+        let mut data_dirs = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+            // Residue holds only UUID data dirs: `xl.meta` is live metadata and
+            // any other child makes `path` a prefix of other keys. Stop at the
+            // first such child instead of walking a possibly large prefix.
+            let is_data_dir_name = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| Uuid::parse_str(name).is_ok_and(|uuid| !uuid.is_nil()));
+            if !is_data_dir_name {
+                return Ok(BTreeSet::new());
+            }
+            match entry.file_type().await {
+                Ok(file_type) if file_type.is_dir() => data_dirs.push(entry.path()),
+                Ok(_) => return Ok(BTreeSet::new()),
+                // Removed since the directory was read, e.g. by a racing purge.
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
+
+        let mut transactions = BTreeSet::new();
+        for data_dir in data_dirs {
+            let mut entries = match fs::read_dir(&data_dir).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(to_file_error(err).into()),
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                let Some(transaction) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| delete_transaction_marker_id(name, DELETE_DATA_DIR_MARKER_PREFIX))
+                else {
+                    continue;
+                };
+                match entry.file_type().await {
+                    Ok(file_type) if file_type.is_file() => {
+                        transactions.insert(transaction);
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+            }
+        }
+        Ok(transactions)
     }
 
     async fn finish_version_delete(
@@ -17913,6 +18072,326 @@ mod test {
             b"old-data"
         );
         assert!(!object_dir.join(rollback_dir.to_string()).exists());
+    }
+
+    struct CommittedDeleteResidue {
+        object_dir: PathBuf,
+        data_dir: Uuid,
+        transaction: Uuid,
+        version_id: Uuid,
+    }
+
+    impl CommittedDeleteResidue {
+        fn part(&self) -> PathBuf {
+            self.object_dir.join(self.data_dir.to_string()).join("part.1")
+        }
+
+        fn marker(&self) -> PathBuf {
+            self.object_dir
+                .join(self.data_dir.to_string())
+                .join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", self.transaction))
+        }
+
+        fn backup(&self) -> PathBuf {
+            self.object_dir
+                .join(self.transaction.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+        }
+    }
+
+    /// Leave the state a delete reaches once it committed on this disk but
+    /// before its cleanup pass: what a cancelled request used to strand.
+    async fn write_committed_delete_residue(disk: &LocalDisk, bucket: &str, object: &str) -> CommittedDeleteResidue {
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let object_dir = disk.io_get_object_path(bucket, object).expect("object IO path");
+        fs::create_dir_all(object_dir.join(data_dir.to_string()))
+            .await
+            .expect("data dir should be created");
+        fs::write(object_dir.join(data_dir.to_string()).join("part.1"), b"stale")
+            .await
+            .expect("part data should be written");
+        let fi = test_file_info(object, version_id, Some(data_dir), None);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(fi.clone()))
+            .await
+            .expect("metadata should be written");
+        disk.delete_version(
+            bucket,
+            object,
+            fi,
+            false,
+            DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the delete should commit on this disk");
+
+        let residue = CommittedDeleteResidue {
+            object_dir,
+            data_dir,
+            transaction,
+            version_id,
+        };
+        assert!(!residue.object_dir.join(STORAGE_FORMAT_FILE).exists());
+        assert!(residue.part().exists() && residue.marker().exists() && residue.backup().exists());
+        residue
+    }
+
+    fn residue_delete_request(object: &str) -> Vec<FileInfoVersions> {
+        vec![FileInfoVersions {
+            name: object.to_string(),
+            versions: vec![FileInfo {
+                name: object.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]
+    }
+
+    // #6898: repeating the delete of a key whose earlier delete committed but
+    // never cleaned up reclaims the residue and still reports the key missing.
+    #[tokio::test]
+    async fn delete_versions_finishes_committed_delete_residue() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "prefix/object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+
+        let errors = disk
+            .delete_versions(bucket, residue_delete_request(object), DeleteOptions::default())
+            .await;
+
+        assert!(matches!(errors.as_slice(), [Some(DiskError::FileNotFound)]), "{errors:?}");
+        assert!(!residue.object_dir.exists(), "the committed residue must be reclaimed");
+        assert!(!dir.path().join(bucket).join("prefix").exists(), "empty parents must be pruned");
+        assert!(dir.path().join(bucket).exists());
+    }
+
+    #[tokio::test]
+    async fn delete_version_finishes_committed_delete_residue() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+
+        let err = disk
+            .delete_version(
+                bucket,
+                object,
+                test_file_info(object, residue.version_id, Some(residue.data_dir), None),
+                false,
+                DeleteOptions::default(),
+            )
+            .await
+            .expect_err("the version is already deleted");
+
+        assert_eq!(err, DiskError::FileVersionNotFound);
+        assert!(!residue.object_dir.exists(), "the committed residue must be reclaimed");
+    }
+
+    // The rollback backup may already be gone; the committed marker alone
+    // proves the delete.
+    #[tokio::test]
+    async fn delete_versions_finishes_committed_marker_without_rollback_backup() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        fs::remove_dir_all(residue.object_dir.join(residue.transaction.to_string()))
+            .await
+            .expect("rollback dir should be removed");
+
+        let errors = disk
+            .delete_versions(bucket, residue_delete_request(object), DeleteOptions::default())
+            .await;
+
+        assert!(matches!(errors.as_slice(), [Some(DiskError::FileNotFound)]), "{errors:?}");
+        assert!(!residue.object_dir.exists(), "the committed marker alone must be enough");
+    }
+
+    // Only a committed marker on this disk proves the delete. A reserved marker,
+    // a rollback backup alone, or live metadata beside the marker is left for
+    // the owning transaction, rollback, or heal.
+    #[tokio::test]
+    async fn committed_delete_residue_finish_leaves_unproven_state_alone() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        // A rollback backup without a committed marker, as an inline object leaves it.
+        let backup_only = write_committed_delete_residue(&disk, bucket, "backup-only").await;
+        fs::remove_dir_all(backup_only.object_dir.join(backup_only.data_dir.to_string()))
+            .await
+            .expect("data dir should be removed");
+
+        // A delete that reserved its data dir but never removed the metadata.
+        let reserved = write_committed_delete_residue(&disk, bucket, "reserved").await;
+        fs::rename(
+            reserved.marker(),
+            reserved
+                .object_dir
+                .join(reserved.data_dir.to_string())
+                .join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{}", reserved.transaction)),
+        )
+        .await
+        .expect("marker should become a reservation");
+
+        // A committed marker beside live metadata.
+        let live = write_committed_delete_residue(&disk, bucket, "live").await;
+        fs::write(live.object_dir.join(STORAGE_FORMAT_FILE), b"live metadata")
+            .await
+            .expect("metadata should be written");
+
+        for object in ["backup-only", "reserved", "live"] {
+            assert_eq!(
+                disk.finish_committed_delete_residue(bucket, object, None).await,
+                0,
+                "{object} carries no committed proof"
+            );
+        }
+        let errors = disk
+            .delete_versions(
+                bucket,
+                [residue_delete_request("backup-only"), residue_delete_request("reserved")].concat(),
+                DeleteOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(|err| matches!(err, Some(DiskError::FileNotFound))), "{errors:?}");
+
+        assert!(backup_only.backup().exists());
+        assert!(reserved.backup().exists() && reserved.part().exists());
+        assert!(live.object_dir.join(STORAGE_FORMAT_FILE).exists());
+        assert!(live.marker().exists() && live.part().exists() && live.backup().exists());
+    }
+
+    // A key that is also a prefix of other keys may name a huge directory; the
+    // first child that is not a data dir ends the scan and nothing is touched.
+    #[tokio::test]
+    async fn committed_delete_residue_finish_skips_a_prefix_of_other_keys() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "logs";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let nested = residue.object_dir.join("2026").join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(nested.parent().expect("nested object dir"))
+            .await
+            .expect("nested object dir should be created");
+        fs::write(&nested, b"nested metadata")
+            .await
+            .expect("nested metadata should be written");
+
+        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 0);
+        assert!(residue.backup().exists() && residue.marker().exists() && residue.part().exists());
+        assert!(nested.exists());
+    }
+
+    // A finish cut short before the marked data is gone (a timeout, a crash)
+    // must leave the marker that lets the next attempt recognize and finish
+    // the residue, never a lone rollback backup.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn committed_delete_residue_finish_removes_backup_before_its_proof() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = disk
+            .io_get_object_path(bucket, &format!("{object}/{}", residue.data_dir))
+            .expect("data dir IO path");
+        let (destination_tx, destination_rx) = std::sync::mpsc::channel();
+        let _destination = hooks::observe_rename_destination(&data_path, move |destination| {
+            let _ = destination_tx.send(destination.to_path_buf());
+        });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &data_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        let mut finish = Box::pin(disk.finish_committed_delete_residue(bucket, object, None));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("finish should reach the marked data dir"),
+                _ = finish.as_mut() => panic!("finish returned before removing the marked data dir"),
+            }
+        })
+        .await
+        .expect("finish should start removing the marked data dir");
+
+        assert!(!residue.backup().exists(), "the rollback backup must go first");
+        assert!(residue.marker().exists(), "the proof must outlive the backup");
+        drop(finish);
+
+        // The abandoned rename is still parked; the next attempt recognizes the
+        // residue by its marker and finishes it.
+        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists(), "the retried finish must reclaim the residue");
+
+        // Let the abandoned rename run into its missing source and wait until
+        // it is done, so it cannot outlive the temp dir.
+        drop(release);
+        let destination = destination_rx
+            .try_recv()
+            .expect("the abandoned rename should have chosen its destination");
+        tokio::time::timeout(Duration::from_secs(10), hooks::drain_namespace_key(&destination))
+            .await
+            .expect("the abandoned rename should finish");
+    }
+
+    // Each transaction is finished only on its own proof.
+    #[tokio::test]
+    async fn committed_delete_residue_finish_is_per_transaction() {
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let committed = write_committed_delete_residue(&disk, bucket, object).await;
+        fs::remove_dir_all(committed.object_dir.join(committed.transaction.to_string()))
+            .await
+            .expect("rollback dir of the committed transaction should be removed");
+        let unproven = Uuid::new_v4();
+        let unproven_backup = committed
+            .object_dir
+            .join(unproven.to_string())
+            .join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(unproven_backup.parent().expect("backup parent"))
+            .await
+            .expect("unproven rollback dir should be created");
+        fs::write(&unproven_backup, b"rollback metadata")
+            .await
+            .expect("unproven backup should be written");
+
+        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert!(!committed.object_dir.join(committed.data_dir.to_string()).exists());
+        assert!(unproven_backup.exists(), "a backup without its own committed marker must remain");
+        assert_eq!(recorder.counter_value(METRIC_DISK_DELETE_RESIDUE_FINISHED_TOTAL, &[]), 1);
     }
 
     #[tokio::test]

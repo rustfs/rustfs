@@ -17643,6 +17643,71 @@ mod tests {
             .expect_err("the object must be deleted");
     }
 
+    // #6898: residue that an older build stranded (every disk committed the
+    // delete, the cleanup pass never ran) is reclaimed by deleting the key again.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn repeated_delete_objects_finishes_committed_delete_residue() {
+        use crate::disk::DiskAPI as _;
+
+        for drives in [1, 4] {
+            let temp = tempfile::tempdir().expect("create temp store dir");
+            let (_ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp.path(), "residue-retry", &[drives])).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("residue-retry-{drives}-{}", uuid::Uuid::new_v4());
+            let object = "residue/retry.bin";
+            put_detached_delete_fixture(&store, &bucket, object).await;
+
+            let transaction = uuid::Uuid::new_v4();
+            let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+            for disk in disks.iter().flatten() {
+                let errors = disk
+                    .delete_versions(
+                        &bucket,
+                        vec![crate::disk::FileInfoVersions {
+                            name: object.to_string(),
+                            versions: vec![rustfs_filemeta::FileInfo {
+                                name: object.to_string(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        crate::disk::DeleteOptions {
+                            old_data_dir: Some(transaction),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "the delete should commit on every disk: {errors:?}");
+            }
+            for disk in 0..drives {
+                let object_dir = temp.path().join(format!("pool0/set0/disk{disk}")).join(&bucket).join(object);
+                assert!(!object_dir.join(crate::disk::STORAGE_FORMAT_FILE).exists());
+                assert!(
+                    object_dir
+                        .join(transaction.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                        .exists(),
+                    "disk {disk} should hold the stranded rollback backup"
+                );
+            }
+
+            let (_deleted, errors) = store
+                .delete_objects(
+                    &bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "a missing key deletes successfully: {errors:?}");
+            assert_no_delete_residue(temp.path(), &bucket, object, drives);
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn prefix_delete_serializes_with_concurrent_object_lock_metadata_updates() {
