@@ -120,7 +120,7 @@ static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>
 static DELETE_SOURCE_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
-static DELETE_OBJECTS_AUTH_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+static DELETE_OBJECTS_GENERATION_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn install_delete_snapshot_test_hook(
@@ -185,24 +185,24 @@ async fn wait_for_delete_source_test_hook(bucket: &str) {
 }
 
 #[cfg(test)]
-pub(crate) fn install_delete_objects_auth_test_hook(
+pub(crate) fn install_delete_objects_generation_test_hook(
     bucket: String,
     loaded: Arc<tokio::sync::Barrier>,
     resume: Arc<tokio::sync::Barrier>,
 ) {
-    *DELETE_OBJECTS_AUTH_TEST_HOOK
+    *DELETE_OBJECTS_GENERATION_TEST_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .expect("delete objects auth test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+        .expect("delete objects generation test hook lock should not be poisoned") = Some((bucket, loaded, resume));
 }
 
 #[cfg(test)]
-async fn wait_for_delete_objects_auth_test_hook(bucket: &str) {
+async fn wait_for_delete_objects_generation_test_hook(bucket: &str) {
     let hook = {
-        let mut slot = DELETE_OBJECTS_AUTH_TEST_HOOK
+        let mut slot = DELETE_OBJECTS_GENERATION_TEST_HOOK
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("delete objects auth test hook lock should not be poisoned");
+            .expect("delete objects generation test hook lock should not be poisoned");
         if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
             slot.take()
         } else {
@@ -481,6 +481,8 @@ impl DefaultObjectUsecase {
         // Capture the bucket generation before per-object authorization, but
         // do not expose a bucket-state error unless at least one object is authorized.
         let bucket_generation = load_bucket_generation_from_store(store.as_ref(), &req, &bucket).await;
+        #[cfg(test)]
+        wait_for_delete_objects_generation_test_hook(&bucket).await;
 
         let bypass_governance = has_bypass_governance_header(&req.headers);
 
@@ -595,8 +597,6 @@ impl DefaultObjectUsecase {
             let _ = helper.complete(&result);
             return result;
         }
-        #[cfg(test)]
-        wait_for_delete_objects_auth_test_hook(&bucket).await;
         req.extensions.insert(bucket_generation?);
         let bucket_lock_enabled = object_lock_checks_required(&bucket).await;
 
@@ -2098,7 +2098,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn execute_delete_objects_rejects_bucket_recreated_after_authorization() {
+    async fn execute_delete_objects_rejects_bucket_recreated_before_publication_admission() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -2125,7 +2125,7 @@ mod tests {
             .expect("authorized bucket metadata should be cached"))
         .clone();
         metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
-        metadata.policy_config_json = policy_json.into_bytes();
+        metadata.policy_config_json = policy_json.clone().into_bytes();
         crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
             .await
             .expect("publish test bucket policy");
@@ -2146,7 +2146,7 @@ mod tests {
         req.extensions.insert(crate::storage::access::ReqInfo::default());
         let loaded = Arc::new(tokio::sync::Barrier::new(2));
         let resume = Arc::new(tokio::sync::Barrier::new(2));
-        install_delete_objects_auth_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
+        install_delete_objects_generation_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
 
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let delete = tokio::spawn(async move { usecase.execute_delete_objects(req).await });
@@ -2166,6 +2166,15 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("recreate same bucket name");
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("recreated bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("republish the same policy for admission");
         let mut reader = PutObjReader::from_vec(b"new generation".to_vec());
         store
             .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
@@ -2176,7 +2185,7 @@ mod tests {
         let err = delete
             .await
             .expect("delete objects task should join")
-            .expect_err("old authorization must not delete from the recreated bucket");
+            .expect_err("the captured generation must not delete from the recreated bucket");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
         store
             .get_object_info(&bucket, "object", &ObjectOptions::default())

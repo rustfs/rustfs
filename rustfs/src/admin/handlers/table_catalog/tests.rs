@@ -5759,11 +5759,15 @@ async fn commit_publication_lock_order_remains_compatible_with_old_maintenance_n
             )
             .await
     });
-    metadata_backend.wait_for_lock_attempts(2).await;
+    metadata_backend.wait_for_lock_attempts(3).await;
     let migration_lock = crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_fence_lock_path("warehouse");
     assert_eq!(
         metadata_backend.lock_attempts.lock().await.as_slice(),
         &[
+            (
+                "warehouse".to_string(),
+                crate::table_catalog::default_table_bucket_publication_lock_path()
+            ),
             (crate::admin::storage_api::RUSTFS_META_BUCKET.to_string(), migration_lock),
             (crate::admin::storage_api::RUSTFS_META_BUCKET.to_string(), table_path),
         ]
