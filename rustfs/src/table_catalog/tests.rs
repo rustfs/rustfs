@@ -492,6 +492,77 @@ impl TableCommitPublication for LosingTestPublication {
     fn complete(&self) {}
 }
 
+struct PersistedMigrationFenceTestPublication;
+
+#[async_trait::async_trait]
+impl TableCommitPublication for PersistedMigrationFenceTestPublication {
+    async fn begin_table_bucket(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    async fn prepare(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    fn holds_table_bucket(&self, _table_bucket: &str) -> bool {
+        true
+    }
+
+    fn holds_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
+        true
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    fn complete(&self) {}
+}
+
+#[tokio::test]
+async fn object_catalog_rechecks_persisted_migration_fence_when_reusing_read_permit() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("returns").expect("table should parse");
+    let existing_table = IdentifierSegment::parse("orders").expect("table should parse");
+    seed_table_for_metadata_maintenance(
+        &store,
+        bucket,
+        &namespace,
+        &existing_table,
+        default_table_metadata_file_path(&namespace, &existing_table, "00001.metadata.json"),
+    )
+    .await;
+    store
+        .materialize_durable_strong_backing_migration(bucket)
+        .await
+        .expect("migration should persist the object-write fence");
+
+    let entry = test_table_entry(
+        bucket,
+        &namespace,
+        &table,
+        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+    );
+    let error = store
+        .register_table_with_publication(entry, &PersistedMigrationFenceTestPublication)
+        .await
+        .expect_err("a persisted migration fence must reject object-backed registration");
+    assert_matches!(
+        error,
+        TableCatalogStoreError::Conflict(message) if message.contains("writes are fenced")
+    );
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("table lookup should succeed")
+            .is_none()
+    );
+}
+
 async fn assert_view_replacement_rechecks_publication_fence<S>(store: &S, backend: &TestCatalogObjectBackend)
 where
     S: TableCatalogStore,
@@ -3960,7 +4031,7 @@ async fn durable_catalog_restore_rejects_changed_referenced_object() {
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
         .expect_err("restore must reject changed referenced objects");
-    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("watermark changed"));
+    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("object graph no longer matches"));
 }
 
 #[tokio::test]
@@ -3971,9 +4042,9 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
     let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-    let manifest_list_location = default_table_metadata_file_path(&namespace, &table, "snap-10.avro");
-    let statistics_location = default_table_metadata_file_path(&namespace, &table, "stats.puffin");
-    let partition_statistics_location = default_table_metadata_file_path(&namespace, &table, "partition-stats.orc");
+    let manifest_list_location = "tables/table-id/metadata/snap-10.avro";
+    let statistics_location = "tables/table-id/metadata/stats.puffin";
+    let partition_statistics_location = "tables/table-id/metadata/partition-stats.orc";
     let mut metadata = table_metadata_json_for_backup(bucket, "table-id", "table-uuid");
     metadata["last-sequence-number"] = serde_json::Value::from(1);
     metadata["snapshots"] = serde_json::json!([{
@@ -4027,8 +4098,8 @@ async fn durable_catalog_backup_tracks_statistics_objects() {
     let error = store
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
-        .expect_err("restore must verify statistics object watermarks");
-    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("watermark changed"));
+        .expect_err("restore must reject changed statistics references");
+    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("object graph no longer matches"));
 }
 
 #[tokio::test]
@@ -4313,7 +4384,7 @@ async fn durable_catalog_restore_rejects_changed_target_after_pending_intent() {
         .restore_durable_catalog_backup(bucket, &backup.backup_id, None, true)
         .await
         .expect_err("a pending restore must not overwrite a changed target");
-    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("target changed"));
+    assert_matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("target bucket changed"));
     assert!(store.get_namespace(bucket, "later").await.unwrap().is_some());
 }
 
@@ -4344,6 +4415,12 @@ async fn durable_catalog_restore_replays_after_unrelated_bucket_change() {
         .unwrap();
     let backup = store.create_durable_catalog_backup(bucket, None).await.unwrap();
 
+    let changed_namespace = Namespace::parse("changed-before-restore").unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &changed_namespace))
+        .await
+        .unwrap();
+
     let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
     backend.fail_next_put(RUSTFS_META_BUCKET, &snapshot_path).await;
     let first_error = store
@@ -4366,6 +4443,13 @@ async fn durable_catalog_restore_replays_after_unrelated_bucket_change() {
         .await
         .expect("an unrelated bucket change must not invalidate a pending bucket restore");
     assert_eq!(replay.status, TableCatalogRestoreStatus::Restored);
+    assert!(
+        store
+            .get_namespace(bucket, changed_namespace.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(store.get_table_bucket(unrelated_bucket).await.unwrap().is_some());
 }
 

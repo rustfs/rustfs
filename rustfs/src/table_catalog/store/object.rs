@@ -2180,7 +2180,11 @@ where
         validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         self.require_table_bucket(&entry.table_bucket).await?;
         let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => None,
+            Some(true) => {
+                self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
+                    .await?;
+                None
+            }
             Some(false) => {
                 return Err(TableCatalogStoreError::Conflict(
                     "table-bucket catalog migration read permit was lost".to_string(),
@@ -2284,7 +2288,11 @@ where
         validate_view_entry_version_and_id(&entry)?;
         self.require_table_bucket(&entry.table_bucket).await?;
         let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => None,
+            Some(true) => {
+                self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
+                    .await?;
+                None
+            }
             Some(false) => {
                 return Err(TableCatalogStoreError::Conflict(
                     "table-bucket catalog migration read permit was lost".to_string(),
@@ -5525,7 +5533,11 @@ where
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
         let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => None,
+            Some(true) => {
+                self.ensure_object_backed_catalog_write_permit_after_lock(&request.table_bucket)
+                    .await?;
+                None
+            }
             Some(false) => {
                 return Err(TableCatalogStoreError::Conflict(
                     "table-bucket catalog migration read permit was lost".to_string(),
@@ -6110,7 +6122,11 @@ where
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
         let _migration_guard = match publication.catalog_migration_read_permit_status() {
-            Some(true) => None,
+            Some(true) => {
+                self.ensure_object_backed_catalog_write_permit_after_lock(&request.table_bucket)
+                    .await?;
+                None
+            }
             Some(false) => {
                 return Err(TableCatalogStoreError::Conflict(
                     "table-bucket catalog migration read permit was lost".to_string(),
