@@ -2419,7 +2419,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api::protocols::client::{BucketOperations as _, MakeBucketOptions};
     use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
