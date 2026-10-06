@@ -14,9 +14,8 @@
 
 //! Regression coverage for policy enforcement at the protocol/backend boundary.
 
-use super::client::ProtocolStorageClient;
 use crate::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
-use crate::storage_api::protocols::client::{BucketOperations, FS, ListObjectsV2Input, MakeBucketOptions};
+use crate::storage_api::protocols::client::{BucketOperations, ListObjectsV2Input, MakeBucketOptions};
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{
@@ -54,29 +53,118 @@ fn decode_policy(value: serde_json::Value) -> Result<rustfs_policy::policy::Poli
     serde_json::from_str(&value.to_string())
 }
 
+async fn protocol_test_context(root: Credentials) -> (tempfile::TempDir, Arc<AppContext>, Arc<IamSys<ObjectStore>>) {
+    let (temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    ObjectStore::new(store.clone())
+        .save_iam_config(json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+        .await
+        .expect("seed IAM format");
+    let iam = rustfs_iam::init_iam_sys_for_context(store.clone())
+        .await
+        .expect("initialize IAM");
+    let context = Arc::new(AppContext::new(store, Arc::new(TestIam(iam.clone())), Arc::new(TestKms)));
+    assert!(context.publish_action_credentials(root));
+    (temp, context, iam)
+}
+
+#[test]
+#[serial_test::serial]
+fn protocol_startup_backend_tracks_server_context_installation() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-startup-context", || async {
+        let root = Credentials {
+            access_key: "protocol-bound-root".into(),
+            secret_key: "protocol-bound-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let foreign_root = Credentials {
+            access_key: "protocol-foreign-root".into(),
+            secret_key: "protocol-foreign-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_foreign_temp, foreign_context, _foreign_iam) = protocol_test_context(foreign_root.clone()).await;
+        let ambient_context = crate::app::context::publish_global_app_context(foreign_context.clone());
+        assert!(
+            ambient_context.iam().is_ready(),
+            "ambient IAM must be ready for the uninstalled-slot probe"
+        );
+        let ambient_root = ambient_context.action_credentials().get().expect("ambient root credentials");
+        assert_ne!(ambient_root.access_key, root.access_key, "server roots must differ");
+        let (_temp, context, _iam) = protocol_test_context(root.clone()).await;
+        let slot = ServerContextSlot::new();
+        let backend = crate::init::protocol_storage_client_for_server(slot.clone());
+        let bucket = "protocol-startup-context";
+        for store in [context.object_store(), foreign_context.object_store()] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+        }
+        let session = |credentials: Credentials, protocol| {
+            SessionContext::new(
+                ProtocolPrincipal::new(Arc::new(rustfs_policy::auth::UserIdentity {
+                    credentials,
+                    ..Default::default()
+                })),
+                protocol,
+                "127.0.0.1".parse().expect("loopback"),
+            )
+        };
+        for protocol in [Protocol::WebDav, Protocol::Ftps, Protocol::Sftp] {
+            for credentials in [ambient_root.clone(), root.clone()] {
+                let result = backend
+                    .authorize_operation(&session(credentials, protocol), &S3Action::GetObject, bucket, Some("key"))
+                    .await;
+                assert!(
+                    matches!(result, Err(AuthorizationError::IamUnavailable)),
+                    "uninstalled server slot must reject before ambient credential lookup: {result:?}"
+                );
+            }
+        }
+        assert!(slot.install(context));
+        let foreign_slot = ServerContextSlot::new();
+        assert!(foreign_slot.install(foreign_context));
+        let foreign_backend = crate::init::protocol_storage_client_for_server(foreign_slot);
+        for protocol in [Protocol::WebDav, Protocol::Ftps, Protocol::Sftp] {
+            foreign_backend
+                .authorize_operation(&session(foreign_root.clone(), protocol), &S3Action::GetObject, bucket, Some("key"))
+                .await
+                .expect("foreign root uses its own installed server slot");
+            backend
+                .authorize_operation(&session(root.clone(), protocol), &S3Action::GetObject, bucket, Some("key"))
+                .await
+                .expect("backend constructed before installation uses the installed server slot");
+            for (target, credentials) in [(&backend, foreign_root.clone()), (&foreign_backend, root.clone())] {
+                assert!(
+                    matches!(
+                        target
+                            .authorize_operation(&session(credentials, protocol), &S3Action::GetObject, bucket, Some("key"))
+                            .await,
+                        Err(AuthorizationError::AccessDenied)
+                    ),
+                    "another server's root is not this server's root"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 #[serial_test::serial]
 fn protocol_policy_denials_and_request_conditions() {
     crate::app::gating_test_env::run_large_stack_test("protocol-policy-authorization", || async {
-        let (_temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-        ObjectStore::new(store.clone())
-            .save_iam_config(json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
-            .await
-            .expect("seed IAM format");
-        let iam = rustfs_iam::init_iam_sys_for_context(store.clone())
-            .await
-            .expect("initialize IAM");
         let root = Credentials {
             access_key: "protocol-root".into(),
             secret_key: "protocol-root-secret".into(),
             status: "on".into(),
             ..Default::default()
         };
-        let context = Arc::new(AppContext::new(store.clone(), Arc::new(TestIam(iam.clone())), Arc::new(TestKms)));
-        assert!(context.publish_action_credentials(root.clone()));
+        let (_temp, context, iam) = protocol_test_context(root.clone()).await;
+        let store = context.object_store();
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let backend = crate::init::protocol_storage_client_for_server(slot);
         let bucket = "protocol-policy-test";
         store
             .make_bucket(bucket, &MakeBucketOptions::default())
