@@ -84,7 +84,7 @@ fn protocol_startup_backend_tracks_server_context_installation() {
             ..Default::default()
         };
         let (_foreign_temp, foreign_context, _foreign_iam) = protocol_test_context(foreign_root.clone()).await;
-        let ambient_context = crate::app::context::publish_global_app_context(foreign_context.clone());
+        let ambient_context = crate::runtime_sources::publish_test_app_context(foreign_context.clone());
         assert!(
             ambient_context.iam().is_ready(),
             "ambient IAM must be ready for the uninstalled-slot probe"
