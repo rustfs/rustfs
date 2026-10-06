@@ -417,12 +417,16 @@ mod tests {
                 std::error::Error::source(&status).is_some_and(|source| source.is::<tonic::transport::Error>()),
                 "the real channel error must retain its typed transport source: {status:?}"
             );
+            let disk = DiskError::from(status.clone());
+            let storage = EcstoreError::from(status.clone());
+            let disk_storage = EcstoreError::from(DiskError::from(status.clone()));
             for error in [
-                Error::Disk(DiskError::from(status.clone())),
-                Error::Disk(DiskError::from(status.clone()).clone()),
-                Error::Storage(EcstoreError::from(status.clone())),
-                Error::Storage(EcstoreError::from(status.clone()).clone()),
-                Error::Storage(EcstoreError::from(DiskError::from(status.clone()))),
+                Error::Disk(disk.clone()),
+                Error::Disk(disk),
+                Error::Storage(storage.clone()),
+                Error::Storage(storage),
+                Error::Storage(disk_storage.clone()),
+                Error::Storage(disk_storage),
                 Error::Io(std::io::Error::from(DiskError::from(status))),
             ] {
                 let io = match &error {
