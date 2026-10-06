@@ -1210,6 +1210,123 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
     assert!(queue.queued_request_id_for_dedup_key(&first_key).is_none());
 }
 
+#[tokio::test]
+async fn durable_mrf_anchor_snapshot_follows_live_owners_and_ignores_stale_notices() {
+    use rustfs_common::mrf_channel::{MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent};
+    let mut intent = MrfIntent {
+        bucket: Arc::from("mrf-notice-snapshot"),
+        object: Arc::from("object"),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        }),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4())
+        .expect("complete durable identity");
+    let target = MrfRepairNoticeTarget {
+        bucket: intent.bucket.clone(),
+        object: intent.object.clone(),
+        version_id: intent.version_id,
+        kind: intent.kind,
+        scope: intent.scope,
+        delete_marker_purge: None,
+        lease: intent.lease,
+        durable_anchor: Some(anchor.clone()),
+    };
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: intent.bucket.to_string(),
+            object: intent.object.to_string(),
+            version_id: None,
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(anchor.bucket_incarnation_id);
+    let queued = manager
+        .submit_mrf_heal_request_with_receipt_and_identity(request, target)
+        .await
+        .expect("queued owner");
+    assert_eq!(queued.result, HealAdmissionResult::Accepted);
+    assert_eq!(
+        manager.try_in_flight_durable_mrf_anchors().expect("stable view"),
+        HashSet::from([anchor.clone()])
+    );
+    let mut moved_request = manager
+        .heal_queue
+        .lock()
+        .await
+        .remove_request_id(&queued.task_id)
+        .expect("queued request");
+    moved_request.id = "retry-merged-active".into();
+    let retry_request = moved_request.clone();
+    manager.active_heals.lock().await.insert(
+        moved_request.id.clone(),
+        Arc::new(HealTask::from_request(moved_request, Arc::new(MockStorage))),
+    );
+    {
+        let mut registry = lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets);
+        let notices = registry.remove(&queued.task_id).expect("queued notices");
+        registry.insert("retry-merged-active".into(), notices);
+    }
+    let held = manager.try_in_flight_durable_mrf_anchors().expect("active ownership view");
+    assert!(held.contains(&anchor));
+    let mut wrong_incarnation = anchor.clone();
+    wrong_incarnation.bucket_incarnation_id = Uuid::new_v4();
+    assert!(!held.contains(&wrong_incarnation));
+    let mut wrong_scope = anchor.clone();
+    wrong_scope.scope = Some(MrfScope {
+        pool_index: 1,
+        set_index: 0,
+    });
+    assert!(!held.contains(&wrong_scope));
+    let mut another = MrfIntent {
+        object: Arc::from("other-object"),
+        lease: None,
+        ..intent.clone()
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut another), MrfIngressResult::Enqueued);
+    let mut wrong_lease = anchor.clone();
+    wrong_lease.lease = another.lease.expect("another ingress generation");
+    assert!(!held.contains(&wrong_lease));
+    let gate = manager.active_heals.lock().await;
+    assert!(manager.try_in_flight_durable_mrf_anchors().is_none(), "contention cannot mean completed");
+    drop(gate);
+    manager.active_heals.lock().await.remove("retry-merged-active");
+    manager.retrying_heals.lock().await.insert(
+        "retry-merged-active".into(),
+        RetryingHeal {
+            request: retry_request,
+            error: "retry pending".into(),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("retrying view")
+            .contains(&anchor)
+    );
+    manager.retrying_heals.lock().await.remove("retry-merged-active");
+    assert!(lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets).contains_key("retry-merged-active"));
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("stable ownerless view")
+            .is_empty(),
+        "a late notice transfer into a finished task must not suppress durable retry"
+    );
+}
+
 #[test]
 fn mrf_verified_repair_event_requires_positive_exact_identity() {
     use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};

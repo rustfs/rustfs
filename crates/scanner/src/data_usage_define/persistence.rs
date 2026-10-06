@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use bytes::Bytes;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -477,7 +478,7 @@ impl DataUsageCache {
     async fn save_path_with_retry<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         store: Arc<S>,
         path: &str,
-        buf: &[u8],
+        buf: &Bytes,
         timeout_duration: Duration,
         max_retries: u32,
         revision: Option<DataUsageCacheRevision>,
@@ -486,11 +487,14 @@ impl DataUsageCache {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
+        let sha256hex = (revision.is_some() && !buf.is_empty())
+            .then(|| hex_simd::encode_to_string(Sha256::digest(buf), hex_simd::AsciiCase::Lower));
 
         let save_result = Self::retry_save_op(path_type, timeout_duration, max_retries, || {
             let store_clone = store.clone();
             let path_clone = path.clone();
-            let buf_clone = buf.to_vec();
+            let buf_clone = buf.clone();
+            let sha256hex = sha256hex.clone();
             let revision = revision.clone();
             async move {
                 let publication_admission = match expected_epoch {
@@ -505,9 +509,18 @@ impl DataUsageCache {
                     });
                 };
                 if let Some(revision) = revision {
-                    save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
+                    crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                        store_clone,
+                        &path_clone,
+                        buf_clone,
+                        sha256hex,
+                        revision.preconditions(),
+                        None,
+                        None,
+                    )
+                    .await?;
                 } else {
-                    save_config(store_clone, &path_clone, buf_clone).await?;
+                    save_config(store_clone, &path_clone, buf_clone.to_vec()).await?;
                 }
                 Ok::<(), StorageError>(())
             }
@@ -539,7 +552,7 @@ impl DataUsageCache {
                         },
                     )
                     .await?;
-                Ok::<bool, StorageError>(reader.read_all().await? == buf)
+                Ok::<bool, StorageError>(reader.read_all().await?.as_slice() == buf.as_ref())
             })
             .await;
             if matches!(reconcile, Ok(Ok(true))) {
@@ -590,6 +603,8 @@ impl DataUsageCache {
     ) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+        // Primary, backup, and retries read the same immutable encoded body.
+        let buf = Bytes::from(buf);
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);

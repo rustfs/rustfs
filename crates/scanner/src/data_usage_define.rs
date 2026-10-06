@@ -43,7 +43,7 @@ use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
     SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError,
-    TRANSITION_COMPLETE, save_config, save_config_with_preconditions, scanner_publication_admission_for_epoch, storageclass,
+    TRANSITION_COMPLETE, save_config, scanner_publication_admission_for_epoch, storageclass,
 };
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 

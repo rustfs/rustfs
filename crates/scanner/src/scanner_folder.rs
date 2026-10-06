@@ -2806,18 +2806,23 @@ pub(crate) async fn scan_data_folder_scoped(
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
     let resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
+    let bucket_name = cache.info.name.clone();
+    let next_cycle = cache.info.next_cycle;
+    let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
+    let new_cache = DataUsageCache {
+        info: cache.info.clone(),
+        ..Default::default()
+    };
+    let update_cache = DataUsageCache {
+        info: cache.info.clone(),
+        ..Default::default()
+    };
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
-        old_cache: cache.clone(),
-        new_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
-        update_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
+        old_cache: cache,
+        new_cache,
+        update_cache,
         data_usage_scanner_debug: false,
         heal_object_select,
         scan_mode,
@@ -2871,7 +2876,7 @@ pub(crate) async fn scan_data_folder_scoped(
     // Read top level in bucket
     let mut root = DataUsageEntry::default();
     let folder = CachedFolder {
-        name: cache.info.name.clone(),
+        name: bucket_name.clone(),
         parent: None,
         object_heal_prob_div: 1,
     };
@@ -2885,7 +2890,7 @@ pub(crate) async fn scan_data_folder_scoped(
             let new_cache = scanner.as_mut_new_cache();
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
-            new_cache.info.next_cycle = cache.info.next_cycle;
+            new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap
                 || root.failed_objects > 0
                 || !new_cache.info.failed_objects.is_empty()
@@ -2906,7 +2911,7 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.scan_plan_digest = None;
                 }
             }
-            let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
+            let had_scan_checkpoint = had_scan_checkpoint || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
             new_cache.info.scan_raw_enumeration_cursor = None;
@@ -2918,20 +2923,20 @@ pub(crate) async fn scan_data_folder_scoped(
 
             close_disk_guard.close().await;
             if unresolved_objects || mixed_coverage {
-                Err(ScannerError::PartialCache(Box::new(new_cache.clone())))
+                Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))))
             } else {
-                Ok(new_cache.clone())
+                Ok(std::mem::take(new_cache))
             }
         }
         Err(e) => {
             if ctx.is_cancelled() {
-                let root_hash = hash_path(&cache.info.name);
+                let root_hash = hash_path(&bucket_name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
                 let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
                 let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
                     && !root_has_progress)
-                    .then(|| scanner.old_cache.cache.clone());
+                    .then(|| std::mem::take(&mut scanner.old_cache.cache));
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
@@ -2963,7 +2968,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     }
                     new_cache.info.last_update = Some(SystemTime::now());
-                    new_cache.info.next_cycle = cache.info.next_cycle;
+                    new_cache.info.next_cycle = next_cycle;
                     new_cache.info.snapshot_complete = false;
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
@@ -2981,13 +2986,13 @@ pub(crate) async fn scan_data_folder_scoped(
                         }
                     }
                     close_disk_guard.close().await;
-                    return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));
+                    return Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))));
                 }
             }
             if matches!(&e, ScannerError::Io(io) if io.kind() == ErrorKind::NotFound) {
-                let mut partial_cache = scanner.old_cache.clone();
+                let mut partial_cache = scanner.old_cache;
                 partial_cache.info.last_update = Some(SystemTime::now());
-                partial_cache.info.next_cycle = cache.info.next_cycle;
+                partial_cache.info.next_cycle = next_cycle;
                 partial_cache.info.snapshot_complete = false;
                 close_disk_guard.close().await;
                 return Err(ScannerError::NamespaceNotFoundCache(Box::new(partial_cache)));
