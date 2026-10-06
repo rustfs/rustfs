@@ -177,6 +177,16 @@
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_null_versions_markers_and_invalid_success_keep_their_meaning"
     },
     {
+      "invariant": "metadata-cache-real-get-and-range-preserve-body-across-read-modes",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::read::metadata_cache_tests::metadata_cache_real_get_and_range_preserve_body_across_read_modes"
+    },
+    {
+      "invariant": "late-metadata-refresh-rejects-changed-generation-and-mapped-shards",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::read::metadata_cache_tests::late_metadata_refresh_rejects_changed_generation_and_mapped_shards"
+    },
+    {
       "invariant": "list-objects-shared-corpus-static-namespace",
       "suite": "rustfs-ecstore",
       "name": "store::list_objects::differential_tests::list_objects_shared_corpus_static_namespace"
