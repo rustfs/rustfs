@@ -17702,21 +17702,25 @@ mod test {
             async move { disk.read_all_data(&volume, &volume_dir, &file_path).await }
         };
 
-        let err = read_absent("missing-bucket")
-            .await
-            .expect_err("absent bucket volume should fail");
-        assert!(matches!(err, DiskError::VolumeNotFound));
-        assert!(logs.contents().contains("read_all_data_with_dmtime_volume_not_found"));
-
-        logs.buffer
-            .lock()
-            .expect("captured logs mutex should not be poisoned")
-            .clear();
-        let err = read_absent(super::super::MIGRATING_META_BUCKET)
-            .await
-            .expect_err("absent migrating metadata volume should fail");
-        assert!(matches!(err, DiskError::VolumeNotFound));
-        assert!(!logs.contents().contains("read_all_data_with_dmtime_volume_not_found"));
+        let cases = [
+            ("missing-bucket", true),
+            (".minio.sysfoo", true),
+            (super::super::MIGRATING_META_BUCKET, false),
+            (".minio.sys/buckets", false),
+        ];
+        for (volume, expect_warning) in cases {
+            logs.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clear();
+            let err = read_absent(volume).await.expect_err("absent volume should fail");
+            assert!(matches!(err, DiskError::VolumeNotFound), "volume {volume}: {err:?}");
+            assert_eq!(
+                logs.contents().contains("read_all_data_with_dmtime_volume_not_found"),
+                expect_warning,
+                "volume {volume}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
