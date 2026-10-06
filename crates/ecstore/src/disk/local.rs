@@ -7084,14 +7084,21 @@ impl LocalDisk {
                     && let Err(access_err) = access(volume_dir).await
                     && access_err.kind() == ErrorKind::NotFound
                 {
-                    warn!(
-                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        reason = "read_all_data_with_dmtime_volume_not_found",
-                        error = ?access_err,
-                        "Disk local read fallback failed"
-                    );
+                    // An absent legacy MinIO volume is expected: startup migrations probe it.
+                    let migrating_meta = volume == super::MIGRATING_META_BUCKET
+                        || volume
+                            .strip_prefix(super::MIGRATING_META_BUCKET)
+                            .is_some_and(|rest| rest.starts_with('/'));
+                    if !migrating_meta {
+                        warn!(
+                            event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            reason = "read_all_data_with_dmtime_volume_not_found",
+                            error = ?access_err,
+                            "Disk local read fallback failed"
+                        );
+                    }
                     return Err(DiskError::VolumeNotFound);
                 }
 
@@ -17669,6 +17676,47 @@ mod test {
                 .exists()
         );
         assert!(!logs.contents().contains("reliable_rename failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_all_data_absent_migrating_meta_volume_does_not_warn() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let read_absent = |volume: &str| {
+            let volume_dir = dir.path().join(volume);
+            let file_path = volume_dir
+                .join("buckets/bucket/.replication/resync.bin")
+                .join(STORAGE_FORMAT_FILE);
+            let disk = &disk;
+            let volume = volume.to_string();
+            async move { disk.read_all_data(&volume, &volume_dir, &file_path).await }
+        };
+
+        let err = read_absent("missing-bucket")
+            .await
+            .expect_err("absent bucket volume should fail");
+        assert!(matches!(err, DiskError::VolumeNotFound));
+        assert!(logs.contents().contains("read_all_data_with_dmtime_volume_not_found"));
+
+        logs.buffer
+            .lock()
+            .expect("captured logs mutex should not be poisoned")
+            .clear();
+        let err = read_absent(super::super::MIGRATING_META_BUCKET)
+            .await
+            .expect_err("absent migrating metadata volume should fail");
+        assert!(matches!(err, DiskError::VolumeNotFound));
+        assert!(!logs.contents().contains("read_all_data_with_dmtime_volume_not_found"));
     }
 
     #[tokio::test(flavor = "current_thread")]
