@@ -40,7 +40,7 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.cycle_max_objects` | `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` | objects | `0` (`DEFAULT_SCANNER_CYCLE_MAX_OBJECTS`) | Caps objects processed by one cycle. `0` disables this budget. |
 | `scanner.cycle_max_directories` | `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` | directories | `0` (`DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES`) | Caps directories entered by one cycle. `0` disables this budget. |
 | `heal.bitrot_cycle` | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` | seconds | `2592000` (`DEFAULT_HEAL_BITROT_CYCLE_SECS`, 30 days) | Controls periodic deep bitrot scans. `false`, `off`, `no`, or `disabled` disables periodic deep scans; `0`, `true`, `on`, or `yes` runs deep mode every scanner cycle. |
-| `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` (`DEFAULT_SCANNER_IDLE_MODE`) | Master switch for scanner throttling: preset sleeps plus the foreground-read backoff floor. `false` disables both and the scanner runs at full speed. |
+| `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` (`DEFAULT_SCANNER_IDLE_MODE`) | Enables preset scanner sleeps and foreground-read backoff. `false` disables those sleeps; per-disk foreground-priority admission remains active. |
 | `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `14` (`DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS`) | Timeout for saving scanner cache; runtime enforces a minimum of `1` and keeps the default persistence budget within the distributed publication lease. |
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS`) | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
 | `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
@@ -59,7 +59,7 @@ Speed presets (`crates/config/src/constants/scanner.rs`) set the base sleep mult
 | `slow` | 10x | 15s | 60s |
 | `slowest` | 100x | 15s | 30m |
 
-Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`).
+Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`). The per-disk foreground-priority gate is independent of `idle_mode` and remains active when sleeps are disabled.
 
 ### Environment-only scanner knobs
 
@@ -67,13 +67,26 @@ These have no persistent key and are read from the environment only.
 
 | Environment variable | Default (constant) | Effect |
 |---|---|---|
-| `RUSTFS_SCANNER_ENABLED` (deprecated alias `RUSTFS_ENABLE_SCANNER`) | `true` (`scanner_enabled_from_env`, `rustfs/src/module_switches.rs`) | Starts the data scanner at all. The heal manager is initialized whenever heal or scanner is enabled, because scanner-produced heal candidates need a consumer. |
+| `RUSTFS_SCANNER_ENABLED` (deprecated alias `RUSTFS_ENABLE_SCANNER`) | `true` (`scanner_enabled_from_env`, `rustfs/src/module_switches.rs`) | Starts the data scanner. Scanner-produced heal candidates require the heal manager, so the manager and MRF consumer also start when scanner is on, even if `RUSTFS_HEAL_ENABLED=false`. |
 | `RUSTFS_SCANNER_ALERT_COOLDOWN_SECS` | `86400` (`DEFAULT_SCANNER_ALERT_COOLDOWN_SECS`, `scanner_folder.rs`) | Per-(kind, bucket, object) cooldown between S3 excess-alert events; `0` emits every cycle. See [Scanner Excess Alerts](scanner-excess-alerts.md). |
 | `RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS` | `60` (`DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS`, `scanner_folder.rs`) | Objects modified within this window are skipped by deep (bitrot) verification in the current cycle. |
 | `RUSTFS_HEAL_OBJECT_SELECT_PROB` | `1024` (`DEFAULT_HEAL_OBJECT_SELECT_PROB`, `scanner_folder.rs`) | Sampling divisor for scanner-originated heal checks: roughly one object in N per cycle is selected for a low-priority heal check. |
 | `RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES` | `16` (`DATA_USAGE_UPDATE_DIR_CYCLES`, `scanner_folder.rs`) | Every N cycles a compacted directory is re-descended instead of reusing its cached usage. `1` forces re-descent every cycle (used by lifecycle e2e lanes). |
 | `RUSTFS_DATA_USAGE_FAILED_OBJECT_TTL_SECS` | `86400` (`DEFAULT_FAILED_OBJECT_TTL_SECS`, `scanner_folder.rs`) | Retention of per-bucket failed-object entries in the usage cache. |
 | `RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX` | `10000` (`DEFAULT_FAILED_OBJECTS_MAX`, `scanner_folder.rs`) | Cap on retained failed-object entries per bucket. |
+
+### Single-node, single-drive startup
+
+RustFS does not turn off background services based on drive count. This follows MinIO's service-level startup model: MinIO starts auto-heal/MRF from its server-pool initialization and starts the data scanner separately when its scanner switch is on; its single-drive branch changes background-heal state handling rather than silently disabling both service initializers ([server startup](https://github.com/minio/minio/blob/master/cmd/server-main.go#L1050-L1055), [heal startup](https://github.com/minio/minio/blob/master/cmd/background-newdisks-heal-ops.go#L373-L387), [scanner single-drive path](https://github.com/minio/minio/blob/master/cmd/data-scanner.go#L75-L87)). RustFS starts the scanner by default and starts the heal manager/MRF consumer whenever either `RUSTFS_SCANNER_ENABLED` or `RUSTFS_HEAL_ENABLED` is true. Startup logs report the configured switches and effective scanner, heal-manager, and MRF-consumer states.
+
+| `RUSTFS_SCANNER_ENABLED` | `RUSTFS_HEAL_ENABLED` | Effective behavior |
+|---|---|---|
+| `true` | `true` | Scanner usage, lifecycle/transition and replication discovery run; heal manager and MRF consumer run. |
+| `true` | `false` | Scanner remains on; heal manager and MRF consumer still start because scanner work can submit heal requests. |
+| `false` | `true` | Scanner-owned usage/lifecycle/replication discovery pauses; heal manager and MRF consumer remain available. |
+| `false` | `false` | Scanner and manager-backed heal/MRF consumer do not start. Usage freshness and scanner-driven lifecycle/replication discovery pause; manager-backed admin heal is unavailable, and durable MRF work waits for the consumer to return. |
+
+For a single slow drive, keep the default services enabled and use the per-disk foreground-priority gate and scanner pacing controls first. To opt into a maintenance-off mode explicitly, set both `RUSTFS_SCANNER_ENABLED=false` and `RUSTFS_HEAL_ENABLED=false`; changing disk count alone never selects that mode. `RUSTFS_SCANNER_BITROT_CYCLE_SECS=off` only disables periodic deep bitrot work and does not stop regular scanner cycles or checkpoints. `RUSTFS_HEAL_AUTO_HEAL_ENABLE=false` disables automatic heal policy but does not prevent the heal manager from starting when the scanner needs its request consumer.
 
 ### Cycle budgets and cadence
 
@@ -92,6 +105,14 @@ The backoff is reset to the base interval by object or bucket mutations, lifecyc
 Lifecycle and replication configuration inspection is bounded so a slow metadata read cannot stall scanner startup or scheduling. A failed or timed-out inspection keeps the base cadence and is retried after 5 minutes, doubling up to a maximum of 60 minutes while failures continue. A lifecycle or replication configuration change wakes the scanner and retries inspection immediately.
 
 With the default 30-day bitrot cycle, the clean-idle interval is capped at the bitrot cycle divided by the object selection window (about 42 minutes with the default `RUSTFS_HEAL_OBJECT_SELECT_PROB`), which preserves the intended wall-clock bitrot coverage. If periodic bitrot is disabled, the clean-idle cap is 24 hours. The effective interval is jittered by up to 10 percent to avoid synchronized scanner starts.
+
+## Per-disk background I/O admission
+
+Local disk wrapper operations share an admission gate across foreground requests and scanner work. Foreground I/O never waits for a scanner permit. A queued scanner operation may start when its wrapper is idle or after eight foreground operation completions. If it is at the head of the background queue and no background operation is active, it starts after at most 100 ms; time queued behind an active background operation is additional. Only one background operation per wrapper runs at a time. Scanner directory reads use bounded batches, and scanner metadata reads release their permit before sending data to the listing consumer. GET streaming reads hold permits only while a disk read is pending, not for the lifetime of a client response. Cancellation removes queued waiters; a permit is released after its last operation or blocking worker holder exits. Tokio filesystem work already dispatched before cancellation may continue beyond the caller's future lifetime.
+
+The `rustfs_disk_io_admission_active` foreground gauge is sampled while background waiters are queued; `rustfs_disk_io_admission_active{class="background"}` reports the active background permit, while `rustfs_disk_io_admission_waiters`, `rustfs_disk_io_admission_total`, and `rustfs_disk_io_admission_wait_seconds` report queued work, background admission counts, and wait time by disk endpoint. `rustfs_scanner_cache_serialized_bytes_total` counts logical encoded cache bytes; `rustfs_scanner_cache_serialize_seconds` records encoding time; `rustfs_scanner_cache_persist_attempt_seconds` records save-attempt duration and retry result, before ambiguous-write reconciliation.
+
+This is logical operation admission, not an OS disk scheduler: foreground and background operations may overlap after a background permit is granted, and the gate does not promise a bandwidth or IOPS limit. It is scoped to each `LocalDiskWrapper`; separate paths to one physical device and remote disk RPCs do not share this gate. It also does not observe or schedule unrelated host processes that share the physical device.
 
 ## Status Endpoint
 
@@ -324,7 +345,7 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 
 | Environment variable | Default (constant) | Effect |
 |---|---|---|
-| `RUSTFS_HEAL_ENABLED` (deprecated alias `RUSTFS_ENABLE_HEAL`) | `true` (`heal_enabled_from_env`, `rustfs/src/module_switches.rs`) | Master switch for the background heal manager. |
+| `RUSTFS_HEAL_ENABLED` (deprecated alias `RUSTFS_ENABLE_HEAL`) | `true` (`heal_enabled_from_env`, `rustfs/src/module_switches.rs`) | Starts the background heal manager when enabled. The manager also starts whenever the scanner is enabled; disable both switches to keep the manager and MRF consumer from starting. |
 | `RUSTFS_HEAL_AUTO_HEAL_ENABLE` | `true` (`DEFAULT_HEAL_AUTO_HEAL_ENABLE`) | Enables automatic healing of detected issues; `false` leaves healing to manual admin requests. |
 | `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. The manager reserves at least one slot per Scanner/ReadRepair/AutoHeal source, or 10% for larger queues, so sustained normal-priority MRF or internal background work cannot consume every slot. |
 | `RUSTFS_HEAL_INTERVAL_SECS` | `10` (`DEFAULT_HEAL_INTERVAL_SECS`) | Heal manager polling interval. |
@@ -438,7 +459,7 @@ Only two MinIO scanner variables are recognized. `apply_external_env_compat` (`c
 |---|---|---|
 | `MINIO_SCANNER_SPEED` / `scanner speed` | `RUSTFS_SCANNER_SPEED` / `scanner.speed` | Env alias mapped at startup; preset names and the preset table are identical. |
 | `MINIO_SCANNER_CYCLE` / `scanner cycle` | `RUSTFS_SCANNER_CYCLE` / `scanner.cycle` | Env alias mapped at startup. |
-| `MINIO_SCANNER_IDLE_SPEED` / `scanner idle_speed` (`on` default, `off`) | `RUSTFS_SCANNER_IDLE_MODE` / `scanner.idle_mode` (`true` default, `false`) | Not mapped; must be rewritten. Direction matches (`on` and `true` both mean throttled). Both RustFS channels also accept `on`/`off` as booleans (`parse_config_bool`, `parse_bool_str`). RustFS `false` additionally disables the foreground-read backoff floor that MinIO does not have, so the scanner competes with foreground reads at full speed; use it only for benchmarks or exclusive-I/O windows. |
+| `MINIO_SCANNER_IDLE_SPEED` / `scanner idle_speed` (`on` default, `off`) | `RUSTFS_SCANNER_IDLE_MODE` / `scanner.idle_mode` (`true` default, `false`) | Not mapped; must be rewritten. Direction matches (`on` and `true` both mean throttled). Both RustFS channels also accept `on`/`off` as booleans (`parse_config_bool`, `parse_bool_str`). RustFS `false` disables sleeper delays and foreground-read backoff, but per-disk foreground-priority admission remains active. |
 | `MINIO_HEAL_BITROTSCAN` / `heal bitrotscan` (default `off`) | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` / `heal.bitrot_cycle` (default 30 days) | Not mapped. RustFS deep-scans periodically by default; set `off` or `disabled` to reproduce MinIO's default. |
 | `MINIO_API_STALE_UPLOADS_EXPIRY` (24h) | `RUSTFS_API_STALE_UPLOADS_EXPIRY` (`DEFAULT_STALE_UPLOADS_EXPIRY`, 24h, `crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs`) | Not mapped; same default. |
 | `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` (6h) | `RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL` (`DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL`, 6h) | Not mapped; same default. |

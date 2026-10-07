@@ -594,10 +594,36 @@ fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
     matches!(status, HealTaskStatus::Retrying { .. })
 }
 
+fn automatic_replacement_grace_deadline(task: &HealTask, result: &Result<()>) -> Option<u64> {
+    if task.source != HealRequestSource::AutoHeal
+        || !matches!(task.heal_type, HealType::ErasureSet { .. })
+        || task.heal_endpoints.is_empty()
+    {
+        return None;
+    }
+    match result {
+        Err(Error::DanglingDeleteDeferred { retry_not_before }) => Some(*retry_not_before),
+        _ => None,
+    }
+}
+
 fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch_failure: bool) -> Option<(Duration, String)> {
     let Err(err) = result else {
         return None;
     };
+    if let Some(retry_not_before) = automatic_replacement_grace_deadline(task, result) {
+        // This typed result is emitted only while the durable generation has
+        // retry budget. A storage grace period is waiting, not a failed attempt.
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let delay = Duration::from_secs(retry_not_before.saturating_sub(now));
+        // Persisted deadlines are untrusted. Reject a duration that Tokio's
+        // monotonic timer cannot represent instead of panicking in sleep.
+        tokio::time::Instant::now().checked_add(delay)?;
+        return Some((delay, err.to_string()));
+    }
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
@@ -621,13 +647,17 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch
 #[cfg(test)]
 fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
     let (delay, error) = retry_budget_for_result(task, result, false)?;
-    Some((task.retry_request(), delay, error))
+    let mut request = task.retry_request();
+    if automatic_replacement_grace_deadline(task, result).is_some() {
+        request.retry_attempts = task.retry_attempts;
+    }
+    Some((request, delay, error))
 }
 
 async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
     let retryable_batch_failure = task.batch_failure_is_retryable().await;
     let (delay, error) = retry_budget_for_result(task, result, retryable_batch_failure)?;
-    let request = match task.retry_request_with_remaining_timeout().await {
+    let mut request = match task.retry_request_with_remaining_timeout().await {
         Ok(request) => request,
         Err(err) => {
             debug!(
@@ -643,6 +673,9 @@ async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<(
             return None;
         }
     };
+    if automatic_replacement_grace_deadline(task, result).is_some() {
+        request.retry_attempts = task.retry_attempts;
+    }
     Some((request, delay, error))
 }
 

@@ -26,7 +26,7 @@ use super::super::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDisk
 use super::super::{BUCKET_META_PREFIX, DiskStore, HealDiskExt, RUSTFS_META_BUCKET};
 use super::{
     LOG_COMPONENT_HEAL, LOG_SUBSYSTEM_RESUME, PersistThrottle, RESUME_CHECKPOINT_BLOCKED_FILE, RESUME_CHECKPOINT_FILE,
-    delete_resume_file, path_to_str, validate_resume_task_id,
+    dangling_delete_deadline_is_representable, delete_resume_file, path_to_str, validate_resume_task_id,
 };
 
 const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
@@ -44,6 +44,11 @@ pub enum CheckpointObjectOutcome {
     Processed,
     Failed,
     Skipped,
+    DeferredDanglingDelete { retry_not_before: u64 },
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug)]
@@ -127,6 +132,11 @@ pub struct ResumeCheckpoint {
     pub failed_object_count: u64,
     #[serde(default)]
     pub skipped_object_count: u64,
+    // Omit defaults to preserve the integrity digest of older checkpoints.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub dangling_delete_grace_objects: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangling_delete_retry_not_before: Option<u64>,
     #[serde(default)]
     pub skipped_new_versions: u64,
     #[serde(default)]
@@ -166,6 +176,8 @@ impl ResumeCheckpoint {
             successful_objects: 0,
             failed_object_count: 0,
             skipped_object_count: 0,
+            dangling_delete_grace_objects: 0,
+            dangling_delete_retry_not_before: None,
             skipped_new_versions: 0,
             skipped_ilm_expired: 0,
             processed_bytes: 0,
@@ -243,6 +255,8 @@ impl ResumeCheckpoint {
         self.successful_objects = 0;
         self.failed_object_count = 0;
         self.skipped_object_count = 0;
+        self.dangling_delete_grace_objects = 0;
+        self.dangling_delete_retry_not_before = None;
         self.skipped_new_versions = 0;
         self.skipped_ilm_expired = 0;
         self.processed_bytes = 0;
@@ -407,6 +421,13 @@ impl CheckpointManager {
                 message: "Resume checkpoint task id does not match filename".to_string(),
             });
         }
+        if checkpoint
+            .dangling_delete_retry_not_before
+            .is_some_and(|deadline| !dangling_delete_deadline_is_representable(deadline))
+        {
+            Self::block_invalid_snapshot(&disk, task_id).await;
+            return Err(Error::InvalidCheckpoint("Unrepresentable dangling-delete grace deadline".to_string()));
+        }
 
         // Older checkpoints can contain identities that are not comparable to
         // the current keys or lack their corresponding aggregate counters.
@@ -484,6 +505,8 @@ impl CheckpointManager {
             checkpoint.successful_objects = 0;
             checkpoint.failed_object_count = 0;
             checkpoint.skipped_object_count = 0;
+            checkpoint.dangling_delete_grace_objects = 0;
+            checkpoint.dangling_delete_retry_not_before = None;
             checkpoint.skipped_new_versions = 0;
             checkpoint.skipped_ilm_expired = 0;
             checkpoint.processed_bytes = 0;
@@ -658,6 +681,22 @@ impl CheckpointManager {
             CheckpointObjectOutcome::Processed => checkpoint.add_processed_object(object),
             CheckpointObjectOutcome::Failed => checkpoint.add_failed_object(object),
             CheckpointObjectOutcome::Skipped => checkpoint.add_skipped_object(object),
+            CheckpointObjectOutcome::DeferredDanglingDelete { retry_not_before } => {
+                if !dangling_delete_deadline_is_representable(retry_not_before) {
+                    return Err(Error::InvalidCheckpoint("Unrepresentable dangling-delete grace deadline".to_string()));
+                }
+                if checkpoint.skipped_objects.insert(object) {
+                    checkpoint.dangling_delete_grace_objects = checkpoint
+                        .dangling_delete_grace_objects
+                        .checked_add(1)
+                        .ok_or_else(|| Error::InvalidCheckpoint("Dangling-delete grace counter overflow".to_string()))?;
+                    checkpoint.dangling_delete_retry_not_before = Some(
+                        checkpoint
+                            .dangling_delete_retry_not_before
+                            .map_or(retry_not_before, |deadline| deadline.max(retry_not_before)),
+                    );
+                }
+            }
         }
         checkpoint.update_progress(successful, failed, skipped, bytes);
         checkpoint.set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired);
