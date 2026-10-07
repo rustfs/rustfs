@@ -14521,15 +14521,19 @@ mod tests {
             let barrier = TierDeleteChunkTestBarrier::install(stage);
             let worker_store = store.clone();
             let worker_bucket = bucket.clone();
+            // Simulate a crash at the barrier. Aborting a caller of the public entry
+            // point no longer stops the delete, which runs on a detached task, so
+            // drive the delete below that task.
             let worker = tokio::spawn(async move {
                 worker_store
-                    .delete_object_with_tier_delete_journal(
+                    .handle_delete_object_with_journal(
                         &worker_bucket,
                         prefix,
                         ObjectOptions {
                             delete_prefix: true,
                             ..Default::default()
                         },
+                        Some(worker_store.clone()),
                     )
                     .await
             });
@@ -14538,6 +14542,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("chunk delete did not reach crash boundary {stage:?}"));
             worker.abort();
             let _ = worker.await;
+            assert_eq!(
+                ctx.detached_mutation_count(),
+                0,
+                "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+            );
             drop(barrier);
             let released_bucket_guard =
                 tokio::time::timeout(Duration::from_secs(5), store.acquire_bucket_lifecycle_write_lock(&bucket))
@@ -14683,15 +14692,19 @@ mod tests {
 
         let barrier = TierDeleteChunkTestBarrier::install(TierDeleteChunkTestStage::DispatchAuthorized);
         let worker_store = store.clone();
+        // Simulate a crash at the barrier. Aborting a caller of the public entry
+        // point no longer stops the delete, which runs on a detached task, so
+        // drive the delete below that task.
         let worker = tokio::spawn(async move {
             worker_store
-                .delete_object_with_tier_delete_journal(
+                .handle_delete_object_with_journal(
                     bucket,
                     prefix,
                     ObjectOptions {
                         delete_prefix: true,
                         ..Default::default()
                     },
+                    Some(worker_store.clone()),
                 )
                 .await
         });
@@ -14700,6 +14713,11 @@ mod tests {
             .expect("chunk delete should persist its authorization before corruption injection");
         worker.abort();
         let _ = worker.await;
+        assert_eq!(
+            ctx.detached_mutation_count(),
+            0,
+            "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+        );
         drop(barrier);
 
         let records = store
