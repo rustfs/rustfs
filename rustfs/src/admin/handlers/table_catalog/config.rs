@@ -43,6 +43,24 @@ impl Operation for EnableTableBucketHandler {
     }
 }
 
+pub struct DisableTableBucketHandler {}
+
+#[async_trait::async_trait]
+impl Operation for DisableTableBucketHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let object_store = runtime_sources::object_store_from_req(&req)
+            .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
+        let store = table_catalog_store_from_backend(backend.clone())?;
+        let publication = TableCommitObjectBackend::preauthorized(backend);
+        let response = disable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct GetTableBucketHandler {}
 
 #[async_trait::async_trait]

@@ -2075,6 +2075,65 @@ where
         self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
+    async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        validate_table_bucket_entry(&entry)?;
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
+        let (snapshot, precondition, postcondition) = {
+            let state = self.state.lock().await;
+            if state.table_buckets.contains_key(&entry.table_bucket) {
+                return Self::require_table_bucket_in_state(&state, &entry.table_bucket);
+            }
+            let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+            draft_state.table_buckets.insert(entry.table_bucket.clone(), entry.clone());
+            (
+                Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
+                precondition,
+                StrongSnapshotWritePostcondition::TableBucketPresent(entry),
+            )
+        };
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+    }
+
+    async fn disable_empty_table_bucket(&self, mut entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        validate_table_bucket_entry(&entry)?;
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
+        let (snapshot, precondition, postcondition) = {
+            let state = self.state.lock().await;
+            if let Some(current) = state.table_buckets.get(&entry.table_bucket) {
+                if current.active_rename_id.is_some()
+                    || !matches!(current.state, TableCatalogEntryState::Active | TableCatalogEntryState::Deleted)
+                {
+                    return Err(TableCatalogStoreError::Conflict("table bucket has an operation in progress".to_string()));
+                }
+                entry = current.clone();
+            }
+            let bucket = &entry.table_bucket;
+            if state.namespaces.keys().any(|(owner, _)| owner == bucket)
+                || state.tables.keys().any(|(owner, _, _)| owner == bucket)
+                || state.views.keys().any(|(owner, _, _)| owner == bucket)
+                || state.commits.keys().any(|(owner, _, _)| owner == bucket)
+                || state.idempotency.keys().any(|(owner, _, _)| owner == bucket)
+            {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table bucket contains namespaces or retained catalog resources".to_string(),
+                ));
+            }
+            entry.state = TableCatalogEntryState::Deleted;
+            let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+            draft_state.table_buckets.insert(entry.table_bucket.clone(), entry.clone());
+            (
+                Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
+                precondition,
+                StrongSnapshotWritePostcondition::TableBucketPresent(entry),
+            )
+        };
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+    }
+
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
         let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;

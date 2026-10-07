@@ -672,9 +672,28 @@ mod absence_receipt_regressions {
         assert_eq!(read_version(store, bucket, OBJECT, current).await, CURRENT);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn historical_absence_receipt_repairs_and_replays() {
+    #[test]
+    fn historical_absence_receipt_repairs_and_replays() {
+        std::thread::Builder::new()
+            .name("absence-receipt-replay".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(32 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .expect("absence receipt replay test runtime should build");
+
+                runtime.block_on(historical_absence_receipt_repairs_and_replays_inner());
+            })
+            .expect("absence receipt replay test thread should spawn")
+            .join()
+            .expect("absence receipt replay test thread should finish");
+    }
+
+    async fn historical_absence_receipt_repairs_and_replays_inner() {
         let bucket = "absence-receipt-replay";
         let (_paths, store, storage, old, current) = stale_history(bucket).await;
         let opts = HealOpts {

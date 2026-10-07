@@ -20618,3 +20618,112 @@ async fn configured_object_catalog_dispatches_table_rename() {
         Err(TableCatalogStoreError::NotFound(_))
     );
 }
+
+async fn assert_disable_empty_table_bucket<S: TableCatalogStore>(store: &S) {
+    let bucket = "disable-empty";
+    let namespace = Namespace::parse("sales").unwrap();
+    store.ensure_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+    assert_matches!(
+        store.disable_empty_table_bucket(test_bucket_entry(bucket)).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    assert_eq!(
+        store.get_table_bucket(bucket).await.unwrap().unwrap().state,
+        TableCatalogEntryState::Active
+    );
+    store.drop_namespace(bucket, "sales").await.unwrap();
+    store.disable_empty_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store.disable_empty_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    assert_eq!(
+        store.get_table_bucket(bucket).await.unwrap().unwrap().state,
+        TableCatalogEntryState::Deleted
+    );
+    // A request that observed the old enabled marker cannot reactivate the entry.
+    assert_matches!(
+        store.ensure_table_bucket(test_bucket_entry(bucket)).await,
+        Err(TableCatalogStoreError::NotFound(_))
+    );
+    assert_matches!(
+        store.create_namespace(test_namespace_entry(bucket, &namespace)).await,
+        Err(TableCatalogStoreError::NotFound(_))
+    );
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_supports_both_catalog_backings() {
+    assert_disable_empty_table_bucket(&ObjectTableCatalogStore::new(TestCatalogObjectBackend::default())).await;
+    assert_disable_empty_table_bucket(&StrongTableCatalogStore::new(TestCatalogObjectBackend::default())).await;
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_survives_restart_and_blocks_stale_initialization() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        // Cover an interrupted enable that wrote the bucket marker but no entry.
+        store.disable_empty_table_bucket(test_bucket_entry("disabled")).await.unwrap();
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        assert_eq!(
+            restarted.get_table_bucket("disabled").await.unwrap().unwrap().state,
+            TableCatalogEntryState::Deleted
+        );
+        assert_matches!(
+            restarted.ensure_table_bucket(test_bucket_entry("disabled")).await,
+            Err(TableCatalogStoreError::NotFound(_))
+        );
+    }
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_serializes_with_namespace_creation() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let store = ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), mode);
+        let bucket = "disable-race";
+        let namespace = Namespace::parse("sales").unwrap();
+        store.ensure_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        let (create, disable) = tokio::join!(
+            store.create_namespace(test_namespace_entry(bucket, &namespace)),
+            store.disable_empty_table_bucket(test_bucket_entry(bucket)),
+        );
+        assert_ne!(create.is_ok(), disable.is_ok());
+        if disable.is_ok() {
+            assert!(store.list_namespaces(bucket).await.unwrap().is_empty());
+        } else {
+            assert_eq!(
+                store.get_table_bucket(bucket).await.unwrap().unwrap().state,
+                TableCatalogEntryState::Active
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_failure_keeps_active_catalog() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let bucket = "disable-failure";
+        store.ensure_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        let path = match mode {
+            TableCatalogBackingMode::ObjectBacked => TableCatalogObjectPaths::default().table_bucket_entry_path(bucket),
+            TableCatalogBackingMode::DurableStrong => StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+        };
+        *backend.fail_put_object_path.lock().await = Some(path);
+        assert!(store.disable_empty_table_bucket(test_bucket_entry(bucket)).await.is_err());
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        assert_eq!(
+            restarted.get_table_bucket(bucket).await.unwrap().unwrap().state,
+            TableCatalogEntryState::Active
+        );
+        restarted.disable_empty_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    }
+}

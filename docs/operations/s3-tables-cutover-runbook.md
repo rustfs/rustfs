@@ -84,3 +84,13 @@ This procedure is not cross-region failover. Cross-region recovery requires an i
 
 - [S3 Tables support matrix](../architecture/s3-tables-support-matrix.md)
 - [Table catalog conformance scripts](../../scripts/table-catalog/README.md) (`failure_coverage.py --print-disaster-recovery-rehearsal` generates the rehearsal for this procedure)
+
+## Disable an Empty Table Catalog
+
+Use `GET /iceberg/v1/buckets/{warehouse}` to check `enabled` and `disable-supported`. When supported, `DELETE` on the same route requires `admin:SetTableBucket` and returns the bucket discovery response with `enabled: false`. The `/_iceberg/v1` alias behaves identically. Existing enable and query requests remain unchanged.
+
+Review the bucket lifecycle configuration before disabling: clearing table-bucket protection allows existing object expiration rules to run again. Objects are preserved by the disable operation itself. Catalog disablement requires no namespaces, retained table/view resources, or objects under `.rustfs-table/`; an active rename or backing migration also blocks it. Clean up through supported catalog operations; do not manually delete internal metadata to bypass these checks.
+
+The server persists an inactive catalog entry before clearing the bucket marker. If marker publication fails, retry the same DELETE; the marker retains object protections until the retry succeeds. A subsequent PUT explicitly enables the bucket again. Stale requests cannot initialize an inactive catalog entry. No table metadata or object data is deleted by either state change.
+
+Before rolling back to a server version without this endpoint, re-enable disabled catalogs with PUT while the supporting version is running. Older enable handlers do not reactivate inactive catalog entries. Complete the server upgrade across the cluster before using disablement.

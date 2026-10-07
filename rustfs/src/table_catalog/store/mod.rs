@@ -143,6 +143,20 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()>;
 
+    async fn ensure_table_bucket(&self, _entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        Err(TableCatalogStoreError::Unsupported(
+            "table bucket initialization is not supported by this catalog store".to_string(),
+        ))
+    }
+
+    /// Persists an inactive entry only when no namespace or retained resource exists.
+    /// The caller holds the bucket publication fence until its metadata marker is cleared.
+    async fn disable_empty_table_bucket(&self, _entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        Err(TableCatalogStoreError::Unsupported(
+            "table bucket disablement is not supported by this catalog store".to_string(),
+        ))
+    }
+
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()>;
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>>;
@@ -1389,6 +1403,20 @@ where
         match self {
             Self::ObjectBacked(store) => store.put_table_bucket(entry).await,
             Self::DurableStrong(store) => store.put_table_bucket(entry).await,
+        }
+    }
+
+    async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.ensure_table_bucket(entry).await,
+            Self::DurableStrong(store) => store.ensure_table_bucket(entry).await,
+        }
+    }
+
+    async fn disable_empty_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.disable_empty_table_bucket(entry).await,
+            Self::DurableStrong(store) => store.disable_empty_table_bucket(entry).await,
         }
     }
 

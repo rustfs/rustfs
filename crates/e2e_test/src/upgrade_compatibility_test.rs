@@ -33,6 +33,7 @@ use aws_sdk_s3::types::{
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,6 +58,10 @@ const UPGRADE_READINESS_BODY: &[u8] = b"upgrade write readiness";
 const PREVIOUS_RELEASE_SEED_KEY: &str = ".upgrade-readiness/previous-seed/node-0";
 const MULTIPART_WORKERS: usize = 16;
 const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
+// Bound each 64 KiB upload, including completion acknowledgement. A peer
+// that accepts the request but never responds must fail the compatibility
+// check with the writer and object, rather than consume the whole CI job.
+const MIXED_MULTIPART_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // Peers keep a restarted node's drive in Suspect/Returning for roughly
 // probe_interval (2s) x success_threshold (3) after it comes back; 30s
 // comfortably covers that window plus CI scheduling jitter.
@@ -335,14 +340,21 @@ fn configure_cluster_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestRes
 async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut tasks = JoinSet::new();
     for worker in 0..MULTIPART_WORKERS {
-        let client = clients[worker % clients.len()].clone();
+        let node = worker % clients.len();
+        let client = clients[node].clone();
         let phase = phase.to_string();
         tasks.spawn(async move {
             let mut keys = Vec::with_capacity(MULTIPART_UPLOADS_PER_WORKER);
             for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
                 let key = format!("{phase}/multipart/{worker:02}/{upload:02}");
                 let part = vec![u8::try_from(worker)?; 64 * 1024];
-                write_multipart(&client, MIXED_BUCKET, &key, &[part]).await?;
+                mixed_multipart_before(
+                    Instant::now() + MIXED_MULTIPART_UPLOAD_TIMEOUT,
+                    node,
+                    &key,
+                    write_multipart(&client, MIXED_BUCKET, &key, &[part]),
+                )
+                .await?;
                 keys.push(key);
             }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(keys)
@@ -354,6 +366,17 @@ async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<Str
         keys.extend(result??);
     }
     Ok(keys)
+}
+
+async fn mixed_multipart_before(
+    deadline: Instant,
+    node: usize,
+    key: &str,
+    upload: impl Future<Output = TestResult>,
+) -> TestResult {
+    tokio::time::timeout_at(deadline, upload)
+        .await
+        .map_err(|_| format!("node {node}: multipart upload {MIXED_BUCKET}/{key} acknowledgement deadline exceeded"))?
 }
 
 /// Assert that `client` eventually lists exactly `expected` objects under
@@ -668,10 +691,54 @@ mod upgrade_write_readiness_tests {
         let phase = "stalled";
         let key = format!(".upgrade-readiness/{phase}/node-0");
         target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Stall(Duration::from_secs(30)), 1);
-        let error = wait_for_upgrade_write_readiness(&[client], phase, Duration::from_secs(1))
+        let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), phase, Duration::from_secs(1))
             .await
             .expect_err("a stalled request must not outlive the readiness deadline");
         assert!(error.to_string().contains("deadline exceeded during PutObject"), "{error}");
+
+        let part = vec![2_u8; 64 * 1024];
+        let successful_key = "stalled/multipart/02/00";
+        mixed_multipart_before(
+            Instant::now() + MIXED_MULTIPART_UPLOAD_TIMEOUT,
+            2,
+            successful_key,
+            write_multipart(&client, MIXED_BUCKET, successful_key, std::slice::from_ref(&part)),
+        )
+        .await?;
+        assert_eq!(read_object(&client, MIXED_BUCKET, successful_key, None).await?.1, part);
+
+        let stalled_key = "stalled/multipart/02/01";
+        target.inject_for_key(
+            FakeTargetOperation::CompleteMultipartUpload,
+            stalled_key,
+            FaultAction::Stall(Duration::from_secs(30)),
+            1,
+        );
+        let error = {
+            let upload = write_multipart(&client, MIXED_BUCKET, stalled_key, std::slice::from_ref(&part));
+            tokio::pin!(upload);
+            tokio::select! {
+                result = &mut upload => panic!("stalled completion unexpectedly returned: {result:?}"),
+                observed = tokio::time::timeout(Duration::from_secs(10), async {
+                    while target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key) == 0
+                        || !target.has_object(MIXED_BUCKET, stalled_key)
+                    {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }) => observed.expect("multipart completion must reach and commit on the fake peer"),
+            }
+            // An already committed object is not an acknowledged client success.
+            // Expire only after observing the real completion request, so host
+            // scheduling cannot turn this into a timeout before admission.
+            tokio::time::timeout(Duration::from_secs(1), mixed_multipart_before(Instant::now(), 2, stalled_key, upload))
+                .await
+                .expect("expired deadline must stop the in-flight completion")
+                .expect_err("unacknowledged completion must fail even if the peer committed")
+        };
+        assert!(error.to_string().contains("node 2"), "{error}");
+        assert!(error.to_string().contains(stalled_key), "{error}");
+        assert!(error.to_string().contains("acknowledgement deadline exceeded"), "{error}");
+        assert_eq!(target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key), 1);
         target.shutdown().await;
         Ok(())
     }
