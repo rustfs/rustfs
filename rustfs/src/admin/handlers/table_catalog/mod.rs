@@ -2433,7 +2433,7 @@ where
         .map_err(catalog_store_error)?;
     let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
     if !crate::table_catalog::TableCommitPublication::holds_table_bucket(publication, bucket) {
-        return Err(s3_error!(InternalError, "table bucket disablement requires a publication fence"));
+        return Err(ApiError::other("table bucket disablement requires a publication fence").into());
     }
     // Staged metadata can exist without a registered table. Keep its protection
     // until it has been explicitly cleaned up by the catalog operator.
@@ -2457,7 +2457,11 @@ where
         .await
         .map_err(catalog_store_error)?;
     if !crate::table_catalog::TableCommitPublication::holds_table_bucket(publication, bucket) {
-        return Err(s3_error!(ServiceUnavailable, "table bucket publication fence was lost"));
+        return Err(ApiError {
+            message: "table bucket publication fence was lost".to_string(),
+            ..ApiError::service_unavailable()
+        }
+        .into());
     }
     // Persist the inactive entry before clearing the marker. A failed metadata
     // update leaves S3 protections enabled and can be retried without deleting data.
@@ -2472,7 +2476,7 @@ where
             }
         })
         .await
-        .map_err(|err| s3_error!(InternalError, "failed to disable table bucket: {}", err))?;
+        .map_err(|err| ApiError::other(format!("failed to disable table bucket: {err}")))?;
     table_bucket_response(store, bucket, false).await
 }
 
