@@ -640,6 +640,7 @@ pub struct PeerLiveEventsBatch {
 pub struct ScannerPublicationLease {
     pub token: Uuid,
     pub movement_generation: u64,
+    pub observational_only: bool,
     /// Stable storage owner identity. This is distinct from the activity
     /// session and is bound into both acquire and release proofs.
     pub owner_id: String,
@@ -658,6 +659,7 @@ fn validate_scanner_publication_lease_response_fields(
     response: &ScannerPublicationLeaseResponse,
     expected_session_id: &str,
     expected_generation: u64,
+    expected_observational_only: bool,
 ) -> Result<(Uuid, String)> {
     if !response.success {
         return Err(Error::other(
@@ -673,6 +675,9 @@ fn validate_scanner_publication_lease_response_fields(
     }
     if response.session_id != expected_session_id {
         return Err(Error::other("peer returned a different scanner publication lease session"));
+    }
+    if response.observational_only != expected_observational_only {
+        return Err(Error::other("peer returned a different scanner publication lease purpose"));
     }
     let owner_id = Uuid::parse_str(&response.owner_id)
         .ok()
@@ -2418,6 +2423,7 @@ impl PeerRestClient {
         &self,
         expected_session_id: &str,
         expected_generation: u64,
+        observational_only: bool,
     ) -> Result<ScannerPublicationLease> {
         let request_started = std::time::Instant::now();
         self.finalize_result(
@@ -2434,6 +2440,7 @@ impl PeerRestClient {
                     ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
                     expected_session_id: expected_session_id.to_string(),
                     token: Bytes::new(),
+                    observational_only,
                 });
                 let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
                     .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
@@ -2444,11 +2451,16 @@ impl PeerRestClient {
                         .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
                 verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
                     .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
-                let (token, owner_id) =
-                    validate_scanner_publication_lease_response_fields(&response, expected_session_id, expected_generation)?;
+                let (token, owner_id) = validate_scanner_publication_lease_response_fields(
+                    &response,
+                    expected_session_id,
+                    expected_generation,
+                    observational_only,
+                )?;
                 Ok(ScannerPublicationLease {
                     token,
                     movement_generation: response.movement_generation,
+                    observational_only,
                     owner_id,
                     session_id: response.session_id,
                     expires_at: scanner_publication_lease_deadline(
@@ -2483,6 +2495,7 @@ impl PeerRestClient {
                     ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
                     expected_session_id: lease.session_id.clone(),
                     token: lease.token.as_bytes().to_vec().into(),
+                    observational_only: lease.observational_only,
                 });
                 let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
                     .map_err(|_| Error::other("scanner publication lease validation request is too large to authenticate"))?;
@@ -2494,8 +2507,12 @@ impl PeerRestClient {
                     )?;
                 verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
                     .map_err(|_| Error::other("peer returned an invalid scanner publication lease validation proof"))?;
-                let (token, owner_id) =
-                    validate_scanner_publication_lease_response_fields(&response, &lease.session_id, lease.movement_generation)?;
+                let (token, owner_id) = validate_scanner_publication_lease_response_fields(
+                    &response,
+                    &lease.session_id,
+                    lease.movement_generation,
+                    lease.observational_only,
+                )?;
                 if token != lease.token {
                     return Err(Error::other("peer returned a different scanner publication lease token"));
                 }
@@ -3001,15 +3018,16 @@ mod tests {
             response_proof: Bytes::new(),
             owner_id: Uuid::new_v4().to_string(),
             session_id: "session-a".to_string(),
+            observational_only: false,
         };
 
-        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7).is_ok());
+        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7, false).is_ok());
 
         let stale_generation = ScannerPublicationLeaseResponse {
             movement_generation: 6,
             ..response.clone()
         };
-        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7)
+        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7, false)
             .expect_err("a response from an older movement generation must be rejected");
         assert!(error.to_string().contains("different scanner publication lease generation"));
 
@@ -3017,9 +3035,21 @@ mod tests {
             session_id: "session-b".to_string(),
             ..response
         };
-        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
+        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7, false)
             .expect_err("a response from an older scanner session must be rejected");
         assert!(error.to_string().contains("different scanner publication lease session"));
+
+        let observational = ScannerPublicationLeaseResponse {
+            observational_only: true,
+            ..stale_session
+        };
+        assert!(
+            validate_scanner_publication_lease_response_fields(&observational, "session-b", 7, true).is_ok(),
+            "the signed purpose echo should validate an observation lease"
+        );
+        let error = validate_scanner_publication_lease_response_fields(&observational, "session-b", 7, false)
+            .expect_err("a peer must not upgrade an observational lease to authoritative");
+        assert!(error.to_string().contains("different scanner publication lease purpose"));
     }
 
     #[test]
