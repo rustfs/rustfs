@@ -98,6 +98,44 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     Ok(plan.scanner_enabled)
 }
 
+/// Installs the backfill runner (admin start/cancel/status need it even
+/// while the module switch is off, to read checkpoints) and, with the switch
+/// on, the recovery loop that takes over expired leases (rustfs/backlog#2159).
+async fn init_on_demand_migration_backfill_runtime(store: Arc<ECStore>) {
+    let contexts = Arc::new(SysBackfillContexts::new(store.clone(), OnDemandMigrationSys::get()));
+    let runner = BackfillRunner::for_local_node(store.clone(), contexts).await;
+    if !install_global_backfill_runner(runner.clone()) {
+        debug!(
+            target: "rustfs::main::run",
+            event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "already_installed",
+            "On-demand migration backfill runner already installed"
+        );
+        return;
+    }
+    let module_enabled = is_on_demand_migration_module_enabled();
+    let node = runner.node().to_string();
+    let state = if !module_enabled {
+        "skipped_module_disabled"
+    } else if spawn_backfill_recovery_loop(runner) {
+        "started"
+    } else {
+        "skipped_no_cancel_token"
+    };
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = state,
+        module_enabled = module_enabled,
+        node = %node,
+        "On-demand migration backfill recovery configured"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BackgroundServicePlan, resolve_background_service_plan};
@@ -149,42 +187,4 @@ mod tests {
             }
         );
     }
-}
-
-/// Installs the backfill runner (admin start/cancel/status need it even
-/// while the module switch is off, to read checkpoints) and, with the switch
-/// on, the recovery loop that takes over expired leases (rustfs/backlog#2159).
-async fn init_on_demand_migration_backfill_runtime(store: Arc<ECStore>) {
-    let contexts = Arc::new(SysBackfillContexts::new(store.clone(), OnDemandMigrationSys::get()));
-    let runner = BackfillRunner::for_local_node(store.clone(), contexts).await;
-    if !install_global_backfill_runner(runner.clone()) {
-        debug!(
-            target: "rustfs::main::run",
-            event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "already_installed",
-            "On-demand migration backfill runner already installed"
-        );
-        return;
-    }
-    let module_enabled = is_on_demand_migration_module_enabled();
-    let node = runner.node().to_string();
-    let state = if !module_enabled {
-        "skipped_module_disabled"
-    } else if spawn_backfill_recovery_loop(runner) {
-        "started"
-    } else {
-        "skipped_no_cancel_token"
-    };
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = state,
-        module_enabled = module_enabled,
-        node = %node,
-        "On-demand migration backfill recovery configured"
-    );
 }
