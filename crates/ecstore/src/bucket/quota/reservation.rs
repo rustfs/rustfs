@@ -593,6 +593,10 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
             quota_limit,
         )
         .await?;
+        let shard_grants = allocator.grants_for(data.shard_index);
+        let bootstrap_shard =
+            allocator.generation == 1 && !shard_grants.is_empty() && shard_grants.values().all(|grant| grant.initial_usage > 0);
+        let allow_create = bootstrap || shard_grants.is_empty() || bootstrap_shard;
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let mut shard = load_current_shard_locked(
@@ -601,7 +605,7 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
             bucket_incarnation,
             quota_revision,
             data.shard_index,
-            bootstrap,
+            allow_create,
             &allocator,
         )
         .await?;
@@ -1211,22 +1215,29 @@ async fn reconcile_shard_exact(store: &Arc<ECStore>, bucket: &str, shard: &mut Q
 }
 
 async fn exact_shard_usage(store: &Arc<ECStore>, bucket: &str, target_shard: u16) -> Result<u64> {
+    let usages = exact_shard_usages(store, bucket).await?;
+    usages
+        .get(usize::from(target_shard))
+        .copied()
+        .ok_or(StorageError::PartMissingOrCorrupt)
+}
+
+async fn exact_shard_usages(store: &Arc<ECStore>, bucket: &str) -> Result<Vec<u64>> {
     let mut marker = None;
     let mut version_marker = None;
-    let mut usage = 0_u64;
+    let mut usages = vec![0_u64; usize::from(SHARDED_LEDGER_COUNT)];
     loop {
         let page = Arc::clone(store)
             .list_object_versions(bucket, "", marker, version_marker, None, 1_000)
             .await?;
         for object in page.objects {
-            if shard_index(object.name.as_str()) == target_shard {
-                usage = usage
-                    .checked_add(logical_object_size(&object)?)
-                    .ok_or(StorageError::PartMissingOrCorrupt)?;
-            }
+            let shard = usize::from(shard_index(object.name.as_str()));
+            usages[shard] = usages[shard]
+                .checked_add(logical_object_size(&object)?)
+                .ok_or(StorageError::PartMissingOrCorrupt)?;
         }
         if !page.is_truncated {
-            return Ok(usage);
+            return Ok(usages);
         }
         marker = page.next_marker;
         version_marker = page.next_version_idmarker;
@@ -1316,19 +1327,31 @@ async fn ensure_sharded_allocator(
         });
     }
     fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.allocator_object, None).await?;
-    let usage = exact_bucket_usage(&store, &data.bucket).await?;
+    let shard_usages = exact_shard_usages(&store, &data.bucket).await?;
+    let usage = shard_usages
+        .iter()
+        .try_fold(0_u64, |total, usage| total.checked_add(*usage).ok_or(StorageError::PartMissingOrCorrupt))?;
     let required = usage.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
-    let amount = credit_grant_amount(0, quota_limit, required)?;
-    let grant_id = Uuid::new_v4();
+    let _ = credit_grant_amount(0, quota_limit, required)?;
     let mut allocator = QuotaAllocatorLedger::new(data.bucket_incarnation, data.quota_revision, quota_limit);
-    allocator.grants.insert(
-        grant_id,
-        AllocatorGrant {
-            shard_index: data.shard_index,
-            amount,
-            initial_usage: usage,
-        },
-    );
+    for (shard_index, initial_usage) in shard_usages.into_iter().enumerate() {
+        let shard_index = u16::try_from(shard_index).map_err(|_| StorageError::PartMissingOrCorrupt)?;
+        let growth_for_shard = if shard_index == data.shard_index { growth } else { 0 };
+        let amount = initial_usage
+            .checked_add(growth_for_shard)
+            .ok_or(StorageError::PartMissingOrCorrupt)?;
+        if amount == 0 {
+            continue;
+        }
+        allocator.grants.insert(
+            Uuid::new_v4(),
+            AllocatorGrant {
+                shard_index,
+                amount,
+                initial_usage,
+            },
+        );
+    }
     allocator.generation = 1;
     save_allocator_locked(Arc::clone(&store), &data.allocator_object, &allocator, &allocator_guard).await?;
     Ok(true)
@@ -1386,9 +1409,6 @@ async fn load_current_shard_locked(
 ) -> Result<QuotaShardLedger> {
     let mut shard = match load_shard_locked(Arc::clone(&store), object).await {
         Ok(shard) if shard.matches(bucket_incarnation, quota_revision, shard_index) => shard,
-        Ok(shard) if shard.reservations.is_empty() && shard.accounted_usage == 0 => {
-            QuotaShardLedger::new(bucket_incarnation, quota_revision, shard_index)
-        }
         Ok(_) => return Err(StorageError::PartMissingOrCorrupt),
         Err(StorageError::ConfigNotFound) if allow_create => {
             QuotaShardLedger::new(bucket_incarnation, quota_revision, shard_index)
@@ -2133,6 +2153,39 @@ mod tests {
             .abort(operation_id, &reservation)
             .expect("abort should release shard credit");
         assert_eq!(shard.available_credit().expect("available credit"), 128);
+    }
+
+    #[test]
+    fn shard_bootstrap_usage_stays_partitioned_by_object_shard() {
+        let revision = OffsetDateTime::now_utc();
+        let incarnation = Uuid::new_v4();
+        let mut allocator = QuotaAllocatorLedger::new(incarnation, revision, 100_000);
+        allocator.grants.insert(
+            Uuid::new_v4(),
+            AllocatorGrant {
+                shard_index: 1,
+                amount: 60_000,
+                initial_usage: 60_000,
+            },
+        );
+        allocator.grants.insert(
+            Uuid::new_v4(),
+            AllocatorGrant {
+                shard_index: 7,
+                amount: 30_000,
+                initial_usage: 30_000,
+            },
+        );
+
+        let mut first = QuotaShardLedger::new(incarnation, revision, 1);
+        first.adopt_grants(&allocator).expect("first shard should adopt its grant");
+        let mut second = QuotaShardLedger::new(incarnation, revision, 7);
+        second.adopt_grants(&allocator).expect("second shard should adopt its grant");
+
+        assert_eq!(first.accounted_usage, 60_000);
+        assert_eq!(second.accounted_usage, 30_000);
+        assert_eq!(first.available_credit().expect("first shard credit"), 0);
+        assert_eq!(second.available_credit().expect("second shard credit"), 0);
     }
 
     #[test]
