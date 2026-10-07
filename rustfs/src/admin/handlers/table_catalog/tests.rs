@@ -13529,7 +13529,7 @@ async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
         .unwrap();
     let rejected = object_store
         .update_bucket_metadata_config_validated(&bucket, crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG, Vec::new(), || {
-            Err(crate::admin::storage_api::StorageError::other("lost publication fence"))
+            Err(crate::admin::storage_api::error::StorageError::other("lost publication fence"))
         })
         .await;
     assert!(rejected.is_err());

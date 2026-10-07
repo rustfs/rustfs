@@ -2466,7 +2466,7 @@ where
             if crate::table_catalog::TableCommitPublication::holds_table_bucket(publication, bucket) {
                 Ok(())
             } else {
-                Err(crate::admin::storage_api::StorageError::other("table bucket publication fence was lost"))
+                Err(crate::admin::storage_api::error::StorageError::other("table bucket publication fence was lost"))
             }
         })
         .await
