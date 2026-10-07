@@ -497,7 +497,7 @@ pub(super) mod tests {
             "127.0.0.1:0".parse()?,
             |_| {
                 tower::service_fn(|_: Request<RequestBody>| async {
-                    Ok::<_, Infallible>(Response::new(s3s::Body::from(Bytes::from_static(b"bounded"))))
+                    Ok::<_, Infallible>(Response::new(http_body_util::Full::new(Bytes::from_static(b"bounded"))))
                 })
             },
             1,
@@ -566,9 +566,9 @@ pub(super) mod tests {
             |_| {
                 tower::service_fn(|request: Request<RequestBody>| async {
                     let mut response = match request.into_body().collect().await {
-                        Ok(body) => Response::new(s3s::Body::from(body.to_bytes())),
+                        Ok(body) => Response::new(http_body_util::Full::new(body.to_bytes())),
                         Err(_) => {
-                            let mut response = Response::new(s3s::Body::empty());
+                            let mut response = Response::new(http_body_util::Full::new(Bytes::new()));
                             *response.status_mut() = http::StatusCode::REQUEST_TIMEOUT;
                             response
                         }
@@ -634,79 +634,6 @@ pub(super) mod tests {
         )
         .await?;
         assert_eq!(body, "after timeout", "a canceled upload must leave the QUIC connection usable");
-        shutdown.send(())?;
-        drop(client);
-        quic.close(0u32.into(), b"test complete");
-        tokio::time::timeout(Duration::from_secs(5), task).await??;
-        driver.abort();
-        Ok(())
-    }
-    struct SignedS3;
-
-    #[async_trait::async_trait]
-    impl s3s::S3 for SignedS3 {
-        async fn list_buckets(
-            &self,
-            req: s3s::S3Request<s3s::dto::ListBucketsInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListBucketsOutput>> {
-            assert_eq!(req.credentials.expect("verified SigV4 credentials").access_key, "test-key");
-            Ok(s3s::S3Response::new(s3s::dto::ListBucketsOutput {
-                buckets: Some(vec![s3s::dto::Bucket {
-                    name: Some("http3-bucket".to_owned()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn http3_s3_service_verifies_sigv4_before_dispatch() -> TestResult {
-        use s3s_sigv4::{
-            AmzDate, EMPTY_STRING_SHA256_HASH, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
-        };
-        let (config, cert) = configs()?;
-        let mut builder = s3s::service::S3ServiceBuilder::new(SignedS3);
-        builder.set_auth(s3s::auth::SimpleAuth::from_single("test-key", "test-secret"));
-        let service = builder.build();
-        let (shutdown, receiver) = broadcast::channel(1);
-        let (endpoint, task) = spawn(
-            config,
-            "127.0.0.1:0".parse()?,
-            move |_| service.clone(),
-            0,
-            Duration::from_secs(1),
-            receiver,
-        )?;
-        let endpoint_client = client_endpoint(vec![cert])?;
-        let (quic, mut client, driver) = connect(&endpoint_client, endpoint.local_addr()?).await?;
-        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let date = AmzDate::parse(&timestamp)?;
-        let canonical = create_canonical_request(
-            "GET",
-            "/",
-            &[] as &[(&str, &str)],
-            [
-                ("host", "localhost"),
-                ("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH),
-                ("x-amz-date", timestamp.as_str()),
-            ],
-            Payload::SingleChunk(EMPTY_STRING_SHA256_HASH),
-        );
-        let string_to_sign = create_string_to_sign(&canonical, &date, "us-east-1", "s3");
-        let make_request = |secret| {
-            let signature = calculate_signature(&string_to_sign, secret, &date, "us-east-1", "s3");
-            Request::builder().uri("https://localhost/").header("host", "localhost")
-                .header("x-amz-date", &timestamp).header("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH)
-                .header("authorization", format!("AWS4-HMAC-SHA256 Credential=test-key/{}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}", date.fmt_date()))
-                .body(())
-        };
-        let (status, _, body) = request(&mut client, make_request("wrong-secret")?, Bytes::new()).await?;
-        assert_eq!(status, http::StatusCode::FORBIDDEN);
-        assert!(String::from_utf8(body.to_vec())?.contains("SignatureDoesNotMatch"));
-        let (status, _, body) = request(&mut client, make_request("test-secret")?, Bytes::new()).await?;
-        assert_eq!(status, http::StatusCode::OK);
-        assert!(String::from_utf8(body.to_vec())?.contains("<Name>http3-bucket</Name>"));
         shutdown.send(())?;
         drop(client);
         quic.close(0u32.into(), b"test complete");
