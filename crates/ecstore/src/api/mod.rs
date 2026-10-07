@@ -240,7 +240,10 @@ pub mod bucket {
     }
 
     pub mod quota {
-        pub use crate::bucket::quota::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
+        pub use crate::bucket::quota::{
+            BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
+            QuotaOperation,
+        };
 
         pub mod checker {
             pub use crate::bucket::quota::checker::QuotaChecker;
