@@ -2762,8 +2762,11 @@ mod tests {
         let error = tokio::time::timeout(Duration::from_secs(1), acquire)
             .await
             .expect("snapshot admission must finish")
-            .expect_err("acquisition must preserve its original namespace generation");
-        assert_eq!(error.to_string(), "Io error: scanner publication lease generation is stale");
+            .expect_err("a namespace change during admission must not install a lease");
+        assert_eq!(
+            error.to_string(),
+            "Io error: scanner publication lease namespace changed during acquisition"
+        );
         assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok(), "no lease was installed");
     }
 
