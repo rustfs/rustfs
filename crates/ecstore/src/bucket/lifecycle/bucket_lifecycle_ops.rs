@@ -1511,10 +1511,6 @@ fn set_recovered_free_version_enqueue_observer(
     RecoveredFreeVersionEnqueueObserverGuard
 }
 
-pub async fn enqueue_recovered_free_version(api: &ECStore, oi: ObjectInfo) -> bool {
-    enqueue_recovered_free_version_with_cancel(api, oi, &CancellationToken::new()).await
-}
-
 pub(super) async fn enqueue_recovered_free_version_with_cancel(
     api: &ECStore,
     oi: ObjectInfo,
@@ -8301,7 +8297,7 @@ mod tests {
         };
 
         assert!(
-            super::enqueue_recovered_free_version(&ecstore, oi).await,
+            super::enqueue_recovered_free_version_with_cancel(&ecstore, oi, &CancellationToken::new()).await,
             "the resized production worker queue should accept the task"
         );
         stop_tx.send(None).await.expect("worker stop signal should be delivered");
@@ -14254,13 +14250,14 @@ mod tests {
         };
         let mut recovery_rx = recovery_rx.lock().await;
         assert!(
-            super::enqueue_recovered_free_version(
+            super::enqueue_recovered_free_version_with_cancel(
                 &ecstore,
                 ObjectInfo {
                     bucket: "prefill".to_string(),
                     name: "prefill".to_string(),
                     ..Default::default()
                 },
+                &CancellationToken::new(),
             )
             .await,
             "the production recovery queue should accept its first task"
