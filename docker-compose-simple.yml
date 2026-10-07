@@ -18,7 +18,8 @@ services:
     image: rustfs/rustfs:latest
     container_name: rustfs-server
     depends_on:
-      - volume-permission-helper
+      volume-permission-helper:
+        condition: service_completed_successfully
     security_opt:
       - "no-new-privileges:true"
     ports:
@@ -41,7 +42,6 @@ services:
       # Keep strict disk topology checks enabled by default.
       # For local testing only, set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` explicitly.
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-false}
-
     volumes:
       - rustfs_data_0:/data/rustfs0
       - rustfs_data_1:/data/rustfs1
@@ -88,14 +88,14 @@ services:
   volume-permission-helper:
     image: alpine
     volumes:
-      - rustfs_data_0:/data0
-      - rustfs_data_1:/data1
-      - rustfs_data_2:/data2
-      - rustfs_data_3:/data3
-      - logs:/logs
+      - rustfs_data_0:/data/rustfs0
+      - rustfs_data_1:/data/rustfs1
+      - rustfs_data_2:/data/rustfs2
+      - rustfs_data_3:/data/rustfs3
+      - logs:/app/logs
     command: >
       sh -c "
-        chown -R 10001:10001 /data0 /data1 /data2 /data3 /logs &&
+        chown -R 10001:10001 /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /app/logs &&
         echo 'Volume Permissions fixed' &&
         exit 0
       "
