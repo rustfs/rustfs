@@ -3943,6 +3943,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         self.execute_get_object_boxed(req).await
     }
