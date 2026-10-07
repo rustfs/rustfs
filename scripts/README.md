@@ -54,6 +54,7 @@ their issue closes.
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
+| `gen_bucket_config_goldens.sh` | dev-tool | One-shot generator for the 13-family persisted bucket-config XML byte goldens; refuses to overwrite without `--force` and records the generating commit | `crates/ecstore/tests/fixtures/bucket-config-goldens/README.md`; `crates/ecstore/tests/bucket_config_goldens.rs` |
 | `run.sh` | dev-tool | Local rustfs startup wrapper | `make e2e-server`; Justfile |
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |

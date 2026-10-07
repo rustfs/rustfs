@@ -1,0 +1,1 @@
+<LifecycleConfiguration><ExpiryUpdatedAt>2026-07-07T15:58:57.337Z</ExpiryUpdatedAt><Rule><Expiration><Days>30</Days></Expiration><Filter><Prefix></Prefix></Filter><ID>d96i4g89k8h26a95st60</ID><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration><Status>Enabled</Status></Rule></LifecycleConfiguration>
