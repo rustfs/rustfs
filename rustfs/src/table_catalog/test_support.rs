@@ -1343,6 +1343,13 @@ pub(crate) struct TestTableCatalogStore {
 
 #[async_trait::async_trait]
 impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
+    async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        if self.get_table_bucket(&entry.table_bucket).await?.is_some() {
+            return Ok(());
+        }
+        self.put_table_bucket(entry).await
+    }
+
     async fn get_table_bucket(
         &self,
         table_bucket: &str,

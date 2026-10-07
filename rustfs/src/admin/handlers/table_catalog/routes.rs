@@ -30,6 +30,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&ENABLE_TABLE_BUCKET_HANDLER),
     )?;
     r.insert(
+        Method::DELETE,
+        format!("{prefix}/buckets/{{warehouse}}").as_str(),
+        AdminOperation(&DISABLE_TABLE_BUCKET_HANDLER),
+    )?;
+    r.insert(
         Method::GET,
         format!("{prefix}/buckets/{{warehouse}}").as_str(),
         AdminOperation(&GET_TABLE_BUCKET_HANDLER),

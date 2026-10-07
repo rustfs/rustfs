@@ -318,6 +318,21 @@ impl ECStore {
         metadata_sys::update_in(&self.ctx, bucket, config_file, data).await
     }
 
+    /// Validate an external fence while holding the bucket metadata transaction.
+    /// Callers acquire their external fence before the lifecycle and transaction locks.
+    pub async fn update_bucket_metadata_config_validated<F>(
+        &self,
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        validate: F,
+    ) -> Result<OffsetDateTime>
+    where
+        F: FnOnce() -> Result<()> + Send,
+    {
+        metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, validate).await
+    }
+
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
         metadata_sys::get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
