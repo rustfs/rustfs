@@ -254,9 +254,11 @@ impl ProtocolStorageClient {
         object: Option<&str>,
         listing: Option<&ListObjectsV2Input>,
     ) -> S3Result<()> {
-        let context = self.fs.server_ctx().app_context();
+        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        })?;
         let (credentials, is_owner) =
-            crate::auth::check_key_valid_with_context("", session.access_key(), context.as_deref()).await?;
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
         let uri = if let Some(input) = listing {
             build_list_objects_uri(input)?
         } else if let Some(key) = object {
