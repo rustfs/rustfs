@@ -178,6 +178,13 @@ tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11.11", default-features = false, features = [
+      "futures-io",
+      "runtime-tokio",
+      "rustls-aws-lc-rs",
+] }
 
 # Serialization and Data Formats
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }

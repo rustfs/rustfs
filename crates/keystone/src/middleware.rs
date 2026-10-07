@@ -40,7 +40,6 @@ use futures::Future;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use rustfs_credentials::Credentials;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,11 +108,12 @@ pub struct KeystoneAuthMiddleware<S> {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
-impl<S, B> Service<Request<Incoming>> for KeystoneAuthMiddleware<S>
+impl<S, ReqBody, B> Service<Request<ReqBody>> for KeystoneAuthMiddleware<S>
 where
-    S: Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
@@ -125,7 +125,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let keystone_auth = self.keystone_auth.clone();
         let mut inner = self.inner.clone();
 
