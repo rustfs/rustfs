@@ -534,6 +534,8 @@ impl AsyncRead for HashReader {
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
+            // SAFETY: This fixed label is unique within rustfs-rio, satisfying hotpath's export_name symbol contract.
+            #[allow(unsafe_code)]
             Poll::Ready(Ok(())) => crate::hp_measure_block!("HashReader::on_chunk", {
                 let data = &buf.filled()[before..];
                 let filled = data.len();
