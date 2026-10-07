@@ -314,6 +314,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key_md5: None,
             },
             user_metadata,
+            ec_block_size_hint: None,
             internal_metadata,
             content: internal_put_content_input(&headers, tags),
             object_lock: PutObjectLockInput {

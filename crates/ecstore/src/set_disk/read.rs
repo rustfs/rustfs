@@ -119,16 +119,17 @@ use super::core::io_primitives::{
     BitrotReaderSetup, BitrotReaderSetupAttribution, BitrotReaderSetupMode, DeferredReaderReopener, EVENT_SET_DISK_READ,
     GetCodecStreamingReaderBuildOutcome, MetadataCacheLookup, ObjectBitrotReader, ReadRepairAdmissionSubmitter,
     ReadRepairHealSubmission, SLOW_OBJECT_READ_LOG_THRESHOLD, codec_streaming_reader_setup_fallback_reason,
-    create_bitrot_readers_until_quorum_with_preference, create_data_block_bitrot_readers, resolved_read_repair_version_id,
-    send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal, submit_read_repair_heal_with_submitter,
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size, create_data_block_bitrot_readers,
+    resolved_read_repair_version_id, send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal,
+    submit_read_repair_heal_with_submitter,
 };
 #[cfg(test)]
 use super::core::io_primitives::{
     ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
     MultipartCodecStreamingReader, ReadRepairAdmissionFuture, ReadRepairAdmissionOutcome, collect_read_multiple_results,
     collect_read_parts_results, create_bitrot_readers_until_quorum, create_bitrot_readers_until_quorum_all_shards,
-    release_read_repair_heal_reservation, reserve_read_repair_heal, resolve_read_part_from_responses, shard_read_cost_for_disk,
-    shard_read_cost_for_endpoint,
+    create_bitrot_readers_until_quorum_with_preference, release_read_repair_heal_reservation, reserve_read_repair_heal,
+    resolve_read_part_from_responses, shard_read_cost_for_disk, shard_read_cost_for_endpoint,
 };
 #[cfg(test)]
 use super::core::metadata_quorum::{MetadataEarlyStopDecision, MetadataQuorumAccumulator};
@@ -984,6 +985,21 @@ impl SetDisks {
 
         let erasure = erasure_cache.get_for_file_info(fi)?;
 
+        // The direct-memory helper consumes one complete shard in a single
+        // frame. Bounded-quantum objects need the regular striped decoder so
+        // it can walk all authenticated frames in order.
+        if crate::object_api::persisted_ec_read_quantum(
+            &fi.metadata,
+            erasure.block_size,
+            erasure.data_shards,
+            erasure.shard_size(),
+        )
+        .map_err(|error| Error::other(error.to_string()))?
+        .is_some()
+        {
+            return Ok(None);
+        }
+
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
             HashAlgorithm::HighwayHash256SLegacy
@@ -1222,6 +1238,7 @@ impl SetDisks {
         );
 
         let erasure = erasure_cache.get_for_file_info(&fi)?;
+        let frame_size = read_frame_size_for_file_info(&fi, &erasure)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1234,6 +1251,40 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
         let files = Arc::new(files);
         let disks = Arc::new(disks);
+
+        // A small Range GET only needs the authenticated q-aligned slice that
+        // contains each requested data-shard segment. Permit one complete
+        // logical block as well as a single physical shard: the 64 KiB layout
+        // has 32 KiB shards, so a normal 64 KiB range otherwise bypasses the
+        // bounded reader and reopens parity on the legacy path.
+        if frame_size != erasure.shard_size() && length > 0 && length <= erasure.block_size {
+            return Self::read_quantized_range(
+                bucket,
+                object,
+                writer,
+                &fi,
+                files.as_ref(),
+                disks.as_ref(),
+                &erasure,
+                frame_size,
+                offset,
+                length,
+                part_index,
+                last_part_index,
+                part_offset,
+                skip_verify_bitrot,
+                suppress_read_repair,
+                prefer_data_blocks_first_reader_setup,
+                require_reconstruction_surplus,
+                pool_index,
+                set_index,
+                metrics_path,
+                metrics_object_class,
+                metrics_size_bucket,
+            )
+            .await;
+        }
+
         let prefetch_enabled = multipart_reader_setup_prefetch_enabled(get_object_read_policy());
         let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
 
@@ -1286,6 +1337,7 @@ impl SetDisks {
                 part_number,
                 read_offset,
                 read_length,
+                frame_size,
                 checksum_algo,
             };
             let mut setup_result = None;
@@ -1341,6 +1393,7 @@ impl SetDisks {
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
+                    frame_size,
                     checksum_algo: multipart_part_checksum_algo(&fi, next_number),
                 };
                 let files = Arc::clone(&files);
@@ -1521,6 +1574,7 @@ impl SetDisks {
                 exact_quorum,
                 repair,
             } = erasure
+                .clone()
                 .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                     writer,
                     readers,
@@ -1654,6 +1708,239 @@ impl SetDisks {
             );
         }
 
+        Ok(())
+    }
+    /// Read a small q-enabled range one data-shard segment at a time. Each setup
+    /// opens the same q-aligned logical slice on every shard, so Reed-Solomon sees
+    /// equal-length vectors while the caller receives only the requested bytes.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_quantized_range<W>(
+        bucket: &str,
+        object: &str,
+        writer: &mut W,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        erasure: &coding::Erasure,
+        frame_size: usize,
+        offset: usize,
+        length: usize,
+        part_index: usize,
+        last_part_index: usize,
+        mut part_offset: usize,
+        skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
+        prefer_data_blocks_first_reader_setup: bool,
+        require_reconstruction_surplus: bool,
+        pool_index: usize,
+        set_index: usize,
+        metrics_path: &'static str,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let logical_shard_size = erasure.shard_size();
+        if frame_size == 0
+            || logical_shard_size == 0
+            || erasure.block_size == 0
+            || erasure.data_shards == 0
+            || !logical_shard_size.is_multiple_of(frame_size)
+        {
+            return Err(Error::other("invalid EC read quantum geometry"));
+        }
+
+        let use_mmap_read = object_mmap_read_enabled();
+        let mut total_read = 0usize;
+        for current_part in part_index..=last_part_index {
+            if total_read == length {
+                break;
+            }
+
+            let part_number = fi.parts[current_part].number;
+            let part_size = fi.parts[current_part].size;
+            let part_length = (part_size - part_offset).min(length - total_read);
+            let mut segment_offset = part_offset;
+            let mut segment_remaining = part_length;
+
+            while segment_remaining > 0 {
+                let block_index = segment_offset / erasure.block_size;
+                let within_block = segment_offset % erasure.block_size;
+                let block_data_start = block_index
+                    .checked_mul(erasure.block_size)
+                    .ok_or_else(|| Error::other("EC read quantum block offset overflows"))?;
+                if block_data_start >= part_size {
+                    return Err(Error::other("EC read quantum block offset exceeds part size"));
+                }
+                let block_data_len = (part_size - block_data_start).min(erasure.block_size);
+                let block_shard_size = coding::calc_shard_size(block_data_len, erasure.data_shards);
+                if block_shard_size == 0 {
+                    return Err(Error::other("EC read quantum block has zero shard length"));
+                }
+                let shard_index = within_block / block_shard_size;
+                if shard_index >= erasure.data_shards {
+                    return Err(Error::other("EC read quantum data shard index is out of range"));
+                }
+                let within_shard = within_block % block_shard_size;
+                let block_remaining = erasure.block_size - within_block;
+                if within_shard >= block_shard_size {
+                    return Err(Error::other("EC read quantum shard offset exceeds encoded block"));
+                }
+                let shard_remaining = block_shard_size - within_shard;
+                let read_full_block =
+                    within_block == 0 && block_data_len == erasure.block_size && segment_remaining >= block_data_len;
+                let (segment_length, read_shard_size, read_offset, output_offset) = if read_full_block {
+                    // A complete logical block needs every data shard, but
+                    // each shard only once. Group its data-shard segments
+                    // into one decode so a 64 KiB request does not read the
+                    // same 32 KiB data shard twice.
+                    let read_offset = block_index
+                        .checked_mul(logical_shard_size)
+                        .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+                    (block_data_len, block_shard_size, read_offset, 0)
+                } else {
+                    let segment_length = segment_remaining.min(block_remaining).min(shard_remaining);
+                    if segment_length == 0 {
+                        return Err(Error::other("EC read quantum segment is empty"));
+                    }
+
+                    let q_base = (within_shard / frame_size) * frame_size;
+                    let relative_offset = within_shard - q_base;
+                    let covered = relative_offset
+                        .checked_add(segment_length)
+                        .ok_or_else(|| Error::other("EC read quantum segment overflows"))?;
+                    let frame_count = covered.div_ceil(frame_size);
+                    let frame_aligned_size = frame_count
+                        .checked_mul(frame_size)
+                        .ok_or_else(|| Error::other("EC read quantum frame size overflows"))?;
+                    let read_shard_size = frame_aligned_size.min(block_shard_size - q_base);
+                    let read_offset = block_index
+                        .checked_mul(logical_shard_size)
+                        .and_then(|base| base.checked_add(q_base))
+                        .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+                    let output_offset = shard_index
+                        .checked_mul(read_shard_size)
+                        .and_then(|base| base.checked_add(relative_offset))
+                        .ok_or_else(|| Error::other("EC read quantum output offset overflows"))?;
+                    (segment_length, read_shard_size, read_offset, output_offset)
+                };
+
+                let spec = PartReaderSetupSpec {
+                    integrity: fi.parts[current_part].integrity.clone(),
+                    part_number,
+                    read_offset,
+                    read_length: read_shard_size,
+                    frame_size,
+                    checksum_algo: multipart_part_checksum_algo(fi, part_number),
+                };
+                let (reader_setup, reader_setup_elapsed) = setup_multipart_part_readers(
+                    files,
+                    disks,
+                    bucket,
+                    object,
+                    spec,
+                    logical_shard_size,
+                    erasure.data_shards,
+                    erasure.parity_shards,
+                    skip_verify_bitrot,
+                    use_mmap_read,
+                    prefer_data_blocks_first_reader_setup,
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                )
+                .await;
+                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                    metrics_path,
+                    GET_STAGE_READER_SETUP,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    reader_setup_elapsed.as_secs_f64(),
+                );
+
+                let available_shards = reader_setup.available_shards();
+                if available_shards < erasure.data_shards {
+                    return Err(Error::other(format!(
+                        "not enough disks to read quantized range: available {available_shards}, required {}",
+                        erasure.data_shards
+                    )));
+                }
+
+                let missing_shards = reader_setup.completed_failed_shards();
+                if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
+                    let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                    submit_read_repair_heal(
+                        bucket,
+                        object,
+                        version_id.as_deref(),
+                        pool_index,
+                        set_index,
+                        Some(part_number),
+                        "missing_shards",
+                    )
+                    .await;
+                }
+
+                let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
+                let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
+                let readers = reader_setup.readers;
+                let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+                let deferred_reopeners = reader_setup.deferred_reopeners;
+                let outcome = erasure
+                    .clone()
+                    .decode_quantized_range_with_stripe_handles_and_reopeners(
+                        writer,
+                        readers,
+                        output_offset,
+                        segment_length,
+                        read_shard_size,
+                        read_costs,
+                        deferred_stripe_handles,
+                        deferred_reopeners,
+                    )
+                    .await;
+                let mut repair_needed = outcome.repair.needed(!unattempted_data_shards);
+                if require_reconstruction_surplus && outcome.exact_quorum && outcome.error.is_none() {
+                    return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
+                }
+                if let Some(error) = outcome.error {
+                    let disk_error: DiskError = error.into();
+                    let mut has_error = true;
+                    if outcome.written == segment_length {
+                        let should_enqueue_heal = matches!(disk_error, DiskError::FileCorrupt)
+                            || (matches!(disk_error, DiskError::FileNotFound) && !unattempted_data_shards);
+                        if should_enqueue_heal {
+                            repair_needed = true;
+                            has_error = false;
+                        }
+                    }
+                    if has_error {
+                        return Err(disk_error.into());
+                    }
+                }
+                if outcome.written != segment_length {
+                    return Err(Error::other("quantized range returned fewer bytes than requested"));
+                }
+                if !suppress_read_repair && repair_needed {
+                    DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number, false)
+                        .submit()
+                        .await;
+                }
+
+                total_read += segment_length;
+                segment_offset += segment_length;
+                segment_remaining -= segment_length;
+            }
+            part_offset = 0;
+        }
+
+        if total_read != length {
+            return Err(Error::other(format!(
+                "quantized range returned {total_read} bytes, expected {length} at offset {offset}"
+            )));
+        }
         Ok(())
     }
 
@@ -1935,6 +2222,7 @@ impl SetDisks {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
+        let frame_size = read_frame_size_for_file_info(fi, erasure)?;
         let checksum_info = fi.erasure.get_checksum_info(part_number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
             HashAlgorithm::HighwayHash256SLegacy
@@ -1955,7 +2243,7 @@ impl SetDisks {
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
-        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference(
+        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
             files,
             disks,
             bucket,
@@ -1964,6 +2252,7 @@ impl SetDisks {
             read_offset,
             read_length,
             erasure.shard_size(),
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -2226,6 +2515,7 @@ struct PartReaderSetupSpec {
     part_number: usize,
     read_offset: usize,
     read_length: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
 }
 
@@ -2238,6 +2528,25 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
     } else {
         checksum_info.algorithm
     }
+}
+
+/// Resolve the physical authenticated frame size for a persisted object while
+/// keeping the original EC layout geometry for offsets and reconstruction.
+fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
+    let Some(quantum) =
+        crate::object_api::persisted_ec_read_quantum(&fi.metadata, erasure.block_size, erasure.data_shards, erasure.shard_size())
+            .map_err(|error| Error::other(error.to_string()))?
+    else {
+        return Ok(erasure.shard_size());
+    };
+
+    if erasure.uses_legacy_codec() {
+        return Err(Error::other("EC read quantum marker is unsupported for legacy erasure objects"));
+    }
+    if fi.parts.iter().any(|part| part.integrity.is_some()) {
+        return Err(Error::other("EC read quantum marker cannot be combined with protected shard integrity"));
+    }
+    Ok(quantum)
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
@@ -2365,7 +2674,7 @@ async fn setup_multipart_part_readers(
     metrics_size_bucket: &'static str,
 ) -> (BitrotReaderSetup, Duration) {
     let started = Instant::now();
-    let mut setup = create_bitrot_readers_until_quorum_with_preference(
+    let mut setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
         files,
         disks,
         bucket,
@@ -2374,6 +2683,7 @@ async fn setup_multipart_part_readers(
         spec.read_offset,
         spec.read_length,
         shard_size,
+        spec.frame_size,
         spec.checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,

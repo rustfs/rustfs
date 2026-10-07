@@ -127,6 +127,33 @@ pub const DEFAULT_SHARD_INTEGRITY_WRITE: bool = false;
 pub const ENV_SHARD_INTEGRITY_FLEET_CONFIRMED: &str = "RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED";
 pub const DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED: bool = false;
 
+/// Request parsing switch for the per-object erasure-code block-size hint.
+/// The default keeps the feature inert during rolling upgrades.
+pub const ENV_EC_BLOCK_SIZE_HINT_ENABLE: &str = "RUSTFS_EC_BLOCK_SIZE_HINT_ENABLE";
+pub const DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE: bool = false;
+
+/// Operator confirmation that every writer and reader in the fleet understands
+/// the persisted erasure block-size geometry.
+pub const ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED: &str = "RUSTFS_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED";
+pub const DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED: bool = false;
+
+/// Write new EC shards with a bounded bitrot frame size so Range GETs do not
+/// inherit the full persisted layout block as their physical read quantum.
+/// The marker is only emitted after the fleet confirmation gate is enabled;
+/// readers without this feature continue to consume legacy objects unchanged.
+pub const ENV_EC_READ_QUANTUM_ENABLE: &str = "RUSTFS_EC_READ_QUANTUM_ENABLE";
+pub const DEFAULT_EC_READ_QUANTUM_ENABLE: bool = false;
+
+/// Operator confirmation that every reader and writer understands the
+/// persisted EC read-quantum marker and its per-frame bitrot layout.
+pub const ENV_EC_READ_QUANTUM_FLEET_CONFIRMED: &str = "RUSTFS_EC_READ_QUANTUM_FLEET_CONFIRMED";
+pub const DEFAULT_EC_READ_QUANTUM_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE);
+const _: () = assert!(!DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED);
+const _: () = assert!(!DEFAULT_EC_READ_QUANTUM_ENABLE);
+const _: () = assert!(!DEFAULT_EC_READ_QUANTUM_FLEET_CONFIRMED);
+
 const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_WRITE);
 const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED);
 

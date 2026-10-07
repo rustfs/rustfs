@@ -555,6 +555,31 @@ fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksu
     adjust_shard_read_params(offset, length, shard_size, &checksum_algo)
 }
 
+fn bitrot_encoded_range_with_frame_size(
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+) -> (usize, usize) {
+    if frame_size == shard_size {
+        return bitrot_encoded_range(offset, length, shard_size, checksum_algo);
+    }
+
+    // The caller starts every reader at a logical shard boundary.  Keep the
+    // mapping explicit nevertheless: each logical shard has a fixed number of
+    // authenticated frames, so seeking to shard N must skip all hashes in the
+    // preceding logical shards as well.
+    let frames_per_shard = shard_size.div_ceil(frame_size);
+    let hash_size = checksum_algo.size();
+    let logical_shards = offset / shard_size;
+    let within_shard = offset % shard_size;
+    let frame_index = within_shard / frame_size;
+    let physical_offset = logical_shards * (shard_size + frames_per_shard * hash_size) + within_shard + frame_index * hash_size;
+    let physical_length = length + length.div_ceil(frame_size) * hash_size;
+    (physical_offset, physical_length)
+}
+
 /// Adjusts a raw (offset, length) pair to account for per-shard checksum overhead.
 /// Returns (adjusted_offset, adjusted_length).
 pub(crate) fn adjust_shard_read_params(
@@ -687,11 +712,43 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
+    create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+        stage_metrics,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+    inline_data: Option<Bytes>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
     let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
     let stage_metrics_enabled = stage_metrics.is_some();
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
-    let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    let (offset, length) = bitrot_encoded_range_with_frame_size(offset, length, shard_size, frame_size, checksum_algo.clone());
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
     }
@@ -713,7 +770,8 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     }
 
     let bitrot_reader_init_start = stage_metrics_enabled.then(Instant::now);
-    let reader = reader.map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify));
+    let reader =
+        reader.map(|reader| BitrotReader::new_with_frame_size(reader, shard_size, frame_size, checksum_algo, skip_verify));
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.bitrot_reader_init_stage, bitrot_reader_init_start);
     }
@@ -766,8 +824,38 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> (BitrotReader<ShardReader>, DeferredReaderStripeHandle) {
-    let stripe_stride = shard_size + checksum_algo.size();
-    let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+) -> (BitrotReader<ShardReader>, DeferredReaderStripeHandle) {
+    let frames_per_shard = shard_size.div_ceil(frame_size);
+    let stripe_stride = shard_size + frames_per_shard * checksum_algo.size();
+    let (offset, length) = bitrot_encoded_range_with_frame_size(offset, length, shard_size, frame_size, checksum_algo.clone());
     let inline_source = inline_data.is_some();
     let source = BitrotReaderSource {
         inline_data,
@@ -785,7 +873,13 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
     // The deferred parity reader opens its source lazily, so it cannot hand out an
     // in-memory block up front; it stays on the streaming path. Parity shards are
     // only read when a data shard fails, so the fast path is not needed here.
-    let reader = BitrotReader::new(ShardReader::Stream(Box::new(deferred)), shard_size, checksum_algo, skip_verify);
+    let reader = BitrotReader::new_with_frame_size(
+        ShardReader::Stream(Box::new(deferred)),
+        shard_size,
+        frame_size,
+        checksum_algo,
+        skip_verify,
+    );
     (reader, handle)
 }
 

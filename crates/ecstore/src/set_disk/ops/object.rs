@@ -4266,6 +4266,11 @@ impl SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
+        let requested_ec_block_size = crate::object_api::take_ec_block_size_hint(&mut user_defined);
+        // This is a request-to-writer marker.  It must never become ordinary
+        // object metadata, even when the caller supplied it through an
+        // internal path.
+        rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if let Some(eval_metadata) = &opts.eval_metadata {
             merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
@@ -4305,6 +4310,9 @@ impl SetDisks {
         // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+        if let Some(block_size) = requested_ec_block_size {
+            fi.erasure.block_size = block_size;
+        }
 
         fi.version_id = {
             if let Some(ref vid) = opts.version_id {
@@ -4397,6 +4405,21 @@ impl SetDisks {
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
             let shard_size = erasure.shard_size();
+            // Large layout blocks are still useful for sequential writes, but
+            // they should not force every Range GET to verify/read that whole
+            // shard.  New unprotected, non-inline objects may opt into the
+            // bounded per-frame format; legacy and protected writes retain the
+            // historical framing so their existing readers and proofs remain
+            // byte-for-byte compatible.
+            let frame_size = if !is_inline_buffer && !protect_write && crate::object_api::ec_read_quantum_write_enabled() {
+                crate::object_api::select_ec_read_quantum(fi.erasure.block_size, erasure.data_shards, shard_size)
+                    .unwrap_or(shard_size)
+            } else {
+                shard_size
+            };
+            if frame_size != shard_size {
+                crate::object_api::insert_ec_read_quantum(&mut user_defined, frame_size);
+            }
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
@@ -4435,7 +4458,7 @@ impl SetDisks {
                                     RUSTFS_META_TMP_BUCKET,
                                     &tmp_obj,
                                     shard_file_size,
-                                    shard_size,
+                                    frame_size,
                                     HashAlgorithm::HighwayHash256S,
                                 )
                                 .await
@@ -12814,6 +12837,61 @@ mod replication_quota_safety_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn put_object_persists_transient_ec_block_size_without_leaking_marker_metadata() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ec-block-size-marker";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        for block_size in crate::object_api::EC_BLOCK_SIZE_CANDIDATES {
+            let object = format!("object-{block_size}");
+            let mut opts = ObjectOptions::default();
+            opts.user_defined
+                .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_string(), block_size.to_string());
+            let payload = vec![0x61; 4096];
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut reader, &opts)
+                .await
+                .expect("object with a supported block-size marker should be written");
+
+            let info = set_disks
+                .get_object_info(bucket, &object, &ObjectOptions::default())
+                .await
+                .expect("written object metadata should be readable");
+            assert_eq!(info.effective_ec_block_size(), Some(block_size));
+            assert!(
+                !info
+                    .user_defined
+                    .contains_key(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY)
+            );
+
+            let mut object_reader = set_disks
+                .get_object_reader(
+                    bucket,
+                    &object,
+                    Some(HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: 128,
+                        end: 511,
+                    }),
+                    HeaderMap::new(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("persisted block size should decode range reads");
+            let mut restored = Vec::new();
+            object_reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("range read should complete");
+            assert_eq!(restored, payload[128..512]);
+        }
+    }
 
     #[tokio::test]
     async fn quota_put_future_keeps_commit_state_off_the_caller_stack() {

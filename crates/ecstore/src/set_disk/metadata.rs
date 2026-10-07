@@ -29,9 +29,19 @@ use sha2::Digest;
 
 #[derive(Clone, Copy)]
 struct FileInfoIdentityGroup {
-    hash: [u8; 32],
+    key: FileInfoQuorumKey,
     count: usize,
     mod_time: Option<OffsetDateTime>,
+}
+
+/// Metadata identity used when selecting a quorum member.  The historical
+/// content hash remains unchanged for compatibility with diagnostics and
+/// external callers; this second digest prevents two objects with the same
+/// metadata but different decode geometry from sharing a quorum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FileInfoQuorumKey {
+    content_hash: [u8; 32],
+    decode_layout_hash: [u8; 32],
 }
 
 impl SetDisks {
@@ -605,7 +615,7 @@ impl SetDisks {
                 continue;
             }
 
-            let key = Self::file_info_quorum_hash(meta);
+            let key = Self::file_info_quorum_key(meta);
 
             let count = identity_counts.entry(key).or_insert(0);
             *count += 1;
@@ -794,6 +804,26 @@ impl SetDisks {
         key
     }
 
+    fn file_info_quorum_key(meta: &FileInfo) -> FileInfoQuorumKey {
+        let mut hasher = Sha256::new();
+        Self::update_hash_str(&mut hasher, &meta.erasure.algorithm);
+        hasher.update([u8::from(meta.uses_legacy_checksum)]);
+        hasher.update(meta.erasure.data_blocks.to_le_bytes());
+        hasher.update(meta.erasure.parity_blocks.to_le_bytes());
+        hasher.update(meta.erasure.block_size.to_le_bytes());
+        hasher.update(meta.erasure.distribution.len().to_le_bytes());
+        for disk_index in &meta.erasure.distribution {
+            hasher.update(disk_index.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut decode_layout_hash = [0u8; 32];
+        decode_layout_hash.copy_from_slice(digest.as_slice());
+        FileInfoQuorumKey {
+            content_hash: Self::file_info_quorum_hash(meta),
+            decode_layout_hash,
+        }
+    }
+
     /// Hash the per-target delete-marker versions through their normalized form
     /// so the dual internal prefixes carrying the same mapping share one
     /// identity, while a genuine disagreement between disks still changes the
@@ -884,14 +914,14 @@ impl SetDisks {
                 continue;
             }
 
-            let hash = Self::file_info_quorum_hash(meta);
-            if let Some(group) = groups.iter_mut().find(|group| group.hash == hash) {
+            let key = Self::file_info_quorum_key(meta);
+            if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
                 group.count += 1;
                 continue;
             }
 
             groups.push(FileInfoIdentityGroup {
-                hash,
+                key,
                 count: 1,
                 mod_time: meta.mod_time,
             });
@@ -904,7 +934,7 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
         errs: &[Option<DiskError>],
-        hash: [u8; 32],
+        key: FileInfoQuorumKey,
         quorum: usize,
     ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
         let mut online_disks = vec![None; disks.len()];
@@ -912,7 +942,7 @@ impl SetDisks {
         let mut count = 0;
 
         for (i, ((meta, err), disk)) in parts_metadata.iter().zip(errs.iter()).zip(disks.iter()).enumerate() {
-            if err.is_some() || !file_info_is_valid_for_metadata(meta) || Self::file_info_quorum_hash(meta) != hash {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) || Self::file_info_quorum_key(meta) != key {
                 continue;
             }
 
@@ -953,7 +983,7 @@ impl SetDisks {
         let mut older_start = 0;
         while older_start < groups.len() && groups[older_start].mod_time == latest_mod_time {
             if groups[older_start].count >= write_quorum {
-                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, groups[older_start].hash, write_quorum);
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, groups[older_start].key, write_quorum);
             }
             older_start += 1;
         }
@@ -964,7 +994,7 @@ impl SetDisks {
 
         for group in groups.iter().skip(older_start) {
             if group.count >= read_quorum {
-                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, group.hash, read_quorum);
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, group.key, read_quorum);
             }
         }
 
@@ -1014,7 +1044,7 @@ impl SetDisks {
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
-                meta_hashes[i] = Some(Self::file_info_quorum_hash(meta));
+                meta_hashes[i] = Some(Self::file_info_quorum_key(meta));
             } else {
                 debug!(
                     index = i,
@@ -1429,6 +1459,33 @@ mod tests {
             .expect("checksums should exist")
             .insert("sha256".to_string(), "changed".to_string());
         assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+    }
+
+    #[test]
+    fn decode_geometry_is_required_for_fileinfo_quorum_selection() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut base = metadata_quorum_test_fileinfo(mod_time, 1);
+        base.erasure.block_size = 64 * 1024;
+        let mut same_layout = vec![base; 3];
+        for (index, fi) in same_layout.iter_mut().enumerate() {
+            fi.erasure.index = index + 1;
+        }
+        let mut different_layout = same_layout[2].clone();
+        different_layout.erasure.block_size = 256 * 1024;
+
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&same_layout[0]),
+            SetDisks::file_info_quorum_hash(&different_layout),
+            "the compatibility hash remains unchanged when only decode geometry differs"
+        );
+
+        same_layout[2] = different_layout;
+        let selected = SetDisks::find_file_info_in_quorum(&same_layout, &Some(mod_time), &None, 2)
+            .expect("the two matching geometries should form a quorum");
+        assert_eq!(selected.erasure.block_size, 64 * 1024);
+        let err = SetDisks::find_file_info_in_quorum(&same_layout, &Some(mod_time), &None, 3)
+            .expect_err("mixed block sizes must never be combined into a quorum");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]

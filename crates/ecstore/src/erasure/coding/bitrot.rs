@@ -30,6 +30,8 @@ const EVENT_BITROT_SHORT_SHARD_READ: &str = "bitrot_short_shard_read";
 const EVENT_BITROT_HASH_MISMATCH: &str = "bitrot_hash_mismatch";
 const MAX_RETAINED_CHUNKS_PER_BLOCK: usize = 64;
 const MAX_CHUNK_POLLS_PER_YIELD: usize = MAX_RETAINED_CHUNKS_PER_BLOCK + 1;
+const MAX_STACK_BITROT_FRAMES: usize = 8;
+const MAX_STACK_BITROT_SLICES: usize = MAX_STACK_BITROT_FRAMES * 2;
 
 /// Result of polling an optional owned-chunk handoff.
 pub enum ShardChunkRead {
@@ -94,6 +96,10 @@ pin_project! {
         inner: R,
         hash_algo: HashAlgorithm,
         shard_size: usize,
+        // Logical bytes in one layout shard.  `frame_size` is the physical
+        // authenticated payload size; it may be smaller than `shard_size`
+        // for dynamic read-quantum objects.
+        frame_size: usize,
         // Scratch buffer reused across reads. On the hashed path it holds the
         // contiguous on-disk `[hash][data]` block so both are pulled in a single
         // pass; grown lazily and never shrunk.
@@ -113,10 +119,18 @@ where
 {
     /// Create a new BitrotReader.
     pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
+        Self::new_with_frame_size(inner, shard_size, shard_size, algo, skip_verify)
+    }
+
+    /// Create a reader whose logical shard is authenticated as a sequence of
+    /// smaller physical frames.  The decoder still sees one complete logical
+    /// shard, while each frame carries its own hash on disk.
+    pub fn new_with_frame_size(inner: R, shard_size: usize, frame_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
         Self {
             inner,
             hash_algo: algo,
             shard_size,
+            frame_size,
             buf: Vec::new(),
             chunks: Vec::new(),
             skip_verify,
@@ -170,6 +184,10 @@ where
             return self.finish_len(data_len, want);
         }
 
+        if self.frame_size != self.shard_size {
+            return self.read_quantized(out, want).await;
+        }
+
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
@@ -185,6 +203,12 @@ where
     /// verify timer and reject a request larger than one shard.
     fn begin_read(&mut self, want: usize) -> std::io::Result<()> {
         self.last_verify_duration = Duration::ZERO;
+        if self.frame_size == 0 || self.frame_size > self.shard_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid bitrot frame size {} for shard size {}", self.frame_size, self.shard_size),
+            ));
+        }
         if want > self.shard_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -192,6 +216,26 @@ where
             ));
         }
         Ok(())
+    }
+
+    async fn read_quantized(&mut self, out: &mut [u8], want: usize) -> std::io::Result<usize> {
+        let hash_size = self.hash_algo.size();
+        let mut offset = 0;
+        let mut verify = Duration::ZERO;
+        while offset < want {
+            let frame_want = (want - offset).min(self.frame_size);
+            let need = hash_size + frame_want;
+            self.read_scratch_block(need, frame_want).await?;
+            let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+            out[offset..offset + frame_want].copy_from_slice(data);
+            offset += frame_want;
+            verify += frame_verify;
+        }
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(&out[..want]).await?;
+        }
+        self.last_verify_duration = verify;
+        Ok(want)
     }
 
     /// Read a full `[hash][data]` block of `need` bytes into the scratch buffer
@@ -323,6 +367,10 @@ where
                 }
             }
             return self.finish_len(out.len() - start, want);
+        }
+
+        if self.frame_size != self.shard_size {
+            return self.read_quantized_appending(out, want).await;
         }
 
         let need = hash_size + want;
@@ -463,6 +511,25 @@ where
         self.last_verify_duration = verify;
         Ok(want)
     }
+
+    async fn read_quantized_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+        let hash_size = self.hash_algo.size();
+        let mut offset = 0;
+        let mut verify = Duration::ZERO;
+        while offset < want {
+            let frame_want = (want - offset).min(self.frame_size);
+            let need = hash_size + frame_want;
+            self.read_scratch_block(need, frame_want).await?;
+            let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+            out.extend_from_slice(data);
+            offset += frame_want;
+            verify += frame_verify;
+        }
+        self.last_verify_duration = verify;
+        // The outer `read_appending` call performs the optional protected
+        // shard verification over the complete logical shard.
+        Ok(want)
+    }
 }
 
 pin_project! {
@@ -546,6 +613,139 @@ where
         Ok(n)
     }
 
+    /// Write several complete bitrot frames with one vectored write sequence.
+    ///
+    /// The EC encoder gives the wrapper one logical shard at a time.  Dynamic
+    /// read-quantum objects split that shard into several authenticated frames;
+    /// writing each frame separately adds an async writer round trip per frame.
+    /// Keep the frame hashes in a small stack-shaped allocation and submit all
+    /// hash/data pairs together so local files and transports that support
+    /// vectored writes can coalesce the operation without changing the on-disk
+    /// `[hash][data]` layout.
+    async fn write_frames(&mut self, frames: &[&[u8]]) -> std::io::Result<usize> {
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        if self.finished {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot writer already finished"));
+        }
+
+        if frames.len() <= MAX_STACK_BITROT_FRAMES {
+            return self.write_small_frames(frames).await;
+        }
+
+        let hash_size = self.hash_algo.size();
+        // HashAlgorithm's largest output is BLAKE2b-512 (64 bytes).  A fixed
+        // slot avoids one heap allocation per frame while keeping the helper
+        // generic for the legacy algorithms used by tests and heal.
+        let mut hashes = if hash_size > 0 {
+            vec![[0u8; 64]; frames.len()]
+        } else {
+            Vec::new()
+        };
+        let mut slices = Vec::with_capacity(frames.len().saturating_mul(2));
+        let mut written = 0usize;
+        let mut frame_index = 0;
+        for frame in frames {
+            if frame.is_empty() {
+                continue;
+            }
+            if frame.len() > self.shard_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("data size {} exceeds shard size {}", frame.len(), self.shard_size),
+                ));
+            }
+            if hash_size > 0 {
+                let hash = self.hash_algo.hash_encode(frame);
+                if hash.as_ref().is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
+                }
+                hashes[frame_index][..hash_size].copy_from_slice(hash.as_ref());
+            }
+            written = written.saturating_add(frame.len());
+            frame_index += 1;
+        }
+        if written == 0 {
+            return Ok(0);
+        }
+
+        // Build the IoSlice list only after hashes are owned by `hashes`, so
+        // the borrowed vectors remain stable while the write is in flight.
+        if hash_size > 0 {
+            let mut hash_index = 0;
+            for frame in frames {
+                if frame.is_empty() {
+                    continue;
+                }
+                slices.push(IoSlice::new(&hashes[hash_index][..hash_size]));
+                slices.push(IoSlice::new(frame));
+                hash_index += 1;
+            }
+        } else {
+            slices.extend(
+                frames
+                    .iter()
+                    .filter(|frame| !frame.is_empty())
+                    .map(|frame| IoSlice::new(frame)),
+            );
+        }
+
+        write_all_vectored_slices(&mut self.inner, &slices).await?;
+        if frames.last().is_some_and(|frame| frame.len() < self.shard_size) {
+            self.finished = true;
+        }
+        Ok(written)
+    }
+
+    async fn write_small_frames(&mut self, frames: &[&[u8]]) -> std::io::Result<usize> {
+        let hash_size = self.hash_algo.size();
+        let mut hashes = [[0u8; 64]; MAX_STACK_BITROT_FRAMES];
+        let mut frame_count = 0usize;
+        let mut written = 0usize;
+
+        for frame in frames {
+            if frame.is_empty() {
+                continue;
+            }
+            if frame.len() > self.shard_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("data size {} exceeds shard size {}", frame.len(), self.shard_size),
+                ));
+            }
+            if hash_size > 0 {
+                let hash = self.hash_algo.hash_encode(frame);
+                if hash.as_ref().is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
+                }
+                hashes[frame_count][..hash_size].copy_from_slice(hash.as_ref());
+            }
+            written = written.saturating_add(frame.len());
+            frame_count += 1;
+        }
+        if written == 0 {
+            return Ok(0);
+        }
+
+        let mut slices = [IoSlice::new(&[]); MAX_STACK_BITROT_SLICES];
+        let mut slice_count = 0usize;
+        for (frame_index, frame) in frames.iter().filter(|frame| !frame.is_empty()).enumerate() {
+            if hash_size > 0 {
+                slices[slice_count] = IoSlice::new(&hashes[frame_index][..hash_size]);
+                slice_count += 1;
+            }
+            slices[slice_count] = IoSlice::new(frame);
+            slice_count += 1;
+        }
+
+        write_all_vectored_slices(&mut self.inner, &slices[..slice_count]).await?;
+        if frames.last().is_some_and(|frame| frame.len() < self.shard_size) {
+            self.finished = true;
+        }
+        Ok(written)
+    }
+
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.inner.flush().await?;
         self.inner.shutdown().await
@@ -598,6 +798,87 @@ where
         data_offset += written - hash_remaining;
     }
 
+    Ok(())
+}
+
+/// Complete a vectored write even when the sink accepts only a prefix of the
+/// supplied slices.  This is the multi-frame counterpart of
+/// [`write_all_vectored`].
+async fn write_all_vectored_slices<W>(writer: &mut W, slices: &[IoSlice<'_>]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if slices.len() <= MAX_STACK_BITROT_SLICES {
+        let mut offsets = [0usize; MAX_STACK_BITROT_SLICES];
+        let mut first = 0usize;
+        while first < slices.len() {
+            let mut pending = [IoSlice::new(&[]); MAX_STACK_BITROT_SLICES];
+            let mut pending_count = 0usize;
+            for (index, slice) in slices[first..].iter().enumerate() {
+                let offset = offsets[first + index];
+                if offset < slice.len() {
+                    pending[pending_count] = IoSlice::new(&slice[offset..]);
+                    pending_count += 1;
+                }
+            }
+            if pending_count == 0 {
+                break;
+            }
+            let written = writer.write_vectored(&pending[..pending_count]).await?;
+            if written == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write bitrot frames"));
+            }
+
+            let mut remaining = written;
+            for index in first..slices.len() {
+                let available = slices[index].len().saturating_sub(offsets[index]);
+                let consumed = available.min(remaining);
+                offsets[index] += consumed;
+                remaining -= consumed;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            while first < slices.len() && offsets[first] == slices[first].len() {
+                first += 1;
+            }
+        }
+        return Ok(());
+    }
+
+    let mut offsets = vec![0usize; slices.len()];
+    let mut pending = Vec::with_capacity(slices.len());
+    let mut first = 0usize;
+    while first < slices.len() {
+        pending.clear();
+        for (index, slice) in slices[first..].iter().enumerate() {
+            let offset = offsets[first + index];
+            if offset < slice.len() {
+                pending.push(IoSlice::new(&slice[offset..]));
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        let written = writer.write_vectored(&pending).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write bitrot frames"));
+        }
+
+        let mut remaining = written;
+        for index in first..slices.len() {
+            let available = slices[index].len().saturating_sub(offsets[index]);
+            let consumed = available.min(remaining);
+            offsets[index] += consumed;
+            remaining -= consumed;
+            if remaining == 0 {
+                break;
+            }
+        }
+        while first < slices.len() && offsets[first] == slices[first].len() {
+            first += 1;
+        }
+    }
     Ok(())
 }
 
@@ -847,7 +1128,28 @@ impl BitrotWriterWrapper {
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(buf).await?;
         }
-        self.bitrot_writer.write(buf).await
+        // The encoder hands us one complete EC shard for each layout stripe.
+        // A bounded read quantum stores that shard as several independently
+        // authenticated frames, so split only at this boundary.  The selected
+        // quantum divides every complete layout shard; a short final chunk is
+        // therefore seen only at the end of the object shard.
+        let frame_size = self.bitrot_writer.shard_size;
+        if frame_size == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot frame size is zero"));
+        }
+        if buf.len() <= frame_size {
+            return self.bitrot_writer.write(buf).await;
+        }
+        let frame_count = 1 + (buf.len() - 1) / frame_size;
+        if frame_count <= MAX_STACK_BITROT_FRAMES {
+            let mut frames = [&[][..]; MAX_STACK_BITROT_FRAMES];
+            for (slot, frame) in frames.iter_mut().zip(buf.chunks(frame_size)) {
+                *slot = frame;
+            }
+            return self.bitrot_writer.write_frames(&frames[..frame_count]).await;
+        }
+        let frames: Vec<&[u8]> = buf.chunks(frame_size).collect();
+        self.bitrot_writer.write_frames(&frames).await
     }
 
     pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) {
@@ -1126,7 +1428,7 @@ pub async fn bitrot_self_test() -> Result<(), BitrotSelfTestError> {
 mod tests {
     use super::{
         BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_kat_check, bitrot_self_test,
-        bitrot_self_test_payload, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
+        bitrot_self_test_payload, bitrot_shard_file_size, bitrot_verify, write_all_vectored, write_all_vectored_slices,
     };
     use super::{MAX_RETAINED_CHUNKS_PER_BLOCK, ShardChunkRead, ShardSource};
     use bytes::Bytes;
@@ -1630,6 +1932,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_all_vectored_slices_retries_partial_writes_for_stack_and_heap_paths() {
+        for count in [8, 20] {
+            let chunks: Vec<Vec<u8>> = (0..count)
+                .map(|index| vec![b'a' + (index % 26) as u8; index % 3 + 1])
+                .collect();
+            let slices: Vec<IoSlice<'_>> = chunks.iter().map(|chunk| IoSlice::new(chunk)).collect();
+            let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+            let mut writer = LimitedVectoredWriter {
+                max_write: 5,
+                writes: Vec::new(),
+            };
+
+            write_all_vectored_slices(&mut writer, &slices)
+                .await
+                .expect("partial vectored writes should be completed");
+            assert_eq!(writer.writes, expected, "slice count {count}");
+        }
+
+        let slices = [IoSlice::new(b"hash"), IoSlice::new(b"payload")];
+        let mut zero_writer = LimitedVectoredWriter {
+            max_write: 0,
+            writes: Vec::new(),
+        };
+        let err = write_all_vectored_slices(&mut zero_writer, &slices)
+            .await
+            .expect_err("zero-byte vectored writes must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
     async fn bitrot_reader_rejects_output_buffers_larger_than_shard_size() {
         let mut reader = BitrotReader::new(std::io::Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
         let mut out = [0u8; 5];
@@ -2040,6 +2372,48 @@ mod tests {
             assert_eq!(via_read, via_append, "{algo:?}: bytes must be identical");
             assert_eq!(via_append, data, "{algo:?}: and equal to what was written");
         }
+    }
+
+    #[tokio::test]
+    async fn quantized_reader_reassembles_multiple_authenticated_frames() {
+        const SHARD: usize = 32;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data: Vec<u8> = (0..SHARD)
+            .map(|index| index.wrapping_mul(29).wrapping_add(11) as u8)
+            .collect();
+
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        assert_eq!(writer.write(&data).await.expect("write quantized shard"), SHARD);
+        writer.shutdown().await.expect("finish quantized shard");
+        let encoded = writer.into_inline_data().expect("inline quantized bytes");
+
+        let mut reader = BitrotReader::new_with_frame_size(Cursor::new(encoded), SHARD, FRAME, algo, false);
+        let mut first = vec![0u8; 16];
+        assert_eq!(reader.read(&mut first).await.expect("read first frames"), first.len());
+        assert_eq!(&first, &data[..16]);
+
+        let mut second = vec![0u8; 16];
+        assert_eq!(reader.read(&mut second).await.expect("read remaining frames"), second.len());
+        assert_eq!(&second, &data[16..]);
+    }
+
+    #[tokio::test]
+    async fn quantized_writer_heap_fallback_reassembles_many_authenticated_frames() {
+        const SHARD: usize = 128;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data: Vec<u8> = (0..SHARD).map(|index| index.wrapping_mul(13).wrapping_add(7) as u8).collect();
+
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        assert_eq!(writer.write(&data).await.expect("write quantized shard"), SHARD);
+        writer.shutdown().await.expect("finish quantized shard");
+        let encoded = writer.into_inline_data().expect("inline quantized bytes");
+
+        let mut reader = BitrotReader::new_with_frame_size(Cursor::new(encoded), SHARD, FRAME, algo, false);
+        let mut decoded = vec![0u8; SHARD];
+        assert_eq!(reader.read(&mut decoded).await.expect("read all frames"), SHARD);
+        assert_eq!(decoded, data);
     }
 
     /// A truncated shard must be an error, never a partially filled buffer — that

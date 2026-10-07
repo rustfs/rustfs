@@ -512,6 +512,7 @@ impl DefaultObjectUsecase {
         } else {
             0
         };
+        let effective_ec_block_size = info.effective_ec_block_size();
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -565,6 +566,11 @@ impl DefaultObjectUsecase {
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
         // carry on the typed HeadObjectOutput (#1257).
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist

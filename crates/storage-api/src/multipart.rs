@@ -20,6 +20,10 @@ pub struct MultipartUploadResult {
     pub upload_id: String,
     pub checksum_algo: Option<String>,
     pub checksum_type: Option<String>,
+    /// The block size persisted in the multipart session's authoritative
+    /// `FileInfo`.  The application uses this value for the Create-MPU
+    /// response; later parts never re-select the layout.
+    pub effective_ec_block_size: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone)]

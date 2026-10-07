@@ -819,6 +819,58 @@ where
         }
     }
 
+    /// Build a reconstruction-verifying reader for one q-aligned slice of a
+    /// logical EC block. The underlying erasure geometry still determines the
+    /// number of data and parity readers, while `read_shard_size` describes the
+    /// smaller byte vector that Reed-Solomon should reconstruct for this range.
+    ///
+    /// The q-range caller opens every reader at the same logical shard offset,
+    /// so this reader only needs one local stripe and no global shard cursor.
+    fn new_for_quantized_decode(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        read_shard_size: usize,
+        metrics_path: Option<&'static str>,
+        read_costs: Option<Vec<ShardReadCost>>,
+    ) -> Self {
+        let mut reader = if let Some(read_costs) = read_costs {
+            Self::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+                readers,
+                e,
+                0,
+                0,
+                metrics_path,
+                read_costs,
+                get_object_disk_read_timeout(),
+                true,
+            )
+        } else {
+            Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                e,
+                0,
+                0,
+                metrics_path,
+                get_object_disk_read_timeout(),
+                true,
+            )
+        };
+        reader.offset = 0;
+        reader.shard_size = read_shard_size;
+        reader.shard_file_size = read_shard_size;
+        // A q-range is already bounded to the exact shard frames needed by the
+        // client request.  Keep healthy reads demand-bound as well: read the
+        // data quorum and retain parity as stripe-aligned reserves for a failed
+        // data reader.  The ordinary GET rollout remains controlled by its
+        // deployment gate, while this bounded path avoids paying parity I/O for
+        // every small Range request.
+        reader.demand_bound_lockstep = true;
+        for (index, engaged) in reader.engaged.iter_mut().enumerate() {
+            *engaged = index < reader.data_shards;
+        }
+        reader
+    }
+
     pub(crate) fn with_repair_evidence(mut self, evidence: Arc<ShardReadRepair>) -> Self {
         self.repair_evidence = Some(evidence);
         self
@@ -2371,6 +2423,117 @@ impl Erasure {
         .await
     }
 
+    /// Decode a range that was opened as one q-aligned slice of every data
+    /// shard. The caller supplies the output offset within the concatenated
+    /// q-slices (`shard_index * read_shard_size + offset_in_shard`). Keeping
+    /// this path separate from `decode_inner` preserves the normal full-shard
+    /// reader geometry for legacy and full-object GETs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decode_quantized_range_with_stripe_handles_and_reopeners<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        output_offset: usize,
+        length: usize,
+        read_shard_size: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+        deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+    ) -> DecodeOutcome
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: crate::erasure::coding::ShardSource,
+    {
+        if readers.len() != self.data_shards + self.parity_shards {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")),
+                ..Default::default()
+            };
+        }
+        if read_shard_size == 0 {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized shard size must be non-zero")),
+                ..Default::default()
+            };
+        }
+        let Some(required_len) = output_offset.checked_add(length) else {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized output range overflows")),
+                ..Default::default()
+            };
+        };
+        let Some(max_len) = self.data_shards.checked_mul(read_shard_size) else {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized shard geometry overflows")),
+                ..Default::default()
+            };
+        };
+        if required_len > max_len {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized output range exceeds shard geometry")),
+                ..Default::default()
+            };
+        }
+        if length == 0 {
+            return DecodeOutcome::default();
+        }
+
+        let metrics_path = Some(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let mut reader =
+            ParallelReader::new_for_quantized_decode(readers, self.clone(), read_shard_size, metrics_path, read_costs)
+                .with_deferred_parity_handles(deferred_handles)
+                .with_deferred_parity_reopeners(deferred_reopeners);
+        let integrity = reader.integrity.clone();
+        // The q-range reader still verifies each bitrot frame.  Requiring an
+        // additional reconstruction source for a healthy range would defeat
+        // demand-bound parity and turn every request back into an all-shard
+        // read; parity is admitted by the lockstep reader only when data is
+        // missing or fails verification.
+        let require_surplus_source = false;
+
+        let stripe_read_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+        let (mut shards, errs) = reader.read().await;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+        let exact_quorum = shards.iter().filter(|shard| shard.is_some()).count() == self.data_shards;
+        let repair = ShardReadRepair::default();
+        let mut written = 0;
+        let mut ret_err = None;
+        let flow = self
+            .emit_decoded_stripe(
+                writer,
+                &mut shards,
+                &errs,
+                output_offset,
+                length,
+                &mut written,
+                &mut ret_err,
+                &repair,
+                rustfs_io_metrics::get_stage_metrics_enabled(),
+                require_surplus_source,
+                integrity.as_ref(),
+                0,
+            )
+            .await;
+        if matches!(flow, StripeFlow::Continue) {
+            reader.recycle_shards(&mut shards);
+        }
+        if ret_err.is_none() && written < length {
+            ret_err = Some(Error::LessData.into());
+        }
+
+        DecodeOutcome {
+            written,
+            error: ret_err,
+            exact_quorum,
+            repair,
+        }
+    }
+
     /// Reconstruct and emit one already-read stripe.
     ///
     /// This is the shared per-stripe body used by both the serial legacy loop
@@ -3209,6 +3372,12 @@ mod tests {
 
         assert_eq!(defaulted.read_costs, vec![ShardReadCost::Unknown; 3]);
         assert!(defaulted.verify_reconstruction);
+
+        let quantized: ParallelReader<Cursor<Vec<u8>>> =
+            ParallelReader::new_for_quantized_decode(vec![None, None, None], Erasure::new(2, 1, 64), 16, None, None);
+        assert!(quantized.verify_reconstruction);
+        assert!(quantized.demand_bound_lockstep);
+        assert_eq!(quantized.engaged.as_slice(), &[true, true, false]);
     }
 
     #[tokio::test]
