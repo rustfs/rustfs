@@ -423,7 +423,7 @@ async fn exercise_mixed_cluster(
     previous_node: usize,
 ) -> TestResult {
     let clients = cluster.create_all_clients()?;
-    wait_for_upgrade_write_readiness(&clients, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
     let current_client = &clients[current_node];
     let previous_client = &clients[previous_node];
 
@@ -485,7 +485,12 @@ fn upgrade_probe_client(client: &Client) -> Client {
     )
 }
 
-async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budget: Duration) -> TestResult {
+pub(crate) async fn wait_for_upgrade_write_readiness(
+    clients: &[Client],
+    bucket: &str,
+    phase: &str,
+    budget: Duration,
+) -> TestResult {
     // ListBuckets can succeed before peers recover a restarted disk. Cluster
     // health also accepts Returning disks whose write health is still FAULTY.
     // Probe every writer outside the asserted phase prefix; compatibility
@@ -505,7 +510,7 @@ async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budge
                 deadline,
                 client
                     .put_object()
-                    .bucket(MIXED_BUCKET)
+                    .bucket(bucket)
                     .key(&key)
                     .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
                     .send(),
@@ -540,19 +545,20 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
     // readable. This preparation ends before any current binary is started.
-    wait_for_upgrade_write_readiness(&clients[..1], "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
+            MIXED_BUCKET,
             &format!("previous-restart-{node}"),
             LISTING_CONVERGENCE_TIMEOUT,
         )
         .await?;
     }
 
-    wait_for_upgrade_write_readiness(&clients, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
@@ -579,9 +585,10 @@ mod upgrade_write_readiness_tests {
     #[tokio::test]
     async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
         let target = FakeS3Target::start().await?;
-        target.create_bucket(MIXED_BUCKET);
+        let bucket = "distributed-upgrade-history";
+        target.create_bucket(bucket);
         let client = fake_source_client(&target);
-        client.head_bucket().bucket(MIXED_BUCKET).send().await?;
+        client.head_bucket().bucket(bucket).send().await?;
 
         let phase = "one-previous-node";
         let first_key = format!(".upgrade-readiness/{phase}/node-0");
@@ -601,7 +608,7 @@ mod upgrade_write_readiness_tests {
         // Metadata readiness does not prove that a data write can succeed.
         let premature = client
             .put_object()
-            .bucket(MIXED_BUCKET)
+            .bucket(bucket)
             .key(&first_key)
             .body(ByteStream::from_static(b"upgrade write readiness"))
             .send()
@@ -609,15 +616,15 @@ mod upgrade_write_readiness_tests {
             .expect_err("metadata readiness does not prove write readiness");
         assert_eq!(premature.raw_response().map(|response| response.status().as_u16()), Some(503));
 
-        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], phase, Duration::from_secs(5)).await?;
+        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], bucket, phase, Duration::from_secs(5)).await?;
         assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &first_key), 3);
         assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &second_key), 2);
-        assert!(target.has_object(MIXED_BUCKET, &first_key));
-        assert!(target.has_object(MIXED_BUCKET, &second_key));
+        assert!(target.has_object(bucket, &first_key));
+        assert!(target.has_object(bucket, &second_key));
         assert!(
             client
                 .list_objects_v2()
-                .bucket(MIXED_BUCKET)
+                .bucket(bucket)
                 .prefix(format!("{phase}/"))
                 .send()
                 .await?
@@ -647,9 +654,10 @@ mod upgrade_write_readiness_tests {
             let phase = format!("permanent-{}", status.as_u16());
             let key = format!(".upgrade-readiness/{phase}/node-0");
             target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Status(status), 1);
-            let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), &phase, Duration::from_secs(5))
-                .await
-                .expect_err("a permanent error must not be retried into success");
+            let error =
+                wait_for_upgrade_write_readiness(std::slice::from_ref(&client), MIXED_BUCKET, &phase, Duration::from_secs(5))
+                    .await
+                    .expect_err("a permanent error must not be retried into success");
             assert!(error.to_string().contains("node 0 write readiness failed"), "{error}");
             assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &key), 1);
             assert!(!target.has_object(MIXED_BUCKET, &key));
@@ -672,7 +680,7 @@ mod upgrade_write_readiness_tests {
             FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
             10,
         );
-        let error = wait_for_upgrade_write_readiness(&[client], phase, Duration::from_secs(1))
+        let error = wait_for_upgrade_write_readiness(&[client], MIXED_BUCKET, phase, Duration::from_secs(1))
             .await
             .expect_err("persistent unavailability must exhaust the shared deadline");
         // Transport scheduling consumes the same budget; do not require a
@@ -691,7 +699,7 @@ mod upgrade_write_readiness_tests {
         let phase = "stalled";
         let key = format!(".upgrade-readiness/{phase}/node-0");
         target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Stall(Duration::from_secs(30)), 1);
-        let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), phase, Duration::from_secs(1))
+        let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), MIXED_BUCKET, phase, Duration::from_secs(1))
             .await
             .expect_err("a stalled request must not outlive the readiness deadline");
         assert!(error.to_string().contains("deadline exceeded during PutObject"), "{error}");
