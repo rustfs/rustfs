@@ -84,7 +84,7 @@ pub(crate) async fn init_startup_runtime_services(
 ) -> Result<StartupServiceRuntime> {
     init_kms_system(config, store.clone()).await?;
 
-    let optional_runtimes = init_optional_runtime_services().await?;
+    let optional_runtimes = init_optional_runtime_services(server_ctx.clone()).await?;
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
     let local_trace_capture = heartbeat_config
         .as_ref()

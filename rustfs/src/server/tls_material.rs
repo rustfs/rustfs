@@ -465,6 +465,7 @@ enum ServerCertSource {
 
 enum ServerProtocol {
     Tcp,
+    #[cfg(feature = "http3")]
     Http3,
 }
 
@@ -475,6 +476,7 @@ fn build_server_config(
 ) -> Result<rustls::ServerConfig, TlsMaterialError> {
     let builder = match protocol {
         ServerProtocol::Tcp => rustls::ServerConfig::builder(),
+        #[cfg(feature = "http3")]
         ServerProtocol::Http3 => rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]),
     };
 
@@ -505,9 +507,11 @@ fn build_server_config(
         ServerProtocol::Tcp => {
             vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()]
         }
+        #[cfg(feature = "http3")]
         ServerProtocol::Http3 => vec![b"h3".to_vec()],
     };
 
+    #[cfg(feature = "http3")]
     if matches!(protocol, ServerProtocol::Http3) {
         config.max_early_data_size = 0;
     }
@@ -642,12 +646,45 @@ impl TlsAcceptorHolder {
     }
 }
 
+// Build both configurations before publishing either listener's new certificate.
+async fn reload_acceptors(
+    server: Option<RuntimeServerTlsMaterial>,
+    tls_dir: &Path,
+    holder: &TlsAcceptorHolder,
+    #[cfg(feature = "http3")] http3_endpoint: Option<&quinn::Endpoint>,
+) -> Result<bool, TlsMaterialError> {
+    #[cfg(feature = "http3")]
+    let http3_config = if http3_endpoint.is_some() {
+        let config = build_http3_server_config_from_loaded(server.as_ref(), tls_dir).await?;
+        let Some(mut config) = config else {
+            return Ok(false);
+        };
+        config.migration(false);
+        Some(config)
+    } else {
+        None
+    };
+    let Some(new_holder) = build_acceptor_from_loaded(server, tls_dir).await? else {
+        return Ok(false);
+    };
+    #[cfg(feature = "http3")]
+    if let (Some(endpoint), Some(config)) = (http3_endpoint, http3_config) {
+        endpoint.set_server_config(Some(config));
+    }
+    holder.swap(&new_holder);
+    Ok(true)
+}
+
 // ── Reload Loop ──
 
 /// Spawn a background task that periodically checks for TLS certificate changes.
 /// Single load per tick: loads once via tls-runtime, enriches, publishes outbound,
 /// and builds acceptor — no double reads.
-pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>) {
+pub(crate) fn spawn_reload_loop(
+    tls_path: String,
+    holder: Arc<TlsAcceptorHolder>,
+    #[cfg(feature = "http3")] http3_endpoint: Option<quinn::Endpoint>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let enabled = get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
     if !enabled {
         debug!(
@@ -658,7 +695,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
             env_var = ENV_TLS_RELOAD_ENABLE,
             "TLS reload state changed"
         );
-        return;
+        return None;
     }
 
     let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
@@ -673,7 +710,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
         "TLS reload state changed"
     );
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         let tls_dir = PathBuf::from(&tls_path);
         loop {
@@ -708,8 +745,16 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                         );
                     }
 
-                    match build_acceptor_from_loaded(snapshot.server, &tls_dir).await {
-                        Ok(Some(new_holder)) => {
+                    match reload_acceptors(
+                        snapshot.server,
+                        &tls_dir,
+                        &holder,
+                        #[cfg(feature = "http3")]
+                        http3_endpoint.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
                             info!(
                                 component = LOG_COMPONENT_TLS,
                                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -718,7 +763,6 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                                 generation,
                                 "TLS reload state changed"
                             );
-                            holder.swap(&new_holder);
                             startup_runtime_sources::record_tls_reload_result(
                                 "rustfs_server_reload_loop",
                                 "ok",
@@ -726,7 +770,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                                 Some(generation),
                             );
                         }
-                        Ok(None) => {
+                        Ok(false) => {
                             startup_runtime_sources::record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
                             warn!(
                                 component = LOG_COMPONENT_TLS,
@@ -769,7 +813,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]
@@ -1020,8 +1064,9 @@ mod tests {
         assert!(acceptor.is_some());
     }
 
+    #[cfg(feature = "http3")]
     #[test]
-    fn http3_server_config_uses_h3_and_disables_early_dta() {
+    fn http3_server_config_uses_h3_and_disables_early_data() {
         ensure_rustls_crypto_provider();
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
@@ -1038,5 +1083,77 @@ mod tests {
 
         assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
         assert_eq!(config.max_early_data_size, 0);
+    }
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http3_certificate_reload_updates_handshakes_and_retains_valid_config() {
+        use crate::server::http3::tests::{client_endpoint, connect};
+        let dir = TempDir::new().expect("TLS directory");
+        write_test_cert_pair(dir.path(), "localhost");
+        let snapshot = load_tls_material(dir.path().to_str().expect("TLS path"))
+            .await
+            .expect("load first cert");
+        let holder = build_acceptor_from_loaded(
+            load_tls_material(dir.path().to_str().expect("TLS path"))
+                .await
+                .expect("load TCP cert")
+                .server,
+            dir.path(),
+        )
+        .await
+        .expect("TCP config")
+        .expect("TCP holder");
+        let config = build_http3_server_config_from_loaded(snapshot.server.as_ref(), dir.path())
+            .await
+            .expect("QUIC config")
+            .expect("server cert");
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("address")).expect("QUIC endpoint");
+        let first_cert = match snapshot.server.expect("cert") {
+            RuntimeServerTlsMaterial::SingleCert { certs, .. } => certs[0].clone(),
+            _ => panic!("single certificate expected"),
+        };
+        write_test_cert_pair(dir.path(), "localhost");
+        let snapshot = load_tls_material(dir.path().to_str().expect("TLS path"))
+            .await
+            .expect("load rotated cert");
+        let second_cert = match snapshot.server.as_ref().expect("cert") {
+            RuntimeServerTlsMaterial::SingleCert { certs, .. } => certs[0].clone(),
+            _ => panic!("single certificate expected"),
+        };
+        assert_ne!(first_cert, second_cert);
+        let old_tcp = holder.get();
+        assert!(
+            reload_acceptors(snapshot.server, dir.path(), &holder, Some(&endpoint))
+                .await
+                .expect("reload both listeners")
+        );
+        assert!(!Arc::ptr_eq(&old_tcp, &holder.get()), "TCP acceptor must also rotate");
+        let valid_tcp = holder.get();
+        assert!(
+            !reload_acceptors(None, dir.path(), &holder, Some(&endpoint))
+                .await
+                .expect("empty snapshot")
+        );
+        assert!(Arc::ptr_eq(&valid_tcp, &holder.get()), "failed reload must retain the valid TCP acceptor");
+        let client = client_endpoint(vec![second_cert.clone()]).expect("trust rotated cert");
+        let addr = endpoint.local_addr().expect("server address");
+        let handshake = tokio::spawn(async move { connect(&client, addr).await });
+        let incoming = endpoint.accept().await.expect("new connection");
+        let server = incoming.await.expect("rotated TLS handshake");
+        let (client, _, driver) = handshake.await.expect("client task").expect("client trusts new certificate");
+        let identity = client
+            .peer_identity()
+            .expect("peer certs")
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .expect("rustls identity");
+        assert_eq!(
+            identity[0], second_cert,
+            "QUIC must serve the rotated certificate even after a rejected reload"
+        );
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+        driver.abort();
+        endpoint.close(0u32.into(), b"test complete");
     }
 }

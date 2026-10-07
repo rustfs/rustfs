@@ -4048,7 +4048,7 @@ dependencies = [
  "rustfs-tokio-tar",
  "rustfs-utils",
  "rustls",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -5017,7 +5017,6 @@ dependencies = [
  "http 1.5.0",
  "pin-project-lite",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5032,7 +5031,6 @@ dependencies = [
  "quinn",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -9519,6 +9517,8 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "google-cloud-auth",
+ "h3",
+ "h3-quinn",
  "hashbrown 0.17.1",
  "hex-simd",
  "hmac 0.13.0",
@@ -9608,9 +9608,8 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "s3s-http3",
- "s3s-sigv4 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
+ "s3s-sigv4",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -9866,7 +9865,7 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "serial_test",
@@ -10223,7 +10222,7 @@ dependencies = [
  "rustfs-replication",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serial_test",
  "temp-env",
  "time",
@@ -10286,7 +10285,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rustfs-signer",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "sysinfo",
@@ -10518,7 +10517,7 @@ dependencies = [
  "rustfs-trusted-proxies",
  "rustfs-utils",
  "rustls",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -10574,7 +10573,7 @@ dependencies = [
  "regex",
  "rmp",
  "rmp-serde",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "time",
  "tokio",
@@ -10677,7 +10676,7 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "rustls-pki-types",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -10732,7 +10731,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-storage-api",
  "rustfs-test-utils",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde_json",
  "serial_test",
  "thiserror 2.0.21",
@@ -10758,7 +10757,7 @@ dependencies = [
  "parking_lot",
  "rustfs-s3select-api",
  "rustfs-test-utils",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "tokio",
@@ -10796,7 +10795,7 @@ dependencies = [
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-utils",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "serial_test",
@@ -10845,7 +10844,7 @@ dependencies = [
  "http 1.5.0",
  "hyper",
  "rustfs-utils",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde_urlencoded",
  "thiserror 2.0.21",
  "time",
@@ -10903,7 +10902,7 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "rustls-native-certs",
- "s3s 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -11148,7 +11147,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -11267,8 +11265,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "030a43692a1fd97bbd2c594eeaad8f5c1e452a9d29ad6a3eebce1650937c4a77"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11278,7 +11275,6 @@ dependencies = [
  "bytes",
  "bytestring",
  "cfg-if",
- "chrono",
  "crc-fast",
  "futures",
  "hex-simd",
@@ -11298,10 +11294,10 @@ dependencies = [
  "pin-project-lite",
  "quick-xml",
  "regex",
- "s3s-multipart 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "s3s-rfc2047 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "s3s-sigv2 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "s3s-sigv4 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "s3s-multipart",
+ "s3s-rfc2047",
+ "s3s-sigv2",
+ "s3s-sigv4",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -11324,189 +11320,56 @@ dependencies = [
 ]
 
 [[package]]
-name = "s3s"
+name = "s3s-multipart"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
 dependencies = [
- "arc-swap",
  "arrayvec",
- "async-trait",
- "atoi 3.1.0",
- "base64-simd",
  "bytes",
- "bytestring",
- "cfg-if",
- "chrono",
- "crc-fast",
- "futures",
+ "futures-core",
+ "httparse",
+ "memchr",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "s3s-rfc2047"
+version = "0.17.0"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+dependencies = [
+ "base64-simd",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "s3s-sigv2"
+version = "0.17.0"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+dependencies = [
+ "base64-simd",
+ "hmac 0.13.0",
+ "jiff",
+ "sha1 0.11.0",
+ "smallvec",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "s3s-sigv4"
+version = "0.17.0"
+source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+dependencies = [
+ "arrayvec",
+ "base64-simd",
  "hex-simd",
  "hmac 0.13.0",
- "http 1.5.0",
- "http-body",
- "http-body-util",
- "hyper",
- "itoa",
  "jiff",
- "md-5 0.11.0",
- "memchr",
- "mime",
  "nom 8.0.0",
- "numeric_cast",
- "phf 0.14.0",
- "pin-project-lite",
- "quick-xml",
- "regex",
- "s3s-multipart 0.17.0 (git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0)",
- "s3s-rfc2047 0.17.0 (git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0)",
- "s3s-sigv2 0.17.0 (git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0)",
- "s3s-sigv4 0.17.0 (git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0)",
  "serde",
- "serde_json",
- "serde_urlencoded",
- "sha1 0.11.0",
  "sha2 0.11.0",
  "smallvec",
  "std-next",
  "subtle",
- "sync_wrapper",
- "thiserror 2.0.21",
- "time",
- "tokio",
- "tower",
- "tracing",
- "transform-stream",
- "url",
- "urlencoding",
- "xxhash-rust",
- "zeroize",
-]
-
-[[package]]
-name = "s3s-http3"
-version = "0.17.0-alpha.1"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
-dependencies = [
- "bytes",
- "h3",
- "h3-quinn",
- "http 1.5.0",
- "http-body",
- "quinn",
- "s3s 0.17.0 (git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0)",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "s3s-multipart"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a543079d42c20c81781b7e31704ecacd64b0e3819b2384db5bf4869abf6c6f01"
-dependencies = [
- "arrayvec",
- "bytes",
- "futures-core",
- "httparse",
- "memchr",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-multipart"
-version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
-dependencies = [
- "arrayvec",
- "bytes",
- "futures-core",
- "httparse",
- "memchr",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-rfc2047"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918b207c39474baef4774355100e712dfea46020e3289ddd5b4bc6e21927b826"
-dependencies = [
- "base64-simd",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-rfc2047"
-version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
-dependencies = [
- "base64-simd",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-sigv2"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0979baf8cdf30e38bdfba8e58ee2776d78e55bb3bd3d1f3502f917829da79933"
-dependencies = [
- "base64-simd",
- "hmac 0.13.0",
- "jiff",
- "sha1 0.11.0",
- "smallvec",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-sigv2"
-version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
-dependencies = [
- "base64-simd",
- "hmac 0.13.0",
- "jiff",
- "sha1 0.11.0",
- "smallvec",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "s3s-sigv4"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330996b9a24804b3df4ad37e62e7817968857d99cf6029c21512b6b64b97f645"
-dependencies = [
- "arrayvec",
- "base64-simd",
- "hex-simd",
- "hmac 0.13.0",
- "jiff",
- "nom 8.0.0",
- "serde",
- "sha2 0.11.0",
- "smallvec",
- "std-next",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "s3s-sigv4"
-version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0#c3d9d5f2a13b023bad57be362a3ba1d7bbbe87e0"
-dependencies = [
- "arrayvec",
- "base64-simd",
- "hex-simd",
- "hmac 0.13.0",
- "jiff",
- "nom 8.0.0",
- "serde",
- "sha2 0.11.0",
- "smallvec",
- "std-next",
  "thiserror 2.0.21",
  "zeroize",
 ]

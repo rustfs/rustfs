@@ -21,7 +21,7 @@ use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
-    hybrid::{HybridBody, hybrid},
+    hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
         ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
@@ -37,7 +37,7 @@ use crate::server::{
     },
 };
 #[cfg(feature = "http3")]
-use crate::server::{http3, tls_material::build_http3_server_config_from_loaded};
+use crate::server::{http3, hybrid::HybridBody, tls_material::build_http3_server_config_from_loaded};
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 #[cfg(test)]
@@ -103,6 +103,20 @@ use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
+
+#[cfg(feature = "http3")]
+type Http3CoreService = tower::util::BoxCloneService<
+    HttpRequest<http3::RequestBody>,
+    Response<HybridBody<s3s::Body, http_body_util::Empty<Bytes>>>,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+#[cfg(feature = "http3")]
+type Http3ExternalService = tower::util::BoxCloneService<
+    HttpRequest<http3::RequestBody>,
+    Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
 use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -1088,6 +1102,153 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
     span
 }
 
+// Keep TCP and QUIC on the same external request stack. A macro preserves the
+// concrete Tower types for each streaming request body without boxing TCP.
+macro_rules! external_service_stack {
+    ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
+     $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
+     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr) => {{
+        let remote_addr = $remote_addr;
+        let trusted_proxy_layer = $trusted_proxy_layer;
+        let is_console = $is_console;
+        let rate_limit_layer = $rate_limit_layer;
+        let connection_is_tls = $connection_is_tls;
+        let readiness = $readiness;
+        let keystone_auth = $keystone_auth;
+        let compression_config = $compression_config;
+        let server_ctx = $server_ctx;
+        let server_domains_configured = $server_domains_configured;
+        ServiceBuilder::new()
+            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+            // while our application code uses the RemoteAddr wrapper. Consolidating these would
+            // require either modifying the third-party middleware or refactoring all existing handlers.
+            .layer(AddExtensionLayer::new(remote_addr))
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+            // This should be placed before TraceLayer so that logs reflect the real client IP
+            // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
+            .option_layer(trusted_proxy_layer)
+            .map_request(move |mut request: HttpRequest<_>| {
+                if request.version() == Version::HTTP_3 {
+                    if let Some(info) = request.extensions_mut().get_mut::<ClientInfo>() {
+                        if !info.is_from_trusted_proxy {
+                            info.forwarded_proto = Some("https".to_owned());
+                        }
+                    } else if let Some(peer) = remote_addr {
+                        let mut info = ClientInfo::direct(peer.0);
+                        info.forwarded_proto = Some("https".to_owned());
+                        request.extensions_mut().insert(info);
+                    }
+                }
+                request
+            })
+            .layer(ExternalRequestContextLayer::new(is_console))
+            .layer(StsQueryApiCompatLayer)
+            .layer(EmptyBodyContentLengthCompatLayer)
+            .layer(CatchPanicLayer::new())
+            // Per-client API rate limit (backlog#1191): rejects over-limit
+            // requests with 429 before readiness/auth/tracing spend any
+            // work on them, but after the trusted-proxy layer has resolved
+            // a spoof-proof client IP. Absent (None) unless enabled via
+            // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
+            .option_layer(rate_limit_layer)
+            // backlog#2369 P7.2: an SSE-C request carries the customer key
+            // in a header, so a plaintext hop leaks it permanently. Sits
+            // beside the rate limiter: after the trusted-proxy layer, which
+            // is what makes a forwarded `https` protocol trustworthy, and
+            // after the request context so a rejection can echo the request
+            // id. Reports by default; refuses only under
+            // RUSTFS_SSE_C_REQUIRE_TLS.
+            .layer(SsecTransportLayer::new(connection_is_tls))
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness.clone()))
+            // Add Keystone authentication middleware
+            // This validates X-Auth-Token headers and stores credentials in task-local storage
+            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+            // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
+            .layer(KeystoneAuthLayer::new(keystone_auth))
+            // Maintain the in-flight request gauge with an RAII guard so it is
+            // decremented exactly once per request (backlog#806-35). Placed just
+            // outside TraceLayer so the counting window matches the old on_request
+            // timing while avoiding the 5xx double-decrement.
+            .layer(InFlightLayer)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(make_http_trace_span)
+                    .on_request(|request: &HttpRequest<_>, span: &Span| {
+                        let _enter = span.enter();
+                        trace!("HTTP request started");
+                        let method_metrics = http_method_metrics(request.method());
+                        // In-flight counting is handled by InFlightLayer's RAII guard
+                        // (backlog#806-35); do not adjust the active-requests gauge here.
+                        method_metrics.requests.increment(1);
+
+                        if let Some(cl) = request.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            REQUEST_BODY_BYTES_COUNTER.increment(len);
+                            method_metrics.request_body_size.record(len as f64);
+                        }
+                    })
+                    .on_response(trace_on_response)
+                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                        record_response_body_chunk_observation(chunk.len(), latency);
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (latency, span);
+                        }
+                    })
+                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                        record_response_body_stream_duration(stream_duration);
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (_trailers, stream_duration, span);
+                        }
+                    })
+                    .on_failure(|error, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
+                        // In-flight counting is handled by InFlightLayer's RAII guard
+                        // (backlog#806-35). This hook previously also fired for 5xx
+                        // responses (which ALSO hit on_response), double-decrementing
+                        // the gauge; only the failure metric is recorded here now.
+                        HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+                        record_http_transport_failure_if_body_error(&error);
+                        trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
+                    }),
+            )
+            .layer(RequestLoggingLayer)
+            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
+            .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
+            .layer(S3ErrorMessageCompatLayer)
+            .layer(IcebergRestErrorCompatLayer)
+            .layer(ObjectAttributesEtagFixLayer)
+            .layer(ConditionalCorsLayer::new())
+            .option_layer(if is_console { Some(RedirectLayer) } else { None })
+            .layer(BodylessStatusFixLayer)
+            .layer(HeadRequestBodyFixLayer)
+            .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
+            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+            .layer(DoubleSlashListBucketsCompatLayer)
+            .layer(SigV4HeaderGuardLayer)
+            .service($service)
+    }};
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
@@ -1323,10 +1484,6 @@ pub async fn start_http_server(
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
-    // Spawn background TLS certificate hot-reload loop (if enabled).
-    if let Some(holder) = &tls_acceptor {
-        spawn_reload_loop(tls_path.to_string(), holder.clone());
-    }
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -1536,8 +1693,12 @@ pub async fn start_http_server(
         );
     }
 
+    let http_request_body_read_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
+        rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+    ));
     #[cfg(feature = "http3")]
-    let http3_task = if let Some(server_config) = http3_server_config {
+    let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();
         let h3_readiness = Arc::clone(&readiness);
         let h3_server_ctx = Arc::clone(&server_ctx);
@@ -1547,46 +1708,61 @@ pub async fn start_http_server(
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
         let h3_domains_configured = !config.server_domains.is_empty();
 
-        let make_service = move |peer_addr: SocketAddr| {
+        let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
             let remote_addr = RemoteAddr(peer_addr);
 
-            ServiceBuilder::new()
-                .layer(AddExtensionLayer::new(Some(remote_addr)))
-                .layer(AddExtensionLayer::new(peer_addr))
-                .option_layer(h3_trusted_proxy.clone())
-                .layer(ExternalRequestContextLayer::new(false))
-                .layer(StsQueryApiCompatLayer)
-                .layer(EmptyBodyContentLengthCompatLayer)
-                .layer(CatchPanicLayer::new())
-                .option_layer(h3_rate_limit.clone())
-                .layer(SsecTransportLayer::new(true))
-                .layer(ReadinessGateLayer::new(Arc::clone(&h3_readiness)))
-                .layer(KeystoneAuthLayer::new(h3_keystone.clone()))
-                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(h3_compression.clone())))
-                .option_layer(h3_compression.enabled.then_some(PathCategoryInjectionLayer))
-                .layer(S3ErrorMessageCompatLayer)
-                .layer(IcebergRestErrorCompatLayer)
-                .layer(ObjectAttributesEtagFixLayer)
-                .layer(ConditionalCorsLayer::new())
-                .layer(BodylessStatusFixLayer)
-                .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(Arc::clone(&h3_server_ctx), Arc::clone(&h3_readiness)))
-                .option_layer((!h3_domains_configured).then_some(VirtualHostStyleHintLayer))
-                .layer(DoubleSlashListBucketsCompatLayer)
-                .layer(SigV4HeaderGuardLayer)
+            #[cfg(feature = "swift")]
+            let service = SwiftService::new(true, None, h3_s3_service.clone());
+            #[cfg(not(feature = "swift"))]
+            let service = h3_s3_service.clone();
+            let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
+            let service = ServiceBuilder::new()
                 .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
                     response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
                 }))
-                .service(h3_s3_service.clone())
+                .service(service);
+            #[cfg(not(feature = "swift"))]
+            let service = ServiceBuilder::new()
+                .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+                .service(service);
+            let service = Http3CoreService::new(service);
+            Http3ExternalService::new(external_service_stack!(
+                service,
+                Some(remote_addr),
+                h3_trusted_proxy.clone(),
+                false,
+                h3_rate_limit.clone(),
+                true,
+                h3_readiness.clone(),
+                h3_keystone.clone(),
+                h3_compression.clone(),
+                h3_server_ctx.clone(),
+                h3_domains_configured
+            ))
         };
 
-        let (_, task) = http3::spawn(server_config, local_addr, make_service, shutdown_tx.subscribe())
-            .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
+        let (endpoint, task) = http3::spawn(
+            server_config,
+            local_addr,
+            make_service,
+            max_connections,
+            http_request_body_read_timeout,
+            shutdown_tx.subscribe(),
+        )
+        .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
 
-        Some(task)
+        Some((endpoint, task))
     } else {
         None
     };
+    let tls_reload_task = tls_acceptor.as_ref().and_then(|holder| {
+        spawn_reload_loop(
+            tls_path.to_string(),
+            holder.clone(),
+            #[cfg(feature = "http3")]
+            http3_server.as_ref().map(|(endpoint, _)| endpoint.clone()),
+        )
+    });
 
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
@@ -1626,10 +1802,6 @@ pub async fn start_http_server(
             rustfs_config::ENV_HTTP1_HEADER_READ_TIMEOUT,
             rustfs_config::DEFAULT_HTTP1_HEADER_READ_TIMEOUT,
         );
-        let http_request_body_read_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
-            rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
-        ));
         let http1_max_buf_size =
             rustfs_utils::get_env_usize(rustfs_config::ENV_HTTP1_MAX_BUF_SIZE, rustfs_config::DEFAULT_HTTP1_MAX_BUF_SIZE);
 
@@ -1868,18 +2040,23 @@ pub async fn start_http_server(
             }
         }
 
+        if let Some(task) = tls_reload_task {
+            task.abort();
+            let _ = task.await;
+        }
+
         #[cfg(feature = "http3")]
-        if let Some(task) = http3_task {
-            if let Err(error) = task.await {
-                error!(
-                    event = EVENT_HTTP_TRANSPORT_FAILED,
-                    component = LOG_COMPONENT_SERVER,
-                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                    protocol = "http3",
-                    error = ?error,
-                    "HTTP/3 server task failed during shutdown"
-                );
-            }
+        if let Some((_, task)) = http3_server
+            && let Err(error) = task.await
+        {
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                protocol = "http3",
+                error = ?error,
+                "HTTP/3 server task failed during shutdown"
+            );
         }
     });
 
@@ -2164,123 +2341,19 @@ fn process_connection(
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
         let build_external_stack = |service| {
-            ServiceBuilder::new()
-                // NOTE: Both extension types are intentionally inserted to maintain compatibility:
-                // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
-                // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
-                // This dual insertion is necessary because the middleware expects the raw SocketAddr type
-                // while our application code uses the RemoteAddr wrapper. Consolidating these would
-                // require either modifying the third-party middleware or refactoring all existing handlers.
-                .layer(AddExtensionLayer::new(remote_addr))
-                .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
-                // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
-                // This should be placed before TraceLayer so that logs reflect the real client IP
-                // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
-                .option_layer(trusted_proxy_layer.clone())
-                .layer(ExternalRequestContextLayer::new(is_console))
-                .layer(StsQueryApiCompatLayer)
-                .layer(EmptyBodyContentLengthCompatLayer)
-                .layer(CatchPanicLayer::new())
-                // Per-client API rate limit (backlog#1191): rejects over-limit
-                // requests with 429 before readiness/auth/tracing spend any
-                // work on them, but after the trusted-proxy layer has resolved
-                // a spoof-proof client IP. Absent (None) unless enabled via
-                // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
-                .option_layer(rate_limit_layer.clone())
-                // backlog#2369 P7.2: an SSE-C request carries the customer key
-                // in a header, so a plaintext hop leaks it permanently. Sits
-                // beside the rate limiter: after the trusted-proxy layer, which
-                // is what makes a forwarded `https` protocol trustworthy, and
-                // after the request context so a rejection can echo the request
-                // id. Reports by default; refuses only under
-                // RUSTFS_SSE_C_REQUIRE_TLS.
-                .layer(SsecTransportLayer::new(connection_is_tls))
-                // CRITICAL: Insert ReadinessGateLayer before business logic
-                // This stops requests from hitting IAMAuth or Storage if they are not ready.
-                .layer(ReadinessGateLayer::new(readiness.clone()))
-                // Add Keystone authentication middleware
-                // This validates X-Auth-Token headers and stores credentials in task-local storage
-                // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
-                // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
-                .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
-                // Maintain the in-flight request gauge with an RAII guard so it is
-                // decremented exactly once per request (backlog#806-35). Placed just
-                // outside TraceLayer so the counting window matches the old on_request
-                // timing while avoiding the 5xx double-decrement.
-                .layer(InFlightLayer)
-                .layer(
-                    TraceLayer::new_for_http()
-                        .make_span_with(make_http_trace_span)
-                        .on_request(|request: &HttpRequest<_>, span: &Span| {
-                            let _enter = span.enter();
-                            trace!("HTTP request started");
-                            let method_metrics = http_method_metrics(request.method());
-                            // In-flight counting is handled by InFlightLayer's RAII guard
-                            // (backlog#806-35); do not adjust the active-requests gauge here.
-                            method_metrics.requests.increment(1);
-
-                            if let Some(cl) = request.headers().get("content-length")
-                                && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
-                            {
-                                REQUEST_BODY_BYTES_COUNTER.increment(len);
-                                method_metrics.request_body_size.record(len as f64);
-                            }
-                        })
-                        .on_response(trace_on_response)
-                        .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
-                            record_response_body_chunk_observation(chunk.len(), latency);
-                            #[cfg(feature = "tracing-chunk-debug")]
-                            {
-                                let _enter = span.enter();
-                                debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
-                            }
-                            #[cfg(not(feature = "tracing-chunk-debug"))]
-                            {
-                                let _ = (latency, span);
-                            }
-                        })
-                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
-                            record_response_body_stream_duration(stream_duration);
-                            #[cfg(feature = "tracing-chunk-debug")]
-                            {
-                                let _enter = span.enter();
-                                debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
-                            }
-                            #[cfg(not(feature = "tracing-chunk-debug"))]
-                            {
-                                let _ = (_trailers, stream_duration, span);
-                            }
-                        })
-                        .on_failure(|error, latency: Duration, span: &Span| {
-                            let _enter = span.enter();
-                            // In-flight counting is handled by InFlightLayer's RAII guard
-                            // (backlog#806-35). This hook previously also fired for 5xx
-                            // responses (which ALSO hit on_response), double-decrementing
-                            // the gauge; only the failure metric is recorded here now.
-                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
-                            record_http_transport_failure_if_body_error(&error);
-                            trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
-                        }),
-                )
-                .layer(RequestLoggingLayer)
-                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-                .layer(S3ErrorMessageCompatLayer)
-                .layer(IcebergRestErrorCompatLayer)
-                .layer(ObjectAttributesEtagFixLayer)
-                .layer(ConditionalCorsLayer::new())
-                .option_layer(if is_console { Some(RedirectLayer) } else { None })
-                .layer(BodylessStatusFixLayer)
-                .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(
-                    Arc::clone(&server_ctx),
-                    Arc::clone(&readiness),
-                ))
-                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-                .layer(DoubleSlashListBucketsCompatLayer)
-                .layer(SigV4HeaderGuardLayer)
-                .service(service)
+            external_service_stack!(
+                service,
+                remote_addr,
+                trusted_proxy_layer.clone(),
+                is_console,
+                rate_limit_layer.clone(),
+                connection_is_tls,
+                readiness.clone(),
+                keystone_auth.clone(),
+                compression_config.clone(),
+                server_ctx.clone(),
+                server_domains_configured
+            )
         };
         let build_internode_stack = |service| {
             ServiceBuilder::new()
@@ -4334,5 +4407,157 @@ mod tests {
         let result = futures::executor::block_on(svc.call(req));
         assert!(result.is_err(), "ErrService must return an error");
         assert_eq!(active_http_requests(), before, "gauge must net to zero on service error");
+    }
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http3_external_stack_enforces_readiness_keystone_context_and_rate_limit() -> http3::tests::TestResult {
+        use crate::server::rate_limit::RateLimitQuota;
+        use http3::tests::{client_endpoint, configs, connect, request};
+        use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneVersion};
+        temp_env::async_with_vars([("NO_PROXY", Some("127.0.0.1,localhost")), ("no_proxy", Some("127.0.0.1,localhost"))], async {
+            let mock = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let auth_url = format!("http://{}", mock.local_addr()?);
+            let mock_task = tokio::spawn(async move {
+                let (socket, _) = mock.accept().await.expect("Keystone connection");
+                hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), hyper::service::service_fn(|request: HttpRequest<Incoming>| async move {
+                    assert_eq!(request.uri().path(), "/v3/auth/tokens");
+                    let valid = request.headers().get("x-subject-token").is_some_and(|value| value == "valid-token");
+                    let mut response = Response::new(http_body_util::Full::new(Bytes::from_static(br#"{"token":{"user":{"id":"user-id","name":"test-user"},"expires_at":"2099-01-01T00:00:00Z"}}"#)));
+                    if !valid { *response.status_mut() = http::StatusCode::UNAUTHORIZED; }
+                    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                    Ok::<_, std::convert::Infallible>(response)
+                })).await.expect("Keystone mock");
+            });
+            let provider = Arc::new(KeystoneAuthProvider::new(KeystoneClient::new(auth_url, KeystoneVersion::V3,
+                None, None, None, "Default".to_owned(), true, Duration::from_secs(5)), 10, Duration::from_secs(60), false));
+            let readiness = Arc::new(GlobalReadiness::new());
+            let server_readiness = readiness.clone();
+            let rate = RateLimitLayer::new(Some(RateLimitQuota { requests_per_minute: 1, burst: 4 }), None, vec![]);
+            let (config, cert) = configs()?;
+            let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+            let (endpoint, task) = http3::spawn(config, "127.0.0.1:0".parse()?, move |peer| {
+                let inner = tower::service_fn(move |request: HttpRequest<http3::RequestBody>| async move {
+                    assert_eq!(request.version(), Version::HTTP_3);
+                    assert_eq!(request.extensions().get::<Option<RemoteAddr>>().copied().flatten().expect("peer").0, peer);
+                    let info = request.extensions().get::<ClientInfo>().expect("policy context");
+                    assert_eq!(info.real_ip, peer.ip());
+                    assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
+                    let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
+                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body: s3s::Body::from(identity) }))
+                });
+                let inner = Http3CoreService::new(inner);
+                Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
+                    Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), false))
+            }, 0, Duration::from_secs(1), receiver)?;
+            let client_endpoint = client_endpoint(vec![cert])?;
+            let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
+            let make_request = || HttpRequest::builder().uri("https://localhost/bucket/key").body(());
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::SERVICE_UNAVAILABLE);
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            assert_eq!(request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "invalid-token").body(())?, Bytes::new()).await?.0, http::StatusCode::UNAUTHORIZED);
+            let (status, headers, body) = request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "valid-token").header("x-forwarded-for", "203.0.113.1").body(())?, Bytes::new()).await?;
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(body, "test-user");
+            assert!(headers.contains_key("x-amz-request-id"), "request context must survive HTTP/3 dispatch");
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.2, "anonymous", "Keystone task-local credentials must not leak between streams");
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::TOO_MANY_REQUESTS);
+            shutdown.send(())?;
+            drop(client);
+            quic.close(0u32.into(), b"test complete");
+            tokio::time::timeout(Duration::from_secs(5), task).await??;
+            driver.abort();
+            mock_task.abort();
+            Ok(())
+        }).await
+    }
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_upload_part_timeout_preserves_s3_error_and_other_streams() -> http3::tests::TestResult {
+        use bytes::Buf;
+        use http3::tests::{client_endpoint, configs, connect};
+        let (config, cert) = configs()?;
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        let s3 = S3ServiceBuilder::new(UploadPartTimeoutS3 {
+            timeout: Duration::from_secs(1),
+        })
+        .build();
+        let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+        let (endpoint, task) = http3::spawn(
+            config,
+            "127.0.0.1:0".parse()?,
+            move |peer| {
+                let inner = ServiceBuilder::new()
+                    .map_response(|response: Response<s3s::Body>| {
+                        response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                    })
+                    .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+                    .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
+                let inner = Http3CoreService::new(inner);
+                Http3ExternalService::new(external_service_stack!(
+                    inner,
+                    Some(RemoteAddr(peer)),
+                    None::<rustfs_trusted_proxies::TrustedProxyLayer>,
+                    false,
+                    None::<RateLimitLayer>,
+                    true,
+                    readiness.clone(),
+                    None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+                    HttpCompressionConfig::default(),
+                    ServerContextSlot::new(),
+                    false
+                ))
+            },
+            0,
+            Duration::from_secs(1),
+            receiver,
+        )?;
+        let client_endpoint = client_endpoint(vec![cert])?;
+        let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
+        let mut stalled = client
+            .send_request(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("https://localhost/bucket/object?partNumber=1&uploadId=upload")
+                    .header("content-length", 1024)
+                    .body(())?,
+            )
+            .await?;
+        stalled.send_data(Bytes::from_static(b"x")).await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), stalled.recv_response()).await??;
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        let mut xml = Vec::new();
+        while let Some(mut chunk) = stalled.recv_data().await? {
+            xml.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        assert!(String::from_utf8(xml)?.contains("<Code>RequestTimeout</Code>"));
+        let mut subsequent = client
+            .send_request(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("https://localhost/bucket/object?partNumber=1&uploadId=upload")
+                    .header("content-length", 0)
+                    .body(())?,
+            )
+            .await?;
+        subsequent.finish().await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), subsequent.recv_response()).await??;
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "timed-out uploads must not close unrelated HTTP/3 streams"
+        );
+        while subsequent.recv_data().await?.is_some() {}
+        drop(stalled);
+        drop(subsequent);
+        shutdown.send(())?;
+        drop(client);
+        quic.close(0u32.into(), b"test complete");
+        tokio::time::timeout(Duration::from_secs(5), task).await??;
+        driver.abort();
+        Ok(())
     }
 }
