@@ -123,7 +123,7 @@ impl Error {
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
-            Error::ReplacementTargetNotReady(_) => true,
+            Error::ReplacementTargetNotReady(_) => true, // conflict probe for rustfs/backlog#2736 acceptance 3
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
