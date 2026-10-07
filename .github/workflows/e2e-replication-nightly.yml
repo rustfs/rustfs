@@ -53,6 +53,7 @@ concurrency:
 
 jobs:
   repl-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Replication e2e (nightly)
     # dual-node tests spawn two full rustfs servers each; the extra headroom
     # over the per-PR sm-standard-2 e2e job keeps the parallel process fan-out
@@ -119,6 +120,7 @@ jobs:
           if-no-files-found: ignore
 
   cluster-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Cluster fault e2e (nightly)
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -168,6 +170,7 @@ jobs:
           if-no-files-found: warn
 
   protocols-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Protocol e2e (nightly)
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -229,7 +232,7 @@ jobs:
     # Only scheduled runs open/append the tracking issue (backlog#1149 ci-8);
     # manual workflow_dispatch runs stay quiet so a debugging run never files a
     # spurious alert.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

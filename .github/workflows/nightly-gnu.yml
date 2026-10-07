@@ -43,6 +43,7 @@ env:
 
 jobs:
   resolve-source:
+    if: github.repository == 'rustfs/rustfs'
     name: Resolve nightly source
     runs-on: sm-standard-2
     timeout-minutes: 10
@@ -496,8 +497,10 @@ jobs:
     name: Alert on scheduled failure
     needs: [build, kms-vault-lane, kms-vault-ha-failover]
     if: >-
-      always() && github.event_name == 'schedule' &&
-      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      github.repository == 'rustfs/rustfs' && (
+        always() && github.event_name == 'schedule' &&
+        (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
