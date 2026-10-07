@@ -1675,10 +1675,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 usage_metrics_update = Some(usage_metrics);
                             }
 
-                            if let Some(usage_metrics) = usage_metrics_update {
-                                if let Err(error) = bucket_usage_snapshot.replace_collected(usage_metrics, usage_collection_started) {
-                                    error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", result = "invalid_bucket_snapshot", error = %error, "bucket usage metrics snapshot rejected");
-                                }
+                            if let Some(usage_metrics) = usage_metrics_update
+                                && let Err(error) = bucket_usage_snapshot.replace_collected(usage_metrics, usage_collection_started)
+                            {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", result = "invalid_bucket_snapshot", error = %error, "bucket usage metrics snapshot rejected");
                             }
 
                             if !metrics.is_empty() {
