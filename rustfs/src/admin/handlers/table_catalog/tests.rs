@@ -684,6 +684,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
 
     for (handler, action) in [
         ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
+        ("DisableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
         ("GetTableCatalogMigrationHandler", "AdminAction::GetTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
@@ -13506,4 +13507,104 @@ async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
         .expect("table should still exist");
     assert_eq!(unchanged.metadata_location, current_location);
     assert_eq!(unchanged.generation, current.generation);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("disable-{}", Uuid::new_v4().simple());
+    object_store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .unwrap();
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        object_store.clone(),
+        crate::table_catalog::StrongTableCatalogRuntime::default(),
+    );
+    let catalog = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+        .await
+        .unwrap();
+    let rejected = object_store
+        .update_bucket_metadata_config_validated(&bucket, crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG, Vec::new(), || {
+            Err(crate::admin::storage_api::StorageError::other("lost publication fence"))
+        })
+        .await;
+    assert!(rejected.is_err());
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    backend
+        .put_object(
+            &bucket,
+            "external/orders.parquet",
+            b"parquet-fixture".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    let response = disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+        .await
+        .unwrap();
+    assert!(!response.enabled);
+    assert!(ensure_table_bucket_entry(&catalog, &bucket, true).await.is_err());
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    assert_eq!(
+        backend
+            .read_object(&bucket, "external/orders.parquet")
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        b"parquet-fixture"
+    );
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    assert!(
+        !disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    assert!(
+        enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    backend
+        .put_object(
+            &bucket,
+            ".rustfs-table/staged.json",
+            b"{}".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::preauthorized(backend);
+    assert!(
+        disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .is_err()
+    );
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
 }
