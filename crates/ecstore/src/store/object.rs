@@ -4831,6 +4831,25 @@ impl ECStore {
         object: &str,
         opts: ObjectOptions,
     ) -> Result<ObjectInfo> {
+        self.delete_object_with_tier_delete_journal_and_guards(bucket, object, opts, None)
+            .await
+    }
+
+    /// [`Self::delete_object_with_tier_delete_journal`] for a caller that
+    /// holds namespace locks covering the delete and passes only their fences
+    /// in `opts`, such as the bucket lifecycle write lock of a recursive delete.
+    ///
+    /// The guards move into the detached task and are released only after
+    /// the delete has finished. Dropping the caller therefore cannot let a
+    /// writer into the scope they exclude while the delete is still running.
+    pub async fn delete_object_with_tier_delete_journal_and_guards(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+        guards: impl IntoIterator<Item = rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<ObjectInfo> {
+        let guards: Vec<_> = guards.into_iter().collect();
         let store = Arc::clone(self);
         let bucket = bucket.to_owned();
         let object = object.to_owned();
@@ -4842,6 +4861,8 @@ impl ECStore {
                 if result.is_ok() {
                     list_objects::observe_list_objects_mutation(&store, &bucket).await;
                 }
+                // Keep: the only use of `guards` here, it moves them into the task so the locks outlive a dropped caller.
+                drop(guards);
                 result
             })
             .await

@@ -17643,6 +17643,160 @@ mod tests {
             .expect_err("the object must be deleted");
     }
 
+    // A recursive (force) delete runs under its caller's bucket lifecycle write
+    // lock and carries only that lock's fence. If the caller is dropped, the
+    // detached delete must still hold the lock: otherwise a PUT under the prefix
+    // succeeds and is then removed by the delete that is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_delete_keeps_bucket_lock_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-recursive-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-recursive-delete-{}", uuid::Uuid::new_v4());
+        let old_object = "folder/old.bin";
+        let new_object = "folder/new.bin";
+        put_detached_delete_fixture(&store, &bucket, old_object).await;
+
+        // The S3 force-delete path: the caller owns the lock, opts carry its fence.
+        let guard = store
+            .lock_bucket_for_recursive_delete(&bucket)
+            .await
+            .expect("recursive delete should lock the bucket");
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            ..Default::default()
+        };
+        opts.add_bucket_lifecycle_lock_guard(&guard);
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal_and_guards(&bucket, "folder/", opts, Some(guard));
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("recursive delete must pause inside its detached task"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped caller must leave its delete running");
+
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let mut put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"written while the delete runs".to_vec());
+            put_store
+                .put_object(&put_bucket, new_object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut put).await.is_err(),
+            "a PUT under the prefix must wait while the detached recursive delete runs"
+        );
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached recursive delete should finish"
+        );
+        put.await
+            .expect("PUT task should join")
+            .expect("the PUT should succeed once the recursive delete has finished");
+        store
+            .get_object_info(&bucket, old_object, &ObjectOptions::default())
+            .await
+            .expect_err("the recursive delete must remove the object it covered");
+        store
+            .get_object_info(&bucket, new_object, &ObjectOptions::default())
+            .await
+            .expect("the PUT that waited for the recursive delete must survive it");
+        for disk in 0..4 {
+            let metadata = temp
+                .path()
+                .join(format!("pool0/set0/disk{disk}"))
+                .join(&bucket)
+                .join(new_object)
+                .join(crate::disk::STORAGE_FORMAT_FILE);
+            assert!(
+                metadata.exists(),
+                "disk {disk} must keep the object written after the delete: {metadata:?}"
+            );
+        }
+    }
+
+    // Lifecycle expiry holds the table-bucket publication read lock and passes
+    // only its lock-lost signal to the delete. A cancelled expiry worker must not
+    // release that lock while its detached delete is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn lifecycle_expiry_keeps_publication_lock_after_worker_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-lifecycle-expiry", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-lifecycle-expiry-{}", uuid::Uuid::new_v4());
+        let object = "expired.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create lifecycle bucket");
+        let mut reader = PutObjReader::from_vec(b"expired data".to_vec());
+        let object_info = store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put expired object");
+        let bucket_incarnation_id = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let expiry_store = Arc::clone(&store);
+        let expiry = tokio::spawn(async move {
+            crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                expiry_store,
+                &object_info,
+                &crate::bucket::lifecycle::lifecycle::Event {
+                    action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                    ..Default::default()
+                },
+                &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                bucket_incarnation_id,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("lifecycle delete should pause inside its detached task");
+        // A cancelled worker drops its future while the delete keeps running.
+        expiry.abort();
+        assert!(
+            expiry
+                .await
+                .expect_err("aborted expiry worker should not join")
+                .is_cancelled(),
+            "expiry worker should be cancelled"
+        );
+        assert_eq!(ctx.detached_mutation_count(), 1, "the cancelled worker must leave its delete running");
+
+        let publication_lock = store
+            .handle_new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock handle");
+        publication_lock
+            .get_write_lock_quiet(Duration::from_millis(300))
+            .await
+            .expect_err("table-bucket publication must wait for the detached lifecycle delete");
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached lifecycle delete should finish"
+        );
+        let publication_guard = publication_lock
+            .get_write_lock_quiet(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket publication should proceed once the lifecycle delete has finished");
+        drop(publication_guard);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the detached lifecycle delete should still remove the expired object");
+    }
+
     // #6898: residue that an older build stranded (every disk committed the
     // delete, the cleanup pass never ran) is reclaimed by deleting the key again.
     #[tokio::test]
