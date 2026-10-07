@@ -714,12 +714,23 @@ impl OtlpTlsCaBundle {
         &self,
         configured_timeout: Option<Duration>,
         otel_signal_timeout_env: &str,
-    ) -> Result<reqwest::Client, TelemetryError> {
+    ) -> Result<reqwest::blocking::Client, TelemetryError> {
+        // OpenTelemetry's default processors call exporters on standard threads without a Tokio runtime.
         let timeout = configured_timeout.unwrap_or_else(|| resolve_otlp_http_timeout(otel_signal_timeout_env));
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .tls_certs_merge(self.certificates.clone())
-            .build()
+        std::thread::Builder::new()
+            .name("otlp-http-client-init".to_string())
+            .spawn({
+                let certificates = self.certificates.clone();
+                move || {
+                    reqwest::blocking::Client::builder()
+                        .timeout(timeout)
+                        .tls_certs_merge(certificates)
+                        .build()
+                }
+            })
+            .map_err(|error| TelemetryError::Io(error.to_string()))?
+            .join()
+            .map_err(|_| TelemetryError::Io("OTLP HTTP client initialization thread panicked".to_string()))?
             .map_err(TelemetryError::BuildOtlpHttpClient)
     }
 }
@@ -728,7 +739,7 @@ fn build_otlp_http_client(
     otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     configured_timeout: Option<Duration>,
     otel_signal_timeout_env: &str,
-) -> Result<Option<reqwest::Client>, TelemetryError> {
+) -> Result<Option<reqwest::blocking::Client>, TelemetryError> {
     otlp_tls_ca_bundle
         .map(|bundle| bundle.build_http_client(configured_timeout, otel_signal_timeout_env))
         .transpose()
@@ -769,6 +780,10 @@ mod tests {
     }
 
     async fn spawn_test_tls_server() -> (String, String, tokio::task::JoinHandle<bool>) {
+        spawn_test_tls_server_with_requests(1).await
+    }
+
+    async fn spawn_test_tls_server_with_requests(request_count: usize) -> (String, String, tokio::task::JoinHandle<bool>) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certified =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
@@ -783,33 +798,73 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS test server");
         let endpoint = format!("https://{}", listener.local_addr().expect("read TLS test server address"));
         let server = tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return false;
-            };
-            let Ok(mut stream) = acceptor.accept(stream).await else {
-                return false;
-            };
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1_024];
-            loop {
-                let Ok(read) = stream.read(&mut buffer).await else {
+            for _ in 0..request_count {
+                let Ok((stream, _)) = listener.accept().await else {
                     return false;
                 };
-                if read == 0 {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return false;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return false;
+                    };
+                    if read == 0 {
+                        return false;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await
+                    .is_err()
+                    || stream.shutdown().await.is_err()
+                {
                     return false;
                 }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
             }
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
-                .await
-                .is_ok()
-                && stream.shutdown().await.is_ok()
+            true
         });
         (endpoint, ca_pem, server)
+    }
+
+    #[tokio::test]
+    async fn periodic_reader_exports_with_custom_ca_without_a_tokio_reactor() {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let (endpoint, ca_pem, server) = spawn_test_tls_server_with_requests(2).await;
+        let file = tempfile::NamedTempFile::new().expect("create CA file");
+        std::fs::write(file.path(), ca_pem).expect("write CA file");
+        let bundle = load_tls_ca_bundle(file.path());
+        let client = build_otlp_http_client(Some(&bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
+            .expect("build custom CA client")
+            .expect("custom CA should build a client");
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_protocol(Protocol::HttpBinary)
+            .with_http_client(client)
+            .build()
+            .expect("build OTLP metrics exporter");
+        let reader = PeriodicReader::builder(exporter)
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let counter = provider.meter("test").u64_counter("test.counter").build();
+        counter.add(1, &[]);
+
+        tokio::task::spawn_blocking(move || {
+            provider.force_flush().expect("flush metric through periodic reader");
+            provider.shutdown().expect("shutdown periodic reader");
+        })
+        .await
+        .expect("periodic reader worker task");
+        assert!(server.await.expect("TLS test server task"));
     }
 
     #[tokio::test]
@@ -821,24 +876,22 @@ mod tests {
 
         let bundle = load_tls_ca_bundle(file.path());
         let client = build_otlp_http_client(Some(&bundle), Some(Duration::from_millis(250)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
-            .expect("build client with CA bundle");
-        let client = client.expect("custom CA should build a client");
+            .expect("build client with CA bundle")
+            .expect("custom CA should build a client");
+        // Exercise the client on a blocking worker without a Tokio reactor, as the default exporters do.
+        let first_client = client.clone();
         assert_eq!(
-            client
-                .get(first_endpoint)
-                .send()
+            tokio::task::spawn_blocking(move || first_client.get(first_endpoint).send().map(|response| response.status()))
                 .await
-                .expect("first bundled CA should complete TLS handshake")
-                .status(),
+                .expect("first blocking client request task")
+                .expect("first bundled CA should complete TLS handshake"),
             reqwest::StatusCode::OK
         );
         assert_eq!(
-            client
-                .get(second_endpoint)
-                .send()
+            tokio::task::spawn_blocking(move || client.get(second_endpoint).send().map(|response| response.status()))
                 .await
-                .expect("second bundled CA should complete TLS handshake")
-                .status(),
+                .expect("second blocking client request task")
+                .expect("second bundled CA should complete TLS handshake"),
             reqwest::StatusCode::OK
         );
         assert!(first_server.await.expect("first bundled TLS server task"));
@@ -885,12 +938,10 @@ mod tests {
                 .expect("build trusted client")
                 .expect("custom CA should build a client");
         assert_eq!(
-            trusted_client
-                .get(&endpoint)
-                .send()
+            tokio::task::spawn_blocking(move || trusted_client.get(&endpoint).send().map(|response| response.status()))
                 .await
-                .expect("configured CA should complete TLS handshake")
-                .status(),
+                .expect("trusted blocking client request task")
+                .expect("configured CA should complete TLS handshake"),
             reqwest::StatusCode::OK
         );
         assert!(trusted_server.await.expect("trusted TLS server task"));
@@ -905,7 +956,11 @@ mod tests {
             build_otlp_http_client(Some(&untrusted_bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
                 .expect("build untrusted client")
                 .expect("custom CA should build a client");
-        assert!(untrusted_client.get(&endpoint).send().await.is_err());
+        assert!(
+            tokio::task::spawn_blocking(move || untrusted_client.get(&endpoint).send().is_err())
+                .await
+                .expect("untrusted blocking client request task")
+        );
         assert!(!untrusted_server.await.expect("untrusted TLS server task"));
     }
 
