@@ -420,6 +420,9 @@ impl DataUsageCache {
         if is_cache_publication_epoch_changed(err) {
             return false;
         }
+        if matches!(err, StorageError::Io(error) if error.kind() == std::io::ErrorKind::Interrupted) {
+            return false;
+        }
         !matches!(
             err,
             StorageError::Lock(_)
@@ -490,6 +493,7 @@ impl DataUsageCache {
         let sha256hex = (revision.is_some() && !buf.is_empty())
             .then(|| hex_simd::encode_to_string(Sha256::digest(buf), hex_simd::AsciiCase::Lower));
 
+        let persist_started = Instant::now();
         let save_result = Self::retry_save_op(path_type, timeout_duration, max_retries, || {
             let store_clone = store.clone();
             let path_clone = path.clone();
@@ -526,6 +530,8 @@ impl DataUsageCache {
             }
         })
         .await;
+        histogram!("rustfs_scanner_cache_persist_attempt_seconds", "path_type" => path_type, "retry_result" => if save_result.is_ok() { "success" } else { "error" })
+            .record(persist_started.elapsed().as_secs_f64());
         let Err(save_err) = save_result else {
             return Ok(());
         };
@@ -601,10 +607,13 @@ impl DataUsageCache {
         revisions: Option<&DataUsageCacheRevisions>,
         expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
+        let serialize_started = Instant::now();
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
         // Primary, backup, and retries read the same immutable encoded body.
         let buf = Bytes::from(buf);
+        counter!("rustfs_scanner_cache_serialized_bytes_total").increment(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        histogram!("rustfs_scanner_cache_serialize_seconds").record(serialize_started.elapsed().as_secs_f64());
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
@@ -653,5 +662,19 @@ impl DataUsageCache {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_checkpoint_admission_is_not_retried() {
+        let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled while queued"));
+        assert!(
+            !DataUsageCache::should_retry_save_error(&error),
+            "a cancelled background admission must stop before retry backoff"
+        );
     }
 }
