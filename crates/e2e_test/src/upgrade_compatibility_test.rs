@@ -2489,9 +2489,9 @@ struct LayoutTransport {
     uploaded_parts: Vec<i32>,
     single_puts: usize,
     completes: usize,
-    /// Raw per-key journal in target order: (sequence, operation, part number,
-    /// upload id), so duplicate drives can be told apart from retries.
-    journal: Vec<(u64, String, Option<i32>, Option<String>)>,
+    /// Allowlisted request identity and prepared response metadata. A prepared
+    /// response does not prove that the client received it.
+    journal: Vec<Value>,
 }
 
 /// Configure every layout bucket to replicate its existing objects to a fresh
@@ -2553,12 +2553,28 @@ async fn replicate_layouts(
             journal: key_requests
                 .iter()
                 .map(|record| {
-                    (
-                        record.sequence,
-                        format!("{:?}", record.operation),
-                        record.part_number,
-                        record.upload_id.as_ref().map(|id| id.chars().take(12).collect()),
-                    )
+                    serde_json::json!({
+                        "sequence": record.sequence,
+                        "operation": format!("{:?}", record.operation),
+                        "part_number": record.part_number,
+                        "upload_id": record.upload_id,
+                        "requested_version_id": record.version_id,
+                        "source_version_id": record.source_version_id,
+                        "source_mtime": record.source_mtime,
+                        "source_etag": record.source_etag,
+                        "source_replication_request": record.source_replication_request,
+                        "request_content_length": record.content_length,
+                        "journaled_at_unix_millis": record.journaled_at_unix_millis,
+                        "prepared_response": record.prepared_response.as_ref().map(|response| serde_json::json!({
+                            "status": response.status,
+                            "version_id": response.version_id,
+                            "etag": response.etag,
+                            "last_modified": response.last_modified,
+                            "content_length": response.content_length,
+                            "prepared_at_unix_millis": response.prepared_at_unix_millis,
+                            "elapsed_secs": response.elapsed.as_secs_f64(),
+                        })),
+                    })
                 })
                 .collect(),
         };
