@@ -298,6 +298,11 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
         }
     }
 
+    // x-minio-internal-* is reserved by MinIO and its derivatives; they reject
+    // any request carrying it with 400 InvalidArgument. The transition ids above
+    // are the only internal keys the remote needs, and they travel as x-amz-meta-*.
+    metadata.retain(|key, _| !rustfs_utils::http::is_internal_key(key));
+
     opts.user_metadata = metadata;
     opts
 }
@@ -2242,6 +2247,38 @@ mod tests {
                 rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX
             )));
         }
+    }
+
+    #[test]
+    fn build_transition_put_options_drops_reserved_internal_headers() {
+        let transaction_suffix = rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID;
+        let mut metadata = HashMap::new();
+        for suffix in [
+            rustfs_utils::http::SUFFIX_INLINE_DATA,
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            transaction_suffix,
+        ] {
+            rustfs_utils::http::metadata_compat::insert_str(&mut metadata, suffix, "x".to_string());
+        }
+        metadata.insert("X-Minio-Internal-Compression".to_string(), "klauspost/compress/s2".to_string());
+        metadata.insert("x-amz-meta-foo".to_string(), "bar".to_string());
+        metadata.insert("name".to_string(), "object".to_string());
+
+        let opts = build_transition_put_options("COLD".to_string(), metadata);
+
+        let leaked: Vec<_> = opts
+            .user_metadata
+            .keys()
+            .filter(|key| rustfs_utils::http::is_internal_key(key))
+            .collect();
+        assert!(leaked.is_empty(), "reserved internal keys must not reach the remote: {leaked:?}");
+        assert_eq!(opts.user_metadata.get("x-amz-meta-foo").map(String::as_str), Some("bar"));
+        assert_eq!(opts.user_metadata.get("name").map(String::as_str), Some("object"));
+        assert!(opts.user_metadata.contains_key(&format!(
+            "x-amz-meta-{}",
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(transaction_suffix)
+        )));
     }
 
     #[test]

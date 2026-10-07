@@ -88,7 +88,7 @@ jobs:
   # database lookup with a second ignore list to maintain.
   cargo-deny:
     name: Cargo Deny
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    if: github.repository == 'rustfs/rustfs' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
@@ -131,7 +131,7 @@ jobs:
 
   workflow-pin-report:
     name: Workflow Pin Report
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    if: github.repository == 'rustfs/rustfs' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
@@ -203,7 +203,7 @@ jobs:
     # workflow produces, and until now it was only visible to whoever happened to
     # open the Actions tab. Same ci-8 mechanism coverage.yml and
     # e2e-replication-nightly.yml already use.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

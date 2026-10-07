@@ -4883,6 +4883,71 @@ where
         .await
     }
 
+    async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        validate_table_bucket_entry(&entry)?;
+        let _registry_guard = self.acquire_table_bucket_registry_write_permit().await?;
+        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
+        let object = self.paths.table_bucket_entry_path(&entry.table_bucket);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
+        if let Some((current, _)) = self.read_table_bucket_with_etag_unlocked(&entry.table_bucket).await? {
+            return if current.state == TableCatalogEntryState::Active {
+                Ok(())
+            } else {
+                Err(TableCatalogStoreError::NotFound(format!("table bucket {}", entry.table_bucket)))
+            };
+        }
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            TableCatalogPutPrecondition::IfAbsent,
+            _guard.write_commit_guards(),
+        )
+        .await
+    }
+
+    async fn disable_empty_table_bucket(&self, mut entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        validate_table_bucket_entry(&entry)?;
+        let _registry_guard = self.acquire_table_bucket_registry_write_permit().await?;
+        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
+        let object = self.paths.table_bucket_entry_path(&entry.table_bucket);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
+        if let Some((current, _)) = self.read_table_bucket_with_etag_unlocked(&entry.table_bucket).await? {
+            if current.active_rename_id.is_some()
+                || !matches!(current.state, TableCatalogEntryState::Active | TableCatalogEntryState::Deleted)
+            {
+                return Err(TableCatalogStoreError::Conflict("table bucket has an operation in progress".to_string()));
+            }
+            entry = current;
+        }
+        // Namespace creation holds this same bucket lock. Retained table, view, and
+        // maintenance records also prevent removing their data-plane protections.
+        let page = self
+            .backend
+            .list_objects_page(
+                self.catalog_bucket(),
+                &self.paths.namespace_entries_prefix(&entry.table_bucket),
+                None,
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        if !page.objects.is_empty() || page.is_truncated {
+            return Err(TableCatalogStoreError::Conflict(
+                "table bucket contains namespaces or retained catalog resources".to_string(),
+            ));
+        }
+        entry.state = TableCatalogEntryState::Deleted;
+        entry.updated_at = Some(next_table_catalog_update_time(entry.updated_at.as_deref()));
+        self.write_entry_unlocked(
+            self.catalog_bucket(),
+            &object,
+            &entry,
+            TableCatalogPutPrecondition::Any,
+            _guard.write_commit_guards(),
+        )
+        .await
+    }
+
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
         let namespace = validate_namespace_entry_identity(&entry)?;
         validate_namespace_properties(&entry.properties)?;
@@ -4890,11 +4955,14 @@ where
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
         let bucket_path = self.paths.table_bucket_entry_path(&entry.table_bucket);
         let _bucket_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?;
-        if self
-            .read_table_bucket_with_etag_unlocked(&entry.table_bucket)
-            .await?
-            .is_some_and(|(current, _)| current.active_rename_id.is_some())
+        let current = self.read_table_bucket_with_etag_unlocked(&entry.table_bucket).await?;
+        if current
+            .as_ref()
+            .is_none_or(|(entry, _)| entry.state != TableCatalogEntryState::Active)
         {
+            return Err(TableCatalogStoreError::NotFound(format!("table bucket {}", entry.table_bucket)));
+        }
+        if current.is_some_and(|(current, _)| current.active_rename_id.is_some()) {
             return Err(TableCatalogStoreError::Unavailable(format!(
                 "table bucket {} has an active table rename",
                 entry.table_bucket

@@ -562,17 +562,23 @@ mod tests {
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
         let object_count = 1002;
-        for i in 0..object_count {
-            let key = format!("object{:04}.txt", i);
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(&key)
-                .body(ByteStream::from_static(b"test content"))
-                .send()
-                .await
-                .expect("Failed to put object");
-        }
+        // Finish every durable PUT before listing, with the same bounded fanout as the delimiter fixtures.
+        stream::iter(0..object_count)
+            .for_each_concurrent(16, |i| {
+                let client = &client;
+                async move {
+                    let key = format!("object{i:04}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"test content"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                }
+            })
+            .await;
 
         eprintln!("Seeded {object_count} objects in {bucket}; starting ListObjectsV2 pagination");
         let deadline = Instant::now() + PAGINATION_TIMEOUT;
