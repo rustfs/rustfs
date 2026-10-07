@@ -14,6 +14,21 @@
 /// The heal scheduler: queue consumption loop and its skip/metric helpers.
 use super::*;
 
+pub(super) fn retry_admission_delay(
+    grace_deadline: Option<u64>,
+    ordinary_delay: Duration,
+    grace_admission_backoff: Duration,
+    now: u64,
+) -> Option<Duration> {
+    let delay = match grace_deadline {
+        Some(deadline) if deadline > now => Duration::from_secs(deadline - now),
+        Some(_) => grace_admission_backoff,
+        None => ordinary_delay,
+    };
+    tokio::time::Instant::now().checked_add(delay)?;
+    Some(delay)
+}
+
 impl HealManager {
     /// Start scheduler
     pub(super) async fn start_scheduler(&self) -> Result<()> {
@@ -458,6 +473,7 @@ impl HealManager {
                     if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =
                         (retry_request_for_queue, retry_cancel_token)
                     {
+                        let grace_deadline = automatic_replacement_grace_deadline(task.as_ref(), &result);
                         let retry_request_id = retry_request.id.clone();
                         let retry_attempt = retry_request.retry_attempts;
                         let retry_key = PriorityHealQueue::make_dedup_key(&retry_request);
@@ -473,7 +489,18 @@ impl HealManager {
                         let retry_manager_cancel_token = manager_cancel_token.clone();
                         let retry_config = config_for_spawn.clone();
                         tokio::spawn(async move {
+                            let mut grace_admission_backoff = Duration::ZERO;
                             loop {
+                                let now = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let Some(admission_delay) =
+                                    retry_admission_delay(grace_deadline, retry_delay, grace_admission_backoff, now)
+                                else {
+                                    retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                    return;
+                                };
                                 tokio::select! {
                                     _ = retry_cancel_token.cancelled() => {
                                         debug!(
@@ -493,7 +520,17 @@ impl HealManager {
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
                                         return;
                                     }
-                                    _ = sleep(retry_delay) => {}
+                                    _ = sleep(admission_delay) => {}
+                                }
+
+                                // A wall-clock rollback during the monotonic
+                                // wait must not admit work before its deadline.
+                                let now = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                if grace_deadline.is_some_and(|deadline| deadline > now) {
+                                    continue;
                                 }
 
                                 {
@@ -582,12 +619,12 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_enqueued",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
-                                            retry_delay_ms = retry_delay.as_millis(),
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             error = %retry_error,
-                                            result = "retry_enqueued",
                                             "Heal retry admission decided"
                                         );
                                         if should_notify {
@@ -631,10 +668,11 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_rejected_full",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
-                                            result = "retry_rejected_full",
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             "Heal retry admission decided"
                                         );
                                     }
@@ -644,15 +682,20 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_dropped",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             reason = reason.as_str(),
-                                            result = "retry_dropped",
                                             "Heal retry admission decided"
                                         );
                                     }
                                 }
+                                // Once the storage deadline has passed, queue
+                                // pressure uses ordinary bounded admission
+                                // backoff instead of repeating the grace wait.
+                                grace_admission_backoff = recoverable_heal_retry_delay(retry_attempt);
                             }
                         });
                     }
