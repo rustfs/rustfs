@@ -11386,6 +11386,36 @@ mod tests {
         }
     }
 
+    fn ldap_settings_kvs() -> rustfs_config::server_config::KVS {
+        rustfs_config::server_config::KVS(vec![
+            rustfs_config::server_config::KV {
+                key: "enable".to_string(),
+                value: "on".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "user_dn_search_base_dn".to_string(),
+                value: "ou=people,dc=example,dc=com".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "user_dn_search_filter".to_string(),
+                value: "(uid=%s)".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "group_search_base_dn".to_string(),
+                value: "ou=groups,dc=example,dc=com".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "group_search_filter".to_string(),
+                value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
+                hidden_if_empty: false,
+            },
+        ])
+    }
+
     // rustfs#7003: the site region is per-site and must not reach the peer
     // IDP comparison while OpenID is unconfigured, or two sites in different
     // regions can never be paired even with an identical (empty) IDP config.
@@ -11410,6 +11440,66 @@ mod tests {
         assert!(settings.enabled);
         assert_eq!(settings.region, "eu-site-1");
         assert_eq!(settings.claim_provider.client_id, "client-a");
+    }
+
+    #[test]
+    fn idp_settings_preserve_site_replication_wire_shape() {
+        let (ldap, ldap_configs) = ldap_settings_from_kvs(&ldap_settings_kvs());
+        let settings = IDPSettings {
+            ldap,
+            ldap_configs,
+            open_id: open_id_settings(
+                vec![
+                    ("default".to_string(), openid_provider("client-a")),
+                    ("corp".to_string(), openid_provider("client-b")),
+                ],
+                "eu-site-1".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            serde_json::to_value(settings).expect("serialize IDP settings"),
+            serde_json::json!({
+                "LDAP": {
+                    "IsLDAPEnabled": true,
+                    "LDAPUserDNSearchBase": "ou=people,dc=example,dc=com",
+                    "LDAPUserDNSearchFilter": "(uid=%s)",
+                    "LDAPGroupSearchBase": "ou=groups,dc=example,dc=com",
+                    "LDAPGroupSearchFilter": "(&(objectclass=groupOfNames)(member=%s))",
+                },
+                "LDAPConfigs": {
+                    "Enabled": true,
+                    "Configs": {
+                        "default": {
+                            "UserDNSearchBase": "ou=people,dc=example,dc=com",
+                            "UserDNSearchFilter": "(uid=%s)",
+                            "GroupSearchBase": "ou=groups,dc=example,dc=com",
+                            "GroupSearchFilter": "(&(objectclass=groupOfNames)(member=%s))",
+                        }
+                    }
+                },
+                "OpenID": {
+                    "Enabled": true,
+                    "Region": "eu-site-1",
+                    "Roles": {
+                        "corp": {
+                            "ClaimName": "groups",
+                            "ClaimUserinfoEnabled": false,
+                            "RolePolicy": "readwrite",
+                            "ClientID": "client-b",
+                            "HashedClientSecret": "hashed",
+                        }
+                    },
+                    "ClaimProvider": {
+                        "ClaimName": "groups",
+                        "ClaimUserinfoEnabled": false,
+                        "RolePolicy": "readwrite",
+                        "ClientID": "client-a",
+                        "HashedClientSecret": "hashed",
+                    }
+                }
+            })
+        );
     }
 
     // A whole provider object present on one side only must not spill its
@@ -14494,33 +14584,7 @@ mod tests {
 
     #[test]
     fn test_ldap_settings_from_kvs_reads_minio_style_keys() {
-        let kvs = rustfs_config::server_config::KVS(vec![
-            rustfs_config::server_config::KV {
-                key: "enable".to_string(),
-                value: "on".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "user_dn_search_base_dn".to_string(),
-                value: "ou=people,dc=example,dc=com".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "user_dn_search_filter".to_string(),
-                value: "(uid=%s)".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "group_search_base_dn".to_string(),
-                value: "ou=groups,dc=example,dc=com".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "group_search_filter".to_string(),
-                value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
-                hidden_if_empty: false,
-            },
-        ]);
+        let kvs = ldap_settings_kvs();
 
         let (ldap, ldap_configs) = ldap_settings_from_kvs(&kvs);
 
