@@ -165,4 +165,210 @@ mod tests {
         info!("RT-13c PASS: scanner/config persists across restart");
         Ok(())
     }
+
+    /// RT-14: a transition PUT must not carry reserved `x-minio-internal-*` headers.
+    ///
+    /// Regression pattern: transition forwarded the object's internal metadata as raw
+    /// request headers, so MinIO-derived remotes (Storj) refused every transition with
+    /// `400 InvalidArgument` while `tier add` still succeeded (rustfs#8362). The fake
+    /// target refuses any PutObject carrying such a header, like MinIO and Storj do.
+    #[tokio::test]
+    async fn test_transition_put_omits_reserved_internal_headers() -> TestResult {
+        use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation};
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_sdk_s3::types::{
+            BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, LifecycleRuleFilter, Transition,
+            TransitionStorageClass,
+        };
+        use std::time::{Duration, Instant};
+
+        init_logging();
+        info!("RT-14: transition PUT omits reserved internal headers");
+
+        const TIER: &str = "RT14COLD";
+        const TARGET_BUCKET: &str = "rt14-cold";
+        const SOURCE_BUCKET: &str = "rt14-hot";
+
+        let target = FakeS3Target::start().await.expect("start fake target");
+        target.create_bucket_with_mode(TARGET_BUCKET, BucketMode::Unversioned);
+        target.reject_reserved_internal_headers(true);
+
+        let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
+        env.start_rustfs_server_with_env(
+            vec![],
+            &[
+                ("RUSTFS_CONSOLE_ENABLE", "false"),
+                ("RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT", "true"),
+            ],
+        )
+        .await
+        .expect("start RustFS");
+
+        let tier_body = serde_json::json!({
+            "type": "rustfs",
+            "rustfs": {
+                "name": TIER,
+                "endpoint": target.endpoint(),
+                "accessKey": FAKE_ACCESS_KEY,
+                "secretKey": FAKE_SECRET_KEY,
+                "bucket": TARGET_BUCKET,
+                "prefix": "cold/",
+                "region": "us-east-1",
+                "storageClass": ""
+            }
+        })
+        .to_string();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match admin_ok(&env, http::Method::PUT, "/rustfs/admin/v3/tier", Some(tier_body.clone())).await {
+                Ok(_) => break,
+                Err(err) if Instant::now() < deadline => {
+                    info!("  add tier not ready yet: {err}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(err) => panic!("RT-14 FAIL: add tier: {err}"),
+            }
+        }
+
+        let client = env.create_s3_client();
+        client
+            .create_bucket()
+            .bucket(SOURCE_BUCKET)
+            .send()
+            .await
+            .expect("create bucket");
+
+        let objects: Vec<(&str, Vec<u8>)> = vec![
+            ("small.bin", (0..1024u32).map(|i| (i % 251) as u8).collect()),
+            ("medium.bin", (0..200_000u32).map(|i| (i.wrapping_mul(31) % 253) as u8).collect()),
+        ];
+        for (key, body) in &objects {
+            client
+                .put_object()
+                .bucket(SOURCE_BUCKET)
+                .key(*key)
+                .body(ByteStream::from(body.clone()))
+                .send()
+                .await
+                .expect("put source object");
+        }
+
+        let rule = LifecycleRule::builder()
+            .id("to-cold")
+            .status(ExpirationStatus::Enabled)
+            .filter(LifecycleRuleFilter::builder().prefix("").build())
+            .transitions(
+                Transition::builder()
+                    .days(0)
+                    .storage_class(TransitionStorageClass::from(TIER))
+                    .build(),
+            )
+            .build()
+            .expect("build rule");
+        client
+            .put_bucket_lifecycle_configuration()
+            .bucket(SOURCE_BUCKET)
+            .lifecycle_configuration(
+                BucketLifecycleConfiguration::builder()
+                    .rules(rule)
+                    .build()
+                    .expect("build config"),
+            )
+            .send()
+            .await
+            .expect("put lifecycle");
+
+        admin_ok(
+            &env,
+            http::Method::POST,
+            &format!("/rustfs/admin/v3/ilm/transition/run?bucket={SOURCE_BUCKET}&prefix=&tier={TIER}&dryRun=false"),
+            None,
+        )
+        .await
+        .expect("run transition");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while target.stored_keys(TARGET_BUCKET).len() < objects.len() {
+            assert!(
+                Instant::now() < deadline,
+                "RT-14 FAIL: transition did not reach the target; stored keys: {:?}",
+                target.stored_keys(TARGET_BUCKET)
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let keys = target.stored_keys(TARGET_BUCKET);
+        assert_eq!(keys.len(), objects.len(), "RT-14 FAIL: unexpected remote objects: {keys:?}");
+
+        let mut stored_bodies = Vec::new();
+        for key in &keys {
+            let (body, metadata) = target.stored_object(TARGET_BUCKET, key).expect("remote object");
+            for name in [
+                "x-rustfs-internal-transition-transaction-id",
+                "x-minio-internal-transition-transaction-id",
+                "x-rustfs-internal-transition-tier-destination-id",
+                "x-minio-internal-transition-tier-destination-id",
+            ] {
+                assert!(
+                    metadata.contains_key(name),
+                    "RT-14 FAIL: remote object {key} lost transition identity {name}: {:?}",
+                    metadata.keys().collect::<Vec<_>>()
+                );
+            }
+            stored_bodies.push(body.to_vec());
+        }
+        let mut expected_bodies: Vec<Vec<u8>> = objects.iter().map(|(_, body)| body.clone()).collect();
+        expected_bodies.sort();
+        stored_bodies.sort();
+        assert_eq!(stored_bodies, expected_bodies, "RT-14 FAIL: remote bytes differ from the source objects");
+
+        let transition_puts = target
+            .requests()
+            .iter()
+            .filter(|record| {
+                record.operation == Operation::PutObject
+                    && record
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| key.contains("transition-transactions"))
+            })
+            .count();
+        assert_eq!(
+            transition_puts,
+            objects.len(),
+            "RT-14 FAIL: transition PUTs were retried or refused by the target"
+        );
+
+        for (key, body) in &objects {
+            let head = client
+                .head_object()
+                .bucket(SOURCE_BUCKET)
+                .key(*key)
+                .send()
+                .await
+                .expect("head transitioned");
+            assert_eq!(
+                head.storage_class().map(|class| class.as_str()),
+                Some(TIER),
+                "RT-14 FAIL: {key} is not reported as transitioned"
+            );
+            let got = client
+                .get_object()
+                .bucket(SOURCE_BUCKET)
+                .key(*key)
+                .send()
+                .await
+                .expect("get transitioned")
+                .body
+                .collect()
+                .await
+                .expect("read body")
+                .into_bytes();
+            assert_eq!(got.as_ref(), body.as_slice(), "RT-14 FAIL: read-back of {key} differs");
+        }
+
+        target.shutdown().await;
+        info!("RT-14 PASS: transition PUT omits reserved internal headers");
+        Ok(())
+    }
 }
