@@ -21,6 +21,8 @@ PRs changing only Rust sources under `crates/e2e_test/src/` and known E2E select
 
 `required-checks` runs even after failed or skipped dependencies. `scripts/ci_gate.py verify` rejects missing jobs, unexpected jobs, failure, cancellation, and unexpected skips; optional lanes are required only on their declared events. `Workspace Test and Lint` is the ordinary Rust job, while `Test and Lint` uniquely names the aggregate. New validation jobs must update both its direct dependencies and the script contract. Test this wiring and its failure cases with `python3 scripts/ci_gate.py --self-test`.
 
+The `gateway/integration` ruleset (`24663286`) requires the same three contexts with the same review rules for the s3s to gateway integration branch (rustfs/backlog#2734). It omits `required_linear_history` because `gateway-integration-sync.yml` lands `--no-ff` merge commits from `main` on that branch every weekday, and it names the `rustfs-cla-assistant` app as the bypass actor that pushes them. `ci.yml` runs on pull requests targeting either branch.
+
 Verify the live rule before changing merge policy:
 
 ```bash
@@ -100,6 +102,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `e2e-upgrade.yml` (weekly) | `upgrade` (4-case matrix) | upgrade and rollback gate; server logs | no | see the PR row |
 | `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | no | see the PR row |
 | `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | no | see the PR row |
+| `gateway-integration-sync.yml` (weekdays) | `sync` | merges `main` into `gateway/integration` as a `--no-ff` merge commit; a conflicting merge is aborted and opens a `sync/<source>-<date>` pull request listing the conflicting files, which keeps the run green; a rejected push or missing pull request fails it | no | dispatch, optionally with `source_ref` |
 | `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on missing or stale attempts or completed successes | n/a | dispatch |
 
 Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.

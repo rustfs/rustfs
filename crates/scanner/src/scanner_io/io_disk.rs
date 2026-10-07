@@ -175,21 +175,25 @@ impl ScannerIODisk for Disk {
 
         let mut cache = cache;
 
-        let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
-            .await
-            .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+        let (lifecycle_config, _) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_lifecycle_config(&cache.info.name))
+                .await
+                .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
 
         if lifecycle_config.has_active_rules("") {
             cache.info.lifecycle = Some(Arc::new(lifecycle_config));
         }
 
-        let (replication_config, _) = get_replication_config(&cache.info.name).await.unwrap_or((
-            ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            },
-            OffsetDateTime::now_utc(),
-        ));
+        let (replication_config, _) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_replication_config(&cache.info.name))
+                .await
+                .unwrap_or((
+                    ReplicationConfiguration {
+                        role: "".to_string(),
+                        rules: vec![],
+                    },
+                    OffsetDateTime::now_utc(),
+                ));
 
         if replication_config.has_active_rules("", true)
             && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
@@ -197,7 +201,8 @@ impl ScannerIODisk for Disk {
             cache.info.replication = Some(Arc::new(ReplicationConfig::new(Some(replication_config), Some(targets))));
         }
 
-        if let Ok((object_lock_config, _)) = get_object_lock_config(&cache.info.name).await
+        if let Ok((object_lock_config, _)) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_object_lock_config(&cache.info.name)).await
             && object_lock_config_enabled(&object_lock_config)
         {
             cache.info.object_lock = Some(Arc::new(object_lock_config));
@@ -215,17 +220,20 @@ impl ScannerIODisk for Disk {
         .then_some(prefix_scan_scope)
         .flatten();
 
-        let result = scan_data_folder_scoped(
+        let result = crate::storage_api::ecstore_with_background_disk_io(
             ctx.clone(),
-            budget,
-            set_disks,
-            self.clone(),
-            cache,
-            updates,
-            scan_mode,
-            SCANNER_SLEEPER.clone(),
-            prefix_scan_scope,
-            checkpoint_tx,
+            scan_data_folder_scoped(
+                ctx.clone(),
+                budget,
+                set_disks,
+                self.clone(),
+                cache,
+                updates,
+                scan_mode,
+                SCANNER_SLEEPER.clone(),
+                prefix_scan_scope,
+                checkpoint_tx,
+            ),
         )
         .await;
 
