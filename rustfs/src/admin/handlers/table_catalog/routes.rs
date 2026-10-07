@@ -56,6 +56,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/backup").as_str(),
+        AdminOperation(&CREATE_TABLE_CATALOG_BACKUP_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/restore").as_str(),
+        AdminOperation(&RESTORE_TABLE_CATALOG_BACKUP_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
         format!("{prefix}/{{warehouse}}/catalog/warehouse-index/backfill").as_str(),
         AdminOperation(&BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER),
     )?;

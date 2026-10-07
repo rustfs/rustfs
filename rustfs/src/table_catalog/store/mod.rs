@@ -16,10 +16,14 @@ use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
+mod backup;
 mod migration;
 mod object;
 mod strong;
 
+pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
+#[cfg(test)]
+pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
@@ -455,6 +459,15 @@ pub(crate) trait TableCommitPublication: Send + Sync {
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
+    /// Whether bucket publication acquires its own migration read permits.
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        None
+    }
+
     fn complete(&self);
 }
 
@@ -583,6 +596,7 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+    pub size: u64,
 }
 
 pub(crate) struct TableCatalogLockGuard {
@@ -614,9 +628,10 @@ impl TableCatalogLockGuard {
     }
 
     fn write_namespace(guard: WriteCommitGuard) -> Self {
+        let lock_lost = guard.lock_lost_signal();
         Self {
             _guard: Box::new(()),
-            lock_lost: None,
+            lock_lost,
             write_commit_guard: Some(guard),
         }
     }
@@ -628,6 +643,40 @@ impl TableCatalogLockGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.lock_lost.as_ref().is_some_and(|signal| signal.is_lost())
             || self.write_commit_guard.as_ref().is_some_and(WriteCommitGuard::is_lock_lost)
+    }
+
+    pub(crate) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+        self.lock_lost.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TableCatalogObjectMutationFence {
+    signals: Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+}
+
+impl TableCatalogObjectMutationFence {
+    pub(crate) fn from_signals(
+        signals: impl IntoIterator<Item = Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
+    ) -> Self {
+        Self {
+            signals: signals.into_iter().flatten().collect(),
+        }
+    }
+
+    pub(crate) fn ensure_held(&self) -> TableCatalogStoreResult<()> {
+        if self.signals.iter().any(|signal| signal.is_lost()) {
+            return Err(TableCatalogStoreError::Unavailable(
+                "catalog backup or restore lost its fencing lock".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_to_object_options(&self, options: &mut ObjectOptions) {
+        for signal in &self.signals {
+            options.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
     }
 }
 
@@ -667,6 +716,13 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         None
+    }
+
+    async fn acquire_catalog_migration_read_guards(
+        &self,
+        _table_bucket: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
+        Ok(Vec::new())
     }
 
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
@@ -712,6 +768,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
             }))
     }
 
@@ -726,6 +783,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
             }))
     }
 
@@ -758,7 +816,34 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         self.put_object(bucket, object, data, precondition).await
     }
 
+    async fn put_object_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.put_object(bucket, object, data, precondition).await?;
+        fence.ensure_held()
+    }
+
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()>;
+
+    async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()>;
+
+    async fn delete_object_if_match_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.delete_object_if_match(bucket, object, expected_etag).await?;
+        fence.ensure_held()
+    }
 
     async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
         self.delete_object(bucket, object).await
@@ -811,6 +896,15 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     fn table_commit_publication_is_held(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
         false
+    }
+
+    /// Whether bucket publication acquires its own migration read permits.
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        None
     }
 
     fn complete_table_commit_publication(&self) {}
@@ -929,6 +1023,14 @@ where
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
         self.table_commit_publication_is_held(table_bucket, namespace, table)
+    }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        TableCatalogObjectBackend::acquires_catalog_migration_read_permit(self)
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        TableCatalogObjectBackend::catalog_migration_read_permit_status(self)
     }
 
     fn complete(&self) {
@@ -1192,6 +1294,26 @@ impl TableCatalogObjectPaths {
         format!(
             "{}/{}/{}",
             self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK
+        )
+    }
+
+    pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
+        format!(
+            "{}/{}/{}/{}.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket),
+            table_catalog_path_hash(backup_id)
+        )
+    }
+
+    pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_RESTORE_ROOT,
+            table_catalog_path_hash(table_bucket),
+            TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE
         )
     }
 
@@ -1839,6 +1961,42 @@ where
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
         }
     }
+
+    pub(crate) async fn create_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        expected_snapshot_etag: Option<&str>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog backup requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn restore_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        backup_id: &str,
+        expected_snapshot_etag: Option<&str>,
+        allow_replace: bool,
+    ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog restore requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .await
+            }
+        }
+    }
 }
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
@@ -1873,6 +2031,26 @@ where
 {
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         Some(self.strong_runtime.clone())
+    }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        true
+    }
+
+    async fn acquire_catalog_migration_read_guards(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
+        // Handlers discover and publish objects through one publication object. Keep the
+        // migration read permits ahead of its publication lock, matching store mutations.
+        let paths = TableCatalogObjectPaths::default();
+        let global = self
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
+            .await?;
+        let bucket = self
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(table_bucket))
+            .await?;
+        Ok(vec![global, bucket])
     }
 
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
@@ -1926,6 +2104,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
@@ -1952,6 +2131,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
@@ -1992,7 +2172,8 @@ where
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, None).await
+        self.put_object_with_options(bucket, object, data, precondition, None, None)
+            .await
     }
 
     async fn put_object_unlocked(
@@ -2003,7 +2184,20 @@ where
         precondition: TableCatalogPutPrecondition,
         write_guards: Vec<WriteCommitGuard>,
     ) -> TableCatalogStoreResult<()> {
-        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards))
+        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards), None)
+            .await
+    }
+
+    async fn put_object_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.put_object_with_options(bucket, object, data, precondition, None, Some(fence))
             .await
     }
 
@@ -2013,6 +2207,23 @@ where
             Err(err) if is_missing_storage_error(&err) => Ok(()),
             Err(err) => Err(storage_error_to_catalog("delete catalog object", err)),
         }
+    }
+
+    async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()> {
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, None)
+            .await
+    }
+
+    async fn delete_object_if_match_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, Some(fence))
+            .await
     }
 
     async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -2115,6 +2326,37 @@ impl<S> EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    async fn delete_object_if_match_with_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<()> {
+        let mut options = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(expected_etag.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if let Some(fence) = fence {
+            fence.add_to_object_options(&mut options);
+        }
+        match self.store.delete_object(bucket, object, options).await {
+            Ok(_) => {
+                if let Some(fence) = fence {
+                    fence.ensure_held()?;
+                }
+                Ok(())
+            }
+            Err(err) if is_missing_storage_error(&err) => Err(TableCatalogStoreError::Conflict(format!(
+                "delete catalog object: {bucket}/{object} disappeared before conditional cleanup"
+            ))),
+            Err(err) => Err(storage_error_to_catalog("conditionally delete catalog object", err)),
+        }
+    }
+
     async fn read_object_with_options(
         &self,
         bucket: &str,
@@ -2168,12 +2410,16 @@ where
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
         write_guards: Option<Vec<WriteCommitGuard>>,
+        fence: Option<&TableCatalogObjectMutationFence>,
     ) -> TableCatalogStoreResult<()> {
         let mut reader = PutObjReader::from_vec(data);
         let mut opts = ObjectOptions {
             http_preconditions: http_preconditions_for_catalog_put(precondition),
             ..Default::default()
         };
+        if let Some(fence) = fence {
+            fence.add_to_object_options(&mut opts);
+        }
         if let Some(write_guards) = write_guards {
             if write_guards.is_empty() {
                 return Err(TableCatalogStoreError::Internal("catalog write has no namespace owner".to_string()));
@@ -2183,10 +2429,133 @@ where
             }
             opts.write_completion = WriteCompletion::TailDrained;
         }
-        self.store
+        let result = self
+            .store
             .put_object(bucket, object, &mut reader, &opts)
             .await
             .map(|_| ())
-            .map_err(|err| storage_error_to_catalog("write catalog object", err))
+            .map_err(|err| storage_error_to_catalog("write catalog object", err));
+        if result.is_ok()
+            && let Some(fence) = fence
+        {
+            fence.ensure_held()?;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_api::protocols::client::{BucketOperations as _, MakeBucketOptions};
+    use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct RecordingLeaseClient {
+        inner: rustfs_lock::LocalClient,
+        acquired: Mutex<Option<LockId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for RecordingLeaseClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> rustfs_lock::Result<LockResponse> {
+            let response = self.inner.acquire_lock(request).await?;
+            if let Some(info) = response.lock_info.as_ref() {
+                *self.acquired.lock().expect("record lease") = Some(info.id.clone());
+            }
+            Ok(response)
+        }
+        async fn release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.release(id).await
+        }
+        async fn refresh(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.refresh(id).await
+        }
+        async fn force_release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+            self.inner.force_release(id).await
+        }
+        async fn check_status(&self, id: &LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            self.inner.check_status(id).await
+        }
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            self.inner.get_stats().await
+        }
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            self.inner.close().await
+        }
+        async fn is_online(&self) -> bool {
+            self.inner.is_online().await
+        }
+        async fn is_local(&self) -> bool {
+            self.inner.is_local().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_writer_loss_prevents_recovery_storage_commit() {
+        let (_temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let bucket = "catalog-fence-loss-probe";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("make probe bucket");
+        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
+        let client = Arc::new(RecordingLeaseClient {
+            inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+                rustfs_lock::FastObjectLockManager::new(),
+            )))),
+            acquired: Mutex::new(None),
+        });
+        let lock = rustfs_lock::NamespaceLockWrapper::new(
+            rustfs_lock::NamespaceLock::with_clients_and_quorum(
+                "catalog-probe".to_string(),
+                vec![client.clone() as Arc<dyn LockClient>],
+                1,
+            ),
+            rustfs_lock::ObjectKey::new(bucket, default_table_bucket_publication_lock_path()),
+            "catalog-backup-probe".to_string(),
+        );
+        // These are the exact acquisition and conversion used by the production
+        // EcStoreTableCatalogObjectBackend::acquire_write_lock implementation.
+        let owner = WriteCommitGuard::acquire(&lock, Duration::from_secs(5))
+            .await
+            .expect("acquire distributed writer");
+        let guard = TableCatalogLockGuard::write_namespace(owner);
+        let fence = TableCatalogObjectMutationFence::from_signals([guard.lock_lost_signal()]);
+        assert!(!guard.is_lock_lost(), "models backup's last outer fencing check");
+        let id = client
+            .acquired
+            .lock()
+            .expect("lease recorded")
+            .clone()
+            .expect("actual lease acquired");
+        assert!(client.force_release(&id).await.expect("force-release lease"));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !guard.is_lock_lost() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual heartbeat must observe released distributed lease");
+        let result = backend
+            .put_object_fenced(
+                bucket,
+                "recovery-artifact.json",
+                b"stale recovery artifact".to_vec(),
+                TableCatalogPutPrecondition::IfAbsent,
+                &fence,
+            )
+            .await;
+        let persisted = backend
+            .read_object(bucket, "recovery-artifact.json")
+            .await
+            .expect("read real persisted object");
+        assert!(
+            result.is_err() && persisted.is_none(),
+            "lost publication writer must prevent storage commit; result={result:?}, persisted={}",
+            persisted.is_some()
+        );
     }
 }

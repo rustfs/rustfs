@@ -819,6 +819,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         Ok(state.objects.get(&key).map(|record| TableCatalogObjectMetadata {
             etag: (!etagless).then(|| record.etag.clone()),
             mod_time: record.mod_time,
+            size: record.data.len() as u64,
         }))
     }
 
@@ -944,6 +945,49 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             return Err(TableCatalogStoreError::Internal(format!(
                 "injected delete failure for {object} attempt {attempt}"
             )));
+        }
+        state.objects.remove(&key);
+        if state
+            .fail_after_delete_attempts
+            .get(&key)
+            .is_some_and(|attempts| attempts.contains(&attempt))
+        {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "injected post-commit delete failure for {object} attempt {attempt}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()> {
+        let mut state = self.state.lock().await;
+        let key = (bucket.to_string(), object.to_string());
+        let attempt = {
+            let attempts = state.delete_attempts.entry(key.clone()).or_default();
+            *attempts += 1;
+            *attempts
+        };
+        if state
+            .fail_delete_attempts
+            .get(&key)
+            .is_some_and(|attempts| attempts.contains(&attempt))
+        {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "injected delete failure for {object} attempt {attempt}"
+            )));
+        }
+        match state.objects.get(&key) {
+            None => {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "conditionally delete catalog object: {bucket}/{object} disappeared before cleanup"
+                )));
+            }
+            Some(record) if record.etag != expected_etag => {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "conditionally delete catalog object: {bucket}/{object} changed before cleanup"
+                )));
+            }
+            Some(_) => {}
         }
         state.objects.remove(&key);
         if state

@@ -4748,7 +4748,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> Result<ObjectInfo, std::io::Error> {
-    let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
+    let publication_guard = lifecycle_expiry_publication_guard(&api, &oi.bucket, &oi.name, bucket_incarnation_id)
         .await
         .ok_or_else(|| std::io::Error::other("lifecycle expiry is not allowed for this bucket"))?;
     let snapshot = lifecycle_delete_config_snapshot(&api, oi)
@@ -4838,10 +4838,14 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
+    let (publication_guard, bucket_incarnation_id) = lifecycle_transition_publication_guard(&api, oi)
+        .await
+        .ok_or_else(|| Error::other("lifecycle transition is not allowed for this bucket"))?;
+
     let etag = if let Some(etag) = &oi.etag { etag } else { "" };
     let etag = etag.to_string();
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         transition: TransitionOptions {
             status: lifecycle::TRANSITION_PENDING.to_string(),
             tier: lae.event.storage_class,
@@ -4853,8 +4857,10 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
+        expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
+    opts.add_namespace_lock_guard(&publication_guard);
     let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
     time_ilm(1)();
     result
@@ -5458,20 +5464,26 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
         .await
 }
 
-async fn lifecycle_expiry_publication_guard(
+async fn acquire_lifecycle_publication_guard(api: &ECStore, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard, Error> {
+    let lock = api
+        .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+        .await?;
+    let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
+    if guard.is_lock_lost() {
+        return Err(Error::other("table-bucket publication lock was lost before lifecycle admission"));
+    }
+    Ok(guard)
+}
+
+pub(crate) async fn lifecycle_expiry_publication_guard(
     api: &ECStore,
-    oi: &ObjectInfo,
+    bucket: &str,
+    object: &str,
     bucket_incarnation_id: Uuid,
 ) -> Option<rustfs_lock::NamespaceLockGuard> {
-    let result = async {
-        let lock = api
-            .new_ns_lock(&oi.bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
-            .await?;
-        let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
-        if guard.is_lock_lost() {
-            return Err(Error::other("table-bucket publication lock was lost before lifecycle delete admission"));
-        }
-        if !metadata_boundary::lifecycle_expiry_allowed(api, &oi.bucket, bucket_incarnation_id).await? {
+    let result: std::result::Result<Option<rustfs_lock::NamespaceLockGuard>, Error> = async {
+        let guard = acquire_lifecycle_publication_guard(api, bucket).await?;
+        if !metadata_boundary::lifecycle_expiry_allowed(api, bucket, bucket_incarnation_id).await? {
             return Ok(None);
         }
         Ok(Some(guard))
@@ -5484,11 +5496,39 @@ async fn lifecycle_expiry_publication_guard(
                 event = EVENT_LIFECYCLE_DELETE_FAILED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                bucket = %oi.bucket,
-                object = %oi.name,
+                bucket,
+                object,
                 operation = "authorize_lifecycle_expiry",
                 error = %err,
                 "Lifecycle delete admission failed"
+            );
+            None
+        }
+    }
+}
+
+async fn lifecycle_transition_publication_guard(
+    api: &ECStore,
+    oi: &ObjectInfo,
+) -> Option<(rustfs_lock::NamespaceLockGuard, Uuid)> {
+    let result: std::result::Result<(rustfs_lock::NamespaceLockGuard, Uuid), Error> = async {
+        let guard = acquire_lifecycle_publication_guard(api, &oi.bucket).await?;
+        let configs = metadata_boundary::get_expiry_configs(api, &oi.bucket).await?;
+        Ok((guard, configs.bucket_incarnation_id))
+    }
+    .await;
+    match result {
+        Ok(state) => Some(state),
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "authorize_lifecycle_transition",
+                error = %err,
+                "Lifecycle transition admission failed"
             );
             None
         }
@@ -5551,7 +5591,8 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {
-    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
+    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, &oi.bucket, &oi.name, bucket_incarnation_id).await
+    else {
         return false;
     };
     let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
@@ -5844,6 +5885,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::expiry_worker_count;
+    use super::lifecycle_transition_publication_guard;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -13026,6 +13068,171 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_noncurrent_batch_expiry_does_not_delete_from_table_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("table-noncurrent-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let mut old_reader = PutObjReader::from_vec(b"old table data".to_vec());
+        let old = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the historical table version should be created");
+        let old_version_id = old.version_id.expect("the historical version should have an identity");
+        let mut current_reader = PutObjReader::from_vec(b"current table data".to_vec());
+        ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current table version should be created");
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket enablement should acquire the publication lock");
+
+        let delete_store = ecstore.clone();
+        let delete_bucket = bucket.clone();
+        let delete_object = object.to_string();
+        let mut delete = tokio::spawn(async move {
+            let target = ObjectToDelete {
+                object_name: delete_object,
+                version_id: Some(old_version_id),
+                ..Default::default()
+            };
+            crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+                &delete_store,
+                &delete_bucket,
+                std::slice::from_ref(&target),
+                lifecycle::Event::default(),
+                incarnation,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "noncurrent lifecycle cleanup must wait for the table-bucket publication fence"
+        );
+
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
+        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        sys.persist_and_set(metadata)
+            .await
+            .expect("table bucket marker should be persisted");
+        sys.reload_from_store(&bucket)
+            .await
+            .expect("table bucket marker should become authoritative");
+        drop(enable_guard);
+
+        let failed = tokio::time::timeout(StdDuration::from_secs(2), delete)
+            .await
+            .expect("noncurrent lifecycle cleanup should resume after the fence is released")
+            .expect("noncurrent lifecycle cleanup task should join");
+        assert_eq!(failed, 1, "table-bucket noncurrent cleanup must be rejected");
+        assert!(
+            ecstore
+                .get_object_info(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(old_version_id.to_string()),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_ok(),
+            "table data must remain after queued noncurrent cleanup is rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_transition_admission_holds_publication_reader() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-transition-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+        let object_info = ObjectInfo {
+            bucket: bucket.clone(),
+            name: object.to_string(),
+            ..Default::default()
+        };
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication writer should be acquired");
+        let admission_store = ecstore.clone();
+        let admission_object = object_info.clone();
+        let mut admission =
+            tokio::spawn(async move { lifecycle_transition_publication_guard(&admission_store, &admission_object).await });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut admission)
+                .await
+                .is_err(),
+            "transition admission must wait for an in-progress table publication"
+        );
+        drop(enable_guard);
+
+        let (transition_guard, incarnation) = tokio::time::timeout(StdDuration::from_secs(2), admission)
+            .await
+            .expect("transition admission should resume after publication")
+            .expect("transition admission task should join")
+            .expect("transition admission should succeed");
+        assert_ne!(incarnation, Uuid::nil(), "transition admission must bind a bucket incarnation");
+        let blocked_writer = publication_lock.get_write_lock(StdDuration::from_millis(100)).await;
+        assert!(blocked_writer.is_err(), "transition admission must retain the publication read lock");
+        drop(transition_guard);
+        publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication writer should proceed after transition admission releases its guard");
     }
 
     #[tokio::test]

@@ -787,6 +787,7 @@ impl DefaultObjectUsecase {
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let copy_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -796,10 +797,12 @@ impl DefaultObjectUsecase {
             let key = key.clone();
             let src_opts = src_opts.clone();
             let dst_opts = dst_opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
                 let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
                 let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
                 let _self_copy_lock_guard = _self_copy_lock_guard;
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
 
                 let oi = store
                     .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)

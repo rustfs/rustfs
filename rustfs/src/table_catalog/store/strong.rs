@@ -51,7 +51,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) hydrated: bool,
     snapshot_required: bool,
     pub(in crate::table_catalog) snapshot_etag: Option<String>,
-    snapshot_version: Option<u16>,
+    pub(super) snapshot_version: Option<u16>,
     pub(in crate::table_catalog) table_buckets: BTreeMap<String, TableBucketEntry>,
     pub(in crate::table_catalog) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
     namespace_children: BTreeMap<StrongNamespaceChildKey, String>,
@@ -102,7 +102,8 @@ pub(in crate::table_catalog) struct StrongTableCatalogSnapshot {
     pub(in crate::table_catalog) idempotency: Vec<StrongCommitSnapshotRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
     pub(super) table_bucket: TableBucketEntry,
     pub(super) namespaces: Vec<NamespaceEntry>,
@@ -113,7 +114,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
 }
 
 #[derive(Clone)]
-enum StrongSnapshotWritePostcondition {
+pub(super) enum StrongSnapshotWritePostcondition {
     TableBucketPresent(TableBucketEntry),
     TableBucketAbsent(String),
     NamespacePresent(NamespaceEntry),
@@ -297,8 +298,8 @@ pub(in crate::table_catalog) fn table_catalog_bucket_snapshot_fingerprint(
 
 #[derive(Clone)]
 pub(crate) struct StrongTableCatalogStore<B> {
-    object_backend: B,
-    snapshot_write_version: u16,
+    pub(super) object_backend: B,
+    pub(super) snapshot_write_version: u16,
     snapshot_required_on_start: bool,
     // Single mutex protecting all catalog state (table_buckets, namespaces, tables, views, commits, idempotency).
     // This is intentional: many operations require atomic read-modify-write across multiple fields.
@@ -309,7 +310,7 @@ pub(crate) struct StrongTableCatalogStore<B> {
     // 3. Using optimistic concurrency with version checks
     pub(in crate::table_catalog) state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
     // Coalesces reloads for clones of one store so only one task reads and decodes a changed snapshot.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -596,7 +597,7 @@ where
         }
     }
 
-    fn bucket_snapshot_from_state_locked(
+    pub(super) fn bucket_snapshot_from_state_locked(
         state: &StrongTableCatalogState,
         table_bucket: &str,
     ) -> Option<StrongTableCatalogBucketSnapshot> {
@@ -646,7 +647,7 @@ where
         })
     }
 
-    fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
+    pub(super) fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
         state.table_buckets.remove(table_bucket);
         state.namespaces.retain(|(entry_bucket, _), _| entry_bucket != table_bucket);
         state
@@ -960,7 +961,7 @@ where
         Ok(())
     }
 
-    fn snapshot_from_mutated_state_locked(
+    pub(super) fn snapshot_from_mutated_state_locked(
         state: &mut StrongTableCatalogState,
         configured_write_version: u16,
     ) -> TableCatalogStoreResult<StrongTableCatalogSnapshot> {
@@ -1000,7 +1001,7 @@ where
         Ok(snapshot)
     }
 
-    fn state_from_snapshot(
+    pub(super) fn state_from_snapshot(
         snapshot: StrongTableCatalogSnapshot,
         snapshot_etag: Option<String>,
     ) -> TableCatalogStoreResult<StrongTableCatalogState> {
@@ -1228,7 +1229,7 @@ where
         );
     }
 
-    async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
+    pub(super) async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
         let Some((current_snapshot_etag, current_snapshot_required)) = ({
             let state = self.state.lock().await;
             if state.hydrated {
@@ -1330,11 +1331,22 @@ where
         ))
     }
 
-    async fn finalize_snapshot_write(
+    pub(super) async fn finalize_snapshot_write(
         &self,
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
         postcondition: StrongSnapshotWritePostcondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, None)
+            .await
+    }
+
+    pub(super) async fn finalize_snapshot_write_with_fence(
+        &self,
+        snapshot: StrongTableCatalogSnapshot,
+        precondition: TableCatalogPutPrecondition,
+        postcondition: StrongSnapshotWritePostcondition,
+        mutation_fence: Option<&TableCatalogObjectMutationFence>,
     ) -> TableCatalogStoreResult<()> {
         let data = serde_json::to_vec(&snapshot)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to encode strong catalog snapshot: {err}")))?;
@@ -1343,15 +1355,26 @@ where
                 "durable strong catalog snapshot exceeds the maximum encoded size of {STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE} bytes"
             )));
         }
-        match self
-            .object_backend
-            .put_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), data, precondition)
-            .await
-        {
+        if let Some(fence) = mutation_fence {
+            fence.ensure_held()?;
+        }
+        let write_result = if let Some(fence) = mutation_fence {
+            self.object_backend
+                .put_object_fenced(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), data, precondition, fence)
+                .await
+        } else {
+            self.object_backend
+                .put_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), data, precondition)
+                .await
+        };
+        match write_result {
             Ok(()) => {
                 self.state.lock().await.snapshot_required = true;
                 if let Err(err) = self.reload_state_from_durable().await {
                     self.mark_snapshot_reload_failed(&err, "confirmed-write").await;
+                }
+                if let Some(fence) = mutation_fence {
+                    fence.ensure_held()?;
                 }
                 Ok(())
             }
@@ -1360,12 +1383,18 @@ where
                 if let Err(reload_err) = self.reload_state_from_durable().await {
                     self.mark_snapshot_reload_failed(&reload_err, "write-conflict").await;
                 }
+                if let Some(fence) = mutation_fence {
+                    fence.ensure_held()?;
+                }
                 Err(err)
             }
             Err(err) => {
                 self.state.lock().await.snapshot_required = true;
                 match self.reload_state_from_durable().await {
                     Ok(()) => {
+                        if let Some(fence) = mutation_fence {
+                            fence.ensure_held()?;
+                        }
                         let state = self.state.lock().await;
                         if postcondition.is_satisfied_by::<B>(&state) {
                             Ok(())
@@ -1496,7 +1525,7 @@ where
         Ok(())
     }
 
-    pub(super) async fn bucket_snapshot_observation(
+    pub(crate) async fn bucket_snapshot_observation(
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<(Option<String>, Option<String>)> {
@@ -1591,7 +1620,7 @@ where
         Ok(())
     }
 
-    fn table_commit_recovery_report_for_entry_locked(
+    pub(super) fn table_commit_recovery_report_for_entry_locked(
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
@@ -2381,6 +2410,16 @@ where
                 "table metadata location must be inside the table metadata directory".to_string(),
             ));
         }
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None if publication.acquires_catalog_migration_read_permit() => None,
+            None => Some(self.acquire_snapshot_write_permit().await?),
+        };
         publication.begin_table_bucket(&entry.table_bucket).await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -2388,7 +2427,6 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
             .await?;
@@ -2536,6 +2574,7 @@ where
         destination_table: &str,
     ) -> TableCatalogStoreResult<()> {
         let publication = TableCommitLockPublication::new(&self.object_backend);
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         publication.begin_table_bucket(table_bucket).await?;
         if !publication.holds_table_bucket(table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -2543,7 +2582,6 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(&publication);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
 
@@ -2677,7 +2715,6 @@ where
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         let publication = TableCommitLockPublication::new(&self.object_backend);
-        publication.begin_table_bucket(&request.table_bucket).await?;
         self.commit_table_with_publication(request, &publication).await
     }
 
@@ -2686,11 +2723,26 @@ where
         request: TableCommitRequest,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<TableCommitResult> {
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None if publication.acquires_catalog_migration_read_permit() => None,
+            None => Some(self.acquire_snapshot_write_permit().await?),
+        };
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
+        publication.begin_table_bucket(&request.table_bucket).await?;
+        if !publication.holds_table_bucket(&request.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table-bucket publication fence".to_string(),
+            ));
+        }
         publication
             .prepare(&request.table_bucket, &request.namespace, &request.table)
             .await?;
@@ -2876,8 +2928,8 @@ where
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         let publication = TableCommitLockPublication::new(&self.object_backend);
-        publication.begin_table_bucket(table_bucket).await?;
         let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        publication.begin_table_bucket(table_bucket).await?;
         publication.prepare(table_bucket, namespace, table).await?;
         if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
             return Err(TableCatalogStoreError::Internal(
@@ -2959,6 +3011,16 @@ where
                 "view metadata location must be inside the view metadata directory".to_string(),
             ));
         }
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None if publication.acquires_catalog_migration_read_permit() => None,
+            None => Some(self.acquire_snapshot_write_permit().await?),
+        };
         publication.begin_table_bucket(&entry.table_bucket).await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -2966,7 +3028,6 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.view)
             .await?;
@@ -3083,6 +3144,16 @@ where
         table_bucket_fence_required: bool,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<ViewCommitResult> {
+        let _migration_guard = match publication.catalog_migration_read_permit_status() {
+            Some(true) => None,
+            Some(false) => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table-bucket catalog migration read permit was lost".to_string(),
+                ));
+            }
+            None if table_bucket_fence_required && publication.acquires_catalog_migration_read_permit() => None,
+            None => Some(self.acquire_snapshot_write_permit().await?),
+        };
         if table_bucket_fence_required {
             publication.begin_table_bucket(&request.table_bucket).await?;
             if !publication.holds_table_bucket(&request.table_bucket) {
@@ -3092,7 +3163,6 @@ where
             }
         }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
         publication

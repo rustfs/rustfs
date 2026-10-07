@@ -298,12 +298,21 @@ where
     ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
+        self.ensure_object_backed_catalog_write_permit_after_lock(table_bucket)
+            .await?;
+        Ok(guard)
+    }
+
+    pub(super) async fn ensure_object_backed_catalog_write_permit_after_lock(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<()> {
         if self.read_backing_migration_fence(table_bucket).await?.is_some() {
             return Err(TableCatalogStoreError::Conflict(format!(
                 "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
             )));
         }
-        Ok(guard)
+        Ok(())
     }
 
     async fn ensure_global_backing_migration_fence(

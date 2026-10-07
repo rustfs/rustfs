@@ -42,6 +42,32 @@ DELETE /iceberg/v1/{warehouse}/catalog/migration
 
 After the durable-strong state advances, cancellation fails closed; recovery requires an operator-selected restore or reverse migration.
 
+## Controlled Catalog Backup And Restore
+
+The durable catalog backup and restore endpoints are a controlled, same-table-bucket recovery mechanism. They are available only with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`; they protect the catalog snapshot and maintenance state, but do not copy or replicate table data, metadata, manifest, or delete objects.
+
+Backup artifacts and restore intents use a strict internal format version. A binary rejects artifacts or pending intents from another format version; create a new backup after upgrading instead of assuming cross-version restore compatibility.
+
+1. Stop or drain catalog writers and maintenance workers for the table bucket. The backup operation acquires the table-bucket publication fence and the durable migration fence, rejects pending commit recovery and pending restore recovery, rejects active maintenance leases, and records the current snapshot ETag, format version, catalog fingerprint, and referenced object watermarks.
+2. Create a backup with a principal authorized for `MigrateTableCatalogAction`. Backup creation persists an immutable recovery artifact and is therefore not covered by read-only catalog permission. The optional `expected-snapshot-etag` provides an additional compare-and-capture guard.
+
+   ```text
+   POST /iceberg/v1/{warehouse}/catalog/backup
+   {"expected-snapshot-etag":"<current-etag>"}
+   ```
+
+3. Keep every referenced table object available for the retention period. A successful backup is immutable and idempotent by content-derived backup ID; it is not a copy of those objects and cannot restore an object that was deleted or changed after capture.
+4. Before restoring, stop writers and maintenance workers again. Verify the target table bucket is still table-enabled, obtain its current snapshot ETag, and use `expected-snapshot-etag` whenever replacing an existing catalog. `allow-replace` must be explicitly `true` to replace a non-identical existing bucket snapshot.
+
+   ```text
+   POST /iceberg/v1/{warehouse}/catalog/restore
+   {"backup-id":"<backup-id>","expected-snapshot-etag":"<current-etag>","allow-replace":true}
+   ```
+
+5. Treat a restore conflict as a stale-target or changed-object condition, not as permission to retry blindly. The service verifies all recorded object watermarks before applying an ETag-CAS snapshot replacement. If the process fails after catalog replacement, retrying the same backup ID is safe only while maintenance state is exactly the persisted source state or already exactly the backup target state. A partial multi-object reconciliation fails closed with a conflict and requires operator inspection before manual cleanup.
+
+This procedure is not cross-region failover. Cross-region recovery requires an independent object replication/backup system and an operator-selected catalog import or restore procedure.
+
 ## Strong Snapshot Version 1 to Version 2
 
 1. Keep snapshot writes on version 1 during a rolling binary upgrade. Current binaries read both versions.

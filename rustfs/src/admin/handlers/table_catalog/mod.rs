@@ -177,7 +177,8 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] =
+    &["POST /v1/{prefix}/catalog/backup", "POST /v1/{prefix}/catalog/restore"];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
@@ -187,6 +188,8 @@ static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = Ge
 static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
     MaterializeTableCatalogMigrationHandler {};
 static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
+static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
+static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
@@ -461,6 +464,24 @@ struct CatalogImportRequest {
     metadata_location: String,
     #[serde(default)]
     properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBackupRequest {
+    #[serde(default, rename = "expected-snapshot-etag")]
+    expected_snapshot_etag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogRestoreRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
+    #[serde(default, rename = "expected-snapshot-etag")]
+    expected_snapshot_etag: Option<String>,
+    #[serde(default, rename = "allow-replace")]
+    allow_replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1289,6 +1310,7 @@ struct TableCommitPublicationState {
     phase: TableCommitPublicationPhase,
     bucket_fence: Option<String>,
     table_fence: Option<(String, String, String)>,
+    catalog_migration_read_permit: bool,
     observed_objects: BTreeMap<(String, String), TableCommitObservedObject>,
     guards: Vec<crate::table_catalog::TableCatalogLockGuard>,
 }
@@ -1490,15 +1512,27 @@ where
             }
             publication.bucket_fence = Some(table_bucket.to_string());
         }
-        let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
-        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
-            Ok(guard) => guard,
+        let migration_guards = match self.backend.acquire_catalog_migration_read_guards(table_bucket).await {
+            Ok(guards) => guards,
             Err(err) => {
                 self.publication.lock().bucket_fence = None;
                 return Err(err);
             }
         };
-        self.publication.lock().guards.push(guard);
+        let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                let mut publication = self.publication.lock();
+                publication.bucket_fence = None;
+                publication.catalog_migration_read_permit = false;
+                return Err(err);
+            }
+        };
+        let mut publication = self.publication.lock();
+        publication.catalog_migration_read_permit = !migration_guards.is_empty();
+        publication.guards.extend(migration_guards);
+        publication.guards.push(guard);
         Ok(())
     }
 
@@ -1634,6 +1668,7 @@ where
         publication.observed_objects.clear();
         publication.bucket_fence = None;
         publication.table_fence = None;
+        publication.catalog_migration_read_permit = false;
         publication.phase = TableCommitPublicationPhase::Complete;
     }
 
@@ -1749,6 +1784,17 @@ where
         self.backend.delete_object(bucket, object).await
     }
 
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.authorize(bucket, object, S3Action::DeleteObjectAction).await?;
+        self.ensure_observation_allowed(bucket, object)?;
+        self.backend.delete_object_if_match(bucket, object, expected_etag).await
+    }
+
     async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.delete_object(bucket, object).await
     }
@@ -1803,6 +1849,17 @@ where
             .as_ref()
             .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
             && publication.guards.iter().all(|guard| !guard.is_lock_lost())
+    }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        self.backend.acquires_catalog_migration_read_permit()
+    }
+
+    fn catalog_migration_read_permit_status(&self) -> Option<bool> {
+        let publication = self.publication.lock();
+        publication
+            .catalog_migration_read_permit
+            .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
     }
 
     fn complete_table_commit_publication(&self) {
@@ -2299,11 +2356,10 @@ fn table_catalog_object_store_from_extensions(extensions: &http::Extensions) -> 
 async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<bool> {
     let store = runtime_sources::object_store_from_extensions(extensions)
         .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
-    let metadata = store
-        .get_bucket_metadata(bucket)
+    store
+        .table_bucket_enabled(bucket)
         .await
-        .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))?;
-    Ok(metadata.table_bucket_enabled())
+        .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))
 }
 
 async fn ensure_table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<()> {

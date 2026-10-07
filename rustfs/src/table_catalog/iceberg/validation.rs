@@ -976,6 +976,13 @@ pub(crate) enum IcebergStatisticsFileKind {
     Partition,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct IcebergStatisticsObjectReference {
+    pub(crate) snapshot_id: i64,
+    pub(crate) location: String,
+    pub(crate) kind: IcebergStatisticsFileKind,
+}
+
 pub(crate) fn validate_iceberg_statistics_file(
     value: &serde_json::Value,
     label: &str,
@@ -1073,10 +1080,16 @@ fn statistics_non_negative_i64(
     Ok(value)
 }
 
-fn validate_table_statistics_references(
+fn is_supported_partition_statistics_file(data: &[u8]) -> bool {
+    data.starts_with(b"ORC")
+        || data.starts_with(b"Obj\x01")
+        || (data.len() >= 8 && data.starts_with(b"PAR1") && data.ends_with(b"PAR1"))
+}
+
+pub(crate) fn table_statistics_object_references(
     metadata: &serde_json::Value,
-    snapshot_ids: &BTreeSet<i64>,
-) -> TableCatalogStoreResult<()> {
+) -> TableCatalogStoreResult<Vec<IcebergStatisticsObjectReference>> {
+    let mut references = Vec::new();
     for (field, kind) in [
         ("statistics", IcebergStatisticsFileKind::Table),
         ("partition-statistics", IcebergStatisticsFileKind::Partition),
@@ -1087,19 +1100,49 @@ fn validate_table_statistics_references(
         let values = values
             .as_array()
             .ok_or_else(|| TableCatalogStoreError::Invalid(format!("table metadata field {field} must be an array")))?;
-        let mut snapshot_ids_with_statistics = BTreeSet::new();
         for value in values {
             let snapshot_id = validate_iceberg_statistics_file(value, field, kind)?;
-            if !snapshot_ids.contains(&snapshot_id) {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "{field} references missing snapshot {snapshot_id}"
-                )));
-            }
-            if !snapshot_ids_with_statistics.insert(snapshot_id) {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "{field} contains duplicate entries for snapshot {snapshot_id}"
-                )));
-            }
+            let location = value
+                .get("statistics-path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|location| !location.is_empty())
+                .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{field}.statistics-path must be a non-empty string")))?;
+            references.push(IcebergStatisticsObjectReference {
+                snapshot_id,
+                location: location.to_string(),
+                kind,
+            });
+        }
+    }
+    Ok(references)
+}
+
+fn validate_table_statistics_references(
+    metadata: &serde_json::Value,
+    snapshot_ids: &BTreeSet<i64>,
+) -> TableCatalogStoreResult<()> {
+    let mut table_statistics_snapshot_ids = BTreeSet::new();
+    let mut partition_statistics_snapshot_ids = BTreeSet::new();
+    for reference in table_statistics_object_references(metadata)? {
+        if !snapshot_ids.contains(&reference.snapshot_id) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "{} references missing snapshot {}",
+                match reference.kind {
+                    IcebergStatisticsFileKind::Table => "statistics",
+                    IcebergStatisticsFileKind::Partition => "partition-statistics",
+                },
+                reference.snapshot_id
+            )));
+        }
+        let (field, snapshot_ids_with_statistics) = match reference.kind {
+            IcebergStatisticsFileKind::Table => ("statistics", &mut table_statistics_snapshot_ids),
+            IcebergStatisticsFileKind::Partition => ("partition-statistics", &mut partition_statistics_snapshot_ids),
+        };
+        if !snapshot_ids_with_statistics.insert(reference.snapshot_id) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "{field} contains duplicate entries for snapshot {}",
+                reference.snapshot_id
+            )));
         }
     }
     Ok(())
@@ -2798,7 +2841,7 @@ fn snapshot_is_retained_v1_history(current_metadata: Option<&serde_json::Value>,
     current_snapshot == target_snapshot
 }
 
-async fn validate_table_statistics_objects<B>(
+pub(crate) async fn validate_table_statistics_objects<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
     metadata: &serde_json::Value,
 ) -> TableCatalogStoreResult<()>
@@ -2879,12 +2922,17 @@ where
                 }
                 let valid_magic = match kind {
                     IcebergStatisticsFileKind::Table => object.data.starts_with(b"PFA1") && object.data.ends_with(b"PFA1"),
-                    IcebergStatisticsFileKind::Partition => object.data.starts_with(b"PAR1") && object.data.ends_with(b"PAR1"),
+                    // Iceberg partition statistics use the table's data-file format, not a
+                    // fixed Parquet encoding. Validate the format envelope without parsing
+                    // the optional statistics rows here.
+                    IcebergStatisticsFileKind::Partition => is_supported_partition_statistics_file(&object.data),
                 };
                 if !valid_magic {
                     return Err(TableCatalogStoreError::Invalid(match kind {
                         IcebergStatisticsFileKind::Table => "table statistics object is not a Puffin file".to_string(),
-                        IcebergStatisticsFileKind::Partition => "partition statistics object is not a Parquet file".to_string(),
+                        IcebergStatisticsFileKind::Partition => {
+                            "partition statistics object is not a supported table data file".to_string()
+                        }
                     }));
                 }
                 Ok(())
