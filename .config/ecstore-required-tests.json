@@ -162,6 +162,11 @@
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction"
     },
     {
+      "invariant": "metadata-observation-mixed-current-identity-arrivals-preserve-selection",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_mixed_current_identity_arrivals_preserve_selection"
+    },
+    {
       "invariant": "metadata-observation-pending-newer-version-and-same-time-different-directory-force-full-wait",
       "suite": "rustfs-ecstore",
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_pending_newer_version_and_same_time_different_directory_force_full_wait"

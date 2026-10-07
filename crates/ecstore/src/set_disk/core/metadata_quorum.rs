@@ -515,6 +515,102 @@ mod tests {
     }
 
     #[test]
+    fn metadata_observation_mixed_current_identity_arrivals_preserve_selection() {
+        let permutations = (0..4)
+            .flat_map(|a| (0..4).filter(move |b| *b != a).map(move |b| (a, b)))
+            .flat_map(|(a, b)| (0..4).filter(move |c| *c != a && *c != b).map(move |c| (a, b, c)))
+            .map(|(a, b, c)| [a, b, c, 6 - a - b - c])
+            .collect::<Vec<_>>();
+        assert_eq!(permutations.len(), 24);
+
+        for (case, newer_version) in [("newer-current-version", true), ("same-time-different-directory", false)] {
+            let metadata = std::array::from_fn::<_, 4, _>(|index| {
+                let mut file_info = payload(index);
+                file_info.version_id = Some(Uuid::from_u128(if index > 0 && newer_version { 11 } else { 10 }));
+                file_info.is_latest = true;
+                if index > 0 {
+                    file_info.data_dir = Some(Uuid::from_u128(2));
+                    if newer_version {
+                        file_info.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+                    }
+                }
+                assert!(file_info_is_valid_for_metadata(&file_info), "case={case}, disk={index}");
+                file_info
+            });
+            let expected_current = &metadata[1];
+            let expected_hash = SetDisks::file_info_quorum_hash(expected_current);
+            assert_ne!(SetDisks::file_info_quorum_hash(&metadata[0]), expected_hash);
+
+            for enabled in [false, true] {
+                for order in &permutations {
+                    let mut slots = std::array::from_fn::<_, 4, _>(|index| observation(index, 4));
+                    let mut typed = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    let mut legacy = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    for slot in &slots {
+                        typed.observe(slot);
+                        observe_legacy(&mut legacy, slot);
+                    }
+                    assert_same_reduction(&typed, &legacy);
+                    assert_eq!(typed.valid_responses, 0, "pending slots cannot supply votes");
+
+                    let mut old_seen = false;
+                    let mut current_votes = 0;
+                    for (prefix, &index) in order.iter().enumerate() {
+                        slots[index].result = Some(Ok(metadata[index].clone()));
+                        typed.observe(&slots[index]);
+                        observe_legacy(&mut legacy, &slots[index]);
+                        assert_same_reduction(&typed, &legacy);
+                        if index == 0 {
+                            old_seen = true;
+                        } else {
+                            current_votes += 1;
+                        }
+
+                        // A+B+B must wait for pending B; three B responses may
+                        // finish early only before the conflicting A arrives.
+                        let expected_decision = if enabled && !old_seen && current_votes == 3 {
+                            Some(MetadataEarlyStopDecision {
+                                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+                            })
+                        } else {
+                            None
+                        };
+                        assert_eq!(
+                            typed.early_stop_decision(),
+                            expected_decision,
+                            "case={case}, enabled={enabled}, order={order:?}, prefix={prefix}"
+                        );
+                        assert_eq!(typed.valid_responses, prefix + 1);
+                        assert_eq!(typed.conflicting_metadata, old_seen && current_votes > 0);
+                        assert_eq!(typed.version_early_stop_decision(), None, "current reads do not request a version ID");
+                        if expected_decision.is_some() {
+                            assert_eq!(
+                                SetDisks::file_info_quorum_hash(
+                                    typed.candidate.as_ref().expect("three B votes need a candidate")
+                                ),
+                                expected_hash
+                            );
+                        }
+                    }
+
+                    let completed_metadata = slots
+                        .iter()
+                        .map(|slot| slot.file_info().expect("every disk must have arrived").clone())
+                        .collect::<Vec<_>>();
+                    let (_, selected, selection_quorum) =
+                        SetDisks::select_valid_fileinfo(&vec![None; 4], &completed_metadata, &vec![None; 4], "", 2, 3)
+                            .expect("three matching B disks must select the current identity");
+                    assert_eq!(selection_quorum, 3);
+                    assert_eq!(selected.version_id, expected_current.version_id);
+                    assert_eq!(selected.mod_time, expected_current.mod_time);
+                    assert_eq!(selected.data_dir, expected_current.data_dir);
+                    assert_eq!(SetDisks::file_info_quorum_hash(&selected), expected_hash);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn metadata_observation_pending_newer_version_and_same_time_different_directory_force_full_wait() {
         let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
         for index in 0..2 {
