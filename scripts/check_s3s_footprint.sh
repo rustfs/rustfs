@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-# Exact-baseline guard on the direct s3s dependency footprint during the
-# gateway migration (rustfs/backlog#1677 review finding F1, acceptance in
-# rustfs/backlog#1733; made exact by rustfs/backlog#2734 task T0.4,
-# rustfs/backlog#2739).
+# Guard on the direct s3s dependency footprint during the gateway migration
+# (rustfs/backlog#1677 review finding F1, acceptance in rustfs/backlog#1733;
+# made exact by rustfs/backlog#2734 task T0.4, rustfs/backlog#2739; allowlist
+# mode added by task T0.6, rustfs/backlog#2741).
+#
+# Usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run]
+#
+# The two modes are independent: each reads its own input file and runs its own
+# search, so a malformed baseline file cannot fail (or pass) the allowlist mode
+# and vice versa. CI runs the mode it wants; running both means two invocations.
+# Any other argument, an unknown mode, a repeated --mode, or --dry-run outside
+# the allowlist mode is rejected with exit 2 rather than ignored, so a typo in a
+# CI step cannot silently run a different check.
+#
+# ---------------------------------------------------------------------------
+# --mode baseline (the default)
 #
 # Three counters are measured and compared against the committed values in
 # .config/s3s-footprint-baseline.txt, the only place the numbers live:
@@ -42,23 +54,204 @@
 # counters read 0 and were waved through as "shrank"). The sanity assertions
 # below fail hard if that ever regresses.
 #
-# Usage: scripts/check_s3s_footprint.sh
-# The script takes no arguments; an argument is rejected rather than ignored,
-# so a mode flag added later (rustfs/backlog#2741) cannot silently fall back to
-# the baseline comparison.
+# ---------------------------------------------------------------------------
+# --mode allowlist
+#
+# Every Rust file listed by
+#
+#   git grep -l '\bs3s\(::\|_sigv4\)' -- '*.rs'
+#
+# must be matched by an entry of .config/s3s-edge-allowlist.txt: the files that
+# may still reference s3s when Phase 1 of rustfs/backlog#2734 ends. A file
+# outside the allowlist fails the check and is listed; with --dry-run the list
+# is printed and the exit status is 0, which is the Phase 1 tracking view.
+# Task T1.9 switches the CI step to this mode. The search deliberately differs
+# from the baseline counters: it is the spec's git grep pattern, which also
+# catches s3s_sigv4, and it covers crates/e2e_test, which the allowlist admits
+# explicitly as the e2e oracle. git grep searches tracked files, as a CI
+# checkout is.
+#
+# Output contract: stdout carries only the files outside the allowlist, one
+# per line, so the dry run can be redirected into a tracking list; every
+# summary, error and verdict line goes to stderr.
+#
+# The allowlist file is validated strictly, and --dry-run downgrades none of
+# this: a missing file, an entry containing whitespace, an entry that is not a
+# valid pathspec, and an entry that names or matches anything under crates/
+# other than crates/e2e_test each fail hard. The engine crates leave s3s
+# entirely; rustfs/backlog#2741 forbids allowlisting them, and a wildcard that
+# reaches into crates/ is the same thing spelled differently.
+#
+# Before the tree search the pattern is run, through git grep itself with the
+# same dialect flag and in this repository's config context, against a control
+# file holding two lines it must match and three it must not. A dialect that
+# matches nothing would otherwise read as "no s3s outside the allowlist", which
+# is the one wrong answer this mode must never give once CI depends on it.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if (($# > 0)); then
-    echo "error: unexpected argument '$1'; usage: scripts/check_s3s_footprint.sh" >&2
+usage() {
+    echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run]" >&2
+}
+
+MODE=''
+DRY_RUN=0
+while (($# > 0)); do
+    case "$1" in
+        --mode)
+            if (($# < 2)); then
+                echo "error: '--mode' needs a value: baseline or allowlist" >&2
+                usage
+                exit 2
+            fi
+            if [[ -n "$MODE" ]]; then
+                echo "error: '--mode' given more than once" >&2
+                usage
+                exit 2
+            fi
+            case "$2" in
+                baseline | allowlist) MODE="$2" ;;
+                *)
+                    echo "error: unknown mode '$2'; expected baseline or allowlist" >&2
+                    usage
+                    exit 2
+                    ;;
+            esac
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        *)
+            echo "error: unexpected argument '$1'" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+MODE="${MODE:-baseline}"
+if ((DRY_RUN)) && [[ "$MODE" != allowlist ]]; then
+    echo "error: '--dry-run' is only valid with '--mode allowlist'" >&2
+    usage
     exit 2
 fi
 
 BASELINE_FILE='.config/s3s-footprint-baseline.txt'
+ALLOWLIST_FILE='.config/s3s-edge-allowlist.txt'
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
+# The allowlist search pattern, verbatim from rustfs/backlog#2741: a git grep
+# basic regular expression (-G below pins the dialect against grep.patternType).
+S3S_EDGE_PATTERN='\bs3s\(::\|_sigv4\)'
 E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Returns 0 when every s3s-referencing Rust file is allowlisted (or on a dry
+# run), 1 when files remain outside the allowlist; exits 1 on a broken input.
+run_allowlist_mode() {
+    local git_dir control grep_status line offender total allowed outside
+
+    if [[ ! -f "$ALLOWLIST_FILE" ]]; then
+        echo "error: allowlist file '$ALLOWLIST_FILE' is missing" >&2
+        exit 1
+    fi
+
+    # Two-directional regex control (see header): the positive lines must
+    # match and the negative ones must not, through the same engine and flag.
+    # --git-dir keeps the control in this repository's config context, so a
+    # grep.patternType set here reaches the control as well as the measurement.
+    git_dir="$(git rev-parse --absolute-git-dir)"
+    printf '%s\n' 'use s3s::Body;' 'use s3s_sigv4::Sig;' \
+        'use ms3s::X;' 'use s3sx::Y;' 'use s3s_other::Z;' >"$TMP_DIR/control.rs"
+    control="$(git -C "$TMP_DIR" --git-dir="$git_dir" grep --no-index -G -c -e "$S3S_EDGE_PATTERN" -- control.rs </dev/null || true)"
+    if [[ "$control" != 'control.rs:2' ]]; then
+        echo "error: the s3s edge pattern matched the control file as '${control:-nothing}', expected" >&2
+        echo "  'control.rs:2'; git grep or its regex dialect is broken, so a tree result would be" >&2
+        echo "  meaningless." >&2
+        exit 1
+    fi
+
+    # Exit 1 is "no match", a legitimate end state once every s3s reference is
+    # gone; only a larger status is an error.
+    grep_status=0
+    git grep -l -G -e "$S3S_EDGE_PATTERN" -- '*.rs' >"$TMP_DIR/s3s_files" </dev/null || grep_status=$?
+    if ((grep_status > 1)); then
+        echo "error: \"git grep -l -G -e '$S3S_EDGE_PATTERN' -- '*.rs'\" failed with status $grep_status" >&2
+        exit 1
+    fi
+    LC_ALL=C sort -u -o "$TMP_DIR/s3s_files" "$TMP_DIR/s3s_files"
+
+    : >"$TMP_DIR/allowed_files"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            '' | '#'*) continue ;;
+        esac
+        if [[ "$line" =~ [[:space:]] ]]; then
+            echo "error: '$ALLOWLIST_FILE' entry '$line' contains whitespace; one path or glob per" >&2
+            echo "  line, and a note goes on its own '#' line" >&2
+            exit 1
+        fi
+        case "$line" in
+            crates/e2e_test | crates/e2e_test/*) ;;
+            crates | crates/*)
+                echo "error: '$ALLOWLIST_FILE' entry '$line' allowlists crates/ outside crates/e2e_test;" >&2
+                echo "  the engine crates leave s3s entirely (rustfs/backlog#2741)" >&2
+                exit 1
+                ;;
+        esac
+        if ! git ls-files -- ":(glob)$line" >"$TMP_DIR/entry_files" </dev/null; then
+            echo "error: '$ALLOWLIST_FILE' entry '$line' is not a valid pathspec" >&2
+            exit 1
+        fi
+        # The textual check above catches the spelled-out case; this one
+        # catches a wildcard whose matches reach into crates/ (e.g. '**/mod.rs').
+        offender="$(awk '/^crates\// && !/^crates\/e2e_test\// { print; exit }' "$TMP_DIR/entry_files")"
+        if [[ -n "$offender" ]]; then
+            echo "error: '$ALLOWLIST_FILE' entry '$line' matches '$offender', which is under crates/" >&2
+            echo "  outside crates/e2e_test; the engine crates leave s3s entirely (rustfs/backlog#2741)" >&2
+            exit 1
+        fi
+        cat "$TMP_DIR/entry_files" >>"$TMP_DIR/allowed_files"
+    done <"$ALLOWLIST_FILE"
+    LC_ALL=C sort -u -o "$TMP_DIR/allowed_files" "$TMP_DIR/allowed_files"
+
+    LC_ALL=C comm -12 "$TMP_DIR/s3s_files" "$TMP_DIR/allowed_files" >"$TMP_DIR/allowed_hits"
+    LC_ALL=C comm -23 "$TMP_DIR/s3s_files" "$TMP_DIR/allowed_files" >"$TMP_DIR/outside"
+    total="$(grep -c . "$TMP_DIR/s3s_files" || true)"
+    allowed="$(grep -c . "$TMP_DIR/allowed_hits" || true)"
+    outside="$(grep -c . "$TMP_DIR/outside" || true)"
+    if ((allowed + outside != total)); then
+        echo "error: allowlist partition does not add up: $allowed allowlisted + $outside outside != $total total" >&2
+        exit 1
+    fi
+
+    echo "s3s edge allowlist: $total Rust files reference s3s, $allowed allowlisted, $outside outside the allowlist" >&2
+    cat "$TMP_DIR/outside"
+    if ((outside == 0)); then
+        echo "✅ s3s edge allowlist check passed: no s3s reference outside $ALLOWLIST_FILE" >&2
+        return 0
+    fi
+    if ((DRY_RUN)); then
+        echo "s3s edge allowlist dry run: $outside files still reference s3s outside $ALLOWLIST_FILE (listed on stdout; not a failure)" >&2
+        return 0
+    fi
+    echo "❌ s3s edge allowlist: $outside files reference s3s outside $ALLOWLIST_FILE (listed on stdout)" >&2
+    echo "   Route the code through the gateway abstractions instead of importing s3s. The" >&2
+    echo "   allowlist names the edge that keeps s3s and is never widened to go green." >&2
+    return 1
+}
+
+# Dispatched before the baseline inputs are read: see the header.
+if [[ "$MODE" == allowlist ]]; then
+    if run_allowlist_mode; then
+        exit 0
+    fi
+    exit 1
+fi
 
 # The baseline file is the guard's only input and always exists in a checkout;
 # a missing or malformed file is a broken guard, never a pass.
@@ -98,9 +291,6 @@ fi
 files_baseline="$(baseline_value files)"
 s3_error_lines_baseline="$(baseline_value s3_error_lines)"
 ecstore_files_baseline="$(baseline_value ecstore_files)"
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
 
 # rg exits 1 on zero matches (a legitimate count of 0 at the end of the
 # migration) and >1 on real errors; only the latter may abort the check.
@@ -155,8 +345,9 @@ fi
 status=0
 
 # Exact comparison of one counter against its baseline line. Reports every
-# counter before failing so one run shows all three deltas. rustfs/backlog#2741
-# (T0.6) adds its allowlist mode beside this function, not inside it.
+# counter before failing so one run shows all three deltas. The allowlist mode
+# lives in run_allowlist_mode above, dispatched before any baseline input is
+# read, not inside this function.
 check_exact() {
     local key="$1" label="$2" count="$3" baseline="$4" inspect_cmd="$5"
 
