@@ -6,6 +6,12 @@
 
 RustFS speaks plain S3 over HTTP/1.1 and HTTP/2. Most proxy problems are not RustFS storage bugs: if the same request works directly against `:9000`, the fault is in proxy/CDN request forwarding. Use the checklist below to find which forwarding behavior broke.
 
+## Experimental HTTP/3
+
+Build with `cargo build -p rustfs --features http3` and set `RUSTFS_HTTP3_ENABLE=true` together with `RUSTFS_TLS_PATH`. HTTP/3 listens on UDP at the S3 listener's TCP address and port. Allow UDP through your firewall or proxy; clients must explicitly support HTTP/3. The console and internode RPC remain on TCP. HTTP/3 uses TLS 1.3 with `h3` ALPN, disables early data and connection migration, and follows the existing certificate reload settings.
+
+The external request stack is shared with TCP, including readiness, Keystone authentication, trusted proxy validation, rate limiting, CORS, and response compatibility. `RUSTFS_API_MAX_CONNECTIONS` bounds each transport listener separately; a value of `0` disables this cap. HTTP/3 refuses excess connections before their handshake. `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT` also bounds idle HTTP/3 body reads; unread or timed-out streams are canceled without draining them in a background task. Shutdown allows up to ten seconds for active HTTP/3 requests to finish.
+
 ## What RustFS requires from the proxy
 
 S3 clients sign requests with AWS SigV4. RustFS (via `s3s`) re-derives the signature from the forwarded request and streams the request body to storage, so the proxy must forward the signed material and the body byte-for-byte:

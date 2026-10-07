@@ -67,8 +67,8 @@ fn inherent_hotpath_measurements_have_cpu_attribution_types() {
     }
     assert_measured_as(BITROT, "BitrotReader", "read");
     assert!(
-        BITROT.contains("#[hotpath::measure(label = \"BitrotWriter::write\", impl_type = \"BitrotWriter\")]"),
-        "BitrotWriter::write must retain its stable label and CPU impl_type",
+        BITROT.contains("#[hotpath::measure(impl_type = \"BitrotWriter\", future = true)]\n    pub async fn write"),
+        "BitrotWriter::write must retain async lifecycle and CPU attribution",
     );
     for function in [
         "read_version_optimized",
