@@ -1155,6 +1155,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         self.execute_put_object_boxed(_fs, req).await
     }
