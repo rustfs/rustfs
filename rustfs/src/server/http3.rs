@@ -217,7 +217,7 @@ enum State {
 
 // Dropping an unread body cancels the receive stream without a detached drain.
 struct Body {
-    stream: RecvStream,
+    stream: Option<RecvStream>,
     state: State,
     expected_length: Option<u64>,
     received_length: u64,
@@ -228,7 +228,7 @@ struct Body {
 impl Body {
     fn new(stream: RecvStream, expected_length: Option<u64>, timeout: Duration) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
             state: State::Data,
             expected_length,
             received_length: 0,
@@ -245,7 +245,9 @@ impl Body {
         if std::future::Future::poll(timer.as_mut(), cx).is_pending() {
             return Poll::Pending;
         }
-        self.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+        // h3-quinn moves the receive stream into its pending read future.
+        // Dropping it cancels that read and sends STOP_SENDING without panic.
+        drop(self.stream.take());
         self.state = State::Done;
         Poll::Ready(Some(Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -274,7 +276,7 @@ impl HttpBody for Body {
         loop {
             match this.state {
                 State::Data => {
-                    let stream = &mut this.stream;
+                    let stream = this.stream.as_mut().expect("data state owns the receive stream");
 
                     match stream.poll_recv_data(cx) {
                         Poll::Pending => return this.pending(cx),
@@ -322,7 +324,7 @@ impl HttpBody for Body {
                     }
                 }
                 State::Trailers => {
-                    let stream = &mut this.stream;
+                    let stream = this.stream.as_mut().expect("trailers state owns the receive stream");
 
                     match stream.poll_recv_trailers(cx) {
                         Poll::Pending => return this.pending(cx),
