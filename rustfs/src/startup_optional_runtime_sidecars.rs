@@ -15,9 +15,10 @@
 use crate::{
     server::ShutdownHandle,
     startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
+    storage_api::startup::services::ServerContextSlot,
 };
 use futures_util::future::join_all;
-use std::io::Result;
+use std::{io::Result, sync::Arc};
 use tracing::info;
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -34,8 +35,8 @@ impl OptionalRuntimeServices {
     }
 }
 
-pub(crate) async fn init_optional_runtime_services() -> Result<OptionalRuntimeServices> {
-    let protocols = init_protocol_shutdown_senders().await?;
+pub(crate) async fn init_optional_runtime_services(server_ctx: Arc<ServerContextSlot>) -> Result<OptionalRuntimeServices> {
+    let protocols = init_protocol_shutdown_senders(server_ctx).await?;
     Ok(OptionalRuntimeServices::new(protocols))
 }
 

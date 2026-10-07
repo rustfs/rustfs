@@ -72,9 +72,11 @@ jobs:
   fuzz-build:
     name: Build Fuzz Harness
     if: >
-      (github.event_name == 'pull_request' && github.event.action != 'closed') ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
+      github.repository == 'rustfs/rustfs' && (
+        (github.event_name == 'pull_request' && github.event.action != 'closed') ||
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: sm-standard-4
     timeout-minutes: 60
     env:
@@ -239,7 +241,7 @@ jobs:
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
     # ci-8); PR and manual dispatch failures are already watched by a human.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

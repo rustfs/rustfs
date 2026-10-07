@@ -39,6 +39,7 @@ jobs:
   alert-on-incomplete-run:
     name: Alert on incomplete scheduled run
     if: >-
+      github.repository == 'rustfs/rustfs' &&
       github.event.workflow_run.event == 'schedule' &&
       github.event.workflow_run.conclusion != 'success' &&
       github.event.workflow_run.conclusion != 'failure'
