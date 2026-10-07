@@ -576,6 +576,27 @@ pub(crate) async fn update_in(
     Box::pin(update_with_sys(require_bucket_metadata_sys_in(ctx)?, bucket, config_file, data)).await
 }
 
+/// Validate a caller's fence after acquiring the lifecycle and metadata
+/// transaction locks, before changing the configuration.
+pub(crate) async fn update_validated_in<F>(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    validate: F,
+) -> Result<OffsetDateTime>
+where
+    F: FnOnce() -> Result<()> + Send,
+{
+    Box::pin(async {
+        let sys = require_bucket_metadata_sys_in(ctx)?;
+        let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+        validate()?;
+        update_under_config_write_guard(sys, &guard, config_file, data, None).await
+    })
+    .await
+}
+
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
     delete_with_sys(get_bucket_metadata_sys()?, bucket, config_file).await
 }
