@@ -511,6 +511,10 @@ struct StoreState {
     /// version id the target never had answers 404 `NoSuchVersion` instead of
     /// the idempotent 204 RustFS/MinIO give.
     reject_unknown_version_deletes: bool,
+    /// Models MinIO and its derivatives (Storj): `X-Minio-Internal-` is a reserved
+    /// metadata prefix, so a PutObject or UploadPart carrying any such request
+    /// header is refused with `InvalidArgument` (rustfs#8362).
+    reject_reserved_internal_headers: bool,
     limits: StoreLimits,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
@@ -975,6 +979,43 @@ impl FakeS3Target {
         lock(&self.backend.store).reject_unknown_version_deletes = enabled;
     }
 
+    /// Refuse every PutObject / UploadPart that carries an `x-minio-internal-*`
+    /// request header, the way MinIO and Storj do.
+    pub fn reject_reserved_internal_headers(&self, enabled: bool) {
+        lock(&self.backend.store).reject_reserved_internal_headers = enabled;
+    }
+
+    /// Keys of every stored, non-delete object in the bucket, sorted.
+    pub fn stored_keys(&self, bucket: &str) -> Vec<String> {
+        let state = lock(&self.backend.store);
+        let mut keys: Vec<String> = state
+            .buckets
+            .get(bucket)
+            .map(|bucket| {
+                bucket
+                    .objects
+                    .iter()
+                    .filter(|(_, versions)| versions.last().is_some_and(|version| !version.delete_marker))
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    /// Body and user metadata (names as stored, without the `x-amz-meta-` prefix)
+    /// of the latest non-delete version of an object.
+    pub fn stored_object(&self, bucket: &str, key: &str) -> Option<(Bytes, HashMap<String, String>)> {
+        lock(&self.backend.store)
+            .buckets
+            .get(bucket)
+            .and_then(|bucket| bucket.objects.get(key))
+            .and_then(|versions| versions.last())
+            .filter(|version| !version.delete_marker)
+            .map(|version| (version.body.clone(), version.metadata.clone().unwrap_or_default()))
+    }
+
     pub fn require_checksum_for_object_lock(&self, enabled: bool) {
         lock(&self.backend.store).require_checksum_for_object_lock = enabled;
     }
@@ -1173,6 +1214,15 @@ impl S3Access for FaultAccess {
                 InvalidRequest,
                 "this target does not decode aws-chunked request bodies; send a plain signed payload with an exact Content-Length"
             ));
+        }
+        if matches!(operation, Operation::PutObject | Operation::UploadPart)
+            && lock(&self.store).reject_reserved_internal_headers
+            && context
+                .headers()
+                .keys()
+                .any(|name| name.as_str().starts_with("x-minio-internal-"))
+        {
+            return Err(s3s::s3_error!(InvalidArgument, "Your metadata headers are not supported."));
         }
         let prebody_permit = if operation == Operation::CompleteMultipartUpload {
             Some(

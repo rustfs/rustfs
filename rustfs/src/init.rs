@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
+use crate::protocols::ProtocolStorageClient;
 use crate::runtime_sources::current_region;
 use crate::server::ShutdownHandle;
 use crate::server::runtime_sources::current_notify_interface;
@@ -21,6 +23,8 @@ use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::storage_api::startup::services::ECStore;
+#[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
+use crate::storage_api::startup::services::ServerContextSlot;
 use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
@@ -921,14 +925,21 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
     }
 }
 
+#[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
+pub(crate) fn protocol_storage_client_for_server(server_ctx: Arc<ServerContextSlot>) -> ProtocolStorageClient {
+    let fs = crate::storage_api::startup::init::ecfs::FS::with_server_ctx(server_ctx);
+    ProtocolStorageClient::new(fs)
+}
+
 /// Initialize the FTP system
 ///
 /// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftp_system(
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
-        use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
         use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
         use rustfs_protocols::{FtpsConfig, FtpsServer};
@@ -971,8 +982,7 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
         config.validate().await?;
 
         // Create FTP server with protocol storage client
-        let fs = crate::storage_api::startup::init::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs);
+        let storage_client = protocol_storage_client_for_server(server_ctx);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
         let passive_ports = server.config().passive_ports.clone();
@@ -1040,9 +1050,10 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
 /// the server in a background task.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftps_system(
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
-        use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
             DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_DIR, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
             ENV_FTPS_PASSIVE_PORTS, ENV_FTPS_TLS_ENABLED,
@@ -1091,8 +1102,7 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         config.validate().await?;
 
         // Create FTPS server with protocol storage client
-        let fs = crate::storage_api::startup::init::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs);
+        let storage_client = protocol_storage_client_for_server(server_ctx);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
         let passive_ports = server.config().passive_ports.clone();
@@ -1161,9 +1171,10 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 /// the server in a background task.
 #[cfg(feature = "webdav")]
 #[instrument(skip_all)]
-pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_webdav_system(
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
-        use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
             DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
             ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_MAX_CONNECTIONS, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
@@ -1211,8 +1222,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         };
 
         // Create WebDAV server with protocol storage client
-        let fs = crate::storage_api::startup::init::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs);
+        let storage_client = protocol_storage_client_for_server(server_ctx);
         let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
         let tls_enabled = server.config().tls_enabled;
@@ -1283,9 +1293,10 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
 /// and spawns the listener task.
 #[cfg(feature = "sftp")]
 #[instrument(skip_all)]
-pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_sftp_system(
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
-        use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
             DEFAULT_SFTP_ADDRESS, DEFAULT_SFTP_BANNER, DEFAULT_SFTP_IDLE_TIMEOUT, DEFAULT_SFTP_PART_SIZE, DEFAULT_SFTP_READ_ONLY,
             ENV_SFTP_ADDRESS, ENV_SFTP_BACKEND_OP_TIMEOUT_SECS, ENV_SFTP_BANNER, ENV_SFTP_ENABLE, ENV_SFTP_HANDLES_PER_SESSION,
@@ -1347,8 +1358,7 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         // file has insecure permissions.
         let host_keys = SftpConfig::load_host_keys(&config.host_key_dir).await?;
 
-        let fs = crate::storage_api::startup::init::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs);
+        let storage_client = protocol_storage_client_for_server(server_ctx);
 
         let server = SftpServer::new(config.clone(), storage_client, host_keys)?;
 

@@ -3558,6 +3558,245 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn metadata_cache_real_get_and_range_preserve_body_across_read_modes() {
+        use crate::object_api::{PutObjReader, WriteCompletion};
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        for size in [4097, 1024 * 1024 + 321] {
+            for early_stop in [false, true] {
+                for offline in [false, true] {
+                    let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                    let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                    let bucket = "metadata-cache-real-body";
+                    let object = format!("body-{size}-{early_stop}-{offline}");
+                    let body = (0..size)
+                        .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+                        .collect::<Vec<_>>();
+                    set.make_bucket(bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create real bucket");
+                    set.put_object(
+                        bucket,
+                        &object,
+                        &mut PutObjReader::from_vec(body.clone()),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit all real shards before reading");
+                    if offline {
+                        set.disks.write().await[0] = None;
+                    }
+                    let opts = ObjectOptions {
+                        suppress_read_repair: true,
+                        ..Default::default()
+                    };
+                    assert!(
+                        set.get_object_metadata_cache_bypass_reason(bucket, &opts, true)
+                            .await
+                            .is_none()
+                    );
+                    temp_env::async_with_vars(
+                        [
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some(if early_stop { "true" } else { "false" })),
+                            (
+                                "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE",
+                                Some(if early_stop { "true" } else { "false" }),
+                            ),
+                            (
+                                "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT",
+                                Some(if early_stop { "true" } else { "false" }),
+                            ),
+                        ],
+                        async {
+                            let calls = disk_call_counters::observe(&object);
+                            for range in [
+                                None,
+                                Some(HTTPRangeSpec {
+                                    is_suffix_length: false,
+                                    start: 17,
+                                    end: 103,
+                                }),
+                            ] {
+                                set.invalidate_get_object_metadata_cache(bucket, &object).await;
+                                assert!(
+                                    set.cached_get_object_fileinfo(bucket, &object).await.is_none(),
+                                    "miss fixture must be uncached"
+                                );
+                                let expected = if range.is_some() { &body[17..104] } else { body.as_slice() };
+                                let before_miss = calls.total(disk_call_counters::KIND_READ_VERSION);
+                                let mut miss = set
+                                    .get_object_reader(bucket, &object, range.clone(), HeaderMap::new(), &opts)
+                                    .await
+                                    .expect("real miss reader");
+                                assert_eq!(miss.object_info.size, i64::try_from(body.len()).expect("fixture object size"));
+                                let mut miss_body = Vec::new();
+                                miss.stream.read_to_end(&mut miss_body).await.expect("stream real cache miss");
+                                assert_eq!(miss_body, expected);
+                                assert!(
+                                    calls.total(disk_call_counters::KIND_READ_VERSION) > before_miss,
+                                    "miss must issue disk metadata reads"
+                                );
+
+                                // Partial early-stop snapshots cannot be cached. Warm through the
+                                // existing full-wait read, retaining its normal publication rules.
+                                set.get_object_fileinfo_gated(bucket, &object, &opts, true, false)
+                                    .await
+                                    .expect("complete metadata snapshot");
+                                let cached = set
+                                    .cached_get_object_fileinfo(bucket, &object)
+                                    .await
+                                    .expect("real complete snapshot published");
+                                assert!(cached.read_quorum > 0);
+                                assert_eq!(
+                                    cached.fi.inline_data(),
+                                    size == 4097,
+                                    "the real disk fixture must reach the intended storage shape"
+                                );
+                                assert!(cached.online_disks.iter().filter(|disk| disk.is_some()).count() >= cached.read_quorum);
+                                assert_eq!(cached.online_disks.len(), 4, "snapshot must retain every disk slot");
+                                assert_eq!(
+                                    cached.online_disks.iter().flatten().count(),
+                                    if offline { 3 } else { 4 },
+                                    "snapshot must include every available disk rather than only the first quorum"
+                                );
+                                let before_hit = calls.total(disk_call_counters::KIND_READ_VERSION);
+                                let snapshot = set
+                                    .get_object_fileinfo_gated(bucket, &object, &opts, true, false)
+                                    .await
+                                    .expect("real metadata cache hit");
+                                assert!(
+                                    snapshot.shared_entry().is_some_and(|entry| Arc::ptr_eq(entry, &cached)),
+                                    "hit must share the published disk snapshot"
+                                );
+                                let mut hit = set
+                                    .get_object_reader(bucket, &object, range, HeaderMap::new(), &opts)
+                                    .await
+                                    .expect("real hit reader");
+                                assert_eq!(hit.object_info.size, miss.object_info.size);
+                                let mut hit_body = Vec::new();
+                                hit.stream.read_to_end(&mut hit_body).await.expect("stream real cache hit");
+                                assert_eq!(hit_body.len(), expected.len());
+                                assert_eq!(hit_body, miss_body);
+                                assert_eq!(
+                                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                                    before_hit,
+                                    "cached GET and Range must not refetch metadata"
+                                );
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_metadata_refresh_rejects_changed_generation_and_mapped_shards() {
+        use crate::object_api::{PutObjReader, WriteCompletion};
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let bucket = "late-metadata-identity";
+        let object = "late-metadata-identity-object";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create real late-read bucket");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![7; 1024 * 1024 + 321]),
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("commit real metadata and all shard files before late refresh");
+        let disks = set.get_disks_internal().await;
+        let original = SetDisks::read_metadata_observed(&disks, "", bucket, object, "", true, false, false, false, 2)
+            .await
+            .expect("read original real disk metadata");
+        assert!(original.is_complete());
+        let (baseline, errors, _) = original.into_legacy();
+        assert!(errors.iter().all(Option::is_none), "original real shards must all be readable");
+        let (_, selected, _) =
+            SetDisks::select_valid_fileinfo(&disks, &baseline, &errors, "", 2, 3).expect("original metadata quorum");
+        assert!(!selected.inline_data(), "late fixture must retain real non-inline shard files");
+        let expected = LateMetadataIdentity::from_file_info(&selected);
+        let (_, _, original_online) =
+            SetDisks::refresh_late_metadata_fanout(&disks, bucket, object, &expected, GET_OBJECT_PATH_LEGACY_DUPLEX)
+                .await
+                .expect("matching late metadata remains usable");
+        assert_eq!(original_online.iter().flatten().count(), 4);
+
+        for changed_generation in [true, false] {
+            let changed_directory = uuid::Uuid::new_v4();
+            for (index, disk) in disks.iter().enumerate() {
+                let mut metadata = baseline[index].clone();
+                if changed_generation {
+                    metadata.data_dir = Some(changed_directory);
+                } else {
+                    metadata.erasure.index = metadata.erasure.index % 4 + 1;
+                }
+                assert!(
+                    metadata.validate_for_metadata_read().is_ok(),
+                    "mutated late metadata must remain decodable"
+                );
+                disk.as_ref()
+                    .expect("real disk slot")
+                    .write_metadata(bucket, bucket, object, metadata)
+                    .await
+                    .expect("persist late identity change");
+            }
+            let changed = SetDisks::read_metadata_observed(&disks, "", bucket, object, "", true, false, false, false, 2)
+                .await
+                .expect("read changed real disk metadata");
+            assert!(changed.is_complete(), "late fixture must reach complete metadata observation");
+            let (metadata, errors, _) = changed.into_legacy();
+            let (online, selected, _) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errors, "", 2, 3)
+                .expect("changed metadata still reaches selection quorum");
+            assert_eq!(online.iter().flatten().count(), 4, "the late identity guard must decide this failure");
+            if changed_generation {
+                assert_ne!(SetDisks::file_info_quorum_hash(&selected), expected.quorum_hash);
+            } else {
+                assert_eq!(SetDisks::file_info_quorum_hash(&selected), expected.quorum_hash);
+                assert!(
+                    metadata
+                        .iter()
+                        .enumerate()
+                        .all(|(index, item)| expected.distribution[index] != item.erasure.index)
+                );
+            }
+            let calls = disk_call_counters::observe(object);
+            let result =
+                SetDisks::refresh_late_metadata_fanout(&disks, bucket, object, &expected, GET_OBJECT_PATH_LEGACY_DUPLEX).await;
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_READ_VERSION),
+                4,
+                "late refresh must read all real disk slots before rejection"
+            );
+            assert!(
+                matches!(result, Err(Error::InsufficientReadQuorum(ref failed_bucket, ref failed_object))
+                    if failed_bucket == bucket && failed_object == object),
+                "changed late identity cannot yield usable shards (changed_generation={changed_generation})"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
         let set = new_metadata_cache_test_set().await;
 

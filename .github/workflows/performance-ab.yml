@@ -49,6 +49,7 @@ env:
 
 jobs:
   warp-ab:
+    if: github.repository == 'rustfs/rustfs'
     name: Warp A/B budget gate
     runs-on: sm-standard-2
     # A normal nightly restores the last successful binary and builds only the
@@ -364,8 +365,10 @@ jobs:
     # composite action already reports cancelled/timed-out jobs in the issue
     # body.
     if: >-
-      always() && github.event_name == 'schedule' &&
-      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      github.repository == 'rustfs/rustfs' && (
+        always() && github.event_name == 'schedule' &&
+        (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

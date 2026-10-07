@@ -42,6 +42,7 @@ concurrency:
 
 jobs:
   check-ephemerality:
+    if: github.repository == 'rustfs/rustfs'
     name: Check runner ephemerality
     runs-on: sm-standard-2
     timeout-minutes: 15
@@ -65,7 +66,7 @@ jobs:
     # Same ci-8 mechanism as coverage.yml, audit.yml and the nightly lanes:
     # scheduled runs file a tracking issue, manual dispatch stays quiet so
     # debugging never produces a spurious alert.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

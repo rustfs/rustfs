@@ -1210,6 +1210,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.notification_config = None;
         if !self.notification_config_xml.is_empty()
             && let Err(e) = deserialize::<NotificationConfiguration>(&self.notification_config_xml)
                 .map(|c| self.notification_config = Some(c))
@@ -1224,6 +1225,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.lifecycle_config = None;
         if !self.lifecycle_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
@@ -1238,6 +1240,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.object_lock_config = None;
         if !self.object_lock_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
@@ -1267,6 +1270,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.sse_config = None;
         if !self.encryption_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml).map(|c| self.sse_config = Some(c))
@@ -1281,6 +1285,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.tagging_config = None;
         if !self.tagging_config_xml.is_empty()
             && let Err(e) = deserialize::<Tagging>(&self.tagging_config_xml).map(|c| self.tagging_config = Some(c))
         {
@@ -1346,6 +1351,7 @@ impl BucketMetadata {
         } else {
             self.bucket_target_config = Some(BucketTargets::default());
         }
+        self.cors_config = None;
         if !self.cors_config_xml.is_empty()
             && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
         {
@@ -1359,6 +1365,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.logging_config = None;
         if !self.logging_config_xml.is_empty()
             && let Err(e) = deserialize::<BucketLoggingStatus>(&self.logging_config_xml).map(|c| self.logging_config = Some(c))
         {
@@ -1372,6 +1379,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.website_config = None;
         if !self.website_config_xml.is_empty()
             && let Err(e) = deserialize::<WebsiteConfiguration>(&self.website_config_xml).map(|c| self.website_config = Some(c))
         {
@@ -1385,6 +1393,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.accelerate_config = None;
         if !self.accelerate_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<AccelerateConfiguration>(&self.accelerate_config_xml).map(|c| self.accelerate_config = Some(c))
@@ -1399,6 +1408,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.request_payment_config = None;
         if !self.request_payment_config_xml.is_empty()
             && let Err(e) = deserialize::<RequestPaymentConfiguration>(&self.request_payment_config_xml)
                 .map(|c| self.request_payment_config = Some(c))
@@ -1413,6 +1423,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.public_access_block_config = None;
         if !self.public_access_block_config_xml.is_empty()
             && let Err(e) = deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)
                 .map(|c| self.public_access_block_config = Some(c))
@@ -1971,6 +1982,156 @@ mod test {
 
         assert_eq!(bm.bucket_targets_config_json, malformed_json, "raw bytes are retained");
         assert_eq!(bm.lifecycle_config_xml, malformed_xml, "raw bytes are retained");
+    }
+
+    const REPARSE_XML_FIXTURES: [(&str, &[u8]); 13] = [
+        (BUCKET_NOTIFICATION_CONFIG, br#"<NotificationConfiguration/>"#),
+        (
+            BUCKET_LIFECYCLE_CONFIG,
+            br#"<LifecycleConfiguration><Rule><ID>keep</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#,
+        ),
+        (
+            OBJECT_LOCK_CONFIG,
+            br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#,
+        ),
+        (BUCKET_VERSIONING_CONFIG, br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#),
+        (
+            BUCKET_SSECONFIG,
+            br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#,
+        ),
+        (BUCKET_TAGGING_CONFIG, br#"<Tagging><TagSet><Tag><Key>team</Key><Value>blue</Value></Tag></TagSet></Tagging>"#),
+        (
+            BUCKET_REPLICATION_CONFIG,
+            br#"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication-role</Role><Rule><ID>copy</ID><Status>Enabled</Status><Prefix>documents/</Prefix><Destination><Bucket>arn:aws:s3:::destination-bucket</Bucket></Destination></Rule></ReplicationConfiguration>"#,
+        ),
+        (
+            BUCKET_CORS_CONFIG,
+            br#"<CORSConfiguration><CORSRule><AllowedOrigin>https://example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"#,
+        ),
+        (BUCKET_LOGGING_CONFIG, br#"<BucketLoggingStatus/>"#),
+        (BUCKET_WEBSITE_CONFIG, br#"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>"#),
+        (BUCKET_ACCELERATE_CONFIG, br#"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>"#),
+        (BUCKET_REQUEST_PAYMENT_CONFIG, br#"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>"#),
+        (
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG,
+            br#"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#,
+        ),
+    ];
+
+    fn reparse_xml_state(bm: &BucketMetadata, config: &str) -> &'static str {
+        fn state<T>(raw: &[u8], parsed: &Option<T>) -> &'static str {
+            match ConfigState::of(raw, parsed) {
+                ConfigState::Absent => "absent",
+                ConfigState::Valid(_) => "valid",
+                ConfigState::Unreadable { .. } => "unreadable",
+            }
+        }
+        match config {
+            BUCKET_NOTIFICATION_CONFIG => state(&bm.notification_config_xml, &bm.notification_config),
+            BUCKET_LIFECYCLE_CONFIG => state(&bm.lifecycle_config_xml, &bm.lifecycle_config),
+            OBJECT_LOCK_CONFIG => state(&bm.object_lock_config_xml, &bm.object_lock_config),
+            BUCKET_VERSIONING_CONFIG => state(&bm.versioning_config_xml, &bm.versioning_config),
+            BUCKET_SSECONFIG => state(&bm.encryption_config_xml, &bm.sse_config),
+            BUCKET_TAGGING_CONFIG => state(&bm.tagging_config_xml, &bm.tagging_config),
+            BUCKET_REPLICATION_CONFIG => state(&bm.replication_config_xml, &bm.replication_config),
+            BUCKET_CORS_CONFIG => state(&bm.cors_config_xml, &bm.cors_config),
+            BUCKET_LOGGING_CONFIG => state(&bm.logging_config_xml, &bm.logging_config),
+            BUCKET_WEBSITE_CONFIG => state(&bm.website_config_xml, &bm.website_config),
+            BUCKET_ACCELERATE_CONFIG => state(&bm.accelerate_config_xml, &bm.accelerate_config),
+            BUCKET_REQUEST_PAYMENT_CONFIG => state(&bm.request_payment_config_xml, &bm.request_payment_config),
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => state(&bm.public_access_block_config_xml, &bm.public_access_block_config),
+            _ => panic!("unknown XML config: {config}"),
+        }
+    }
+
+    // A persisted payload can change without going through the request decoder.
+    fn replace_xml_raw(bm: &mut BucketMetadata, config: &str, raw: Vec<u8>) {
+        match config {
+            BUCKET_NOTIFICATION_CONFIG => bm.notification_config_xml = raw,
+            BUCKET_LIFECYCLE_CONFIG => bm.lifecycle_config_xml = raw,
+            OBJECT_LOCK_CONFIG => bm.object_lock_config_xml = raw,
+            BUCKET_VERSIONING_CONFIG => bm.versioning_config_xml = raw,
+            BUCKET_SSECONFIG => bm.encryption_config_xml = raw,
+            BUCKET_TAGGING_CONFIG => bm.tagging_config_xml = raw,
+            BUCKET_REPLICATION_CONFIG => bm.replication_config_xml = raw,
+            BUCKET_CORS_CONFIG => bm.cors_config_xml = raw,
+            BUCKET_LOGGING_CONFIG => bm.logging_config_xml = raw,
+            BUCKET_WEBSITE_CONFIG => bm.website_config_xml = raw,
+            BUCKET_ACCELERATE_CONFIG => bm.accelerate_config_xml = raw,
+            BUCKET_REQUEST_PAYMENT_CONFIG => bm.request_payment_config_xml = raw,
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => bm.public_access_block_config_xml = raw,
+            _ => panic!("unknown XML config: {config}"),
+        }
+    }
+
+    #[test]
+    fn reparse_xml_rejects_stale_views_after_corruption() {
+        let corrupt = b"<not-a-valid-document";
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-corrupt");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: valid setup");
+
+            replace_xml_raw(&mut bm, config, corrupt.to_vec());
+            let before = bm.marshal_msg().expect("marshal corrupt raw metadata");
+            bm.parse_all_configs()
+                .expect("one corrupt config must not fail the metadata load");
+
+            assert_eq!(reparse_xml_state(&bm, config), "unreadable", "{config}: stale view accepted");
+            assert_eq!(bm.xml_config_unreadable_len(config), Some(corrupt.len()), "{config}: missing refusal");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn reparse_xml_clears_stale_views_after_raw_is_removed() {
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-removed");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: valid setup");
+
+            replace_xml_raw(&mut bm, config, Vec::new());
+            let before = bm.marshal_msg().expect("marshal absent raw metadata");
+            bm.parse_all_configs().expect("parse removed XML");
+
+            assert_eq!(reparse_xml_state(&bm, config), "absent", "{config}: stale view survived removal");
+            assert!(!bm.xml_config_unreadable(config), "{config}: absence is not corruption");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn reparse_xml_recovers_after_corrupt_raw_is_repaired() {
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-repaired");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            replace_xml_raw(&mut bm, config, b"<not-a-valid-document".to_vec());
+            bm.parse_all_configs().expect("parse corrupt XML");
+            assert_eq!(reparse_xml_state(&bm, config), "unreadable", "{config}: corrupt setup");
+
+            replace_xml_raw(&mut bm, config, valid.to_vec());
+            let before = bm.marshal_msg().expect("marshal repaired raw metadata");
+            bm.parse_all_configs().expect("parse repaired XML");
+
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: repaired config must become readable");
+            assert!(!bm.xml_config_unreadable(config), "{config}: repaired config is not corrupt");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
     }
 
     #[test]
