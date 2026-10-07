@@ -824,6 +824,10 @@ pub fn get_condition_values_with_query_and_client_info(
     args
 }
 
+/// Condition name for `s3:object-lock-remaining-retention-days`. Storage access
+/// derives it from the requested retain-until date, so no header may set it.
+pub(crate) const OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION: &str = "object-lock-remaining-retention-days";
+
 /// Whether a request header is forbidden from contributing to policy condition key
 /// `key`, either because the server already derived that key from verified state or
 /// because it is a well-known identity/context key that only the server may populate.
@@ -836,6 +840,7 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
         ]
         .iter()
         .any(|header| key.eq_ignore_ascii_case(header.trim_start_matches("x-amz-")))
+        || key.eq_ignore_ascii_case(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION)
         || is_server_derived_condition_key(key)
 }
 
@@ -2002,6 +2007,17 @@ mod tests {
         assert_eq!(conditions.get("object-lock-mode"), None);
         assert_eq!(conditions.get("object-lock-legal-hold"), None);
         assert_eq!(conditions.get("object-lock-retain-until-date"), None);
+    }
+
+    #[test]
+    fn object_lock_remaining_retention_days_header_is_ignored() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION), None);
     }
 
     #[test]
