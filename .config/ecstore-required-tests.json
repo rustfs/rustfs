@@ -187,6 +187,11 @@
       "name": "set_disk::read::metadata_cache_tests::late_metadata_refresh_rejects_changed_generation_and_mapped_shards"
     },
     {
+      "invariant": "late-full-get-rejects-changed-object-generation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::prepared_get_object_metadata_tests::non_inline_two_phase_get_rejects_generation_change_before_late_refresh"
+    },
+    {
       "invariant": "list-objects-shared-corpus-static-namespace",
       "suite": "rustfs-ecstore",
       "name": "store::list_objects::differential_tests::list_objects_shared_corpus_static_namespace"

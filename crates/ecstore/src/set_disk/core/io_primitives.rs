@@ -6177,6 +6177,7 @@ pub(crate) mod rename_fanout_barrier {
         ReadVersion,
         MetadataSlowtailFault,
         NonInlineHedgeTimer,
+        LateMetadataRefresh,
     }
 
     impl From<&'static str> for Phase {
@@ -6188,6 +6189,7 @@ pub(crate) mod rename_fanout_barrier {
                 super::rename_fanout_barrier_phase::READ_VERSION => Self::ReadVersion,
                 "metadata_slowtail_fault" => Self::MetadataSlowtailFault,
                 "non_inline_hedge_timer" => Self::NonInlineHedgeTimer,
+                "late_metadata_refresh" => Self::LateMetadataRefresh,
                 _ => panic!("unknown commit fault phase: {label}"),
             }
         }
@@ -6201,6 +6203,9 @@ pub(crate) mod rename_fanout_barrier {
 
     /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
     pub const PHASE_NON_INLINE_HEDGE_TIMER: Phase = Phase::NonInlineHedgeTimer;
+
+    /// Object-scoped retry boundary; slot zero identifies the refresh, not a disk.
+    pub const PHASE_LATE_METADATA_REFRESH: Phase = Phase::LateMetadataRefresh;
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {
