@@ -497,6 +497,8 @@ where
 
     /// Write a (hash+data) block. Returns the number of data bytes written.
     /// Returns an error if called after a short write or if data exceeds shard_size.
+    // hotpath uses an unsafe export_name marker to enforce label uniqueness.
+    #[allow(unsafe_code)]
     #[hotpath::measure(label = "BitrotWriter::write", impl_type = "BitrotWriter")]
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {

@@ -534,6 +534,8 @@ impl AsyncRead for HashReader {
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
+            // hotpath uses an unsafe export_name marker to enforce label uniqueness.
+            #[allow(unsafe_code)]
             Poll::Ready(Ok(())) => crate::hp_measure_block!("HashReader::on_chunk", {
                 let data = &buf.filled()[before..];
                 let filled = data.len();

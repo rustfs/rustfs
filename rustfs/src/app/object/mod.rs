@@ -363,6 +363,8 @@ impl DefaultObjectUsecase {
         map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(Some)
     }
 
+    // hotpath uses unsafe export_name markers to enforce label uniqueness.
+    #[allow(unsafe_code)]
     #[hotpath::measure(
         label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_put_object",
         impl_type = "DefaultObjectUsecase"
