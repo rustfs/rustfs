@@ -531,7 +531,7 @@ impl QuotaContext {
             })
         })
         .await
-        .map_err(|err| StorageError::other(format!("quota ledger reservation task failed: {err}")))?
+        .map_err(|err| StorageError::other_with_context("quota ledger reservation task failed", err))?
     }
 }
 
@@ -1033,7 +1033,7 @@ async fn mark_commit_started(data: &ReservationLedgerData) -> Result<()> {
         save_ledger_locked(Arc::clone(&data.store), &data.ledger_object, &ledger, &ledger_guard).await
     })
     .await
-    .map_err(|err| StorageError::other(format!("quota commit marker task failed: {err}")))?
+    .map_err(|err| StorageError::other_with_context("quota commit marker task failed", err))?
 }
 
 async fn settle(data: &ReservationLedgerData, committed: bool) -> Result<()> {
@@ -1064,7 +1064,7 @@ async fn settle(data: &ReservationLedgerData, committed: bool) -> Result<()> {
         save_ledger_locked(Arc::clone(&store), &ledger_object, &ledger, &ledger_guard).await
     })
     .await
-    .map_err(|err| StorageError::other(format!("quota ledger settlement task failed: {err}")))?
+    .map_err(|err| StorageError::other_with_context("quota ledger settlement task failed", err))?
 }
 
 async fn load_current_ledger_locked(
@@ -1674,7 +1674,7 @@ async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()
         save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await
     })
     .await
-    .map_err(|err| StorageError::other(format!("quota sharded commit marker task failed: {err}")))?
+    .map_err(|err| StorageError::other_with_context("quota sharded commit marker task failed", err))?
 }
 
 async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Result<()> {
@@ -1726,7 +1726,7 @@ async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Resul
         save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await
     })
     .await
-    .map_err(|err| StorageError::other(format!("quota sharded settlement task failed: {err}")))?
+    .map_err(|err| StorageError::other_with_context("quota sharded settlement task failed", err))?
 }
 
 fn now_unix() -> i64 {
