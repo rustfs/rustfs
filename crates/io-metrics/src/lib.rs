@@ -140,7 +140,11 @@ fn record_get_stage_local_summary(
     duration_secs: f64,
 ) {
     let sample_rate = get_stage_local_summary_sample_rate();
-    if sample_rate > 1 && GET_STAGE_LOCAL_SUMMARY_SEQUENCE.fetch_add(1, Ordering::Relaxed) % sample_rate != 0 {
+    if sample_rate > 1
+        && !GET_STAGE_LOCAL_SUMMARY_SEQUENCE
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(sample_rate)
+    {
         return;
     }
 
