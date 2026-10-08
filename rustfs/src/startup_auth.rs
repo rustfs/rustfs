@@ -14,11 +14,8 @@
 
 use rustfs_iam::{
     build_oidc_sys_with_extra_root_ca_provider,
-    federation::{
-        CoreFederatedAuthorizationMapper, FederatedIdentityService,
-        oidc::{OidcConfigQuery, StandardOidcAdapter},
-    },
-    oidc::{OidcExtraRootCaMaterial, OidcExtraRootCaProvider, OidcSys},
+    federation::{CoreFederatedAuthorizationMapper, FederatedIdentityService},
+    oidc::{OidcConfigQuery, OidcExtraRootCaMaterial, OidcExtraRootCaProvider, OidcSys, StandardOidcAdapter},
 };
 use std::{
     collections::hash_map::DefaultHasher,

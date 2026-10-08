@@ -39,9 +39,7 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
-    error::Error as IamError,
-    federation::{FederatedIdentityService, oidc::OidcConfigQuery},
-    store::object::ObjectStore,
+    error::Error as IamError, federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore,
     sys::IamSys,
 };
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
@@ -544,11 +542,8 @@ mod tests {
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
     use rustfs_iam::{
-        federation::{
-            CoreFederatedAuthorizationMapper, FederatedIdentityService,
-            oidc::{OidcConfigQuery, StandardOidcAdapter},
-        },
-        oidc::OidcSys,
+        federation::{CoreFederatedAuthorizationMapper, FederatedIdentityService},
+        oidc::{OidcConfigQuery, OidcSys, StandardOidcAdapter},
         store::object::ObjectStore,
         sys::IamSys,
     };

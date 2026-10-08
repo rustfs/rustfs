@@ -16,14 +16,15 @@ mod binding;
 mod error;
 mod mapper;
 mod model;
-pub mod oidc;
 mod provider;
 mod transaction;
 
 pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
+pub(crate) use mapper::FederatedAuthorizationRule;
+#[cfg(test)]
+pub(crate) use mapper::FederatedAuthorizationRuleRef;
 pub use mapper::{CoreFederatedAuthorizationMapper, FederatedAuthorizationRules};
-pub(crate) use mapper::{FederatedAuthorizationRule, FederatedAuthorizationRuleRef};
 pub(crate) use model::OpaqueLogoutContinuation;
 pub use model::{
     FederatedAuthorization, FederatedClaims, FederatedLoginSession, FederatedProviderRef, FederatedSession,

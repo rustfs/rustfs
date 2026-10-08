@@ -35,11 +35,7 @@ use super::interfaces::{
 };
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::object_traffic_health::ObjectTrafficHealth;
-use rustfs_iam::{
-    federation::{FederatedIdentityService, oidc::OidcConfigQuery},
-    store::object::ObjectStore,
-    sys::IamSys,
-};
+use rustfs_iam::{federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
 

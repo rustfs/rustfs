@@ -14,7 +14,7 @@
 
 use crate::app::context;
 use rustfs_config::ENV_RUSTFS_BROWSER_REDIRECT_URL;
-use rustfs_iam::federation::{FederatedIdentityService, oidc::OidcConfigQuery};
+use rustfs_iam::{federation::FederatedIdentityService, oidc::OidcConfigQuery};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -104,11 +104,8 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 mod tests {
     use super::*;
     use rustfs_iam::{
-        federation::{
-            CoreFederatedAuthorizationMapper,
-            oidc::{OidcConfigQuery, StandardOidcAdapter},
-        },
-        oidc::{OidcSys, make_test_sys, test_config},
+        federation::CoreFederatedAuthorizationMapper,
+        oidc::{OidcConfigQuery, OidcSys, StandardOidcAdapter, make_test_sys, test_config},
     };
     use std::{
         io::{self, Write},

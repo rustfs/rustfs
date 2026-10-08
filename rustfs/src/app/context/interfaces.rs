@@ -22,11 +22,7 @@ use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::{
-    federation::{FederatedIdentityService, oidc::OidcConfigQuery},
-    store::object::ObjectStore,
-    sys::IamSys,
-};
+use rustfs_iam::{federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;

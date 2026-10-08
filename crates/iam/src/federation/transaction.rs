@@ -61,7 +61,7 @@ impl FederatedIdentityService {
         self.authentication.create_logout_token(continuation).await
     }
 
-    pub(super) fn from_standard_oidc_parts(
+    pub(crate) fn from_standard_oidc_parts(
         provider_query: Arc<dyn FederatedProviderQuery>,
         authentication: Arc<dyn StandardOidcAuthentication>,
         mapper: CoreFederatedAuthorizationMapper,
