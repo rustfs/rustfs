@@ -565,7 +565,8 @@ fn is_supported_idp_type(idp_type: &str) -> bool {
 fn idp_config_names(idp_type: &str) -> S3Result<Vec<(String, bool)>> {
     let config = current_active_server_config();
     match idp_type {
-        IDP_TYPE_OPENID => Ok(rustfs_iam::oidc::load_effective_oidc_provider_configs(config.as_ref())
+        IDP_TYPE_OPENID => Ok(rustfs_iam::oidc::load_oidc_config_snapshot(config.as_ref())
+            .into_providers()
             .into_iter()
             .map(|provider| (provider.config.id, provider.config.enabled))
             .collect()),
@@ -583,7 +584,8 @@ fn idp_config_info(idp_type: &str, name: &str) -> S3Result<(bool, Vec<IdpConfigE
     let config = current_active_server_config();
     match idp_type {
         IDP_TYPE_OPENID => {
-            let provider = rustfs_iam::oidc::load_effective_oidc_provider_configs(config.as_ref())
+            let provider = rustfs_iam::oidc::load_oidc_config_snapshot(config.as_ref())
+                .into_providers()
                 .into_iter()
                 .find(|provider| provider.config.id == name || (name == DEFAULT_DELIMITER && provider.config.id == "default"))
                 .ok_or_else(|| s3_error!(NoSuchResource, "openid provider '{}' not found", name))?;
