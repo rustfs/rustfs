@@ -15,7 +15,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_deployment_id, current_federated_identity_runtime, current_iam_handle, current_object_store_handle, current_region,
+    current_deployment_id, current_iam_handle, current_object_store_handle, current_oidc_config_query, current_region,
     current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
     object_store_from_req,
 };
@@ -2086,40 +2086,11 @@ fn open_id_provider_settings(config: &rustfs_iam::oidc::OidcProviderConfig) -> O
     }
 }
 
-fn open_id_settings_from_service(service: &rustfs_iam::federation::FederatedIdentityService, region: String) -> OpenIDSettings {
-    let providers = service
-        .list_providers()
-        .into_iter()
-        .filter_map(|provider| {
-            let config = service.get_provider_config(&provider.provider_id)?;
-            Some((provider.provider_id, open_id_provider_settings(config)))
-        })
-        .collect();
-
-    open_id_settings(providers, region)
-}
-
-fn open_id_settings_from_runtime(
-    oidc_config_query: Option<&dyn rustfs_iam::federation::oidc::OidcConfigQuery>,
-    service: Option<&rustfs_iam::federation::FederatedIdentityService>,
-    region: String,
-) -> OpenIDSettings {
-    if let Some(oidc_config_query) = oidc_config_query {
-        return open_id_settings_from_snapshot(&oidc_config_query.config_snapshot(), region);
-    }
-
-    service
-        .map(|service| open_id_settings_from_service(service, region))
-        .unwrap_or_default()
-}
-
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
     let region = current_region().map(|region| region.to_string()).unwrap_or_default();
-    settings.open_id = current_federated_identity_runtime()
-        .map(|(service, oidc_config_query)| {
-            open_id_settings_from_runtime(oidc_config_query.as_deref(), Some(service.as_ref()), region)
-        })
+    settings.open_id = current_oidc_config_query()
+        .map(|query| open_id_settings_from_snapshot(&query.config_snapshot(), region))
         .unwrap_or_default();
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
@@ -11444,82 +11415,6 @@ mod tests {
         }
     }
 
-    struct LegacyOidcProvider {
-        configs: Vec<rustfs_iam::oidc::OidcProviderConfig>,
-    }
-
-    struct SnapshotOidcConfigQuery {
-        snapshot: rustfs_iam::oidc::OidcConfigSnapshot,
-    }
-
-    impl rustfs_iam::federation::oidc::OidcConfigQuery for SnapshotOidcConfigQuery {
-        fn config_snapshot(&self) -> rustfs_iam::oidc::OidcConfigSnapshot {
-            self.snapshot.clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl rustfs_iam::federation::FederatedIdentityProvider for LegacyOidcProvider {
-        fn has_providers(&self) -> bool {
-            !self.configs.is_empty()
-        }
-
-        fn list_providers(&self) -> Vec<rustfs_iam::federation::FederatedProviderView> {
-            self.configs
-                .iter()
-                .map(|config| rustfs_iam::federation::FederatedProviderView {
-                    provider_id: config.id.clone(),
-                    display_name: config.display_name.clone(),
-                })
-                .collect()
-        }
-
-        fn list_visible_providers(&self) -> Vec<rustfs_iam::federation::FederatedProviderView> {
-            self.list_providers()
-        }
-
-        fn provider_config(&self, provider_id: &str) -> Option<&rustfs_iam::oidc::OidcProviderConfig> {
-            self.configs.iter().find(|config| config.id == provider_id)
-        }
-
-        async fn authorize_url(
-            &self,
-            _provider_id: &str,
-            _redirect_uri: &str,
-            _redirect_after: Option<String>,
-        ) -> rustfs_iam::federation::Result<String> {
-            unreachable!("site replication compatibility test does not authorize")
-        }
-
-        async fn exchange_code(
-            &self,
-            _state: &str,
-            _code: &str,
-            _redirect_uri: &str,
-        ) -> rustfs_iam::federation::Result<rustfs_iam::federation::FederatedCodeExchange> {
-            unreachable!("site replication compatibility test does not exchange codes")
-        }
-
-        async fn verify_web_identity_token(
-            &self,
-            _jwt: &str,
-        ) -> rustfs_iam::federation::Result<rustfs_iam::federation::FederatedAuthorization> {
-            unreachable!("site replication compatibility test does not verify tokens")
-        }
-
-        async fn create_logout_token(&self, _provider_id: &str, _id_token: &str) -> rustfs_iam::federation::Result<String> {
-            unreachable!("site replication compatibility test does not create logout tokens")
-        }
-
-        async fn build_logout_url(
-            &self,
-            _logout_token: &str,
-            _post_logout_redirect_uri: &str,
-        ) -> rustfs_iam::federation::Result<Option<String>> {
-            unreachable!("site replication compatibility test does not build logout URLs")
-        }
-    }
-
     fn ldap_settings_kvs() -> rustfs_config::server_config::KVS {
         rustfs_config::server_config::KVS(vec![
             rustfs_config::server_config::KV {
@@ -11690,43 +11585,6 @@ mod tests {
                 }
             })
         );
-    }
-
-    #[test]
-    fn service_only_oidc_runtime_preserves_site_replication_settings() {
-        let default = oidc_snapshot_provider("default", "client-a");
-        let corp = oidc_snapshot_provider("corp", "client-b");
-        let expected = open_id_settings_from_snapshot(
-            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![corp.clone(), default.clone()]),
-            "eu-site-1".to_string(),
-        );
-        let service = rustfs_iam::federation::FederatedIdentityService::new(
-            rustfs_iam::federation::FederatedIdentityRegistry::new(Arc::new(LegacyOidcProvider {
-                configs: vec![corp.config, default.config],
-            })),
-        );
-
-        assert_eq!(
-            serde_json::to_value(open_id_settings_from_runtime(None, Some(&service), "eu-site-1".to_string(),))
-                .expect("serialize legacy OpenID settings"),
-            serde_json::to_value(expected).expect("serialize snapshot OpenID settings"),
-        );
-    }
-
-    #[test]
-    fn oidc_query_takes_precedence_over_service_only_compatibility() {
-        let query = SnapshotOidcConfigQuery {
-            snapshot: rustfs_iam::oidc::OidcConfigSnapshot::new(vec![oidc_snapshot_provider("default", "query-client")]),
-        };
-        let service = rustfs_iam::federation::FederatedIdentityService::new(
-            rustfs_iam::federation::FederatedIdentityRegistry::new(Arc::new(LegacyOidcProvider {
-                configs: vec![oidc_snapshot_provider("default", "service-client").config],
-            })),
-        );
-
-        let settings = open_id_settings_from_runtime(Some(&query), Some(&service), "eu-site-1".to_string());
-
-        assert_eq!(settings.claim_provider.client_id, "query-client");
     }
 
     // A whole provider object present on one side only must not spill its
