@@ -21,6 +21,8 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
@@ -377,6 +379,7 @@ pub(crate) trait ScannerStorage:
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
     async fn scanner_data_usage_publication_blocked(&self) -> bool;
+    async fn scanner_data_movement_publication_blocked(&self) -> bool;
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus;
     fn scanner_data_movement_generation(&self) -> u64;
     fn scanner_data_movement_changed(&self) -> Arc<Notify>;
@@ -414,6 +417,10 @@ impl ScannerStorage for EcstoreStore {
 
     async fn scanner_data_usage_publication_blocked(&self) -> bool {
         EcstoreStore::scanner_data_usage_publication_blocked(self).await
+    }
+
+    async fn scanner_data_movement_publication_blocked(&self) -> bool {
+        EcstoreStore::scanner_data_movement_activity(self).await.1
     }
 
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
@@ -582,6 +589,10 @@ mod tests {
         }
 
         async fn scanner_data_usage_publication_blocked(&self) -> bool {
+            false
+        }
+
+        async fn scanner_data_movement_publication_blocked(&self) -> bool {
             false
         }
 

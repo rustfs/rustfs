@@ -369,9 +369,14 @@ async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
         let pause_status = store.scanner_data_movement_pause_status().await;
         assert!(pause_status.paused);
         assert_eq!(
-            scanner_local_publication_defer_reason(store.as_ref()).await,
+            scanner_local_publication_defer_reason(store.as_ref(), false).await,
             Some(ScannerCycleDeferReason::DataMovement),
             "an actual data-movement pause must retain durable catch-up tracking"
+        );
+        assert_eq!(
+            scanner_local_publication_defer_reason(store.as_ref(), true).await,
+            Some(ScannerCycleDeferReason::DataMovement),
+            "an observational lease must retain the data-movement fence"
         );
         paused_probe.wait().await;
         drop(paused_probe);
@@ -1425,7 +1430,7 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 
 #[tokio::test]
 #[serial]
-async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledging_usage() {
+async fn coordinator_persists_only_an_observation_during_pending_put() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let mut pause_backlog = ScannerPauseBacklogController::claim(store.clone(), scanner_pause_backlog_now())
@@ -1459,9 +1464,14 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         .expect("fixture usage baseline should be readable");
     let pending = ecstore_hold_namespace_commit(store.as_ref());
     assert_eq!(
-        scanner_local_publication_defer_reason(store.as_ref()).await,
+        scanner_local_publication_defer_reason(store.as_ref(), false).await,
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
         "an ordinary namespace commit must not be classified as data movement"
+    );
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), true).await,
+        None,
+        "an observational snapshot may publish while only an ordinary namespace commit is pending"
     );
     let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
     assert_eq!(pause_backlog_attempt, ScannerPauseBacklogAttemptDecision::Untracked);
@@ -1490,18 +1500,23 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
     assert_eq!(budget.progress().0, 1, "the coordinator must reach actual object traversal");
-    assert_eq!(
-        outcome,
-        ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    assert!(
+        matches!(
+            outcome,
+            ScannerCycleOutcome::Superseded | ScannerCycleOutcome::Partial | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ),
+        "a pending PUT may store an observation without publishing authority: {outcome:?}"
     );
     finish_scanner_pause_backlog_cycle(&mut pause_backlog, &store, pause_backlog_attempt, outcome).await;
     let pause_backlog_status = scanner_pause_backlog_status(store.clone()).await;
     assert_eq!(pause_backlog_status.phase, ScannerPauseBacklogPhase::Idle);
     assert!(!pause_backlog_status.pending_full_scan);
     assert_eq!(pause_backlog_status.catch_up_attempts, 0);
-    assert_eq!(cycle_info.next, 1, "a rejected publication must not advance the cycle");
-    assert_eq!(revision, DataUsageCacheRevision::Missing);
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    assert!(
+        matches!(revision, DataUsageCacheRevision::Etag(_)),
+        "the cycle-state floor should advance after its durable observation"
+    );
     assert_eq!(
         read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await
@@ -1509,6 +1524,11 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         baseline,
         "the pending candidate must not replace the authoritative baseline"
     );
+    let observed = read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("the pending cycle should persist its non-authoritative observation");
+    let observed: DataUsageInfo = serde_json::from_slice(&observed).expect("observed usage should decode");
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
 
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
@@ -1530,6 +1550,7 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
     drop(pending);
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+    let retry_cycle = cycle_info.next;
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
         run_data_scanner_cycle_with_budget(
@@ -1556,14 +1577,14 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         outcome,
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
     ));
-    assert_eq!(cycle_info.next, 2);
+    assert_eq!(cycle_info.next, retry_cycle + 1);
     assert!(!crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket));
     let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
         .expect("the converged usage should be persisted");
     let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("the persisted usage should decode");
     assert_eq!(usage.usage_snapshot_converged, Some(true));
-    assert_eq!(usage.scanner_cycle, Some(1));
+    assert_eq!(usage.scanner_cycle, Some(retry_cycle));
     assert_eq!(usage.objects_total_count, 1);
     assert_eq!(
         usage.objects_total_size,
@@ -1577,6 +1598,33 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     assert_eq!(bucket_usage.size, u64::try_from(committed_body.len()).expect("fixture body length"));
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let pending = ecstore_hold_namespace_commit(store.as_ref());
+
+    let complete_uses_observation = scanner_cycle_uses_observational_publication(ScannerCycleStatus::Complete, true);
+    assert!(!complete_uses_observation, "a converged Complete snapshot is authoritative");
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), complete_uses_observation).await,
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        "a Complete cycle must remain fenced while an ordinary namespace commit is pending"
+    );
+
+    assert!(scanner_cycle_uses_observational_publication(ScannerCycleStatus::Superseded, true));
+    assert!(scanner_cycle_uses_observational_publication(
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        true
+    ));
+    assert!(!scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, true));
+    assert!(!scanner_cycle_uses_observational_publication(
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+        true
+    ));
+    drop(pending);
 }
 
 #[tokio::test]
@@ -8411,6 +8459,8 @@ fn publication_lease_retry_preserves_only_recoverable_candidates() {
     for error in [
         "scanner publication lease acquisition failed: scanner publication lease capacity is exhausted",
         "scanner publication lease acquisition failed: scanner publication lease response arrived after its safety window",
+        "scanner publication lease acquisition failed: scanner publication lease is blocked by pending namespace commit",
+        "scanner publication lease acquisition failed: scanner publication lease namespace changed during acquisition",
         "scanner publication lease acquisition failed: peer node3 is temporarily offline",
     ] {
         assert!(scanner_publication_lease_error_is_retryable(error), "{error}");
@@ -8420,10 +8470,41 @@ fn publication_lease_retry_preserves_only_recoverable_candidates() {
         "scanner publication lease acquisition failed: scanner publication lease generation is stale",
         "scanner publication lease acquisition failed: peer returned a different scanner publication lease session",
         "scanner publication lease acquisition failed: scanner publication lease is blocked by data movement",
+        "scanner publication lease acquisition failed: scanner publication lease generation is exhausted",
         "scanner publication lease acquisition failed: peer returned an invalid scanner publication lease proof",
     ] {
         assert!(!scanner_publication_lease_error_is_retryable(error), "{error}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_lease_retries_pending_namespace_commit_until_it_clears() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let proof_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let result = await_scanner_publication_proof(
+        &ctx,
+        17,
+        "lease_acquire",
+        move || {
+            let attempt = proof_attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err("scanner publication lease is blocked by pending namespace commit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        |error| scanner_publication_lease_error_is_retryable(error),
+    )
+    .await;
+
+    assert!(matches!(result, ScannerPublicationProofWait::Ready(())));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(started_at.elapsed(), scanner_publication_proof_retry_delay(1));
 }
 
 #[tokio::test(start_paused = true)]

@@ -20,23 +20,38 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "S3 event type definitions for RustFS."
-keywords = ["s3", "event", "types", "rustfs"]
+description = "S3 event and error type definitions for RustFS."
+keywords = ["s3", "event", "error", "types", "rustfs"]
 categories = ["data-structures"]
+build = "build.rs"
 
 [lints]
 workspace = true
 
 [features]
 default = []
+# Legacy edge only: `From` conversions between this crate's error types and the
+# s3s error types, so the s3s-facing `impl S3` can keep using `?` while the
+# gateway migration is in flight (rustfs/backlog#2734). Off by default; the
+# runtime dependency tree of this crate carries no s3s unless a consumer asks.
+# DELETE BY T4.2 (rustfs/backlog#2784) together with src/compat_s3s.rs.
+compat-s3s = ["dep:legacy-s3s"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
 hotpath.workspace = true
+http = { workspace = true }
+# The s3s package under the name the legacy edge knows it by. Only
+# src/compat_s3s.rs may use it; see that file's header for the footprint note.
+legacy-s3s = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
+
+[dev-dependencies]
+# Oracle for the parity tests in src/compat_s3s.rs; never a normal dependency.
+legacy-s3s = { workspace = true }
 
 [lib]
 doctest = false
