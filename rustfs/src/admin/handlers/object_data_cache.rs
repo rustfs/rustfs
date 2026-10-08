@@ -31,7 +31,8 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -187,7 +188,7 @@ impl Operation for ObjectDataCacheFlushHandler {
 mod tests {
     use super::*;
     use http::HeaderMap;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     #[test]
     fn flush_outcome_maps_removed_and_noop() {

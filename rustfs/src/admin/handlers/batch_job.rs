@@ -45,7 +45,8 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use tracing::warn;
 

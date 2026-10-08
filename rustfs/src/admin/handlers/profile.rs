@@ -16,7 +16,8 @@ use crate::admin::{auth::authorize_admin_request, router::Operation};
 use http::StatusCode;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use tracing::info;
 
 /// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
@@ -66,7 +67,8 @@ mod tests {
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use rustfs_s3_types::S3ErrorCode;
+    use s3s::{Body, S3Request};
 
     fn build_profile_request(uri: &'static str) -> S3Request<Body> {
         S3Request {

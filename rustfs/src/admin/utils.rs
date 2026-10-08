@@ -15,8 +15,9 @@
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 

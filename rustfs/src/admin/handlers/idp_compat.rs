@@ -59,8 +59,9 @@ use rustfs_madmin::{
     ServiceAccountInfo,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::MaskedAccessKey;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::{collections::HashMap, sync::LazyLock};
 use time::OffsetDateTime;

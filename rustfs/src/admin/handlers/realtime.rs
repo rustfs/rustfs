@@ -30,9 +30,10 @@ use matchit::Params;
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
+use s3s::{Body, S3Request, S3Response, StdError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -284,7 +285,8 @@ mod tests {
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use rustfs_s3_types::S3ErrorCode;
+    use s3s::{Body, S3Request};
 
     fn build_metrics_request(uri: &'static str) -> S3Request<Body> {
         S3Request {

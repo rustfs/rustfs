@@ -31,13 +31,14 @@ use rustfs_extension_schema::{
     OPS_PROFILER_CAPABILITY, OpsDiagnosticsContract, OpsProfilerContract,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::{
     TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, builtin_extension_schemas,
     builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema, builtin_ops_profiler_contract,
     builtin_ops_profiler_extension_schema,
 };
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -328,7 +329,7 @@ mod tests {
                 .await
                 .expect_err("a request without credentials must be rejected"),
         ] {
-            assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("authentication required"));
         }
     }

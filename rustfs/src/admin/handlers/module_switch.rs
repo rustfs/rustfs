@@ -33,7 +33,8 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -182,7 +183,7 @@ async fn apply_module_switch_update(context: Arc<AppContext>, switches: Persiste
             failures.push("local notify convergence");
         }
 
-        Ok::<_, s3s::S3Error>(failures)
+        Ok::<_, rustfs_s3_types::S3Error>(failures)
     })
     .await?;
 
@@ -285,7 +286,7 @@ mod tests {
         let err = super::authorize_module_switch_request(&req, rustfs_policy::policy::action::AdminAction::ServerInfoAdminAction)
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("authentication required"));
     }
 

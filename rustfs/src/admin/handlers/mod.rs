@@ -88,9 +88,10 @@ pub(crate) fn admin_json_response<T: serde::Serialize>(
     secret_key: &str,
     status: http::StatusCode,
     payload: &T,
-) -> s3s::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+) -> rustfs_s3_types::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
+    let body = serde_json::to_vec(payload).map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::InternalError, format!("serialize error: {e}"))
+    })?;
     let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
 
     let mut header = hyper::HeaderMap::new();
@@ -100,14 +101,14 @@ pub(crate) fn admin_json_response<T: serde::Serialize>(
 
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,
-    mutation: impl std::future::Future<Output = s3s::S3Result<T>> + Send + 'static,
-) -> s3s::S3Result<T>
+    mutation: impl std::future::Future<Output = rustfs_s3_types::S3Result<T>> + Send + 'static,
+) -> rustfs_s3_types::S3Result<T>
 where
     T: Send + 'static,
 {
     tokio::spawn(mutation).await.map_err(|err| {
         let outcome = if err.is_cancelled() { "cancelled" } else { "panicked" };
-        s3s::s3_error!(InternalError, "{} task {}", operation, outcome)
+        rustfs_s3_types::s3_error!(InternalError, "{} task {}", operation, outcome)
     })?
 }
 

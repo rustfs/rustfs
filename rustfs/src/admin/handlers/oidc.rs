@@ -39,8 +39,9 @@ use rustfs_config::server_config::Config as ServerConfig;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_RUSTFS_BROWSER_REDIRECT_URL, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::egress::validate_outbound_url;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -942,7 +943,7 @@ fn oidc_restart_required_from_active_config(config: &ServerConfig, active_config
         != rustfs_iam::oidc::load_effective_oidc_provider_configs(active_config)
 }
 
-fn default_oidc_kvs() -> s3s::S3Result<rustfs_config::server_config::KVS> {
+fn default_oidc_kvs() -> rustfs_s3_types::S3Result<rustfs_config::server_config::KVS> {
     ServerConfig::new()
         .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
         .ok_or_else(|| s3_error!(InternalError, "default OIDC configuration missing"))

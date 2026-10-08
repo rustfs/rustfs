@@ -27,9 +27,10 @@ use rustfs_common::trace_bus::{TraceEvent, TraceKind, TraceVal, subscribe_trace_
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use rustfs_madmin::trace::TraceType;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
+use s3s::{Body, S3Request, S3Response, StdError};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -539,7 +540,8 @@ mod tests {
     use rustfs_madmin::service_commands::ServiceTraceOpts;
     use rustfs_madmin::trace::TraceType;
     use rustfs_policy::policy::action::AdminAction;
-    use s3s::{Body, S3ErrorCode, S3Request, S3Result};
+    use rustfs_s3_types::{S3ErrorCode, S3Result};
+    use s3s::{Body, S3Request};
     use std::time::{Duration, UNIX_EPOCH};
 
     fn build_profile_request(uri: &'static str) -> S3Request<Body> {

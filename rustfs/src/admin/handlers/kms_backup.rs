@@ -59,7 +59,8 @@ use rustfs_kms::backup::{
 use rustfs_kms::config::{BackendConfig, KmsConfig, LocalConfig, VaultAuthMethod};
 use rustfs_kms::{KmsBackend, KmsManager, KmsServiceManager, KmsServiceStatus};
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

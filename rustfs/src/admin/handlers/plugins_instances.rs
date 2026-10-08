@@ -41,9 +41,10 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use tracing::warn;
@@ -950,7 +951,7 @@ mod tests {
                 .await
                 .expect_err("a request without credentials must be rejected"),
         ] {
-            assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("authentication required"));
         }
     }

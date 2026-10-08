@@ -29,7 +29,8 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::Arc;
@@ -96,7 +97,7 @@ fn bucket_from_params_or_query(params: &Params<'_, '_>, uri: &hyper::Uri) -> Str
     String::new()
 }
 
-fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, s3s::S3Error> {
+fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, rustfs_s3_types::S3Error> {
     if body.is_empty() {
         return Ok(SetBucketQuotaRequest {
             quota: None,
@@ -299,7 +300,7 @@ impl Operation for SetBucketQuotaHandler {
         let fleet_proof = if request.quota.is_some() {
             Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
                 S3Error::with_message(
-                    s3s::S3ErrorCode::ServiceUnavailable,
+                    rustfs_s3_types::S3ErrorCode::ServiceUnavailable,
                     "durable quota capability is not confirmed across the cluster".to_string(),
                 )
             })?)
@@ -772,7 +773,7 @@ mod tests {
             "check quota",
         );
 
-        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]

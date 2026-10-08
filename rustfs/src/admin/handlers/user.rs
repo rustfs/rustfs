@@ -39,11 +39,11 @@ use rustfs_madmin::{
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::path::path_join_buf;
 use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response,
     header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -1352,7 +1352,8 @@ mod tests {
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
     use rustfs_madmin::user::SRSvcAccCreate;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use rustfs_s3_types::S3ErrorCode;
+    use s3s::{Body, S3Request};
     use serde_json::Value;
     use std::collections::HashMap;
 

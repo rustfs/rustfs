@@ -41,9 +41,10 @@ use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_security_governance::{AdminRouteSpec, HttpMethod};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
@@ -1241,8 +1242,9 @@ mod tests {
     use rustfs_concurrency::WorkloadClass;
     use rustfs_madmin::{InfoMessage, StorageInfo};
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_security_governance::HttpMethod;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use s3s::{Body, S3Request};
     use serde_json::json;
 
     /// Authz regression pin (rustfs/backlog#1306): datausageinfo stays an

@@ -7875,7 +7875,7 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
     )
     .await
     .expect_err("deleted file sequence must not change");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
     seed_test_snapshot_manifest(
         &metadata_backend,
@@ -7957,7 +7957,7 @@ async fn row_level_conflict_rejects_embedded_manifests_for_v2_snapshot() {
     .await
     .expect_err("new v2 snapshots must use a manifest list");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -8222,7 +8222,7 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     .await
     .expect_err("inherited manifest identity must not change");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -8422,7 +8422,7 @@ async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
             panic!("[{case}] {failure}");
         };
 
-        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest, "[{case}] {failure}");
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest, "[{case}] {failure}");
         let unchanged = store
             .load_table("warehouse", "analytics", "events")
             .await
@@ -8657,7 +8657,7 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
     .await
     .expect_err("stale row-level delete should conflict");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
     assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
@@ -8716,7 +8716,7 @@ async fn row_level_conflict_rejects_append_with_delete_files() {
     .await
     .expect_err("append must not add delete files");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -8824,7 +8824,7 @@ async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
     .await
     .expect_err("missing manifest-list should fail before pointer update");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -8932,7 +8932,7 @@ async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
     .await
     .expect_err("outside manifest-list should fail before pointer update");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -10527,7 +10527,7 @@ async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     )
     .await
     .expect_err("retention refs should require force delete");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
     let force_delete: DeleteTableRefRequest =
         serde_json::from_value(serde_json::json!({ "force": true })).expect("ref force delete should parse");
@@ -10553,7 +10553,7 @@ async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     let error = delete_table_ref_response(&store, &metadata_backend, "warehouse", &namespace, "events", "main", main_delete)
         .await
         .expect_err("main ref should remain protected");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 }
 
 #[test]

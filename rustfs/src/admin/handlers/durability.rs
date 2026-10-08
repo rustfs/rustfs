@@ -32,7 +32,8 @@ use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -79,7 +80,7 @@ pub fn register_durability_route(r: &mut S3Router<AdminOperation>) -> std::io::R
     Ok(())
 }
 
-fn parse_set_bucket_durability_request(body: &[u8]) -> Result<SetBucketDurabilityRequest, s3s::S3Error> {
+fn parse_set_bucket_durability_request(body: &[u8]) -> Result<SetBucketDurabilityRequest, rustfs_s3_types::S3Error> {
     if body.is_empty() {
         return Err(s3_error!(InvalidRequest, "request body is required, e.g. {{\"mode\":\"relaxed\"}}"));
     }
@@ -87,7 +88,7 @@ fn parse_set_bucket_durability_request(body: &[u8]) -> Result<SetBucketDurabilit
 }
 
 /// Validates and canonicalizes the requested tier name.
-fn normalize_mode(mode: &str) -> Result<String, s3s::S3Error> {
+fn normalize_mode(mode: &str) -> Result<String, rustfs_s3_types::S3Error> {
     let normalized = mode.trim().to_ascii_lowercase();
     if BucketDurabilityConfig::is_valid_mode(&normalized) {
         Ok(normalized)

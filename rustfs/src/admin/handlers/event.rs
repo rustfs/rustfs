@@ -39,8 +39,9 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1101,7 +1102,7 @@ mod tests {
         let err = authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction)
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("credentials not found"));
     }
 

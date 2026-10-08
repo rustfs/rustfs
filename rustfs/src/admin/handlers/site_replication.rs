@@ -75,11 +75,12 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::dto::{
     DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ObjectLockConfiguration,
     ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
 };
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

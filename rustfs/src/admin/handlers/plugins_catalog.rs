@@ -26,12 +26,13 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::catalog::{
     builtin::builtin_audit_target_admin_descriptors, builtin::builtin_notify_target_admin_descriptors,
 };
 use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -186,7 +187,7 @@ mod tests {
         let err = super::authorize_plugin_catalog_request(&req)
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("authentication required"));
     }
 

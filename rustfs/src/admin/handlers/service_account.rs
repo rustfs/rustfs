@@ -39,9 +39,10 @@ use rustfs_madmin::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy};
-use s3s::S3ErrorCode::InvalidRequest;
+use rustfs_s3_types::S3ErrorCode::InvalidRequest;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::header::CONTENT_LENGTH;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Request, S3Response, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;

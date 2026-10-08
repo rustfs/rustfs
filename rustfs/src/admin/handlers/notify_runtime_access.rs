@@ -14,7 +14,7 @@
 
 use crate::server::{init_event_notifier, is_event_notifier_reconciled};
 use rustfs_config::server_config::Config;
-use s3s::{S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
 pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {

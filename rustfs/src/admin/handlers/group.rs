@@ -32,10 +32,10 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;

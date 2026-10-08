@@ -24,7 +24,7 @@ use rustfs_iam::{
 };
 use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
-use s3s::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};

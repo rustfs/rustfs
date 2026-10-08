@@ -19,7 +19,8 @@ use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     let mut st_opts = ServiceTraceOpts::default();

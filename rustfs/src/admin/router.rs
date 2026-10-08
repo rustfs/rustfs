@@ -3388,14 +3388,14 @@ where
 pub trait Operation: Send + Sync + 'static {
     // fn method() -> Method;
     // fn uri() -> &'static str;
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>>;
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>>;
 }
 
 pub struct AdminOperation(pub &'static dyn Operation);
 
 #[async_trait::async_trait]
 impl Operation for AdminOperation {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
         self.0.call(req, params).await
     }
 }
@@ -3476,7 +3476,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Operation for StatusOperation {
-        async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        async fn call(
+            &self,
+            _req: S3Request<Body>,
+            _params: Params<'_, '_>,
+        ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
             Ok(S3Response::new((self.0, Body::empty())))
         }
     }

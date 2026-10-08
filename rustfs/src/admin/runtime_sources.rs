@@ -165,8 +165,9 @@ mod tests {
     use matchit::Params;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
+    use rustfs_s3_types::{S3ErrorCode, s3_error};
     use s3s::route::S3Route;
-    use s3s::{Body, S3ErrorCode, S3Request, S3Response, s3_error};
+    use s3s::{Body, S3Request, S3Response};
     use std::sync::Arc;
 
     struct UnreadyIam;
@@ -270,7 +271,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Operation for ContextDependentAdminRoute {
-        async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> s3s::S3Result<S3Response<(StatusCode, Body)>> {
+        async fn call(
+            &self,
+            req: S3Request<Body>,
+            _params: Params<'_, '_>,
+        ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
             app_context_from_req(&req).ok_or_else(|| s3_error!(ServiceUnavailable, "server context is not ready"))?;
             Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
         }

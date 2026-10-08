@@ -45,11 +45,11 @@ use rustfs_policy::{
         action::{Action, StsAction},
     },
 };
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::MaskedAccessKey;
 use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
-    s3_error,
 };
 use serde::Deserialize;
 use serde_json::Value;

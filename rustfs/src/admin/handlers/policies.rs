@@ -37,10 +37,10 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
 };
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
@@ -1113,7 +1113,7 @@ mod tests {
         })
         .expect_err("request should be invalid");
 
-        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(*err.code(), rustfs_s3_types::S3ErrorCode::InvalidArgument);
     }
 
     #[test]
