@@ -71,7 +71,7 @@ pub(crate) fn set_buffer_profile_enabled(enabled: bool) {
 }
 
 pub(crate) async fn init_observability_guard(obs_endpoint: String) -> Result<OtelGuard, ObservabilityError> {
-    rustfs_obs::init_obs(Some(obs_endpoint)).await
+    rustfs_obs::init_obs(Some(obs_endpoint), Some(crate::version::DISPLAY_VERSION.to_owned())).await
 }
 
 pub(crate) fn set_observability_guard(guard: OtelGuard) -> Result<(), ObservabilityError> {
