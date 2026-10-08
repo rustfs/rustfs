@@ -27,10 +27,11 @@ use super::tempurl;
 use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
+use http_body_util::combinators::UnsyncBoxBody;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::KEYSTONE_CREDENTIALS;
+use rustfs_s3_types::{Body, StdError};
 use rustfs_trusted_proxies::ClientInfo;
-use s3s::Body;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -51,7 +52,16 @@ fn trusted_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
         .filter(|ip| !ip.is_unspecified())
 }
 
-/// Swift-aware service that routes to Swift handlers or S3 service
+/// The request body as the Swift handlers read it: the body the server hands
+/// over, boxed without a `Sync` bound because the handlers only consume it and
+/// never pass it on.
+pub type SwiftRequestBody = UnsyncBoxBody<bytes::Bytes, StdError>;
+
+/// Swift-aware service that routes to Swift handlers or S3 service.
+///
+/// Swift responses are built as [`Body`] and converted into the wrapped S3
+/// service's response body type, so the two kinds of response leave this
+/// service as one type.
 #[derive(Clone)]
 pub struct SwiftService<S> {
     /// Swift router for URL parsing
@@ -68,15 +78,16 @@ impl<S> SwiftService<S> {
     }
 }
 
-impl<S, B> Service<Request<B>> for SwiftService<S>
+impl<S, B, ResBody> Service<Request<B>> for SwiftService<S>
 where
-    S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
+    S: Service<Request<B>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     B: axum::body::HttpBody<Data = bytes::Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
+    ResBody: From<Body> + Send + 'static,
 {
-    type Response = Response<Body>;
+    type Response = Response<ResBody>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -104,19 +115,18 @@ where
             // This is consistent with how S3 auth handler retrieves Keystone credentials
             let credentials = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()).ok().flatten();
 
-            // Convert Request<B> to Request<Body> for Swift handler
-            let req_body = req.map(|b| Body::http_body_unsync(b));
+            // Convert Request<B> to Request<SwiftRequestBody> for Swift handler
+            let req_body = req.map(|b| UnsyncBoxBody::new(http_body_util::BodyExt::map_err(b, StdError::from)));
 
             // Handle Swift operations with full request
             let response_future = handle_swift_request(req_body, route, credentials);
             return Box::pin(async move {
-                match response_future.await {
-                    Ok(response) => Ok(response),
-                    Err(swift_error) => {
-                        // Convert SwiftError to Response
-                        Ok(swift_error_to_response(swift_error))
-                    }
-                }
+                let response = match response_future.await {
+                    Ok(response) => response,
+                    // Convert SwiftError to Response
+                    Err(swift_error) => swift_error_to_response(swift_error),
+                };
+                Ok(response.map(ResBody::from))
             });
         }
 
@@ -135,7 +145,7 @@ where
 
 /// Handle Swift API requests with full access to request data
 async fn handle_swift_request(
-    req: Request<Body>,
+    req: Request<SwiftRequestBody>,
     route: SwiftRoute,
     credentials: Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
@@ -236,7 +246,7 @@ async fn handle_swift_request(
 }
 
 /// Handle TempURL-authenticated object requests
-async fn handle_tempurl_object_request(req: Request<Body>, route: SwiftRoute) -> Result<Response<Body>, SwiftError> {
+async fn handle_tempurl_object_request(req: Request<SwiftRequestBody>, route: SwiftRoute) -> Result<Response<Body>, SwiftError> {
     let SwiftRoute::Object {
         account,
         container,
@@ -269,7 +279,7 @@ async fn handle_tempurl_object_request(req: Request<Body>, route: SwiftRoute) ->
 
 /// Handle authenticated Swift API requests
 async fn handle_authenticated_request(
-    req: Request<Body>,
+    req: Request<SwiftRequestBody>,
     route: SwiftRoute,
     credentials: Credentials,
 ) -> Result<Response<Body>, SwiftError> {
@@ -666,8 +676,9 @@ async fn handle_authenticated_request(
                         .into_data_stream()
                         .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
 
-                    // Create streaming reader from the body stream
-                    let reader = StreamReader::new(stream);
+                    // Create streaming reader from the body stream; the storage
+                    // writer needs a Sync reader and the request body is only Send
+                    let reader = StreamReader::new(sync_wrapper::SyncStream::new(stream));
 
                     // Add buffering for optimal streaming performance (64KB buffer)
                     // This provides backpressure handling and reduces syscall overhead
@@ -825,12 +836,8 @@ async fn handle_authenticated_request(
                         }
                     }
 
-                    // Convert GetObjectReader stream to Body
-                    // Use ReaderStream to convert AsyncRead to Stream
-                    let stream = tokio_util::io::ReaderStream::new(reader.stream);
-                    let axum_body = axum::body::Body::from_stream(stream);
-                    // Use http_body_unsync since axum Body doesn't implement Sync
-                    let body = Body::http_body_unsync(axum_body);
+                    // Stream the GetObjectReader through a ReaderStream
+                    let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader.stream));
 
                     response
                         .body(body)
@@ -1248,11 +1255,8 @@ async fn handle_object_get(
         }
     }
 
-    // Convert GetObjectReader AsyncRead stream to Body
-    // Use ReaderStream to convert AsyncRead to Stream
-    let stream = tokio_util::io::ReaderStream::new(reader.stream);
-    let axum_body = axum::body::Body::from_stream(stream);
-    let body = Body::http_body_unsync(axum_body);
+    // Stream the GetObjectReader through a ReaderStream
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader.stream));
 
     response
         .body(body)
@@ -1315,7 +1319,7 @@ async fn handle_object_put(
     account: &str,
     container: &str,
     object: &str,
-    body: Body,
+    body: SwiftRequestBody,
     headers: &http::HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
@@ -1332,8 +1336,9 @@ async fn handle_object_put(
         .into_data_stream()
         .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
 
-    // Create streaming reader from the body stream
-    let reader = StreamReader::new(stream);
+    // Create streaming reader from the body stream; the storage writer needs a
+    // Sync reader and the request body is only Send
+    let reader = StreamReader::new(sync_wrapper::SyncStream::new(stream));
 
     // Add buffering for optimal streaming performance (64KB buffer)
     let buffered_reader = tokio::io::BufReader::with_capacity(65536, reader);
@@ -1624,5 +1629,94 @@ mod tests {
             .insert(ClientInfo::direct("0.0.0.0:0".parse::<SocketAddr>().expect("unspecified fallback")));
 
         assert_eq!(trusted_client_ip(&request), None);
+    }
+
+    // ---- the service edge: request and response body types ----
+
+    use super::{Body, SwiftService};
+    use axum::http::{Response, StatusCode};
+    use bytes::Bytes;
+    use http_body_util::combinators::UnsyncBoxBody;
+    use http_body_util::{BodyExt, Full};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt as _;
+
+    /// Stands in for the S3 service's response body type, which a Swift
+    /// response can only reach through `From<Body>`.
+    struct S3Body(Body);
+
+    impl From<Body> for S3Body {
+        fn from(body: Body) -> Self {
+            Self(body)
+        }
+    }
+
+    /// A Send-only request body, the kind the server may hand over.
+    type SendOnlyBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+    fn request(path: &str) -> Request<SendOnlyBody> {
+        let body = Full::new(Bytes::from_static(b"payload"))
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync();
+        Request::get(path).body(body).expect("a valid test request")
+    }
+
+    /// The S3 service behind the Swift one, counting the requests it gets.
+    fn s3_service(
+        calls: Arc<AtomicUsize>,
+    ) -> impl tower::Service<Request<SendOnlyBody>, Response = Response<S3Body>, Error = Infallible, Future: Send> + Clone + Send
+    {
+        tower::service_fn(move |request: Request<SendOnlyBody>| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let payload = request.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                Ok(Response::new(S3Body(Body::from(payload))))
+            }
+        })
+    }
+
+    async fn text(response: Response<S3Body>) -> String {
+        let bytes = response.into_body().0.collect().await.expect("an in-memory body").to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("a text body")
+    }
+
+    #[tokio::test]
+    async fn a_swift_error_leaves_as_the_s3_body_type_with_its_status_and_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(true, None, s3_service(Arc::clone(&calls)));
+        let response = service
+            .oneshot(request("/v1/AUTH_test/photos"))
+            .await
+            .expect("a Swift error is a response, not a service error");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["content-type"], "text/plain; charset=utf-8");
+        assert!(response.headers().contains_key("x-trans-id"));
+        assert_eq!(text(response).await, "Authentication required");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a Swift route never reaches the S3 service");
+    }
+
+    #[tokio::test]
+    async fn a_non_swift_request_reaches_the_s3_service_with_its_body_untouched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(true, None, s3_service(Arc::clone(&calls)));
+        let response = service.oneshot(request("/bucket/key")).await.expect("the S3 service answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(text(response).await, "payload", "the S3 service read the original request body");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_swift_router_hands_swift_paths_to_the_s3_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SwiftService::new(false, None, s3_service(Arc::clone(&calls)));
+        let response = service
+            .oneshot(request("/v1/AUTH_test/photos"))
+            .await
+            .expect("the S3 service answers");
+        assert_eq!(text(response).await, "payload");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

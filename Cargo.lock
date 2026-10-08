@@ -10508,6 +10508,7 @@ dependencies = [
  "rustfs-keystone",
  "rustfs-policy",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-tls-runtime",
@@ -10522,6 +10523,7 @@ dependencies = [
  "sha2 0.11.0",
  "socket2",
  "subtle",
+ "sync_wrapper",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -10703,13 +10705,18 @@ name = "rustfs-s3-types"
 version = "1.0.1"
 dependencies = [
  "bytes",
+ "futures-core",
  "hotpath",
  "http 1.5.0",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
  "s3s",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

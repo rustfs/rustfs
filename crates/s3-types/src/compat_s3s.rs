@@ -560,4 +560,178 @@ mod tests {
         assert_eq!(hint_of(&ours), hint_of(&legacy), "empty: size hint");
         assert_eq!(ours.is_end_stream(), legacy.is_end_stream(), "empty: end of stream");
     }
+
+    // ---- streams: from_stream against the s3s StreamingBlob::wrap it replaces ----
+
+    use crate::body::test_support::ScriptedStream;
+    use std::task::Poll;
+
+    type Script = fn() -> Vec<Poll<Option<io::Result<Bytes>>>>;
+
+    fn chunk(bytes: &'static [u8]) -> Poll<Option<io::Result<Bytes>>> {
+        Poll::Ready(Some(Ok(Bytes::from_static(bytes))))
+    }
+
+    fn failure(kind: io::ErrorKind) -> Poll<Option<io::Result<Bytes>>> {
+        Poll::Ready(Some(Err(io::Error::new(kind, "scripted failure"))))
+    }
+
+    /// The stream shapes the migrated call sites hand over: data then the end,
+    /// an empty chunk, no data at all, a failure after data (with and without
+    /// a pause that lets the server flush the data first), a failure first.
+    const STREAM_SCRIPTS: [(&str, Script); 6] = [
+        ("multi-chunk", || vec![chunk(b"ab"), chunk(b"cde"), chunk(b"f")]),
+        ("with an empty chunk", || vec![chunk(b"ab"), chunk(b""), chunk(b"c")]),
+        ("empty", Vec::new),
+        ("error after data", || {
+            vec![chunk(b"head"), failure(io::ErrorKind::TimedOut), chunk(b"tail")]
+        }),
+        ("error after flushed data", || {
+            vec![
+                chunk(b"head"),
+                Poll::Pending,
+                failure(io::ErrorKind::TimedOut),
+                chunk(b"tail"),
+            ]
+        }),
+        ("error first", || vec![failure(io::ErrorKind::ConnectionReset)]),
+    ];
+
+    /// What a migrated call site hands the legacy edge now, and what the same
+    /// call site built with s3s before, from identical input.
+    fn stream_pair(script: Script) -> (legacy_s3s::Body, legacy_s3s::Body) {
+        let (ours, _) = ScriptedStream::new(script());
+        let (theirs, _) = ScriptedStream::new(script());
+        (
+            legacy_s3s::Body::from(Body::from_stream(ours)),
+            legacy_s3s::Body::from(legacy_s3s::dto::StreamingBlob::wrap(theirs)),
+        )
+    }
+
+    #[test]
+    fn a_stream_reaches_s3s_with_the_length_frames_and_error_s3s_wrapping_gave_it() {
+        for (name, script) in STREAM_SCRIPTS {
+            let (ours, theirs) = stream_pair(script);
+            assert_eq!(hint_of(&ours), hint_of(&theirs), "{name}: size hint");
+            assert_eq!(ours.is_end_stream(), theirs.is_end_stream(), "{name}: end of stream");
+            let (ours, theirs) = (drain(ours), drain(theirs));
+            assert_eq!(ours.chunks, theirs.chunks, "{name}: frames");
+            assert_eq!(ours.error.is_some(), theirs.error.is_some(), "{name}: error presence");
+            assert_eq!(
+                ours.error.as_ref().and_then(as_io).map(io::Error::kind),
+                theirs.error.as_ref().and_then(as_io).map(io::Error::kind),
+                "{name}: error kind"
+            );
+        }
+    }
+
+    // ---- the wire: what hyper writes for each body, byte for byte ----
+
+    use http::{Method, Response};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `body` as a 200 response to one HTTP/1.1 request and returns the
+    /// raw bytes the client read until the server closed the connection. The
+    /// date header is off, so equal bodies must give equal bytes.
+    async fn wire(body: legacy_s3s::Body, method: &Method) -> Vec<u8> {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let response = Mutex::new(Some(Response::new(body)));
+        let service = hyper::service::service_fn(move |_request| {
+            let response = response.lock().ok().and_then(|mut slot| slot.take());
+            async move { response.ok_or("one request per connection") }
+        });
+        let server = tokio::spawn(async move {
+            // A body error aborts the connection. What the peer read before the
+            // abort is the observation; the server's own error is not.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .auto_date_header(false)
+                .serve_connection(hyper_util::rt::TokioIo::new(server), service)
+                .await;
+        });
+        let request = format!("{method} /wire HTTP/1.1\r\nhost: peer\r\nconnection: close\r\n\r\n");
+        client.write_all(request.as_bytes()).await.expect("the request is written");
+        let mut raw = Vec::new();
+        client
+            .read_to_end(&mut raw)
+            .await
+            .expect("the response is read until the close");
+        server.await.expect("the server task ends");
+        raw
+    }
+
+    type Pair = fn() -> (legacy_s3s::Body, legacy_s3s::Body);
+
+    /// Every body form the migrated call sites build, paired with the s3s body
+    /// the same site built before: in memory, empty, and each stream shape.
+    fn wire_pairs() -> Vec<(&'static str, Pair)> {
+        let mut pairs: Vec<(&'static str, Pair)> = vec![
+            ("Bytes", || {
+                let payload = Bytes::from_static(b"\x83\xa7version\x01");
+                (Body::from(payload.clone()).into(), legacy_s3s::Body::from(payload))
+            }),
+            ("String", || {
+                (
+                    Body::from(String::from("internode rpc route not found")).into(),
+                    legacy_s3s::Body::from(String::from("internode rpc route not found")),
+                )
+            }),
+            ("empty Bytes", || (Body::from(Bytes::new()).into(), legacy_s3s::Body::from(Bytes::new()))),
+            ("empty", || (Body::empty().into(), legacy_s3s::Body::empty())),
+        ];
+        pairs.extend([
+            ("stream multi-chunk", (|| stream_pair(STREAM_SCRIPTS[0].1)) as Pair),
+            ("stream with an empty chunk", || stream_pair(STREAM_SCRIPTS[1].1)),
+            ("stream empty", || stream_pair(STREAM_SCRIPTS[2].1)),
+            ("stream error after data", || stream_pair(STREAM_SCRIPTS[3].1)),
+            ("stream error after flushed data", || stream_pair(STREAM_SCRIPTS[4].1)),
+            ("stream error first", || stream_pair(STREAM_SCRIPTS[5].1)),
+        ]);
+        pairs
+    }
+
+    #[tokio::test]
+    async fn every_migrated_body_form_puts_the_bytes_its_s3s_form_did_on_the_wire() {
+        for method in [Method::GET, Method::HEAD] {
+            for (name, pair) in wire_pairs() {
+                let (ours, theirs) = pair();
+                let (ours, theirs) = (wire(ours, &method).await, wire(theirs, &method).await);
+                assert_eq!(
+                    String::from_utf8_lossy(&ours),
+                    String::from_utf8_lossy(&theirs),
+                    "{method} {name}: the wire bytes changed"
+                );
+            }
+        }
+    }
+
+    /// Controls for the harness above: the framing it compares is really on
+    /// the wire, so equal bytes are not two empty or two identical-by-accident
+    /// captures.
+    #[tokio::test]
+    async fn the_wire_harness_sees_length_framing_chunking_and_aborts() {
+        let text = |raw: Vec<u8>| String::from_utf8(raw).expect("the scripted responses are ASCII");
+
+        let sized = text(wire(Body::from("hello").into(), &Method::GET).await);
+        assert_eq!(sized, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 5\r\n\r\nhello");
+
+        let empty = text(wire(Body::empty().into(), &Method::GET).await);
+        assert_eq!(empty, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+
+        let (stream, _) = ScriptedStream::new(STREAM_SCRIPTS[0].1());
+        let chunked = text(wire(Body::from_stream(stream).into(), &Method::GET).await);
+        assert_eq!(
+            chunked,
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n3\r\ncde\r\n1\r\nf\r\n0\r\n\r\n"
+        );
+
+        // The data flushed before the failure arrives, then the connection is
+        // cut: no terminating chunk, and nothing after the error.
+        let (stream, _) = ScriptedStream::new(STREAM_SCRIPTS[4].1());
+        let aborted = text(wire(Body::from_stream(stream).into(), &Method::GET).await);
+        assert_eq!(
+            aborted,
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n4\r\nhead\r\n"
+        );
+    }
 }

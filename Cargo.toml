@@ -335,6 +335,7 @@ compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
 strum = { version = "0.28.0" }
+sync_wrapper = "1.0.2"
 sysinfo = "0.39.6"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
