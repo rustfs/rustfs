@@ -50,6 +50,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_fuzz_runner.sh
 	./scripts/test_python_bin.sh
 	./scripts/check_embedded_secrets.sh --self-test
+	./scripts/check_s3s_footprint.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py

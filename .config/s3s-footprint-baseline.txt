@@ -9,7 +9,8 @@
 #     value to the measured number in the same PR.
 #
 # files           Rust files referencing s3s paths, repo-wide minus crates/e2e_test
-# s3_error_lines  s3_error! invocation lines, same scope, summed
+# s3_error_lines  lines holding s3_error!, same scope, minus those the script
+#                 header's rule clears (rustfs_s3_types's macro); fails closed
 # ecstore_files   Rust files referencing s3s paths under crates/ecstore/src
 files=202
 s3_error_lines=1585
