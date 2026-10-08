@@ -27,7 +27,6 @@ use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
 use rustfs_madmin::{BackendInfo, Disk, StorageInfo};
@@ -192,11 +191,12 @@ fn service_not_ready_response(stage: rustfs_common::SystemStage) -> Response<Box
     response
 }
 
-impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
+impl<S, ReqBody, B> Service<HttpRequest<ReqBody>> for ReadinessGateService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
@@ -208,7 +208,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let mut inner = self.inner.clone();
         let readiness = self.readiness.clone();
         Box::pin(async move {

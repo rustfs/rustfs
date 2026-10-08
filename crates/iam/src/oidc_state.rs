@@ -234,6 +234,53 @@ mod tests {
         assert_eq!(first.is_some() as usize + second.is_some() as usize, 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distinct_auth_states_are_consumed_independently_under_concurrent_take() {
+        let store = OidcStateStore::new();
+        for (state, provider_id) in [("state_corp", "corp"), ("state_partner", "partner")] {
+            store
+                .insert(
+                    state.to_string(),
+                    OidcAuthSession {
+                        provider_id: provider_id.to_string(),
+                        pkce_verifier: format!("{provider_id}-verifier"),
+                        nonce: format!("{provider_id}-nonce"),
+                        redirect_after: None,
+                    },
+                )
+                .await;
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let first_store = store.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = tokio::spawn(async move {
+            first_barrier.wait().await;
+            first_store.take("state_corp").await
+        });
+        let second_store = store.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = tokio::spawn(async move {
+            second_barrier.wait().await;
+            second_store.take("state_partner").await
+        });
+
+        barrier.wait().await;
+        let first = first
+            .await
+            .expect("first state consumer should finish")
+            .expect("first state should remain available to its consumer");
+        let second = second
+            .await
+            .expect("second state consumer should finish")
+            .expect("second state should remain available to its consumer");
+
+        assert_eq!(first.provider_id, "corp");
+        assert_eq!(second.provider_id, "partner");
+        assert!(!store.contains("state_corp").await);
+        assert!(!store.contains("state_partner").await);
+    }
+
     #[tokio::test]
     async fn test_logout_state_store_insert_and_take() {
         let store = OidcStateStore::new();

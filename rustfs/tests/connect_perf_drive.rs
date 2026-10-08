@@ -80,7 +80,11 @@ fn request(scratch_root: &Path) -> DrivePerformanceRequest {
 async fn real_local_write_read_is_measured_and_scratch_is_removed() {
     let _guard = TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("scratch root");
-    let request = request(root.path());
+    let mut request = request(root.path());
+    // This exercises real sync_all and filesystem reads. Keep a generous
+    // deadline so a slow CI filesystem does not turn the integration test
+    // into an assertion about runner load.
+    request.duration = Duration::from_secs(10);
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("real drive benchmark");
@@ -108,7 +112,7 @@ async fn real_local_write_read_is_measured_and_scratch_is_removed() {
     assert_eq!(measurement.target.reason_code, DriveTargetReasonCode::Complete);
     assert_eq!(measurement.target.parameters.scratch_bytes, 32_768);
     assert_eq!(measurement.target.parameters.block_bytes, 4_096);
-    assert_eq!(measurement.target.parameters.duration_millis, 1_000);
+    assert_eq!(measurement.target.parameters.duration_millis, 10_000);
     assert_eq!(measurement.target.parameters.concurrency, 1);
     assert_eq!(measurement.target.units.bytes, "BYTE");
     assert_eq!(measurement.target.units.duration, "MILLISECOND");
@@ -293,14 +297,38 @@ async fn invalid_roots_and_existing_scratch_fail_without_clobbering() {
 #[tokio::test]
 async fn read_only_root_and_full_drive_errors_are_classified() {
     let _guard = TEST_LOCK.lock().await;
-    let root = tempfile::tempdir().expect("scratch root");
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).expect("make root read only");
-    let measurement = measure_drive(&request(root.path()), &CancellationToken::new())
+    let _temp_root = tempfile::tempdir().expect("scratch root");
+    // Permission bits do not make a directory unwritable to root. Linux's
+    // sysfs is a real directory whose mount rejects child creation even for
+    // privileged test runners; other Unix runners use a mode-restricted temp
+    // directory.
+    #[cfg(target_os = "linux")]
+    let read_only_root = Path::new("/sys");
+    #[cfg(not(target_os = "linux"))]
+    let read_only_root = {
+        fs::set_permissions(_temp_root.path(), fs::Permissions::from_mode(0o500)).expect("make root read only");
+        _temp_root.path()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = fs::symlink_metadata(read_only_root).expect("read-only root metadata");
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Linux read-only root must be a real directory"
+        );
+    }
+    let measurement = measure_drive(&request(read_only_root), &CancellationToken::new())
         .await
         .expect("typed permission result");
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("restore permissions");
+    #[cfg(not(target_os = "linux"))]
+    fs::set_permissions(read_only_root, fs::Permissions::from_mode(0o700)).expect("restore permissions");
     assert_eq!(measurement.result.outcome(), DriveOutcome::Failed);
-    assert_eq!(measurement.result.reason_code(), DriveReasonCode::PermissionDenied);
+    assert_eq!(
+        measurement.result.reason_code(),
+        DriveReasonCode::PermissionDenied,
+        "target result: {:?}",
+        measurement.target
+    );
     assert_eq!(measurement.target.reason_code, DriveTargetReasonCode::PermissionDenied);
     let failed = serde_json::to_value(&measurement.result).expect("failed result JSON");
     assert_eq!(failed["outcome"], "FAILED");
@@ -475,9 +503,17 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
         .load_or_create()
         .expect("enrolled identity");
-    let result = drive_command(&state, &scratch, &output, "019e3ae0-0000-7000-8000-000000000014", 32_768, true)
-        .output()
-        .expect("run production rustfs binary");
+    let result = drive_command(
+        &state,
+        &scratch,
+        &output,
+        "019e3ae0-0000-7000-8000-000000000014",
+        32_768,
+        Duration::from_secs(10),
+        true,
+    )
+    .output()
+    .expect("run production rustfs binary");
 
     assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
     assert!(fs::read_dir(&scratch).expect("scratch directory").next().is_none());
@@ -492,7 +528,7 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     assert_eq!(target["reasonCode"], "COMPLETE");
     assert_eq!(target["parameters"]["scratchBytes"], 32_768);
     assert_eq!(target["parameters"]["blockBytes"], 4_096);
-    assert_eq!(target["parameters"]["durationMillis"], 1_000);
+    assert_eq!(target["parameters"]["durationMillis"], 10_000);
     assert_eq!(target["parameters"]["concurrency"], 1);
     assert_eq!(target["units"]["bytes"], "BYTE");
     assert_eq!(target["units"]["duration"], "MILLISECOND");
@@ -555,6 +591,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &no_consent_output,
         "019e3ae0-0000-7000-8000-000000000024",
         32_768,
+        Duration::from_secs(1),
         false,
     )
     .output()
@@ -571,6 +608,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &over_limit_output,
         "019e3ae0-0000-7000-8000-000000000034",
         524_289,
+        Duration::from_secs(1),
         true,
     );
     let over_limit = over_limit.output().expect("run over limit");
@@ -592,6 +630,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &failed_output,
         "019e3ae0-0000-7000-8000-000000000044",
         32_768,
+        Duration::from_secs(1),
         true,
     )
     .output()
@@ -615,6 +654,7 @@ fn drive_command(
     output: &Path,
     artifact_uid: &str,
     scratch_bytes: u64,
+    duration: Duration,
     acknowledge_l1: bool,
 ) -> Command {
     let current = now();
@@ -644,7 +684,7 @@ fn drive_command(
             "--expires-at",
             &(current + 60).to_string(),
             "--duration-millis",
-            "1000",
+            &duration.as_millis().to_string(),
         ]);
     command
         .arg("--scratch-bytes")

@@ -183,6 +183,8 @@ pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool 
     scanner_publication_activity_error_is_retryable(error)
         || error.ends_with("scanner publication lease capacity is exhausted")
         || error.ends_with("scanner publication lease response arrived after its safety window")
+        || error.ends_with("scanner publication lease is blocked by pending namespace commit")
+        || error.ends_with("scanner publication lease namespace changed during acquisition")
 }
 
 pub(crate) enum ScannerPublicationProofWait<T, E> {

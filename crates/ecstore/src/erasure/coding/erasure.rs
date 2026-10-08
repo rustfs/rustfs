@@ -791,7 +791,7 @@ impl Erasure {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    #[hotpath::measure(label = "Erasure::encode_data", impl_type = "Erasure")]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub(crate) fn encode_data_block(&self, data: &[u8]) -> io::Result<EncodedBlock> {
         self.encode_data_block_inner(data)
     }
@@ -810,7 +810,7 @@ impl Erasure {
             .map(|block| block.into_shards(self.total_shard_count()))
     }
 
-    #[hotpath::measure(label = "Erasure::encode_data_owned", impl_type = "Erasure")]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub(crate) fn encode_data_owned_block(&self, data: Vec<u8>) -> io::Result<EncodedBlock> {
         self.encode_data_owned_block_inner(data)
     }
@@ -844,7 +844,7 @@ impl Erasure {
             .map(|block| block.into_shards(self.total_shard_count()))
     }
 
-    #[hotpath::measure(label = "Erasure::encode_data_bytes_mut", impl_type = "Erasure")]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub(crate) fn encode_data_bytes_mut_block(&self, data_buffer: BytesMut, data_len: usize) -> io::Result<EncodedBlock> {
         self.encode_buffer(data_buffer, data_len)
     }
