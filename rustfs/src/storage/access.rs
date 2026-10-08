@@ -404,7 +404,7 @@ async fn authorize_bucket_config_mutation<T>(fs: &FS, req: &mut S3Request<T>, ac
 }
 
 #[derive(Clone, Debug)]
-struct CopySourceBucketGenerationGuard {
+pub(crate) struct CopySourceBucketGenerationGuard {
     bucket: String,
     incarnation_id: uuid::Uuid,
 }
@@ -447,7 +447,7 @@ async fn wait_for_object_generation_test_hook(bucket: &str) {
 }
 
 #[derive(Clone, Debug)]
-enum PendingDeleteBucketGenerationGuard {
+pub(crate) enum PendingDeleteBucketGenerationGuard {
     Ready(BucketGenerationGuard),
     Failed { code: S3ErrorCode, message: String },
 }
@@ -495,7 +495,7 @@ async fn load_bucket_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) ->
 /// A read may consult only the source admitted before its authorization.
 /// Capture failures are deferred until a local miss actually needs that source.
 #[derive(Clone, Debug)]
-enum OdmReadGenerationGuard {
+pub(crate) enum OdmReadGenerationGuard {
     Unavailable,
     Ready(BucketGenerationGuard),
     Failed { code: S3ErrorCode, message: String },
@@ -677,6 +677,64 @@ impl ObjectTagConditions {
 
     fn matches(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
         self.bucket == bucket && self.object == object && self.version_id.as_deref() == version_id
+    }
+}
+
+/// Authorization-phase payloads for request-envelope tests, which cannot reach
+/// the private fields. Production code builds them only through the
+/// authorization paths in this module.
+#[cfg(test)]
+pub(crate) mod envelope_payloads {
+    use super::{
+        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, HashMap, ObjectTagConditions,
+        OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, TableDataPlaneListAccess,
+    };
+
+    fn incarnation() -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x7107)
+    }
+
+    pub(crate) fn bucket_generation(bucket: &str) -> BucketGenerationGuard {
+        BucketGenerationGuard {
+            bucket: bucket.to_owned(),
+            incarnation_id: incarnation(),
+        }
+    }
+
+    pub(crate) fn pending_delete_bucket_generation(bucket: &str) -> PendingDeleteBucketGenerationGuard {
+        PendingDeleteBucketGenerationGuard::Ready(bucket_generation(bucket))
+    }
+
+    pub(crate) fn copy_source_bucket_generation(bucket: &str) -> CopySourceBucketGenerationGuard {
+        CopySourceBucketGenerationGuard {
+            bucket: bucket.to_owned(),
+            incarnation_id: incarnation(),
+        }
+    }
+
+    pub(crate) fn odm_read_generation(bucket: &str) -> OdmReadGenerationGuard {
+        OdmReadGenerationGuard::Ready(bucket_generation(bucket))
+    }
+
+    pub(crate) fn bucket_config_mutation(bucket: &str) -> BucketConfigMutationSnapshot {
+        BucketConfigMutationSnapshot {
+            bucket: bucket.to_owned(),
+            incarnation_id: incarnation(),
+        }
+    }
+
+    pub(crate) fn table_list_access(bucket: &str) -> TableDataPlaneListAccess {
+        TableDataPlaneListAccess {
+            bucket: bucket.to_owned(),
+            principal_fingerprint: String::new(),
+            snapshot_fingerprint: String::new(),
+            cursor_key: [0; 32],
+            resources: Vec::new(),
+        }
+    }
+
+    pub(crate) fn object_tag_conditions(bucket: &str) -> ObjectTagConditions {
+        ObjectTagConditions::new(bucket, "object", None, HashMap::new())
     }
 }
 
