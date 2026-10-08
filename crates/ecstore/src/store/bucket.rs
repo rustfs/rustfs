@@ -204,6 +204,16 @@ where
     .await
 }
 
+fn bucket_recovery_lock_unavailable(bucket: &str, object: &str) -> StorageError {
+    StorageError::NamespaceLockQuorumUnavailable {
+        mode: "write",
+        bucket: bucket.to_string(),
+        object: object.to_string(),
+        required: 1,
+        achieved: 0,
+    }
+}
+
 async fn await_orphan_bucket_recovery<T, F>(
     bucket: &str,
     publication_guard: &rustfs_lock::NamespaceLockGuard,
@@ -215,25 +225,27 @@ async fn await_orphan_bucket_recovery<T, F>(
 where
     F: Future<Output = Result<T>>,
 {
-    for (name, guard) in [
-        ("publication", publication_guard),
-        ("lifecycle", lifecycle_guard),
-        ("metadata transaction", metadata_guard),
-        ("namespace", namespace_guard),
+    let metadata_lock_object = crate::bucket::metadata_sys::bucket_metadata_transaction_lock_key(bucket);
+    for ((lock_bucket, lock_object), guard) in [
+        (
+            (bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH),
+            publication_guard,
+        ),
+        ((bucket, BUCKET_LIFECYCLE_LOCK_OBJECT), lifecycle_guard),
+        ((RUSTFS_META_BUCKET, metadata_lock_object.as_str()), metadata_guard),
+        ((bucket, bucket), namespace_guard),
     ] {
         if guard.is_lock_lost() {
-            return Err(StorageError::other(format!(
-                "bucket {name} lock was lost before orphan recovery: {bucket}"
-            )));
+            return Err(bucket_recovery_lock_unavailable(lock_bucket, lock_object));
         }
     }
 
     tokio::select! {
         biased;
-        _ = publication_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket publication lock was lost during orphan recovery: {bucket}"))),
-        _ = lifecycle_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket lifecycle lock was lost during orphan recovery: {bucket}"))),
-        _ = metadata_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket metadata transaction lock was lost during orphan recovery: {bucket}"))),
-        _ = namespace_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket namespace lock was lost during orphan recovery: {bucket}"))),
+        _ = publication_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)),
+        _ = lifecycle_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)),
+        _ = metadata_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(RUSTFS_META_BUCKET, &metadata_lock_object)),
+        _ = namespace_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, bucket)),
         result = future => result,
     }
 }

@@ -1153,7 +1153,7 @@ async fn acquire_transaction_lock_with_sys(
 /// agree on, so renaming it would leave a mixed-version cluster with two
 /// disjoint keys — and old and new nodes would stop excluding each other on
 /// the very writes that are serialized today.
-fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
+pub(crate) fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
     format!("bucket-targets/{bucket}/transaction.lock")
 }
 
