@@ -50,8 +50,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -363,6 +363,14 @@ pub struct RequestRecord {
     pub upload_id: Option<String>,
     pub part_number: Option<i32>,
     pub content_length: Option<u64>,
+    pub source_version_id: Option<String>,
+    pub source_mtime: Option<String>,
+    pub source_etag: Option<String>,
+    pub source_replication_request: bool,
+    pub journaled_at_unix_millis: Option<u64>,
+    /// Computed by the target, before response stall/disconnect faults. This
+    /// does not prove that any response bytes reached the client.
+    pub prepared_response: Option<PreparedResponse>,
     pub consumed_bytes: Option<usize>,
     pub replication_timestamps: ReplicationTimestampHeaders,
     pub proxy_headers: ProxyHeaderSnapshot,
@@ -380,6 +388,20 @@ pub struct RequestRecord {
     pub continuation_token: Option<String>,
     pub fault: Option<FaultAction>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedResponse {
+    pub status: u16,
+    pub version_id: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_length: Option<u64>,
+    pub prepared_at_unix_millis: Option<u64>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Default)]
+struct RequestSequence(Arc<OnceLock<u64>>);
 
 /// Integrity and framing headers of an upload. A remote target's acceptance
 /// rules key off exactly these (rustfs#6853: `aws-chunked` framing stored
@@ -430,6 +452,10 @@ impl TransportSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct JournaledHeaders {
     content_length: Option<u64>,
+    source_version_id: Option<String>,
+    source_mtime: Option<String>,
+    source_etag: Option<String>,
+    source_replication_request: bool,
     replication_timestamps: ReplicationTimestampHeaders,
     proxy_headers: ProxyHeaderSnapshot,
     transport: TransportSnapshot,
@@ -444,6 +470,10 @@ impl JournaledHeaders {
                 .get(CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse().ok()),
+            source_version_id: header_value(headers, &SOURCE_VERSION_ID_HEADERS).map(bounded_journal_value),
+            source_mtime: header_value(headers, &SOURCE_MTIME_HEADERS).map(bounded_journal_value),
+            source_etag: header_value(headers, &SOURCE_ETAG_HEADERS).map(bounded_journal_value),
+            source_replication_request: header_value(headers, &SOURCE_REPLICATION_REQUEST_HEADERS).as_deref() == Some("true"),
             replication_timestamps: ReplicationTimestampHeaders::from_headers(headers),
             proxy_headers: ProxyHeaderSnapshot::from_headers(headers),
             transport: TransportSnapshot::from_headers(headers),
@@ -742,6 +772,7 @@ impl FakeS3Target {
         let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let (active_connections_tx, active_connections) = watch::channel(0usize);
         let task_connection_limit = Arc::clone(&connection_limit);
+        let task_control = Arc::clone(&control);
 
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
@@ -755,6 +786,7 @@ impl FakeS3Target {
                         };
                         active_connections_tx.send_modify(|count| *count += 1);
                         let service = service.clone();
+                        let control = Arc::clone(&task_control);
                         let active_connections = active_connections_tx.clone();
                         let mut connection_gate = connection_gate.clone();
                         connections.spawn(async move {
@@ -768,7 +800,7 @@ impl FakeS3Target {
                             {
                                 return;
                             }
-                            let handler = service_fn(move |request| handle_request(request, service.clone()));
+                            let handler = service_fn(move |request| handle_request(request, service.clone(), Arc::clone(&control)));
                             let mut connection = http1::Builder::new();
                             connection
                                 .keep_alive(false)
@@ -1202,7 +1234,10 @@ impl S3Access for FaultAccess {
         let operation = operation_from_s3_name(context.s3_op().name());
         let journaled = JournaledHeaders::from_headers(context.headers());
         let aws_chunked = journaled.transport.aws_chunked;
-        let fault = record_request(&self.control, operation, context.method().clone(), parsed, journaled);
+        let (sequence, fault) = record_request(&self.control, operation, context.method().clone(), parsed, journaled);
+        if let Some(slot) = context.extensions_mut().get::<RequestSequence>() {
+            let _ = slot.0.set(sequence);
+        }
         if let Some(status) = fault.as_ref().and_then(|fault| scripted_status(&fault.action)) {
             return Err(scripted_status_error(status));
         }
@@ -1278,7 +1313,7 @@ fn record_request(
     method: Method,
     parsed: ParsedRequest,
     headers: JournaledHeaders,
-) -> Option<RequestFault> {
+) -> (u64, Option<RequestFault>) {
     let mut state = lock(control);
     let action = parsed
         .key
@@ -1301,6 +1336,12 @@ fn record_request(
         upload_id: parsed.upload_id.map(bounded_journal_value),
         part_number: parsed.part_number,
         content_length: headers.content_length,
+        source_version_id: headers.source_version_id,
+        source_mtime: headers.source_mtime,
+        source_etag: headers.source_etag,
+        source_replication_request: headers.source_replication_request,
+        journaled_at_unix_millis: unix_millis(),
+        prepared_response: None,
         consumed_bytes: None,
         replication_timestamps: headers.replication_timestamps,
         proxy_headers: headers.proxy_headers,
@@ -1311,7 +1352,14 @@ fn record_request(
         continuation_token: parsed.continuation_token.map(bounded_journal_value),
         fault: action.clone(),
     });
-    action.map(|action| RequestFault { sequence, action })
+    (sequence, action.map(|action| RequestFault { sequence, action }))
+}
+
+fn unix_millis() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
 fn bounded_journal_value(mut value: String) -> String {
@@ -1319,14 +1367,31 @@ fn bounded_journal_value(mut value: String) -> String {
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    value.truncate(end);
-    value
+    if value.capacity() > MAX_RETAINED_IDENTIFIER_BYTES {
+        value[..end].to_owned()
+    } else {
+        value.truncate(end);
+        value
+    }
 }
 
-async fn handle_request(request: Request<Incoming>, service: S3Service) -> Result<Response<Body>, BoxError> {
-    let mut response = timeout(MAX_REQUEST_DURATION, call_s3(service, request.map(Body::from)))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fake target request exceeded 65 seconds"))??;
+async fn handle_request(
+    mut request: Request<Incoming>,
+    service: S3Service,
+    control: Arc<Mutex<ControlState>>,
+) -> Result<Response<Body>, BoxError> {
+    let started = Instant::now();
+    let sequence = RequestSequence::default();
+    request.extensions_mut().insert(sequence.clone());
+    let mut response = timeout(MAX_REQUEST_DURATION, async {
+        let result = call_s3(service, request.map(Body::from)).await;
+        if let (Ok(response), Some(sequence)) = (&result, sequence.0.get()) {
+            update_prepared_response(&control, *sequence, response, started.elapsed());
+        }
+        result
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fake target request exceeded 65 seconds"))??;
     if response.headers_mut().remove(DISCONNECT_HEADER).is_some() {
         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "fake target scripted disconnect").into());
     }
@@ -1578,6 +1643,25 @@ fn scripted_disconnect_error() -> s3s::S3Error {
 fn update_consumed(control: &Mutex<ControlState>, sequence: u64, consumed: usize) {
     if let Some(record) = lock(control).requests.iter_mut().find(|record| record.sequence == sequence) {
         record.consumed_bytes = Some(consumed);
+    }
+}
+
+fn update_prepared_response(control: &Mutex<ControlState>, sequence: u64, response: &Response<Body>, elapsed: Duration) {
+    let prepared = PreparedResponse {
+        status: response.status().as_u16(),
+        version_id: header_value(response.headers(), &["x-amz-version-id"]).map(bounded_journal_value),
+        etag: header_value(response.headers(), &[ETAG.as_str()]).map(bounded_journal_value),
+        last_modified: header_value(response.headers(), &[LAST_MODIFIED.as_str()]).map(bounded_journal_value),
+        content_length: response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok()),
+        prepared_at_unix_millis: unix_millis(),
+        elapsed,
+    };
+    if let Some(record) = lock(control).requests.iter_mut().find(|record| record.sequence == sequence) {
+        record.prepared_response = Some(prepared);
     }
 }
 
@@ -3280,9 +3364,37 @@ mod tests {
         let retry = client.clone();
         requests.spawn(async move { get_bytes(&retry, bucket, "held", None).await });
         timeout(Duration::from_secs(2), gate.entered.wait_for(|count| *count == 2)).await??;
+        let held_retry = target
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == Operation::GetObject && record.key.as_deref() == Some("held"))
+            .expect("the held retry must be journaled");
+        assert_eq!(held_retry.prepared_response, None);
         assert_eq!(
             timeout(Duration::from_secs(2), get_bytes(&client, bucket, "unrelated", None)).await??,
             Bytes::from_static(b"payload")
+        );
+        let unrelated = target
+            .requests()
+            .into_iter()
+            .find(|record| record.operation == Operation::GetObject && record.key.as_deref() == Some("unrelated"))
+            .expect("the unrelated GET must be journaled");
+        let unrelated_response = unrelated.prepared_response.expect("the unrelated GET prepared a response");
+        assert_eq!(unrelated_response.status, 200);
+        assert_eq!(
+            unrelated_response.version_id.as_deref(),
+            Some(target.stored_versions(bucket, "unrelated")[0].0.as_str())
+        );
+        assert!(held_retry.sequence < unrelated.sequence);
+        assert_eq!(
+            target
+                .requests()
+                .into_iter()
+                .find(|record| record.sequence == held_retry.sequence)
+                .expect("the held retry remains journaled")
+                .prepared_response,
+            None
         );
         assert!(requests.try_join_next().is_none(), "the retry must remain behind the gate");
         drop(gate);
@@ -3292,6 +3404,18 @@ mod tests {
                 .expect("retried GET task")??,
             Bytes::from_static(b"payload")
         );
+        let held_response = target
+            .requests()
+            .into_iter()
+            .find(|record| record.sequence == held_retry.sequence)
+            .and_then(|record| record.prepared_response)
+            .expect("the released retry prepared its own response");
+        assert_eq!(held_response.status, 200);
+        assert_eq!(
+            held_response.version_id.as_deref(),
+            Some(target.stored_versions(bucket, "held")[0].0.as_str())
+        );
+        assert_ne!(held_response.version_id, unrelated_response.version_id);
         assert_eq!(get_bytes(&client, bucket, "held", None).await?, Bytes::from_static(b"payload"));
         assert_eq!(target.count_requests(Operation::GetObject, "held"), 3);
         Ok(())
@@ -3636,6 +3760,23 @@ mod tests {
             .await?;
         assert_eq!(first_head.content_length(), Some(5));
         assert_eq!(first_head.version_id(), first.version_id.as_deref());
+        let journaled_head = target
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == Operation::HeadObject)
+            .expect("the version HEAD must be journaled");
+        assert_eq!(journaled_head.version_id, first.version_id);
+        assert!(journaled_head.journaled_at_unix_millis.is_some());
+        let prepared_head = journaled_head
+            .prepared_response
+            .expect("the version HEAD prepared a response");
+        assert_eq!(prepared_head.status, 200);
+        assert_eq!(prepared_head.version_id.as_deref(), first_head.version_id());
+        assert_eq!(prepared_head.etag.as_deref(), first_head.e_tag());
+        assert_eq!(prepared_head.content_length, Some(5));
+        assert!(prepared_head.last_modified.is_some());
+        assert!(prepared_head.prepared_at_unix_millis.is_some());
         assert_eq!(
             get_bytes(&client, "target-bucket", "nested/key", None).await?,
             Bytes::from_static(b"second")
@@ -3661,6 +3802,20 @@ mod tests {
             .await
             .expect_err("deleted version must not remain readable");
         assert_sdk_error!(deleted, 404, "NoSuchVersion");
+        let deleted_record = target
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == Operation::GetObject)
+            .expect("the deleted version GET must be journaled");
+        assert_eq!(deleted_record.version_id, first.version_id);
+        assert_eq!(
+            deleted_record
+                .prepared_response
+                .expect("the error response was prepared")
+                .status,
+            404
+        );
         let marker = client
             .delete_object()
             .bucket("target-bucket")
@@ -4092,7 +4247,21 @@ mod tests {
             .await
             .expect_err("wrong part ETag must fail without consuming the upload");
         assert_sdk_error!(invalid_complete, 400, "InvalidPart");
-        client
+        let rejected_complete = target
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == Operation::CompleteMultipartUpload)
+            .expect("the rejected completion must be journaled");
+        assert_eq!(rejected_complete.upload_id.as_deref(), Some(upload_id.as_str()));
+        assert_eq!(
+            rejected_complete
+                .prepared_response
+                .expect("the rejection was prepared")
+                .status,
+            400
+        );
+        let successful_complete = client
             .complete_multipart_upload()
             .bucket("target-bucket")
             .key("multipart")
@@ -4100,6 +4269,18 @@ mod tests {
             .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(parts)).build())
             .send()
             .await?;
+        let completed_record = target
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == Operation::CompleteMultipartUpload)
+            .expect("the successful completion must be journaled");
+        assert_eq!(completed_record.upload_id.as_deref(), Some(upload_id.as_str()));
+        let prepared_complete = completed_record
+            .prepared_response
+            .expect("the completion response was prepared");
+        assert_eq!(prepared_complete.status, 200);
+        assert_eq!(prepared_complete.version_id.as_deref(), successful_complete.version_id());
         let completed = get_bytes(&client, "target-bucket", "multipart", None).await?;
         assert_eq!(completed.len(), MIN_MULTIPART_PART_BYTES + 5);
         assert_eq!(&completed[..MIN_MULTIPART_PART_BYTES], first_body.as_ref());
@@ -4480,6 +4661,32 @@ mod tests {
             .send()
             .await?;
         assert_eq!(completed.version_id(), Some(completed_version.as_str()));
+        let receipt_records = target.requests();
+        let receipt_create = receipt_records
+            .iter()
+            .find(|record| {
+                record.operation == Operation::CreateMultipartUpload && record.key.as_deref() == Some("multipart-receipt-time")
+            })
+            .expect("the source version must be retained on MPU creation");
+        assert_eq!(receipt_create.source_version_id.as_deref(), Some(completed_version.as_str()));
+        let receipt_complete = receipt_records
+            .iter()
+            .find(|record| {
+                record.operation == Operation::CompleteMultipartUpload
+                    && record.upload_id.as_deref() == Some(receipt_upload.as_str())
+            })
+            .expect("the source mtime must be retained on completion");
+        assert_eq!(receipt_complete.source_mtime.as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert!(receipt_complete.source_replication_request);
+        assert_eq!(
+            receipt_complete
+                .prepared_response
+                .as_ref()
+                .expect("the receipt-time response was prepared")
+                .version_id
+                .as_deref(),
+            completed.version_id()
+        );
         assert_eq!(
             get_bytes(&client, "target-bucket", "multipart-receipt-time", None).await?,
             Bytes::from_static(b"completed"),
@@ -4698,6 +4905,23 @@ mod tests {
             .expect_err("disconnected request must not store an object");
         assert_sdk_error!(disconnected, 404, "NotFound");
 
+        target.inject_for_key(Operation::PutObject, "lost-response", FaultAction::DisconnectAfterResponse, 1);
+        client
+            .put_object()
+            .bucket("target-bucket")
+            .key("lost-response")
+            .body(ByteStream::from_static(b"stored"))
+            .send()
+            .await
+            .expect_err("a prepared response does not prove client delivery");
+        let lost_response_head = client
+            .head_object()
+            .bucket("target-bucket")
+            .key("lost-response")
+            .send()
+            .await?;
+        assert_eq!(lost_response_head.content_length(), Some(6));
+
         assert_eq!(
             parse_request(&Method::PUT, &"/target-bucket/key?uploadId=upload&partNumber=bad".parse::<Uri>()?).operation,
             Operation::Unknown
@@ -4711,6 +4935,28 @@ mod tests {
                 .count(),
             4
         );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.fault == Some(FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE)))
+                .all(|request| {
+                    request
+                        .prepared_response
+                        .as_ref()
+                        .is_some_and(|response| response.status == 503)
+                })
+        );
+        let lost_response = requests
+            .iter()
+            .find(|request| request.operation == Operation::PutObject && request.key.as_deref() == Some("lost-response"))
+            .expect("the disconnected response must be journaled");
+        assert_eq!(lost_response.fault, Some(FaultAction::DisconnectAfterResponse));
+        let prepared_lost_response = lost_response
+            .prepared_response
+            .as_ref()
+            .expect("the target prepared the successful response");
+        assert_eq!(prepared_lost_response.status, 200);
+        assert_eq!(prepared_lost_response.version_id.as_deref(), lost_response_head.version_id());
         assert!(
             requests
                 .iter()
@@ -4901,8 +5147,44 @@ mod tests {
             assert_eq!(records.len(), MAX_REQUEST_RECORDS);
             assert_eq!(records.front().map(|record| record.sequence), Some(2));
             assert_eq!(records.back().map(|record| record.sequence), Some((MAX_REQUEST_RECORDS + 1) as u64));
+            let mut oversized_allocation = String::with_capacity(MAX_RETAINED_IDENTIFIER_BYTES * 16);
+            oversized_allocation.push_str("short");
+            let short_value = bounded_journal_value(oversized_allocation);
+            assert_eq!(short_value, "short");
+            assert!(short_value.capacity() <= MAX_RETAINED_IDENTIFIER_BYTES);
+            let mut response = Response::new(Body::empty());
+            for name in ["x-amz-version-id", "etag", "last-modified"] {
+                response.headers_mut().insert(
+                    name,
+                    HeaderValue::from_str(&"r".repeat(MAX_RETAINED_IDENTIFIER_BYTES + 1)).expect("header"),
+                );
+            }
+            response.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("17"));
+            response
+                .headers_mut()
+                .insert("authorization", HeaderValue::from_static("unrecorded-response-authorization"));
+            response.headers_mut().insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_static("unrecorded-response-customer-key"),
+            );
+            update_prepared_response(&control, 1, &response, Duration::ZERO);
+            update_prepared_response(&control, u64::MAX, &response, Duration::ZERO);
+            assert_eq!(lock(&control).requests, records, "misses and evicted records must not be resurrected");
             let bounded_control = Mutex::new(ControlState::default());
             let utf8_boundary = format!("{}é", "a".repeat(MAX_RETAINED_IDENTIFIER_BYTES - 1));
+            let mut source_headers = HeaderMap::new();
+            for name in ["x-rustfs-source-version-id", "x-minio-source-mtime", "x-rustfs-source-etag"] {
+                source_headers.insert(
+                    name,
+                    HeaderValue::from_str(&"s".repeat(MAX_RETAINED_IDENTIFIER_BYTES + 1)).expect("header"),
+                );
+            }
+            source_headers.insert("x-minio-source-replication-request", HeaderValue::from_static("true"));
+            source_headers.insert("authorization", HeaderValue::from_static("unrecorded-request-authorization"));
+            source_headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_static("unrecorded-request-customer-key"),
+            );
             record_request(
                 &bounded_control,
                 Operation::GetObject,
@@ -4915,8 +5197,9 @@ mod tests {
                     upload_id: Some("u".repeat(MAX_RETAINED_IDENTIFIER_BYTES + 1)),
                     ..Default::default()
                 },
-                JournaledHeaders::default(),
+                JournaledHeaders::from_headers(&source_headers),
             );
+            update_prepared_response(&bounded_control, 1, &response, Duration::from_millis(7));
             {
                 let bounded_records = lock(&bounded_control);
                 let bounded = &bounded_records.requests[0];
@@ -4924,7 +5207,39 @@ mod tests {
                 assert_eq!(bounded.key.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES - 1));
                 assert_eq!(bounded.version_id.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
                 assert_eq!(bounded.upload_id.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                assert_eq!(bounded.source_version_id.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                assert_eq!(bounded.source_mtime.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                assert_eq!(bounded.source_etag.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                for value in [&bounded.source_version_id, &bounded.source_mtime, &bounded.source_etag]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(value.capacity() <= MAX_RETAINED_IDENTIFIER_BYTES);
+                }
+                assert!(bounded.source_replication_request);
+                let prepared = bounded
+                    .prepared_response
+                    .as_ref()
+                    .expect("the retained record receives its response");
+                assert_eq!(prepared.version_id.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                assert_eq!(prepared.etag.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                assert_eq!(prepared.last_modified.as_ref().map(String::len), Some(MAX_RETAINED_IDENTIFIER_BYTES));
+                for value in [&prepared.version_id, &prepared.etag, &prepared.last_modified]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(value.capacity() <= MAX_RETAINED_IDENTIFIER_BYTES);
+                }
+                assert_eq!(prepared.content_length, Some(17));
+                assert_eq!(prepared.elapsed, Duration::from_millis(7));
+                assert!(
+                    !format!("{bounded:?}").contains("unrecorded-"),
+                    "authorization and customer keys must not enter the journal"
+                );
             }
+            lock(&bounded_control).requests.clear();
+            update_prepared_response(&bounded_control, 1, &response, Duration::ZERO);
+            assert!(lock(&bounded_control).requests.is_empty(), "a drained record must not be resurrected");
             let target = FakeS3Target::start().await.expect("target");
             target.create_bucket("b".repeat(63));
             let empty_bucket = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
