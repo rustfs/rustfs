@@ -70,17 +70,18 @@ impl FederatedIdentityService {
         binding: &dyn FederatedSessionBinding,
     ) -> Result<FederatedLoginSession> {
         let exchange = self.registry.standard_oidc().exchange_code(state, code, redirect_uri).await?;
-        let provider_id = exchange.authorization.provider_id.clone();
+        let (authorization, redirect_after, logout_continuation) = exchange.into_parts();
         let transaction = FederatedSessionTransaction {
-            authorization: exchange.authorization,
+            authorization,
             duration_seconds,
             session_policy: None,
         };
         let credentials = binding.bind(&transaction).await?;
+        let (provider, id_token) = logout_continuation.into_parts();
         let logout_token = self
             .registry
             .standard_oidc()
-            .create_logout_token(&provider_id, &exchange.id_token)
+            .create_logout_token(provider.as_str(), &id_token)
             .await?;
 
         Ok(FederatedLoginSession {
@@ -88,7 +89,7 @@ impl FederatedIdentityService {
                 credentials,
                 authorization: transaction.authorization,
             },
-            redirect_after: exchange.redirect_after,
+            redirect_after,
             logout_token,
         })
     }
