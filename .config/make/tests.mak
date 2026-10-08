@@ -51,6 +51,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_python_bin.sh
 	./scripts/check_embedded_secrets.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_migration_gate_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
