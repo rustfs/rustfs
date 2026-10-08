@@ -1651,7 +1651,7 @@ where
     pub(in crate::table_catalog) async fn tombstone_table_warehouse_index_for_drop(
         &self,
         entry: &TableEntry,
-        replace_deleted_owner: bool,
+        authoritative_strong_owner: bool,
     ) -> TableCatalogStoreResult<()> {
         let index = table_warehouse_index_entry(entry)?;
         let mut tombstone = index.clone();
@@ -1679,7 +1679,14 @@ where
         if current == tombstone {
             return Ok(());
         }
-        if current != index && !(replace_deleted_owner && current.state == TableCatalogEntryState::Deleted) {
+        // Materialized indexes can retain the old identifier after a strong-catalog rename.
+        let same_stable_owner = current.state == TableCatalogEntryState::Active
+            && current.table_bucket == index.table_bucket
+            && current.warehouse_object_prefix == index.warehouse_object_prefix
+            && current.table_id == index.table_id;
+        if current != index
+            && !(authoritative_strong_owner && (current.state == TableCatalogEntryState::Deleted || same_stable_owner))
+        {
             return Err(TableCatalogStoreError::Conflict(format!(
                 "table warehouse index owner changed before drop: {}",
                 index.warehouse_object_prefix
