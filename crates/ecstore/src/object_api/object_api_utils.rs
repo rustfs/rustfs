@@ -29,7 +29,7 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
-use s3s::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 
 //#[derive(Clone)]
 pub struct PutObjReader {
