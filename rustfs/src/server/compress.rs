@@ -548,7 +548,10 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let category = if req.method() == http::Method::POST
             && req.uri().path() == "/"
-            && req.extensions().get::<crate::server::layer::StsQueryRequest>().is_some()
+            && req
+                .extensions()
+                .get::<crate::server::legacy_compat::StsQueryRequest>()
+                .is_some()
         {
             PathCategory::StsQueryApi
         } else {

@@ -242,6 +242,14 @@ pub(crate) mod server {
         }
     }
 
+    /// The s3s error types the s3s-compat tower layers in
+    /// `server::legacy_compat` render and match on, funneled here so those
+    /// files stay off the direct s3s surface (s3s footprint ratchet). T2.12
+    /// (rustfs/backlog#2771) removes the layers and with them this module.
+    pub(crate) mod legacy_compat {
+        pub(crate) use s3s::{S3Error, S3ErrorCode};
+    }
+
     pub(crate) mod module_switch {
         pub(crate) use crate::storage::storage_api::{
             Error, read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
