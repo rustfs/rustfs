@@ -1389,10 +1389,17 @@ where
         Ok(true)
     }
 
-    async fn ensure_table_warehouse_prefix_available(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
+    async fn ensure_table_warehouse_prefix_available(
+        &self,
+        entry: &TableEntry,
+        locked_table_entry: Option<&str>,
+    ) -> TableCatalogStoreResult<()> {
         let candidate = table_warehouse_index_entry(entry)?;
         validate_table_entry_version_and_id(entry)?;
-        for existing in self.list_all_table_entries(&candidate.table_bucket).await? {
+        for existing in self
+            .list_all_table_entries_with_limit(&candidate.table_bucket, None, locked_table_entry)
+            .await?
+        {
             if existing.state != TableCatalogEntryState::Active {
                 continue;
             }
@@ -1447,6 +1454,7 @@ where
         &self,
         entry: &TableEntry,
         prefix_already_checked: bool,
+        locked_table_entry: &str,
     ) -> TableCatalogStoreResult<WarehouseIndexReservation> {
         let index = table_warehouse_index_entry(entry)?;
         let object = self
@@ -1463,7 +1471,8 @@ where
         }
         // Registration already checked the prefix while holding the bucket publication fence.
         if !prefix_already_checked {
-            self.ensure_table_warehouse_prefix_available(entry).await?;
+            self.ensure_table_warehouse_prefix_available(entry, Some(locked_table_entry))
+                .await?;
         }
         loop {
             match self
@@ -1704,8 +1713,13 @@ where
         .await
     }
 
-    async fn restore_table_warehouse_index_after_failed_drop(&self, entry: &TableEntry, reason: &'static str) {
-        if let Err(err) = self.reserve_table_warehouse_index(entry, false).await {
+    async fn restore_table_warehouse_index_after_failed_drop(
+        &self,
+        entry: &TableEntry,
+        locked_table_entry: &str,
+        reason: &'static str,
+    ) {
+        if let Err(err) = self.reserve_table_warehouse_index(entry, false, locked_table_entry).await {
             tracing::warn!(
                 table_bucket = %entry.table_bucket,
                 namespace = %entry.namespace,
@@ -1874,7 +1888,7 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         let mut matched: Option<TableDataPlaneResource> = None;
         for table in self
-            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS))
+            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS), None)
             .await?
         {
             if table.state != TableCatalogEntryState::Active {
@@ -1933,7 +1947,7 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Ok(());
         }
-        self.reserve_table_warehouse_index(&current, prefix_already_checked)
+        self.reserve_table_warehouse_index(&current, prefix_already_checked, &table_path)
             .await
             .map(|_| ())
     }
@@ -1966,7 +1980,7 @@ where
             return Ok(());
         }
         let tables = self
-            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects)
+            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects, None)
             .await?
             .into_iter()
             .filter(|table| table.state == TableCatalogEntryState::Active)
@@ -2047,7 +2061,7 @@ where
     }
 
     async fn list_all_table_entries(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        self.list_all_table_entries_with_limit(table_bucket, None).await
+        self.list_all_table_entries_with_limit(table_bucket, None, None).await
     }
 
     async fn list_table_entry_objects_for_data_plane_scan(
@@ -2095,6 +2109,7 @@ where
         &self,
         table_bucket: &str,
         max_catalog_objects: Option<usize>,
+        locked_table_entry: Option<&str>,
     ) -> TableCatalogStoreResult<Vec<TableEntry>> {
         let mut entries = Vec::new();
         let table_objects = match max_catalog_objects {
@@ -2111,7 +2126,13 @@ where
                 .collect(),
         };
         for object in table_objects {
-            let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
+            // Only the exact entry protected by the caller's write lock can bypass a read lock.
+            let entry = if locked_table_entry == Some(object.as_str()) {
+                self.read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &object).await?
+            } else {
+                self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await?
+            };
+            let Some((entry, _)) = entry else {
                 continue;
             };
             validate_table_entry_object(&self.paths, &object, &entry)?;
@@ -2275,8 +2296,9 @@ where
                 "table registration requires a table publication fence".to_string(),
             ));
         }
-        self.ensure_table_warehouse_prefix_available(&entry).await?;
-        let reservation = self.reserve_table_warehouse_index(&entry, true).await?;
+        self.ensure_table_warehouse_prefix_available(&entry, Some(&table_path))
+            .await?;
+        let reservation = self.reserve_table_warehouse_index(&entry, true, &table_path).await?;
         if !publication.holds_table_bucket(&entry.table_bucket)
             || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
         {
@@ -5314,7 +5336,7 @@ where
     }
 
     async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
-        self.ensure_table_warehouse_prefix_available(candidate).await
+        self.ensure_table_warehouse_prefix_available(candidate, None).await
     }
 
     async fn list_tables_page(
@@ -5940,9 +5962,9 @@ where
         next.version_token = staged_commit_log.new_version_token.clone();
         next.generation = current.generation.saturating_add(1);
         if next.warehouse_location != current.warehouse_location {
-            self.ensure_table_warehouse_prefix_available(&next).await?;
+            self.ensure_table_warehouse_prefix_available(&next, Some(&table_path)).await?;
         }
-        let reservation = self.reserve_table_warehouse_index(&next, false).await?;
+        let reservation = self.reserve_table_warehouse_index(&next, false, &table_path).await?;
 
         let staged_write_result = async {
             if !has_existing_commit {
@@ -6082,7 +6104,7 @@ where
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
         {
-            self.restore_table_warehouse_index_after_failed_drop(&entry, "table publication fence lost")
+            self.restore_table_warehouse_index_after_failed_drop(&entry, &object, "table publication fence lost")
                 .await;
             return Err(TableCatalogStoreError::Internal(
                 "table drop publication fence was lost before catalog update".to_string(),
@@ -6092,7 +6114,7 @@ where
             match self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await {
                 Ok(None) => return Ok(()),
                 Ok(Some((current, _))) if current == entry => {
-                    self.restore_table_warehouse_index_after_failed_drop(&entry, "table entry delete failed")
+                    self.restore_table_warehouse_index_after_failed_drop(&entry, &object, "table entry delete failed")
                         .await;
                 }
                 Ok(Some(_)) => {

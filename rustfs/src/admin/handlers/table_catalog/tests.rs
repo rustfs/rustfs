@@ -3278,6 +3278,157 @@ async fn create_view_holds_publication_fences_from_metadata_write_through_regist
 }
 
 #[tokio::test]
+async fn object_create_table_response_recreates_renamed_source_without_relocking_or_crossing_identities() {
+    for destination in ["analytics", "curated"] {
+        let backend = TestTableCatalogObjectBackend {
+            reject_reads_while_write_locked: true,
+            ..TestTableCatalogObjectBackend::content_addressed()
+        };
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+        create_standard_events_table(&store, &backend, &namespace).await;
+        let first = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+        let initial_metadata = backend
+            .read_object("warehouse", &first.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        let commit_id = "11111111-1111-4111-8111-111111111111";
+        let first_commit = standard_commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&backend),
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &first.table_uuid, "original"),
+        )
+        .await
+        .expect("original table should commit before rename");
+        let first_commit_object = table_metadata_location_for_catalog("warehouse", &first_commit.metadata_location).unwrap();
+        let committed_metadata = backend.read_object("warehouse", &first_commit_object).await.unwrap().unwrap();
+        if destination != "analytics" {
+            create_namespace_response(
+                &store,
+                "warehouse",
+                CreateNamespaceRequest {
+                    namespace: vec![destination.to_string()],
+                    properties: BTreeMap::new(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        store
+            .rename_table("warehouse", "analytics", "events", destination, "events_v2")
+            .await
+            .unwrap();
+        let restarted = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let renamed = restarted
+            .load_table("warehouse", destination, "events_v2")
+            .await
+            .unwrap()
+            .unwrap();
+        let original_receipt = restarted
+            .get_commit_by_id("warehouse", &renamed.table_id, commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"}
+            ]}
+        }))
+        .unwrap();
+        let response = create_table_response(
+            &restarted,
+            &TableCommitObjectBackend::trusted(backend.clone()),
+            "warehouse",
+            &namespace,
+            request,
+            true,
+        )
+        .await
+        .expect("source recreation should publish without re-locking its tombstone");
+        let recreated = restarted
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(recreated.table_id, renamed.table_id);
+        assert_ne!(recreated.table_uuid, renamed.table_uuid);
+        assert_ne!(recreated.warehouse_location, renamed.warehouse_location);
+        assert_ne!(recreated.metadata_location, renamed.metadata_location);
+        assert_ne!(recreated.metadata_location, first.metadata_location);
+        assert_eq!(response.metadata["table-uuid"], recreated.table_uuid);
+        assert_eq!(response.metadata["location"], recreated.warehouse_location);
+        let published = backend
+            .read_object("warehouse", &recreated.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&published.data).unwrap(), response.metadata);
+        let second_commit = standard_commit_table_response(
+            &restarted,
+            &trusted_table_commit_backend(&backend),
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &recreated.table_uuid, "replacement"),
+        )
+        .await
+        .expect("recreated table should commit with its own scoped receipt and metadata");
+        let fresh = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let advanced = fresh.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+        assert_eq!(advanced.generation, recreated.generation + 1);
+        assert_ne!(advanced.version_token, recreated.version_token);
+        assert_eq!(
+            table_metadata_location_for_client("warehouse", &advanced.metadata_location),
+            second_commit.metadata_location
+        );
+        assert_eq!(second_commit.metadata["table-uuid"], recreated.table_uuid);
+        assert_eq!(second_commit.metadata["properties"]["owner"], "replacement");
+        assert_ne!(second_commit.metadata_location, first_commit.metadata_location);
+        assert_eq!(
+            fresh.load_table("warehouse", destination, "events_v2").await.unwrap(),
+            Some(renamed.clone())
+        );
+        assert_eq!(
+            fresh
+                .get_commit_by_id("warehouse", &renamed.table_id, commit_id)
+                .await
+                .unwrap(),
+            Some(original_receipt)
+        );
+        let replacement_receipt = fresh
+            .get_commit_by_id("warehouse", &recreated.table_id, commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement_receipt.table_id, recreated.table_id);
+        assert_eq!(replacement_receipt.new_metadata_location, advanced.metadata_location);
+        assert_eq!(
+            backend.read_object("warehouse", &first.metadata_location).await.unwrap(),
+            Some(initial_metadata)
+        );
+        assert_eq!(
+            backend.read_object("warehouse", &first_commit_object).await.unwrap(),
+            Some(committed_metadata)
+        );
+        drop_table_in_store(&fresh, "warehouse", &namespace, "events").await.unwrap();
+        let destination_namespace = crate::table_catalog::Namespace::parse(destination).unwrap();
+        drop_table_in_store(&fresh, "warehouse", &destination_namespace, "events_v2")
+            .await
+            .unwrap();
+        drop_namespace_in_store(&fresh, "warehouse", "analytics").await.unwrap();
+        if destination != "analytics" {
+            drop_namespace_in_store(&fresh, "warehouse", destination).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn create_table_response_recreates_dropped_identifier_without_overwriting_retained_metadata() {
     let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
