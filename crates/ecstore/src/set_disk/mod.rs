@@ -62,7 +62,7 @@ use crate::diagnostics::get::{
     classify_storage_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::diagnostics::object_lock::ObjectLockAttempt;
+use crate::diagnostics::object_lock::{ObjectLockAttempt, record_lock_acquire_failure};
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
     reduce_write_quorum_errs,
@@ -4549,6 +4549,9 @@ impl SetDisks {
         let timeout = get_lock_acquire_timeout();
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "read", timeout);
         let result = ns_lock.get_read_lock(timeout).await;
+        if let Err(error) = &result {
+            record_lock_acquire_failure(op, bucket, object, "read", error);
+        }
         attempt.observe(&result);
         let guard = result.map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
@@ -4607,6 +4610,9 @@ impl SetDisks {
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", acquire_timeout);
         let result = ns_lock.get_write_lock(acquire_timeout).await;
+        if let Err(error) = &result {
+            record_lock_acquire_failure(op, bucket, object, "write", error);
+        }
         attempt.observe(&result);
         let guard = resolve_put_object_commit_lock_acquire_result(self, op, bucket, object, result)?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
@@ -4659,6 +4665,9 @@ impl SetDisks {
             std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
         })
         .await;
+        if let Err(error) = &result {
+            record_lock_acquire_failure(op, bucket, object, "write", error);
+        }
         attempt.observe(&result);
         let guard = resolve_put_object_commit_lock_acquire_result(self, op, bucket, object, result)?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
