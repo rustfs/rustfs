@@ -48,6 +48,7 @@ use crate::diagnostics::get::{
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
+use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
@@ -55,7 +56,7 @@ use crate::disk::{
     PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
     RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
     STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    conv_part_err_to_int,
+    acquire_context_disk_io_permit, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -2809,44 +2810,95 @@ where
     with_walk_stall_deadline(stall, fut).await?
 }
 
+async fn await_walk_stall_progress<T>(
+    stall: Option<Duration>,
+    mut task: tokio::task::JoinHandle<Result<T>>,
+    mut progress: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> Result<T> {
+    let Some(stall) = stall.filter(|stall| !stall.is_zero()) else {
+        return task.await.map_err(DiskError::from)?;
+    };
+
+    let mut deadline = Box::pin(tokio::time::sleep(stall));
+    loop {
+        tokio::select! {
+            result = &mut task => return result.map_err(DiskError::from)?,
+            progress_update = progress.recv() => match progress_update {
+                Some(()) => deadline.as_mut().reset(tokio::time::Instant::now() + stall),
+                None => return task.await.map_err(DiskError::from)?,
+            },
+            _ = &mut deadline => return Err(DiskError::Timeout),
+        }
+    }
+}
+
 async fn read_dir_entries_with_walk_stall(path: &Path, count: i32, stall: Option<Duration>) -> Result<Vec<String>> {
-    let mut entries = with_walk_stall_deadline(stall, fs::read_dir(path))
-        .await?
-        .map_err(to_file_error)?;
+    let mut entries = read_dir_with_walk_stall(path.to_path_buf(), stall).await?;
     let mut names = Vec::new();
     let mut remaining = count;
 
     loop {
-        let Some(entry) = with_walk_stall_deadline(stall, entries.next_entry())
-            .await?
-            .map_err(to_file_error)?
-        else {
-            break;
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
-        }
-
-        let file_type = with_walk_stall_deadline(stall, entry.file_type())
-            .await?
-            .map_err(to_file_error)?;
-        if file_type.is_file() {
-            names.push(name);
-        } else if file_type.is_dir() {
-            names.push(format!("{name}{SLASH_SEPARATOR}"));
+        let result_limit = if remaining > 0 {
+            (remaining as usize).min(WALK_DIR_BATCH_SIZE)
         } else {
-            continue;
-        }
-
-        remaining -= 1;
-        if remaining == 0 {
+            WALK_DIR_BATCH_SIZE
+        };
+        let (next_entries, next_names, reached_eof) = read_dir_entry_batch_with_walk_stall(entries, result_limit, stall).await?;
+        entries = next_entries;
+        remaining -= next_names.len() as i32;
+        names.extend(next_names);
+        if (count > 0 && remaining == 0) || reached_eof {
             break;
         }
     }
 
     Ok(names)
+}
+
+const WALK_DIR_BATCH_SIZE: usize = 32;
+
+async fn read_dir_with_walk_stall(path: PathBuf, stall: Option<Duration>) -> Result<std::fs::ReadDir> {
+    let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+    let read_dir = spawn_blocking_with_disk_io_permit(io_permit, move || std::fs::read_dir(path).map_err(to_file_error));
+    let read_dir = with_walk_stall_deadline(stall, read_dir).await?.map_err(DiskError::from)?;
+    read_dir.map_err(|error| DiskError::from(to_file_error(error)))
+}
+
+async fn read_dir_entry_batch_with_walk_stall(
+    mut entries: std::fs::ReadDir,
+    result_limit: usize,
+    stall: Option<Duration>,
+) -> Result<(std::fs::ReadDir, Vec<String>, bool)> {
+    let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let batch = spawn_blocking_with_disk_io_permit(io_permit, move || {
+        let mut names = Vec::with_capacity(result_limit);
+        let mut reached_eof = false;
+        for _ in 0..WALK_DIR_BATCH_SIZE {
+            if names.len() == result_limit {
+                break;
+            }
+            let Some(entry) = entries.next() else {
+                reached_eof = true;
+                break;
+            };
+            let _ = progress_tx.send(());
+            let entry = entry.map_err(to_file_error)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(to_file_error)?;
+            let _ = progress_tx.send(());
+            if file_type.is_file() {
+                names.push(name);
+            } else if file_type.is_dir() {
+                names.push(format!("{name}{SLASH_SEPARATOR}"));
+            }
+        }
+        Ok::<_, DiskError>((entries, names, reached_eof))
+    });
+    await_walk_stall_progress(stall, batch, progress_rx).await
 }
 
 impl FileCacheReclaimReader {
@@ -6899,7 +6951,8 @@ impl LocalDisk {
 
         let res = {
             if read_data {
-                self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
+                let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+                self.read_all_data_with_dmtime(bucket, volume_dir, meta_path, io_permit).await
             } else {
                 match self.read_metadata_with_dmtime(meta_path).await {
                     Ok(res) => Ok(res),
@@ -6932,6 +6985,7 @@ impl LocalDisk {
     #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
+        let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
 
         // HP-12 item 1 (sub-change A): fold the open + fstat + bounded xl.meta
         // read into a single spawn_blocking dispatch instead of three separate
@@ -6944,30 +6998,31 @@ impl LocalDisk {
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
         let path = file_path.as_ref().to_path_buf();
-        let (data, modtime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-            // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
-            let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
+        let (data, modtime) =
+            spawn_blocking_with_disk_io_permit(io_permit, move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+                // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
+                let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
 
-            let meta = f.metadata().map_err(to_file_error)?;
+                let meta = f.metadata().map_err(to_file_error)?;
 
-            if meta.is_dir() {
-                // fix use io::Error
-                return Err(Error::FileNotFound);
-            }
+                if meta.is_dir() {
+                    // fix use io::Error
+                    return Err(Error::FileNotFound);
+                }
 
-            let size = meta.len() as usize;
+                let size = meta.len() as usize;
 
-            let data = read_xl_meta_no_data_sync(&mut f, size)?;
+                let data = read_xl_meta_no_data_sync(&mut f, size)?;
 
-            let modtime = match meta.modified() {
-                Ok(md) => Some(OffsetDateTime::from(md)),
-                Err(_) => None,
-            };
+                let modtime = match meta.modified() {
+                    Ok(md) => Some(OffsetDateTime::from(md)),
+                    Err(_) => None,
+                };
 
-            Ok((data, modtime))
-        })
-        .await
-        .map_err(DiskError::from)??;
+                Ok((data, modtime))
+            })
+            .await
+            .map_err(DiskError::from)??;
 
         Ok((data, modtime))
     }
@@ -6975,11 +7030,12 @@ impl LocalDisk {
     #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // TODO(backlog): add configurable timeout for read_all_data operations
-        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
+        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path, None).await?;
         Ok(data)
     }
 
     async fn read_part_metadata(&self, bucket: &str, volume_dir: &Path, path_str: &str) -> Result<ObjectPartInfo> {
+        let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         let path = Path::new(path_str);
         let num = path
             .file_name()
@@ -6999,7 +7055,7 @@ impl LocalDisk {
         let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
-        let result = tokio::task::spawn_blocking(move || -> Result<_> {
+        let result = spawn_blocking_with_disk_io_permit(io_permit, move || -> Result<_> {
             let part_error = |error: String| ObjectPartInfo {
                 number: num,
                 error: Some(error),
@@ -7027,10 +7083,11 @@ impl LocalDisk {
     }
 
     async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
+        let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         let object_dir = self.io_get_object_path(volume, object_name)?;
         let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
         let volume_dir = self.io_get_bucket_path(volume)?;
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_with_disk_io_permit(io_permit, move || {
             let (bytes, _) = read_all_data_std(&metadata_path)?;
             let file_meta = FileMeta::load(&bytes).ok();
             let data_dirs: HashSet<String> = file_meta
@@ -7113,6 +7170,7 @@ impl LocalDisk {
         volume: &str,
         volume_dir: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
+        io_permit: Option<DiskIoPermit>,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         // HP-12 item 1 (sub-change A): fold open + fstat + is_dir + try_reserve +
         // read_to_end into a single spawn_blocking dispatch. The closure mirrors
@@ -7128,7 +7186,7 @@ impl LocalDisk {
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
         let path = file_path.as_ref().to_path_buf();
-        let res = tokio::task::spawn_blocking(move || read_all_data_std(&path))
+        let res = spawn_blocking_with_disk_io_permit(io_permit, move || read_all_data_std(&path))
             .await
             .map_err(DiskError::from)?;
 
@@ -7215,7 +7273,10 @@ impl LocalDisk {
             .await;
         }
 
-        let (data, _) = match self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await {
+        let (data, _) = match self
+            .read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath, None)
+            .await
+        {
             Ok(data) => data,
             Err(DiskError::FileNotFound) => {
                 // `deleted` alone can be an explicit marker purge; only
@@ -8352,13 +8413,11 @@ impl LocalDisk {
                         if err == Error::FileNotFound || err == Error::IsNotRegular {
                             // NOT an object, append to stack (with slash)
                             // If dirObject, but no metadata (which is unexpected) we skip it.
-                            if !is_dir_obj
-                                && !with_walk_stall_deadline(
-                                    stall,
-                                    is_empty_dir(self.io_get_object_path(&opts.bucket, &meta.name)?),
-                                )
-                                .await?
-                            {
+                            if !is_dir_obj && {
+                                let _io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+                                !with_walk_stall_deadline(stall, is_empty_dir(self.io_get_object_path(&opts.bucket, &meta.name)?))
+                                    .await?
+                            } {
                                 meta.name.push_str(SLASH_SEPARATOR);
                                 // Conservative listings verify physical prefixes. Never-versioned
                                 // buckets use the bounded fast path, which only has to rule out
@@ -10393,6 +10452,7 @@ impl DiskAPI for LocalDisk {
     /// listing resilient while preserving existing full-enumeration behavior.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
+        let _io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         if !origvolume.is_empty() {
             let origvolume_dir = self.io_get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume)
@@ -10405,21 +10465,16 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let dir_path_abs = self.io_get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
-        // Whole-directory enumeration in one syscall path (see the wide-directory
-        // stall hazard on this fn): with `count < 0` this reads every entry, and
-        // the caller's stall budget bounds the entire call as a unit.
-        let entries = match os::read_dir(&dir_path_abs, count).await {
-            Ok(res) => res,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound
+        let entries = match read_dir_entries_with_walk_stall(&dir_path_abs, count, None).await {
+            Ok(entries) => entries,
+            Err(err)
+                if err == DiskError::FileNotFound
                     && !skip_access_checks(volume)
-                    && let Err(e) = cached_access(&volume_dir).await
-                {
-                    return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
-                }
-
-                return Err(to_file_error(e).into());
+                    && let Err(err) = cached_access(&volume_dir).await =>
+            {
+                return Err(to_access_error(err, DiskError::VolumeAccessDenied).into());
             }
+            Err(err) => return Err(err),
         };
 
         Ok(entries)
@@ -10441,10 +10496,11 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
 
-        if !skip_access_checks(&opts.bucket)
-            && let Err(e) = with_walk_stall_deadline(stall, cached_access(&volume_dir)).await?
-        {
-            return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
+        if !skip_access_checks(&opts.bucket) {
+            let _io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+            if let Err(e) = with_walk_stall_deadline(stall, cached_access(&volume_dir)).await? {
+                return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
+            }
         }
 
         let mut wr = wr;
@@ -10483,8 +10539,10 @@ impl DiskAPI for LocalDisk {
             let fpath =
                 self.io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
-            if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
-                && meta.is_file()
+            if let Ok(meta) = {
+                let _io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+                with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
+            } && meta.is_file()
             {
                 skip_current_dir_object = true;
                 if let Ok(meta_bytes) = with_walk_stall_deadline(
@@ -11209,11 +11267,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        crate::hp_guard!("LocalDisk::read_metadata");
-        let file_path = self.io_get_object_path(volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
-        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
-        Ok(data.into())
+        self.read_metadata_with_permit(volume, path, None).await
     }
 }
 
@@ -11233,6 +11287,25 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
 }
 
 impl LocalDisk {
+    pub(crate) async fn read_metadata_with_permit(
+        &self,
+        volume: &str,
+        path: &str,
+        io_permit: Option<DiskIoPermit>,
+    ) -> Result<Bytes> {
+        crate::hp_guard!("LocalDisk::read_metadata");
+        let io_permit = match io_permit {
+            Some(io_permit) => Some(io_permit),
+            None => acquire_context_disk_io_permit().await.map_err(DiskError::Io)?,
+        };
+        let file_path = self.io_get_object_path(volume, path)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let (data, _) = self
+            .read_all_data_with_dmtime(volume, volume_dir, file_path, io_permit)
+            .await?;
+        Ok(data.into())
+    }
+
     pub(crate) async fn rename_data_borrowed(
         &self,
         src_volume: &str,
@@ -11302,6 +11375,42 @@ mod test {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_dir_entries_skip_symlinks_without_truncating_listing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("directory should be created");
+        std::fs::write(dir.path().join("before"), b"file").expect("file should be created");
+        symlink(dir.path().join("before"), dir.path().join("link")).expect("symlink should be created");
+        std::fs::write(dir.path().join("after"), b"file").expect("file should be created");
+
+        let names = read_dir_entries_with_walk_stall(dir.path(), -1, None)
+            .await
+            .expect("directory listing should complete");
+
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|name| name == "before"));
+        assert!(names.iter().any(|name| name == "after"));
+        assert!(!names.iter().any(|name| name == "link"));
+    }
+
+    #[tokio::test]
+    async fn stalled_walk_batch_reports_timeout_at_one_stall_interval() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = release_rx.recv();
+            Ok::<_, DiskError>(())
+        });
+        let (_progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        let result = await_walk_stall_progress(Some(Duration::from_millis(50)), task, progress_rx).await;
+        assert_eq!(result, Err(DiskError::Timeout));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release_tx.send(()).expect("blocking worker should be released");
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {

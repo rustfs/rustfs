@@ -1924,7 +1924,7 @@ where
         // fence remains enforced by the usage store and the cycle is advanced
         // as partial without acknowledging dirty usage.
         Ok(result)
-            if result.has_observational_snapshot()
+            if scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot())
                 && matches!(
                     result.status,
                     ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -1932,9 +1932,19 @@ where
         {
             None
         }
-        Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
+        Ok(result) => {
+            final_data_usage_publication_defer_reason(
+                storeapi.as_ref(),
+                result.status,
+                scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot()),
+            )
+            .await
+        }
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
+    let observational_only = scan_result
+        .as_ref()
+        .is_ok_and(|result| scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot()));
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let remote_publication_lease_targets = if publication_defer_reason.is_none() {
         scan_result
@@ -1954,7 +1964,19 @@ where
             &publication_proof_ctx,
             cycle_info.current,
             "lease_acquire",
-            || notification_system.acquire_scanner_publication_leases(remote_publication_lease_targets.clone()),
+            || {
+                let targets = remote_publication_lease_targets.clone();
+                let notification_system = Arc::clone(&notification_system);
+                async move {
+                    if observational_only {
+                        notification_system
+                            .acquire_observational_scanner_publication_leases(targets)
+                            .await
+                    } else {
+                        notification_system.acquire_scanner_publication_leases(targets).await
+                    }
+                }
+            },
             |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
         )
         .await;
@@ -2041,6 +2063,7 @@ where
             let storeapi_clone = storeapi.clone();
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
+            let route_probe_observational_only = observational_only;
             let remote_lease_fence = remote_lease_fence.clone();
             let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
             let remote_lease_tokens = remote_publication_leases
@@ -2070,6 +2093,7 @@ where
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();
+                        let observational_only = route_probe_observational_only;
                         async move {
                             if let Some((notification_system, grants)) = remote_lease_probe.as_ref()
                                 && notification_system.validate_scanner_publication_leases(grants).await.is_err()
@@ -2091,7 +2115,7 @@ where
                                     probe_scanner_activity(storeapi.as_ref(), true).await,
                                 ));
                             }
-                            scanner_local_publication_defer_reason(storeapi.as_ref()).await
+                            scanner_local_publication_defer_reason(storeapi.as_ref(), observational_only).await
                         }
                     },
                 )
@@ -3497,13 +3521,17 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
-async fn final_data_usage_publication_defer_reason<S>(storeapi: &S, status: ScannerCycleStatus) -> Option<ScannerCycleDeferReason>
+async fn final_data_usage_publication_defer_reason<S>(
+    storeapi: &S,
+    status: ScannerCycleStatus,
+    observational_only: bool,
+) -> Option<ScannerCycleDeferReason>
 where
     S: ScannerStorage,
 {
     match status {
         ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded => {
-            if let Some(reason) = scanner_local_publication_defer_reason(storeapi).await {
+            if let Some(reason) = scanner_local_publication_defer_reason(storeapi, observational_only).await {
                 return Some(reason);
             }
             if status == ScannerCycleStatus::Complete {
@@ -3527,16 +3555,21 @@ where
     }
 }
 
-async fn scanner_local_publication_defer_reason<S>(storeapi: &S) -> Option<ScannerCycleDeferReason>
+async fn scanner_local_publication_defer_reason<S>(storeapi: &S, observational_only: bool) -> Option<ScannerCycleDeferReason>
 where
     S: ScannerStorage,
 {
-    if !storeapi.scanner_data_usage_publication_blocked().await {
+    let blocked = if observational_only {
+        storeapi.scanner_data_movement_publication_blocked().await
+    } else {
+        storeapi.scanner_data_usage_publication_blocked().await
+    };
+    if !blocked {
         return None;
     }
     // Pending namespace commits invalidate this publication attempt, but only
     // storage movement creates durable, rate-limited catch-up debt.
-    if storeapi.scanner_data_movement_pause_status().await.paused {
+    if storeapi.scanner_data_movement_publication_blocked().await {
         debug!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_PERSIST_STATE,
@@ -3559,6 +3592,14 @@ where
         );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     }
+}
+
+fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_observational_candidate: bool) -> bool {
+    has_observational_candidate
+        && matches!(
+            status,
+            ScannerCycleStatus::Superseded | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
 }
 
 fn scanner_post_lease_activity_defer_reason(
