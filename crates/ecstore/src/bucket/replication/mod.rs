@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod replication_bandwidth_boundary;
-mod replication_cache_serde;
 mod replication_config_boundary;
 mod replication_config_store;
 mod replication_error_boundary;

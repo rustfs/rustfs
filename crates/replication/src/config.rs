@@ -1270,7 +1270,7 @@ mod tests {
 
     // Regression test for BUG-3: replicate_object was calling filter_target_arns with
     // existing_object:false regardless of op_type, letting ExistingObject resync operations
-    // fan out to targets whose rule has Status::DISABLED.as_str().
+    // fan out to targets whose rule has a Disabled ExistingObjectReplication status.
     #[test]
     fn filter_target_arns_excludes_disabled_existing_object_target_for_existing_object_op() {
         let config = PersistedReplicationConfiguration {
@@ -1642,7 +1642,7 @@ mod tests {
         "#;
         let config = parse_replication(xml).expect("console-shaped config should parse");
 
-        assert_eq!(config.rules[0].destination.storage_class.as_ref().map(|c| c.as_str()), Some("STANDARD"));
+        assert_eq!(config.rules[0].destination.storage_class.as_deref(), Some("STANDARD"));
         assert_eq!(unsupported_replication_config_field(&config), None);
     }
 
@@ -1742,7 +1742,6 @@ mod tests {
                     value: Some("and-tag-value-marker".to_string()),
                 }]),
             }),
-            ..Default::default()
         });
         rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
             status: Some(Status::ENABLED.to_string()),

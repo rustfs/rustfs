@@ -28,9 +28,10 @@
 //! member without a counterpart, `ReplicationRuleFilter::cached_tags`, is a
 //! parse cache with no wire form.
 //!
-//! Upstream: `app::bucket_usecase` (the S3 put/get handlers).
-//! Downstream: none; the gateway HTTP stack replaces this edge (T1.8,
-//! rustfs/backlog#2749).
+//! Upstream: `storage::ecfs` (`put_bucket_replication`,
+//! `get_bucket_replication`). Downstream: `app::bucket_usecase`, which takes and
+//! answers the persistence shape. The gateway HTTP stack retires this edge
+//! (T1.8, rustfs/backlog#2749).
 
 use rustfs_gateway_types::persistence::{
     PersistedAccessControlTranslation, PersistedEncryptionConfiguration, PersistedOptionalReplicationStatus,
@@ -225,9 +226,9 @@ fn tag_to_s3s(value: PersistedReplicationTag) -> dto::Tag {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rustfs_gateway_types::persistence::{parse_replication, serialize_replication};
-    use s3s::xml;
+    use super::{replication_configuration_from_s3s, replication_configuration_to_s3s};
+    use rustfs_gateway_types::persistence::{PersistedReplicationConfiguration, parse_replication, serialize_replication};
+    use s3s::{dto, xml};
 
     fn s3s_bytes(value: &dto::ReplicationConfiguration) -> Vec<u8> {
         let mut buf = Vec::new();

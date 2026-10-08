@@ -16,8 +16,8 @@
 //! usage cache.
 //!
 //! Responsible for: encoding `PersistedReplicationConfiguration` with serde in
-//! exactly the layout the s3s DTO's derived serde produced, because
-//! [`super::ReplicationConfig`] is a member of the scanner's
+//! exactly the layout the s3s DTO's derived serde produced, because the
+//! ECStore `ReplicationConfig` carrying it is a member of the scanner's
 //! `DataUsageCacheInfo`, which RustFS persists with MessagePack: a cache written
 //! before the gateway types must still decode, and an older reader must still
 //! decode a cache written now.
@@ -30,7 +30,8 @@
 //! fields in declaration order (alphabetical), every string enum is its wire
 //! text, and the rule filter carries the s3s tag cache as an empty map.
 //!
-//! Upstream: `ReplicationConfig`'s serde derive. Downstream: none.
+//! Upstream: the serde derive of ECStore's `ReplicationConfig`, through
+//! `#[serde(with = ...)]`. Downstream: none.
 
 use rustfs_gateway_types::persistence::{
     PersistedAccessControlTranslation, PersistedEncryptionConfiguration, PersistedOptionalReplicationStatus,
@@ -42,16 +43,11 @@ use serde::de::IgnoredAny;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub(super) fn serialize<S: Serializer>(
-    value: &Option<PersistedReplicationConfiguration>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
+pub fn serialize<S: Serializer>(value: &Option<PersistedReplicationConfiguration>, serializer: S) -> Result<S::Ok, S::Error> {
     value.as_ref().map(CacheConfiguration::from).serialize(serializer)
 }
 
-pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<PersistedReplicationConfiguration>, D::Error> {
+pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<PersistedReplicationConfiguration>, D::Error> {
     Ok(Option::<CacheConfiguration>::deserialize(deserializer)?.map(Into::into))
 }
 
@@ -503,12 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn writes_the_bytes_the_s3s_derive_wrote() {
+    fn writes_the_bytes_the_old_derive_wrote() {
         assert_eq!(encode(Some(every_member())), bytes(S3S_COMPACT));
     }
 
     #[test]
-    fn reads_a_cache_the_s3s_derive_wrote() {
+    fn reads_a_cache_the_old_derive_wrote() {
         assert_eq!(decode(&bytes(S3S_COMPACT)).expect("the old cache field decodes"), Some(every_member()));
         assert_eq!(decode(&bytes(S3S_NAMED)).expect("the named form decodes"), Some(every_member()));
     }

@@ -79,7 +79,6 @@ use crate::site_replication::{
     cancel_site_replication_delete_bucket, commit_site_replication_delete_bucket, prepare_site_replication_delete_bucket,
     site_replication_bucket_meta_hook, site_replication_make_bucket_hook, with_site_replication_bucket_mutation_lock,
 };
-use crate::storage::s3_compat::replication::{replication_configuration_from_s3s, replication_configuration_to_s3s};
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
@@ -109,17 +108,17 @@ use s3s::dto::{
     GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
     GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
     GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput,
-    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput,
-    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration,
-    NotificationConfigurationFilter, Object, ObjectLockConfiguration, ObjectStorageClass, ObjectVersion,
-    ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
-    PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
-    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
-    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
-    ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
+    GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
+    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration, NotificationConfigurationFilter, Object,
+    ObjectLockConfiguration, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput,
+    PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
+    PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
+    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput,
+    PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput,
+    PutPublicAccessBlockOutput, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
+    VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -2183,10 +2182,12 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
+    /// Answers the stored configuration in the engine's shape; the s3s edge
+    /// (`storage::ecfs`) converts it into the `GetBucketReplication` output.
     pub async fn execute_get_bucket_replication(
         &self,
         req: S3Request<GetBucketReplicationInput>,
-    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+    ) -> S3Result<PersistedReplicationConfiguration> {
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2219,9 +2220,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration_to_s3s(replication_configuration)),
-        }))
+        Ok(replication_configuration)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2665,21 +2664,19 @@ impl DefaultBucketUsecase {
     }
 
     /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
-    /// `contract`.
+    /// `contract`. `replication_configuration` is the request body in the
+    /// engine's shape: the s3s edge (`storage::ecfs`) converts it, and this use
+    /// case never reads `req.input.replication_configuration`.
     pub async fn execute_put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
+        replication_configuration: PersistedReplicationConfiguration,
         site_peers: HashSet<String>,
         contract: OperatorRuleContract,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketReplicationInput {
-            bucket,
-            replication_configuration,
-            ..
-        } = req.input;
-        let replication_configuration = replication_configuration_from_s3s(replication_configuration);
+        let PutBucketReplicationInput { bucket, .. } = req.input;
         info!(bucket = %bucket, "updating bucket replication config");
 
         validate_replication_config_capabilities(&replication_configuration)?;
@@ -3924,7 +3921,7 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(
             err.to_string()
-                .contains("Destination.PersistedEncryptionConfiguration is not supported")
+                .contains("Destination.EncryptionConfiguration is not supported")
         );
         assert!(!err.to_string().contains(destination_key_id));
     }
@@ -5288,12 +5285,13 @@ mod tests {
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
         // The config must clear the structural/capability validators so the
         // request actually reaches the store lookup this test pins.
+        let configuration = PersistedReplicationConfiguration {
+            role: "arn:aws:iam::123456789012:role/test".to_string(),
+            rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
+        };
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(replication_configuration_to_s3s(PersistedReplicationConfiguration {
-                role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
-            }))
+            .replication_configuration(Default::default())
             .build()
             .unwrap();
 
@@ -5301,7 +5299,7 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .execute_put_bucket_replication(req, configuration, HashSet::new(), OperatorRuleContract::Derived)
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -5311,17 +5309,23 @@ mod tests {
     async fn execute_put_bucket_replication_rejects_unsupported_fields_before_store_or_metadata_write() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         rule.destination.account = Some("123456789012".to_string());
+        let configuration = PersistedReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(replication_configuration_to_s3s(PersistedReplicationConfiguration {
-                role: String::new(),
-                rules: vec![rule],
-            }))
+            .replication_configuration(Default::default())
             .build()
             .unwrap();
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new(), OperatorRuleContract::Derived)
+            .execute_put_bucket_replication(
+                build_request(input, Method::PUT),
+                configuration,
+                HashSet::new(),
+                OperatorRuleContract::Derived,
+            )
             .await
             .expect_err("unsupported fields must be rejected before store access");
 

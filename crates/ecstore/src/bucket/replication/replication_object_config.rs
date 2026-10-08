@@ -253,8 +253,8 @@ pub(crate) async fn load_delete_replication_config_in(
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicationConfig {
     /// Carried in the scanner's persisted data usage cache, so its serde form
-    /// is the one the s3s DTO wrote there (see `replication_cache_serde`).
-    #[serde(with = "super::replication_cache_serde")]
+    /// is the one the s3s DTO wrote there (see `config_cache_serde` in the replication crate).
+    #[serde(with = "super::replication_config_boundary::config_cache_serde")]
     pub config: Option<PersistedReplicationConfiguration>,
     pub remotes: Option<BucketTargets>,
 }
@@ -764,7 +764,7 @@ mod tests {
         assert!(validate_delete_replication_config(&invalid_versioning, None).is_err());
 
         let mut invalid_rule = replication_rule();
-        invalid_rule.status = "Enabld".to_string().into();
+        invalid_rule.status = "Enabld".to_string();
         let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![invalid_rule],
@@ -773,7 +773,7 @@ mod tests {
 
         let mut invalid_delete = replication_rule();
         invalid_delete.delete_replication = Some(PersistedReplicationStatus {
-            status: "Enabld".to_string().into(),
+            status: "Enabld".to_string(),
         });
         let config = PersistedReplicationConfiguration {
             role: String::new(),
@@ -783,7 +783,7 @@ mod tests {
 
         let mut invalid_delete_marker = replication_rule();
         invalid_delete_marker.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
-            status: Some("Enabld".to_string().into()),
+            status: Some("Enabld".to_string()),
         });
         let config = PersistedReplicationConfiguration {
             role: String::new(),
@@ -794,7 +794,7 @@ mod tests {
         let mut invalid_replica_modifications = replication_rule();
         invalid_replica_modifications.source_selection_criteria = Some(PersistedSourceSelectionCriteria {
             replica_modifications: Some(PersistedReplicationStatus {
-                status: "Enabld".to_string().into(),
+                status: "Enabld".to_string(),
             }),
             sse_kms_encrypted_objects: None,
         });
