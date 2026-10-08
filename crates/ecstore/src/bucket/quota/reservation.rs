@@ -568,12 +568,13 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
         operation_id,
         reservation,
     };
-    let (initial_allocator, bootstrap) = ensure_sharded_allocator(Arc::clone(&store), &data, growth, quota_limit).await?;
+    let bootstrap = ensure_sharded_allocator(Arc::clone(&store), &data, growth, quota_limit).await?;
+    #[cfg(test)]
+    tests::pause_after_allocator_ready(&data.bucket, &data.reservation.object).await;
     let operation_lock_object = operation_lock_object(&data.shard_object, operation_id);
     let operation_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &operation_lock_object).await?;
     let operation_guard = operation_lock.get_write_lock(get_lock_acquire_timeout()).await?;
 
-    let mut cached_allocator = Some(initial_allocator);
     for attempt in 0..=2 {
         let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
         let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
@@ -586,19 +587,15 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 achieved: 0,
             });
         }
-        let allocator = match cached_allocator.take() {
-            Some(allocator) => allocator,
-            None => {
-                load_current_allocator_locked(
-                    Arc::clone(&store),
-                    &data.allocator_object,
-                    bucket_incarnation,
-                    quota_revision,
-                    quota_limit,
-                )
-                .await?
-            }
-        };
+        // Initialization released its lock; a concurrent refill may have added grants.
+        let allocator = load_current_allocator_locked(
+            Arc::clone(&store),
+            &data.allocator_object,
+            bucket_incarnation,
+            quota_revision,
+            quota_limit,
+        )
+        .await?;
         let allow_create = shard_may_be_created(&allocator, data.shard_index, bootstrap);
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
@@ -1308,12 +1305,12 @@ async fn ensure_sharded_allocator(
     data: &ShardedReservationData,
     growth: u64,
     quota_limit: u64,
-) -> Result<(QuotaAllocatorLedger, bool)> {
+) -> Result<bool> {
     let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
     let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
     match load_allocator_locked(Arc::clone(&store), &data.allocator_object).await {
         Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => {
-            return Ok((allocator, false));
+            return Ok(false);
         }
         Ok(_) | Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(err),
@@ -1324,7 +1321,7 @@ async fn ensure_sharded_allocator(
     let allocator_guard = Arc::new(allocator_lock.get_write_lock(get_lock_acquire_timeout()).await?);
     match load_allocator_locked(Arc::clone(&store), &data.allocator_object).await {
         Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => {
-            return Ok((allocator, false));
+            return Ok(false);
         }
         Ok(allocator) if !allocator.grants.is_empty() => return Err(StorageError::PartMissingOrCorrupt),
         Ok(_) | Err(StorageError::ConfigNotFound) => {}
@@ -1375,7 +1372,7 @@ async fn ensure_sharded_allocator(
     }
     allocator.generation = 1;
     save_allocator_locked(Arc::clone(&store), &data.allocator_object, &allocator, &allocator_guard).await?;
-    Ok((allocator, true))
+    Ok(true)
 }
 
 async fn load_allocator_locked(store: Arc<ECStore>, object: &str) -> Result<QuotaAllocatorLedger> {
@@ -2277,5 +2274,113 @@ mod tests {
         shard.reservations.insert(operation_id, reservation.clone());
         shard.commit(operation_id, &reservation).expect("commit marker should settle");
         assert!(shard.reconcile_required);
+    }
+
+    struct AllocatorPause {
+        bucket: String,
+        object: String,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static ALLOCATOR_PAUSE: std::sync::Mutex<Option<Arc<AllocatorPause>>> = std::sync::Mutex::new(None);
+
+    struct AllocatorPauseGuard(Arc<AllocatorPause>);
+
+    impl Drop for AllocatorPauseGuard {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+            let mut pause = ALLOCATOR_PAUSE.lock().expect("allocator pause registry");
+            if pause.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.0)) {
+                *pause = None;
+            }
+        }
+    }
+
+    pub(super) async fn pause_after_allocator_ready(bucket: &str, object: &str) {
+        let pause = ALLOCATOR_PAUSE
+            .lock()
+            .expect("allocator pause registry")
+            .as_ref()
+            .filter(|pause| pause.bucket == bucket && pause.object == object)
+            .cloned();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sharded_reservation_reloads_allocator_after_concurrent_refill() {
+        use crate::object_api::PutObjReader;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let (_directories, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        let bucket = format!("quota-refill-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create quota bucket");
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                "quota.json",
+                serde_json::to_vec(&super::super::BucketQuota::new_sharded(100_000)).expect("serialize v2 quota"),
+            )
+            .await
+            .expect("enable v2 quota");
+        let names = (0..1000)
+            .map(|index| format!("quota-object-{index}"))
+            .filter(|name| shard_index(name) == 0)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 3);
+        let mut seed = PutObjReader::from_vec(vec![1]);
+        store
+            .put_object(&bucket, &names[0], &mut seed, &ObjectOptions::default())
+            .await
+            .expect("seed a one-byte initial grant");
+
+        let pause = Arc::new(AllocatorPause {
+            bucket: bucket.clone(),
+            object: names[1].clone(),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let _pause_guard = AllocatorPauseGuard(Arc::clone(&pause));
+        *ALLOCATOR_PAUSE.lock().expect("install allocator pause") = Some(Arc::clone(&pause));
+        let waiting_put = tokio::spawn({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let object = names[1].clone();
+            async move {
+                let mut body = PutObjReader::from_vec(vec![2]);
+                store.put_object(&bucket, &object, &mut body, &ObjectOptions::default()).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("first PUT reached the gap after allocator initialization");
+
+        // This PUT refills the allocator and persists the new grant in the same shard.
+        let mut body = PutObjReader::from_vec(vec![3, 4]);
+        let refill_result = store
+            .put_object(&bucket, &names[2], &mut body, &ObjectOptions::default())
+            .await;
+        pause.release.notify_one();
+        let waiting_result = tokio::time::timeout(Duration::from_secs(30), waiting_put)
+            .await
+            .expect("paused PUT completed")
+            .expect("paused PUT task joined");
+        assert_eq!(refill_result.expect("refill PUT remains below quota").size, 2);
+        assert_eq!(
+            waiting_result
+                .expect("paused PUT must adopt the current allocator grants")
+                .size,
+            1
+        );
     }
 }
