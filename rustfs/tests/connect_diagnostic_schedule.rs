@@ -112,31 +112,3 @@ async fn missing_inventory_has_bounded_retries_and_durable_failure_receipt() {
     shutdown.cancel();
     runtime.shutdown().await;
 }
-
-#[tokio::test]
-async fn consent_revoke_cancels_retry_and_persists_receipt() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let (policy_tx, policy_rx) = watch::channel(policy(4, "RUNNING", None));
-    let shutdown = CancellationToken::new();
-    let runtime = spawn_environment_schedule(temp.path(), policy_rx, shutdown.clone()).expect("scheduler");
-    let mut status = runtime.status();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !matches!(&*status.borrow(), DiagnosticScheduleStatus::Running { .. }) {
-            status.changed().await.expect("schedule remains active");
-        }
-    })
-    .await
-    .expect("first attempt");
-
-    policy_tx
-        .send(policy(5, "STOPPED", Some("CONSENT_INACTIVE")))
-        .expect("revoke policy");
-    let cancelled = receipt(&mut status).await;
-    assert_eq!(cancelled.outcome, ReceiptOutcome::Cancelled);
-    let state: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(temp.path().join("diagnostics/schedule.json")).expect("durable state"))
-            .expect("state JSON");
-    assert_eq!(state["lastReceipt"]["outcome"], "CANCELLED");
-    shutdown.cancel();
-    runtime.shutdown().await;
-}

@@ -2788,6 +2788,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await;
                 if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                    #[cfg(test)]
+                    super::super::rename_fanout_barrier::checkpoint(
+                        object,
+                        0,
+                        super::super::rename_fanout_barrier::PHASE_LATE_METADATA_REFRESH,
+                    )
+                    .await;
                     let (full_fi, full_parts_metadata, full_online_disks) = Self::refresh_late_metadata_fanout(
                         &late_metadata_fanout_disks,
                         bucket,
