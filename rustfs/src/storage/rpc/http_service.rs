@@ -42,8 +42,7 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
     INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
-use s3s::Body;
-use s3s::dto::StreamingBlob;
+use rustfs_s3_types::Body;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_bytes;
 use sha2::{Digest, Sha256};
@@ -250,6 +249,9 @@ macro_rules! log_internode_put_file_stage_failure {
     };
 }
 
+/// Answers the internode rpc paths itself and hands every other request to
+/// `inner`. Its own responses are built as [`Body`] and converted into the
+/// wrapped service's response body type, so both leave as one type.
 #[derive(Clone)]
 pub struct InternodeRpcService<S> {
     inner: S,
@@ -385,13 +387,14 @@ fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
     query.put_file_server_epoch.is_some_and(|epoch| !epoch.is_nil())
 }
 
-impl<S> Service<Request<Incoming>> for InternodeRpcService<S>
+impl<S, ResBody> Service<Request<Incoming>> for InternodeRpcService<S>
 where
-    S: Service<Request<Incoming>, Response = Response<Body>> + Clone + Send + 'static,
+    S: Service<Request<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<BoxError> + Send + 'static,
+    ResBody: From<Body> + Send + 'static,
 {
-    type Response = Response<Body>;
+    type Response = Response<ResBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -405,7 +408,7 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        Box::pin(async move { Ok(handle_internode_rpc(req).await) })
+        Box::pin(async move { Ok(handle_internode_rpc(req).await.map(ResBody::from)) })
     }
 }
 
@@ -693,7 +696,7 @@ where
 
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(stream)))
+        .body(Body::from_stream(stream))
         .expect("failed to build read file stream response")
 }
 
@@ -1249,7 +1252,7 @@ where
     let mut stream = Box::pin(stream);
     if !preflight_missing_path_error {
         let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-        return Ok(Body::from(StreamingBlob::wrap(stream)));
+        return Ok(Body::from_stream(stream));
     }
 
     // Keep the first chunk bounded in memory so a missing-path error can use
@@ -1258,12 +1261,12 @@ where
         Some(Ok(first_bytes)) => {
             let stream = stream::once(async move { Ok(first_bytes) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from(StreamingBlob::wrap(stream)))
+            Ok(Body::from_stream(stream))
         }
         Some(Err(first_error)) => {
             let stream = stream::once(async move { Err(first_error) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from(StreamingBlob::wrap(stream)))
+            Ok(Body::from_stream(stream))
         }
         None => match completion_rx.await {
             Ok(Ok(())) => Ok(Body::empty()),
@@ -1279,7 +1282,7 @@ where
 
 fn walk_dir_error_body(message: &'static str) -> Body {
     let stream = stream::once(async move { Err(io::Error::other(message)) });
-    Body::from(StreamingBlob::wrap(stream))
+    Body::from_stream(stream)
 }
 
 fn append_walk_dir_completion<S>(
@@ -1348,7 +1351,7 @@ where
     })
     .filter_map(std::future::ready);
 
-    Body::from(StreamingBlob::wrap(stream.chain(completion)))
+    Body::from_stream(stream.chain(completion))
 }
 
 fn put_file_target_lock(disk: &DiskStore, query: &PutFileQuery) -> Arc<Mutex<()>> {
@@ -1920,7 +1923,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener address should be available");
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("test server should accept a connection");
-            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(super::Body::empty())) });
             server_http1::Builder::new()
                 .serve_connection(TokioIo::new(socket), TowerToHyperService::new(InternodeRpcService::new(fallback)))
                 .await
@@ -3074,7 +3077,7 @@ mod tests {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         drop(completion_tx);
         let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"partial walk data"))]);
-        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, true)));
+        let body = super::Body::from_stream(append_walk_dir_completion(stream, completion_rx, true));
 
         let err = BodyExt::collect(body)
             .await
@@ -3126,7 +3129,7 @@ mod tests {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         drop(completion_tx);
         let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"legacy partial data"))]);
-        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, false)));
+        let body = super::Body::from_stream(append_walk_dir_completion(stream, completion_rx, false));
 
         let bytes = BodyExt::collect(body)
             .await
