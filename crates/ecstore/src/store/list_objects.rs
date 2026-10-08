@@ -2361,24 +2361,43 @@ fn list_objects_paginate(
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
-fn list_objects_paginate_versions<'a>(
-    mut get_objects: Vec<ObjectInfo>,
-    delimiter: &Option<String>,
+struct VersionedListPagination<'a, I> {
+    delimiter: &'a Option<String>,
     max_keys: i32,
     disk_has_more: bool,
-    cache_id: Option<&str>,
-    marker: Option<&str>,
-    last_scanned_key: Option<&str>,
-    raw_keys: impl Iterator<Item = &'a str>,
-) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
-    filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), marker);
-    let prefix_at_page_boundary =
-        versioned_prefix_page_boundary_key(&get_objects, raw_keys, delimiter.as_deref(), max_keys, disk_has_more);
+    cache_id: Option<&'a str>,
+    marker: Option<&'a str>,
+    last_scanned_key: Option<&'a str>,
+    raw_keys: I,
+}
 
-    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) =
-        list_objects_paginate(get_objects, delimiter, max_keys, disk_has_more, cache_id, true, last_scanned_key);
+fn list_objects_paginate_versions<'a, I>(
+    mut get_objects: Vec<ObjectInfo>,
+    pagination: VersionedListPagination<'a, I>,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    filter_versions_common_prefixes_after_marker(&mut get_objects, pagination.delimiter.as_deref(), pagination.marker);
+    let prefix_at_page_boundary = versioned_prefix_page_boundary_key(
+        &get_objects,
+        pagination.raw_keys,
+        pagination.delimiter.as_deref(),
+        pagination.max_keys,
+        pagination.disk_has_more,
+    );
+
+    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) = list_objects_paginate(
+        get_objects,
+        pagination.delimiter,
+        pagination.max_keys,
+        pagination.disk_has_more,
+        pagination.cache_id,
+        true,
+        pagination.last_scanned_key,
+    );
     if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
-        next_marker = Some(append_list_cache_id_to_marker(raw_key, cache_id));
+        next_marker = Some(append_list_cache_id_to_marker(raw_key, pagination.cache_id));
         next_version_idmarker = None;
     }
 
@@ -4326,13 +4345,15 @@ impl ECStore {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -5754,13 +5775,15 @@ impl Sets {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -6568,13 +6591,15 @@ impl SetDisks {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -8848,13 +8873,15 @@ mod test {
             let get_objects = fold_delimiter_page(&window, "", "-");
             let (objects, prefixes, is_truncated, next_marker, _v) = super::list_objects_paginate_versions(
                 get_objects,
-                &delimiter,
-                max_keys,
-                disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
             );
 
             assert!(
@@ -8927,13 +8954,15 @@ mod test {
             let get_objects = fold_delimiter_page(&window, "", "-");
             let (objects, prefixes, is_truncated, next_marker, _) = super::list_objects_paginate_versions(
                 get_objects,
-                &delimiter,
-                max_keys,
-                disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
             );
 
             assert_eq!(objects.len() + prefixes.len(), 1, "a page must respect max-keys");
