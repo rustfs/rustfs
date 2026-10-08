@@ -35,6 +35,21 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 const EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED: &str = "odm_backfill_recovery_configured";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundServicePlan {
+    scanner_enabled: bool,
+    heal_enabled: bool,
+    heal_manager_enabled: bool,
+}
+
+fn resolve_background_service_plan(scanner_enabled: bool, heal_enabled: bool) -> BackgroundServicePlan {
+    BackgroundServicePlan {
+        scanner_enabled,
+        heal_enabled,
+        heal_manager_enabled: scanner_enabled || heal_enabled,
+    }
+}
+
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
     // Pin the bitrot algorithms before anything can write or verify a shard:
     // the check costs well under a millisecond, and in strict mode a drifted
@@ -44,46 +59,43 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
 
     let _ = create_ahm_services_cancel_token();
 
-    let enable_scanner = scanner_enabled_from_env();
-    let enable_heal = heal_enabled_from_env();
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        enable_scanner = enable_scanner,
-        enable_heal = enable_heal,
-        "Background services configured"
-    );
+    let plan = resolve_background_service_plan(scanner_enabled_from_env(), heal_enabled_from_env());
 
     let workload_provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync> =
         Arc::new(RustFsWorkloadAdmissionSnapshotProvider);
     let _ = set_workload_admission_snapshot_provider(workload_provider.clone());
     rustfs_scanner::set_scanner_workload_admission_snapshot_provider(workload_provider.clone());
 
-    if enable_heal || enable_scanner {
+    if plan.heal_manager_enabled {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
         init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider)).await?;
     }
 
-    if !enable_heal && !enable_scanner {
-        debug!(
-            target: "rustfs::main::run",
-            event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enable_scanner = false,
-            enable_heal = false,
-            ahm_state = "skipped",
-            reason = "disabled",
-            "Background services disabled"
-        );
-    }
+    let heal_manager_reason = if plan.heal_enabled {
+        "heal_switch"
+    } else if plan.scanner_enabled {
+        "scanner_dependency"
+    } else {
+        "disabled"
+    };
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        configured_scanner = plan.scanner_enabled,
+        configured_heal = plan.heal_enabled,
+        scanner = if plan.scanner_enabled { "enabled" } else { "disabled" },
+        scanner_usage_lifecycle_replication = if plan.scanner_enabled { "enabled" } else { "paused" },
+        heal_manager = if plan.heal_manager_enabled { "started" } else { "not_started" },
+        mrf_consumer = if plan.heal_manager_enabled { "started" } else { "not_started" },
+        heal_manager_reason,
+        "Background service startup resolved"
+    );
 
     init_on_demand_migration_backfill_runtime(store).await;
 
-    Ok(enable_scanner)
+    Ok(plan.scanner_enabled)
 }
 
 /// Installs the backfill runner (admin start/cancel/status need it even
@@ -122,4 +134,57 @@ async fn init_on_demand_migration_backfill_runtime(store: Arc<ECStore>) {
         node = %node,
         "On-demand migration backfill recovery configured"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackgroundServicePlan, resolve_background_service_plan};
+
+    #[test]
+    fn enabling_both_switches_starts_scanner_and_heal_manager() {
+        assert_eq!(
+            resolve_background_service_plan(true, true),
+            BackgroundServicePlan {
+                scanner_enabled: true,
+                heal_enabled: true,
+                heal_manager_enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn scanner_requires_the_heal_manager_and_mrf_consumer() {
+        assert_eq!(
+            resolve_background_service_plan(true, false),
+            BackgroundServicePlan {
+                scanner_enabled: true,
+                heal_enabled: false,
+                heal_manager_enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_scanner_keeps_heal_manager_when_explicitly_enabled() {
+        assert_eq!(
+            resolve_background_service_plan(false, true),
+            BackgroundServicePlan {
+                scanner_enabled: false,
+                heal_enabled: true,
+                heal_manager_enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_both_background_switches_skips_heal_manager() {
+        assert_eq!(
+            resolve_background_service_plan(false, false),
+            BackgroundServicePlan {
+                scanner_enabled: false,
+                heal_enabled: false,
+                heal_manager_enabled: false,
+            }
+        );
+    }
 }

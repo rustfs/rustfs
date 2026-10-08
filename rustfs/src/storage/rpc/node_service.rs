@@ -2594,6 +2594,7 @@ impl Node for NodeService {
         };
         let challenge = request.get_ref().challenge.clone();
         let request = request.into_inner();
+        let observational_only = request.observational_only;
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
@@ -2603,14 +2604,15 @@ impl Node for NodeService {
         let owner_id = store.id.to_string();
         let result = match validation_token {
             Some(token) => store
-                .validate_scanner_publication_lease(token, request.expected_movement_generation)
+                .validate_scanner_publication_lease_with_purpose(token, request.expected_movement_generation, observational_only)
                 .await
                 .map(|()| (token, request.expected_movement_generation)),
             None => {
                 store
-                    .acquire_scanner_publication_lease(
+                    .acquire_scanner_publication_lease_with_purpose(
                         request.expected_movement_generation,
                         Duration::from_millis(request.ttl_ms),
+                        observational_only,
                     )
                     .await
             }
@@ -2625,6 +2627,7 @@ impl Node for NodeService {
                 response_proof: Bytes::new(),
                 owner_id: owner_id.clone(),
                 session_id: session_id.clone(),
+                observational_only,
             },
             Err(err) => ScannerPublicationLeaseResponse {
                 success: false,
@@ -2638,6 +2641,7 @@ impl Node for NodeService {
                 response_proof: Bytes::new(),
                 owner_id: owner_id.clone(),
                 session_id: session_id.clone(),
+                observational_only,
             },
         };
         let response_body = rustfs_protos::canonical_scanner_publication_lease_response_body(&challenge, &response)
@@ -8763,6 +8767,7 @@ mod tests {
                 ttl_ms: SCANNER_PUBLICATION_LEASE_TTL_MS,
                 expected_session_id: String::new(),
                 token: Bytes::new(),
+                observational_only: false,
             }
         );
         assert_tampered!(

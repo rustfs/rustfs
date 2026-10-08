@@ -226,6 +226,10 @@ fn remember_global_recorder(recorder: &Recorder) {
     let _ = GLOBAL_RECORDER.set(recorder.clone());
 }
 
+pub(crate) fn process_global_meter() -> Option<Meter> {
+    GLOBAL_RECORDER.get().map(|recorder| recorder.meter.clone())
+}
+
 pub(crate) fn install_process_global_recorder(recorder: Recorder) -> Result<(), metrics::SetRecorderError<Recorder>> {
     metrics::set_global_recorder(recorder.clone())?;
     remember_global_recorder(&recorder);

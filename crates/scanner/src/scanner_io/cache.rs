@@ -38,34 +38,6 @@ pub(crate) struct ScannerCheckpointPersistContext<'a> {
     pub(crate) leader_epoch: u64,
 }
 
-const CHECKPOINT_FOREGROUND_QUIET_WAIT: Duration = Duration::from_secs(1);
-
-async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
-    let deadline = tokio::time::Instant::now() + CHECKPOINT_FOREGROUND_QUIET_WAIT;
-    loop {
-        if crate::workload_admission::foreground_workload_activity() == 0 {
-            return true;
-        }
-
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-
-        let backoff = Duration::from_millis(
-            crate::workload_admission::foreground_workload_activity()
-                .saturating_mul(10)
-                .min(250),
-        )
-        .max(Duration::from_millis(10))
-        .min(remaining);
-        tokio::select! {
-            _ = ctx.cancelled() => return false,
-            _ = tokio::time::sleep(backoff) => {}
-        }
-    }
-}
-
 /// Persist one bounded checkpoint and refresh its CAS revisions.
 ///
 /// Local and remote workers share the same publication/leader fencing and
@@ -85,22 +57,6 @@ where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
     F: ScannerObjectIO,
 {
-    let foreground_quiet = wait_for_checkpoint_foreground_quiet(context.ctx).await;
-    if !foreground_quiet && context.ctx.is_cancelled() {
-        return ScannerCheckpointPersistResult::FenceChanged;
-    }
-    if !foreground_quiet {
-        debug!(
-            target: "rustfs::scanner::io",
-            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_IO,
-            cache_name,
-            state = "checkpoint_foreground_wait_expired",
-            "Scanner checkpoint foreground quiet wait expired; preserving bounded progress"
-        );
-    }
-
     if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
         context.cycle,
         context.leader_epoch,
@@ -118,10 +74,12 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    if let Err(error) = checkpoint
-        .save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch)
-        .await
-    {
+    let checkpoint_save = crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        checkpoint.save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch),
+    )
+    .await;
+    if let Err(error) = checkpoint_save {
         return ScannerCheckpointPersistResult::Failed(error);
     }
 
@@ -135,7 +93,12 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    match DataUsageCache::read_revisions(store, cache_name).await {
+    match crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        DataUsageCache::read_revisions(store, cache_name),
+    )
+    .await
+    {
         Ok(next_revisions) => {
             *revisions = next_revisions;
             ScannerCheckpointPersistResult::Saved

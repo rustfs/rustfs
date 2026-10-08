@@ -355,21 +355,24 @@ mod tests {
     }
 
     #[test]
-    fn check_kafka_broker_available_rejects_sasl_without_tls_before_connecting() {
+    fn check_kafka_broker_available_accepts_sasl_without_tls_configuration() {
         let mut args = kafka_args();
         args.sasl_enable = true;
         args.sasl_username = "user".to_string();
         args.sasl_password = "secret".to_string();
 
-        let err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(check_kafka_broker_available(&args))
-            .expect_err("SASL without TLS should fail before opening a network connection");
+        assert!(args.validate().is_ok());
+        let security = args
+            .security_config(false)
+            .expect("valid SASL configuration")
+            .expect("SASL should configure security");
+        assert!(!security.tls_enabled());
 
-        match err {
-            TargetError::Configuration(msg) => assert!(msg.contains("requires tls_enable")),
-            other => panic!("expected configuration error, got {other:?}"),
-        }
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_kafka_broker_available(&args));
+
+        assert!(!matches!(result, Err(TargetError::Configuration(_))));
     }
 
     #[test]

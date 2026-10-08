@@ -888,15 +888,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_kafka_config_rejects_sasl_without_tls() {
+    fn validate_kafka_config_accepts_sasl_without_tls() {
         let mut config = kafka_base_config();
         config.insert(KAFKA_SASL_ENABLE.to_string(), "on".to_string());
         config.insert(KAFKA_SASL_USERNAME.to_string(), "user".to_string());
         config.insert(KAFKA_SASL_PASSWORD.to_string(), "secret".to_string());
 
-        let err = validate_kafka_config(&config, "").expect_err("SASL without TLS should fail");
-
-        assert!(err.to_string().contains("requires tls_enable"));
+        for target_type in [TargetType::NotifyEvent, TargetType::AuditLog] {
+            let args = build_kafka_args(&config, "", target_type).expect("SASL plaintext config should parse");
+            assert_eq!(args.target_type, target_type);
+            assert!(!args.tls_enable);
+            assert!(args.sasl_enable);
+            assert!(args.validate().is_ok());
+        }
     }
 
     #[test]
