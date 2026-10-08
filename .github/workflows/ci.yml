@@ -16,7 +16,9 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main ]
+    # gateway/integration receives the daily merge of main as a direct push
+    # (rustfs/backlog#2734), so its pushes must prove the result like main's.
+    branches: [ main, gateway/integration ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -36,7 +38,9 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    # gateway/integration carries main's ruleset (rustfs/backlog#2734), so its
+    # pull requests must produce the same required checks.
+    branches: [ main, gateway/integration ]
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -778,6 +782,8 @@ jobs:
     needs: [ build-rustfs-debug-binary ]
     runs-on: sm-standard-2
     timeout-minutes: 30
+    env:
+      RUSTFS_S3_STACK: legacy
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -896,18 +902,105 @@ jobs:
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
           retention-days: 3
 
+  # The same e2e-smoke suite against the same debug binary with the gateway
+  # S3 stack selected (rustfs/backlog#2734). Report-only: it is outside the
+  # Test and Lint aggregate and becomes required at T2.10. The archive and run
+  # steps must stay identical to e2e-tests; scripts/ci_gate.py enforces that.
+  e2e-tests-gateway:
+    name: e2e-smoke (gateway, report-only until T2.10)
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-2
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      RUSTFS_S3_STACK: gateway
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
+      - name: Download debug binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Archive e2e smoke test binaries
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+        run: |
+          cargo nextest archive --profile e2e-smoke -p e2e_test --archive-file "${NEXTEST_ARCHIVE}"
+          cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
+          ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
+
+      - name: Run e2e smoke suite
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
+          SAMPLER_INTERVAL_SECS: "15"
+        run: |
+          ./scripts/ci/resource_sampler.sh start e2e-smoke
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
+            --status-level all --final-status-level all --failure-output final
+
+      - name: Upload e2e smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-smoke-gateway-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/rustfs-e2e-smoke-logs/
+            ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+          if-no-files-found: warn
+
+      - name: Upload e2e smoke JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-smoke-gateway-junit-${{ github.run_number }}
+          path: target/nextest/e2e-smoke/junit.xml
+          if-no-files-found: warn
+
   e2e-full:
     name: End-to-End Tests (full merge gate)
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main pushes, the merge queue, and manual
-    # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
-    # owned by other lanes (see .config/nextest.toml profile.e2e-full).
+    # every PR, so it is gated to main and gateway/integration pushes, the merge
+    # queue, and manual dispatch. protocols / the 7 cluster suites / replication
+    # / #[ignore] are owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/gateway/integration'))
     needs: [ build-rustfs-debug-binary ]
     runs-on: sm-standard-2
     timeout-minutes: 55

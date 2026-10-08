@@ -53,6 +53,7 @@ use crate::TelemetryError;
 use crate::config::OtelConfig;
 pub use filter::HTTP_SERVER_LOG_TARGET;
 pub use guard::OtelGuard;
+pub(crate) use recorder::process_global_meter;
 pub use recorder::{Recorder, retire_metric_series};
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
 use rustfs_config::{DEFAULT_LOG_LEVEL, ENVIRONMENT, observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION};

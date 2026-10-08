@@ -36,6 +36,7 @@ their issue closes.
 | `check_no_planning_docs.sh` | ci-gate | Blocks committed planning-type documents | ci.yml Quick Checks; `make pre-commit` |
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Exact, lower-only baseline on the direct s3s surface ahead of the gateway migration (reads `.config/s3s-footprint-baseline.txt`); `--mode allowlist` fails on any Rust file referencing s3s outside `.config/s3s-edge-allowlist.txt`, `--dry-run` lists them | ci.yml Quick Checks; `make pre-commit` |
+| `check_test_count_ratchet.sh` | ci-gate | Exact per-crate test-count and `#[ignore]` ratchet against `.config/test-count-baseline.txt`; no crate may lose tests or gain ignores | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
@@ -54,6 +55,7 @@ their issue closes.
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
+| `gen_bucket_config_goldens.sh` | dev-tool | One-shot generator for the 13-family persisted bucket-config XML byte goldens; refuses to overwrite without `--force` and records the generating commit | `crates/ecstore/tests/fixtures/bucket-config-goldens/README.md`; `crates/ecstore/tests/bucket_config_goldens.rs` |
 | `run.sh` | dev-tool | Local rustfs startup wrapper | `make e2e-server`; Justfile |
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |

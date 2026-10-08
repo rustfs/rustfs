@@ -48,7 +48,7 @@ members = [
     "crates/replication", # Replication contracts and wire formats
     "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-client", # S3 client for engine-side consumption of remote S3 endpoints (tiering, transition targets)
-    "crates/s3-types", # S3 event type definitions
+    "crates/s3-types", # S3 event and error type definitions
     "crates/s3-ops", # S3 operation definitions and mapping
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
@@ -166,7 +166,7 @@ http-body-util = "0.1.5"
 memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
-rustfs-kafka-async = { version = "1.3.1" }
+rustfs-kafka-async = { version = "1.4.0" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.2" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
@@ -323,6 +323,10 @@ rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
 s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
 s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
+# The same s3s pin under the name the legacy edge of the gateway migration uses
+# (crates/s3-types, feature `compat-s3s`). Keep `rev` identical to `s3s` above.
+# DELETE BY T4.2 (rustfs/backlog#2784).
+legacy-s3s = { package = "s3s", git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.4"

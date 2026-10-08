@@ -1,0 +1,63 @@
+# Per-crate test-count baseline consumed by scripts/check_test_count_ratchet.sh
+# (rustfs/backlog#2734 section 1 rule 3; T0.3 in rustfs/backlog#2738).
+#
+# One row per workspace member: <package>, tests, ignored, tab-separated.
+# tests counts #[test], #[tokio::test], #[tokio::test(...)] and #[test_case(...)]
+# attribute lines under the package directory; ignored counts #[ignore] and
+# #[ignore = "..."]. Both columns are exact: CI fails when a crate's tests fall
+# below or rise above its row, or when its ignored count changes. Raise a row in
+# the PR that adds tests; lowering one is a reviewed statement that tests were
+# intentionally removed. Regenerate with:
+#   scripts/check_test_count_ratchet.sh --update
+e2e_test	870	18
+rustfs	5475	62
+rustfs-audit	70	0
+rustfs-checksums	26	0
+rustfs-common	23	0
+rustfs-concurrency	27	0
+rustfs-config	43	0
+rustfs-connect-symbol-catalog	6	0
+rustfs-credentials	24	0
+rustfs-crypto	67	0
+rustfs-data-usage	54	0
+rustfs-ecstore	6203	1
+rustfs-extension-schema	23	0
+rustfs-filemeta	306	0
+rustfs-heal	836	3
+rustfs-heal-contracts	6	0
+rustfs-iam	357	0
+rustfs-io-core	49	0
+rustfs-io-metrics	123	0
+rustfs-keystone	29	0
+rustfs-kms	715	25
+rustfs-license	2	0
+rustfs-lifecycle	152	0
+rustfs-lock	135	0
+rustfs-log-analyzer	87	0
+rustfs-madmin	209	0
+rustfs-notify	136	0
+rustfs-object-capacity	92	0
+rustfs-object-data-cache	140	0
+rustfs-obs	362	0
+rustfs-policy	663	0
+rustfs-protocols	733	1
+rustfs-protos	52	0
+rustfs-replication	200	0
+rustfs-rio	198	0
+rustfs-rio-v2	34	6
+rustfs-s3-client	65	0
+rustfs-s3-ops	8	0
+rustfs-s3-types	21	0
+rustfs-s3select-api	206	0
+rustfs-s3select-query	188	2
+rustfs-scanner	968	20
+rustfs-scanner-metrics	75	0
+rustfs-security-governance	20	0
+rustfs-signer	30	0
+rustfs-storage-api	31	0
+rustfs-targets	603	26
+rustfs-test-utils	1	0
+rustfs-tls-runtime	20	0
+rustfs-trusted-proxies	68	0
+rustfs-utils	216	0
+rustfs-zip	30	0
