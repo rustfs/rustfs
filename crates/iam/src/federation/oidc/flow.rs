@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::config::OidcConfigQuery;
 use super::{claims, config, discovery, http};
 use crate::{
-    federation::{FederatedAuthorization, FederatedCodeExchange, FederatedIdentityProvider, FederationError, Result},
-    oidc::{OidcProviderConfig, OidcProviderSummary, OidcSys},
+    federation::{
+        FederatedAuthorization, FederatedCodeExchange, FederatedIdentityProvider, FederatedProviderView, FederatedRedirectPolicy,
+        FederationError, Result,
+    },
+    oidc::{OidcConfigSnapshot, OidcSys},
 };
 use std::sync::Arc;
 
@@ -29,22 +33,32 @@ impl StandardOidcAdapter {
     }
 }
 
+impl OidcConfigQuery for StandardOidcAdapter {
+    fn config_snapshot(&self) -> OidcConfigSnapshot {
+        self.oidc.config_snapshot()
+    }
+}
+
 #[async_trait::async_trait]
 impl FederatedIdentityProvider for StandardOidcAdapter {
     fn has_providers(&self) -> bool {
         self.oidc.has_providers()
     }
 
-    fn list_providers(&self) -> Vec<OidcProviderSummary> {
+    fn list_providers(&self) -> Vec<FederatedProviderView> {
         discovery::list_providers(&self.oidc)
     }
 
-    fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
+    fn list_visible_providers(&self) -> Vec<FederatedProviderView> {
         discovery::list_visible_providers(&self.oidc)
     }
 
-    fn provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
-        config::provider_config(&self.oidc, id)
+    fn provider_config(&self, provider_id: &str) -> Option<&crate::oidc::OidcProviderConfig> {
+        self.oidc.get_provider_config(provider_id)
+    }
+
+    fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy> {
+        config::redirect_policy(&self.oidc, provider_id)
     }
 
     async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String> {
