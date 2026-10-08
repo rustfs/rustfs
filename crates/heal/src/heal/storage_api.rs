@@ -50,8 +50,8 @@ pub(crate) mod owner {
 pub(crate) mod storage {
     pub(crate) use super::EcstoreHealObjectStorageResult;
     pub(crate) use super::storage_contracts::{
-        BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
-        StorageAdminApi,
+        BucketInfo, BucketOperations, DeleteBucketOptions, DiskSetSelector, HealOperations, ListOperations, ObjectIO,
+        ObjectOperations, StorageAdminApi,
     };
 }
 

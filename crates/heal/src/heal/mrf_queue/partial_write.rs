@@ -1011,8 +1011,8 @@ mod tests {
     use super::*;
     use crate::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
+    use crate::heal::storage_api::storage::{BucketOperations as _, DeleteBucketOptions};
     use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
-    use rustfs_storage_api::bucket::{BucketOperations as _, DeleteBucketOptions};
     use serial_test::serial;
     use std::sync::Arc;
     use std::time::Duration;
