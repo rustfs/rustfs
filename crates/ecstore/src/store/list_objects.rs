@@ -2194,6 +2194,41 @@ fn last_scanned_entry_name(entries: Option<&MetaCacheEntriesSorted>) -> Option<S
     entries.and_then(|entries| entries.entries().last().map(|entry| entry.name.clone()))
 }
 
+fn filter_versions_common_prefixes_after_marker(objects: &mut Vec<ObjectInfo>, delimiter: Option<&str>, marker: Option<&str>) {
+    if delimiter.is_some()
+        && let Some(marker) = marker
+    {
+        // S3 excludes CommonPrefixes that are not lexicographically greater than KeyMarker.
+        // Filter before applying max-keys so a resumed prefix cannot consume the page budget.
+        objects.retain(|object| !(object.is_dir && object.mod_time.is_none()) || object.name.as_str() > marker);
+    }
+}
+
+fn last_raw_key_for_prefix<'a>(raw_keys: impl Iterator<Item = &'a str>, prefix: &str) -> Option<&'a str> {
+    raw_keys.filter(|key| key.starts_with(prefix)).last()
+}
+
+fn versioned_prefix_page_boundary_key<'a>(
+    objects: &[ObjectInfo],
+    raw_keys: impl Iterator<Item = &'a str>,
+    delimiter: Option<&str>,
+    max_keys: i32,
+    disk_has_more: bool,
+) -> Option<String> {
+    if delimiter.is_none() || !disk_has_more || max_keys <= 0 || objects.len() < max_keys as usize {
+        return None;
+    }
+
+    let last_visible = objects.get(max_keys as usize - 1)?;
+    if !last_visible.is_dir || last_visible.mod_time.is_some() {
+        return None;
+    }
+
+    // A folded prefix cannot advance the raw versioned walker. Continue at the last
+    // raw key represented by the final returned prefix, not at the next prefix's key.
+    last_raw_key_for_prefix(raw_keys, &last_visible.name).map(str::to_owned)
+}
+
 fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
     if let Some(last) = objects.last() {
         Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
@@ -2321,6 +2356,30 @@ fn list_objects_paginate(
             // A bare key marker with no version id makes `forward_past` skip the whole
             // scanned window on the next page; its folded prefixes are already emitted.
         }
+    }
+
+    (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
+}
+
+fn list_objects_paginate_versions<'a>(
+    mut get_objects: Vec<ObjectInfo>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    disk_has_more: bool,
+    cache_id: Option<&str>,
+    marker: Option<&str>,
+    last_scanned_key: Option<&str>,
+    raw_keys: impl Iterator<Item = &'a str>,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
+    filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), marker);
+    let prefix_at_page_boundary =
+        versioned_prefix_page_boundary_key(&get_objects, raw_keys, delimiter.as_deref(), max_keys, disk_has_more);
+
+    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) =
+        list_objects_paginate(get_objects, delimiter, max_keys, disk_has_more, cache_id, true, last_scanned_key);
+    if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
+        next_marker = Some(append_list_cache_id_to_marker(raw_key, cache_id));
+        next_version_idmarker = None;
     }
 
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
@@ -4265,14 +4324,15 @@ impl ECStore {
             ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker).await
         };
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
             &delimiter,
             max_keys,
             disk_has_more,
             next_cache_id.as_deref(),
-            true,
+            opts.marker.as_deref(),
             last_scanned_key.as_deref(),
+            entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -5687,23 +5747,20 @@ impl Sets {
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
         let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-            version_marker,
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
+                .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
             &delimiter,
             max_keys,
             disk_has_more,
             next_cache_id.as_deref(),
-            true,
+            opts.marker.as_deref(),
             last_scanned_key.as_deref(),
+            entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -6504,23 +6561,20 @@ impl SetDisks {
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
         let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-            version_marker,
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
+                .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
             &delimiter,
             max_keys,
             disk_has_more,
             next_cache_id.as_deref(),
-            true,
+            opts.marker.as_deref(),
             last_scanned_key.as_deref(),
+            entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -8757,18 +8811,26 @@ mod test {
     // `other-`/`zzz` were never listed.
     #[test]
     fn list_objects_paginate_versioned_delimiter_prefix_filled_pages_terminate() {
-        use std::collections::BTreeSet;
-
-        let all: Vec<String> = ["data-0001", "data-0002", "other-0001", "other-0002", "zzz"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let all: Vec<String> = [
+            "data-0001",
+            "data-0002",
+            "data-0003",
+            "data-0004",
+            "data-0005",
+            "other-0001",
+            "zzz",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let delimiter = Some("-".to_string());
         let max_keys = 1i32;
         let limit = max_keys_plus_one(max_keys, true) as usize;
 
         let mut marker: Option<String> = None;
-        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut seen_prefixes = Vec::new();
+        let mut seen_objects = Vec::new();
+        let mut page_prefixes = Vec::new();
         let mut pages = 0;
 
         loop {
@@ -8783,18 +8845,31 @@ mod test {
             let disk_has_more = window.len() == limit;
             let last_scanned = window.last().cloned();
 
-            let (objects, prefixes, is_truncated, next_marker, _v) = list_objects_paginate(
-                fold_delimiter_page(&window, "", "-"),
+            let get_objects = fold_delimiter_page(&window, "", "-");
+            let (objects, prefixes, is_truncated, next_marker, _v) = super::list_objects_paginate_versions(
+                get_objects,
                 &delimiter,
                 max_keys,
                 disk_has_more,
                 None,
-                true,
+                marker.as_deref(),
                 last_scanned.as_deref(),
+                window.iter().map(String::as_str),
             );
 
-            seen.extend(objects.into_iter().map(|object| object.name));
-            seen.extend(prefixes);
+            assert!(
+                prefixes.windows(2).all(|pair| pair[0] != pair[1]),
+                "a page must not contain duplicate common prefixes"
+            );
+            assert!(
+                prefixes
+                    .iter()
+                    .all(|prefix| marker.as_deref().is_none_or(|marker| prefix.as_str() > marker)),
+                "a resumed page must not repeat a prefix at or before its key marker"
+            );
+            page_prefixes.push(prefixes.clone());
+            seen_objects.extend(objects.into_iter().map(|object| object.name));
+            seen_prefixes.extend(prefixes);
 
             if !is_truncated {
                 assert!(next_marker.is_none());
@@ -8811,10 +8886,88 @@ mod test {
             marker = Some(next);
         }
 
-        let expected: BTreeSet<String> = ["data-".to_string(), "other-".to_string(), "zzz".to_string()]
+        assert_eq!(
+            page_prefixes,
+            vec![vec!["data-".to_string()], vec![], vec!["other-".to_string()], vec![]],
+            "versioned pagination must not repeat a folded prefix while scanning later raw keys"
+        );
+        assert_eq!(
+            seen_prefixes,
+            vec!["data-".to_string(), "other-".to_string()],
+            "versioned pagination must preserve the ordered visible result sequence"
+        );
+        assert_eq!(seen_objects, vec!["zzz".to_string()]);
+    }
+
+    #[test]
+    fn list_objects_paginate_versioned_prefix_boundary_uses_last_raw_key_in_returned_prefix() {
+        let all: Vec<String> = ["alpha-0001", "beta-0001", "charlie-0001"]
             .into_iter()
+            .map(str::to_string)
             .collect();
-        assert_eq!(seen, expected, "versioned pagination must cover every prefix and object");
+        let delimiter = Some("-".to_string());
+        let max_keys = 1;
+        let limit = max_keys_plus_one(max_keys, true) as usize;
+        let mut marker: Option<String> = None;
+        let mut page_prefixes = Vec::new();
+        let mut pages = 0;
+
+        loop {
+            pages += 1;
+            assert!(pages <= 8, "versioned prefix pagination did not terminate");
+
+            let start = marker
+                .as_deref()
+                .map(|marker| all.partition_point(|key| key.as_str() <= marker))
+                .unwrap_or(0);
+            let window: Vec<String> = all[start..].iter().take(limit).cloned().collect();
+            let disk_has_more = window.len() == limit;
+            let last_scanned = window.last().cloned();
+
+            let get_objects = fold_delimiter_page(&window, "", "-");
+            let (objects, prefixes, is_truncated, next_marker, _) = super::list_objects_paginate_versions(
+                get_objects,
+                &delimiter,
+                max_keys,
+                disk_has_more,
+                None,
+                marker.as_deref(),
+                last_scanned.as_deref(),
+                window.iter().map(String::as_str),
+            );
+
+            assert_eq!(objects.len() + prefixes.len(), 1, "a page must respect max-keys");
+            page_prefixes.push(prefixes);
+
+            if !is_truncated {
+                assert!(next_marker.is_none());
+                break;
+            }
+
+            let next = next_marker.expect("truncated page must carry a continuation key marker");
+            if let Some(previous) = &marker {
+                assert!(next > *previous, "the continuation marker must strictly advance");
+            }
+            marker = Some(next);
+        }
+
+        assert_eq!(
+            page_prefixes,
+            vec![
+                vec!["alpha-".to_string()],
+                vec!["beta-".to_string()],
+                vec!["charlie-".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn versioned_marker_filter_does_not_change_no_delimiter_directories() {
+        let mut objects = vec![folded_prefix_object("data-")];
+        super::filter_versions_common_prefixes_after_marker(&mut objects, None, Some("z"));
+
+        assert_eq!(objects.len(), 1);
+        assert!(super::versioned_prefix_page_boundary_key(&objects, std::iter::once("data-"), None, 1, true).is_none());
     }
 
     // End-to-end pagination over 5000 `data-*` + 100 `other-*` with delimiter '-'.
