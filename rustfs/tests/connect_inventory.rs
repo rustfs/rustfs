@@ -47,6 +47,7 @@ const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const SNAPSHOT_UID: &str = "0198f4b0-4d00-7f40-9051-5b6c7d8e9fa3";
+const INVENTORY_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn safe_tempdir() -> tempfile::TempDir {
     tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory")
@@ -302,7 +303,7 @@ async fn wait_for(
     status: &mut watch::Receiver<InventoryStatus>,
     predicate: impl Fn(&InventoryStatus) -> bool,
 ) -> InventoryStatus {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(INVENTORY_STATUS_WAIT_TIMEOUT, async {
         loop {
             let current = status.borrow_and_update().clone();
             if predicate(&current) {

@@ -240,7 +240,10 @@ pub mod bucket {
     }
 
     pub mod quota {
-        pub use crate::bucket::quota::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
+        pub use crate::bucket::quota::{
+            BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
+            QuotaOperation,
+        };
 
         pub mod checker {
             pub use crate::bucket::quota::checker::QuotaChecker;
@@ -469,7 +472,7 @@ pub mod event {
 pub mod global {
     pub use crate::runtime::global::{
         set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
-        update_erasure_type,
+        update_erasure_type, wait_for_detached_mutations,
     };
 }
 

@@ -2311,7 +2311,7 @@ impl DiskAPI for LocalDiskWrapper {
 
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
-        self.health.increment_waiting();
+        let waiting_guard = self.health.waiting_guard();
         let metric_waiting_guard = self.metrics.waiting_guard();
         let started = Instant::now();
 
@@ -2320,7 +2320,7 @@ impl DiskAPI for LocalDiskWrapper {
         self.metrics.record_operation_latency("delete_versions", started.elapsed());
         self.record_batch_delete_error_metrics(&result);
 
-        self.health.decrement_waiting();
+        drop(waiting_guard);
         drop(metric_waiting_guard);
         let has_err = result.iter().any(|e| e.is_some());
         if !has_err {
@@ -3227,6 +3227,40 @@ mod tests {
         let snapshot = wrapper.metrics_snapshot();
         assert_eq!(snapshot.total_writes, 2);
         assert_eq!(snapshot.total_deletes, 1);
+    }
+
+    // A batch delete dropped while the disk call is in flight (for example by a
+    // cancelled caller) must not leave the drive looking busy forever.
+    #[tokio::test]
+    async fn delete_versions_releases_waiting_slot_when_dropped() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        wrapper.make_volume("bucket").await.expect("volume should be created");
+        let object_path = disk.get_object_path("bucket", "object").expect("object path");
+        // Holding the object's metadata lease parks the disk call before it mutates anything.
+        let metadata_lease = crate::disk::os::acquire_metadata_mutation_lease(&object_path, None).await;
+
+        let mut delete = Box::pin(wrapper.delete_versions(
+            "bucket",
+            vec![FileInfoVersions {
+                name: "object".to_string(),
+                versions: vec![FileInfo::default()],
+                ..Default::default()
+            }],
+            DeleteOptions::default(),
+        ));
+        assert!(
+            futures::poll!(delete.as_mut()).is_pending(),
+            "the disk call should wait for the metadata lease"
+        );
+        assert_eq!(wrapper.health.waiting_count(), 1);
+
+        drop(delete);
+        assert_eq!(wrapper.health.waiting_count(), 0, "a dropped delete must release its waiting slot");
+        drop(metadata_lease);
     }
 
     #[tokio::test]

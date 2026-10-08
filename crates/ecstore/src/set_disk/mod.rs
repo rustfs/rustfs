@@ -885,8 +885,6 @@ pub(crate) use ops::hermetic_set_disks_isolated;
 pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
-#[cfg(test)]
-pub(crate) use ops::object::DeleteObjectCommitBarrier;
 #[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 #[cfg(all(test, feature = "test-util"))]
@@ -894,6 +892,8 @@ pub(crate) use ops::object::TransitionUploadedCommitBarrier as SetDiskTransition
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
+#[cfg(test)]
+pub(crate) use ops::object::{DeleteCleanupBarrier, DeleteObjectCommitBarrier};
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
 #[cfg(all(test, feature = "test-util"))]
@@ -9653,6 +9653,141 @@ mod tests {
             "committed files under a dir blocked elsewhere must remain"
         );
         assert!(nested.join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    /// The residue a delete leaves once it committed on a disk but before its
+    /// cleanup pass: a marked data dir and the rollback backup of the same
+    /// transaction. Returns `(data dir, rollback backup)`.
+    async fn write_committed_delete_with_rollback_backup(
+        object_dir: &std::path::Path,
+        backup_transaction: Uuid,
+        marker_transaction: Option<Uuid>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let data_dir = object_dir.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&data_dir).await.expect("data dir should be created");
+        fs::write(data_dir.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        if let Some(transaction) = marker_transaction {
+            fs::write(
+                data_dir.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+        }
+        let backup = object_dir
+            .join(backup_transaction.to_string())
+            .join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(backup.parent().expect("backup parent"))
+            .await
+            .expect("rollback dir should be created");
+        fs::write(&backup, b"rollback metadata")
+            .await
+            .expect("rollback backup should be written");
+        (data_dir, backup)
+    }
+
+    // #6898: the rollback backup of a delete whose committed marker sits in a
+    // data dir of the same object is residue too, so the empty listing can
+    // reclaim the whole object directory.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_removes_rollback_backup_of_committed_delete() {
+        let (dir, disk) = make_single_local_disk().await;
+        let transaction = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket/pfx/obj");
+        write_committed_delete_with_rollback_backup(&object_dir, transaction, Some(transaction)).await;
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("purge should succeed");
+
+        assert!(purged);
+        assert!(!dir.path().join("bucket/pfx").exists(), "the whole committed residue tree must go");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_rollback_backup_of_other_transaction() {
+        let (dir, disk) = make_single_local_disk().await;
+        let object_dir = dir.path().join("bucket/pfx/obj");
+        let (data_dir, backup) =
+            write_committed_delete_with_rollback_backup(&object_dir, Uuid::new_v4(), Some(Uuid::new_v4())).await;
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        set.purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!data_dir.exists(), "the committed data dir is still reclaimed");
+        assert!(backup.exists(), "a backup whose own transaction is unproven must remain");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_rollback_backup_without_marker() {
+        let (dir, disk) = make_single_local_disk().await;
+        let object_dir = dir.path().join("bucket/pfx/obj");
+        let backup = object_dir.join(Uuid::new_v4().to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(backup.parent().expect("backup parent"))
+            .await
+            .expect("rollback dir should be created");
+        fs::write(&backup, b"rollback metadata")
+            .await
+            .expect("rollback backup should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "a lone rollback backup may still be needed to roll a delete back");
+        assert!(backup.exists());
+    }
+
+    // Live metadata on one disk blocks the object there and keeps it intact;
+    // on the other disks only what each disk's own committed marker proves is
+    // reclaimed, the same rule that already applies to a marked data dir.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_keeps_object_with_metadata_on_another_disk() {
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        for _ in 0..4 {
+            let (dir, disk) = make_single_local_disk().await;
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        let transaction = Uuid::new_v4();
+        let mut residue = Vec::new();
+        for dir in &dirs[..3] {
+            residue.push(
+                write_committed_delete_with_rollback_backup(&dir.path().join("bucket/pfx/obj"), transaction, Some(transaction))
+                    .await,
+            );
+        }
+        let live_object = dirs[3].path().join("bucket/pfx/obj");
+        let live_part = live_object.join(Uuid::new_v4().to_string()).join("part.1");
+        fs::create_dir_all(live_part.parent().expect("data dir"))
+            .await
+            .expect("live data dir should be created");
+        fs::write(&live_part, b"live").await.expect("live part should be written");
+        fs::write(live_object.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("live metadata should be written");
+
+        let set = make_set_disks_with(disks).await;
+        set.purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(
+            live_object.join(STORAGE_FORMAT_FILE).exists() && live_part.exists(),
+            "the object with metadata on another disk must stay intact there"
+        );
+        for (data_dir, backup) in &residue {
+            assert!(!data_dir.exists() && !backup.exists(), "this disk's committed residue is reclaimed");
+        }
     }
 
     // An unreadable directory anywhere under the prefix aborts the purge on
