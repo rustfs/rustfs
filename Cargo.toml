@@ -166,7 +166,7 @@ http-body-util = "0.1.5"
 memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
-rustfs-kafka-async = { version = "1.3.1" }
+rustfs-kafka-async = { version = "1.4.0" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.2" }
 tokio-rustls = { default-features = false, version = "0.26.6" }

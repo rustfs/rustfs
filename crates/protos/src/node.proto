@@ -981,6 +981,9 @@ message ScannerPublicationLeaseRequest {
   // existing lease.  Keeping this on the existing RPC lets old peers reject
   // the proof without changing the v7 activity wire shape.
   bytes token = 5;
+  // Observations may race ordinary namespace commits but still remain
+  // non-authoritative. Peers bind this mode to the observed-usage rename path.
+  bool observational_only = 6;
 }
 
 message ScannerPublicationLeaseResponse {
@@ -992,6 +995,7 @@ message ScannerPublicationLeaseResponse {
   bytes response_proof = 6;
   string owner_id = 7;
   string session_id = 8;
+  bool observational_only = 9;
 }
 
 message ScannerPublicationLeaseReleaseRequest {

@@ -64,7 +64,7 @@ const SIGNATURE_PATH: &str = "envelope.sig";
 const RESULT_PATH: &str = "result.json";
 const MAX_OBJECT_RESPONSE_BYTES: usize = 16_384;
 const CLEANUP_RESERVE_MAX: Duration = Duration::from_millis(250);
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_MODE: u32 = 0o600;
 
 static OBJECT_COLLECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
