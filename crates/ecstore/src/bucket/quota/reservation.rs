@@ -593,10 +593,7 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
             quota_limit,
         )
         .await?;
-        let shard_grants = allocator.grants_for(data.shard_index);
-        let bootstrap_shard =
-            allocator.generation == 1 && !shard_grants.is_empty() && shard_grants.values().all(|grant| grant.initial_usage > 0);
-        let allow_create = bootstrap || shard_grants.is_empty() || bootstrap_shard;
+        let allow_create = shard_may_be_created(&allocator, data.shard_index, bootstrap);
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let mut shard = load_current_shard_locked(
@@ -643,6 +640,10 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 capability_proof,
                 state: ReservationState::Pending,
             });
+        }
+        if shard.grants.is_empty() && shard.reservations.is_empty() && shard.accounted_usage == 0 {
+            fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
+            save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await?;
         }
         drop(shard_guard);
         drop(allocator_guard);
@@ -1272,6 +1273,14 @@ fn shard_object(ledger_object: &str, shard_index: u16, bucket_incarnation: Uuid,
 fn shard_index(object: &str) -> u16 {
     let digest = Sha256::digest(object.as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) % SHARDED_LEDGER_COUNT
+}
+
+fn shard_may_be_created(allocator: &QuotaAllocatorLedger, shard_index: u16, bootstrap: bool) -> bool {
+    if bootstrap {
+        return true;
+    }
+    let grants = allocator.grants_for(shard_index);
+    grants.is_empty() || grants.values().all(|grant| grant.initial_usage > 0)
 }
 
 fn credit_grant_amount(issued: u64, quota_limit: u64, growth: u64) -> Result<u64> {
@@ -2186,6 +2195,34 @@ mod tests {
         assert_eq!(second.accounted_usage, 30_000);
         assert_eq!(first.available_credit().expect("first shard credit"), 0);
         assert_eq!(second.available_credit().expect("second shard credit"), 0);
+    }
+
+    #[test]
+    fn untouched_bootstrap_shard_remains_creatable_after_allocator_refill() {
+        let revision = OffsetDateTime::now_utc();
+        let incarnation = Uuid::new_v4();
+        let mut allocator = QuotaAllocatorLedger::new(incarnation, revision, 100_000);
+        allocator.generation = 2;
+        allocator.grants.insert(
+            Uuid::new_v4(),
+            AllocatorGrant {
+                shard_index: 7,
+                amount: 100,
+                initial_usage: 100,
+            },
+        );
+        assert!(shard_may_be_created(&allocator, 7, false));
+
+        allocator.grants.insert(
+            Uuid::new_v4(),
+            AllocatorGrant {
+                shard_index: 7,
+                amount: 100,
+                initial_usage: 0,
+            },
+        );
+        assert!(!shard_may_be_created(&allocator, 7, false));
+        assert!(shard_may_be_created(&allocator, 1, false));
     }
 
     #[test]
