@@ -58,6 +58,12 @@ impl WriteCommitGuard {
         }
     }
 
+    /// Return the loss signal of the namespace owner retained by acquisition.
+    #[doc(hidden)]
+    pub fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+        self.guards.first().and_then(|guard| guard.lock_lost_signal())
+    }
+
     pub fn is_lock_lost(&self) -> bool {
         self.guards.iter().any(|guard| guard.is_lock_lost() || guard.is_released())
     }

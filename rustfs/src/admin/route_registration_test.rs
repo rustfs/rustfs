@@ -178,7 +178,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(
             Method::GET,
             "/v3/target/{target_type}/{target_name}/subscriptions",
-            "/v3/target/webhook/test-target/subscriptions",
+            "/v3/target/notify_webhook/test-target/subscriptions",
         ),
         admin_route(Method::POST, "/v3/service"),
         admin_route(Method::POST, "/v3/update"),
@@ -288,6 +288,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
         admin_route(Method::PUT, "/v3/import-bucket-metadata"),
+        admin_route_sample(
+            Method::POST,
+            "/v3/recover-orphaned-bucket/{bucket}",
+            "/v3/recover-orphaned-bucket/test-bucket",
+        ),
         admin_route(Method::GET, "/v3/get-config-kv"),
         admin_route(Method::PUT, "/v3/set-config-kv"),
         admin_route(Method::DELETE, "/v3/del-config-kv"),
@@ -457,10 +462,13 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/idp/openid/list-access-keys-bulk"),
         table_route(Method::GET, "/config"),
         table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        table_route_sample(Method::DELETE, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         table_route_sample(
             Method::POST,
             "/{warehouse}/catalog/warehouse-index/backfill",
@@ -659,10 +667,13 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         compat_table_route(Method::GET, "/config"),
         compat_table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        compat_table_route_sample(Method::DELETE, "/buckets/{warehouse}", "/buckets/analytics"),
         compat_table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         compat_table_route_sample(
             Method::POST,
             "/{warehouse}/catalog/warehouse-index/backfill",
@@ -1383,6 +1394,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/import-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
+    assert_route(&router, Method::POST, &admin_path("/v3/recover-orphaned-bucket/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
     assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));

@@ -20,10 +20,11 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
-    delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store, odm_read_generation,
-    prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut,
-    req_info_ref,
+    PostObjectRequestMarker, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+    apply_copy_source_bucket_generation_guard, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
+    load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
+    recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
+    retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
@@ -363,14 +364,7 @@ impl DefaultObjectUsecase {
         map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(Some)
     }
 
-    #[hotpath::measure(
-        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_put_object",
-        impl_type = "DefaultObjectUsecase"
-    )]
-    #[hotpath::measure(
-        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_get_object",
-        impl_type = "DefaultObjectUsecase"
-    )]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_select_object_content(
         &self,

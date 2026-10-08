@@ -15,7 +15,8 @@
 use super::FederatedIdentityProvider;
 use std::sync::Arc;
 
-/// Immutable registry of built-in federation adapters.
+/// Compatibility facade for integrations built against the original provider API.
+/// Production standard OIDC startup composes the adapter, mapper, and service directly.
 pub struct FederatedIdentityRegistry {
     standard_oidc: Arc<dyn FederatedIdentityProvider>,
 }
@@ -25,7 +26,7 @@ impl FederatedIdentityRegistry {
         Self { standard_oidc }
     }
 
-    pub(crate) fn standard_oidc(&self) -> &dyn FederatedIdentityProvider {
-        self.standard_oidc.as_ref()
+    pub(crate) fn standard_oidc_arc(&self) -> Arc<dyn FederatedIdentityProvider> {
+        Arc::clone(&self.standard_oidc)
     }
 }

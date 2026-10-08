@@ -312,6 +312,12 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   and snapshot refs remain protected. Orphan candidates are read-only observations,
   not deletion authorization. Object-backed reports share one recovery observation
   but do not provide a cross-object linearizable snapshot.
+  diagnostics fail closed if the strong snapshot changes during inspection;
+  until strong maintenance configuration is persisted, diagnostics use a
+  conservative zero-file retention default. Durable catalog backup and restore
+  are controlled durable-strong operations; backup artifacts record catalog and
+  referenced-object watermarks, while restore verifies them and retains a
+  recoverable intent when maintenance-state finalization is interrupted.
 
 ## Client Matrix
 

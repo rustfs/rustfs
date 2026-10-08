@@ -30,7 +30,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, warn};
 
@@ -44,6 +44,9 @@ enum HealObjectOutcome {
     /// contended lock). The object is skipped and retried on a later pass
     /// instead of being recorded as processed.
     Transient,
+    /// A storage safety window with a known deadline; it consumes no failure
+    /// retry when it is the only reason a replacement pass remains incomplete.
+    DanglingDeleteDeferred { retry_not_before: u64 },
     /// A real heal failure that should be recorded as failed.
     Failed,
 }
@@ -312,13 +315,33 @@ impl ErasureSetHealer {
     /// Most heal object failures wrap `Error::Storage(StorageError)`, while
     /// compatibility markers can also arrive through Disk/Io/task wrappers.
     fn classify_heal_object_error(err: &Error) -> HealObjectOutcome {
+        if let Error::DanglingDeleteDeferred { retry_not_before } = err {
+            return HealObjectOutcome::DanglingDeleteDeferred {
+                retry_not_before: *retry_not_before,
+            };
+        }
         if err.is_dangling_delete_grace() {
+            if let Some(retry_not_before) = err
+                .dangling_delete_retry_not_before()
+                .and_then(|deadline| deadline.duration_since(UNIX_EPOCH).ok())
+                .and_then(|deadline| deadline.as_secs().checked_add(1))
+            {
+                // Storage reports whole remaining seconds. Round the absolute
+                // deadline up so subsecond grace boundaries cannot hot-loop.
+                return HealObjectOutcome::DanglingDeleteDeferred { retry_not_before };
+            }
             return HealObjectOutcome::Transient;
         }
 
         let Error::Storage(se) = err else {
             return HealObjectOutcome::Failed;
         };
+
+        if let EcstoreError::Lock(lock_error) = se
+            && !lock_error.is_fatal()
+        {
+            return HealObjectOutcome::Transient;
+        }
 
         // Genuine object/version absence: nothing left to heal, treat as handled.
         if matches!(
@@ -622,7 +645,7 @@ impl ErasureSetHealer {
 
             let state = resume_manager.get_state().await;
             if self.admin_task.is_none()
-                && state.retry_count > 0
+                && (state.retry_count > 0 || state.dangling_delete_retry_not_before.is_some())
                 && state.completed_buckets.is_empty()
                 && state.resume_cursor.is_none()
                 && state.processed_objects == 0
@@ -633,9 +656,9 @@ impl ErasureSetHealer {
                 && state.skipped_ilm_expired == 0
                 && state.processed_bytes == 0
             {
-                // schedule_retry persists the authoritative resume reset before
-                // resetting the checkpoint. Reapply the checkpoint reset after
-                // a crash in that window so stale positions cannot skip work.
+                // Retry and grace deferral persist the resume rewind before
+                // resetting the checkpoint. Repair that crash window even when
+                // a grace wait has never spent a failure retry.
                 checkpoint_manager.reset_for_retry().await?;
             }
 
@@ -685,6 +708,15 @@ impl ErasureSetHealer {
     ) -> Result<()> {
         // 1. get current state
         let state = resume_manager.get_state().await;
+        if self.replacement_task_id.is_some()
+            && let Some(retry_not_before) = state.dangling_delete_retry_not_before
+            && retry_not_before > SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        {
+            if !state.can_retry() {
+                return Err(Error::ReplacementRetryBudgetExhausted);
+            }
+            return Err(Error::DanglingDeleteDeferred { retry_not_before });
+        }
         let checkpoint = checkpoint_manager.get_checkpoint().await;
 
         debug!(
@@ -956,6 +988,24 @@ impl ErasureSetHealer {
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
             if self.replacement_task_id.is_some() {
                 let state = resume_manager.get_state().await;
+                let checkpoint = checkpoint_manager.get_checkpoint().await;
+                if state.can_retry()
+                    && failed_objects == 0
+                    && failed_buckets == 0
+                    && skipped_objects > 0
+                    && skipped_objects == checkpoint.dangling_delete_grace_objects
+                    && !checkpoint.counter_unknown
+                    && let Some(retry_not_before) = checkpoint.dangling_delete_retry_not_before
+                {
+                    // Publish the generation's rewind and wait first. If the
+                    // checkpoint reset is interrupted, initialization reapplies
+                    // it without losing the deferred object classification.
+                    resume_manager
+                        .defer_retry_until_dangling_delete_ready(retry_not_before)
+                        .await?;
+                    checkpoint_manager.reset_for_retry().await?;
+                    return Err(Error::DanglingDeleteDeferred { retry_not_before });
+                }
                 let targets_ready = self
                     .storage
                     .replacement_targets_ready_for_retry(
@@ -1129,6 +1179,9 @@ impl ErasureSetHealer {
             Ok((result, Some(err))) => {
                 let object_size = result_object_size_u64(&result);
                 match Self::classify_heal_object_error(&err) {
+                    HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
+                        (object_size, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                    }
                     HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
                         object_size,
                         Err(Error::transient_skip(format!(
@@ -1140,6 +1193,9 @@ impl ErasureSetHealer {
             }
             Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
             Err(err) => match Self::classify_heal_object_error(&err) {
+                HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
+                    (0, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                }
                 HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
                     0,
                     Err(Error::transient_skip(format!(
@@ -1170,7 +1226,8 @@ impl ErasureSetHealer {
                 );
                 CheckpointObjectOutcome::Processed
             }
-            Err(Error::TransientSkip { message }) => {
+            Err(err) if matches!(err, Error::TransientSkip { .. } | Error::DanglingDeleteDeferred { .. }) => {
+                let message = err.to_string();
                 telemetry_unknown |= !increment_counter(counters.skipped_objects);
                 telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                 warn!(
@@ -1185,7 +1242,12 @@ impl ErasureSetHealer {
                     error = %message,
                     "Replacement pool metadata heal skipped due to transient error"
                 );
-                CheckpointObjectOutcome::Skipped
+                match err {
+                    Error::DanglingDeleteDeferred { retry_not_before } => {
+                        CheckpointObjectOutcome::DeferredDanglingDelete { retry_not_before }
+                    }
+                    _ => CheckpointObjectOutcome::Skipped,
+                }
             }
             Err(err) => {
                 telemetry_unknown |= !increment_counter(counters.failed_objects);
@@ -1247,6 +1309,10 @@ impl ErasureSetHealer {
                 CheckpointObjectOutcome::Skipped => HealObjectDisposition::Deferred {
                     reason: HealDeferredReason::TransientExistenceCheck,
                     retry_not_before: None,
+                },
+                CheckpointObjectOutcome::DeferredDanglingDelete { retry_not_before } => HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::DanglingDeleteGrace,
+                    retry_not_before: UNIX_EPOCH.checked_add(Duration::from_secs(retry_not_before)),
                 },
                 CheckpointObjectOutcome::Failed => HealObjectDisposition::Failed(HealFailureClass::Permanent),
             };
@@ -1669,6 +1735,9 @@ impl ErasureSetHealer {
                                 let object_size = result_object_size_u64(&result);
                                 match Self::classify_heal_object_error(&err) {
                                     HealObjectOutcome::Absent => (object_size, Ok(false)),
+                                    HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
+                                        (object_size, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                                    }
                                     HealObjectOutcome::Transient => (
                                         object_size,
                                         Err(Error::transient_skip(format!(
@@ -1680,6 +1749,9 @@ impl ErasureSetHealer {
                             }
                             Err(err) => match Self::classify_heal_object_error(&err) {
                                 HealObjectOutcome::Absent => (0, Ok(false)),
+                                HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
+                                    (0, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                                }
                                 HealObjectOutcome::Transient => (
                                     0,
                                     Err(Error::transient_skip(format!(
@@ -1744,7 +1816,8 @@ impl ErasureSetHealer {
                         CheckpointObjectOutcome::Processed
                     }
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
-                    Err(Error::TransientSkip { message }) => {
+                    Err(err) if matches!(err, Error::TransientSkip { .. } | Error::DanglingDeleteDeferred { .. }) => {
+                        let message = err.to_string();
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
@@ -1759,7 +1832,12 @@ impl ErasureSetHealer {
                             error = %message,
                             "Erasure set object heal skipped due to transient error"
                         });
-                        CheckpointObjectOutcome::Skipped
+                        match err {
+                            Error::DanglingDeleteDeferred { retry_not_before } => {
+                                CheckpointObjectOutcome::DeferredDanglingDelete { retry_not_before }
+                            }
+                            _ => CheckpointObjectOutcome::Skipped,
+                        }
                     }
                     Err(err) => {
                         telemetry_unknown |= !increment_counter(failed_objects);
@@ -2071,6 +2149,46 @@ mod tests {
     }
 
     #[test]
+    fn retryable_lock_failures_are_transient_but_fatal_lock_errors_are_not() {
+        use rustfs_lock::LockError;
+
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::timeout(
+                "bucket/object",
+                std::time::Duration::from_secs(5)
+            )))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::QuorumNotReached {
+                required: 3,
+                achieved: 1,
+            }))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::already_locked(
+                "bucket/object",
+                "node-2"
+            )))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::InsufficientNodes {
+                required: 3,
+                available: 1,
+            }))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::permission_denied(
+                "lock policy"
+            )))),
+            HealObjectOutcome::Failed
+        ));
+    }
+
+    #[test]
     fn dangling_delete_grace_is_transient() {
         assert!(matches!(
             ErasureSetHealer::classify_heal_object_error(&Error::Disk(DiskError::other(
@@ -2133,6 +2251,8 @@ mod resume_loop_tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
+
+    mod dangling_grace;
 
     fn item(name: &str, version: Option<&str>, delete_marker: bool) -> HealListItem {
         HealListItem {
@@ -2254,6 +2374,8 @@ mod resume_loop_tests {
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
+        DanglingGrace(u64),
+        StorageError(EcstoreError),
         RpcCancelled(u32),
         Cancelled,
         Timeout,
@@ -2475,6 +2597,10 @@ mod resume_loop_tests {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
                 HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
+                HealOutcome::DanglingGrace(retry_not_before) => {
+                    Ok((HealResultItem::default(), Some(Error::DanglingDeleteDeferred { retry_not_before })))
+                }
+                HealOutcome::StorageError(error) => Ok((HealResultItem::default(), Some(Error::Storage(error)))),
                 HealOutcome::RpcCancelled(_) => {
                     // Pool aggregation clones the selected error before returning it to heal.
                     let error = EcstoreError::from(tonic::Status::cancelled("injected peer cancellation"));

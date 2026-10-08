@@ -19,8 +19,10 @@ use crate::init::init_webdav_system;
 #[cfg(feature = "ftps")]
 use crate::init::{init_ftp_system, init_ftps_system};
 use crate::server::ShutdownHandle;
+use crate::storage_api::startup::services::ServerContextSlot;
 use std::future::Future;
 use std::io::{Error, Result};
+use std::sync::Arc;
 use tracing::{debug, error, info};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -38,52 +40,52 @@ pub(crate) struct ProtocolShutdownSenders {
     pub(crate) sftp: Option<ShutdownHandle>,
 }
 
-pub(crate) async fn init_protocol_shutdown_senders() -> Result<ProtocolShutdownSenders> {
+pub(crate) async fn init_protocol_shutdown_senders(server_ctx: Arc<ServerContextSlot>) -> Result<ProtocolShutdownSenders> {
     Ok(ProtocolShutdownSenders {
-        ftp: init_ftp_protocol().await?,
-        ftps: init_ftps_protocol().await?,
-        webdav: init_webdav_protocol().await?,
-        sftp: init_sftp_protocol().await?,
+        ftp: init_ftp_protocol(server_ctx.clone()).await?,
+        ftps: init_ftps_protocol(server_ctx.clone()).await?,
+        webdav: init_webdav_protocol(server_ctx.clone()).await?,
+        sftp: init_sftp_protocol(server_ctx).await?,
     })
 }
 
 #[cfg(feature = "ftps")]
-async fn init_ftp_protocol() -> Result<Option<ShutdownHandle>> {
-    init_protocol("ftp", init_ftp_system).await
+async fn init_ftp_protocol(server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
+    init_protocol("ftp", || init_ftp_system(server_ctx)).await
 }
 
 #[cfg(not(feature = "ftps"))]
-async fn init_ftp_protocol() -> Result<Option<ShutdownHandle>> {
+async fn init_ftp_protocol(_server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 
 #[cfg(feature = "ftps")]
-async fn init_ftps_protocol() -> Result<Option<ShutdownHandle>> {
-    init_protocol("ftps", init_ftps_system).await
+async fn init_ftps_protocol(server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
+    init_protocol("ftps", || init_ftps_system(server_ctx)).await
 }
 
 #[cfg(not(feature = "ftps"))]
-async fn init_ftps_protocol() -> Result<Option<ShutdownHandle>> {
+async fn init_ftps_protocol(_server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 
 #[cfg(feature = "webdav")]
-async fn init_webdav_protocol() -> Result<Option<ShutdownHandle>> {
-    init_protocol("webdav", init_webdav_system).await
+async fn init_webdav_protocol(server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
+    init_protocol("webdav", || init_webdav_system(server_ctx)).await
 }
 
 #[cfg(not(feature = "webdav"))]
-async fn init_webdav_protocol() -> Result<Option<ShutdownHandle>> {
+async fn init_webdav_protocol(_server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 
 #[cfg(feature = "sftp")]
-async fn init_sftp_protocol() -> Result<Option<ShutdownHandle>> {
-    init_protocol("sftp", init_sftp_system).await
+async fn init_sftp_protocol(server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
+    init_protocol("sftp", || init_sftp_system(server_ctx)).await
 }
 
 #[cfg(not(feature = "sftp"))]
-async fn init_sftp_protocol() -> Result<Option<ShutdownHandle>> {
+async fn init_sftp_protocol(_server_ctx: Arc<ServerContextSlot>) -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 

@@ -35,7 +35,11 @@ use super::interfaces::{
 };
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::object_traffic_health::ObjectTrafficHealth;
-use rustfs_iam::{federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{
+    federation::{FederatedIdentityService, oidc::OidcConfigQuery},
+    store::object::ObjectStore,
+    sys::IamSys,
+};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
 
@@ -157,6 +161,15 @@ impl AppContext {
         self.federated_identity.clone()
     }
 
+    pub fn publish_federated_identity_runtime(
+        &self,
+        service: Arc<FederatedIdentityService>,
+        oidc_config_query: Arc<dyn OidcConfigQuery>,
+    ) -> bool {
+        self.federated_identity.publish_runtime(service, oidc_config_query)
+    }
+
+    /// Publish a service-only federation runtime for compatibility integrations.
     pub fn publish_federated_identity_service(&self, service: Arc<FederatedIdentityService>) -> bool {
         self.federated_identity.publish_handle(service)
     }

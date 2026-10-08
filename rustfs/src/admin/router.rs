@@ -39,7 +39,7 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
-    is_sts_query_request,
+    is_sts_query_request, is_table_catalog_path,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -85,6 +85,7 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 use s3s::StdError;
+use s3s::auth::SigV4PathEncoding;
 use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, StreamingBlob, Timestamp, TimestampFormat};
 use s3s::header;
 use s3s::route::S3Route;
@@ -3242,12 +3243,16 @@ impl<T> S3Route for S3Router<T>
 where
     T: Operation,
 {
-    fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
+    fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, extensions: &mut Extensions) -> bool {
         if parse_replication_extension_request(method, uri).is_some() || parse_misc_extension_request(method, uri).is_some() {
             return true;
         }
 
         let path = uri.path();
+        if is_table_catalog_path(path) {
+            extensions.insert(SigV4PathEncoding::DoubleEncoded);
+            return true;
+        }
 
         // Profiling endpoints
         if method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
@@ -3572,6 +3577,86 @@ mod tests {
         assert!(!is_admin_path("/minio/administrator/object"));
         assert!(!is_admin_path("/rustfs/adminx/object"));
         assert!(!is_admin_path("/minio/adminx/object"));
+    }
+
+    #[test]
+    fn iceberg_routes_select_double_encoded_sigv4() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+        for path in [
+            "/iceberg/v1",
+            "/iceberg/v1/warehouse/namespaces/ods%1Forders/tables/files",
+            "/_iceberg/v1",
+            "/_iceberg/v1/warehouse/namespaces/ods%1Forders/tables/files",
+        ] {
+            let mut extensions = Extensions::new();
+            assert!(router.is_match(&Method::GET, &path.parse().unwrap(), &HeaderMap::new(), &mut extensions));
+            assert_eq!(
+                extensions.get::<s3s::auth::SigV4PathEncoding>(),
+                Some(&s3s::auth::SigV4PathEncoding::DoubleEncoded),
+                "{path}"
+            );
+        }
+        for path in [
+            "/bucket/name%20space",
+            "/rustfs/admin/v3/info",
+            "/minio/admin/v3/info",
+            "/health",
+            "/iceberg/v10/config",
+            "/_iceberg/v10/config",
+            "/iceberg/v1suffix/config",
+        ] {
+            let mut extensions = Extensions::new();
+            router.is_match(&Method::GET, &path.parse().unwrap(), &HeaderMap::new(), &mut extensions);
+            assert!(extensions.get::<s3s::auth::SigV4PathEncoding>().is_none(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn iceberg_metadata_probe_passes_sigv4_verification() {
+        use s3s::auth::SimpleAuth;
+        use s3s::config::{S3Config, StaticConfigProvider};
+        use s3s::service::S3ServiceBuilder;
+
+        struct TestS3;
+        #[async_trait::async_trait]
+        impl s3s::S3 for TestS3 {}
+
+        let mut router = S3Router::new(false);
+        router
+            .insert(
+                Method::GET,
+                "/iceberg/v1/warehouse/namespaces/{namespace}/tables/{table}",
+                StatusOperation(StatusCode::NOT_FOUND),
+            )
+            .unwrap();
+        let mut builder = S3ServiceBuilder::new(TestS3);
+        builder.set_route(router);
+        builder.set_auth(SimpleAuth::from_single("catalog-test-access", "catalog-test-secret"));
+        let mut config = S3Config::default();
+        config.presigned_url_max_skew_time_secs = u32::MAX;
+        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
+        let service = builder.build();
+
+        // Captured from botocore SigV4Auth, independently of the server signer.
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri("/iceberg/v1/warehouse/namespaces/ods%1Fkfk_log_order/tables/files")
+            .header("host", "catalog.example:9000")
+            .header("content-type", "application/json")
+            .header("x-amz-date", "20200101T000000Z")
+            .header("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .header(
+                "authorization",
+                concat!(
+                    "AWS4-HMAC-SHA256 Credential=catalog-test-access/20200101/us-east-1/s3/aws4_request, ",
+                    "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, ",
+                    "Signature=38357111b8355d0efdc6746cc5e94930c455d2f6741ea38c65e6556fe45d882d"
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

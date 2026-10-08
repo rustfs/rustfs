@@ -17,7 +17,7 @@
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
     TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-    has_bypass_governance_header, replication_request_authorized,
+    has_bypass_governance_header, replication_request_authorized, retained_table_data_plane_publication_guards,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -710,6 +710,7 @@ impl DefaultMultipartUsecase {
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
@@ -778,7 +779,9 @@ impl DefaultMultipartUsecase {
             let key = key.clone();
             let upload_id = upload_id.clone();
             let opts = opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let obj_info = store
                     .clone()
                     .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)

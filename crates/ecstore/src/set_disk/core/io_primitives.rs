@@ -2340,7 +2340,8 @@ enum OrphanDirScan {
     /// under taking parents, root included when anything under it is blocked);
     /// `dirs` is the pre-order list of every directory reached that is not
     /// blocked, and `committed_files` the erasure data and committed delete
-    /// markers found in the unblocked UUID data dirs among them.
+    /// markers found in the unblocked UUID data dirs among them, plus the
+    /// rollback backups those markers prove.
     Scanned {
         blocked: HashSet<String>,
         dirs: Vec<String>,
@@ -2382,10 +2383,15 @@ fn is_safe_orphan_dir_entry(entry: &str) -> bool {
         && !component.contains('\\')
 }
 
-fn is_committed_delete_marker(entry: &str) -> bool {
+fn committed_delete_marker_transaction(entry: &str) -> Option<Uuid> {
     entry
         .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
-        .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok_and(|uuid| !uuid.is_nil()))
+        .and_then(|transaction| Uuid::parse_str(transaction).ok())
+        .filter(|uuid| !uuid.is_nil())
+}
+
+fn is_committed_delete_marker(entry: &str) -> bool {
+    committed_delete_marker_transaction(entry).is_some()
 }
 
 /// Outcome of a *post-quorum* `rename_data` commit, classifying whether the
@@ -5818,8 +5824,9 @@ impl SetDisks {
     }
 
     /// Scan a single disk's copy of `prefix` and classify every directory
-    /// under it. Only empty directories and UUID data directories with valid
-    /// committed delete markers are purgeable; anything else blocks its whole
+    /// under it. Only empty directories, UUID data directories with valid
+    /// committed delete markers, and the rollback backup of a delete whose
+    /// marker sits beside it are purgeable; anything else blocks its whole
     /// ancestor chain while sibling subtrees stay purgeable, so committed
     /// residue is still reclaimed when it shares an ancestor with residue from
     /// an older build that never wrote markers (#6898).
@@ -5832,6 +5839,12 @@ impl SetDisks {
         let mut committed_files: Vec<String> = Vec::new();
         let mut blocked: HashSet<String> = HashSet::new();
         let mut existed = false;
+        // `<object>/<T>` directories holding only a delete's rollback backup,
+        // and the `(object, T)` pairs a committed `delete-data.<T>` marker in a
+        // purgeable data dir of that object proves. Both are resolved after the
+        // walk because siblings are visited in no particular order.
+        let mut rollback_backup_dirs: Vec<String> = Vec::new();
+        let mut committed_transactions: HashSet<(String, Uuid)> = HashSet::new();
 
         while let Some(dir) = stack.pop() {
             let entries = match disk.list_dir("", bucket, &dir, 0).await {
@@ -5865,10 +5878,24 @@ impl SetDisks {
             }
 
             if !has_data && !files.is_empty() {
-                let data_dir_name = dir.rsplit(SLASH_SEPARATOR).next().unwrap_or_default();
+                let (parent, data_dir_name) = dir.rsplit_once(SLASH_SEPARATOR).unwrap_or(("", dir.as_str()));
                 let is_uuid_data_dir = Uuid::parse_str(data_dir_name).is_ok_and(|uuid| !uuid.is_nil());
-                let has_committed_delete = files.iter().any(|entry| is_committed_delete_marker(entry));
-                has_data = !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE);
+                let committed = files
+                    .iter()
+                    .filter_map(|entry| committed_delete_marker_transaction(entry))
+                    .collect::<Vec<_>>();
+                if is_uuid_data_dir
+                    && dir != root
+                    && child_dirs.is_empty()
+                    && matches!(files.as_slice(), [entry] if entry == STORAGE_FORMAT_FILE_BACKUP)
+                {
+                    rollback_backup_dirs.push(dir);
+                    continue;
+                }
+                has_data = !is_uuid_data_dir || committed.is_empty() || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE);
+                if !has_data {
+                    committed_transactions.extend(committed.into_iter().map(|transaction| (parent.to_string(), transaction)));
+                }
             }
 
             if has_data {
@@ -5881,6 +5908,22 @@ impl SetDisks {
             committed_files.extend(files.into_iter().map(|entry| format!("{dir}{SLASH_SEPARATOR}{entry}")));
             dirs.push(dir);
             stack.extend(child_dirs);
+        }
+
+        // A rollback backup is purgeable only when a data dir of the same
+        // object proves its transaction committed on this disk; otherwise it may
+        // still be needed to roll the delete back, so it blocks as before.
+        for dir in rollback_backup_dirs {
+            let proven = dir.rsplit_once(SLASH_SEPARATOR).is_some_and(|(parent, transaction)| {
+                Uuid::parse_str(transaction)
+                    .is_ok_and(|transaction| committed_transactions.contains(&(parent.to_string(), transaction)))
+            });
+            if proven {
+                committed_files.push(format!("{dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}"));
+                dirs.push(dir);
+            } else {
+                block_orphan_dir_chain(&mut blocked, &root, &dir);
+            }
         }
 
         if existed {
@@ -6846,6 +6889,7 @@ pub(crate) mod rename_fanout_barrier {
         ReadVersion,
         MetadataSlowtailFault,
         NonInlineHedgeTimer,
+        LateMetadataRefresh,
     }
 
     impl From<&'static str> for Phase {
@@ -6857,6 +6901,7 @@ pub(crate) mod rename_fanout_barrier {
                 super::rename_fanout_barrier_phase::READ_VERSION => Self::ReadVersion,
                 "metadata_slowtail_fault" => Self::MetadataSlowtailFault,
                 "non_inline_hedge_timer" => Self::NonInlineHedgeTimer,
+                "late_metadata_refresh" => Self::LateMetadataRefresh,
                 _ => panic!("unknown commit fault phase: {label}"),
             }
         }
@@ -6870,6 +6915,9 @@ pub(crate) mod rename_fanout_barrier {
 
     /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
     pub const PHASE_NON_INLINE_HEDGE_TIMER: Phase = Phase::NonInlineHedgeTimer;
+
+    /// Object-scoped retry boundary; slot zero identifies the refresh, not a disk.
+    pub const PHASE_LATE_METADATA_REFRESH: Phase = Phase::LateMetadataRefresh;
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {

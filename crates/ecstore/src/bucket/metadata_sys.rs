@@ -583,6 +583,27 @@ pub(crate) async fn update_in(
     Box::pin(update_with_sys(require_bucket_metadata_sys_in(ctx)?, bucket, config_file, data)).await
 }
 
+/// Validate a caller's fence after acquiring the lifecycle and metadata
+/// transaction locks, before changing the configuration.
+pub(crate) async fn update_validated_in<F>(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    validate: F,
+) -> Result<OffsetDateTime>
+where
+    F: FnOnce() -> Result<()> + Send,
+{
+    Box::pin(async {
+        let sys = require_bucket_metadata_sys_in(ctx)?;
+        let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+        validate()?;
+        update_under_config_write_guard(sys, &guard, config_file, data, None).await
+    })
+    .await
+}
+
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
     delete_with_sys(get_bucket_metadata_sys()?, bucket, config_file).await
 }
@@ -1139,7 +1160,7 @@ async fn acquire_transaction_lock_with_sys(
 /// agree on, so renaming it would leave a mixed-version cluster with two
 /// disjoint keys — and old and new nodes would stop excluding each other on
 /// the very writes that are serialized today.
-fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
+pub(crate) fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
     format!("bucket-targets/{bucket}/transaction.lock")
 }
 
@@ -4204,6 +4225,114 @@ mod tests {
         bm.update_config(config_file, raw.to_vec())
             .expect("raw config should be stored");
         sys.persist_new_and_set(bm).await.expect("initial metadata should persist");
+    }
+
+    #[tokio::test]
+    async fn reparse_xml_rmw_corruption_refuses_cached_and_reloaded_encryption() {
+        use crate::bucket::metadata::{BUCKET_SSECONFIG, is_unreadable_config_error};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "reparse-encryption-corrupt";
+        let valid = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+        let corrupt = b"<ServerSideEncryptionConfiguration";
+        persist_bucket_with_raw_config(&sys, &dirs, bucket, BUCKET_SSECONFIG, valid).await;
+        sys.get_sse_config(bucket).await.expect("valid encryption must be readable");
+
+        let updated = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |bm| {
+                assert!(bm.sse_config.is_some(), "rewrite must start with parsed encryption");
+                Ok(corrupt.to_vec())
+            })
+            .await
+            .expect("persist future or corrupt raw encryption without failing the whole bucket");
+
+        let err = sys
+            .get_sse_config(bucket)
+            .await
+            .expect_err("cached old encryption must not hide corrupt raw");
+        assert!(is_unreadable_config_error(&err), "cached refusal must retain its type: {err}");
+        let (cached, _) = sys.get_config(bucket).await.expect("bucket remains readable");
+        assert_eq!(cached.encryption_config_xml, corrupt);
+        assert_eq!(cached.encryption_config_updated_at, updated);
+
+        sys.metadata_map.write().await.clear();
+        let err = sys
+            .get_sse_config(bucket)
+            .await
+            .expect_err("reloaded encryption must still refuse corrupt raw");
+        assert!(is_unreadable_config_error(&err), "reloaded refusal must retain its type: {err}");
+
+        let calls = AtomicUsize::new(0);
+        let err = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .await
+            .expect_err("another rewrite must refuse before it consumes corrupt encryption");
+        assert!(is_unreadable_config_error(&err));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "refused rewrite must not erase the original raw");
+        let disk = sys
+            .get_config_from_disk(bucket)
+            .await
+            .expect("read unchanged metadata from disk");
+        assert_eq!(disk.encryption_config_xml, corrupt);
+        assert_eq!(disk.encryption_config_updated_at, updated);
+
+        sys.update(bucket, BUCKET_SSECONFIG, valid.to_vec())
+            .await
+            .expect("explicit repair must remain possible");
+        sys.get_sse_config(bucket)
+            .await
+            .expect("repaired cached encryption must be readable");
+        sys.metadata_map.write().await.clear();
+        sys.get_sse_config(bucket).await.expect("repair must survive a disk reload");
+    }
+
+    #[tokio::test]
+    async fn reparse_xml_rmw_removal_clears_cached_and_reloaded_encryption() {
+        use crate::bucket::metadata::BUCKET_SSECONFIG;
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "reparse-encryption-removed";
+        let valid = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+        persist_bucket_with_raw_config(&sys, &dirs, bucket, BUCKET_SSECONFIG, valid).await;
+        sys.get_sse_config(bucket).await.expect("valid encryption must be readable");
+
+        let updated = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |bm| {
+                assert!(bm.sse_config.is_some(), "rewrite must start with parsed encryption");
+                Ok(Vec::new())
+            })
+            .await
+            .expect("removing encryption must persist");
+
+        assert_eq!(
+            sys.get_sse_config(bucket)
+                .await
+                .expect_err("old cached encryption must be gone"),
+            Error::ConfigNotFound
+        );
+        let (cached, _) = sys.get_config(bucket).await.expect("bucket remains readable");
+        assert!(cached.encryption_config_xml.is_empty());
+        assert_eq!(cached.encryption_config_updated_at, updated);
+
+        sys.metadata_map.write().await.clear();
+        assert_eq!(
+            sys.get_sse_config(bucket)
+                .await
+                .expect_err("removed encryption must stay absent after reload"),
+            Error::ConfigNotFound
+        );
+        let disk = sys
+            .get_config_from_disk(bucket)
+            .await
+            .expect("read removed encryption from disk");
+        assert!(disk.encryption_config_xml.is_empty());
+        assert_eq!(disk.encryption_config_updated_at, updated);
     }
 
     /// rustfs/backlog#1734: a read-modify-write of a stored config that cannot

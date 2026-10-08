@@ -162,6 +162,11 @@
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction"
     },
     {
+      "invariant": "metadata-observation-mixed-current-identity-arrivals-preserve-selection",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::metadata_quorum::tests::metadata_observation_mixed_current_identity_arrivals_preserve_selection"
+    },
+    {
       "invariant": "metadata-observation-pending-newer-version-and-same-time-different-directory-force-full-wait",
       "suite": "rustfs-ecstore",
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_pending_newer_version_and_same_time_different_directory_force_full_wait"
@@ -175,6 +180,21 @@
       "invariant": "metadata-observation-null-versions-markers-and-invalid-success-keep-their-meaning",
       "suite": "rustfs-ecstore",
       "name": "set_disk::core::metadata_quorum::tests::metadata_observation_null_versions_markers_and_invalid_success_keep_their_meaning"
+    },
+    {
+      "invariant": "metadata-cache-real-get-and-range-preserve-body-across-read-modes",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::read::metadata_cache_tests::metadata_cache_real_get_and_range_preserve_body_across_read_modes"
+    },
+    {
+      "invariant": "late-metadata-refresh-rejects-changed-generation-and-mapped-shards",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::read::metadata_cache_tests::late_metadata_refresh_rejects_changed_generation_and_mapped_shards"
+    },
+    {
+      "invariant": "late-full-get-rejects-changed-object-generation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::prepared_get_object_metadata_tests::non_inline_two_phase_get_rejects_generation_change_before_late_refresh"
     },
     {
       "invariant": "list-objects-shared-corpus-static-namespace",

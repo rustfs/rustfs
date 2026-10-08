@@ -125,11 +125,13 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
-        TableDataPlaneListCursorPosition, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
-        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+        apply_copy_source_bucket_generation_guard, authorize_internal_object_request, authorize_request,
+        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -502,7 +504,7 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, wait_for_detached_mutations,
     };
 }
 
@@ -1338,6 +1340,10 @@ where
 
 pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
+}
+
+pub(crate) async fn wait_for_detached_mutations(timeout: std::time::Duration) -> bool {
+    ecstore_global::wait_for_detached_mutations(timeout).await
 }
 
 pub(crate) fn shutdown_background_monitors() {

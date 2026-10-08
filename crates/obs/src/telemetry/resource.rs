@@ -31,7 +31,7 @@ use opentelemetry_semantic_conventions::{
         SERVICE_VERSION as OTEL_SERVICE_VERSION,
     },
 };
-use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
+use rustfs_config::{APP_NAME, ENVIRONMENT, VERSION};
 use rustfs_utils::get_local_ip_with_default;
 use std::borrow::Cow;
 
@@ -40,7 +40,7 @@ use std::borrow::Cow;
 /// The resource carries the following attributes:
 /// - `service.name` — from `config.service_name`, defaulting to [`APP_NAME`].
 /// - `service.version` — from `config.service_version`, defaulting to
-///   [`SERVICE_VERSION`].
+///   [`VERSION`].
 /// - `deployment.environment` — from `config.environment`, defaulting to
 ///   [`ENVIRONMENT`].
 /// - `rustfs.node` / `service.instance.id` — the stable RustFS local node name
@@ -63,7 +63,7 @@ pub(super) fn build_resource(config: &OtelConfig) -> Resource {
             [
                 KeyValue::new(
                     OTEL_SERVICE_VERSION,
-                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(SERVICE_VERSION)).to_string(),
+                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(VERSION)).to_string(),
                 ),
                 KeyValue::new(
                     DEPLOYMENT_ENVIRONMENT_NAME,
@@ -83,6 +83,22 @@ pub(super) fn build_resource(config: &OtelConfig) -> Resource {
 mod tests {
     use super::*;
     use opentelemetry::Key;
+
+    #[test]
+    fn build_resource_uses_configured_service_version() {
+        let config = OtelConfig {
+            service_version: Some("@a1b2c3d".to_string()),
+            ..OtelConfig::default()
+        };
+        let resource = build_resource(&config);
+
+        assert_eq!(
+            resource
+                .get(&Key::from_static_str(OTEL_SERVICE_VERSION))
+                .map(|value| value.to_string()),
+            Some("@a1b2c3d".to_string())
+        );
+    }
 
     #[tokio::test]
     async fn build_resource_uses_stable_local_node_identity() {

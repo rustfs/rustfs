@@ -55,6 +55,7 @@ const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespa
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
+const RECOVER_ORPHANED_BUCKET: AdminActionRef = AdminActionRef::new("RecoverOrphanedBucketAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
 const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
 const KMS_BACKUP: AdminActionRef = AdminActionRef::new("kms:Backup");
@@ -468,6 +469,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Put,
         "/rustfs/admin/v3/import-bucket-metadata",
         IMPORT_BUCKET_METADATA,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/recover-orphaned-bucket/{bucket}",
+        RECOVER_ORPHANED_BUCKET,
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/get-config-kv", CONFIG_UPDATE, RouteRiskLevel::High),
@@ -1020,6 +1027,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET, RouteRiskLevel::High),
     admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/iceberg/v1/buckets/{warehouse}",
         GET_TABLE_BUCKET,
@@ -1040,6 +1053,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/catalog/migration",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/restore",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1304,6 +1329,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/_iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
     admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Put,
         "/_iceberg/v1/buckets/{warehouse}",
         SET_TABLE_BUCKET,
@@ -1330,6 +1361,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/catalog/migration",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/restore",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1917,8 +1960,10 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 100);
+        assert_eq!(table_specs.count(), 106);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Delete, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Delete, "/_iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -2100,6 +2145,10 @@ mod tests {
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Delete, "/iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Delete, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
         assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",

@@ -75,6 +75,9 @@ pub enum Error {
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
 
+    #[error("Dangling object cleanup deferred until UNIX time {retry_not_before}")]
+    DanglingDeleteDeferred { retry_not_before: u64 },
+
     #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
     StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
 
@@ -123,7 +126,7 @@ impl Error {
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
-            Error::ReplacementTargetNotReady(_) => true,
+            Error::ReplacementTargetNotReady(_) | Error::DanglingDeleteDeferred { .. } => true,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
@@ -138,7 +141,7 @@ impl Error {
                     return true;
                 }
                 err.is_quorum_error()
-                    || matches!(err, EcstoreError::Io(error) if is_recoverable_internode_error(error))
+                    || matches!(err, EcstoreError::Io(error) if is_recoverable_io_error(error))
                     || matches!(
                         err,
                         EcstoreError::DiskNotFound
@@ -168,11 +171,11 @@ impl Error {
                         | DiskError::FaultyRemoteDisk
                         | DiskError::FaultyDisk
                         | DiskError::RemoteClientUnavailable(_)
-                ) || matches!(err, DiskError::Io(error) if is_recoverable_internode_error(error))
+                ) || matches!(err, DiskError::Io(error) if is_recoverable_io_error(error))
                     || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
-            Error::Io(err) => is_recoverable_internode_error(err) || is_recoverable_heal_error_message(&err.to_string()),
+            Error::Io(err) => is_recoverable_io_error(err) || is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
     }
@@ -193,6 +196,9 @@ impl Error {
     }
 
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
+        if let Self::DanglingDeleteDeferred { retry_not_before } = self {
+            return std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(*retry_not_before));
+        }
         let after = match self {
             Self::Storage(error) => error.dangling_delete_retry_after(),
             Self::Disk(error) => error.dangling_delete_retry_after(),
@@ -204,6 +210,7 @@ impl Error {
 
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
         match self {
+            Error::DanglingDeleteDeferred { .. } => true,
             Error::Storage(err) => err.is_dangling_delete_grace(),
             Error::Disk(err) => err.is_dangling_delete_grace(),
             Error::Io(err) => DiskError::io_error_is_dangling_delete_grace(err),
@@ -215,11 +222,31 @@ impl Error {
     }
 }
 
-fn is_recoverable_internode_error(error: &std::io::Error) -> bool {
+fn is_recoverable_io_error(error: &std::io::Error) -> bool {
+    // ObjectIO preserves store errors as IO sources; their quorum identity must survive this boundary.
+    if error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<EcstoreError>())
+        .is_some_and(EcstoreError::is_quorum_error)
+    {
+        return true;
+    }
     // A peer restart can cancel an RPC after a partial repair. Replay it within
     // the existing heal retry budget; task cancellation remains terminal.
     if DiskError::io_error_is_rpc_cancelled(error) {
         return true;
+    }
+    let status = error.get_ref().and_then(|source| {
+        source
+            .downcast_ref::<tonic::Status>()
+            .or_else(|| source.source().and_then(|source| source.downcast_ref::<tonic::Status>()))
+    });
+    if let Some(status) = status {
+        // GOAWAY can surface as Internal/Unknown; replay only when the status
+        // retains the typed transport cause, within the existing heal budget.
+        return status.code() == tonic::Code::Unavailable
+            || (matches!(status.code(), tonic::Code::Internal | tonic::Code::Unknown)
+                && std::error::Error::source(status).is_some_and(|source| source.is::<tonic::transport::Error>()));
     }
     let Some(error) = error.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) else {
         return false;
@@ -283,6 +310,37 @@ mod tests {
     use crate::heal::{DiskError, EcstoreError};
 
     #[test]
+    fn namespace_lock_quorum_is_recoverable_across_io_error_conversions() {
+        for (required, achieved) in [(2, 1), (1, 0)] {
+            let quorum = || EcstoreError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".to_owned(),
+                object: "object".to_owned(),
+                required,
+                achieved,
+            };
+            for error in [
+                Error::Storage(quorum()),
+                Error::Io(std::io::Error::from(quorum())),
+                Error::Storage(EcstoreError::from(std::io::Error::from(quorum()))),
+                Error::Disk(DiskError::from(std::io::Error::from(quorum()))),
+            ] {
+                assert!(
+                    error.is_recoverable_object_heal(),
+                    "typed lock quorum failure must remain retryable: {error:?}"
+                );
+            }
+        }
+
+        let message = "Namespace lock quorum unavailable for write lock on bucket/object: required 2, achieved 1";
+        assert!(!Error::Io(std::io::Error::other(message)).is_recoverable_object_heal());
+        let denied = EcstoreError::Lock(rustfs_lock::LockError::PermissionDenied {
+            reason: message.to_owned(),
+        });
+        assert!(!Error::Storage(EcstoreError::from(std::io::Error::from(denied))).is_recoverable_object_heal());
+    }
+
+    #[test]
     fn cancelled_rpc_is_recoverable_across_storage_error_conversions() {
         let status = tonic::Status::cancelled("operation was canceled");
         let disk = DiskError::from(status.clone());
@@ -344,6 +402,122 @@ mod tests {
         for error in [DiskError::FileCorrupt, DiskError::DiskFull, DiskError::FileAccessDenied] {
             assert!(!Error::Disk(error).is_recoverable_heal());
         }
+    }
+
+    #[tokio::test]
+    async fn rpc_goaway_is_recoverable_across_storage_error_conversions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tonic::codegen::Service;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind HTTP/2 peer");
+            let address = listener.local_addr().expect("HTTP/2 peer address");
+            let (release, held) = tokio::sync::oneshot::channel::<()>();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept internode channel");
+                let mut preface = [0_u8; 24];
+                stream.read_exact(&mut preface).await.expect("read HTTP/2 preface");
+                assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                stream
+                    .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                    .await
+                    .expect("send HTTP/2 settings");
+                loop {
+                    let mut header = [0_u8; 9];
+                    stream.read_exact(&mut header).await.expect("read HTTP/2 frame header");
+                    let length = (usize::from(header[0]) << 16) | (usize::from(header[1]) << 8) | usize::from(header[2]);
+                    assert!(length <= 4096, "fixture frame exceeds its budget");
+                    let mut payload = vec![0_u8; length];
+                    stream.read_exact(&mut payload).await.expect("read HTTP/2 frame payload");
+                    if header[3] == 1 {
+                        // A graceful peer restart rejects the admitted stream
+                        // with GOAWAY(NO_ERROR), without an application status.
+                        stream
+                            .write_all(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .expect("send HTTP/2 GOAWAY");
+                        held.await.expect("hold peer until the client observes GOAWAY");
+                        return;
+                    }
+                }
+            });
+            let mut channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .expect("fixture endpoint")
+                .connect()
+                .await
+                .expect("connect internode channel");
+            std::future::poll_fn(|cx| channel.poll_ready(cx))
+                .await
+                .expect("internode channel ready");
+            let request = http::Request::builder()
+                .uri("/rustfs.node/HealObject")
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .body(tonic::body::Body::empty())
+                .expect("build internode request");
+            let transport = channel.call(request).await.expect_err("GOAWAY must terminate the RPC");
+            let status = tonic::Status::from_error(Box::new(transport));
+            release.send(()).expect("release HTTP/2 peer");
+            peer.await.expect("HTTP/2 peer completed");
+            assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+            assert!(
+                std::error::Error::source(&status).is_some_and(|source| source.is::<tonic::transport::Error>()),
+                "the real channel error must retain its typed transport source: {status:?}"
+            );
+            let disk = DiskError::from(status.clone());
+            let storage = EcstoreError::from(status.clone());
+            let disk_storage = EcstoreError::from(DiskError::from(status.clone()));
+            for error in [
+                Error::Disk(disk.clone()),
+                Error::Disk(disk),
+                Error::Storage(storage.clone()),
+                Error::Storage(storage),
+                Error::Storage(disk_storage.clone()),
+                Error::Storage(disk_storage),
+                Error::Io(std::io::Error::from(DiskError::from(status))),
+            ] {
+                let io = match &error {
+                    Error::Disk(DiskError::Io(io)) | Error::Storage(EcstoreError::Io(io)) | Error::Io(io) => io,
+                    _ => panic!("RPC conversion must retain the I/O error: {error:?}"),
+                };
+                let retained = io
+                    .get_ref()
+                    .and_then(|source| source.source())
+                    .and_then(|source| source.downcast_ref::<tonic::Status>())
+                    .expect("RPC conversion and cloning must retain the typed status");
+                assert!(
+                    std::error::Error::source(retained).is_some_and(|source| source.is::<tonic::transport::Error>()),
+                    "RPC conversion and cloning must retain the typed transport source"
+                );
+                assert!(
+                    !super::is_recoverable_heal_error_message(&error.to_string()),
+                    "GOAWAY regression must not be covered by the legacy message fallback: {error}"
+                );
+                assert!(error.is_recoverable_heal(), "a peer GOAWAY must remain recoverable: {error}");
+            }
+        })
+        .await
+        .expect("HTTP/2 GOAWAY fixture completed within its budget");
+    }
+
+    #[test]
+    fn rpc_application_errors_do_not_become_recoverable_from_transport_text() {
+        for code in [
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::DataLoss,
+        ] {
+            let status = tonic::Status::new(code, "h2 protocol error: http2 error");
+            for error in [
+                Error::Disk(DiskError::from(status.clone())),
+                Error::Storage(EcstoreError::from(status.clone())),
+                Error::Io(std::io::Error::from(DiskError::from(status.clone()))),
+            ] {
+                assert!(!error.is_recoverable_heal(), "application RPC errors must stay terminal: {error:?}");
+            }
+        }
+        assert!(!Error::Io(std::io::Error::other("h2 protocol error: http2 error")).is_recoverable_heal());
     }
 
     #[tokio::test]

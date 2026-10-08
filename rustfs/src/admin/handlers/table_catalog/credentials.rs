@@ -25,10 +25,19 @@ impl Operation for RestLoadCredentialsHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let issuer = IamTableCredentialIssuer::from_request(&req)?;
-        let response =
-            load_credentials_response(&store, &warehouse, &namespace, &table, &issuer, Some(&principal.credentials)).await?;
+        let response = load_credentials_response(
+            &store,
+            &metadata_backend,
+            &warehouse,
+            &namespace,
+            &table,
+            &issuer,
+            Some(&principal.credentials),
+        )
+        .await?;
         build_sensitive_json_response(StatusCode::OK, &response)
     }
 }

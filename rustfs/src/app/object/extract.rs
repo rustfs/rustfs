@@ -627,6 +627,7 @@ struct ExtractPreparedMember<R = ExtractStagedBody> {
     body: R,
     write_plan: WritePlan,
     opts: ObjectOptions,
+    table_data_plane_publication_guards: Option<TableDataPlanePublicationGuards>,
     replication: ReplicateDecision,
     producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity,
     staging_permit: OwnedSemaphorePermit,
@@ -765,7 +766,8 @@ where
         actual_size,
         body,
         write_plan,
-        opts,
+        mut opts,
+        table_data_plane_publication_guards,
         replication,
         producer_identity,
         staging_permit,
@@ -775,6 +777,9 @@ where
     let hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
     let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
     let mut reader = PutObjReader::new(hrd);
+    if let Some(guards) = table_data_plane_publication_guards.as_ref() {
+        guards.add_lock_loss_fences(&mut opts);
+    }
     let _ = invalidate_object_data_cache_before_mutation(&context.cache_adapter, &context.bucket, &key).await;
 
     let (obj_info, backfilled_old_current_size) = match context
@@ -2447,6 +2452,8 @@ impl DefaultObjectUsecase {
                 explicit_version_id,
                 opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
             );
+            // auth_req inherits the outer request's date; a PAX override replaces it.
+            set_requested_object_lock_retain_until(&mut auth_req, effective_object_lock_retain_until_date.as_ref());
             extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await);
             if iam_requirements.tagging {
                 extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await);
@@ -2460,6 +2467,7 @@ impl DefaultObjectUsecase {
             if iam_requirements.replication {
                 extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await);
             }
+            let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&auth_req);
             drop(auth_req);
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
@@ -2605,6 +2613,7 @@ impl DefaultObjectUsecase {
                                         body: std::io::Cursor::new(Vec::new()),
                                         write_plan,
                                         opts,
+                                        table_data_plane_publication_guards,
                                         replication,
                                         producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
                                         staging_permit,
@@ -2630,6 +2639,7 @@ impl DefaultObjectUsecase {
                                         body: f,
                                         write_plan,
                                         opts,
+                                        table_data_plane_publication_guards,
                                         replication,
                                         producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
                                         staging_permit,
@@ -2660,6 +2670,7 @@ impl DefaultObjectUsecase {
                 body,
                 write_plan,
                 opts,
+                table_data_plane_publication_guards,
                 replication,
                 producer_identity: if is_dir {
                     rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject

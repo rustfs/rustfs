@@ -73,7 +73,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 version = "1.0.1"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -157,7 +157,7 @@ futures-util = "0.3.34"
 pollster = "1.0.1"
 pulsar = { default-features = false, version = "6.9.0" }
 lapin = { default-features = false, version = "4.12.0" }
-hyper = { version = "1.11.1" }
+hyper = { version = "1.12.0" }
 hyper-rustls = { default-features = false, version = "0.27.10" }
 hyper-util = { version = "0.1.21" }
 http = "1.5.0"
@@ -166,7 +166,7 @@ http-body-util = "0.1.5"
 memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
-rustfs-kafka-async = { version = "1.3.1" }
+rustfs-kafka-async = { version = "1.4.0" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.2" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
@@ -178,6 +178,13 @@ tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11.11", default-features = false, features = [
+      "futures-io",
+      "runtime-tokio",
+      "rustls-aws-lc-rs",
+] }
 
 # Serialization and Data Formats
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
@@ -219,13 +226,13 @@ x509-parser = "0.18.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6"
-zeroize = { version = "1.9.0" }
+zeroize = { version = "1.9.1" }
 proptest = "1"
 
 # Time and Date
 chrono = { version = "0.4.45" }
 humantime = "2.4.0"
-jiff = { version = "0.2.37" }
+jiff = { version = "0.2.38" }
 time = { version = "0.3.55" }
 
 # Database
@@ -299,7 +306,7 @@ percent-encoding = "2.3.2"
 # Server-side QR rendering for TOTP enrollment, so neither the console nor the
 # CLI needs its own QR encoder. No default features: the image/render backends
 # pull in an image stack this only needs SVG and text output from.
-qrcode-rs = { version = "2.1.1", default-features = false, features = ["std", "svg"] }
+qrcode-rs = { version = "2.2.0", default-features = false, features = ["std", "svg"] }
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.3" }
@@ -314,8 +321,8 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.5" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { version = "0.17.0", features = ["minio"] }
-s3s-sigv4 = { version = "0.17.0"}
+s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
+s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.4"
@@ -352,7 +359,7 @@ zstd = "0.14.0"
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
-dial9 = { version = "0.5.2", default-features = false }
+dial9 = { version = "0.5.3", default-features = false }
 opentelemetry = { version = "0.33.0" }
 opentelemetry-appender-tracing = { version = "0.33.0" }
 opentelemetry-otlp = { version = "0.33.0" }
@@ -367,7 +374,7 @@ libunftp = { version = "0.23.1" }
 unftp-core = "0.1.0"
 suppaftp = { version = "12.1.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.63.3" }
+russh = { version = "0.64.1" }
 russh-sftp = "3.0.1"
 
 # WebDAV

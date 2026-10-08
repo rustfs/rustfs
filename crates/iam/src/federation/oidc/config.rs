@@ -12,16 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::oidc::{OidcProviderConfig, OidcSys};
+use crate::{
+    federation::{FederatedAuthorizationRule, FederatedAuthorizationRules, FederatedRedirectPolicy},
+    oidc::{OidcConfigSnapshot, OidcSys},
+};
 
-pub(super) fn provider_config<'a>(oidc: &'a OidcSys, id: &str) -> Option<&'a OidcProviderConfig> {
-    oidc.get_provider_config(id)
+pub(crate) fn authorization_rules(oidc: &OidcSys) -> FederatedAuthorizationRules {
+    FederatedAuthorizationRules::new(oidc.provider_configs().map(|config| {
+        FederatedAuthorizationRule::new(
+            config.id.clone(),
+            config.claim_name.clone(),
+            config.claim_prefix.clone(),
+            config.role_policy.clone(),
+            config.groups_claim.clone(),
+            config.roles_claim.clone(),
+        )
+    }))
 }
 
-pub(super) fn roles_claim_key(oidc: &OidcSys, provider_id: &str) -> Option<String> {
-    provider_config(oidc, provider_id)
-        .map(|config| config.roles_claim.trim().to_string())
-        .filter(|claim| !claim.is_empty())
+/// Read-only access to the active standard OIDC configuration.
+///
+/// This interface stays separate from authentication and generic provider
+/// views because its snapshots include OIDC-specific fields and secrets.
+pub trait OidcConfigQuery: Send + Sync {
+    fn config_snapshot(&self) -> OidcConfigSnapshot;
+}
+
+pub(super) fn redirect_policy(oidc: &OidcSys, provider_id: &str) -> Option<FederatedRedirectPolicy> {
+    oidc.get_provider_config(provider_id).map(|config| FederatedRedirectPolicy {
+        redirect_uri: config.redirect_uri.clone(),
+        allow_request_origin: config.redirect_uri_dynamic,
+    })
 }
 
 #[cfg(test)]
@@ -29,8 +50,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roles_claim_key_requires_explicit_provider_config() {
-        let oidc = OidcSys::empty().expect("empty OIDC configuration should be valid");
-        assert_eq!(roles_claim_key(&oidc, "default"), None);
+    fn redirect_policy_keeps_configured_uri_and_dynamic_setting() {
+        let mut config = crate::oidc::test_config("default");
+        config.redirect_uri = Some("https://console.example.test/callback".to_string());
+        config.redirect_uri_dynamic = false;
+        let oidc = crate::oidc::make_test_sys(vec![config]);
+
+        assert_eq!(
+            redirect_policy(&oidc, "default"),
+            Some(FederatedRedirectPolicy {
+                redirect_uri: Some("https://console.example.test/callback".to_string()),
+                allow_request_origin: false,
+            })
+        );
+        assert_eq!(redirect_policy(&oidc, "missing"), None);
     }
 }

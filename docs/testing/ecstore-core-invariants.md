@@ -46,6 +46,8 @@ shown. The manifest contains their complete module paths.
 | Restore failures | `multipart_restore_aborts_every_post_create_failure` | Every injected post-create failure aborts the remote upload. |
 | Partial LIST metadata | `rustfs-filemeta`: `resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge` | A partial newer version remains hidden. |
 | Metadata observations | `metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction` and its companion tests | Pending, absent, corrupt, offline and successful disk slots retain the existing quorum decisions across all four-slot arrival orders. |
+| Metadata cache bodies | `metadata_cache_real_get_and_range_preserve_body_across_read_modes` | Real cache misses and hits return identical full-body and non-zero Range bytes for verified inline/non-inline objects, with early-stop enabled/disabled and one offline disk. Hits share a complete four-slot snapshot containing all available disks and issue no new metadata reads. |
+| Late metadata identity | `late_metadata_refresh_rejects_changed_generation_and_mapped_shards` | Metadata from a real four-disk PUT still reaches selection quorum, but changed generation or incorrect per-slot shard mapping fails the disk-backed late-refresh boundary with an object-scoped read-quorum error. |
 | LIST backend parity | `list_objects_shared_corpus_*` | One independent namespace oracle checks actual disk, set, pool, store and index paths, including version visibility, page boundaries, faults and cancellation. |
 | LIST logical budget | `list_path_gather_results_counts_common_prefixes_before_page_limit` | Repeated common prefixes consume one page slot while max+1 retains a continuation. |
 | Directory-marker metadata | `rustfs-filemeta`: `resolve_directory_marker_and_prefix_preserve_quorum_in_both_orders` | Quorum object metadata survives same-named prefix candidates; a fallback directory still requires its own quorum. |
@@ -58,6 +60,11 @@ shown. The manifest contains their complete module paths.
 | External shard quorum and codec | `pinned_erasure_fixtures_test`: `pinned_erasure_shards_reject_insufficient_quorum_and_wrong_codec` | Five shards cannot satisfy the six-shard read quorum; the opposite codec cannot reproduce the oracle. |
 
 The same manifest retains the S3, Azure and GCS source-contract tests for ODM.
+The direct late-refresh test complements the real GET tests
+`non_inline_two_phase_read_fetches_late_parity_after_two_selected_shards_fail`
+and `non_inline_two_phase_read_fetches_late_parity_when_selected_parts_are_missing`,
+which verify reader retry and exact body reconstruction. The direct test does
+not itself issue a full late GET after changing the metadata identity.
 The static LIST keys in `crates/ecstore/tests/fixtures/list_namespace_keys.json`
 are also consumed by ODM's `list_through_static_namespace_boundary_matrix`.
 The ECStore query replay uses seed `0xec5707`; the ODM matrix retains seed

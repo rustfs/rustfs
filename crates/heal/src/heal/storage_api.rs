@@ -53,6 +53,9 @@ pub(crate) mod storage {
         BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
         StorageAdminApi,
     };
+
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::DeleteBucketOptions;
 }
 
 #[cfg(test)]

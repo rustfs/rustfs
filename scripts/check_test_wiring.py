@@ -1072,7 +1072,10 @@ def check_quick_checks(root: Path) -> list[str]:
         errors.append(f"{relative}: missing composite action")
         return errors
     steps = yaml_block(runs, "steps", 2) or []
-    for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
+    for command in (
+        "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
+        "python3 ./scripts/test_object_generation_protocol_model.py",
+    ):
         step = workflow_step_block(steps, command, key="run", indent=4)
         if step is None:
             errors.append(f"{relative}: missing direct execution of {command}")
@@ -3517,6 +3520,8 @@ class SelfTests(unittest.TestCase):
                 "    - name: Error format ratchet\n      shell: bash\n"
                 "      run: ./scripts/check_error_other_format_ratchet.sh\n"
                 "    - name: Script tests\n      shell: bash\n      run: make script-tests\n"
+                "    - name: Object generation model\n      shell: bash\n"
+                "      run: python3 ./scripts/test_object_generation_protocol_model.py\n"
             )
             sources = {
                 ".github/workflows/ci.yml": caller.replace(
@@ -3576,6 +3581,11 @@ class SelfTests(unittest.TestCase):
                 "missing ratchet": action.replace("run: ./scripts/check_error_other_format_ratchet.sh", "run: echo skipped"),
                 "missing script tests": action.replace("run: make script-tests", "run: echo skipped"),
                 "swallowed script failure": action.replace("run: make script-tests", "run: make script-tests || true"),
+                "missing generation model": action.replace("run: python3 ./scripts/test_object_generation_protocol_model.py", "run: echo skipped"),
+                "swallowed generation model failure": action.replace(
+                    "run: python3 ./scripts/test_object_generation_protocol_model.py",
+                    "run: python3 ./scripts/test_object_generation_protocol_model.py || true",
+                ),
                 "swallowed lint failure": action.replace("&& actionlint", "&& actionlint || true"),
                 "swallowed ratchet failure": action.replace("ratchet.sh", "ratchet.sh || true"),
                 "conditional lint": action.replace("run: shellcheck", "if: false\n      run: shellcheck"),
@@ -3585,7 +3595,10 @@ class SelfTests(unittest.TestCase):
                     "name: Lint workflows", "name: |\n        run: shellcheck --version && actionlint"
                 ).replace("\n      run: shellcheck --version && actionlint\n", "\n      run: shellcheck --version && actionlint\n        || true\n"),
             }
-            for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
+            for command in (
+                "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
+                "python3 ./scripts/test_object_generation_protocol_model.py",
+            ):
                 for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
                     mutations[f"quoted {command} {key}"] = action.replace(f"run: {command}", f"{key}\n      run: {command}")
                 for separator in ("", "\n", "        # continued command\n"):
@@ -3606,8 +3619,9 @@ class SelfTests(unittest.TestCase):
             root = Path(tmp)
             (root / "scripts").mkdir()
             commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh")
+            model_command = "python3 ./scripts/test_object_generation_protocol_model.py"
             (root / "Makefile").write_text(".PHONY: script-tests\nscript-tests:\n\texit 17\n")
-            for failing in (*commands, "make script-tests"):
+            for failing in (*commands, "make script-tests", model_command):
                 with self.subTest(command=failing):
                     run = "shellcheck --version && actionlint" if failing in ("shellcheck", "actionlint") else failing
                     step = workflow_step_block(steps, run, key="run", indent=4)
@@ -3619,6 +3633,9 @@ class SelfTests(unittest.TestCase):
                         shim = root / command
                         shim.write_text(f"#!/bin/sh\nexit {17 if command == failing else 0}\n")
                         shim.chmod(0o755)
+                    (root / "scripts/test_object_generation_protocol_model.py").write_text(
+                        f"raise SystemExit({17 if failing == model_command else 0})\n"
+                    )
                     result = subprocess.run(
                         ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", body],
                         cwd=root, env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}"),

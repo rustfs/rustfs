@@ -1237,7 +1237,8 @@ impl ObjectOptions {
         self.version_id.is_some() || !self.versioned || self.version_suspended
     }
 
-    pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+    #[doc(hidden)]
+    pub fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
         #[cfg(test)]
         let test_fence = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
