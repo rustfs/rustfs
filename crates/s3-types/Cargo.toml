@@ -30,10 +30,11 @@ workspace = true
 
 [features]
 default = []
-# Legacy edge only: `From` conversions between this crate's error types and the
-# s3s error types, so the s3s-facing `impl S3` can keep using `?` while the
-# gateway migration is in flight (rustfs/backlog#2734). Off by default; the
-# runtime dependency tree of this crate carries no s3s unless a consumer asks.
+# Legacy edge only: `From` conversions between this crate's error and body
+# types and the s3s ones, so the s3s-facing `impl S3` can keep using `?` and
+# hand bodies across while the gateway migration is in flight
+# (rustfs/backlog#2734). Off by default; the runtime dependency tree of this
+# crate carries no s3s unless a consumer asks.
 # DELETE BY T4.2 (rustfs/backlog#2784) together with src/compat_s3s.rs.
 compat-s3s = ["dep:legacy-s3s"]
 hotpath = ["hotpath/hotpath"]
@@ -41,8 +42,11 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
+bytes = { workspace = true }
 hotpath.workspace = true
 http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
 # The s3s package under the name the legacy edge knows it by. Only
 # src/compat_s3s.rs may use it; see that file's header for the footprint note.
 legacy-s3s = { workspace = true, optional = true }

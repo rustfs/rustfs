@@ -12,18 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! RustFS-owned S3 contract types: event names and the S3 error carrier.
+//! RustFS-owned S3 contract types: event names, the S3 error carrier, and the
+//! plain HTTP body.
 //!
-//! Responsible for: `EventName`, and the error surface (`S3Error`, `S3ErrorCode`,
-//! `S3Result`, the `s3_error` macro) that every RustFS crate raises S3 errors with.
-//! Not responsible for: I/O, global state, wire rendering, or any s3s type; the
-//! legacy conversions live behind the `compat-s3s` feature in `compat_s3s` only.
-//! Upstream: `http`. Downstream: every crate that raises or inspects S3 errors.
+//! Responsible for: `EventName`, the error surface (`S3Error`, `S3ErrorCode`,
+//! `S3Result`, the `s3_error` macro) that every RustFS crate raises S3 errors with,
+//! and `Body`, the type-erased body the outbound client crates send.
+//! Not responsible for: I/O, global state, wire rendering, S3 body semantics
+//! (trailers, checksums, framing), or any s3s type; the legacy conversions live
+//! behind the `compat-s3s` feature in `compat_s3s` only.
+//! Upstream: `http`, `bytes`, `http-body`, `http-body-util`. Downstream: every
+//! crate that raises or inspects S3 errors, and the crates that build HTTP bodies.
 
+mod body;
 #[cfg(any(test, feature = "compat-s3s"))]
 mod compat_s3s;
 mod error;
 mod event_name;
 
+pub use body::Body;
 pub use error::{S3Error, S3ErrorCode, S3ErrorParts, S3Result, StdError};
 pub use event_name::{EventName, ParseEventNameError, event_schema_version};
