@@ -142,6 +142,12 @@ rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.1" }
 rustfs-utils = { path = "crates/utils", version = "1.0.1" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.1" }
 
+# The gateway's S3 types: the DTOs and persisted bucket-configuration codecs the
+# engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
+# gateway in this workspace; no crate may enable a `compat-s3s*` feature except
+# the s3s-facing edge of the rustfs binary.
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "772d3385421626aca5735e5581c5dff13a7aebff", version = "0.32.0", default-features = false }
+
 # Async Runtime and Networking
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }

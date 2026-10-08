@@ -173,19 +173,19 @@ pub(crate) trait AdminReplicationConfigExt {
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool);
 }
 
-impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+impl AdminReplicationConfigExt for rustfs_gateway_types::persistence::PersistedReplicationConfiguration {
     fn filter_all_replication_target_arns(&self) -> Vec<String> {
         let obj = ecstore_bucket::replication::ObjectOpts {
             op_type: ecstore_bucket::replication::ReplicationType::All,
             ..Default::default()
         };
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
             self, &obj,
         )
     }
 
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_existing_object_replication(
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_existing_object_replication(
             self, arn,
         )
     }
@@ -512,7 +512,9 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get_quota_config(bucket).await
     }
 
-    pub(crate) async fn get_replication_config(bucket: &str) -> Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)> {
+    pub(crate) async fn get_replication_config(
+        bucket: &str,
+    ) -> Result<(rustfs_gateway_types::persistence::PersistedReplicationConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_replication_config(bucket).await
     }
 
@@ -759,19 +761,10 @@ pub(crate) mod target {
 }
 
 pub(crate) mod ecstore_utils {
-    pub(crate) fn deserialize<T>(input: &[u8]) -> s3s::xml::DeResult<T>
-    where
-        T: for<'xml> s3s::xml::Deserialize<'xml>,
-    {
-        super::ecstore_bucket::utils::deserialize(input)
-    }
+    pub(crate) use super::ecstore_bucket::utils::{deserialize, serialize};
 
     pub(crate) fn is_valid_object_prefix(object: &str) -> bool {
         super::ecstore_bucket::utils::is_valid_object_prefix(object)
-    }
-
-    pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-        super::ecstore_bucket::utils::serialize(val)
     }
 }
 

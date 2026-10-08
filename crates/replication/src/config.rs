@@ -15,12 +15,10 @@
 use crate::ReplicationTagFilter;
 use crate::ReplicationType;
 use crate::rule::ReplicationRuleExt as _;
-use s3s::dto::DeleteMarkerReplicationStatus;
-use s3s::dto::DeleteReplicationStatus;
-use s3s::dto::Destination;
-use s3s::dto::{
-    ExistingObjectReplicationStatus, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, ReplicationRules, StorageClass,
+use rustfs_gateway_types::dto::{Status, StorageClass};
+use rustfs_gateway_types::persistence::{
+    PersistedReplicationAnd, PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter,
+    PersistedReplicationRule, PersistedReplicationTag,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -117,8 +115,8 @@ pub struct ObjectOpts {
 pub trait ReplicationConfigurationExt {
     fn replicate(&self, opts: &ObjectOpts) -> bool;
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool);
-    fn filter_actionable_rules(&self, obj: &ObjectOpts) -> ReplicationRules;
-    fn get_destination(&self) -> Destination;
+    fn filter_actionable_rules(&self, obj: &ObjectOpts) -> Vec<PersistedReplicationRule>;
+    fn get_destination(&self) -> PersistedReplicationDestination;
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
     fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String>;
@@ -138,10 +136,10 @@ pub trait ReplicationConfigurationExt {
     }
 }
 
-fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
+fn rule_replicates(rule: &PersistedReplicationRule, obj: &ObjectOpts) -> bool {
     if let Some(status) = &rule.existing_object_replication
         && obj.existing_object
-        && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+        && status.status == Status::DISABLED.as_str()
     {
         return false;
     }
@@ -158,16 +156,16 @@ fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
     if version_purge {
         rule.delete_replication
             .as_ref()
-            .is_some_and(|delete| delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED))
+            .is_some_and(|delete| delete.status == Status::ENABLED.as_str())
     } else {
-        rule.delete_marker_replication.as_ref().is_some_and(|delete_marker| {
-            delete_marker.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-        })
+        rule.delete_marker_replication
+            .as_ref()
+            .is_some_and(|delete_marker| delete_marker.status.as_deref() == Some(Status::ENABLED.as_str()))
     }
 }
 
-fn replication_filter_tags_match(filter: &s3s::dto::ReplicationRuleFilter, object_tags: &HashMap<String, String>) -> bool {
-    let tag_matches = |tag: &s3s::dto::Tag| match (&tag.key, &tag.value) {
+fn replication_filter_tags_match(filter: &PersistedReplicationFilter, object_tags: &HashMap<String, String>) -> bool {
+    let tag_matches = |tag: &PersistedReplicationTag| match (&tag.key, &tag.value) {
         (None, None) => true,
         (Some(key), _) if key.is_empty() => true,
         (Some(key), Some(value)) => object_tags.get(key) == Some(value),
@@ -184,13 +182,20 @@ fn replication_filter_tags_match(filter: &s3s::dto::ReplicationRuleFilter, objec
         .all(tag_matches)
 }
 
+/// Whether a persisted status carries one of the two values the engine
+/// branches on. The persisted shape keeps any stored text, so every other
+/// value is a status the capability gate refuses.
+fn is_enabled_or_disabled(status: &str) -> bool {
+    status == Status::ENABLED.as_str() || status == Status::DISABLED.as_str()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationTargetValidationError {
     RoleWithMultipleDestinations,
     StaleTarget,
 }
 
-pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -> Option<&'static str> {
+pub fn unsupported_replication_config_field(config: &PersistedReplicationConfiguration) -> Option<&'static str> {
     for rule in &config.rules {
         if rule
             .source_selection_criteria
@@ -224,7 +229,7 @@ pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -
             .destination
             .storage_class
             .as_ref()
-            .is_some_and(|class| class.as_str() != StorageClass::STANDARD)
+            .is_some_and(|class| class != StorageClass::STANDARD.as_str())
         {
             return Some("Destination.StorageClass");
         }
@@ -232,37 +237,30 @@ pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -
     None
 }
 
-pub fn invalid_replication_config_status_field(config: &ReplicationConfiguration) -> Option<&'static str> {
+pub fn invalid_replication_config_status_field(config: &PersistedReplicationConfiguration) -> Option<&'static str> {
     for rule in &config.rules {
-        if !matches!(rule.status.as_str(), ReplicationRuleStatus::ENABLED | ReplicationRuleStatus::DISABLED) {
+        if !is_enabled_or_disabled(rule.status.as_str()) {
             return Some("Rule.Status");
         }
-        if rule.existing_object_replication.as_ref().is_some_and(|existing| {
-            !matches!(
-                existing.status.as_str(),
-                ExistingObjectReplicationStatus::ENABLED | ExistingObjectReplicationStatus::DISABLED
-            )
-        }) {
+        if rule
+            .existing_object_replication
+            .as_ref()
+            .is_some_and(|existing| !is_enabled_or_disabled(existing.status.as_str()))
+        {
             return Some("Rule.ExistingObjectReplication.Status");
         }
-        if rule.delete_replication.as_ref().is_some_and(|delete| {
-            !matches!(
-                delete.status.as_str(),
-                DeleteReplicationStatus::ENABLED | DeleteReplicationStatus::DISABLED
-            )
-        }) {
+        if rule
+            .delete_replication
+            .as_ref()
+            .is_some_and(|delete| !is_enabled_or_disabled(delete.status.as_str()))
+        {
             return Some("Rule.DeleteReplication.Status");
         }
         if rule
             .delete_marker_replication
             .as_ref()
             .and_then(|delete| delete.status.as_ref())
-            .is_some_and(|status| {
-                !matches!(
-                    status.as_str(),
-                    DeleteMarkerReplicationStatus::ENABLED | DeleteMarkerReplicationStatus::DISABLED
-                )
-            })
+            .is_some_and(|status| !is_enabled_or_disabled(status.as_str()))
         {
             return Some("Rule.DeleteMarkerReplication.Status");
         }
@@ -270,12 +268,7 @@ pub fn invalid_replication_config_status_field(config: &ReplicationConfiguration
             .source_selection_criteria
             .as_ref()
             .and_then(|criteria| criteria.replica_modifications.as_ref())
-            .is_some_and(|modifications| {
-                !matches!(
-                    modifications.status.as_str(),
-                    ReplicaModificationsStatus::ENABLED | ReplicaModificationsStatus::DISABLED
-                )
-            })
+            .is_some_and(|modifications| !is_enabled_or_disabled(modifications.status.as_str()))
         {
             return Some("Rule.SourceSelectionCriteria.ReplicaModifications.Status");
         }
@@ -284,11 +277,11 @@ pub fn invalid_replication_config_status_field(config: &ReplicationConfiguration
     None
 }
 
-pub fn active_replication_rule_destination_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+pub fn active_replication_rule_destination_arns(config: &PersistedReplicationConfiguration) -> HashSet<String> {
     let mut arns = HashSet::new();
 
     for rule in &config.rules {
-        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+        if rule.status == Status::DISABLED.as_str() {
             continue;
         }
 
@@ -326,7 +319,7 @@ pub const SITE_REPLICATION_RULE_ID_PREFIX: &str = "site-repl-";
 /// ids are not reserved, so this is only the classification of
 /// [`OperatorRuleContract::Legacy`]; every other path classifies by
 /// [`site_replication_rule_deployment_id`].
-pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
+pub fn is_site_replication_rule(rule: &PersistedReplicationRule) -> bool {
     rule.id
         .as_deref()
         .is_some_and(|id| id.starts_with(SITE_REPLICATION_RULE_ID_PREFIX))
@@ -339,7 +332,7 @@ pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
 /// `site-repl-<peer>` id pasted onto a foreign ARN, fails the agreement check.
 /// Callers that know the current peer set must also confirm the id is one of
 /// those peers before treating the rule as reconciler-owned.
-pub fn site_replication_rule_deployment_id(rule: &ReplicationRule) -> Option<&str> {
+pub fn site_replication_rule_deployment_id(rule: &PersistedReplicationRule) -> Option<&str> {
     let deployment_id = rule.id.as_deref()?.strip_prefix(SITE_REPLICATION_RULE_ID_PREFIX)?;
     (!deployment_id.is_empty()
         && replication_target_arn_deployment_id(&rule.destination.bucket).as_deref() == Some(deployment_id))
@@ -350,7 +343,7 @@ pub fn site_replication_rule_deployment_id(rule: &ReplicationRule) -> Option<&st
 /// site-replication peer in `peer_deployment_ids`. With an empty peer set
 /// (site replication disabled) nothing qualifies, so a bucket outside site
 /// replication keeps the verbatim S3 put/delete semantics.
-pub fn is_reconciler_owned_site_replication_rule(rule: &ReplicationRule, peer_deployment_ids: &HashSet<String>) -> bool {
+pub fn is_reconciler_owned_site_replication_rule(rule: &PersistedReplicationRule, peer_deployment_ids: &HashSet<String>) -> bool {
     site_replication_rule_deployment_id(rule).is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
 }
 
@@ -399,11 +392,11 @@ pub enum OperatorRuleContract {
 /// persists on every site. `incoming == None` models a delete of the
 /// operator-authored rules.
 pub fn merge_incoming_replication_config(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
+    incoming: Option<PersistedReplicationConfiguration>,
+    local: Option<PersistedReplicationConfiguration>,
     site_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> Option<ReplicationConfiguration> {
+) -> Option<PersistedReplicationConfiguration> {
     merge_replication_config_keeping_site_rules(incoming, local, site_deployment_ids, contract)
 }
 
@@ -418,11 +411,11 @@ pub fn merge_incoming_replication_config(
 /// pre-contract peers will do with the broadcast, listing the operator rules
 /// in priority order so their relative order survives the renumbering.
 pub fn merge_user_replication_config(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
+    incoming: Option<PersistedReplicationConfiguration>,
+    local: Option<PersistedReplicationConfiguration>,
     peer_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> Option<ReplicationConfiguration> {
+) -> Option<PersistedReplicationConfiguration> {
     let incoming = incoming.map(|mut config| {
         match contract {
             OperatorRuleContract::Derived => config.rules.retain(|rule| {
@@ -443,12 +436,12 @@ pub fn merge_user_replication_config(
 }
 
 fn merge_replication_config_keeping_site_rules(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
+    incoming: Option<PersistedReplicationConfiguration>,
+    local: Option<PersistedReplicationConfiguration>,
     deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> Option<ReplicationConfiguration> {
-    let is_site_rule = |rule: &ReplicationRule| match contract {
+) -> Option<PersistedReplicationConfiguration> {
+    let is_site_rule = |rule: &PersistedReplicationRule| match contract {
         OperatorRuleContract::Derived => is_reconciler_owned_site_replication_rule(rule, deployment_ids),
         OperatorRuleContract::Legacy => is_site_replication_rule(rule),
     };
@@ -456,7 +449,7 @@ fn merge_replication_config_keeping_site_rules(
     // Operator rules first, then the local site rules — the same order the
     // site-replication reconciler produces, so its no-op check matches and
     // the bucket metadata is written once per broadcast, not twice.
-    let mut rules: Vec<ReplicationRule> = incoming
+    let mut rules: Vec<PersistedReplicationRule> = incoming
         .into_iter()
         .flat_map(|config| config.rules)
         .filter(|rule| !is_site_rule(rule))
@@ -486,7 +479,7 @@ fn merge_replication_config_keeping_site_rules(
     };
     let role = if drop_role { String::new() } else { incoming_role };
 
-    Some(ReplicationConfiguration { role, rules })
+    Some(PersistedReplicationConfiguration { role, rules })
 }
 
 /// Give the site rules in `rules` the lowest priorities no operator rule uses,
@@ -497,7 +490,10 @@ fn merge_replication_config_keeping_site_rules(
 /// is a pure function of the rule list, so the site-replication reconciler,
 /// the peer ingestion merge and the S3 edit merge all converge on the same
 /// bytes and the reconciler's no-op check holds.
-pub fn assign_site_replication_rule_priorities(rules: &mut [ReplicationRule], is_site_rule: impl Fn(&ReplicationRule) -> bool) {
+pub fn assign_site_replication_rule_priorities(
+    rules: &mut [PersistedReplicationRule],
+    is_site_rule: impl Fn(&PersistedReplicationRule) -> bool,
+) {
     let taken: HashSet<i32> = rules
         .iter()
         .filter(|rule| !is_site_rule(rule))
@@ -513,7 +509,7 @@ pub fn assign_site_replication_rule_priorities(rules: &mut [ReplicationRule], is
     }
 }
 
-pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+pub fn replication_target_arns(config: &PersistedReplicationConfiguration) -> HashSet<String> {
     let role = config.role.trim();
     if !role.is_empty() {
         return HashSet::from([role.to_string()]);
@@ -524,7 +520,7 @@ pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<Str
 
 pub fn validate_replication_config_target_arns<'a>(
     configured_arns: impl IntoIterator<Item = &'a str>,
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
 ) -> std::result::Result<(), ReplicationTargetValidationError> {
     let configured_arns = configured_arns.into_iter().collect::<HashSet<_>>();
 
@@ -587,7 +583,7 @@ impl ReplicationConfigStructureError {
     }
 }
 
-fn filter_and_operator_is_set(and: &s3s::dto::ReplicationRuleAndOperator) -> bool {
+fn filter_and_operator_is_set(and: &PersistedReplicationAnd) -> bool {
     and.prefix.as_ref().is_some_and(|prefix| !prefix.is_empty()) || and.tags.as_ref().is_some_and(|tags| !tags.is_empty())
 }
 
@@ -609,7 +605,7 @@ fn filter_and_operator_is_set(and: &s3s::dto::ReplicationRuleAndOperator) -> boo
 /// target itself is created, so a config can never reference a self-pointing
 /// ARN.
 pub fn validate_replication_config_structure(
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
 ) -> std::result::Result<(), ReplicationConfigStructureError> {
     if config.rules.is_empty() {
         return Err(ReplicationConfigStructureError::NoRules);
@@ -654,7 +650,7 @@ pub fn validate_replication_config_structure(
                 .delete_marker_replication
                 .as_ref()
                 .and_then(|delete_marker| delete_marker.status.as_ref())
-                .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
+                .is_some_and(|status| status == Status::ENABLED.as_str());
             if delete_marker_replication_enabled && has_tag {
                 return Err(ReplicationConfigStructureError::TagFilterWithDeleteMarkerReplication);
             }
@@ -664,7 +660,7 @@ pub fn validate_replication_config_structure(
     Ok(())
 }
 
-impl ReplicationConfigurationExt for ReplicationConfiguration {
+impl ReplicationConfigurationExt for PersistedReplicationConfiguration {
     /// Check whether any object-replication rules exist
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
         let mut has_arn = false;
@@ -676,7 +672,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                     has_arn = true;
                 }
                 if let Some(status) = &rule.existing_object_replication
-                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
+                    && status.status == Status::ENABLED.as_str()
                 {
                     return (true, true);
                 }
@@ -685,15 +681,15 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         (has_arn, false)
     }
 
-    fn filter_actionable_rules(&self, obj: &ObjectOpts) -> ReplicationRules {
+    fn filter_actionable_rules(&self, obj: &ObjectOpts) -> Vec<PersistedReplicationRule> {
         if obj.name.is_empty() && obj.op_type != ReplicationType::Resync && obj.op_type != ReplicationType::All {
             return vec![];
         }
 
-        let mut rules = ReplicationRules::default();
+        let mut rules = Vec::new();
 
         for rule in &self.rules {
-            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            if rule.status == Status::DISABLED.as_str() {
                 continue;
             }
 
@@ -711,7 +707,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
             if let Some(status) = &rule.existing_object_replication
                 && obj.existing_object
-                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+                && status.status == Status::DISABLED.as_str()
             {
                 continue;
             }
@@ -746,15 +742,8 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
     }
 
     /// Retrieve the destination configuration
-    fn get_destination(&self) -> Destination {
-        if !self.rules.is_empty() {
-            self.rules[0].destination.clone()
-        } else {
-            Destination {
-                bucket: String::new(),
-                ..Default::default()
-            }
-        }
+    fn get_destination(&self) -> PersistedReplicationDestination {
+        self.rules.first().map(|rule| rule.destination.clone()).unwrap_or_default()
     }
 
     /// Determine whether an object should be replicated
@@ -773,7 +762,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         }
 
         for rule in &self.rules {
-            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            if rule.status == Status::DISABLED.as_str() {
                 continue;
             }
 
@@ -821,7 +810,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         // iterate targets see the highest-priority destination first.
         let mut arns: Vec<String> = Vec::new();
         for rule in self.filter_actionable_rules(obj) {
-            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            if rule.status == Status::DISABLED.as_str() {
                 continue;
             }
 
@@ -835,10 +824,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
     fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String> {
         let role = self.role.trim();
-        let mut selected = BTreeMap::<String, (&ReplicationRule, bool)>::new();
+        let mut selected = BTreeMap::<String, (&PersistedReplicationRule, bool)>::new();
 
         for rule in &self.rules {
-            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            if rule.status == Status::DISABLED.as_str() {
                 continue;
             }
 
@@ -856,13 +845,14 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            let delete_enabled =
-                rule.delete_replication.as_ref().is_some_and(|delete| {
-                    delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
-                }) || rule.delete_marker_replication.as_ref().is_some_and(|delete_marker| {
-                    delete_marker.status
-                        == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-                });
+            let delete_enabled = rule
+                .delete_replication
+                .as_ref()
+                .is_some_and(|delete| delete.status == Status::ENABLED.as_str())
+                || rule
+                    .delete_marker_replication
+                    .as_ref()
+                    .is_some_and(|delete_marker| delete_marker.status.as_deref() == Some(Status::ENABLED.as_str()));
 
             if selected
                 .get(target)
@@ -884,7 +874,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         if !role.is_empty() {
             let mut selected = None;
             for rule in &rules {
-                if selected.is_none_or(|current: &ReplicationRule| rule.priority > current.priority) {
+                if selected.is_none_or(|current: &PersistedReplicationRule| rule.priority > current.priority) {
                     selected = Some(rule);
                 }
             }
@@ -892,7 +882,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         }
 
         let mut target_indexes: HashMap<&str, usize> = HashMap::new();
-        let mut selected_rules: Vec<(&str, &ReplicationRule)> = Vec::new();
+        let mut selected_rules: Vec<(&str, &PersistedReplicationRule)> = Vec::new();
         for rule in &rules {
             let arn = rule.destination.bucket.trim();
             if arn.is_empty() {
@@ -917,43 +907,42 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::dto::{
-        DeleteMarkerReplication, DeleteReplication, Destination, EncryptionConfiguration, ExistingObjectReplication, Metrics,
-        MetricsStatus, ReplicaModifications, ReplicationRule, ReplicationTime, ReplicationTimeStatus, ReplicationTimeValue,
-        SourceSelectionCriteria, SseKmsEncryptedObjects, SseKmsEncryptedObjectsStatus,
+    use rustfs_gateway_types::persistence::{
+        PersistedAccessControlTranslation, PersistedEncryptionConfiguration, PersistedOptionalReplicationStatus,
+        PersistedReplicationMetrics, PersistedReplicationStatus, PersistedReplicationTime, PersistedReplicationTimeValue,
+        PersistedSourceSelectionCriteria, parse_replication, serialize_replication,
     };
-    use s3s::xml::{Deserializer, Serializer};
 
-    fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
-        ReplicationRule {
-            delete_marker_replication: Some(DeleteMarkerReplication::default()),
+    fn replication_rule(id: &str, arn: &str) -> PersistedReplicationRule {
+        PersistedReplicationRule {
+            delete_marker_replication: Some(PersistedOptionalReplicationStatus::default()),
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
-            existing_object_replication: Some(ExistingObjectReplication {
-                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            existing_object_replication: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
             filter: None,
             id: Some(id.to_string()),
             prefix: Some(String::new()),
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
-    fn structure_config(rules: Vec<ReplicationRule>) -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    fn structure_config(rules: Vec<PersistedReplicationRule>) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: String::new(),
             rules,
         }
     }
 
-    fn tag_filter() -> s3s::dto::ReplicationRuleFilter {
-        s3s::dto::ReplicationRuleFilter {
-            tag: Some(s3s::dto::Tag {
+    fn tag_filter() -> PersistedReplicationFilter {
+        PersistedReplicationFilter {
+            tag: Some(PersistedReplicationTag {
                 key: Some("k".to_string()),
                 value: Some("v".to_string()),
             }),
@@ -965,10 +954,10 @@ mod tests {
     fn structure_validation_accepts_multi_rule_config_with_unique_priorities() {
         let mut second = replication_rule("rule-2", "arn:target:a");
         second.priority = Some(2);
-        second.filter = Some(s3s::dto::ReplicationRuleFilter {
-            and: Some(s3s::dto::ReplicationRuleAndOperator {
+        second.filter = Some(PersistedReplicationFilter {
+            and: Some(PersistedReplicationAnd {
                 prefix: Some("photos/".to_string()),
-                tags: Some(vec![s3s::dto::Tag {
+                tags: Some(vec![PersistedReplicationTag {
                     key: Some("k".to_string()),
                     value: Some("v".to_string()),
                 }]),
@@ -1097,8 +1086,8 @@ mod tests {
     #[test]
     fn structure_validation_rejects_delete_marker_replication_on_tag_filtered_rule() {
         let mut rule = replication_rule("rule-1", "arn:target:a");
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
         rule.filter = Some(tag_filter());
 
@@ -1114,12 +1103,12 @@ mod tests {
         // form serializer emits them, so prefix + empty tag must stay valid
         // and an empty tag must not trip the delete-marker check.
         let mut rule = replication_rule("rule-1", "arn:target:a");
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
-        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+        rule.filter = Some(PersistedReplicationFilter {
             prefix: Some("photos/".to_string()),
-            tag: Some(s3s::dto::Tag { key: None, value: None }),
+            tag: Some(PersistedReplicationTag { key: None, value: None }),
             ..Default::default()
         });
 
@@ -1133,18 +1122,18 @@ mod tests {
         // MinIO's validator only inspects the direct Filter.Tag, so this
         // shape must stay accepted for mc interop.
         let mut rule = replication_rule("rule-1", "arn:target:a");
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
-        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
-            and: Some(s3s::dto::ReplicationRuleAndOperator {
+        rule.filter = Some(PersistedReplicationFilter {
+            and: Some(PersistedReplicationAnd {
                 prefix: None,
                 tags: Some(vec![
-                    s3s::dto::Tag {
+                    PersistedReplicationTag {
                         key: Some("k1".to_string()),
                         value: Some("v1".to_string()),
                     },
-                    s3s::dto::Tag {
+                    PersistedReplicationTag {
                         key: Some("k2".to_string()),
                         value: Some("v2".to_string()),
                     },
@@ -1159,15 +1148,15 @@ mod tests {
     #[test]
     fn actionable_rules_require_every_and_tag_to_match() {
         let mut rule = replication_rule("rule-1", "arn:target:a");
-        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
-            and: Some(s3s::dto::ReplicationRuleAndOperator {
+        rule.filter = Some(PersistedReplicationFilter {
+            and: Some(PersistedReplicationAnd {
                 prefix: None,
                 tags: Some(vec![
-                    s3s::dto::Tag {
+                    PersistedReplicationTag {
                         key: Some("env".to_string()),
                         value: Some("prod".to_string()),
                     },
-                    s3s::dto::Tag {
+                    PersistedReplicationTag {
                         key: Some("tier".to_string()),
                         value: Some("gold".to_string()),
                     },
@@ -1187,7 +1176,7 @@ mod tests {
         assert!(config.filter_target_arns(&object("")).is_empty());
 
         let mut malformed = config;
-        malformed.rules[0].filter.as_mut().unwrap().and.as_mut().unwrap().tags = Some(vec![s3s::dto::Tag {
+        malformed.rules[0].filter.as_mut().unwrap().and.as_mut().unwrap().tags = Some(vec![PersistedReplicationTag {
             key: Some("env".to_string()),
             value: None,
         }]);
@@ -1200,8 +1189,8 @@ mod tests {
     #[test]
     fn structure_validation_allows_tag_filter_when_delete_marker_replication_disabled() {
         let mut rule = replication_rule("rule-1", "arn:target:a");
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::DISABLED.to_string()),
         });
         rule.filter = Some(tag_filter());
 
@@ -1210,7 +1199,7 @@ mod tests {
 
     #[test]
     fn filter_target_arns_uses_role_when_role_is_present() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: " arn:legacy:target ".to_string(),
             rules: vec![
                 replication_rule("rule-1", "arn:target:a"),
@@ -1229,24 +1218,24 @@ mod tests {
 
     #[test]
     fn filter_target_arns_falls_back_to_role_when_destination_is_empty() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: "arn:legacy:target".to_string(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication::default()),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus::default()),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: String::new(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some(String::new()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -1259,32 +1248,32 @@ mod tests {
         assert_eq!(arns, vec!["arn:legacy:target".to_string()]);
     }
 
-    fn replication_rule_existing_object_disabled(id: &str, arn: &str) -> ReplicationRule {
-        ReplicationRule {
-            delete_marker_replication: Some(DeleteMarkerReplication::default()),
+    fn replication_rule_existing_object_disabled(id: &str, arn: &str) -> PersistedReplicationRule {
+        PersistedReplicationRule {
+            delete_marker_replication: Some(PersistedOptionalReplicationStatus::default()),
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
-            existing_object_replication: Some(ExistingObjectReplication {
-                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED),
+            existing_object_replication: Some(PersistedReplicationStatus {
+                status: Status::DISABLED.to_string(),
             }),
             filter: None,
             id: Some(id.to_string()),
             prefix: Some(String::new()),
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
     // Regression test for BUG-3: replicate_object was calling filter_target_arns with
     // existing_object:false regardless of op_type, letting ExistingObject resync operations
-    // fan out to targets whose rule has ExistingObjectReplicationStatus::DISABLED.
+    // fan out to targets whose rule has Status::DISABLED.as_str().
     #[test]
     fn filter_target_arns_excludes_disabled_existing_object_target_for_existing_object_op() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule("rule-enabled", "arn:target:enabled"),
@@ -1308,7 +1297,7 @@ mod tests {
     // failure is not subject to the existing-object opt-out.
     #[test]
     fn filter_target_arns_includes_disabled_existing_object_target_for_heal_op() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule("rule-enabled", "arn:target:enabled"),
@@ -1336,7 +1325,7 @@ mod tests {
     fn replication_target_arns_use_role_when_present() {
         let role = "arn:rustfs:replication:us-east-1:source:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: format!(" {role} "),
             rules: vec![replication_rule("rule-1", destination)],
         };
@@ -1350,7 +1339,7 @@ mod tests {
     #[test]
     fn replication_target_arns_use_rule_destinations_without_role() {
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule("rule-1", destination)],
         };
@@ -1363,7 +1352,7 @@ mod tests {
     #[test]
     fn validate_replication_config_target_arns_accepts_matching_destination_arns() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule("rule-1", arn)],
         };
@@ -1373,7 +1362,7 @@ mod tests {
 
     #[test]
     fn validate_replication_config_target_arns_rejects_stale_destination_arns() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule("rule-1", "arn:rustfs:replication:us-east-1:target-b:bucket")],
         };
@@ -1386,7 +1375,7 @@ mod tests {
     #[test]
     fn validate_replication_config_target_arns_rejects_role_with_multiple_destinations() {
         let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: role.to_string(),
             rules: vec![
                 replication_rule("rule-a", "arn:rustfs:replication:us-east-1:target-a:bucket"),
@@ -1402,8 +1391,8 @@ mod tests {
     #[test]
     fn validate_replication_config_target_arns_ignores_disabled_rules() {
         let mut rule = replication_rule("rule-1", "arn:rustfs:replication:us-east-1:stale:bucket");
-        rule.status = ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED);
-        let config = ReplicationConfiguration {
+        rule.status = Status::DISABLED.to_string();
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -1433,28 +1422,34 @@ mod tests {
         ));
     }
 
-    fn delete_marker_rule(id: &str, arn: &str, prefix: &str, priority: i32, delete_marker_enabled: bool) -> ReplicationRule {
+    fn delete_marker_rule(
+        id: &str,
+        arn: &str,
+        prefix: &str,
+        priority: i32,
+        delete_marker_enabled: bool,
+    ) -> PersistedReplicationRule {
         let status = if delete_marker_enabled {
-            DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)
+            Status::ENABLED.to_string()
         } else {
-            DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)
+            Status::DISABLED.to_string()
         };
-        ReplicationRule {
-            delete_marker_replication: Some(DeleteMarkerReplication { status: Some(status) }),
+        PersistedReplicationRule {
+            delete_marker_replication: Some(PersistedOptionalReplicationStatus { status: Some(status) }),
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
-            existing_object_replication: Some(ExistingObjectReplication {
-                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            existing_object_replication: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
             filter: None,
             id: Some(id.to_string()),
             prefix: Some(prefix.to_string()),
             priority: Some(priority),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
@@ -1465,7 +1460,7 @@ mod tests {
     #[test]
     fn replicate_delete_marker_follows_highest_priority_rule() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 delete_marker_rule("low-priority-enabled", arn, "logs/", 1, true),
@@ -1491,7 +1486,7 @@ mod tests {
     fn role_delete_decision_follows_highest_priority_rule() {
         let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: role.to_string(),
             rules: vec![
                 delete_marker_rule("low-priority-enabled", destination, "logs/", 1, true),
@@ -1516,10 +1511,10 @@ mod tests {
     fn version_purge_uses_delete_replication_for_object_and_marker_versions() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut rule = delete_marker_rule("delete-switches", arn, "", 1, true);
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::DISABLED.to_string(),
         });
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -1545,8 +1540,8 @@ mod tests {
         assert!(config.replicate(&stored_marker), "stored markers must use DeleteMarkerReplication");
         assert_eq!(config.filter_target_replication_decisions(&stored_marker), vec![(arn.to_string(), true)]);
 
-        config.rules[0].delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        config.rules[0].delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
         assert!(config.replicate(&ObjectOpts {
             name: "object".to_string(),
@@ -1561,15 +1556,15 @@ mod tests {
     #[test]
     fn unsupported_replication_fields_are_reported_before_persistence() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule("unsupported", arn)],
         };
 
-        config.rules[0].source_selection_criteria = Some(SourceSelectionCriteria {
+        config.rules[0].source_selection_criteria = Some(PersistedSourceSelectionCriteria {
             replica_modifications: None,
-            sse_kms_encrypted_objects: Some(SseKmsEncryptedObjects {
-                status: SseKmsEncryptedObjectsStatus::from_static(SseKmsEncryptedObjectsStatus::ENABLED),
+            sse_kms_encrypted_objects: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
         });
         assert_eq!(
@@ -1578,14 +1573,14 @@ mod tests {
         );
 
         config.rules[0].source_selection_criteria = None;
-        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration {
+        config.rules[0].destination.encryption_configuration = Some(PersistedEncryptionConfiguration {
             replica_kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/opaque-key-id".to_string()),
         });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.EncryptionConfiguration"));
 
         config.rules[0].destination.encryption_configuration = None;
-        config.rules[0].destination.access_control_translation = Some(s3s::dto::AccessControlTranslation {
-            owner: s3s::dto::OwnerOverride::from_static(s3s::dto::OwnerOverride::DESTINATION),
+        config.rules[0].destination.access_control_translation = Some(PersistedAccessControlTranslation {
+            owner: "Destination".to_owned(),
         });
         assert_eq!(
             unsupported_replication_config_field(&config),
@@ -1597,33 +1592,32 @@ mod tests {
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.Account"));
 
         config.rules[0].destination.account = None;
-        config.rules[0].destination.metrics = Some(Metrics {
+        config.rules[0].destination.metrics = Some(PersistedReplicationMetrics {
             event_threshold: None,
-            status: MetricsStatus::from_static(MetricsStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.Metrics"));
 
         config.rules[0].destination.metrics = None;
-        config.rules[0].destination.replication_time = Some(ReplicationTime {
-            status: ReplicationTimeStatus::from_static(ReplicationTimeStatus::ENABLED),
-            time: ReplicationTimeValue { minutes: Some(15) },
+        config.rules[0].destination.replication_time = Some(PersistedReplicationTime {
+            status: Status::ENABLED.to_string(),
+            time: PersistedReplicationTimeValue { minutes: Some(15) },
         });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.ReplicationTime"));
 
         config.rules[0].destination.replication_time = None;
-        config.rules[0].destination.storage_class =
-            Some(s3s::dto::StorageClass::from_static(s3s::dto::StorageClass::STANDARD_IA));
+        config.rules[0].destination.storage_class = Some(StorageClass::STANDARD_IA.to_string());
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
 
         // The exact-match contract is deliberate: S3 storage class enums are
         // case-sensitive, so a lowercase variant must stay rejected.
-        config.rules[0].destination.storage_class = Some(StorageClass::from("standard".to_string()));
+        config.rules[0].destination.storage_class = Some("standard".to_string());
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
 
         // Explicit STANDARD is a no-op (the engine never reads the field) and must
         // pass: the console's rule form always sends it, and rejecting it makes the
         // form unusable.
-        config.rules[0].destination.storage_class = Some(StorageClass::from_static(StorageClass::STANDARD));
+        config.rules[0].destination.storage_class = Some(StorageClass::STANDARD.to_string());
         assert_eq!(unsupported_replication_config_field(&config), None);
     }
 
@@ -1646,12 +1640,7 @@ mod tests {
               </Rule>
             </ReplicationConfiguration>
         "#;
-        let mut deserializer = Deserializer::new(xml);
-        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
-            .expect("console-shaped config should parse");
-        deserializer
-            .expect_eof()
-            .expect("console-shaped config should consume the whole body");
+        let config = parse_replication(xml).expect("console-shaped config should parse");
 
         assert_eq!(config.rules[0].destination.storage_class.as_ref().map(|c| c.as_str()), Some("STANDARD"));
         assert_eq!(unsupported_replication_config_field(&config), None);
@@ -1674,16 +1663,9 @@ mod tests {
               </Rule>
             </ReplicationConfiguration>
         "#;
-        let mut deserializer = Deserializer::new(xml);
-        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
-            .expect("historical config should parse");
-        deserializer
-            .expect_eof()
-            .expect("historical config should consume the whole body");
+        let config = parse_replication(xml).expect("historical config should parse");
 
-        let mut encoded = Vec::new();
-        <ReplicationConfiguration as s3s::xml::Serialize>::serialize(&config, &mut Serializer::new(&mut encoded))
-            .expect("historical config should serialize");
+        let encoded = serialize_replication(&config).expect("historical config should serialize");
         let encoded = String::from_utf8(encoded).expect("serialized XML should be UTF-8");
         for field in [
             "<Account>123456789012</Account>",
@@ -1709,10 +1691,7 @@ mod tests {
               </Rule>
             </ReplicationConfiguration>
         "#;
-        let mut deserializer = Deserializer::new(xml);
-        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
-            .expect("s3s should accept unknown elements");
-        deserializer.expect_eof().expect("unknown elements should still be consumed");
+        let config = parse_replication(xml).expect("the persisted parser should skip an unknown top-level element");
 
         assert!(config.rules[0].destination.encryption_configuration.is_none());
         assert_eq!(unsupported_replication_config_field(&config), None);
@@ -1750,34 +1729,34 @@ mod tests {
     fn replication_writable_fields_bind_to_typed_dto_fields() {
         let mut rule = replication_rule("id-marker", "arn:bucket-marker");
         rule.priority = Some(37);
-        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+        rule.filter = Some(PersistedReplicationFilter {
             prefix: Some("prefix-marker/".to_string()),
-            tag: Some(s3s::dto::Tag {
+            tag: Some(PersistedReplicationTag {
                 key: Some("tag-key-marker".to_string()),
                 value: Some("tag-value-marker".to_string()),
             }),
-            and: Some(s3s::dto::ReplicationRuleAndOperator {
+            and: Some(PersistedReplicationAnd {
                 prefix: Some("and-prefix-marker/".to_string()),
-                tags: Some(vec![s3s::dto::Tag {
+                tags: Some(vec![PersistedReplicationTag {
                     key: Some("and-tag-key-marker".to_string()),
                     value: Some("and-tag-value-marker".to_string()),
                 }]),
             }),
             ..Default::default()
         });
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
-        rule.source_selection_criteria = Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
-                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+        rule.source_selection_criteria = Some(PersistedSourceSelectionCriteria {
+            replica_modifications: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
             sse_kms_encrypted_objects: None,
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: "role-marker".to_string(),
             rules: vec![rule],
         };
@@ -1787,7 +1766,7 @@ mod tests {
         let field_hits = [
             ("Role", config.role == "role-marker"),
             ("Rule.ID", rule.id.as_deref() == Some("id-marker")),
-            ("Rule.Status", rule.status.as_str() == ReplicationRuleStatus::ENABLED),
+            ("Rule.Status", rule.status.as_str() == Status::ENABLED.as_str()),
             ("Rule.Priority", rule.priority == Some(37)),
             ("Rule.Filter.Prefix", filter.prefix.as_deref() == Some("prefix-marker/")),
             (
@@ -1803,27 +1782,27 @@ mod tests {
                 "Rule.ExistingObjectReplication.Status",
                 rule.existing_object_replication
                     .as_ref()
-                    .is_some_and(|existing| existing.status.as_str() == ExistingObjectReplicationStatus::ENABLED),
+                    .is_some_and(|existing| existing.status.as_str() == Status::ENABLED.as_str()),
             ),
             (
                 "Rule.DeleteMarkerReplication.Status",
                 rule.delete_marker_replication
                     .as_ref()
                     .and_then(|delete_marker| delete_marker.status.as_ref())
-                    .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED),
+                    .is_some_and(|status| status.as_str() == Status::ENABLED.as_str()),
             ),
             (
                 "Rule.DeleteReplication.Status",
                 rule.delete_replication
                     .as_ref()
-                    .is_some_and(|delete| delete.status.as_str() == DeleteReplicationStatus::ENABLED),
+                    .is_some_and(|delete| delete.status.as_str() == Status::ENABLED.as_str()),
             ),
             (
                 "Rule.SourceSelectionCriteria.ReplicaModifications.Status",
                 rule.source_selection_criteria
                     .as_ref()
                     .and_then(|criteria| criteria.replica_modifications.as_ref())
-                    .is_some_and(|modifications| modifications.status.as_str() == ReplicaModificationsStatus::ENABLED),
+                    .is_some_and(|modifications| modifications.status.as_str() == Status::ENABLED.as_str()),
             ),
         ];
         let bound_paths = field_hits.iter().map(|(path, _)| *path).collect::<Vec<_>>();
@@ -1837,17 +1816,17 @@ mod tests {
     #[test]
     fn invalid_replication_status_fields_are_reported_before_persistence() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule("invalid-status", arn)],
         };
 
-        config.rules[0].status = ReplicationRuleStatus::from_static("Invalid");
+        config.rules[0].status = "Invalid".to_owned();
         assert_eq!(invalid_replication_config_status_field(&config), Some("Rule.Status"));
 
         config.rules[0] = replication_rule("invalid-status", arn);
-        config.rules[0].existing_object_replication = Some(ExistingObjectReplication {
-            status: ExistingObjectReplicationStatus::from_static("Invalid"),
+        config.rules[0].existing_object_replication = Some(PersistedReplicationStatus {
+            status: "Invalid".to_owned(),
         });
         assert_eq!(
             invalid_replication_config_status_field(&config),
@@ -1855,14 +1834,14 @@ mod tests {
         );
 
         config.rules[0] = replication_rule("invalid-status", arn);
-        config.rules[0].delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static("Invalid"),
+        config.rules[0].delete_replication = Some(PersistedReplicationStatus {
+            status: "Invalid".to_owned(),
         });
         assert_eq!(invalid_replication_config_status_field(&config), Some("Rule.DeleteReplication.Status"));
 
         config.rules[0] = replication_rule("invalid-status", arn);
-        config.rules[0].delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static("Invalid")),
+        config.rules[0].delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some("Invalid".to_owned()),
         });
         assert_eq!(
             invalid_replication_config_status_field(&config),
@@ -1870,9 +1849,9 @@ mod tests {
         );
 
         config.rules[0] = replication_rule("invalid-status", arn);
-        config.rules[0].source_selection_criteria = Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
-                status: ReplicaModificationsStatus::from_static("Invalid"),
+        config.rules[0].source_selection_criteria = Some(PersistedSourceSelectionCriteria {
+            replica_modifications: Some(PersistedReplicationStatus {
+                status: "Invalid".to_owned(),
             }),
             sse_kms_encrypted_objects: None,
         });
@@ -1889,10 +1868,10 @@ mod tests {
         let mut a_low = delete_marker_rule("a-low", target_a, "logs/", 1, true);
         let b = delete_marker_rule("b", target_b, "logs/", 2, true);
         let a_high = delete_marker_rule("a-high", target_a, "logs/2026/", 5, false);
-        a_low.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        a_low.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![a_low, b, a_high],
         };
@@ -1925,7 +1904,7 @@ mod tests {
                     delete_marker_rule(&format!("r{index}"), target, "", index as i32, true)
                 })
                 .collect();
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules,
             };
@@ -1947,7 +1926,7 @@ mod tests {
     #[test]
     fn top_level_rule_prefix_scopes_matching_without_a_filter() {
         let arn = "arn:target:a";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![delete_marker_rule("v1-prefix", arn, "logs/", 1, true)],
         };
@@ -1978,7 +1957,7 @@ mod tests {
 
         // A <Filter> still wins over the deprecated top-level element.
         let mut filtered = delete_marker_rule("filtered", arn, "logs/", 1, true);
-        filtered.filter = Some(s3s::dto::ReplicationRuleFilter {
+        filtered.filter = Some(PersistedReplicationFilter {
             prefix: Some("photos/".to_string()),
             ..Default::default()
         });
@@ -1990,12 +1969,12 @@ mod tests {
         let target_a = "arn:target:a";
         let target_b = "arn:target:b";
         let mut a_parent = delete_marker_rule("a-parent", target_a, "logs/", 1, true);
-        a_parent.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        a_parent.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
         let a_child_disabled = delete_marker_rule("a-child", target_a, "logs/2026/", 5, false);
         let b_child = delete_marker_rule("b-child", target_b, "logs/2026/", 2, true);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![a_parent, a_child_disabled, b_child],
         };
@@ -2037,7 +2016,7 @@ mod tests {
     fn merge_keeps_operator_priorities_and_replication_decision() {
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
         let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 delete_marker_rule("dm-enabled", user_arn, "logs/", 5, true),
@@ -2109,7 +2088,7 @@ mod tests {
         assert_eq!(rules, settled);
     }
 
-    fn operator_rule_ids(config: &ReplicationConfiguration) -> Vec<(&str, Option<i32>)> {
+    fn operator_rule_ids(config: &PersistedReplicationConfiguration) -> Vec<(&str, Option<i32>)> {
         config
             .rules
             .iter()
@@ -2157,7 +2136,7 @@ mod tests {
     fn merge_keeps_operator_role_target_for_target_selection() {
         let role = "arn:minio:replication::operator-dep:bucket";
         let peers = HashSet::from(["peer-dep".to_string()]);
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: role.to_string(),
             rules: vec![delete_marker_rule("nightly", role, "", 1, true)],
         };
@@ -2199,7 +2178,7 @@ mod tests {
     #[test]
     fn legacy_contract_matches_pre_contract_peers_and_keeps_the_decision() {
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
-        let put = ReplicationConfiguration {
+        let put = PersistedReplicationConfiguration {
             role: "arn:minio:replication::operator-dep:bucket".to_string(),
             rules: vec![
                 delete_marker_rule("dm-enabled", user_arn, "logs/", 5, true),

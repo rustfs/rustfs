@@ -39,6 +39,7 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     BucketPolicy,
@@ -48,8 +49,8 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     dto::{
-        BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration, ServerSideEncryptionConfiguration,
-        Tagging, VersioningConfiguration,
+        BucketLifecycleConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging,
+        VersioningConfiguration,
     },
     header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
@@ -288,7 +289,7 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
                 .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .replication_config_xml
                 .clone();
-            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ReplicationConfiguration>)?;
+            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<PersistedReplicationConfiguration>)?;
 
             Ok(Some(config_xml))
         }
@@ -895,7 +896,7 @@ fn apply_imported_bucket_config(
         }
         BUCKET_REPLICATION_CONFIG => {
             validated_config!(
-                deserialize::<ReplicationConfiguration>,
+                deserialize::<PersistedReplicationConfiguration>,
                 replication_config_xml,
                 replication_config_updated_at
             )
@@ -1940,15 +1941,19 @@ mod backup_zip_compatibility_tests {
         checked_raw_xml(
             &validated_replication,
             DIFFERENT_REPLICATION_XML.to_vec(),
-            deserialize::<ReplicationConfiguration>,
+            deserialize::<PersistedReplicationConfiguration>,
         )
         .expect_err("a different valid revision must not be exported after validating the old revision");
-        checked_raw_xml(&validated_replication, b"not xml".to_vec(), deserialize::<ReplicationConfiguration>)
-            .expect_err("an invalid raw revision must not be exported after validating the old revision");
+        checked_raw_xml(
+            &validated_replication,
+            b"not xml".to_vec(),
+            deserialize::<PersistedReplicationConfiguration>,
+        )
+        .expect_err("an invalid raw revision must not be exported after validating the old revision");
         let matching_raw = checked_raw_xml(
             &validated_replication,
             OLD_REPLICATION_XML.to_vec(),
-            deserialize::<ReplicationConfiguration>,
+            deserialize::<PersistedReplicationConfiguration>,
         )
         .expect("the exact validated raw revision must remain exportable");
         assert_eq!(matching_raw, OLD_REPLICATION_XML);
@@ -2010,7 +2015,7 @@ mod backup_zip_compatibility_tests {
                 "g-zip-002 rollback import did not restore {config_file}"
             );
         }
-        let _: ReplicationConfiguration =
+        let _: PersistedReplicationConfiguration =
             deserialize(&restored.replication_config_xml).expect("old parser must read the newly exported archive payload");
 
         // The array-shaped compatibility fixture is unreadable as targets.

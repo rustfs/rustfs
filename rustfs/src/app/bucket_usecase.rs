@@ -43,7 +43,7 @@ use super::storage_api::bucket_usecase::bucket::{
         unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
-    utils::serialize,
+    utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::bucket_usecase::contract::bucket::{
@@ -79,10 +79,12 @@ use crate::site_replication::{
     cancel_site_replication_delete_bucket, commit_site_replication_delete_bucket, prepare_site_replication_delete_bucket,
     site_replication_bucket_meta_hook, site_replication_make_bucket_hook, with_site_replication_bucket_mutation_lock,
 };
+use crate::storage::s3_compat::replication::{replication_configuration_from_s3s, replication_configuration_to_s3s};
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -117,8 +119,7 @@ use s3s::dto::{
     PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
     PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
-    ReplicationConfiguration, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
-    VersioningConfiguration,
+    ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -439,7 +440,7 @@ impl SerializeContent for ObjectInternalInfo {
     }
 }
 
-fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
+fn serialize_config<T: BucketConfigXml>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
 }
 
@@ -664,7 +665,7 @@ fn notify_bucket_metadata_delete(bucket: String, request_context: Option<request
     });
 }
 
-fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
+fn validate_replication_config_targets(targets: &BucketTargets, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
         .targets
         .iter()
@@ -685,7 +686,7 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
     }
 }
 
-fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+fn validate_replication_config_capabilities(config: &PersistedReplicationConfiguration) -> S3Result<()> {
     if let Err(err) = validate_replication_config_structure(config) {
         return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, err.message()));
     }
@@ -704,7 +705,7 @@ fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -
     Ok(())
 }
 
-async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+async fn validate_bucket_replication_update(bucket: &str, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     if !BucketVersioningSys::enabled(bucket).await {
         return Err(s3_error!(
             InvalidRequest,
@@ -735,11 +736,11 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
 /// `contract` is what the peers were probed to support; the merged config is
 /// what gets broadcast, so it is built the way every peer will merge it.
 fn merge_user_replication_config_update(
-    incoming: ReplicationConfiguration,
-    existing: Option<ReplicationConfiguration>,
+    incoming: PersistedReplicationConfiguration,
+    existing: Option<PersistedReplicationConfiguration>,
     site_peer_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> ReplicationConfiguration {
+) -> PersistedReplicationConfiguration {
     if site_peer_deployment_ids.is_empty() {
         return incoming;
     }
@@ -756,10 +757,10 @@ fn merge_user_replication_config_update(
 /// targets may be garbage-collected — never an ARN a surviving reconciler
 /// rule still points at.
 fn split_replication_config_for_user_delete(
-    config: ReplicationConfiguration,
+    config: PersistedReplicationConfiguration,
     site_peer_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> (Option<ReplicationConfiguration>, HashSet<String>) {
+) -> (Option<PersistedReplicationConfiguration>, HashSet<String>) {
     let mut removable_arns = replication_target_arns(&config);
     let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids, contract);
     if let Some(remaining) = remaining.as_ref() {
@@ -822,7 +823,7 @@ async fn write_replication_targets_after_config_delete(
 
 async fn restore_replication_config_after_target_cleanup_failure(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
     cleanup_err: S3Error,
     expected_incarnation_id: Option<uuid::Uuid>,
 ) -> S3Error {
@@ -2219,7 +2220,7 @@ impl DefaultBucketUsecase {
         };
 
         Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration),
+            replication_configuration: Some(replication_configuration_to_s3s(replication_configuration)),
         }))
     }
 
@@ -2678,6 +2679,7 @@ impl DefaultBucketUsecase {
             replication_configuration,
             ..
         } = req.input;
+        let replication_configuration = replication_configuration_from_s3s(replication_configuration);
         info!(bucket = %bucket, "updating bucket replication config");
 
         validate_replication_config_capabilities(&replication_configuration)?;
@@ -3211,10 +3213,13 @@ fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfigu
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
-    use s3s::dto::ReplicationRuleStatus;
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+    };
     use s3s::dto::{
-        BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
-        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
+        BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
+        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
         ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
         TransitionStorageClass,
     };
@@ -3222,6 +3227,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    /// Response bodies are not bucket configurations: they are written by the
+    /// s3s encoder itself, as the legacy stack does.
+    fn serialize_s3s_response<T: xml::Serialize>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value
+            .serialize(&mut xml::Serializer::new(&mut buf))
+            .expect("metadata output should serialize");
+        buf
+    }
 
     fn s3_op_total(op: S3Operation) -> u64 {
         rustfs_io_metrics::s3_op_metrics_snapshot()
@@ -3248,6 +3263,7 @@ mod tests {
 
     /// The stored configuration must be one the write path honours as written:
     /// only AES256 and aws:kms exist, and a key id belongs to aws:kms alone.
+
     #[test]
     fn put_bucket_encryption_refuses_configurations_the_write_path_cannot_honour() {
         validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None)])).expect("AES256 is valid");
@@ -3555,11 +3571,11 @@ mod tests {
         rustfs_scanner::clear_dirty_usage_bucket(BUCKET);
     }
 
-    fn replication_rule_for_target(arn: &str) -> ReplicationRule {
-        ReplicationRule {
+    fn replication_rule_for_target(arn: &str) -> PersistedReplicationRule {
+        PersistedReplicationRule {
             delete_marker_replication: None,
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
@@ -3569,7 +3585,7 @@ mod tests {
             prefix: None,
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
@@ -3577,7 +3593,7 @@ mod tests {
     fn replication_target_arns_use_role_when_present() {
         let role = "arn:rustfs:replication:us-east-1:source:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: format!(" {role} "),
             rules: vec![replication_rule_for_target(destination)],
         };
@@ -3591,7 +3607,7 @@ mod tests {
     #[test]
     fn replication_target_arns_use_rule_destinations_without_role() {
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(destination)],
         };
@@ -3601,7 +3617,7 @@ mod tests {
         assert!(arns.contains(destination));
     }
 
-    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> ReplicationRule {
+    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> PersistedReplicationRule {
         let mut rule = replication_rule_for_target(arn);
         rule.id = Some(id.to_string());
         rule.priority = Some(priority);
@@ -3614,14 +3630,14 @@ mod tests {
 
     #[test]
     fn put_replication_merge_preserves_site_replication_rules() {
-        let existing = ReplicationConfiguration {
+        let existing = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id("arn:rustfs:replication::peer-dep:bucket", "site-repl-peer-dep", 1),
                 replication_rule_with_id("arn:rustfs:replication:us-east-1:old:bucket", "old-user-rule", 2),
             ],
         };
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id("arn:rustfs:replication:us-east-1:new:bucket", "new-user-rule", 1),
@@ -3660,7 +3676,7 @@ mod tests {
     #[test]
     fn put_then_delete_replication_without_site_replication_treats_site_repl_id_as_user_rule() {
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(user_arn, "site-repl-user", 1)],
         };
@@ -3681,7 +3697,7 @@ mod tests {
     fn delete_replication_split_keeps_only_reconciler_derived_rules() {
         let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(user_arn, "site-repl-user", 1),
@@ -3706,7 +3722,7 @@ mod tests {
 
     #[test]
     fn put_replication_merge_returns_incoming_verbatim_without_site_rules() {
-        let existing = ReplicationConfiguration {
+        let existing = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(
                 "arn:rustfs:replication:us-east-1:old:bucket",
@@ -3714,7 +3730,7 @@ mod tests {
                 7,
             )],
         };
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(
                 "arn:rustfs:replication:us-east-1:new:bucket",
@@ -3738,7 +3754,7 @@ mod tests {
     fn delete_replication_split_keeps_site_rules_and_their_targets() {
         let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
         let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(user_arn, "user-rule", 1),
@@ -3762,7 +3778,7 @@ mod tests {
     #[test]
     fn delete_replication_split_protects_targets_shared_with_site_rules() {
         let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(sr_arn, "user-rule-on-sr-target", 1),
@@ -3783,7 +3799,7 @@ mod tests {
     #[test]
     fn delete_replication_split_removes_everything_without_site_rules() {
         let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
         };
@@ -3812,7 +3828,7 @@ mod tests {
     fn validate_replication_config_targets_accepts_matching_destination_arns() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(arn)],
         };
@@ -3823,7 +3839,7 @@ mod tests {
     #[test]
     fn validate_replication_config_targets_rejects_stale_destination_arns() {
         let targets = replication_targets_with_arn(&["arn:rustfs:replication:us-east-1:target:bucket-a"]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(
                 "arn:rustfs:replication:us-east-1:target:bucket-b",
@@ -3838,7 +3854,7 @@ mod tests {
     fn validate_replication_config_targets_accepts_matching_role_arn() {
         let arn = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: format!(" {arn} "),
             rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:ignored:bucket")],
         };
@@ -3850,7 +3866,7 @@ mod tests {
     fn validate_replication_config_targets_rejects_role_with_multiple_destinations() {
         let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[role]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: role.to_string(),
             rules: vec![
                 replication_rule_for_target("arn:rustfs:replication:us-east-1:target-a:bucket"),
@@ -3867,7 +3883,7 @@ mod tests {
     fn validate_replication_config_targets_trims_destination_arns() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(
                 " arn:rustfs:replication:us-east-1:target:bucket ",
@@ -3881,8 +3897,8 @@ mod tests {
     fn validate_replication_config_targets_ignores_disabled_rules() {
         let targets = replication_targets_with_arn(&[]);
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:stale:bucket");
-        rule.status = ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED);
-        let config = ReplicationConfiguration {
+        rule.status = Status::DISABLED.to_string();
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -3894,10 +3910,10 @@ mod tests {
     fn validate_replication_config_capabilities_names_unsupported_field() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         let destination_key_id = "arn:aws:kms:us-east-1:123456789012:key/opaque-key-id";
-        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration {
+        rule.destination.encryption_configuration = Some(PersistedEncryptionConfiguration {
             replica_kms_key_id: Some(destination_key_id.to_string()),
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -3908,7 +3924,7 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(
             err.to_string()
-                .contains("Destination.EncryptionConfiguration is not supported")
+                .contains("Destination.PersistedEncryptionConfiguration is not supported")
         );
         assert!(!err.to_string().contains(destination_key_id));
     }
@@ -3919,7 +3935,7 @@ mod tests {
         first.priority = Some(1);
         let mut second = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         second.priority = Some(1);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![first, second],
         };
@@ -3934,8 +3950,8 @@ mod tests {
     #[test]
     fn validate_replication_config_capabilities_rejects_invalid_status_before_write() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
-        rule.status = ReplicationRuleStatus::from_static("Invalid");
-        let config = ReplicationConfiguration {
+        rule.status = "Invalid".to_owned();
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -4855,8 +4871,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
-            .expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
 
         assert!(xml.contains("<ListBucketResult"));
         assert!(xml.contains("<Contents>"));
@@ -4928,8 +4943,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
-            .expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
 
         // Good sibling metadata survives.
         assert!(xml.contains("<project>alpha</project>"), "well-formed key must remain: {xml}");
@@ -5276,10 +5290,10 @@ mod tests {
         // request actually reaches the store lookup this test pins.
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(ReplicationConfiguration {
+            .replication_configuration(replication_configuration_to_s3s(PersistedReplicationConfiguration {
                 role: "arn:aws:iam::123456789012:role/test".to_string(),
                 rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
-            })
+            }))
             .build()
             .unwrap();
 
@@ -5299,10 +5313,10 @@ mod tests {
         rule.destination.account = Some("123456789012".to_string());
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(ReplicationConfiguration {
+            .replication_configuration(replication_configuration_to_s3s(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![rule],
-            })
+            }))
             .build()
             .unwrap();
 

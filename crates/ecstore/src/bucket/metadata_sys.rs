@@ -30,9 +30,9 @@ use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::{ECStore, await_bucket_namespace_operation};
 use futures::future::join_all;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
-use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
     AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
     ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, PublicAccessBlockConfiguration,
@@ -1417,7 +1417,7 @@ fn quota_config_and_incarnation_from_authority(
     }
 }
 
-pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+pub async fn get_replication_config(bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -1427,7 +1427,7 @@ pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfigur
 pub(crate) async fn get_replication_config_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
-) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -2932,7 +2932,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+    pub async fn get_replication_config(&self, bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         if !bm.replication_config_xml.is_empty() && bm.replication_config.is_none() {

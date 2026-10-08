@@ -67,8 +67,8 @@ use crate::error::{Error, Result};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::TRANSITION_COMPLETE;
 use rustfs_filemeta::{FileInfo, MetaCacheEntry};
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_rio::Index;
-use s3s::dto::ReplicationConfiguration;
 use serde::Serialize;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -2629,7 +2629,7 @@ fn test_resolve_rebalance_optional_bucket_config_result_passthrough() {
     let result = resolve_rebalance_optional_bucket_config_result(
         "bucket-a",
         "replication",
-        Ok((ReplicationConfiguration::default(), OffsetDateTime::UNIX_EPOCH)),
+        Ok((PersistedReplicationConfiguration::default(), OffsetDateTime::UNIX_EPOCH)),
     )
     .expect("bucket config should pass through");
     assert!(result.is_some());

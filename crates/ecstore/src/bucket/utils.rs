@@ -15,6 +15,9 @@
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
+use rustfs_gateway_types::persistence::{
+    PersistedReplicationConfiguration, PersistenceCodecError, parse_replication, serialize_replication,
+};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::xml;
 use tracing::instrument;
@@ -73,38 +76,94 @@ pub fn check_valid_bucket_name_strict(bucket_name: &str) -> Result<()> {
     check_bucket_name_common(bucket_name, true)
 }
 
+/// A bucket configuration persisted as XML in the bucket metadata, together
+/// with the codec that reads and writes its stored bytes.
+///
+/// The gateway persistence codecs (`rustfs_gateway_types::persistence`)
+/// replace the s3s XML codec one configuration family at a time
+/// (rustfs/backlog#2745): a family that has moved implements this trait with
+/// its gateway codec, and every other family still implements it with the s3s
+/// codec it was persisted with. Both must keep the persisted bytes the
+/// `bucket_config_goldens` pin.
+pub trait BucketConfigXml: Sized {
+    /// Decodes the stored bytes of one configuration document.
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError>;
+
+    /// Encodes the value as RustFS stores it.
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError>;
+}
+
+/// Why a persisted bucket configuration could not be decoded or encoded.
+#[derive(Debug, thiserror::Error)]
+pub enum BucketConfigXmlError {
+    /// The s3s XML decoder of a family that has not moved yet refused the bytes.
+    #[error(transparent)]
+    LegacyDecode(#[from] xml::DeError),
+    /// The s3s XML encoder of a family that has not moved yet failed.
+    #[error(transparent)]
+    LegacyEncode(#[from] xml::SerError),
+    /// A gateway persistence codec refused the bytes or the value.
+    #[error(transparent)]
+    Persisted(#[from] PersistenceCodecError),
+}
+
+/// Decodes one persisted bucket configuration document.
+pub fn deserialize<T: BucketConfigXml>(input: &[u8]) -> std::result::Result<T, BucketConfigXmlError> {
+    T::decode_config_xml(input)
+}
+
+/// Encodes one bucket configuration as RustFS persists it.
+pub fn serialize<T: BucketConfigXml>(val: &T) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+    val.encode_config_xml()
+}
+
+impl BucketConfigXml for PersistedReplicationConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_replication(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_replication(self)?)
+    }
+}
+
 // RUSTFS_COMPAT_TODO(s3gate-metadata-xml): the s3s codec reads persisted XML during migration. Remove after every supported writer uses the gateway codec and every retained metadata object and backup archive is verified or rewritten.
-pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
-where
-    T: for<'xml> xml::Deserialize<'xml>,
-{
-    let mut d = xml::Deserializer::new(input);
-    let ans = T::deserialize(&mut d)?;
-    d.expect_eof()?;
-    Ok(ans)
+macro_rules! legacy_s3s_bucket_config_xml {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl BucketConfigXml for $ty {
+            fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+                let mut d = xml::Deserializer::new(input);
+                let ans = <$ty as xml::Deserialize>::deserialize(&mut d)?;
+                d.expect_eof()?;
+                Ok(ans)
+            }
+
+            fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+                let mut buf = Vec::with_capacity(256);
+                {
+                    let mut ser = xml::Serializer::new(&mut buf);
+                    <$ty as xml::Serialize>::serialize(self, &mut ser)?;
+                }
+                Ok(buf)
+            }
+        }
+    )+};
 }
 
-#[allow(
-    dead_code,
-    reason = "xml serialize helper with no caller in this port; the live sibling is deserialize (backlog#1823)"
-)]
-pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = xml::Serializer::new(&mut buf);
-        val.serialize_content(&mut ser)?;
-    }
-    Ok(String::from_utf8(buf).unwrap())
-}
-
-pub fn serialize<T: xml::Serialize>(val: &T) -> xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = xml::Serializer::new(&mut buf);
-        val.serialize(&mut ser)?;
-    }
-    Ok(buf)
-}
+legacy_s3s_bucket_config_xml!(
+    s3s::dto::AccelerateConfiguration,
+    s3s::dto::BucketLifecycleConfiguration,
+    s3s::dto::BucketLoggingStatus,
+    s3s::dto::CORSConfiguration,
+    s3s::dto::NotificationConfiguration,
+    s3s::dto::ObjectLockConfiguration,
+    s3s::dto::PublicAccessBlockConfiguration,
+    s3s::dto::RequestPaymentConfiguration,
+    s3s::dto::ServerSideEncryptionConfiguration,
+    s3s::dto::Tagging,
+    s3s::dto::VersioningConfiguration,
+    s3s::dto::WebsiteConfiguration,
+);
 
 pub fn has_bad_path_component(path: &str) -> bool {
     let n = path.len();

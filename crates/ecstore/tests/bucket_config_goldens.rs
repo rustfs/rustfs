@@ -26,7 +26,9 @@
 //! metadata store, or choosing a canonical shape.
 //!
 //! Upstream: the bucket-config `deserialize`/`serialize` pair, reached through the
-//! integration-test facade `tests/storage_api.rs`, and the s3s DTOs they are generic over. Downstream: the DTO/codec
+//! integration-test facade `tests/storage_api.rs`, and the configuration types they are
+//! generic over (`BucketConfigXml`: the gateway persistence shapes for the families that
+//! have moved, the s3s DTOs for the rest). Downstream: the DTO/codec
 //! replacement (T1.4) and the persisted-bytes comparison (T3.7), which must
 //! keep every golden green without regenerating it. Regeneration is reserved
 //! to `scripts/gen_bucket_config_goldens.sh`, which sets
@@ -35,23 +37,25 @@
 
 mod storage_api;
 
+use rustfs_gateway_types::dto::{Status, StorageClass};
+use rustfs_gateway_types::persistence::{
+    PersistedOptionalReplicationStatus, PersistedReplicationAnd, PersistedReplicationConfiguration,
+    PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus,
+    PersistedReplicationTag, PersistedSourceSelectionCriteria,
+};
 use s3s::dto::{
     AbortIncompleteMultipartUpload, AccelerateConfiguration, BucketAccelerateStatus, BucketLifecycleConfiguration,
     BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule, Condition, DefaultRetention, DelMarkerExpiration,
-    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-    ErrorDocument, Event, ExcludedPrefix, ExistingObjectReplication, ExistingObjectReplicationStatus, ExpirationStatus,
-    FilterRule, FilterRuleName, IndexDocument, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-    LoggingEnabled, NoncurrentVersionExpiration, NotificationConfiguration, NotificationConfigurationFilter,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration,
-    QueueConfiguration, Redirect, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleAndOperator, ReplicationRuleFilter, ReplicationRuleStatus, RequestPaymentConfiguration, RoutingRule,
-    S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, SourceSelectionCriteria, StorageClass, Tag, Tagging, Transition, TransitionStorageClass,
+    ErrorDocument, Event, ExcludedPrefix, ExpirationStatus, FilterRule, FilterRuleName, IndexDocument, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter, LoggingEnabled, NoncurrentVersionExpiration,
+    NotificationConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration, QueueConfiguration, Redirect,
+    RequestPaymentConfiguration, RoutingRule, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, Transition, TransitionStorageClass,
     VersioningConfiguration, WebsiteConfiguration,
 };
-use s3s::xml;
 use std::path::{Path, PathBuf};
-use storage_api::bucket_config_codec::{deserialize, serialize};
+use storage_api::bucket_config_codec::{BucketConfigXml, deserialize, serialize};
 
 /// Set only by `scripts/gen_bucket_config_goldens.sh`. Every pair test then
 /// writes its `.out.xml` (and, for the `rustfs` shape, its `.in.xml`) and
@@ -83,7 +87,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn round_trip<T>(input: &[u8], label: &str) -> Vec<u8>
 where
-    T: for<'xml> xml::Deserialize<'xml> + xml::Serialize,
+    T: BucketConfigXml,
 {
     let parsed: T = deserialize(input).unwrap_or_else(|err| panic!("{label}: deserialize failed: {err}"));
     serialize(&parsed).unwrap_or_else(|err| panic!("{label}: serialize failed: {err}"))
@@ -106,7 +110,7 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
 /// the `rustfs` shape; the `aws` and `minio` shapes pass `None`.
 fn check_pair<T>(family: &str, shape: &str, typed: Option<&T>)
 where
-    T: for<'xml> xml::Deserialize<'xml> + xml::Serialize,
+    T: BucketConfigXml,
 {
     let in_path = pair_path(family, shape, "in");
     let out_path = pair_path(family, shape, "out");
@@ -291,41 +295,44 @@ mod rustfs_values {
         }
     }
 
-    pub(super) fn replication() -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    pub(super) fn replication() -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
-                delete_replication: Some(DeleteReplication {
-                    status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                delete_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:rustfs:replication::0b6f3c2a-5e6a-4d2b-9c1e-7a8f9d0e1b2c:interop-dr".to_owned(),
-                    storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                    storage_class: Some(StorageClass::STANDARD.to_string()),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
-                filter: Some(ReplicationRuleFilter {
-                    and: Some(ReplicationRuleAndOperator {
+                filter: Some(PersistedReplicationFilter {
+                    and: Some(PersistedReplicationAnd {
                         prefix: Some("docs/".to_owned()),
-                        tags: Some(vec![tag("replicate", "yes")]),
+                        tags: Some(vec![PersistedReplicationTag {
+                            key: Some("replicate".to_owned()),
+                            value: Some("yes".to_owned()),
+                        }]),
                     }),
                     ..Default::default()
                 }),
                 id: Some("rustfs-dr".to_owned()),
                 prefix: None,
                 priority: Some(1),
-                source_selection_criteria: Some(SourceSelectionCriteria {
-                    replica_modifications: Some(ReplicaModifications {
-                        status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                source_selection_criteria: Some(PersistedSourceSelectionCriteria {
+                    replica_modifications: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     sse_kms_encrypted_objects: None,
                 }),
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         }
     }
@@ -451,7 +458,7 @@ mod bucket_config_goldens {
     /// element is skipped on read and never re-emitted on write.
     #[test]
     fn replication_aws() {
-        check_pair::<ReplicationConfiguration>("replication", "aws", None);
+        check_pair::<PersistedReplicationConfiguration>("replication", "aws", None);
         let input = read(&pair_path("replication", "aws", "in"));
         let output = read(&pair_path("replication", "aws", "out"));
         assert!(
@@ -464,7 +471,7 @@ mod bucket_config_goldens {
             String::from_utf8_lossy(&output)
         );
     }
-    golden!(replication_minio, "replication", "minio", ReplicationConfiguration);
+    golden!(replication_minio, "replication", "minio", PersistedReplicationConfiguration);
     golden!(replication_rustfs, "replication", rustfs = rustfs_values::replication());
 
     golden!(cors_aws, "cors", "aws", CORSConfiguration);

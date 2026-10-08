@@ -28,15 +28,20 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
+    pub(crate) use rustfs_gateway_types::dto::Status;
+    #[cfg(test)]
+    pub(crate) use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
+    };
+    #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
     #[cfg(test)]
     pub(crate) use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
-        HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output, ReplicationConfiguration, ReplicationRule,
-        ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, Tag, VersioningConfiguration,
+        BucketVersioningStatus, GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration,
     };
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
@@ -552,7 +557,10 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_replication_config(
             bucket: &str,
-        ) -> Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<
+            (rustfs_gateway_types::persistence::PersistedReplicationConfiguration, OffsetDateTime),
+            crate::storage::storage_api::StorageError,
+        > {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_replication_config(bucket).await
         }
 
@@ -913,7 +921,7 @@ pub(crate) mod bucket {
         }
 
         pub(crate) fn delete_replication_state_from_config(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
             obj_info: &crate::storage::storage_api::StorageObjectInfo,
             version_id: Option<Uuid>,
             replica: bool,
@@ -928,7 +936,9 @@ pub(crate) mod bucket {
             replication_contracts::delete_replication_state_from_config(config, &source)
         }
 
-        pub(crate) fn replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> HashSet<String> {
+        pub(crate) fn replication_target_arns(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> HashSet<String> {
             replication_contracts::replication_target_arns(config)
         }
 
@@ -965,17 +975,19 @@ pub(crate) mod bucket {
 
         pub(crate) fn validate_replication_config_target_arns<'a>(
             configured_arns: impl Iterator<Item = &'a str>,
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Result<(), ReplicationTargetValidationError> {
             replication_contracts::validate_replication_config_target_arns(configured_arns, config)
         }
 
-        pub(crate) fn unsupported_replication_config_field(config: &s3s::dto::ReplicationConfiguration) -> Option<&'static str> {
+        pub(crate) fn unsupported_replication_config_field(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> Option<&'static str> {
             replication_contracts::unsupported_replication_config_field(config)
         }
 
         pub(crate) fn invalid_replication_config_status_field(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Option<&'static str> {
             replication_contracts::invalid_replication_config_status_field(config)
         }
@@ -983,7 +995,7 @@ pub(crate) mod bucket {
         pub(crate) type ReplicationConfigStructureError = replication_contracts::ReplicationConfigStructureError;
 
         pub(crate) fn validate_replication_config_structure(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Result<(), ReplicationConfigStructureError> {
             replication_contracts::validate_replication_config_structure(config)
         }
@@ -1003,9 +1015,7 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod utils {
-        pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-            crate::storage::storage_api::ecstore_bucket::utils::serialize(val)
-        }
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::{BucketConfigXml, serialize};
     }
 
     pub(crate) mod versioning_sys {

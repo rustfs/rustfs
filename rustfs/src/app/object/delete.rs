@@ -1297,11 +1297,12 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Method};
-    use s3s::dto::{
-        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-        ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications,
-        ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationRule, PersistedReplicationStatus, PersistedSourceSelectionCriteria,
     };
+    use s3s::dto::{Delete, ObjectIdentifier};
     use std::sync::Arc;
 
     #[test]
@@ -2683,31 +2684,31 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_tracks_downstream_delete_marker_targets() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn.clone(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
-                source_selection_criteria: Some(SourceSelectionCriteria {
-                    replica_modifications: Some(ReplicaModifications {
-                        status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                source_selection_criteria: Some(PersistedSourceSelectionCriteria {
+                    replica_modifications: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     sse_kms_encrypted_objects: None,
                 }),
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -2730,26 +2731,26 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_skips_replica_delete_without_replica_modifications() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn,
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -2769,26 +2770,26 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_requires_delete_switch_for_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn.clone(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -2805,8 +2806,8 @@ mod tests {
             "delete-marker version purge must not use DeleteMarkerReplication"
         );
 
-        config.rules[0].delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        config.rules[0].delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
         let state = delete_replication_state_from_config(&config, &obj_info, version_id, false)
             .expect("delete-marker version purge should honor DeleteReplication");

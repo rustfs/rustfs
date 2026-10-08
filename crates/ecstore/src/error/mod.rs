@@ -1076,6 +1076,12 @@ impl From<s3s::xml::DeError> for Error {
     }
 }
 
+impl From<crate::bucket::utils::BucketConfigXmlError> for Error {
+    fn from(e: crate::bucket::utils::BucketConfigXmlError) -> Self {
+        Error::other(e)
+    }
+}
+
 impl From<tonic::Status> for Error {
     fn from(e: tonic::Status) -> Self {
         // Keep the typed status as the io::Error payload instead of a

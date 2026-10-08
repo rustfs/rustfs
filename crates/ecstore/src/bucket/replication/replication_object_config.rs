@@ -16,7 +16,9 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use super::replication_filemeta_boundary::metadata_keys;
 use crate::bucket::metadata::BucketMetadata;
-use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::error;
@@ -39,7 +41,7 @@ use super::replication_target_boundary::{BucketTargets, ReplicationTargetStore};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 
-pub(crate) async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
+pub(crate) async fn get_replication_config(bucket: &str) -> Result<Option<PersistedReplicationConfiguration>> {
     let config = ReplicationMetadataStore::optional_replication_config(bucket).await?;
     validate_delete_replication_config(&VersioningConfiguration::default(), config.as_ref())?;
     Ok(config)
@@ -64,7 +66,7 @@ impl DeleteReplicationConfigSnapshot {
     #[cfg(test)]
     pub(crate) fn from_configs_for_test(
         versioning: VersioningConfiguration,
-        replication: Option<ReplicationConfiguration>,
+        replication: Option<PersistedReplicationConfiguration>,
     ) -> Self {
         let metadata = replication.map(|config| {
             let mut metadata = BucketMetadata::new("test-bucket");
@@ -78,7 +80,7 @@ impl DeleteReplicationConfigSnapshot {
         &self.versioning
     }
 
-    pub fn replication_config(&self) -> Option<&ReplicationConfiguration> {
+    pub fn replication_config(&self) -> Option<&PersistedReplicationConfiguration> {
         self.metadata
             .as_ref()
             .and_then(|metadata| metadata.replication_config.as_ref())
@@ -101,7 +103,7 @@ impl DeleteReplicationConfigSnapshot {
     pub(crate) fn active_delete_marker_rules_require_tags(&self, object: &str) -> bool {
         self.replication_config().is_some_and(|config| {
             config.rules.iter().any(|rule| {
-                if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+                if rule.status == Status::DISABLED.as_str() {
                     return false;
                 }
                 if !object.starts_with(rule.prefix()) {
@@ -122,7 +124,7 @@ impl DeleteReplicationConfigSnapshot {
 
 fn validate_delete_replication_config(
     versioning: &VersioningConfiguration,
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
 ) -> Result<()> {
     if versioning
         .status
@@ -144,7 +146,7 @@ fn validate_delete_replication_config(
         let role = config.role.trim();
         let mut role_destination = None;
         for rule in &config.rules {
-            if rule.status.as_str() == ReplicationRuleStatus::ENABLED {
+            if rule.status.as_str() == Status::ENABLED.as_str() {
                 let destination = rule.destination.bucket.trim();
                 if role.is_empty() && destination.is_empty() {
                     return Err(super::replication_error_boundary::Error::other(
@@ -169,7 +171,7 @@ fn validate_delete_replication_config(
     Ok(())
 }
 
-fn replication_config_from_metadata(metadata: &BucketMetadata) -> Result<Option<&ReplicationConfiguration>> {
+fn replication_config_from_metadata(metadata: &BucketMetadata) -> Result<Option<&PersistedReplicationConfiguration>> {
     if !metadata.replication_config_xml.is_empty() && metadata.replication_config.is_none() {
         return Err(super::replication_error_boundary::Error::other(
             "persisted bucket replication configuration is invalid",
@@ -250,12 +252,15 @@ pub(crate) async fn load_delete_replication_config_in(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicationConfig {
-    pub config: Option<ReplicationConfiguration>,
+    /// Carried in the scanner's persisted data usage cache, so its serde form
+    /// is the one the s3s DTO wrote there (see `replication_cache_serde`).
+    #[serde(with = "super::replication_cache_serde")]
+    pub config: Option<PersistedReplicationConfiguration>,
     pub remotes: Option<BucketTargets>,
 }
 
 impl ReplicationConfig {
-    pub fn new(config: Option<ReplicationConfiguration>, remotes: Option<BucketTargets>) -> Self {
+    pub fn new(config: Option<PersistedReplicationConfiguration>, remotes: Option<BucketTargets>) -> Self {
         Self { config, remotes }
     }
 
@@ -468,7 +473,7 @@ fn check_replicate_delete_with_config(
     oi: &ObjectInfo,
     del_opts: &ObjectOptions,
     source_error: bool,
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
     existing_delete_marker: bool,
     trust_persisted_replica_status: bool,
 ) -> ReplicateDecision {
@@ -587,7 +592,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
 }
 
 fn metadata_target_should_replicate(
-    cfg: &ReplicationConfiguration,
+    cfg: &PersistedReplicationConfiguration,
     opts: &ObjectOpts,
     mopts: &MustReplicateOptions,
     arn: &str,
@@ -597,20 +602,21 @@ fn metadata_target_should_replicate(
 
 #[cfg(test)]
 mod tests {
-    use s3s::dto::{
-        DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-        ReplicaModifications, ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, SourceSelectionCriteria, Tag,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationDestination, PersistedReplicationFilter,
+        PersistedReplicationRule, PersistedReplicationStatus, PersistedReplicationTag, PersistedSourceSelectionCriteria,
     };
 
     use super::super::replication_filemeta_boundary::VersionPurgeStatusType;
     use super::super::replication_target_boundary::BucketTarget;
     use super::*;
 
-    fn replication_rule() -> ReplicationRule {
-        ReplicationRule {
+    fn replication_rule() -> PersistedReplicationRule {
+        PersistedReplicationRule {
             delete_marker_replication: None,
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: "arn:aws:s3:::target-bucket".to_string(),
                 ..Default::default()
             },
@@ -620,7 +626,7 @@ mod tests {
             prefix: Some(String::new()),
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
@@ -629,11 +635,11 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut rule = replication_rule();
         rule.destination.bucket = arn.to_string();
-        rule.filter = Some(ReplicationRuleFilter {
+        rule.filter = Some(PersistedReplicationFilter {
             prefix: Some("admitted/".to_string()),
             ..Default::default()
         });
-        let cfg = ReplicationConfiguration {
+        let cfg = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -671,7 +677,7 @@ mod tests {
         assert!(!empty.replicate(&ObjectOpts::default()));
 
         let config = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![replication_rule()],
             }),
@@ -725,7 +731,7 @@ mod tests {
     fn delete_snapshot_rejects_enabled_rules_without_a_destination() {
         let mut rule = replication_rule();
         rule.destination.bucket.clear();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -741,7 +747,7 @@ mod tests {
         let first = replication_rule();
         let mut second = replication_rule();
         second.destination.bucket = "arn:aws:s3:::other-target".to_string();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: "arn:aws:s3:::role-target".to_string(),
             rules: vec![first, second],
         };
@@ -759,40 +765,40 @@ mod tests {
 
         let mut invalid_rule = replication_rule();
         invalid_rule.status = "Enabld".to_string().into();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![invalid_rule],
         };
         assert!(validate_delete_replication_config(&VersioningConfiguration::default(), Some(&config)).is_err());
 
         let mut invalid_delete = replication_rule();
-        invalid_delete.delete_replication = Some(DeleteReplication {
+        invalid_delete.delete_replication = Some(PersistedReplicationStatus {
             status: "Enabld".to_string().into(),
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![invalid_delete],
         };
         assert!(validate_delete_replication_config(&VersioningConfiguration::default(), Some(&config)).is_err());
 
         let mut invalid_delete_marker = replication_rule();
-        invalid_delete_marker.delete_marker_replication = Some(DeleteMarkerReplication {
+        invalid_delete_marker.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
             status: Some("Enabld".to_string().into()),
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![invalid_delete_marker],
         };
         assert!(validate_delete_replication_config(&VersioningConfiguration::default(), Some(&config)).is_err());
 
         let mut invalid_replica_modifications = replication_rule();
-        invalid_replica_modifications.source_selection_criteria = Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
+        invalid_replica_modifications.source_selection_criteria = Some(PersistedSourceSelectionCriteria {
+            replica_modifications: Some(PersistedReplicationStatus {
                 status: "Enabld".to_string().into(),
             }),
             sse_kms_encrypted_objects: None,
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![invalid_replica_modifications],
         };
@@ -808,7 +814,7 @@ mod tests {
             ..Default::default()
         });
         metadata.replication_config_xml = b"configured".to_vec();
-        metadata.replication_config = Some(ReplicationConfiguration {
+        metadata.replication_config = Some(PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule()],
         });
@@ -848,7 +854,7 @@ mod tests {
         );
 
         let mut inconsistent = BucketMetadata::new("bucket");
-        inconsistent.replication_config = Some(ReplicationConfiguration {
+        inconsistent.replication_config = Some(PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule()],
         });
@@ -863,11 +869,11 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut rule = replication_rule();
         rule.destination.bucket = arn.to_string();
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
         let mut metadata = BucketMetadata::new("bucket");
-        metadata.replication_config = Some(ReplicationConfiguration {
+        metadata.replication_config = Some(PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         });
@@ -898,8 +904,8 @@ mod tests {
     fn delete_marker_source_read_is_required_only_for_tag_filtered_rules() {
         let mut prefix_rule = replication_rule();
         prefix_rule.prefix = Some("logs/".to_string());
-        prefix_rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        prefix_rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
 
         let prefix_snapshot = DeleteReplicationConfigSnapshot::from_configs_for_test(
@@ -907,18 +913,18 @@ mod tests {
                 status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![prefix_rule],
             }),
         );
 
         let mut tag_rule = replication_rule();
-        tag_rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        tag_rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         });
-        tag_rule.filter = Some(ReplicationRuleFilter {
-            tag: Some(Tag {
+        tag_rule.filter = Some(PersistedReplicationFilter {
+            tag: Some(PersistedReplicationTag {
                 key: Some("class".to_string()),
                 value: Some("audit".to_string()),
             }),
@@ -929,7 +935,7 @@ mod tests {
                 status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![tag_rule],
             }),
@@ -944,14 +950,14 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut rule = replication_rule();
         rule.destination.bucket = arn.to_string();
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::DISABLED.to_string()),
         });
         let config = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![rule],
             }),
@@ -985,16 +991,16 @@ mod tests {
     #[test]
     fn live_delete_does_not_trust_persisted_replica_status() {
         let mut rule = replication_rule();
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
-        rule.source_selection_criteria = Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
-                status: s3s::dto::ReplicaModificationsStatus::from_static(s3s::dto::ReplicaModificationsStatus::DISABLED),
+        rule.source_selection_criteria = Some(PersistedSourceSelectionCriteria {
+            replica_modifications: Some(PersistedReplicationStatus {
+                status: Status::DISABLED.to_string(),
             }),
             sse_kms_encrypted_objects: None,
         });
-        let replication = ReplicationConfiguration {
+        let replication = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -1036,14 +1042,14 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut rule = replication_rule();
         rule.destination.bucket = arn.to_string();
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
-        rule.delete_marker_replication = Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+        rule.delete_marker_replication = Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::DISABLED.to_string()),
         });
         let config = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![rule],
             }),

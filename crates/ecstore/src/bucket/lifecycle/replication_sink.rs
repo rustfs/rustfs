@@ -77,12 +77,13 @@ mod tests {
     use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
     use crate::object_api::{ObjectInfo, ObjectOptions};
     use crate::storage_api_contracts::object::ObjectToDelete;
-    use rustfs_scanner_metrics::metrics::IlmAction;
-    use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
-        DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
-        VersioningConfiguration,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationRule, PersistedReplicationStatus,
     };
+    use rustfs_scanner_metrics::metrics::IlmAction;
+    use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
     use uuid::Uuid;
 
     use super::*;
@@ -158,24 +159,24 @@ mod tests {
                         status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                         ..Default::default()
                     },
-                    Some(ReplicationConfiguration {
+                    Some(PersistedReplicationConfiguration {
                         role: String::new(),
-                        rules: vec![ReplicationRule {
-                            delete_marker_replication: Some(DeleteMarkerReplication {
+                        rules: vec![PersistedReplicationRule {
+                            delete_marker_replication: Some(PersistedOptionalReplicationStatus {
                                 status: Some(if marker_enabled {
-                                    DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)
+                                    Status::ENABLED.to_string()
                                 } else {
-                                    DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)
+                                    Status::DISABLED.to_string()
                                 }),
                             }),
-                            delete_replication: Some(DeleteReplication {
+                            delete_replication: Some(PersistedReplicationStatus {
                                 status: if purge_enabled {
-                                    DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
+                                    Status::ENABLED.to_string()
                                 } else {
-                                    DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED)
+                                    Status::DISABLED.to_string()
                                 },
                             }),
-                            destination: Destination {
+                            destination: PersistedReplicationDestination {
                                 bucket: "arn:rustfs:replication:target".to_string(),
                                 ..Default::default()
                             },
@@ -185,7 +186,7 @@ mod tests {
                             prefix: Some(String::new()),
                             priority: Some(1),
                             source_selection_criteria: None,
-                            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                            status: Status::ENABLED.to_string(),
                         }],
                     }),
                 );

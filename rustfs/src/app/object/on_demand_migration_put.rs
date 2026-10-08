@@ -299,9 +299,10 @@ mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
+        BucketVersioningStatus, PersistedOptionalReplicationStatus, PersistedReplicationConfiguration,
+        PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Status,
+        VersioningConfiguration,
     };
     use crate::app::storage_api::test::bucket::utils::serialize;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -1030,20 +1031,20 @@ mod tests {
             status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
             ..Default::default()
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::DISABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:aws:s3:::target-bucket".to_string(),
                     ..Default::default()
                 },
                 existing_object_replication: None,
-                filter: required_tag.map(|(key, value)| ReplicationRuleFilter {
-                    tag: Some(Tag {
+                filter: required_tag.map(|(key, value)| PersistedReplicationFilter {
+                    tag: Some(PersistedReplicationTag {
                         key: Some(key.to_string()),
                         value: Some(value.to_string()),
                     }),
@@ -1053,7 +1054,7 @@ mod tests {
                 prefix: Some(String::new()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         metadata.replication_config_xml = serialize(&config).expect("replication config serializes");

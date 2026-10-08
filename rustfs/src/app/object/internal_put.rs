@@ -797,8 +797,9 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        BucketVersioningStatus, PersistedOptionalReplicationStatus, PersistedReplicationConfiguration,
+        PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
+        VersioningConfiguration,
     };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
@@ -895,21 +896,21 @@ mod tests {
         });
 
         if let Some(target) = target {
-            let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
-                tag: Some(Tag {
+            let filter = required_tag.map(|(key, value)| PersistedReplicationFilter {
+                tag: Some(PersistedReplicationTag {
                     key: Some(key.to_string()),
                     value: Some(value.to_string()),
                 }),
                 ..Default::default()
             });
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
-                    delete_marker_replication: Some(DeleteMarkerReplication {
-                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+                rules: vec![PersistedReplicationRule {
+                    delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                        status: Some(Status::DISABLED.to_string()),
                     }),
                     delete_replication: None,
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: target.to_string(),
                         ..Default::default()
                     },
@@ -919,7 +920,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             };
             metadata.replication_config_xml = serialize(&config).expect("replication test config should serialize");

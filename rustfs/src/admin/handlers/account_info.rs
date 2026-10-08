@@ -27,10 +27,12 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, ReplicationRuleStatus};
+use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -97,11 +99,11 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
         .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
 }
 
-fn replication_config_enabled(config: &ReplicationConfiguration) -> bool {
+fn replication_config_enabled(config: &PersistedReplicationConfiguration) -> bool {
     config
         .rules
         .iter()
-        .any(|rule| rule.status.as_str() == ReplicationRuleStatus::ENABLED)
+        .any(|rule| rule.status.as_str() == Status::ENABLED.as_str())
 }
 
 async fn bucket_locking_enabled(bucket: &str) -> bool {
@@ -317,9 +319,9 @@ impl Operation for AccountInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_gateway_types::persistence::{PersistedReplicationDestination, PersistedReplicationRule};
     use rustfs_madmin::BackendInfo;
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{Destination, ReplicationRule};
 
     #[test]
     fn accountinfo_response_adds_optional_oidc_display_fields() {
@@ -434,20 +436,20 @@ mod tests {
 
     #[test]
     fn accountinfo_bucket_details_marks_replication_enabled_rules() {
-        let enabled = replication_config_with_status(ReplicationRuleStatus::ENABLED);
-        let disabled = replication_config_with_status(ReplicationRuleStatus::DISABLED);
+        let enabled = replication_config_with_status(Status::ENABLED.as_str());
+        let disabled = replication_config_with_status(Status::DISABLED.as_str());
 
         assert!(replication_config_enabled(&enabled));
         assert!(!replication_config_enabled(&disabled));
     }
 
-    fn replication_config_with_status(status: &'static str) -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    fn replication_config_with_status(status: &str) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: "arn:aws:iam::123456789012:role/replication".to_string(),
-            rules: vec![ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:aws:s3:::target".to_string(),
                     ..Default::default()
                 },
@@ -457,7 +459,7 @@ mod tests {
                 prefix: None,
                 priority: None,
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(status),
+                status: status.to_owned(),
             }],
         }
     }

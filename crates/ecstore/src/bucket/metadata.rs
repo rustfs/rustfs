@@ -25,11 +25,12 @@ use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
     AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration,
-    NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration, ReplicationConfiguration,
-    RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
+    NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration, RequestPaymentConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
 use sha2::{Digest, Sha256};
@@ -493,7 +494,7 @@ pub struct BucketMetadata {
     pub sse_config: Option<ServerSideEncryptionConfiguration>,
     pub tagging_config: Option<Tagging>,
     pub quota_config: Option<BucketQuota>,
-    pub replication_config: Option<ReplicationConfiguration>,
+    pub replication_config: Option<PersistedReplicationConfiguration>,
     pub bucket_target_config: Option<BucketTargets>,
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
     pub cors_config: Option<CORSConfiguration>,
@@ -1033,7 +1034,7 @@ impl BucketMetadata {
                 let config = if data.is_empty() {
                     None
                 } else {
-                    let config = deserialize::<ReplicationConfiguration>(&data)?;
+                    let config = deserialize::<PersistedReplicationConfiguration>(&data)?;
                     if let Some(field) = invalid_replication_config_status_field(&config) {
                         return Err(Error::other(format!("replication field {field} has an invalid status")));
                     }
@@ -1314,8 +1315,8 @@ impl BucketMetadata {
         }
         self.replication_config = None;
         if !self.replication_config_xml.is_empty()
-            && let Err(e) =
-                deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
+            && let Err(e) = deserialize::<PersistedReplicationConfiguration>(&self.replication_config_xml)
+                .map(|c| self.replication_config = Some(c))
         {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",

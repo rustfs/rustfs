@@ -307,9 +307,9 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
-            check_valid_bucket_name_strict, deserialize, has_bad_path_component, is_meta_bucketname, is_valid_object_prefix,
-            serialize,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
+            is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 

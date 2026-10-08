@@ -4689,9 +4689,10 @@ mod tests {
     #[tokio::test]
     async fn heal_queue_marks_missing_versioning_state_as_missed() {
         use super::super::replication_target_boundary::BucketTargets;
-        use s3s::dto::{
-            DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule,
-            ReplicationRuleStatus,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+            PersistedReplicationStatus,
         };
 
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
@@ -4706,14 +4707,14 @@ mod tests {
                 ..Default::default()
             },
             ReplicationConfig::new(
-                Some(ReplicationConfiguration {
+                Some(PersistedReplicationConfiguration {
                     role: String::new(),
-                    rules: vec![ReplicationRule {
+                    rules: vec![PersistedReplicationRule {
                         delete_marker_replication: None,
-                        delete_replication: Some(DeleteReplication {
-                            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                        delete_replication: Some(PersistedReplicationStatus {
+                            status: Status::ENABLED.to_string(),
                         }),
-                        destination: Destination {
+                        destination: PersistedReplicationDestination {
                             bucket: arn.to_string(),
                             ..Default::default()
                         },
@@ -4723,7 +4724,7 @@ mod tests {
                         prefix: Some(String::new()),
                         priority: Some(1),
                         source_selection_criteria: None,
-                        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                        status: Status::ENABLED.to_string(),
                     }],
                 }),
                 Some(BucketTargets::default()),

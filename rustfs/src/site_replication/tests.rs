@@ -3166,8 +3166,8 @@ fn home_office() -> HashSet<String> {
     HashSet::from(["home".to_string(), "office".to_string()])
 }
 
-fn site_repl_config(peer: &str) -> ReplicationConfiguration {
-    ReplicationConfiguration {
+fn site_repl_config(peer: &str) -> PersistedReplicationConfiguration {
+    PersistedReplicationConfiguration {
         role: String::new(),
         rules: vec![build_site_replication_rule(
             &format!("arn:rustfs:replication::{peer}:photos"),
@@ -3177,8 +3177,8 @@ fn site_repl_config(peer: &str) -> ReplicationConfiguration {
     }
 }
 
-fn operator_rule(id: &str) -> ReplicationRule {
-    ReplicationRule {
+fn operator_rule(id: &str) -> PersistedReplicationRule {
+    PersistedReplicationRule {
         id: Some(id.to_string()),
         ..build_site_replication_rule("arn:aws:s3:::backup", 1, id)
     }
@@ -3362,7 +3362,7 @@ fn test_build_site_replication_config_reuses_configured_arn() {
             ..peer("remote", "http://remote.example.com:9000")
         },
     );
-    let existing = ReplicationConfiguration {
+    let existing = PersistedReplicationConfiguration {
         role: String::new(),
         rules: vec![build_site_replication_rule(
             "arn:minio:replication::remote:photos",

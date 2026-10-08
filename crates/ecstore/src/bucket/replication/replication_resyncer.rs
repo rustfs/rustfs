@@ -84,6 +84,8 @@ use http_body_util::StreamBody;
 use metrics::counter;
 #[cfg(test)]
 use rmp_serde;
+#[cfg(test)]
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_TAGGING_DIRECTIVE,
@@ -91,8 +93,6 @@ use rustfs_utils::http::{
     insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
-#[cfg(test)]
-use s3s::dto::ReplicationConfiguration;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::pin::Pin;
@@ -6256,10 +6256,11 @@ mod tests {
 
     use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
-    use s3s::dto::{
-        BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ExcludedPrefix, ReplicationRule,
-        ReplicationRuleStatus, VersioningConfiguration,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
     };
+    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
@@ -7816,7 +7817,7 @@ mod tests {
             ..Default::default()
         };
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: role.to_string(),
                 rules: vec![],
             }),
@@ -7883,14 +7884,14 @@ mod tests {
             },
         );
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
@@ -7900,7 +7901,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
             Some(BucketTargets {
@@ -7936,14 +7937,14 @@ mod tests {
         let admitted_arn = "arn:rustfs:replication:us-east-1:target:admitted";
         let current_role = "arn:rustfs:replication:us-east-1:target:current";
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: current_role.to_string(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::DISABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: current_role.to_string(),
                         ..Default::default()
                     },
@@ -7953,7 +7954,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
             Some(BucketTargets {
@@ -8001,12 +8002,12 @@ mod tests {
     #[tokio::test]
     async fn heal_rejects_semantically_invalid_replication_config() {
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
                         ..Default::default()
                     },
@@ -8016,7 +8017,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static("Enabld"),
+                    status: "Enabld".to_owned(),
                 }],
             }),
             Some(BucketTargets::default()),

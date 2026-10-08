@@ -54,6 +54,8 @@ use http::Uri;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::{PersistedReplicationConfiguration, PersistedReplicationRule};
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::store::object::ObjectStore;
@@ -75,10 +77,7 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
-use s3s::dto::{
-    DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ObjectLockConfiguration,
-    ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
-};
+use s3s::dto::{ObjectLockConfiguration, VersioningConfiguration};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
@@ -2388,26 +2387,25 @@ fn canonical_status_json(value: &Value) -> Value {
     }
 }
 
-fn site_replication_rule_complete(rule: &ReplicationRule, owner_deployment_id: &str) -> bool {
+fn site_replication_rule_complete(rule: &PersistedReplicationRule, owner_deployment_id: &str) -> bool {
     let delete_marker_enabled = rule
         .delete_marker_replication
         .as_ref()
         .and_then(|delete_marker| delete_marker.status.as_ref())
-        .is_some_and(|status| status == &DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED));
+        .is_some_and(|status| status == Status::ENABLED.as_str());
     let delete_enabled = rule
         .delete_replication
         .as_ref()
-        .is_some_and(|delete| delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
-    let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|existing| {
-        existing.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
-    });
+        .is_some_and(|delete| delete.status == Status::ENABLED.as_str());
+    let existing_object_enabled = rule
+        .existing_object_replication
+        .as_ref()
+        .is_some_and(|existing| existing.status == Status::ENABLED.as_str());
     let replica_modifications_enabled = rule
         .source_selection_criteria
         .as_ref()
         .and_then(|criteria| criteria.replica_modifications.as_ref())
-        .is_some_and(|replica_modifications| {
-            replica_modifications.status == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED)
-        });
+        .is_some_and(|replica_modifications| replica_modifications.status == Status::ENABLED.as_str());
 
     // A rule whose destination ARN names the site that holds it can never replicate:
     // `reconcile_site_replication_bucket_targets` skips the local peer, so no bucket
@@ -2417,7 +2415,7 @@ fn site_replication_rule_complete(rule: &ReplicationRule, owner_deployment_id: &
         .is_some_and(|deployment_id| deployment_id != owner_deployment_id);
 
     rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
-        && rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED)
+        && rule.status == Status::ENABLED.as_str()
         && points_at_remote_site
         && delete_marker_enabled
         && delete_enabled
@@ -2448,7 +2446,7 @@ fn site_replication_config_mismatch<'a>(
         // out-of-sync ("0/N Buckets in sync"). decode_bucket_meta_wire_value falls back to
         // the raw bytes when the value is not base64, so plain-XML callers still work.
         let xml = decode_bucket_meta_wire_value(raw);
-        deserialize::<ReplicationConfiguration>(&xml).is_ok_and(|config| {
+        deserialize::<PersistedReplicationConfiguration>(&xml).is_ok_and(|config| {
             config.rules.len() == expected_rules
                 && config
                     .rules
@@ -4721,7 +4719,7 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
 /// will drop for `removed_deployment_ids`, plus a site-replication `Role`
 /// naming one of them: the targets those ARNs back are the site's own.
 fn removed_site_replication_rule_arns(
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
     removed_deployment_ids: &HashSet<String>,
 ) -> HashSet<String> {
     let Some(config) = config else {
@@ -4967,7 +4965,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
     well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
 }
 
-fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
+fn replication_rule_deployment_id(rule: &PersistedReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
             && !deployment_id.is_empty()
@@ -4981,9 +4979,9 @@ fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
 }
 
 fn prune_removed_site_replication_rules(
-    mut config: ReplicationConfiguration,
+    mut config: PersistedReplicationConfiguration,
     removed_deployment_ids: &HashSet<String>,
-) -> (Option<ReplicationConfiguration>, usize) {
+) -> (Option<PersistedReplicationConfiguration>, usize) {
     if removed_deployment_ids.is_empty() {
         return (Some(config), 0);
     }
@@ -5523,7 +5521,7 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
 /// `getRemoteARNForPeer` does: the same-name target bucket on the peer.
 fn site_bucket_resync_target_for_peer<'a>(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
     targets: &'a BucketTargets,
     peer: &PeerInfo,
 ) -> Option<&'a BucketTarget> {
@@ -5547,7 +5545,9 @@ fn site_bucket_resync_target_for_peer<'a>(
 /// The persisted replication configuration and bucket targets, bypassing the
 /// node-local metadata cache. `ConfigNotFound` surfaces for a bucket without
 /// a replication configuration, matching the cached read's error.
-async fn site_bucket_resync_persisted_wiring(bucket: &str) -> Result<(ReplicationConfiguration, BucketTargets), StorageError> {
+async fn site_bucket_resync_persisted_wiring(
+    bucket: &str,
+) -> Result<(PersistedReplicationConfiguration, BucketTargets), StorageError> {
     let metadata = metadata_sys::get_config_from_disk(bucket).await?;
     let config = metadata.replication_config.ok_or(StorageError::ConfigNotFound)?;
     Ok((config, metadata.bucket_target_config.unwrap_or_default()))
@@ -5968,7 +5968,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                 .as_ref()
                 .map(|raw| {
                     let data = decode_bucket_meta_wire_value(raw);
-                    deserialize::<ReplicationConfiguration>(&data)
+                    deserialize::<PersistedReplicationConfiguration>(&data)
                 })
                 .transpose()
                 .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?;
@@ -10748,7 +10748,7 @@ mod tests {
 
     #[test]
     fn test_site_replication_config_status_accepts_peer_specific_targets() {
-        let site_a_config = ReplicationConfiguration {
+        let site_a_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-b:test-replication",
@@ -10756,7 +10756,7 @@ mod tests {
                 "site-repl-site-b",
             )],
         };
-        let site_b_config = ReplicationConfiguration {
+        let site_b_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-a:test-replication",
@@ -10859,7 +10859,7 @@ mod tests {
     // reported "in sync" — the operator's single health signal agreed with the broken state.
     #[test]
     fn test_site_replication_config_mismatch_rejects_rule_pointing_at_owning_site() {
-        let shared_config = ReplicationConfiguration {
+        let shared_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-b:test-replication",
@@ -13044,8 +13044,8 @@ mod tests {
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
     }
 
-    fn site_repl_config(peer: &str) -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    fn site_repl_config(peer: &str) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 &format!("arn:rustfs:replication::{peer}:photos"),
@@ -13554,7 +13554,7 @@ mod tests {
         assert_eq!(credentials.secret_key, "runtime-iam-secret");
 
         let regional_arn = "arn:rustfs:replication:eu-west-1:remote:photos";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(regional_arn, 1, "site-repl-remote")],
         };
@@ -13800,7 +13800,7 @@ mod tests {
     #[test]
     fn test_prune_removed_site_replication_bucket_targets_keeps_operator_target_to_removed_peer() {
         let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:rustfs:replication:eu-west-1:removed-dep:photos", 1, "site-repl-removed-dep"),
@@ -13872,7 +13872,7 @@ mod tests {
                 },
             ],
         };
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:minio:replication::7c0c5a1e-operator:photos-dst", 9, "operator-rule"),
@@ -13882,7 +13882,7 @@ mod tests {
         let picked = site_bucket_resync_target_for_peer("photos", &config, &targets, &peer).expect("site target");
         assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
 
-        let without_rule = ReplicationConfiguration {
+        let without_rule = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:minio:replication::7c0c5a1e-operator:photos-dst",
@@ -13900,7 +13900,7 @@ mod tests {
         let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
         let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
         let user_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 9, "user-managed-rule");
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: "arn:rustfs:replication::removed-dep:photos".to_string(),
             rules: vec![removed_rule, user_rule, kept_rule],
         };
@@ -13930,7 +13930,7 @@ mod tests {
             "site-repl-gone-dep"
         )));
 
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep"),
@@ -14683,7 +14683,7 @@ mod tests {
         use rustfs_madmin::{SRBucketInfo, SRInfo};
 
         let repl_xml = {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     "arn:rustfs:replication::site-b:photos",
@@ -14812,7 +14812,7 @@ mod tests {
         // A peer that is reachable and has complete replication rules for all other peers
         // should be Enable; one that is reachable but has an incomplete config should be Disable.
         let site_config_xml = |peer: &str| {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     &format!("arn:rustfs:replication::{peer}:bucket"),
@@ -14849,7 +14849,7 @@ mod tests {
     #[test]
     fn test_site_replication_config_mismatch_accepts_base64_wire_form() {
         let site_config_xml = |peer: &str| {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     &format!("arn:rustfs:replication::{peer}:bucket"),

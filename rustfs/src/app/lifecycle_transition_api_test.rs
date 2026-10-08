@@ -41,6 +41,12 @@ use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::{
+    PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+    PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus, PersistedReplicationTag,
+    PersistedSourceSelectionCriteria,
+};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, insert_header};
 use rustfs_utils::path::encode_dir_object;
@@ -3105,9 +3111,9 @@ async fn install_delete_replication_config(
     let mut metadata = (*metadata).clone();
     let target = "arn:aws:s3:::target-bucket";
     let delete_status = if delete_enabled {
-        DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
+        Status::ENABLED.to_string()
     } else {
-        DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED)
+        Status::DISABLED.to_string()
     };
 
     metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
@@ -3115,27 +3121,27 @@ async fn install_delete_replication_config(
         status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
         ..Default::default()
     });
-    let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
-        tag: Some(Tag {
+    let filter = required_tag.map(|(key, value)| PersistedReplicationFilter {
+        tag: Some(PersistedReplicationTag {
             key: Some(key.to_string()),
             value: Some(value.to_string()),
         }),
         ..Default::default()
     });
-    let source_selection_criteria = replica_modifications.then(|| SourceSelectionCriteria {
-        replica_modifications: Some(ReplicaModifications {
-            status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+    let source_selection_criteria = replica_modifications.then(|| PersistedSourceSelectionCriteria {
+        replica_modifications: Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         }),
         sse_kms_encrypted_objects: None,
     });
-    let replication_config = ReplicationConfiguration {
+    let replication_config = PersistedReplicationConfiguration {
         role: String::new(),
-        rules: vec![ReplicationRule {
-            delete_marker_replication: Some(DeleteMarkerReplication {
-                status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+        rules: vec![PersistedReplicationRule {
+            delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                status: Some(Status::DISABLED.to_string()),
             }),
-            delete_replication: Some(DeleteReplication { status: delete_status }),
-            destination: Destination {
+            delete_replication: Some(PersistedReplicationStatus { status: delete_status }),
+            destination: PersistedReplicationDestination {
                 bucket: target.to_string(),
                 ..Default::default()
             },
@@ -3145,7 +3151,7 @@ async fn install_delete_replication_config(
             prefix: Some(String::new()),
             priority: Some(1),
             source_selection_criteria,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }],
     };
     metadata.replication_config_xml = serialize(&replication_config).expect("replication test config should serialize");

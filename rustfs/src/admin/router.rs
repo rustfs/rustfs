@@ -62,6 +62,8 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -1720,19 +1722,19 @@ fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest>
     })
 }
 
-fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> Vec<String> {
+fn collect_resettable_replication_target_arns(config: &PersistedReplicationConfiguration) -> Vec<String> {
     let mut arns = Vec::new();
     let mut seen = HashSet::new();
 
     for rule in &config.rules {
-        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+        if rule.status == Status::DISABLED.as_str() {
             continue;
         }
 
-        let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|status| {
-            status.status
-                == s3s::dto::ExistingObjectReplicationStatus::from_static(s3s::dto::ExistingObjectReplicationStatus::ENABLED)
-        });
+        let existing_object_enabled = rule
+            .existing_object_replication
+            .as_ref()
+            .is_some_and(|status| status.status == Status::ENABLED.as_str());
         if !existing_object_enabled {
             continue;
         }
@@ -1755,7 +1757,7 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
     arns
 }
 
-fn resolve_replication_reset_target_arn(config: &s3s::dto::ReplicationConfiguration, requested_arn: &str) -> S3Result<String> {
+fn resolve_replication_reset_target_arn(config: &PersistedReplicationConfiguration, requested_arn: &str) -> S3Result<String> {
     let resettable_arns = collect_resettable_replication_target_arns(config);
 
     if requested_arn.is_empty() {
@@ -1943,7 +1945,7 @@ fn is_object_lock_not_enabled_error(err: &S3ClientError) -> bool {
 
 fn validate_replication_check_config_targets(
     targets: &BucketTargets,
-    config: &s3s::dto::ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
 ) -> S3Result<()> {
     let configured_arns = targets
         .targets
@@ -1961,7 +1963,7 @@ fn validate_replication_check_config_targets(
     }
 
     for rule in &config.rules {
-        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+        if rule.status == Status::DISABLED.as_str() {
             continue;
         }
 
@@ -1978,7 +1980,7 @@ fn validate_replication_check_config_targets(
     Ok(())
 }
 
-fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
+fn filter_replication_check_targets(targets: BucketTargets, config: &PersistedReplicationConfiguration) -> Vec<BucketTarget> {
     let referenced_arns = config
         .filter_all_replication_target_arns()
         .into_iter()
@@ -3406,6 +3408,9 @@ mod tests {
     use http::HeaderMap;
     use http::Method;
     use http::Uri;
+    use rustfs_gateway_types::persistence::{
+        PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
+    };
     use s3s::S3Request;
     use std::net::{IpAddr, SocketAddr};
     use time::macros::datetime;
@@ -3750,26 +3755,24 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_uses_single_existing_object_target_by_default() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:a".to_string(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                        s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                    ),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-a".to_string()),
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -3779,46 +3782,42 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_requires_arn_for_multiple_targets() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
-                s3s::dto::ReplicationRule {
+                PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: s3s::dto::Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:replication:a".to_string(),
                         ..Default::default()
                     },
-                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                        ),
+                    existing_object_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     filter: None,
                     id: Some("rule-a".to_string()),
                     prefix: Some(String::new()),
                     priority: None,
                     source_selection_criteria: None,
-                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 },
-                s3s::dto::ReplicationRule {
+                PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: s3s::dto::Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:replication:b".to_string(),
                         ..Default::default()
                     },
-                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                        ),
+                    existing_object_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     filter: None,
                     id: Some("rule-b".to_string()),
                     prefix: Some(String::new()),
                     priority: None,
                     source_selection_criteria: None,
-                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 },
             ],
         };
@@ -3830,26 +3829,24 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_rejects_target_without_existing_object_replication() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:a".to_string(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                        s3s::dto::ExistingObjectReplicationStatus::DISABLED,
-                    ),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::DISABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-a".to_string()),
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -4373,7 +4370,7 @@ mod tests {
 
     #[test]
     fn build_replication_check_response_rejects_empty_target_list_at_runtime_boundary() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![],
         };
@@ -4521,12 +4518,12 @@ mod tests {
                 },
             ],
         };
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:b".to_string(),
                     ..Default::default()
                 },
@@ -4536,7 +4533,7 @@ mod tests {
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -4555,12 +4552,12 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:missing".to_string(),
                     ..Default::default()
                 },
@@ -4570,7 +4567,7 @@ mod tests {
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 

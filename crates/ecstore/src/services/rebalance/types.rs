@@ -36,7 +36,7 @@ pub(super) struct RebalanceBucketConfigs {
     pub(super) bucket_incarnation_id: Option<uuid::Uuid>,
     pub(super) lifecycle_config: Option<s3s::dto::BucketLifecycleConfiguration>,
     pub(super) object_lock_config: Option<s3s::dto::ObjectLockConfiguration>,
-    pub(super) replication_config: Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
+    pub(super) replication_config: Option<(rustfs_gateway_types::persistence::PersistedReplicationConfiguration, OffsetDateTime)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

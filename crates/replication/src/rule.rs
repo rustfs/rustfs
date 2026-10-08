@@ -13,15 +13,15 @@
 // limitations under the License.
 
 use crate::config::ObjectOpts;
-use s3s::dto::ReplicaModificationsStatus;
-use s3s::dto::ReplicationRule;
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedReplicationRule;
 
 pub trait ReplicationRuleExt {
     fn prefix(&self) -> &str;
     fn metadata_replicate(&self, obj: &ObjectOpts) -> bool;
 }
 
-impl ReplicationRuleExt for ReplicationRule {
+impl ReplicationRuleExt for PersistedReplicationRule {
     /// The rule's key prefix: `Filter.Prefix`, else `Filter.And.Prefix`, else
     /// the deprecated top-level `Prefix` of a V1 rule written without a
     /// `<Filter>` (backlog#2367 C-2). A rule that carries both keeps AWS's
@@ -47,8 +47,8 @@ impl ReplicationRuleExt for ReplicationRule {
 
         self.source_selection_criteria.as_ref().is_some_and(|s| {
             s.replica_modifications
-                .clone()
-                .is_some_and(|r| r.status == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED))
+                .as_ref()
+                .is_some_and(|r| r.status == Status::ENABLED.as_str())
         })
     }
 }

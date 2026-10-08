@@ -8659,6 +8659,15 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
@@ -9548,7 +9557,7 @@ dependencies = [
  "proptest",
  "prost 0.14.4",
  "pyroscope",
- "quick-xml",
+ "quick-xml 0.42.0",
  "quinn",
  "rand 0.10.3",
  "rcgen",
@@ -9567,6 +9576,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-extension-schema",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
  "rustfs-iam",
@@ -9843,6 +9853,7 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-erasure-codec",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal-contracts",
  "rustfs-io-metrics",
  "rustfs-lifecycle",
@@ -9945,6 +9956,45 @@ dependencies = [
  "tracing",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rustfs-gateway-stream"
+version = "0.2.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=772d3385421626aca5735e5581c5dff13a7aebff#772d3385421626aca5735e5581c5dff13a7aebff"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytes",
+ "http 1.5.0",
+ "http-body",
+]
+
+[[package]]
+name = "rustfs-gateway-types"
+version = "0.32.0+aws.2026-10-02"
+source = "git+https://github.com/rustfs/gateway.git?rev=772d3385421626aca5735e5581c5dff13a7aebff#772d3385421626aca5735e5581c5dff13a7aebff"
+dependencies = [
+ "bytes",
+ "crc-fast",
+ "hex",
+ "http 1.5.0",
+ "md-5 0.11.0",
+ "percent-encoding",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-xml",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "twox-hash",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
+name = "rustfs-gateway-xml"
+version = "0.4.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=772d3385421626aca5735e5581c5dff13a7aebff#772d3385421626aca5735e5581c5dff13a7aebff"
+dependencies = [
+ "quick-xml 0.41.0",
 ]
 
 [[package]]
@@ -10323,7 +10373,7 @@ dependencies = [
  "jiff",
  "metrics",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rayon",
  "rustc-hash",
  "rustfs-config",
@@ -10571,7 +10621,7 @@ dependencies = [
  "regex",
  "rmp",
  "rmp-serde",
- "s3s",
+ "rustfs-gateway-types",
  "serde",
  "time",
  "tokio",
@@ -10663,7 +10713,7 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rand 0.10.3",
  "rustfs-checksums",
  "rustfs-config",
@@ -10790,6 +10840,7 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
  "rustfs-lifecycle",
@@ -11296,7 +11347,7 @@ dependencies = [
  "numeric_cast",
  "phf 0.14.0",
  "pin-project-lite",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "s3s-multipart",
  "s3s-rfc2047",

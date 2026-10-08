@@ -2016,8 +2016,12 @@ pub(crate) fn encode_tags(tags: Vec<s3s::dto::Tag>) -> String {
     ecstore_bucket::tagging::encode_tags(tags)
 }
 
+/// Writes an s3s response body. Bucket configurations go through
+/// `ecstore_bucket::utils::serialize` instead, which owns their persisted form.
 pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-    ecstore_bucket::utils::serialize(val)
+    let mut buf = Vec::with_capacity(256);
+    val.serialize(&mut s3s::xml::Serializer::new(&mut buf))?;
+    Ok(buf)
 }
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
