@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
+use crate::{GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
@@ -68,10 +68,12 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
 /// Initialize the observability module
 ///
 /// # Parameters
-/// - `config`: Configuration information
+/// - `endpoint`: Optional root OTLP endpoint; falls back to `RUSTFS_OBS_ENDPOINT`.
+/// - `version`: Optional application build version used as the default OTel
+///   `service.version`; `RUSTFS_OBS_SERVICE_VERSION` takes precedence.
 ///
 /// # Returns
-/// A tuple containing the logger and the telemetry guard
+/// An [`OtelGuard`] that must remain alive for the lifetime of the application.
 ///
 /// # Example
 /// ```no_run
@@ -79,16 +81,15 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #    match init_obs(None).await {
+/// #    match init_obs(None, None).await {
 /// #         Ok(guard) => {}
 /// #         Err(e) => { eprintln!("Failed to initialize observability: {}", e); }
 /// #     }
 /// # }
 /// ```
-pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError> {
-    // Load the configuration file
-    let config = AppConfig::new_with_endpoint(endpoint);
-    init_obs_with_config(&config.observability).await
+pub async fn init_obs(endpoint: Option<String>, version: Option<String>) -> Result<OtelGuard, GlobalError> {
+    let config = OtelConfig::extract_otel_config_from_env_with_version(endpoint, version);
+    init_obs_with_config(&config).await
 }
 
 /// Initialize the observability module with an explicit [`OtelConfig`].
@@ -142,7 +143,7 @@ pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, Glob
 /// # use rustfs_obs::{ init_obs, set_global_guard};
 ///
 /// # async fn init() -> Result<(), Box<dyn std::error::Error>> {
-/// #    let guard = match init_obs(None).await{
+/// #    let guard = match init_obs(None, None).await{
 /// #         Ok(g) => g,
 /// #         Err(e) => { return Err(Box::new(e)); }
 /// #    };

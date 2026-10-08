@@ -1396,6 +1396,10 @@ pub struct ScannerPublicationLeaseRequest {
     /// the proof without changing the v7 activity wire shape.
     #[prost(bytes = "bytes", tag = "5")]
     pub token: ::prost::bytes::Bytes,
+    /// Observations may race ordinary namespace commits but still remain
+    /// non-authoritative. Peers bind this mode to the observed-usage rename path.
+    #[prost(bool, tag = "6")]
+    pub observational_only: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerPublicationLeaseResponse {
@@ -1415,6 +1419,8 @@ pub struct ScannerPublicationLeaseResponse {
     pub owner_id: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub session_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "9")]
+    pub observational_only: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerPublicationLeaseReleaseRequest {

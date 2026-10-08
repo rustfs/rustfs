@@ -75,6 +75,9 @@ pub enum Error {
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
 
+    #[error("Dangling object cleanup deferred until UNIX time {retry_not_before}")]
+    DanglingDeleteDeferred { retry_not_before: u64 },
+
     #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
     StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
 
@@ -123,7 +126,7 @@ impl Error {
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
-            Error::ReplacementTargetNotReady(_) => true,
+            Error::ReplacementTargetNotReady(_) | Error::DanglingDeleteDeferred { .. } => true,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
@@ -138,7 +141,7 @@ impl Error {
                     return true;
                 }
                 err.is_quorum_error()
-                    || matches!(err, EcstoreError::Io(error) if is_recoverable_internode_error(error))
+                    || matches!(err, EcstoreError::Io(error) if is_recoverable_io_error(error))
                     || matches!(
                         err,
                         EcstoreError::DiskNotFound
@@ -168,11 +171,11 @@ impl Error {
                         | DiskError::FaultyRemoteDisk
                         | DiskError::FaultyDisk
                         | DiskError::RemoteClientUnavailable(_)
-                ) || matches!(err, DiskError::Io(error) if is_recoverable_internode_error(error))
+                ) || matches!(err, DiskError::Io(error) if is_recoverable_io_error(error))
                     || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
-            Error::Io(err) => is_recoverable_internode_error(err) || is_recoverable_heal_error_message(&err.to_string()),
+            Error::Io(err) => is_recoverable_io_error(err) || is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
     }
@@ -193,6 +196,9 @@ impl Error {
     }
 
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
+        if let Self::DanglingDeleteDeferred { retry_not_before } = self {
+            return std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(*retry_not_before));
+        }
         let after = match self {
             Self::Storage(error) => error.dangling_delete_retry_after(),
             Self::Disk(error) => error.dangling_delete_retry_after(),
@@ -204,6 +210,7 @@ impl Error {
 
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
         match self {
+            Error::DanglingDeleteDeferred { .. } => true,
             Error::Storage(err) => err.is_dangling_delete_grace(),
             Error::Disk(err) => err.is_dangling_delete_grace(),
             Error::Io(err) => DiskError::io_error_is_dangling_delete_grace(err),
@@ -215,7 +222,15 @@ impl Error {
     }
 }
 
-fn is_recoverable_internode_error(error: &std::io::Error) -> bool {
+fn is_recoverable_io_error(error: &std::io::Error) -> bool {
+    // ObjectIO preserves store errors as IO sources; their quorum identity must survive this boundary.
+    if error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<EcstoreError>())
+        .is_some_and(EcstoreError::is_quorum_error)
+    {
+        return true;
+    }
     // A peer restart can cancel an RPC after a partial repair. Replay it within
     // the existing heal retry budget; task cancellation remains terminal.
     if DiskError::io_error_is_rpc_cancelled(error) {
@@ -293,6 +308,37 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn namespace_lock_quorum_is_recoverable_across_io_error_conversions() {
+        for (required, achieved) in [(2, 1), (1, 0)] {
+            let quorum = || EcstoreError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".to_owned(),
+                object: "object".to_owned(),
+                required,
+                achieved,
+            };
+            for error in [
+                Error::Storage(quorum()),
+                Error::Io(std::io::Error::from(quorum())),
+                Error::Storage(EcstoreError::from(std::io::Error::from(quorum()))),
+                Error::Disk(DiskError::from(std::io::Error::from(quorum()))),
+            ] {
+                assert!(
+                    error.is_recoverable_object_heal(),
+                    "typed lock quorum failure must remain retryable: {error:?}"
+                );
+            }
+        }
+
+        let message = "Namespace lock quorum unavailable for write lock on bucket/object: required 2, achieved 1";
+        assert!(!Error::Io(std::io::Error::other(message)).is_recoverable_object_heal());
+        let denied = EcstoreError::Lock(rustfs_lock::LockError::PermissionDenied {
+            reason: message.to_owned(),
+        });
+        assert!(!Error::Storage(EcstoreError::from(std::io::Error::from(denied))).is_recoverable_object_heal());
+    }
 
     #[test]
     fn cancelled_rpc_is_recoverable_across_storage_error_conversions() {

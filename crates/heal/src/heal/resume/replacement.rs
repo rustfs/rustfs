@@ -506,6 +506,22 @@ impl ResumeManager {
         if state.replacement_generation.as_deref() != Some(state.task_id.as_str()) {
             return Err(replacement_recovery_conflict("replacement failure has no matching generation"));
         }
+        if let Error::DanglingDeleteDeferred { retry_not_before } = error {
+            if !super::dangling_delete_deadline_is_representable(*retry_not_before) {
+                return Err(Error::TaskExecutionFailed {
+                    message: "Cannot persist an unrepresentable dangling-delete grace deadline".to_string(),
+                });
+            }
+            if !state.can_retry() {
+                return Err(Error::ReplacementRetryBudgetExhausted);
+            }
+            state.dangling_delete_retry_not_before = Some(*retry_not_before);
+            state.replacement_retry_waiting_for_target = false;
+            state.error_message = Some(error.to_string());
+            state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            drop(state);
+            return self.save_state_strict().await;
+        }
         let readiness_deferred = matches!(error, Error::ReplacementTargetNotReady(_))
             || (state.replacement_retry_waiting_for_target
                 && matches!(error, Error::TransientSkip { message } if message.contains("target readiness deferred retry")));
@@ -514,6 +530,7 @@ impl ResumeManager {
                 state.retry_count = state.max_retries.saturating_sub(1);
             }
             state.replacement_retry_waiting_for_target = true;
+            state.dangling_delete_retry_not_before = None;
             state.error_message = Some(super::REPLACEMENT_TARGET_READINESS_DEFERRED.to_string());
             state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             drop(state);

@@ -376,7 +376,162 @@ async fn mixed_multipart_before(
 ) -> TestResult {
     tokio::time::timeout_at(deadline, upload)
         .await
-        .map_err(|_| format!("node {node}: multipart upload {MIXED_BUCKET}/{key} acknowledgement deadline exceeded"))?
+        .map_err(|_| MultipartAcknowledgementDeadline {
+            node,
+            key: key.to_owned(),
+        })?
+}
+
+#[derive(Debug)]
+struct MultipartAcknowledgementDeadline {
+    node: usize,
+    key: String,
+}
+
+impl std::fmt::Display for MultipartAcknowledgementDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "node {}: multipart upload {MIXED_BUCKET}/{} acknowledgement deadline exceeded",
+            self.node, self.key
+        )
+    }
+}
+
+impl std::error::Error for MultipartAcknowledgementDeadline {}
+
+// Decode only the public lock snapshot fields. Unknown fields, including
+// credential/configuration payloads, never enter the failure artifact.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MixedLockSnapshot {
+    total: Option<u64>,
+    truncated: Option<bool>,
+    capability_note: Option<String>,
+    locks: Vec<MixedLockEntry>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MixedLockEntry {
+    resource: Option<String>,
+    bucket: Option<String>,
+    object: Option<String>,
+    version: Option<String>,
+    owner: Option<String>,
+    #[serde(rename = "type")]
+    lock_type: Option<String>,
+    priority: Option<String>,
+    since: Option<String>,
+    elapsed_secs: Option<u64>,
+    ttl_secs: Option<u64>,
+}
+
+async fn read_mixed_lock_snapshot(response: &mut reqwest::Response) -> Result<MixedLockSnapshot, &'static str> {
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "body_read_error")? {
+        if chunk.len() > MAX_BODY_BYTES - body.len() {
+            return Err("body_limit_exceeded");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_lock_snapshot")
+}
+
+async fn probe_mixed_multipart_failure(
+    cluster: &RustFSTestClusterEnvironment,
+    node: usize,
+    path: &str,
+    head: bool,
+    deadline: Instant,
+) -> Value {
+    let started = Instant::now();
+    let method = if head { Method::HEAD } else { Method::GET };
+    let mut observation = serde_json::json!({
+        "node": node, "method": method.as_str(), "path": path,
+        "status": null, "observation": "unknown", "timeout": false,
+    });
+    // The shared absolute deadline bounds both headers and a slow/infinite
+    // response body; a send-only timeout would leave the cluster alive forever.
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut response = signed_request(
+            method,
+            &format!("{}{path}", cluster.nodes[node].url.trim_end_matches('/')),
+            &cluster.access_key,
+            &cluster.secret_key,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| "request_error")?;
+        let status = response.status();
+        observation["status"] = serde_json::json!(status.as_u16());
+        if head {
+            observation["observation"] = serde_json::json!(match status {
+                StatusCode::OK => "visible",
+                StatusCode::NOT_FOUND => "not_visible",
+                _ => "unknown",
+            });
+            for (field, header) in [
+                ("content_length", "content-length"),
+                ("etag", "etag"),
+                ("version", "x-amz-version-id"),
+            ] {
+                observation[field] = serde_json::json!(response.headers().get(header).and_then(|value| value.to_str().ok()));
+            }
+        } else if status == StatusCode::OK {
+            observation["snapshot"] =
+                serde_json::to_value(read_mixed_lock_snapshot(&mut response).await?).map_err(|_| "snapshot_encode_error")?;
+            observation["observation"] = serde_json::json!("captured");
+        }
+        Ok::<_, &'static str>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => observation["error"] = serde_json::json!(reason),
+        Err(_) => observation["timeout"] = serde_json::json!(true),
+    }
+    observation["elapsed_secs"] = serde_json::json!(started.elapsed().as_secs_f64());
+    observation
+}
+
+async fn observe_mixed_multipart_failure(
+    cluster: &RustFSTestClusterEnvironment,
+    phase: &str,
+    error: BoxError,
+    log_dir: Option<&Path>,
+) -> TestResult {
+    if let (Some(log_dir), Some(failure)) = (log_dir, error.downcast_ref::<MultipartAcknowledgementDeadline>()) {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        // Reserve the last second for serialization and bounded artifact I/O.
+        // All probes run directly in this future; no diagnostic task is spawned.
+        let network_deadline = started + Duration::from_secs(4);
+        let path = format!("/{MIXED_BUCKET}/{}", failure.key);
+        let _ = tokio::time::timeout_at(deadline, async {
+            let (heads, locks) = tokio::join!(
+                futures::future::join_all((0..cluster.nodes.len()).map(|node| probe_mixed_multipart_failure(
+                    cluster,
+                    node,
+                    &path,
+                    true,
+                    network_deadline
+                ))),
+                probe_mixed_multipart_failure(cluster, 0, "/rustfs/admin/v3/top/locks?count=1000", false, network_deadline),
+            );
+            let snapshot = serde_json::json!({
+                "phase": phase, "bucket": MIXED_BUCKET, "key": failure.key,
+                "writer_node": failure.node, "heads": heads, "top_locks": locks,
+            });
+            let body = serde_json::to_vec_pretty(&snapshot).map_err(|_| ())?;
+            tokio::fs::write(log_dir.join("mixed-multipart-failure.json"), body)
+                .await
+                .map_err(|_| ())
+        })
+        .await;
+    }
+    // Visibility and diagnostic failures cannot acknowledge the original MPU.
+    Err(error)
 }
 
 /// Assert that `client` eventually lists exactly `expected` objects under
@@ -423,7 +578,7 @@ async fn exercise_mixed_cluster(
     previous_node: usize,
 ) -> TestResult {
     let clients = cluster.create_all_clients()?;
-    wait_for_upgrade_write_readiness(&clients, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
     let current_client = &clients[current_node];
     let previous_client = &clients[previous_node];
 
@@ -449,7 +604,13 @@ async fn exercise_mixed_cluster(
         .await?;
     assert_eq!(read_object(current_client, MIXED_BUCKET, &previous_key, None).await?.1, previous_body);
 
-    let multipart_keys = write_multipart_load(&clients, phase).await?;
+    let multipart_keys = match write_multipart_load(&clients, phase).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR");
+            return observe_mixed_multipart_failure(cluster, phase, error, log_dir.as_deref().map(Path::new)).await;
+        }
+    };
     let expected_count = multipart_keys.len() + 2;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
         assert_eq!(
@@ -485,7 +646,12 @@ fn upgrade_probe_client(client: &Client) -> Client {
     )
 }
 
-async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budget: Duration) -> TestResult {
+pub(crate) async fn wait_for_upgrade_write_readiness(
+    clients: &[Client],
+    bucket: &str,
+    phase: &str,
+    budget: Duration,
+) -> TestResult {
     // ListBuckets can succeed before peers recover a restarted disk. Cluster
     // health also accepts Returning disks whose write health is still FAULTY.
     // Probe every writer outside the asserted phase prefix; compatibility
@@ -505,7 +671,7 @@ async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budge
                 deadline,
                 client
                     .put_object()
-                    .bucket(MIXED_BUCKET)
+                    .bucket(bucket)
                     .key(&key)
                     .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
                     .send(),
@@ -540,19 +706,20 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
     // readable. This preparation ends before any current binary is started.
-    wait_for_upgrade_write_readiness(&clients[..1], "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
+            MIXED_BUCKET,
             &format!("previous-restart-{node}"),
             LISTING_CONVERGENCE_TIMEOUT,
         )
         .await?;
     }
 
-    wait_for_upgrade_write_readiness(&clients, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
@@ -579,9 +746,10 @@ mod upgrade_write_readiness_tests {
     #[tokio::test]
     async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
         let target = FakeS3Target::start().await?;
-        target.create_bucket(MIXED_BUCKET);
+        let bucket = "distributed-upgrade-history";
+        target.create_bucket(bucket);
         let client = fake_source_client(&target);
-        client.head_bucket().bucket(MIXED_BUCKET).send().await?;
+        client.head_bucket().bucket(bucket).send().await?;
 
         let phase = "one-previous-node";
         let first_key = format!(".upgrade-readiness/{phase}/node-0");
@@ -601,7 +769,7 @@ mod upgrade_write_readiness_tests {
         // Metadata readiness does not prove that a data write can succeed.
         let premature = client
             .put_object()
-            .bucket(MIXED_BUCKET)
+            .bucket(bucket)
             .key(&first_key)
             .body(ByteStream::from_static(b"upgrade write readiness"))
             .send()
@@ -609,15 +777,15 @@ mod upgrade_write_readiness_tests {
             .expect_err("metadata readiness does not prove write readiness");
         assert_eq!(premature.raw_response().map(|response| response.status().as_u16()), Some(503));
 
-        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], phase, Duration::from_secs(5)).await?;
+        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], bucket, phase, Duration::from_secs(5)).await?;
         assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &first_key), 3);
         assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &second_key), 2);
-        assert!(target.has_object(MIXED_BUCKET, &first_key));
-        assert!(target.has_object(MIXED_BUCKET, &second_key));
+        assert!(target.has_object(bucket, &first_key));
+        assert!(target.has_object(bucket, &second_key));
         assert!(
             client
                 .list_objects_v2()
-                .bucket(MIXED_BUCKET)
+                .bucket(bucket)
                 .prefix(format!("{phase}/"))
                 .send()
                 .await?
@@ -647,9 +815,10 @@ mod upgrade_write_readiness_tests {
             let phase = format!("permanent-{}", status.as_u16());
             let key = format!(".upgrade-readiness/{phase}/node-0");
             target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Status(status), 1);
-            let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), &phase, Duration::from_secs(5))
-                .await
-                .expect_err("a permanent error must not be retried into success");
+            let error =
+                wait_for_upgrade_write_readiness(std::slice::from_ref(&client), MIXED_BUCKET, &phase, Duration::from_secs(5))
+                    .await
+                    .expect_err("a permanent error must not be retried into success");
             assert!(error.to_string().contains("node 0 write readiness failed"), "{error}");
             assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &key), 1);
             assert!(!target.has_object(MIXED_BUCKET, &key));
@@ -672,7 +841,7 @@ mod upgrade_write_readiness_tests {
             FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
             10,
         );
-        let error = wait_for_upgrade_write_readiness(&[client], phase, Duration::from_secs(1))
+        let error = wait_for_upgrade_write_readiness(&[client], MIXED_BUCKET, phase, Duration::from_secs(1))
             .await
             .expect_err("persistent unavailability must exhaust the shared deadline");
         // Transport scheduling consumes the same budget; do not require a
@@ -691,7 +860,7 @@ mod upgrade_write_readiness_tests {
         let phase = "stalled";
         let key = format!(".upgrade-readiness/{phase}/node-0");
         target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Stall(Duration::from_secs(30)), 1);
-        let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), phase, Duration::from_secs(1))
+        let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), MIXED_BUCKET, phase, Duration::from_secs(1))
             .await
             .expect_err("a stalled request must not outlive the readiness deadline");
         assert!(error.to_string().contains("deadline exceeded during PutObject"), "{error}");
@@ -739,6 +908,86 @@ mod upgrade_write_readiness_tests {
         assert!(error.to_string().contains(stalled_key), "{error}");
         assert!(error.to_string().contains("acknowledgement deadline exceeded"), "{error}");
         assert_eq!(target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key), 1);
+
+        let failure = error
+            .downcast_ref::<MultipartAcknowledgementDeadline>()
+            .expect("the timeout must retain typed writer/object context");
+        assert_eq!(failure.node, 2);
+        assert_eq!(failure.key, stalled_key);
+        let original_message = error.to_string();
+        // These four probe addresses share an in-process peer. This verifies
+        // bounded diagnostic fan-out, not a four-node RustFS cluster.
+        let mut probes = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
+        probes.access_key = FAKE_ACCESS_KEY.to_owned();
+        probes.secret_key = FAKE_SECRET_KEY.to_owned();
+        for node in &mut probes.nodes {
+            node.url = target.endpoint().to_owned();
+        }
+        let log_dir = tempfile::tempdir()?;
+        target.inject_for_key(
+            FakeTargetOperation::HeadObject,
+            stalled_key,
+            FaultAction::Stall(Duration::from_secs(30)),
+            1,
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(7),
+            observe_mixed_multipart_failure(&probes, phase, error, Some(log_dir.path())),
+        )
+        .await
+        .expect("the shared diagnostic budget must include artifact writing")
+        .expect_err("observing committed data cannot acknowledge the stalled upload");
+        assert_eq!(error.to_string(), original_message);
+        assert!(error.downcast_ref::<MultipartAcknowledgementDeadline>().is_some());
+        let snapshot: Value =
+            serde_json::from_slice(&tokio::fs::read(log_dir.path().join("mixed-multipart-failure.json")).await?)?;
+        assert_eq!(snapshot["key"], stalled_key);
+        assert_eq!(snapshot["writer_node"], 2);
+        let heads = snapshot["heads"]
+            .as_array()
+            .expect("failure artifact must retain every probe");
+        assert_eq!(heads.len(), MIXED_NODE_COUNT);
+        assert_eq!(
+            heads
+                .iter()
+                .filter(|head| head["timeout"] == true && head["observation"] == "unknown")
+                .count(),
+            1
+        );
+        assert_eq!(
+            heads
+                .iter()
+                .filter(|head| head["status"] == 200 && head["observation"] == "visible")
+                .count(),
+            3
+        );
+        assert_eq!(target.count_requests(FakeTargetOperation::HeadObject, stalled_key), MIXED_NODE_COUNT);
+        assert_eq!(target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key), 1);
+        assert_eq!(snapshot["top_locks"]["observation"], "unknown", "the fake peer has no admin lock API");
+
+        let locks: MixedLockSnapshot = serde_json::from_value(serde_json::json!({
+            "total": 1, "truncated": true, "capability_note": "partial snapshot",
+            "credentials": { "secret_key": "must not persist" },
+            "locks": [{
+                "resource": format!("{MIXED_BUCKET}/{stalled_key}"), "owner": "writer", "type": "WRITE",
+                "elapsed_secs": 30, "ttl_secs": 1, "merged_config": { "secret_key": "must not persist" },
+            }],
+        }))?;
+        let safe_locks = serde_json::to_value(locks)?;
+        assert_eq!(safe_locks["total"], 1);
+        assert_eq!(safe_locks["truncated"], true);
+        assert_eq!(safe_locks["locks"][0]["owner"], "writer");
+        assert_eq!(safe_locks["locks"][0]["elapsed_secs"], 30);
+        assert!(safe_locks.get("credentials").is_none());
+        assert!(safe_locks["locks"][0].get("merged_config").is_none());
+
+        let mut body = br#"{"locks":[]}"#.to_vec();
+        body.resize(1024 * 1024, b' ');
+        let mut at_limit = reqwest::Response::from(http::Response::new(body.clone()));
+        assert!(read_mixed_lock_snapshot(&mut at_limit).await?.locks.is_empty());
+        body.push(b' ');
+        let mut oversized = reqwest::Response::from(http::Response::new(body));
+        assert_eq!(read_mixed_lock_snapshot(&mut oversized).await.err(), Some("body_limit_exceeded"));
         target.shutdown().await;
         Ok(())
     }
@@ -2248,9 +2497,9 @@ struct LayoutTransport {
     uploaded_parts: Vec<i32>,
     single_puts: usize,
     completes: usize,
-    /// Raw per-key journal in target order: (sequence, operation, part number,
-    /// upload id), so duplicate drives can be told apart from retries.
-    journal: Vec<(u64, String, Option<i32>, Option<String>)>,
+    /// Allowlisted request identity and prepared response metadata. A prepared
+    /// response does not prove that the client received it.
+    journal: Vec<Value>,
 }
 
 /// Configure every layout bucket to replicate its existing objects to a fresh
@@ -2312,12 +2561,28 @@ async fn replicate_layouts(
             journal: key_requests
                 .iter()
                 .map(|record| {
-                    (
-                        record.sequence,
-                        format!("{:?}", record.operation),
-                        record.part_number,
-                        record.upload_id.as_ref().map(|id| id.chars().take(12).collect()),
-                    )
+                    serde_json::json!({
+                        "sequence": record.sequence,
+                        "operation": format!("{:?}", record.operation),
+                        "part_number": record.part_number,
+                        "upload_id": record.upload_id,
+                        "requested_version_id": record.version_id,
+                        "source_version_id": record.source_version_id,
+                        "source_mtime": record.source_mtime,
+                        "source_etag": record.source_etag,
+                        "source_replication_request": record.source_replication_request,
+                        "request_content_length": record.content_length,
+                        "journaled_at_unix_millis": record.journaled_at_unix_millis,
+                        "prepared_response": record.prepared_response.as_ref().map(|response| serde_json::json!({
+                            "status": response.status,
+                            "version_id": response.version_id,
+                            "etag": response.etag,
+                            "last_modified": response.last_modified,
+                            "content_length": response.content_length,
+                            "prepared_at_unix_millis": response.prepared_at_unix_millis,
+                            "elapsed_secs": response.elapsed.as_secs_f64(),
+                        })),
+                    })
                 })
                 .collect(),
         };

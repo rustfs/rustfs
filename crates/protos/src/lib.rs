@@ -610,11 +610,17 @@ pub fn canonical_scanner_dirty_usage_snapshot_response_body(
 pub fn canonical_scanner_publication_lease_request_body(
     request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-request-v1\0";
+    let domain = if request.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
     let challenge = request.challenge.as_ref();
     let session_id = request.expected_session_id.as_bytes();
-    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
-    body.extend_from_slice(DOMAIN);
+    let mut body = Vec::with_capacity(domain.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(domain);
     body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
     body.extend_from_slice(challenge);
     body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
@@ -659,16 +665,22 @@ pub fn canonical_scanner_publication_lease_response_body(
     challenge: &[u8],
     response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-response-v1\0";
+    let domain = if response.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
     let token = response.token.as_ref();
     let owner_id = response.owner_id.as_bytes();
     let session_id = response.session_id.as_bytes();
     let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
     let error_code = response.error.as_ref().map_or(0, |error| error.code);
     let mut body = Vec::with_capacity(
-        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+        domain.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
     );
-    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(domain);
     body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
     body.extend_from_slice(challenge);
     body.push(u8::from(response.success));
@@ -2196,6 +2208,7 @@ mod scanner_activity_tests {
             ttl_ms: 60_000,
             expected_session_id: "session-a".to_string(),
             token: Vec::new().into(),
+            observational_only: false,
         };
         let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
         for variant in [
@@ -2213,6 +2226,10 @@ mod scanner_activity_tests {
             },
             ScannerPublicationLeaseRequest {
                 token: vec![3; 16].into(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                observational_only: true,
                 ..request
             },
         ] {
@@ -2243,6 +2260,7 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             owner_id: "owner-a".to_string(),
             session_id: "session-a".to_string(),
+            observational_only: false,
         };
         let response_changed = ScannerPublicationLeaseResponse {
             owner_id: "owner-b".to_string(),
@@ -2251,6 +2269,14 @@ mod scanner_activity_tests {
         assert_ne!(
             canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
             canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
+        );
+        let observational_response = ScannerPublicationLeaseResponse {
+            observational_only: true,
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &observational_response).unwrap()
         );
     }
 }

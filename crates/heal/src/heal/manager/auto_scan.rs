@@ -459,6 +459,13 @@ impl HealManager {
                                 }
                             };
                             let mut state = resume_manager.get_state().await;
+                            let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            if durable_replacement_recovery_is_waiting_for_grace(&state, &task_id, now) {
+                                // Waiting retains generation ownership without
+                                // blocking its set as a recovery conflict.
+                                deferred_recovery_sets.insert(state.set_disk_id.clone());
+                                continue;
+                            }
                             if replacement_retry_is_exhausted_active(&state) {
                                 match resume_manager
                                     .rearm_replacement_recovery_if_needed(storage.as_ref())

@@ -459,6 +459,13 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(None)
     }
 
+    /// Whether the exact old bucket generation has a durable deletion record.
+    /// Alternate backends must fail closed unless they can validate the same
+    /// deployment, bucket and incarnation identity.
+    async fn mrf_bucket_incarnation_retired(&self, _bucket: &str, _expected: Uuid) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Aggregate usage-cache baselines for the requested buckets.
     async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         Ok(None)
@@ -1175,6 +1182,13 @@ impl HealStorageAPI for ECStoreHealStorage {
             .bucket_incarnation_id(bucket)
             .await
             .map(Some)
+            .map_err(Error::Storage)
+    }
+
+    async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        self.ecstore
+            .is_bucket_incarnation_retired(bucket, expected)
+            .await
             .map_err(Error::Storage)
     }
 

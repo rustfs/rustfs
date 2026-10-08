@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_io_metrics::record_object_lock_acquire_failure;
 use rustfs_lock::{LockError, NamespaceLockGuard, NamespaceLockWrapper};
 use std::time::{Duration, Instant};
 use tracing::Span;
@@ -20,6 +21,26 @@ use uuid::Uuid;
 const EVENT_OBJECT_NAMESPACE_LOCK: &str = "object_namespace_lock";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
+
+pub(crate) fn record_lock_acquire_failure(op: &'static str, bucket: &str, object: &str, mode: &'static str, error: &LockError) {
+    let resource_class = if bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+        "multipart_metadata"
+    } else if bucket == crate::disk::RUSTFS_META_BUCKET || bucket == ".minio.sys" {
+        "system_metadata"
+    } else if object.is_empty() || object == bucket {
+        "bucket_namespace"
+    } else {
+        "object_namespace"
+    };
+    let reason = match error {
+        LockError::Timeout { .. } => "timeout",
+        LockError::AlreadyLocked { .. } => "contention",
+        LockError::QuorumNotReached { .. } | LockError::InsufficientNodes { .. } => "quorum",
+        LockError::Network { .. } | LockError::Internal { .. } => "transport",
+        _ => "other",
+    };
+    record_object_lock_acquire_failure(op, mode, resource_class, reason);
+}
 
 /// Diagnostic lifetime only; it never owns or changes a namespace lock.
 /// Keep it alongside the real guard when ownership moves to a commit tail.

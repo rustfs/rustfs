@@ -232,7 +232,7 @@ impl ECStore {
     ) -> DiskResult<RenameDataResp> {
         let external_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_token {
             Some(Arc::new(
-                self.acquire_scanner_publication_lease_guard(token)
+                self.acquire_scanner_publication_lease_guard_for_rename(token, destination.0, destination.1)
                     .await
                     .map_err(|err| DiskError::other(err.to_string()))?,
             ))
@@ -1192,6 +1192,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observational_lease_renames_only_the_observed_usage_object() {
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("target root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let disk_ref = disk.endpoint().to_string();
+        let volume = crate::disk::RUSTFS_META_BUCKET;
+        let observed_path = format!(
+            "{}/{}",
+            crate::disk::BUCKET_META_PREFIX,
+            rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME
+        );
+        let source_path = format!("{}/.staged-observation", crate::disk::BUCKET_META_PREFIX);
+        let fi = target_file_info(&observed_path, Uuid::new_v4(), b"non-authoritative");
+        seed_target(&disk, volume, &source_path, fi.clone()).await;
+
+        let pending = ctx.begin_namespace_commit();
+        let (token, generation) = store
+            .acquire_scanner_publication_lease_with_purpose(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL, true)
+            .await
+            .expect("observational lease should permit a pending namespace commit");
+        let error = store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, "buckets/.usage.v2.json"), Some(token))
+            .await
+            .expect_err("observational token must not authorize the authoritative usage path");
+        assert!(error.to_string().contains("observed usage publication"));
+        assert!(root.path().join(volume).join(&source_path).join("xl.meta").exists());
+
+        store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, &observed_path), Some(token))
+            .await
+            .expect("observational token may rename only the observed usage key");
+        assert!(
+            store
+                .validate_scanner_publication_lease_with_purpose(token, generation, true)
+                .await
+                .is_ok(),
+            "namespace commits do not invalidate the movement-only observation lease"
+        );
+        let wrong_purpose = store
+            .validate_scanner_publication_lease_with_purpose(token, generation, false)
+            .await
+            .expect_err("the same token must not validate as authoritative");
+        assert!(wrong_purpose.to_string().contains("purpose"));
+        drop(pending);
+        assert!(store.release_scanner_publication_lease(token).await);
+        let observed = disk
+            .read_version(
+                volume,
+                volume,
+                &observed_path,
+                &fi.version_id.expect("fixture version").to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("observed metadata should be present");
+        assert_eq!(observed.data.as_deref(), Some(&b"non-authoritative"[..]));
+    }
+
+    #[tokio::test]
     async fn completed_namespace_commit_rejects_stale_scanner_target_admission() {
         use futures::FutureExt;
         use std::time::{Duration, Instant};
@@ -1491,7 +1554,11 @@ mod tests {
             );
             assert_eq!(
                 ctx.scanner_publication_lease_generations(old_token).await,
-                Some((movement_generation, namespace_generation)),
+                Some((
+                    movement_generation,
+                    Some(namespace_generation),
+                    crate::runtime::instance::ScannerPublicationLeasePurpose::Authoritative,
+                )),
                 "rejection must not refresh or discard the old lease"
             );
             let (fresh_token, fresh_generation) = store

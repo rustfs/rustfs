@@ -36,7 +36,9 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    # gateway/integration carries main's ruleset (rustfs/backlog#2734), so its
+    # pull requests must produce the same required checks.
+    branches: [ main, gateway/integration ]
   merge_group:
     types: [ checks_requested ]
   schedule:

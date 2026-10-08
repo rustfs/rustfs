@@ -18,7 +18,11 @@
 //! `openidconnect` crate for standards-compliant discovery, token exchange,
 //! and ID token verification.
 
-use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
+use crate::{
+    EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC,
+    federation::{CoreFederatedAuthorizationMapper, FederatedAuthorizationRuleRef},
+    oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
+};
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
 };
@@ -47,9 +51,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 use url::Url;
 
-const LOG_COMPONENT_IAM: &str = "iam";
-const LOG_SUBSYSTEM_OIDC: &str = "oidc";
-const EVENT_OIDC_DIAGNOSTICS: &str = "oidc_diagnostics";
 const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
@@ -682,7 +683,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
     }
 }
 
-// ---- Public types (unchanged API) ----
+// ---- Public types ----
 
 const REDACTED_SECRET: &str = "***redacted***";
 
@@ -753,6 +754,31 @@ pub struct SourcedOidcProviderConfig {
     pub source: OidcProviderConfigSource,
 }
 
+/// Immutable OIDC configuration entries returned by configuration queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcConfigSnapshot {
+    providers: Vec<SourcedOidcProviderConfig>,
+}
+
+impl OidcConfigSnapshot {
+    pub fn new(mut providers: Vec<SourcedOidcProviderConfig>) -> Self {
+        providers.sort_by(|left, right| {
+            (left.config.id != "default")
+                .cmp(&(right.config.id != "default"))
+                .then_with(|| left.config.id.cmp(&right.config.id))
+        });
+        Self { providers }
+    }
+
+    pub fn providers(&self) -> &[SourcedOidcProviderConfig] {
+        &self.providers
+    }
+
+    pub fn into_providers(self) -> Vec<SourcedOidcProviderConfig> {
+        self.providers
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OidcProviderValidationResult {
     pub issuer: String,
@@ -760,12 +786,8 @@ pub struct OidcProviderValidationResult {
     pub token_endpoint: Option<String>,
 }
 
-/// Summary info about a provider, returned to the console.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OidcProviderSummary {
-    pub provider_id: String,
-    pub display_name: String,
-}
+/// Compatibility name for the provider summary returned by OIDC list APIs.
+pub type OidcProviderSummary = crate::federation::FederatedProviderView;
 
 /// Claims extracted from an OIDC ID token.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -932,7 +954,7 @@ impl ProviderState {
 
 /// Global OIDC manager for all configured providers.
 pub struct OidcSys {
-    configs: HashMap<String, OidcProviderConfig>,
+    configs: HashMap<String, SourcedOidcProviderConfig>,
     provider_states: RwLock<HashMap<String, ProviderState>>,
     state_store: OidcStateStore,
     http_client: ReqwestHttpClient,
@@ -967,22 +989,22 @@ impl OidcSys {
 
     async fn new_with_http_client(http_client: ReqwestHttpClient) -> Result<Self, String> {
         let server_config = crate::server_config::current_server_config();
-        let parsed_configs = load_effective_oidc_provider_configs(server_config.as_ref());
+        let parsed_configs = load_oidc_config_snapshot(server_config.as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
 
-        for sourced_config in parsed_configs {
-            let config = sourced_config.config;
+        for sourced_config in parsed_configs.into_providers() {
+            let config = &sourced_config.config;
             if !config.enabled {
                 debug!(provider = %config.id, "OIDC provider disabled");
                 continue;
             }
 
-            match Self::discover_provider(&config, &http_client).await {
+            match Self::discover_provider(config, &http_client).await {
                 Ok(state) => {
                     debug!(provider = %config.id, "OIDC provider discovered");
                     provider_states.insert(config.id.clone(), state);
-                    configs.insert(config.id.clone(), config);
+                    configs.insert(config.id.clone(), sourced_config);
                 }
                 Err(e) => {
                     error!(
@@ -1026,27 +1048,33 @@ impl OidcSys {
         !self.configs.is_empty()
     }
 
-    /// List all providers (including hidden ones). Used by site-replication and admin config.
+    pub(crate) fn provider_configs(&self) -> impl Iterator<Item = &OidcProviderConfig> {
+        self.configs.values().map(|provider| &provider.config)
+    }
+
+    /// List all providers, including providers hidden from the login UI.
     pub fn list_providers(&self) -> Vec<OidcProviderSummary> {
-        self.configs
-            .values()
-            .map(|c| OidcProviderSummary {
-                provider_id: c.id.clone(),
-                display_name: c.display_name.clone(),
+        self.provider_configs()
+            .map(|config| OidcProviderSummary {
+                provider_id: config.id.clone(),
+                display_name: config.display_name.clone(),
             })
             .collect()
     }
 
-    /// List only visible providers (excludes those with `hide_from_ui = true`).
+    /// List providers visible in the login UI.
     pub fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
-        self.configs
-            .values()
-            .filter(|c| !c.hide_from_ui)
-            .map(|c| OidcProviderSummary {
-                provider_id: c.id.clone(),
-                display_name: c.display_name.clone(),
+        self.provider_configs()
+            .filter(|config| !config.hide_from_ui)
+            .map(|config| OidcProviderSummary {
+                provider_id: config.id.clone(),
+                display_name: config.display_name.clone(),
             })
             .collect()
+    }
+
+    pub fn config_snapshot(&self) -> OidcConfigSnapshot {
+        OidcConfigSnapshot::new(self.configs.values().cloned().collect())
     }
 
     /// Build the PKCE authorization URL for a provider, store state in the state store.
@@ -1057,8 +1085,7 @@ impl OidcSys {
         redirect_after: Option<String>,
     ) -> Result<String, String> {
         let config = self
-            .configs
-            .get(provider_id)
+            .get_provider_config(provider_id)
             .ok_or_else(|| format!("unknown OIDC provider: {provider_id}"))?;
         let state = self.ensure_provider_state(provider_id, config).await?;
 
@@ -1116,8 +1143,7 @@ impl OidcSys {
             .ok_or_else(|| "invalid or expired OIDC state".to_string())?;
 
         let config = self
-            .configs
-            .get(&session.provider_id)
+            .get_provider_config(&session.provider_id)
             .ok_or_else(|| format!("unknown provider: {}", session.provider_id))?;
         let provider_state = self.get_provider_state(&session.provider_id)?;
         let issuer = provider_state.metadata.issuer().to_string();
@@ -1451,8 +1477,7 @@ impl OidcSys {
             .ok_or_else(|| "invalid or expired OIDC logout token".to_string())?;
 
         let config = self
-            .configs
-            .get(&session.provider_id)
+            .get_provider_config(&session.provider_id)
             .ok_or_else(|| format!("unknown OIDC provider: {}", session.provider_id))?;
         let state = self.ensure_provider_state(&session.provider_id, config).await?;
         let Some(end_session_endpoint) = state.metadata.console()?.additional_metadata().end_session_endpoint.clone() else {
@@ -1478,88 +1503,10 @@ impl OidcSys {
 
     /// Map OIDC claims to rustfs policy names.
     pub fn map_claims_to_policies(&self, provider_id: &str, claims: &OidcClaims) -> (Vec<String>, Vec<String>) {
-        let config = match self.configs.get(provider_id) {
-            Some(c) => c,
-            None => return (vec![], vec![]),
+        let Some(rule) = self.authorization_rule(provider_id) else {
+            return (Vec::new(), Vec::new());
         };
-
-        let mut policies = Vec::new();
-        let mut groups = Vec::new();
-
-        // Role-policy and claim-based authorization are separate OIDC modes. When a
-        // role policy is configured, group claims still provide group context but
-        // must not also become policy names.
-        let has_role_policy = !config.role_policy.trim().is_empty();
-        if has_role_policy {
-            for policy in config.role_policy.split(',') {
-                let policy = policy.trim();
-                if !policy.is_empty() {
-                    policies.push(policy.to_string());
-                }
-            }
-        }
-
-        for group in &claims.groups {
-            groups.push(group.clone());
-            if !has_role_policy {
-                policies.push(claim_policy_name(&config.claim_prefix, group));
-            }
-        }
-
-        if !has_role_policy && config.claim_name != config.groups_claim {
-            for val in extract_groups_claim(&claims.raw, &config.claim_name) {
-                policies.push(claim_policy_name(&config.claim_prefix, &val));
-            }
-        }
-
-        // Deduplicate
-        policies.sort();
-        policies.dedup();
-        groups.sort();
-        groups.dedup();
-
-        let mut raw_claim_keys: Vec<&str> = claims.raw.keys().map(String::as_str).collect();
-        raw_claim_keys.sort_unstable();
-        let (claim_name_lookup, claim_name_raw_value) = claim_lookup_for_log(&claims.raw, &config.claim_name);
-        let (groups_claim_lookup, groups_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.groups_claim);
-        let (roles_claim_lookup, roles_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.roles_claim);
-        let claim_name_values = extract_groups_claim(&claims.raw, &config.claim_name);
-        let groups_claim_values = extract_groups_claim(&claims.raw, &config.groups_claim);
-        let roles_claim_values = extract_groups_claim(&claims.raw, &config.roles_claim);
-
-        debug!(
-            event = EVENT_OIDC_DIAGNOSTICS,
-            component = LOG_COMPONENT_IAM,
-            subsystem = LOG_SUBSYSTEM_OIDC,
-            result = "claims_policy_mapped",
-            provider_id = %provider_id,
-            claim_name = %config.claim_name,
-            claim_prefix = %config.claim_prefix,
-            groups_claim = %config.groups_claim,
-            roles_claim = %config.roles_claim,
-            role_policy = %config.role_policy,
-            policy_count = policies.len(),
-            group_count = groups.len(),
-            policies = ?policies,
-            groups = ?groups,
-            raw_claim_keys = ?raw_claim_keys,
-            raw_claims = ?claims.raw,
-            claim_name_lookup = %claim_name_lookup,
-            claim_name_type = claim_value_type_for_log(claim_name_raw_value),
-            claim_name_value = ?claim_name_raw_value,
-            claim_name_values = ?claim_name_values,
-            groups_claim_lookup = %groups_claim_lookup,
-            groups_claim_type = claim_value_type_for_log(groups_claim_raw_value),
-            groups_claim_value = ?groups_claim_raw_value,
-            groups_claim_values = ?groups_claim_values,
-            roles_claim_lookup = %roles_claim_lookup,
-            roles_claim_type = claim_value_type_for_log(roles_claim_raw_value),
-            roles_claim_value = ?roles_claim_raw_value,
-            roles_claim_values = ?roles_claim_values,
-            "oidc claims mapped to policies"
-        );
-
-        (policies, groups)
+        CoreFederatedAuthorizationMapper::map_policies_and_groups(provider_id, rule, &claims.groups, &claims.raw, true)
     }
 
     /// Policy names produced only by the canonical groups in claim-based mode: the groups claim
@@ -1571,30 +1518,22 @@ impl OidcSys {
     /// dedicated policy claim are never included, so those configurations keep requiring every
     /// policy to resolve.
     pub fn group_claim_policy_names(&self, provider_id: &str, claims: &OidcClaims) -> Vec<String> {
-        let Some(config) = self.configs.get(provider_id) else {
+        let Some(rule) = self.authorization_rule(provider_id) else {
             return Vec::new();
         };
-        if !config.role_policy.trim().is_empty() {
-            return Vec::new();
-        }
+        CoreFederatedAuthorizationMapper::group_claim_policy_names(rule, &claims.groups, &claims.raw)
+    }
 
-        let explicit_policy_names: Vec<String> = if config.claim_name != config.groups_claim {
-            extract_groups_claim(&claims.raw, &config.claim_name)
-                .iter()
-                .map(|value| claim_policy_name(&config.claim_prefix, value))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut policies: Vec<String> = claims
-            .groups
-            .iter()
-            .map(|group| claim_policy_name(&config.claim_prefix, group))
-            .filter(|policy| !explicit_policy_names.contains(policy))
-            .collect();
-        policies.sort();
-        policies.dedup();
-        policies
+    fn authorization_rule(&self, provider_id: &str) -> Option<FederatedAuthorizationRuleRef<'_>> {
+        self.get_provider_config(provider_id).map(|config| {
+            FederatedAuthorizationRuleRef::new(
+                &config.claim_name,
+                &config.claim_prefix,
+                &config.role_policy,
+                &config.groups_claim,
+                &config.roles_claim,
+            )
+        })
     }
 
     /// Verify a raw JWT (id_token) for the AssumeRoleWithWebIdentity flow.
@@ -1678,7 +1617,7 @@ impl OidcSys {
                 && issuer_host == provider_host
                 && issuer_port == provider_port
                 && issuer_path == provider_path
-                && let Some(config) = self.configs.get(id)
+                && let Some(config) = self.get_provider_config(id)
             {
                 return Some((id.clone(), config.clone(), state.clone()));
             }
@@ -1747,7 +1686,7 @@ impl OidcSys {
 
     /// Get a provider config by ID.
     pub fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
-        self.configs.get(id)
+        self.configs.get(id).map(|provider| &provider.config)
     }
 
     /// Parse all OIDC provider configs from environment variables.
@@ -2225,6 +2164,10 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
     merge_oidc_provider_configs(env_configs, persisted_configs)
 }
 
+pub fn load_oidc_config_snapshot(server_config: Option<&ServerConfig>) -> OidcConfigSnapshot {
+    OidcConfigSnapshot::new(load_effective_oidc_provider_configs(server_config))
+}
+
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
     validate_oidc_provider_config_with_extra_root_ca(config, None).await
 }
@@ -2387,10 +2330,6 @@ fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) 
     }
 }
 
-fn claim_policy_name(claim_prefix: &str, value: &str) -> String {
-    format!("{claim_prefix}{value}")
-}
-
 /// Extract a groups/array claim from raw claims with case-insensitive fallback. Handles both string arrays and single strings.
 fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
     match get_claim_case_insensitive(claims, key) {
@@ -2415,37 +2354,26 @@ fn extract_canonical_group_values(
     groups
 }
 
-fn claim_lookup_for_log<'a>(
-    claims: &'a HashMap<String, serde_json::Value>,
-    key: &str,
-) -> (&'static str, Option<&'a serde_json::Value>) {
-    match get_claim_case_insensitive(claims, key) {
-        ClaimLookup::Found(value) => ("found", Some(value)),
-        ClaimLookup::Missing => ("missing", None),
-        ClaimLookup::Ambiguous => ("ambiguous", None),
-    }
-}
-
-fn claim_value_type_for_log(value: Option<&serde_json::Value>) -> &'static str {
-    match value {
-        Some(serde_json::Value::Null) => "null",
-        Some(serde_json::Value::Bool(_)) => "bool",
-        Some(serde_json::Value::Number(_)) => "number",
-        Some(serde_json::Value::String(_)) => "string",
-        Some(serde_json::Value::Array(_)) => "array",
-        Some(serde_json::Value::Object(_)) => "object",
-        None => "none",
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
-    let configs = configs.into_iter().map(|config| (config.id.clone(), config)).collect();
+    let configs = configs
+        .into_iter()
+        .map(test_sourced_config)
+        .map(|provider| (provider.config.id.clone(), provider))
+        .collect();
     OidcSys {
         configs,
         provider_states: RwLock::new(HashMap::new()),
         state_store: OidcStateStore::new(),
         http_client: ReqwestHttpClient::new().expect("failed to initialize OIDC HTTP clients"),
+    }
+}
+
+#[cfg(test)]
+fn test_sourced_config(config: OidcProviderConfig) -> SourcedOidcProviderConfig {
+    SourcedOidcProviderConfig {
+        config,
+        source: OidcProviderConfigSource::Persisted,
     }
 }
 
@@ -3041,7 +2969,7 @@ mod tests {
             .await
             .expect("initial OIDC discovery should succeed");
         let sys = OidcSys {
-            configs: HashMap::from([(config.id.clone(), config.clone())]),
+            configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
             provider_states: RwLock::new(HashMap::from([(config.id.clone(), state)])),
             state_store: OidcStateStore::new(),
             http_client,
@@ -3175,7 +3103,7 @@ mod tests {
                 let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
                 let discovered = OidcSys::discover_provider(&config, &http_client).await.unwrap();
                 let sys = OidcSys {
-                    configs: HashMap::from([(config.id.clone(), config)]),
+                    configs: HashMap::from([(config.id.clone(), test_sourced_config(config))]),
                     provider_states: RwLock::new(HashMap::from([("console".into(), discovered)])),
                     state_store: OidcStateStore::new(),
                     http_client,
@@ -3403,13 +3331,13 @@ mod tests {
                 .expect("workload discovery must succeed");
             assert!(state.metadata.authorization_endpoint().is_none());
             let sys = OidcSys {
-                configs: HashMap::from([(config.id.clone(), config.clone())]),
+                configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
                 provider_states: RwLock::new(HashMap::from([(config.id.clone(), state)])),
                 state_store: OidcStateStore::new(),
                 http_client,
             };
             assert!(sys.has_providers());
-            assert!(sys.list_visible_providers().is_empty());
+            assert!(sys.provider_configs().all(|provider| provider.hide_from_ui));
             let error = sys
                 .authorize_url(&config.id, "https://console.example.com/callback", None)
                 .await
@@ -4033,7 +3961,7 @@ mod tests {
     fn test_oidc_sys_empty() {
         let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
         assert!(!sys.has_providers());
-        assert!(sys.list_providers().is_empty());
+        assert!(sys.config_snapshot().providers().is_empty());
     }
 
     #[test]
@@ -4183,7 +4111,7 @@ mod tests {
             )
             .await;
         let sys = OidcSys {
-            configs: HashMap::from([(provider_id.to_string(), config)]),
+            configs: HashMap::from([(provider_id.to_string(), test_sourced_config(config))]),
             provider_states: RwLock::new(HashMap::from([(
                 provider_id.to_string(),
                 ProviderState {
@@ -4432,8 +4360,8 @@ mod tests {
         let listed = sys.list_visible_providers();
 
         assert_eq!(listed.len(), 1);
-        assert!(listed.iter().any(|p| p.provider_id == "dex"));
-        assert!(!listed.iter().any(|p| p.provider_id == "kubernetes"));
+        assert!(listed.iter().any(|provider| provider.provider_id == "dex"));
+        assert!(!listed.iter().any(|provider| provider.provider_id == "kubernetes"));
     }
 
     #[test]
@@ -4449,42 +4377,26 @@ mod tests {
     }
 
     #[test]
-    fn test_list_providers_includes_hidden_for_replication() {
+    fn test_config_snapshot_includes_hidden_for_replication() {
         let visible = test_config("dex");
         let mut hidden = test_config("kubernetes");
         hidden.hide_from_ui = true;
 
         let sys = make_test_sys(vec![visible, hidden]);
 
-        // Unfiltered list returns all (used by site-replication)
+        assert_eq!(sys.config_snapshot().providers().len(), 2);
+    }
+
+    #[test]
+    fn test_list_providers_includes_hidden_for_compatibility() {
+        let visible = test_config("dex");
+        let mut hidden = test_config("kubernetes");
+        hidden.hide_from_ui = true;
+
+        let sys = make_test_sys(vec![visible, hidden]);
+
         assert_eq!(sys.list_providers().len(), 2);
-        // UI-filtered list hides the hidden one
         assert_eq!(sys.list_visible_providers().len(), 1);
-    }
-
-    #[test]
-    fn test_list_providers_all_visible_by_default() {
-        let a = test_config("okta");
-        let b = test_config("dex");
-
-        let sys = make_test_sys(vec![a, b]);
-        let listed = sys.list_visible_providers();
-
-        assert_eq!(listed.len(), 2);
-    }
-
-    #[test]
-    fn test_list_visible_providers_all_hidden() {
-        let mut a = test_config("k8s-a");
-        a.hide_from_ui = true;
-        let mut b = test_config("k8s-b");
-        b.hide_from_ui = true;
-
-        let sys = make_test_sys(vec![a, b]);
-        let listed = sys.list_visible_providers();
-
-        assert!(listed.is_empty());
-        assert!(sys.has_providers());
     }
 
     #[test]
@@ -4723,17 +4635,32 @@ mod tests {
     }
 
     #[test]
-    fn test_list_providers() {
+    fn test_config_snapshot_lists_providers() {
         let mut config = test_config("keycloak");
         config.display_name = "Keycloak SSO".to_string();
 
         let sys = make_test_sys(vec![config]);
 
         assert!(sys.has_providers());
-        let summaries = sys.list_providers();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].provider_id, "keycloak");
-        assert_eq!(summaries[0].display_name, "Keycloak SSO");
+        let snapshot = sys.config_snapshot();
+        assert_eq!(snapshot.providers().len(), 1);
+        assert_eq!(snapshot.providers()[0].config.id, "keycloak");
+        assert_eq!(snapshot.providers()[0].config.display_name, "Keycloak SSO");
+        assert_eq!(snapshot.providers()[0].source, OidcProviderConfigSource::Persisted);
+    }
+
+    #[test]
+    fn test_active_config_snapshot_puts_default_first() {
+        let sys = make_test_sys(vec![test_config("zeta"), test_config("default"), test_config("alpha")]);
+
+        assert_eq!(
+            sys.config_snapshot()
+                .providers()
+                .iter()
+                .map(|provider| provider.config.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "alpha", "zeta"]
+        );
     }
 
     #[test]
