@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-s3-client/latest/rustfs_s3_client/"
 rustfs-checksums.workspace = true
 rustfs-config.workspace = true
 rustfs-rio.workspace = true
+rustfs-s3-types.workspace = true
 rustfs-signer.workspace = true
 rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true

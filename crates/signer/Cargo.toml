@@ -40,11 +40,14 @@ time = { workspace = true, features = ["parsing", "formatting", "macros", "serde
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 serde_urlencoded.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
-s3s = { workspace = true, features = ["minio"] }
 base64-simd.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The signer is generic over the body; its tests sign requests carrying the
+# RustFS-owned body that the outbound clients send.
+http-body.workspace = true
+rustfs-s3-types.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [lints]

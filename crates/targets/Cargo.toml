@@ -74,7 +74,6 @@ rumqttc = { workspace = true, features = ["websocket"] }
 redis = { workspace = true, features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-native-certs = { workspace = true }
-s3s = { workspace = true, features = ["minio"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }

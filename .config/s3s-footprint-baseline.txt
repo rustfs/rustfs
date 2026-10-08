@@ -11,6 +11,6 @@
 # files           Rust files referencing s3s paths, repo-wide minus crates/e2e_test
 # s3_error_lines  s3_error! invocation lines, same scope, summed
 # ecstore_files   Rust files referencing s3s paths under crates/ecstore/src
-files=209
+files=202
 s3_error_lines=1585
 ecstore_files=36

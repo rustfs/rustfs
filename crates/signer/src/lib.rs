@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! SigV2 and SigV4 signing for the requests RustFS sends.
+//!
+//! Every signing function is generic over the request body type: signing reads
+//! and writes only the request head (method, URI, headers), and the payload is
+//! committed through `x-amz-content-sha256`, never by reading the body. The body
+//! passes through unchanged, so callers sign whatever body type they send.
+
 pub mod constants;
 pub mod request_signature_streaming;
 pub mod request_signature_streaming_unsigned_trailer;

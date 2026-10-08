@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The legacy edge between RustFS's S3 error types and the s3s ones.
+//! The legacy edge between RustFS's S3 error and body types and the s3s ones.
 //!
-//! Responsible for: the `From` conversions in both directions, field by field,
-//! and the parity tests that pin this crate's statuses and parsing to the pinned
-//! s3s revision, which the tests use as an oracle.
+//! Responsible for: the `From` conversions in both directions (errors field by
+//! field; bodies frame by frame, keeping errors and the size hint), and the
+//! parity tests that pin this crate's statuses, parsing and body length
+//! reporting to the pinned s3s revision, which the tests use as an oracle.
 //! Not responsible for: anything the s3s-facing `impl S3` does with the result,
-//! or the default messages s3s attaches to a bare code (restored by s3s's own
-//! constructor on the way out, never stored here).
+//! the default messages s3s attaches to a bare code (restored by s3s's own
+//! constructor on the way out, never stored here), or read limits: a limit
+//! armed on an s3s body (`set_limit`) keeps applying inside the wrapped body,
+//! and our `Body` carries none, so none is armed on the way back.
 //! Upstream: `legacy_s3s`, the s3s package under the name the edge knows it
 //! by. Downstream: `rustfs` with the `compat-s3s` feature.
 //! DELETE BY T4.2 (rustfs/backlog#2784).
@@ -30,9 +33,24 @@
 //! in the PR rather than hidden; the edge whitelist of T0.6
 //! (rustfs/backlog#2741) is expected to list this file explicitly.
 
-use crate::{S3Error, S3ErrorCode};
+use crate::{Body, S3Error, S3ErrorCode};
 use std::borrow::Cow;
 use std::fmt;
+
+// Bodies cross the legacy edge as opaque frame streams: nothing is buffered,
+// and errors and the size hint pass through untouched. DELETE BY T4.2
+// (rustfs/backlog#2784) with the rest of this file.
+impl From<legacy_s3s::Body> for Body {
+    fn from(body: legacy_s3s::Body) -> Self {
+        Self::from_http_body(body)
+    }
+}
+
+impl From<Body> for legacy_s3s::Body {
+    fn from(body: Body) -> Self {
+        Self::http_body(body)
+    }
+}
 
 impl From<S3ErrorCode> for legacy_s3s::S3ErrorCode {
     fn from(code: S3ErrorCode) -> Self {
@@ -372,5 +390,174 @@ mod tests {
         assert!(legacy.headers().is_none());
         let back: S3Error = legacy.into();
         assert!(back.headers().is_none());
+    }
+
+    // ---- bodies across the edge ----
+
+    use crate::body::test_support::{Scripted, as_io, drain, io_error};
+    use bytes::Bytes;
+    use http_body::{Body as _, SizeHint};
+
+    fn hint_of(body: &impl http_body::Body) -> (u64, Option<u64>) {
+        let hint = body.size_hint();
+        (hint.lower(), hint.upper())
+    }
+
+    fn ranged(lower: u64, upper: u64) -> SizeHint {
+        let mut hint = SizeHint::new();
+        hint.set_lower(lower);
+        hint.set_upper(upper);
+        hint
+    }
+
+    #[test]
+    fn s3s_bodies_cross_into_ours_with_their_bytes_and_length() {
+        let cases: [(&str, legacy_s3s::Body, &[u8]); 4] = [
+            ("empty", legacy_s3s::Body::empty(), b""),
+            ("small", legacy_s3s::Body::from(Bytes::from_static(b"hello")), b"hello"),
+            (
+                "multi-chunk",
+                legacy_s3s::Body::http_body(Scripted::chunks(&[b"ab", b"cde", b"f"])),
+                b"abcdef",
+            ),
+            ("empty buffer", legacy_s3s::Body::from(Vec::new()), b""),
+        ];
+        for (name, legacy, expected) in cases {
+            let legacy_hint = hint_of(&legacy);
+            let legacy_end = legacy.is_end_stream();
+            let ours = Body::from(legacy);
+            assert_eq!(hint_of(&ours), legacy_hint, "{name}: size hint");
+            assert_eq!(ours.is_end_stream(), legacy_end, "{name}: end of stream");
+            let drained = drain(ours);
+            assert_eq!(drained.bytes(), expected, "{name}");
+            assert!(drained.error.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn our_bodies_cross_into_s3s_with_their_bytes_and_length() {
+        let cases: [(&str, Body, &[u8]); 4] = [
+            ("empty", Body::empty(), b""),
+            ("small", Body::from("hello"), b"hello"),
+            ("multi-chunk", Body::from_http_body(Scripted::chunks(&[b"ab", b"cde", b"f"])), b"abcdef"),
+            ("empty buffer", Body::from(String::new()), b""),
+        ];
+        for (name, ours, expected) in cases {
+            let our_hint = hint_of(&ours);
+            let our_end = ours.is_end_stream();
+            let legacy = legacy_s3s::Body::from(ours);
+            assert_eq!(hint_of(&legacy), our_hint, "{name}: size hint");
+            assert_eq!(legacy.is_end_stream(), our_end, "{name}: end of stream");
+            let drained = drain(legacy);
+            assert_eq!(drained.bytes(), expected, "{name}");
+            assert!(drained.error.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_ranged_or_unknown_size_hint_survives_both_directions() {
+        for hint in [ranged(2, 9), SizeHint::new()] {
+            let expected = (hint.lower(), hint.upper());
+            let ours = Body::from(legacy_s3s::Body::http_body(Scripted::new(Vec::new(), hint)));
+            assert_eq!(hint_of(&ours), expected, "s3s to ours");
+            let legacy = legacy_s3s::Body::from(Body::from_http_body(Scripted::new(Vec::new(), hint)));
+            assert_eq!(hint_of(&legacy), expected, "ours to s3s");
+        }
+    }
+
+    #[test]
+    fn an_s3s_body_error_crosses_into_ours_after_the_data_before_it() {
+        let legacy = legacy_s3s::Body::http_body(Scripted::new(
+            vec![
+                Ok(Bytes::from_static(b"head")),
+                Err(io_error(io::ErrorKind::TimedOut, "remote stalled")),
+            ],
+            SizeHint::new(),
+        ));
+        let drained = drain(Body::from(legacy));
+        assert_eq!(drained.bytes(), b"head");
+        let error = drained.error.expect("the s3s body error must cross the edge");
+        assert_eq!(as_io(&error).map(io::Error::kind), Some(io::ErrorKind::TimedOut));
+        assert_eq!(error.to_string(), "remote stalled");
+    }
+
+    #[test]
+    fn our_body_error_crosses_into_s3s_after_the_data_before_it() {
+        let ours = Body::from_http_body(Scripted::new(
+            vec![
+                Ok(Bytes::from_static(b"head")),
+                Err(io_error(io::ErrorKind::BrokenPipe, "local abort")),
+            ],
+            SizeHint::new(),
+        ));
+        let drained = drain(legacy_s3s::Body::from(ours));
+        assert_eq!(drained.bytes(), b"head");
+        let error = drained.error.expect("our body error must cross the edge");
+        assert_eq!(as_io(&error).map(io::Error::kind), Some(io::ErrorKind::BrokenPipe));
+        assert_eq!(error.to_string(), "local abort");
+    }
+
+    #[test]
+    fn an_error_before_any_data_crosses_both_directions() {
+        let legacy = legacy_s3s::Body::http_body(Scripted::new(
+            vec![Err(io_error(io::ErrorKind::ConnectionReset, "reset"))],
+            SizeHint::with_exact(8),
+        ));
+        let drained = drain(Body::from(legacy));
+        assert!(drained.chunks.is_empty());
+        assert_eq!(
+            drained.error.as_ref().and_then(as_io).map(io::Error::kind),
+            Some(io::ErrorKind::ConnectionReset)
+        );
+
+        let ours = Body::from_http_body(Scripted::new(
+            vec![Err(io_error(io::ErrorKind::ConnectionReset, "reset"))],
+            SizeHint::with_exact(8),
+        ));
+        let drained = drain(legacy_s3s::Body::from(ours));
+        assert!(drained.chunks.is_empty());
+        assert_eq!(
+            drained.error.as_ref().and_then(as_io).map(io::Error::kind),
+            Some(io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[test]
+    fn a_read_limit_armed_on_an_s3s_body_keeps_applying_after_the_crossing() {
+        let mut legacy = legacy_s3s::Body::from(Bytes::from_static(b"hello"));
+        legacy.set_limit(Some(3));
+        let drained = drain(Body::from(legacy));
+        assert!(drained.chunks.is_empty(), "no byte past the limit may be yielded");
+        let error = drained.error.expect("the s3s limit must still fail the read");
+        // s3s recognises this exact type to answer with its size-limit error.
+        assert!(error.is::<legacy_s3s::BodySizeLimitExceeded>(), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn in_memory_constructors_report_length_and_end_of_stream_exactly_as_s3s_does() {
+        let inputs: [&[u8]; 3] = [b"", b"x", b"hello world"];
+        for input in inputs {
+            let pairs = [
+                (
+                    "Bytes",
+                    Body::from(Bytes::copy_from_slice(input)),
+                    legacy_s3s::Body::from(Bytes::copy_from_slice(input)),
+                ),
+                ("Vec<u8>", Body::from(input.to_vec()), legacy_s3s::Body::from(input.to_vec())),
+                (
+                    "String",
+                    Body::from(String::from_utf8(input.to_vec()).expect("ASCII input")),
+                    legacy_s3s::Body::from(String::from_utf8(input.to_vec()).expect("ASCII input")),
+                ),
+            ];
+            for (name, ours, legacy) in pairs {
+                assert_eq!(hint_of(&ours), hint_of(&legacy), "{name} {input:?}: size hint");
+                assert_eq!(ours.is_end_stream(), legacy.is_end_stream(), "{name} {input:?}: end of stream");
+                assert_eq!(drain(ours).chunks, drain(legacy).chunks, "{name} {input:?}: frames");
+            }
+        }
+        let (ours, legacy) = (Body::empty(), legacy_s3s::Body::empty());
+        assert_eq!(hint_of(&ours), hint_of(&legacy), "empty: size hint");
+        assert_eq!(ours.is_end_stream(), legacy.is_end_stream(), "empty: end of stream");
     }
 }

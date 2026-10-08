@@ -94,7 +94,7 @@ impl TransitionClient {
         Ok(location)
     }
 
-    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<s3s::Body>, std::io::Error> {
+    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<rustfs_s3_types::Body>, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("location".to_string(), "".to_string());
 
@@ -135,7 +135,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(http::Method::GET)
             .uri(url_str)
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
