@@ -36,6 +36,14 @@ E2E_SELECTION_FILES = {
 }
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
+# Report-only lanes stay outside the aggregate until their milestone makes them
+# required. Each reruns a required job's suite with one environment change, so
+# the named steps must stay identical to that job's and the change must stay.
+REPORT_ONLY_JOBS = {
+    # rustfs/backlog#2734: required at T2.10.
+    "e2e-tests-gateway": ("e2e-tests", ("Archive e2e smoke test binaries", "Run e2e smoke suite"), "RUSTFS_S3_STACK: gateway"),
+}
+INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
 def documentation_path(path: str) -> bool:
@@ -129,7 +137,7 @@ def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
     expected["e2e-full"] = "success" if full else "skipped"
     return expected
 
@@ -157,7 +165,7 @@ def verify_results(needs: object, event: str, ref: str) -> list[str]:
 
 def check_workflow(root: Path) -> list[str]:
     # Reuse the repository's canonical-indentation checker; actionlint validates YAML syntax.
-    from check_test_wiring import yaml_block, yaml_scalar_continues
+    from check_test_wiring import workflow_step_block, yaml_block, yaml_scalar_continues
 
     errors = []
     lines = (root / ".github/workflows/ci.yml").read_text().splitlines()
@@ -176,8 +184,23 @@ def check_workflow(root: Path) -> list[str]:
         names.add(name)
         jobs[index] = f"  {name}:"
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
-    if names - NON_VALIDATION_JOBS != required:
+    if names - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
+
+    def code(block):
+        return [line for line in block if line.strip() and not line.lstrip().startswith("#")]
+
+    for job, (mirror, steps, env) in REPORT_ONLY_JOBS.items():
+        block, mirrored = yaml_block(jobs, job, 2), yaml_block(jobs, mirror, 2)
+        if block is None or mirrored is None:
+            errors.append(f"report-only {job} and its required {mirror} must both exist")
+            continue
+        if f"      {env}" not in (yaml_block(block, "env", 4) or []):
+            errors.append(f"{job} must set {env}")
+        for step in steps:
+            ours, theirs = workflow_step_block(block, step, "name"), workflow_step_block(mirrored, step, "name")
+            if ours is None or theirs is None or code(ours[1]) != code(theirs[1]):
+                errors.append(f"{job} step {step!r} must match {mirror}")
     for job in required:
         block = yaml_block(jobs, job, 2) or []
         if any(re.match(r"\s+(?:- )?[\"']?continue-on-error[\"']?\s*:", line) for line in block):
@@ -352,6 +375,8 @@ class SelfTests(unittest.TestCase):
     def test_full_e2e_gate_preserves_workflow_branch_and_event_scope(self):
         for event, ref, required in (
             ("push", "refs/heads/main", "success"),
+            ("push", "refs/heads/gateway/integration", "success"),
+            ("push", "refs/heads/gateway/integration-old", "skipped"),
             ("push", "refs/heads/release", "skipped"),
             ("push", "refs/heads/feature", "skipped"),
             ("push", "refs/heads/release-candidate", "skipped"),
@@ -402,6 +427,39 @@ class SelfTests(unittest.TestCase):
                     self.assertTrue(check_workflow(root), (job, field, "step"))
             path.write_text(source + "\n  cancel-after-test-and-lint-failure:\n    runs-on: ubuntu-latest\n")
             self.assertTrue(check_workflow(root))
+
+    def test_report_only_stack_lane_mirrors_e2e_smoke_outside_the_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".github/workflows").mkdir(parents=True)
+            source = (ROOT / ".github/workflows/ci.yml").read_text()
+            path = root / ".github/workflows/ci.yml"
+            before, lane = source.split("  e2e-tests-gateway:\n", 1)
+            lane, after = lane.split("  e2e-full:\n", 1)
+            legacy = before.split("  e2e-tests:\n", 1)[1]
+
+            def with_lane(text):
+                return before + "  e2e-tests-gateway:\n" + text + "  e2e-full:\n" + after
+
+            smoke = "--profile e2e-smoke --archive-file"
+            run_ignored = "--profile e2e-smoke --run-ignored all --archive-file"
+            for case, broken in enumerate((
+                # The lane can neither gate the aggregate nor vanish.
+                source.replace("      - e2e-tests\n", "      - e2e-tests\n      - e2e-tests-gateway\n", 1),
+                before + "  e2e-full:\n" + after,
+                # It must select the gateway stack.
+                with_lane(lane.replace("RUSTFS_S3_STACK: gateway", "RUSTFS_S3_STACK: legacy")),
+                with_lane(lane.replace("    env:\n      RUSTFS_S3_STACK: gateway\n", "")),
+                # Its suite must not drift from the required lane in either direction.
+                with_lane(lane.replace(smoke, run_ignored)),
+                with_lane(lane).replace(legacy, legacy.replace(smoke, run_ignored), 1),
+                with_lane(lane.replace("check_security_smoke_count.sh check", "check_security_smoke_count.sh update")),
+                with_lane(lane.replace("      - name: Run e2e smoke suite\n", "      - name: Run gateway smoke suite\n")),
+            )):
+                path.write_text(broken)
+                self.assertTrue(check_workflow(root), case)
+            path.write_text(with_lane(lane.replace("          if-no-files-found: warn\n", "          if-no-files-found: ignore\n")))
+            self.assertEqual(check_workflow(root), [], "only the mirrored archive and run steps are bound")
 
     def test_job_ids_and_display_names_cannot_hide_validation(self):
         with tempfile.TemporaryDirectory() as directory:
