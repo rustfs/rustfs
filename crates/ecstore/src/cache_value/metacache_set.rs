@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use crate::disk::DiskIoClass;
 use crate::disk::disk_store::{get_drive_walkdir_peek_timeout, get_drive_walkdir_stall_timeout};
 use crate::disk::error::DiskError;
-use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
+use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions, current_disk_io_context, with_optional_disk_io_context};
 use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
@@ -245,6 +247,8 @@ pub struct ListPathRawOptions {
     pub(crate) test_fallback_reader_behaviors: Vec<TestReaderBehavior>,
     #[cfg(test)]
     pub(crate) peek_timeout: Option<Duration>,
+    #[cfg(test)]
+    pub(crate) test_disk_io_context_observed: Option<Arc<AtomicBool>>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -276,6 +280,8 @@ impl Clone for ListPathRawOptions {
             test_fallback_reader_behaviors: self.test_fallback_reader_behaviors.clone(),
             #[cfg(test)]
             peek_timeout: self.peek_timeout,
+            #[cfg(test)]
+            test_disk_io_context_observed: self.test_disk_io_context_observed.clone(),
             ..Default::default()
         }
     }
@@ -344,6 +350,7 @@ async fn list_path_raw_inner(
     let log_path = opts.path.clone();
 
     let mut jobs = JoinSet::new();
+    let disk_io_context = current_disk_io_context();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(TokioMutex::new(opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>()));
     #[cfg(test)]
@@ -364,10 +371,18 @@ async fn list_path_raw_inner(
         let test_fallbacks_clone = test_fallbacks.clone();
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
+        let disk_io_context_clone = disk_io_context.clone();
         let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
-        jobs.spawn(async move {
+        jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
+            #[cfg(test)]
+            if let Some(observer) = &opts_clone.test_disk_io_context_observed {
+                observer.store(
+                    crate::disk::current_disk_io_context().is_some_and(|context| context.class == DiskIoClass::Background),
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
             #[cfg(test)]
             let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
                 match behavior {
@@ -652,7 +667,7 @@ async fn list_path_raw_inner(
 
             // warn!("list_path_raw: while need_fallback done");
             Ok(())
-        });
+        }));
     }
 
     let revjob_rx = rx.clone();
@@ -1166,6 +1181,68 @@ mod tests {
         .expect_err("impossible listing quorum should fail before producing partial results");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_joinset_producers_inherit_scanner_disk_io_class() {
+        let observed = Arc::new(AtomicBool::new(false));
+        crate::disk::with_background_disk_io(
+            CancellationToken::new(),
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None],
+                    min_disks: 1,
+                    test_reader_behaviors: vec![TestReaderBehavior::Eof],
+                    test_disk_io_context_observed: Some(observed.clone()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("empty test producer should complete the listing");
+
+        assert!(
+            observed.load(std::sync::atomic::Ordering::Acquire),
+            "the per-disk JoinSet producer must retain the scanner background class"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_joinset_walk_uses_the_local_disk_background_gate() {
+        let root = tempfile::tempdir().expect("local disk root should be created");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("disk path should be UTF-8"))
+            .expect("endpoint should parse");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("local disk should open"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        wrapper.make_volume("bucket").await.expect("bucket volume should be created");
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper.clone())));
+        let cancellation = CancellationToken::new();
+
+        crate::disk::with_background_disk_io(
+            cancellation.clone(),
+            list_path_raw(
+                cancellation,
+                ListPathRawOptions {
+                    disks: vec![Some(disk)],
+                    bucket: "bucket".to_string(),
+                    min_disks: 1,
+                    recursive: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("scanner metacache walk should complete");
+
+        assert!(
+            wrapper.background_io_admissions_for_tests() > 0,
+            "the LocalDiskWrapper walk should acquire background admission inside its JoinSet producer"
+        );
     }
 
     #[tokio::test]
