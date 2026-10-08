@@ -218,7 +218,7 @@ struct AllocatorGrant {
     initial_usage: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuotaAllocatorLedger {
     version: u8,
     bucket_incarnation: Uuid,
@@ -568,11 +568,12 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
         operation_id,
         reservation,
     };
-    let bootstrap = ensure_sharded_allocator(Arc::clone(&store), &data, growth, quota_limit).await?;
+    let (initial_allocator, bootstrap) = ensure_sharded_allocator(Arc::clone(&store), &data, growth, quota_limit).await?;
     let operation_lock_object = operation_lock_object(&data.shard_object, operation_id);
     let operation_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &operation_lock_object).await?;
     let operation_guard = operation_lock.get_write_lock(get_lock_acquire_timeout()).await?;
 
+    let mut cached_allocator = Some(initial_allocator);
     for attempt in 0..=2 {
         let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
         let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
@@ -585,14 +586,19 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 achieved: 0,
             });
         }
-        let allocator = load_current_allocator_locked(
-            Arc::clone(&store),
-            &data.allocator_object,
-            bucket_incarnation,
-            quota_revision,
-            quota_limit,
-        )
-        .await?;
+        let allocator = match cached_allocator.take() {
+            Some(allocator) => allocator,
+            None => {
+                load_current_allocator_locked(
+                    Arc::clone(&store),
+                    &data.allocator_object,
+                    bucket_incarnation,
+                    quota_revision,
+                    quota_limit,
+                )
+                .await?
+            }
+        };
         let allow_create = shard_may_be_created(&allocator, data.shard_index, bootstrap);
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
@@ -641,7 +647,8 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 state: ReservationState::Pending,
             });
         }
-        if shard.grants.is_empty() && shard.reservations.is_empty() && shard.accounted_usage == 0 {
+        let shard_was_empty = shard.grants.is_empty() && shard.reservations.is_empty() && shard.accounted_usage == 0;
+        if shard_was_empty {
             fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
             save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await?;
         }
@@ -654,7 +661,8 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 limit: quota_limit,
             });
         }
-        if attempt < 2
+        if !shard_was_empty
+            && attempt < 2
             && reap_sharded_reservations(Arc::clone(&store), &data, bucket_incarnation, quota_revision, quota_limit).await?
         {
             continue;
@@ -1300,11 +1308,13 @@ async fn ensure_sharded_allocator(
     data: &ShardedReservationData,
     growth: u64,
     quota_limit: u64,
-) -> Result<bool> {
+) -> Result<(QuotaAllocatorLedger, bool)> {
     let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
     let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
     match load_allocator_locked(Arc::clone(&store), &data.allocator_object).await {
-        Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => return Ok(false),
+        Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => {
+            return Ok((allocator, false));
+        }
         Ok(_) | Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(err),
     }
@@ -1313,7 +1323,9 @@ async fn ensure_sharded_allocator(
     let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
     let allocator_guard = Arc::new(allocator_lock.get_write_lock(get_lock_acquire_timeout()).await?);
     match load_allocator_locked(Arc::clone(&store), &data.allocator_object).await {
-        Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => return Ok(false),
+        Ok(allocator) if allocator.matches(data.bucket_incarnation, data.quota_revision, quota_limit) => {
+            return Ok((allocator, false));
+        }
         Ok(allocator) if !allocator.grants.is_empty() => return Err(StorageError::PartMissingOrCorrupt),
         Ok(_) | Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(err),
@@ -1363,7 +1375,7 @@ async fn ensure_sharded_allocator(
     }
     allocator.generation = 1;
     save_allocator_locked(Arc::clone(&store), &data.allocator_object, &allocator, &allocator_guard).await?;
-    Ok(true)
+    Ok((allocator, true))
 }
 
 async fn load_allocator_locked(store: Arc<ECStore>, object: &str) -> Result<QuotaAllocatorLedger> {
