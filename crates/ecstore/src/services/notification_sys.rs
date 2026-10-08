@@ -2889,7 +2889,22 @@ impl NotificationSys {
     /// pin movement on one peer.
     pub async fn acquire_scanner_publication_leases(
         &self,
+        targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        self.acquire_scanner_publication_leases_with_purpose(targets, false).await
+    }
+
+    pub async fn acquire_observational_scanner_publication_leases(
+        &self,
+        targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        self.acquire_scanner_publication_leases_with_purpose(targets, true).await
+    }
+
+    async fn acquire_scanner_publication_leases_with_purpose(
+        &self,
         mut targets: Vec<(String, String, u64)>,
+        observational_only: bool,
     ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
         targets.sort_by(|left, right| left.0.cmp(&right.0));
         for pair in targets.windows(2) {
@@ -2910,7 +2925,10 @@ impl NotificationSys {
                 let _ = self.release_scanner_publication_leases(grants).await;
                 return Err(Error::other(format!("scanner publication lease peer {host} is unavailable")));
             };
-            match client.acquire_scanner_publication_lease(&session_id, generation).await {
+            match client
+                .acquire_scanner_publication_lease(&session_id, generation, observational_only)
+                .await
+            {
                 Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
                 Err(err) => {
                     let _ = self.release_scanner_publication_leases(grants).await;
@@ -4949,6 +4967,7 @@ mod tests {
                 lease: ScannerPublicationLease {
                     token: Uuid::new_v4(),
                     movement_generation: 3,
+                    observational_only: false,
                     owner_id: Uuid::new_v4().to_string(),
                     session_id: "session-a".to_string(),
                     expires_at: Instant::now() + Duration::from_secs(30),

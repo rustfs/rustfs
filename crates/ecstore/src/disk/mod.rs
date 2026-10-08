@@ -22,8 +22,14 @@ pub mod error_reduce;
 pub mod format;
 pub mod fs;
 pub mod health_state;
+mod io_admission;
 pub mod local;
 pub mod os;
+
+#[cfg(test)]
+pub(crate) use io_admission::DiskIoClass;
+pub use io_admission::with_background_disk_io;
+pub(crate) use io_admission::{acquire_context_disk_io_permit, current_disk_io_context, with_optional_disk_io_context};
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const MIGRATING_META_BUCKET: &str = ".minio.sys";

@@ -36,7 +36,9 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    # gateway/integration carries main's ruleset (rustfs/backlog#2734), so its
+    # pull requests must produce the same required checks.
+    branches: [ main, gateway/integration ]
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -509,7 +511,7 @@ jobs:
     runs-on: sm-standard-4
     timeout-minutes: 90
     strategy:
-      # Preserve both independent results when one protocol fails, so diagnosis
+      # Preserve independent results when one protocol fails, so diagnosis
       # and a focused fix do not require rebuilding an interrupted sibling.
       fail-fast: false
       matrix:
@@ -518,6 +520,8 @@ jobs:
             flags: "--features swift"
           - name: sftp
             flags: "--features sftp"
+          - name: http3
+            flags: "--features http3,swift"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:

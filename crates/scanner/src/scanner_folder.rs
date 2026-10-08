@@ -1806,14 +1806,6 @@ impl FolderScanner {
                     continue;
                 }
 
-                // Do not start another metadata read while foreground work is
-                // active. The post-object timer protects the next request only
-                // after the read has already been dispatched; this admission
-                // point keeps the scanner from extending a single-disk I/O
-                // burst across foreground requests.
-                if crate::workload_admission::foreground_workload_activity() > 0 {
-                    self.sleeper.sleep_folder().await;
-                }
                 let timer = self.sleeper.timer();
 
                 let heal_enabled = this_hash.mod_alt(
@@ -2416,7 +2408,12 @@ impl FolderScanner {
                             options.walkdir_stall_timeout,
                         ));
                     }
-                    if let Err(e) = list_path_raw(child_ctx_clone.clone(), options).await {
+                    if let Err(e) = crate::storage_api::ecstore_with_background_disk_io(
+                        child_ctx_clone.clone(),
+                        list_path_raw(child_ctx_clone.clone(), options),
+                    )
+                    .await
+                    {
                         if is_missing_path_disk_error(&e) {
                             debug!(
                                 target: "rustfs::scanner::folder",

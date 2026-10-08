@@ -434,15 +434,23 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     let new_cred = &session.credentials;
     let subject = authorization.claims.session_identity();
 
-    // Build XML response (AssumeRoleWithWebIdentityResponse)
-    let expiration = new_cred
+    let xml = assume_role_with_web_identity_response_xml(new_cred, &subject);
+
+    let mut resp = S3Response::new((StatusCode::OK, Body::from(xml.into_bytes())));
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    Ok(resp)
+}
+
+fn assume_role_with_web_identity_response_xml(credentials: &rustfs_credentials::Credentials, subject: &str) -> String {
+    let expiration = credentials
         .expiration
         .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
     let exp_str = expiration
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
 
-    let xml = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <AssumeRoleWithWebIdentityResult>
@@ -455,17 +463,12 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     <SubjectFromWebIdentityToken>{}</SubjectFromWebIdentityToken>
   </AssumeRoleWithWebIdentityResult>
 </AssumeRoleWithWebIdentityResponse>"#,
-        xml_escape(&new_cred.access_key),
-        xml_escape(&new_cred.secret_key),
-        xml_escape(&new_cred.session_token),
+        xml_escape(&credentials.access_key),
+        xml_escape(&credentials.secret_key),
+        xml_escape(&credentials.session_token),
         xml_escape(&exp_str),
-        xml_escape(&subject),
-    );
-
-    let mut resp = S3Response::new((StatusCode::OK, Body::from(xml.into_bytes())));
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-    Ok(resp)
+        xml_escape(subject),
+    )
 }
 
 /// Escape special XML characters in a string.
@@ -559,6 +562,33 @@ mod tests {
         assert_eq!(xml_escape("a&b"), "a&amp;b");
         assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
         assert_eq!(xml_escape("it's"), "it&apos;s");
+    }
+
+    #[test]
+    fn web_identity_response_xml_preserves_wire_shape() {
+        let credentials = rustfs_credentials::Credentials {
+            access_key: "access<key".to_string(),
+            secret_key: "secret&key".to_string(),
+            session_token: "session\"token".to_string(),
+            expiration: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            assume_role_with_web_identity_response_xml(&credentials, "subject'name"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>access&lt;key</AccessKeyId>
+      <SecretAccessKey>secret&amp;key</SecretAccessKey>
+      <SessionToken>session&quot;token</SessionToken>
+      <Expiration>1970-01-01T00:00:00Z</Expiration>
+    </Credentials>
+    <SubjectFromWebIdentityToken>subject&apos;name</SubjectFromWebIdentityToken>
+  </AssumeRoleWithWebIdentityResult>
+</AssumeRoleWithWebIdentityResponse>"#
+        );
     }
 
     #[test]

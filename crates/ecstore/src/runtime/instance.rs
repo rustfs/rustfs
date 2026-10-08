@@ -72,10 +72,19 @@ pub(crate) const SCANNER_PUBLICATION_LEASE_MAX_ENTRIES: usize = 256;
 /// have started movement after the lease was abandoned.
 pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Observational leases hold data-movement fencing but may coexist with
+/// ordinary namespace commits; authoritative leases require a stable namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScannerPublicationLeasePurpose {
+    Authoritative,
+    Observational,
+}
+
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
-    pub(crate) namespace_generation: u64,
+    pub(crate) namespace_generation: Option<u64>,
+    pub(crate) purpose: ScannerPublicationLeasePurpose,
     pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
 }
 
@@ -306,7 +315,8 @@ impl InstanceContext {
         token: Uuid,
         expires_at: Instant,
         movement_generation: u64,
-        namespace_generation: u64,
+        namespace_generation: Option<u64>,
+        purpose: ScannerPublicationLeasePurpose,
         operation_guard: OwnedRwLockReadGuard<()>,
     ) -> bool {
         let mut leases = self.scanner_publication_leases.lock().await;
@@ -319,6 +329,7 @@ impl InstanceContext {
                 expires_at,
                 movement_generation,
                 namespace_generation,
+                purpose,
                 _operation_guard: operation_guard,
             },
         );
@@ -329,21 +340,24 @@ impl InstanceContext {
         self.scanner_publication_leases.lock().await.remove(&token).is_some()
     }
 
-    /// Return both generations from the same live lease while the caller holds
-    /// the movement read guard. Namespace commits do not take that guard, so
-    /// the caller must compare the saved namespace generation after this await.
+    /// Return the generations and purpose from the same live lease while the
+    /// caller holds the movement read guard. Namespace commits do not take that
+    /// guard, so strict leases compare their saved generation after this await.
     /// The process-owned table rejects tokens from a prior instance or expiry.
-    pub(crate) async fn scanner_publication_lease_generations(&self, token: Uuid) -> Option<(u64, u64)> {
+    pub(crate) async fn scanner_publication_lease_generations(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let (expires_at, movement_generation, namespace_generation) = leases
+        let (expires_at, movement_generation, namespace_generation, purpose) = leases
             .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation))?;
+            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation, entry.purpose))?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some((movement_generation, namespace_generation))
+        Some((movement_generation, namespace_generation, purpose))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
@@ -859,12 +873,22 @@ mod tests {
         let gate = ctx.data_movement_operation_gate();
         let permit = gate.clone().read_owned().await;
         assert!(
-            ctx.install_scanner_publication_lease(token, Instant::now() + SCANNER_PUBLICATION_LEASE_TTL, 7, 11, permit)
-                .await
+            ctx.install_scanner_publication_lease(
+                token,
+                Instant::now() + SCANNER_PUBLICATION_LEASE_TTL,
+                7,
+                Some(11),
+                ScannerPublicationLeasePurpose::Authoritative,
+                permit,
+            )
+            .await
         );
         drop(ctx.begin_namespace_commit());
         assert_eq!(ctx.namespace_commit_generation(), 2);
-        assert_eq!(ctx.scanner_publication_lease_generations(token).await, Some((7, 11)));
+        assert_eq!(
+            ctx.scanner_publication_lease_generations(token).await,
+            Some((7, Some(11), ScannerPublicationLeasePurpose::Authoritative))
+        );
         assert!(gate.clone().try_write_owned().is_err(), "lookup must retain the stored permit");
         tokio::time::advance(SCANNER_PUBLICATION_LEASE_TTL).await;
         assert_eq!(ctx.scanner_publication_lease_generations(token).await, None);

@@ -34,6 +34,7 @@ use futures::future::Either;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
+#[cfg(test)]
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
@@ -639,11 +640,12 @@ fn is_console_redirect_request<B>(req: &HttpRequest<B>) -> bool {
         && (path.is_empty() || path == "/rustfs" || path == "/index.html")
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for RedirectService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for RedirectService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Default + Send + 'static,
     GrpcBody: Send + 'static,
 {
@@ -655,7 +657,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let path = req.uri().path().trim_end_matches('/');
         if is_console_redirect_request(&req) {
             debug!("Redirecting browser request from {} to console", path);

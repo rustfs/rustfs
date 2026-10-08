@@ -75,6 +75,9 @@ pub enum Error {
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
 
+    #[error("Dangling object cleanup deferred until UNIX time {retry_not_before}")]
+    DanglingDeleteDeferred { retry_not_before: u64 },
+
     #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
     StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
 
@@ -123,7 +126,7 @@ impl Error {
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
-            Error::ReplacementTargetNotReady(_) => true,
+            Error::ReplacementTargetNotReady(_) | Error::DanglingDeleteDeferred { .. } => true,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
@@ -193,6 +196,9 @@ impl Error {
     }
 
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
+        if let Self::DanglingDeleteDeferred { retry_not_before } = self {
+            return std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(*retry_not_before));
+        }
         let after = match self {
             Self::Storage(error) => error.dangling_delete_retry_after(),
             Self::Disk(error) => error.dangling_delete_retry_after(),
@@ -204,6 +210,7 @@ impl Error {
 
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
         match self {
+            Error::DanglingDeleteDeferred { .. } => true,
             Error::Storage(err) => err.is_dangling_delete_grace(),
             Error::Disk(err) => err.is_dangling_delete_grace(),
             Error::Io(err) => DiskError::io_error_is_dangling_delete_grace(err),

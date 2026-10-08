@@ -2632,7 +2632,10 @@ fn table_credential_ttl_seconds() -> i64 {
         .unwrap_or(DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS)
 }
 
-fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<TableCredentialScope> {
+fn table_credential_scope(
+    entry: &crate::table_catalog::TableEntry,
+    metadata: &serde_json::Value,
+) -> S3Result<TableCredentialScope> {
     let location = entry
         .warehouse_location
         .strip_prefix("s3://")
@@ -2645,17 +2648,13 @@ fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<
     }
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
     validate_persisted_table_metadata_location(entry, &entry.metadata_location)?;
+    // Rename preserves the metadata pointer; ownership follows its UUID and warehouse, not its old path identifier.
+    validate_persisted_table_metadata(entry, metadata, true)?;
     let metadata_object =
         crate::table_catalog::table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
             .ok_or_else(|| persisted_metadata_error("table"))?;
-    let namespace = crate::table_catalog::Namespace::parse(&entry.namespace).map_err(|_| persisted_metadata_error("table"))?;
-    let table =
-        crate::table_catalog::IdentifierSegment::parse(entry.table.clone()).map_err(|_| persisted_metadata_error("table"))?;
-    if crate::table_catalog::is_reserved_table_object_key(&metadata_object)
-        && !crate::table_catalog::is_valid_table_metadata_location(&namespace, &table, &metadata_object)
-    {
-        return Err(persisted_metadata_error("table"));
-    }
+    crate::table_catalog::Namespace::parse(&entry.namespace).map_err(|_| persisted_metadata_error("table"))?;
+    crate::table_catalog::IdentifierSegment::parse(entry.table.clone()).map_err(|_| persisted_metadata_error("table"))?;
     let metadata_scope_prefix = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
     Ok(TableCredentialScope {
         warehouse_scope_prefix: format!("s3://{bucket}/{object_prefix}"),
@@ -2920,13 +2919,14 @@ fn add_table_credential_scope_config(config: &mut BTreeMap<String, String>, scop
 
 async fn load_credentials_response_from_entry(
     entry: &crate::table_catalog::TableEntry,
+    metadata: &serde_json::Value,
     issuer: &dyn TableCredentialIssuer,
     principal: Option<&rustfs_credentials::Credentials>,
 ) -> S3Result<RestLoadCredentialsResponse> {
     if !issuer.enabled() {
         return Ok(client_provided_credentials_response(CREDENTIAL_VENDING_DISABLED_REASON));
     }
-    let scope = table_credential_scope(entry)?;
+    let scope = table_credential_scope(entry, metadata)?;
     let request = TableCredentialIssueRequest {
         entry,
         principal,
@@ -2976,7 +2976,7 @@ async fn enrich_load_table_response_with_credentials(
     issuer: &dyn TableCredentialIssuer,
     principal: Option<&rustfs_credentials::Credentials>,
 ) -> S3Result<RestLoadTableResponse> {
-    let credential_response = load_credentials_response_from_entry(entry, issuer, principal).await?;
+    let credential_response = load_credentials_response_from_entry(entry, &response.metadata, issuer, principal).await?;
     Ok(apply_credentials_to_load_table_response(response, credential_response))
 }
 
@@ -6176,6 +6176,7 @@ where
 
 async fn load_credentials_response<S>(
     store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -6192,7 +6193,12 @@ where
     else {
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
-    load_credentials_response_from_entry(&entry, issuer, principal).await
+    let metadata = if issuer.enabled() {
+        read_persisted_table_metadata_for_entry(metadata_backend, &entry, &entry.metadata_location, true).await?
+    } else {
+        serde_json::Value::Null
+    };
+    load_credentials_response_from_entry(&entry, &metadata, issuer, principal).await
 }
 
 async fn get_table_metadata_location_response<S>(

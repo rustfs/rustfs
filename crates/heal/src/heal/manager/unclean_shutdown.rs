@@ -46,6 +46,12 @@ pub(super) fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: 
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
 
+pub(super) fn durable_replacement_recovery_is_waiting_for_grace(state: &ResumeState, task_id: &str, now: u64) -> bool {
+    !state.completed
+        && durable_replacement_recovery_is_due(state, task_id)
+        && state.dangling_delete_retry_not_before.is_some_and(|deadline| deadline > now)
+}
+
 pub(super) fn replacement_discovery_error_is_expected_for_deferred_endpoint(
     error: &Error,
     endpoint: &str,
@@ -371,6 +377,15 @@ impl HealManager {
                     }
                 };
                 let mut state = manager.get_state().await;
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if durable_replacement_recovery_is_waiting_for_grace(&state, &task_id, now) {
+                    // Discovery already reserved this set. Keep the original
+                    // generation and its markers until the storage deadline.
+                    continue;
+                }
                 if replacement_retry_is_exhausted_active(&state) {
                     match manager.rearm_replacement_recovery_if_needed(self.storage.as_ref()).await {
                         Ok(true) => state = manager.get_state().await,

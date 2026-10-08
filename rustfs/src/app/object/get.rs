@@ -1481,6 +1481,14 @@ impl<R> GetObjectStreamingReader<R> {
                 state = "stall_timeout",
                 "GetObject streaming body stalled"
             );
+            if self.emitted < self.expected && self.resume.is_some() && !self.resume_in_flight() {
+                self.begin_resume(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "get object streaming body stall timeout",
+                ));
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             self.finish_err();
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -3943,6 +3951,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         self.execute_get_object_boxed(req).await
     }
@@ -7795,6 +7804,40 @@ mod tests {
         }
     }
 
+    struct PendingAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        pending_after_data: bool,
+    }
+
+    impl PendingAfterReader {
+        fn new(data: &[u8], pending_after_data: bool) -> Self {
+            Self {
+                data: std::io::Cursor::new(data.to_vec()),
+                pending_after_data,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingAfterReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).unwrap_or(usize::MAX);
+            let source_len = self.data.get_ref().len();
+            if position >= source_len {
+                if self.pending_after_data {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            let want = buf.remaining().min(source_len - position);
+            if want == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&self.data.get_ref()[position..position + want]);
+            self.data.set_position(u64::try_from(position + want).unwrap_or(u64::MAX));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn relocation_read_error() -> std::io::Error {
         std::io::Error::other(StorageError::FileNotFound)
     }
@@ -8003,6 +8046,63 @@ mod tests {
             assert_eq!(out, b"hello world");
             assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_object_streaming_reader_resumes_after_body_stall() {
+        use tokio::io::AsyncReadExt;
+
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let reopen: GetObjectReopen<PendingAfterReader> = Box::new({
+            let reopen_count = Arc::clone(&reopen_count);
+            move |emitted| {
+                assert_eq!(emitted, 6, "resume must continue at the delivered byte offset");
+                reopen_count.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(PendingAfterReader::new(b"world", false)) })
+            }
+        });
+        let control = GetObjectResumeControl::new(
+            reopen,
+            RetryTimer::new(
+                GET_OBJECT_RESUME_MAX_ATTEMPTS,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                rustfs_utils::retry::NO_JITTER,
+                0,
+            ),
+        );
+        let mut reader = GetObjectStreamingReader::new(
+            PendingAfterReader::new(b"hello ", true),
+            "test-bucket",
+            "stalled-object",
+            "req-resume-stall",
+            None,
+            11,
+            Duration::from_secs(1),
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        );
+
+        let mut first = [0; 6];
+        assert_eq!(reader.read(&mut first).await.expect("initial bytes must be readable"), 6);
+        assert_eq!(&first, b"hello ");
+
+        let mut tail = Vec::new();
+        let read_to_end = reader.read_to_end(&mut tail);
+        tokio::pin!(read_to_end);
+        assert!(
+            futures::poll!(&mut read_to_end).is_pending(),
+            "the body should stall before the watchdog fires"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(3)).await;
+
+        read_to_end
+            .await
+            .expect("a timed-out source read must resume from the same object version");
+        assert_eq!(tail, b"world");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]

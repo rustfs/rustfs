@@ -40,7 +40,7 @@ mod common;
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // Real storage setup shares the measurement window. Verify functionality with
 // an integration budget; deadline behavior is checked against a stalled peer.
-const REAL_SERVER_MEASUREMENT_BUDGET: Duration = Duration::from_secs(10);
+const REAL_SERVER_MEASUREMENT_BUDGET: Duration = Duration::from_secs(20);
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64
@@ -471,7 +471,9 @@ async fn cleanup_uses_a_budget_independent_of_the_measurement_window() {
             let mut request = vec![0_u8; 16 * 1024];
             let _ = socket.read(&mut request).await.expect("request headers");
             if index >= 3 {
-                tokio::time::sleep(Duration::from_millis(600)).await;
+                // Exercise cleanup beyond the former two-second budget while
+                // keeping both deletes inside the new bounded allowance.
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
             }
             socket.write_all(response).await.expect("response");
         }

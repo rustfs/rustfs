@@ -23,8 +23,8 @@ mod transaction;
 pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
 pub use model::{
-    FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedSession,
-    FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM,
+    FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedProviderRef,
+    FederatedSession, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM, VerifiedFederatedIdentity,
 };
 pub use provider::FederatedIdentityProvider;
 pub use registry::FederatedIdentityRegistry;
