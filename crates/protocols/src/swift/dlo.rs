@@ -22,7 +22,7 @@ use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, container, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use std::collections::HashMap;
 
 /// ObjectInfo represents metadata about an object (from container listings)
@@ -268,9 +268,8 @@ pub async fn handle_dlo_get(
         response = response.header("content-type", ct);
     }
 
-    // Convert stream to Body
-    let axum_body = axum::body::Body::from_stream(segment_stream);
-    let body = Body::http_body_unsync(axum_body);
+    // The segment fetches hold storage futures that are Send but not Sync.
+    let body = Body::from_stream(sync_wrapper::SyncStream::new(segment_stream));
 
     response
         .body(body)

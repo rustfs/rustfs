@@ -12,6 +12,6 @@
 # s3_error_lines  lines holding s3_error!, same scope, minus those the script
 #                 header's rule clears (rustfs_s3_types's macro); fails closed
 # ecstore_files   Rust files referencing s3s paths under crates/ecstore/src
-files=202
+files=195
 s3_error_lines=1585
 ecstore_files=36

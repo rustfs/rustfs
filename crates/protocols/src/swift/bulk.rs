@@ -78,7 +78,7 @@ use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
 use futures::StreamExt;
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
