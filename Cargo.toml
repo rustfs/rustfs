@@ -180,7 +180,7 @@ tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
-quinn = { version = "0.11.11", default-features = false, features = [
+quinn = { version = "0.11.12", default-features = false, features = [
       "futures-io",
       "runtime-tokio",
       "rustls-aws-lc-rs",
@@ -268,7 +268,7 @@ crossbeam-queue = "0.3.14"
 crossbeam-channel = "0.5.17"
 crossbeam-deque = "0.8.8"
 crossbeam-utils = "0.8.23"
-datafusion = { default-features = false, version = "55.1.0" }
+datafusion = { default-features = false, version = "55.2.0" }
 derive_builder = "0.20.2"
 ed25519-dalek = "3.0.0"
 enumset = "1.1.14"
@@ -319,7 +319,7 @@ rumqttc = { package = "rumqttc-next", version = "0.34.0" }
 redis = { version = "1.7.1" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.5" }
-rust-embed = { version = "8.12.0" }
+rust-embed = { version = "8.13.0" }
 rustc-hash = { version = "2.1.3" }
 s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
 s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
@@ -383,7 +383,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.6" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.28.3", default-features = false }
+hotpath = { version = "0.28.5", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
