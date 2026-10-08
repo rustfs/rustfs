@@ -19831,6 +19831,569 @@ fn resolver_builds_paths_under_reserved_table_boundary() {
     );
 }
 
+async fn seed_migrated_renamed_table_for_drop(
+    backend: &TestCatalogObjectBackend,
+    destination_namespace: &str,
+) -> (
+    ObjectTableCatalogStore<TestCatalogObjectBackend>,
+    StrongTableCatalogStore<TestCatalogObjectBackend>,
+    TableEntry,
+) {
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").unwrap();
+    let source_table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json");
+    let next = default_table_metadata_file_path(&source_namespace, &source_table, "00002.metadata.json");
+    let object_store = ObjectTableCatalogStore::new(backend.clone());
+    seed_table_for_metadata_maintenance(&object_store, bucket, &source_namespace, &source_table, current.clone()).await;
+    if destination_namespace != "sales" {
+        let destination = Namespace::parse(destination_namespace).unwrap();
+        object_store
+            .create_namespace(test_namespace_entry(bucket, &destination))
+            .await
+            .unwrap();
+    }
+    let original = object_store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
+    let mut metadata = super::test_support::table_metadata_json(&original.table_uuid, &original.warehouse_location);
+    metadata["format-version"] = serde_json::json!(original.format_version);
+    backend
+        .seed_object(bucket, &next, serde_json::to_vec(&metadata).unwrap())
+        .await;
+    backend
+        .seed_object(bucket, "tables/table-id/data/file.parquet", b"retained data".to_vec())
+        .await;
+    let source = object_store
+        .commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: source_namespace.public_name(),
+            table: source_table.as_str().to_string(),
+            commit_id: "rename-drop-commit".to_string(),
+            idempotency_key: Some("rename-drop-request".to_string()),
+            operation: "update-metadata".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current,
+            new_metadata_location: next,
+            requirements: Vec::new(),
+            writer: Some("rename-drop-test".to_string()),
+        })
+        .await
+        .unwrap()
+        .table;
+    let migration = object_store
+        .materialize_durable_strong_backing_migration(bucket)
+        .await
+        .unwrap();
+    assert!(migration.object_backed_writes_fenced);
+    assert!(migration.ready_to_enable_durable_strong);
+
+    let store = StrongTableCatalogStore::new(backend.clone());
+    store
+        .rename_table(bucket, "sales", "orders", destination_namespace, "orders_v2")
+        .await
+        .unwrap();
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    let renamed = store
+        .load_table(bucket, destination_namespace, "orders_v2")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected = source;
+    expected.namespace = destination_namespace.to_string();
+    expected.table = "orders_v2".to_string();
+    assert_eq!(renamed, expected);
+
+    // Migration leaves the object index at the old identifier; the strong snapshot owns the rename.
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let (index, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(index.state, TableCatalogEntryState::Active);
+    assert_eq!(index.namespace, "sales");
+    assert_eq!(index.table, "orders");
+    assert_eq!(index.table_id, renamed.table_id);
+    assert_eq!(index.warehouse_object_prefix, "tables/table-id/");
+    (object_store, store, renamed)
+}
+
+#[tokio::test]
+async fn strong_catalog_migrated_renamed_table_drop_preserves_recreated_source() {
+    for destination_namespace in ["sales", "curated"] {
+        let backend = TestCatalogObjectBackend::default();
+        let (object_store, store, renamed) = seed_migrated_renamed_table_for_drop(&backend, destination_namespace).await;
+        let bucket = "analytics";
+        let source_namespace = Namespace::parse("sales").unwrap();
+        let source_table = IdentifierSegment::parse("orders").unwrap();
+        let mut replacement = test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001-replacement.metadata.json"),
+        );
+        replacement.table_id = "replacement-table-id".to_string();
+        replacement.table_uuid = "replacement-table-uuid".to_string();
+        replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+        store.create_table(replacement.clone()).await.unwrap();
+
+        let restarted = StrongTableCatalogStore::new(backend.clone());
+        assert_eq!(
+            restarted
+                .load_table(bucket, destination_namespace, "orders_v2")
+                .await
+                .unwrap(),
+            Some(renamed.clone())
+        );
+        restarted
+            .drop_table(bucket, destination_namespace, "orders_v2")
+            .await
+            .expect("a migrated renamed table should drop");
+
+        let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+        let (tombstone, _) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = table_warehouse_index_entry(&renamed).unwrap();
+        expected.state = TableCatalogEntryState::Deleted;
+        assert_eq!(tombstone, expected);
+
+        for reader in [restarted, StrongTableCatalogStore::new(backend.clone())] {
+            assert!(
+                reader
+                    .load_table(bucket, destination_namespace, "orders_v2")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(reader.load_table(bucket, "sales", "orders").await.unwrap(), Some(replacement.clone()));
+            assert!(
+                reader
+                    .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reader
+                    .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let retained = reader
+                .resolve_table_data_plane_resource(bucket, "tables/table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.table_id, renamed.table_id);
+            assert_eq!(retained.namespace, destination_namespace);
+            assert_eq!(retained.table, "orders_v2");
+            assert_eq!(retained.warehouse_object_prefix, "tables/table-id/");
+            let recreated = reader
+                .resolve_table_data_plane_resource(bucket, "tables/replacement-table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recreated.table_id, replacement.table_id);
+            assert_eq!(recreated.namespace, "sales");
+            assert_eq!(recreated.table, "orders");
+        }
+        assert_eq!(
+            backend
+                .read_object(bucket, "tables/table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            b"retained data".to_vec()
+        );
+        let retained_metadata = backend
+            .read_object(bucket, &renamed.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&retained_metadata.data).unwrap();
+        assert_eq!(metadata["table-uuid"].as_str(), Some(renamed.table_uuid.as_str()));
+        assert_eq!(metadata["location"].as_str(), Some(renamed.warehouse_location.as_str()));
+        assert_eq!(metadata["format-version"].as_u64(), Some(u64::from(renamed.format_version)));
+    }
+}
+
+#[tokio::test]
+async fn strong_catalog_migrated_renamed_table_drop_rejects_foreign_or_transient_index() {
+    for (state, table_id) in [
+        (TableCatalogEntryState::Active, "other-table-id"),
+        (TableCatalogEntryState::Renaming, "table-id"),
+        (TableCatalogEntryState::Deleting, "table-id"),
+    ] {
+        let backend = TestCatalogObjectBackend::default();
+        let (object_store, store, renamed) = seed_migrated_renamed_table_for_drop(&backend, "curated").await;
+        let bucket = "analytics";
+        let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+        let (mut conflicting_index, _) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        conflicting_index.state = state;
+        conflicting_index.table_id = table_id.to_string();
+        object_store
+            .write_entry(RUSTFS_META_BUCKET, &index_path, &conflicting_index, TableCatalogPutPrecondition::Any)
+            .await
+            .unwrap();
+        let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+        let before_snapshot = backend
+            .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_index = backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap().unwrap();
+
+        assert_matches!(
+            store.drop_table(bucket, "curated", "orders_v2").await,
+            Err(TableCatalogStoreError::Conflict(message)) if message.contains("owner changed")
+        );
+        assert_eq!(
+            backend.read_object(RUSTFS_META_BUCKET, &snapshot_path).await.unwrap(),
+            Some(before_snapshot)
+        );
+        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap(), Some(before_index));
+        let (retained_index, _) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_index, conflicting_index);
+        let restarted = StrongTableCatalogStore::new(backend);
+        assert_eq!(restarted.load_table(bucket, "curated", "orders_v2").await.unwrap(), Some(renamed.clone()));
+        assert!(
+            restarted
+                .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            restarted
+                .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn strong_catalog_migrated_renamed_table_drop_recovers_after_index_and_snapshot_write_failures() {
+    for (target_index, after_put) in [(true, false), (true, true), (false, false), (false, true)] {
+        let backend = TestCatalogObjectBackend::default();
+        let (object_store, store, renamed) = seed_migrated_renamed_table_for_drop(&backend, "curated").await;
+        let bucket = "analytics";
+        let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+        let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+        let before_snapshot = backend
+            .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let (before_index, before_index_etag) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let target = if target_index { &index_path } else { &snapshot_path };
+        if after_put {
+            backend.fail_after_next_put(RUSTFS_META_BUCKET, target).await;
+        } else {
+            backend.fail_next_put(RUSTFS_META_BUCKET, target).await;
+        }
+
+        let result = store.drop_table(bucket, "curated", "orders_v2").await;
+        let snapshot_committed = !target_index && after_put;
+        if snapshot_committed {
+            result.expect("a committed drop should recover through the snapshot postcondition");
+        } else {
+            assert_matches!(result, Err(TableCatalogStoreError::Internal(_)));
+        }
+        let after_snapshot = backend
+            .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+            .await
+            .unwrap()
+            .unwrap();
+        if snapshot_committed {
+            assert_ne!(after_snapshot.etag, before_snapshot.etag);
+        } else {
+            assert_eq!(after_snapshot, before_snapshot);
+        }
+        let (after_index, after_index_etag) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected_tombstone = table_warehouse_index_entry(&renamed).unwrap();
+        expected_tombstone.state = TableCatalogEntryState::Deleted;
+        if target_index && !after_put {
+            assert_eq!(after_index, before_index);
+            assert_eq!(after_index_etag, before_index_etag);
+        } else {
+            assert_eq!(after_index, expected_tombstone);
+            assert_ne!(after_index_etag, before_index_etag);
+        }
+
+        let restarted = StrongTableCatalogStore::new(backend.clone());
+        if !snapshot_committed {
+            assert_eq!(restarted.load_table(bucket, "curated", "orders_v2").await.unwrap(), Some(renamed.clone()));
+            let active = restarted
+                .resolve_table_data_plane_resource(bucket, "tables/table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.table_id, renamed.table_id);
+            assert_eq!(active.namespace, "curated");
+            assert_eq!(active.table, "orders_v2");
+            assert!(
+                restarted
+                    .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                restarted
+                    .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            restarted
+                .drop_table(bucket, "curated", "orders_v2")
+                .await
+                .expect("a fresh store should safely retry the interrupted drop");
+        }
+        for reader in [restarted, StrongTableCatalogStore::new(backend.clone())] {
+            assert!(reader.load_table(bucket, "curated", "orders_v2").await.unwrap().is_none());
+            assert!(reader.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+            assert!(
+                reader
+                    .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reader
+                    .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let retained = reader
+                .resolve_table_data_plane_resource(bucket, "tables/table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.table_id, renamed.table_id);
+            assert_eq!(retained.namespace, "curated");
+            assert_eq!(retained.table, "orders_v2");
+        }
+        let (final_index, _) = object_store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_index, expected_tombstone);
+        assert_eq!(
+            backend
+                .read_object(bucket, "tables/table-id/data/file.parquet")
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            b"retained data".to_vec()
+        );
+        let retained_metadata = backend
+            .read_object(bucket, &renamed.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&retained_metadata.data).unwrap();
+        assert_eq!(metadata["table-uuid"].as_str(), Some(renamed.table_uuid.as_str()));
+        assert_eq!(metadata["location"].as_str(), Some(renamed.warehouse_location.as_str()));
+        assert_eq!(metadata["format-version"].as_u64(), Some(u64::from(renamed.format_version)));
+    }
+}
+
+#[tokio::test]
+async fn object_catalog_renamed_table_drop_rejects_same_id_index_at_a_stale_identifier() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let source_table = IdentifierSegment::parse("orders").unwrap();
+    let destination_table = IdentifierSegment::parse("orders_v2").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &source_table, "00001.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &source_table, current).await;
+    store
+        .rename_table(bucket, "sales", "orders", "sales", "orders_v2")
+        .await
+        .unwrap();
+    let renamed = store.load_table(bucket, "sales", "orders_v2").await.unwrap().unwrap();
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let (mut stale_index, _) = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale_index, table_warehouse_index_entry(&renamed).unwrap());
+    stale_index.namespace = "sales".to_string();
+    stale_index.table = "orders".to_string();
+    store
+        .write_entry(RUSTFS_META_BUCKET, &index_path, &stale_index, TableCatalogPutPrecondition::Any)
+        .await
+        .unwrap();
+    let entry_path = store.paths.table_entry_path(bucket, &namespace, &destination_table);
+    let before_entry = backend.read_object(RUSTFS_META_BUCKET, &entry_path).await.unwrap().unwrap();
+    let before_index = backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap().unwrap();
+
+    assert_matches!(
+        store.drop_table(bucket, "sales", "orders_v2").await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("owner changed")
+    );
+    assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &entry_path).await.unwrap(), Some(before_entry));
+    assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap(), Some(before_index));
+    assert_eq!(store.load_table(bucket, "sales", "orders_v2").await.unwrap(), Some(renamed));
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn strong_catalog_migrated_renamed_table_drop_preserves_a_racing_foreign_index_owner() {
+    let backend = TestCatalogObjectBackend::default();
+    let (object_store, store, renamed) = seed_migrated_renamed_table_for_drop(&backend, "curated").await;
+    let bucket = "analytics";
+    let index_path = object_store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+    let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+    let before_snapshot = backend
+        .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let (original_index, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut foreign_index = original_index.clone();
+    foreign_index.table_id = "foreign-table-id".to_string();
+    foreign_index.namespace = "finance".to_string();
+    foreign_index.table = "returns".to_string();
+    let foreign_bytes = serde_json::to_vec(&foreign_index).unwrap();
+    let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &index_path).await;
+    let mut drop_task = tokio::spawn(async move { store.drop_table("analytics", "curated", "orders_v2").await });
+    let started = tokio::time::timeout(StdDuration::from_secs(10), async {
+        tokio::select! {
+            () = pause.wait_started() => {},
+            result = &mut drop_task => panic!("drop finished before its warehouse index CAS: {result:?}"),
+        }
+    })
+    .await;
+    if started.is_err() {
+        drop_task.abort();
+        pause.release();
+        let _ = drop_task.await;
+        panic!("drop did not reach its warehouse index CAS within ten seconds");
+    }
+
+    // Bypass the held local index lock to model a competing durable write before the CAS.
+    let replacement = backend
+        .put_object(RUSTFS_META_BUCKET, &index_path, foreign_bytes, TableCatalogPutPrecondition::Any)
+        .await;
+    let racing_index = backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap().unwrap();
+    pause.release();
+    replacement.expect("the competing durable index write should succeed");
+    let completed = tokio::time::timeout(StdDuration::from_secs(10), &mut drop_task).await;
+    let result = match completed {
+        Ok(joined) => joined.expect("drop task should join"),
+        Err(_) => {
+            drop_task.abort();
+            let _ = drop_task.await;
+            panic!("drop did not finish after its index CAS was released");
+        }
+    };
+    assert_matches!(
+        result,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("object changed") && message.contains(&index_path)
+    );
+    assert_eq!(
+        backend.read_object(RUSTFS_META_BUCKET, &snapshot_path).await.unwrap(),
+        Some(before_snapshot)
+    );
+    assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &index_path).await.unwrap(), Some(racing_index));
+    let (retained_index, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained_index, foreign_index);
+    let restarted = StrongTableCatalogStore::new(backend.clone());
+    assert_eq!(restarted.load_table(bucket, "curated", "orders_v2").await.unwrap(), Some(renamed.clone()));
+    assert!(
+        restarted
+            .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        restarted
+            .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    object_store
+        .write_entry(RUSTFS_META_BUCKET, &index_path, &original_index, TableCatalogPutPrecondition::Any)
+        .await
+        .unwrap();
+    let retry = StrongTableCatalogStore::new(backend.clone());
+    retry
+        .drop_table(bucket, "curated", "orders_v2")
+        .await
+        .expect("restoring the stable owner should allow a fresh-store retry");
+    let final_reader = StrongTableCatalogStore::new(backend);
+    assert!(
+        final_reader
+            .load_table(bucket, "curated", "orders_v2")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        final_reader
+            .get_commit_by_id(bucket, &renamed.table_id, "rename-drop-commit")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        final_reader
+            .get_commit_by_idempotency_key(bucket, &renamed.table_id, "rename-drop-request")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (tombstone, _) = object_store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected_tombstone = table_warehouse_index_entry(&renamed).unwrap();
+    expected_tombstone.state = TableCatalogEntryState::Deleted;
+    assert_eq!(tombstone, expected_tombstone);
+}
+
 #[tokio::test]
 async fn strong_catalog_table_rename_is_atomic_and_preserves_stable_table_state() {
     let backend = TestCatalogObjectBackend::default();
