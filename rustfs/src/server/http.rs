@@ -23,10 +23,13 @@ use crate::server::{
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
-        ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
-        PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
-        SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        ConditionalCorsLayer, ExternalRequestContextLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer,
+        RequestLoggingLayer, redact_sensitive_uri_query,
+    },
+    legacy_compat::{
+        BodylessStatusFixLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
+        IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
+        StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     ssec_transport::SsecTransportLayer,
@@ -2337,6 +2340,9 @@ fn process_connection(
         // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
+        // `tests::stack_census` pins this order against the real `external_service_stack!`
+        // expansion. Layers 5, 6, 15, 16, 17, 20, 21, 23, 24 and 25 patch s3s and live in
+        // `server::legacy_compat`; T2.12 (rustfs/backlog#2771) removes them.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -4636,5 +4642,151 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), task).await??;
         driver.abort();
         Ok(())
+    }
+
+    /// The external stack census: the service chain `external_service_stack!`
+    /// nests, outermost first, committed here on purpose rather than derived
+    /// from the macro so that a reorder, insertion or removal is a visible diff.
+    /// Optional layers (`option_layer`, `Either`) are listed because their type
+    /// is part of the chain whether or not the layer is installed at runtime.
+    /// The fixture's own inner service is not part of it. `legacy_compat` marks
+    /// the s3s patch layers that `server::legacy_compat` groups; T2.12
+    /// (rustfs/backlog#2771) reuses this test to prove which layers the gateway
+    /// stack keeps.
+    const EXTERNAL_STACK_CENSUS: [&str; 28] = [
+        "AddExtension",                        // Option<RemoteAddr>
+        "AddExtension",                        // SocketAddr (optional)
+        "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
+        "MapRequest",                          // HTTP/3 forwarded-proto normalisation
+        "ExternalRequestContextService",       //
+        "StsQueryApiCompatService",            // legacy_compat
+        "EmptyBodyContentLengthCompatService", // legacy_compat
+        "CatchPanic",                          //
+        "RateLimitService",                    // optional
+        "SsecTransportService",                // RUSTFS_SSE_C_REQUIRE_TLS
+        "ReadinessGateService",                //
+        "KeystoneAuthMiddleware",              //
+        "InFlightService",                     // in-flight gauge guard
+        "Trace",                               //
+        "RequestLoggingService",               //
+        "Compression",                         //
+        "PathCategoryInjectionService",        // optional
+        "S3ErrorMessageCompatService",         // legacy_compat
+        "IcebergRestErrorCompatService",       // legacy_compat
+        "ObjectAttributesEtagFixService",      // legacy_compat
+        "ConditionalCorsService",              //
+        "RedirectService",                     // optional
+        "BodylessStatusFixService",            // legacy_compat
+        "HeadRequestBodyFixService",           // legacy_compat
+        "PublicHealthEndpointService",         //
+        "VirtualHostStyleHintService",         // legacy_compat, optional
+        "DoubleSlashListBucketsCompatService", // legacy_compat
+        "SigV4HeaderGuardService",             // legacy_compat
+    ];
+
+    /// Walks a `type_name` string along its service chain: at every node the
+    /// last path segment before `<`, then the first generic argument (every
+    /// Tower service in the stack wraps its inner service there), descending
+    /// into the installed branch of an `Either` without listing it. Stops at
+    /// the fixture's `ServiceFn` or at an empty node.
+    fn render_stack_census(type_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = type_name.trim();
+        loop {
+            let (head, args) = match rest.find('<') {
+                Some(open) => (&rest[..open], Some(&rest[open + 1..])),
+                None => (rest, None),
+            };
+            let name = head.rsplit("::").next().unwrap_or(head).trim();
+            if name.is_empty() || name == "ServiceFn" {
+                break;
+            }
+            if name != "Either" {
+                names.push(name.to_owned());
+            }
+            let Some(args) = args else {
+                break;
+            };
+            let mut depth = 0usize;
+            let mut end = args.len();
+            for (index, ch) in args.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' if depth == 0 => {
+                        end = index;
+                        break;
+                    }
+                    '>' => depth -= 1,
+                    ',' if depth == 0 => {
+                        end = index;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            rest = args[..end].trim();
+        }
+        names
+    }
+
+    #[test]
+    fn census_walker_follows_the_inner_service_through_either_and_extra_generics() {
+        let rendered = render_stack_census(
+            "a::Outer<tower::util::either::Either<b::Opt<c::Mid<d::ServiceFn<e::{{closure}}>, f::Extra<g::Inner>>, h::X>, c::Mid<d::ServiceFn<e::{{closure}}>, f::Extra<g::Inner>>>, i::Y>",
+        );
+        assert_eq!(rendered, ["Outer", "Opt", "Mid"]);
+    }
+
+    #[test]
+    fn census_walker_rejects_shapes_that_are_not_a_chain() {
+        assert_eq!(render_stack_census("a::Leaf"), ["Leaf"], "a bare type is a one-node chain");
+        assert_eq!(
+            render_stack_census("d::ServiceFn<e::{{closure}}>"),
+            Vec::<String>::new(),
+            "the fixture alone is empty"
+        );
+        assert_eq!(
+            render_stack_census("tower::util::either::Either<d::ServiceFn<x>, y>"),
+            Vec::<String>::new(),
+            "Either is never listed"
+        );
+        assert_eq!(
+            render_stack_census("a::Outer<"),
+            ["Outer"],
+            "an unterminated argument list ends the chain"
+        );
+    }
+
+    #[test]
+    fn stack_census() {
+        let inner = tower::service_fn(|_request: HttpRequest<Incoming>| async {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(crate::server::hybrid::HybridBody::<
+                s3s::Body,
+                Empty<Bytes>,
+            >::Rest {
+                rest_body: s3s::Body::empty(),
+            }))
+        });
+        let readiness = Arc::new(GlobalReadiness::new());
+        let stack = external_service_stack!(
+            inner,
+            None::<RemoteAddr>,
+            None::<rustfs_trusted_proxies::TrustedProxyLayer>,
+            false,
+            None::<RateLimitLayer>,
+            false,
+            readiness,
+            None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+            HttpCompressionConfig::default(),
+            ServerContextSlot::new(),
+            false
+        );
+        fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}
+        pin_request_type(&stack);
+        let rendered = render_stack_census(std::any::type_name_of_val(&stack));
+        assert_eq!(
+            rendered, EXTERNAL_STACK_CENSUS,
+            "the external stack order drifted from the committed census"
+        );
     }
 }

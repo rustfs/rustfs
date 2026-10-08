@@ -20,6 +20,7 @@ mod health;
 mod http;
 mod hybrid;
 mod layer;
+mod legacy_compat;
 mod module_switch;
 mod prefix;
 pub mod rate_limit;
