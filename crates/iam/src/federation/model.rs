@@ -56,6 +56,10 @@ impl FederatedProviderRef {
     pub fn as_str(&self) -> &str {
         &self.provider_id
     }
+
+    pub(crate) fn into_string(self) -> String {
+        self.provider_id
+    }
 }
 
 #[derive(Clone)]
@@ -80,6 +84,10 @@ impl fmt::Debug for VerifiedFederatedIdentity {
 }
 
 impl VerifiedFederatedIdentity {
+    pub(crate) fn from_claims(provider: FederatedProviderRef, claims: FederatedClaims) -> Self {
+        Self { provider, claims }
+    }
+
     pub fn provider(&self) -> &FederatedProviderRef {
         &self.provider
     }
@@ -110,6 +118,10 @@ impl VerifiedFederatedIdentity {
 
     pub fn session_identity(&self) -> String {
         self.claims.session_identity()
+    }
+
+    pub(crate) fn into_parts(self) -> (FederatedProviderRef, FederatedClaims) {
+        (self.provider, self.claims)
     }
 }
 
@@ -193,6 +205,10 @@ pub(crate) struct OpaqueLogoutContinuation {
 }
 
 impl OpaqueLogoutContinuation {
+    pub(crate) fn new(provider: FederatedProviderRef, id_token: String) -> Self {
+        Self { provider, id_token }
+    }
+
     pub(crate) fn into_parts(self) -> (FederatedProviderRef, String) {
         (self.provider, self.id_token)
     }

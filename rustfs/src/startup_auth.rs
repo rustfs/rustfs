@@ -14,7 +14,7 @@
 
 use rustfs_iam::{
     federation::{
-        FederatedIdentityRegistry, FederatedIdentityService,
+        CoreFederatedAuthorizationMapper, FederatedIdentityService,
         oidc::{OidcConfigQuery, StandardOidcAdapter},
     },
     get_oidc, init_oidc_sys_with_extra_root_ca_provider,
@@ -80,8 +80,8 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
 fn standard_oidc_runtime(oidc: Arc<OidcSys>) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
     let adapter = Arc::new(StandardOidcAdapter::new(oidc));
     let oidc_config_query = adapter.clone();
-    let registry = FederatedIdentityRegistry::new(adapter);
-    (Arc::new(FederatedIdentityService::new(registry)), oidc_config_query)
+    let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+    (Arc::new(adapter.into_service(mapper)), oidc_config_query)
 }
 
 pub(crate) fn oidc_extra_root_ca_provider() -> OidcExtraRootCaProvider {

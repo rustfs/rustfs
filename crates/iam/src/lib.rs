@@ -20,10 +20,11 @@ use store::object::ObjectStore;
 use sys::IamSys;
 use tracing::{debug, error, info, instrument, warn};
 
-const LOG_COMPONENT_IAM: &str = "iam";
+pub(crate) const LOG_COMPONENT_IAM: &str = "iam";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
-const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+pub(crate) const LOG_SUBSYSTEM_OIDC: &str = "oidc";
 const EVENT_IAM_STATE: &str = "iam_state";
+pub(crate) const EVENT_OIDC_DIAGNOSTICS: &str = "oidc_diagnostics";
 const EVENT_OIDC_STATE: &str = "oidc_state";
 
 pub mod cache;
