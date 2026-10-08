@@ -2280,14 +2280,20 @@ fn list_objects_paginate(
         }
     }
 
-    if !is_truncated && disk_has_more && !include_version_id {
+    if !is_truncated && disk_has_more {
         let visible_count = objects.len() + prefixes.len();
         let should_truncate = if delimiter.is_none() {
             visible_count > 0
         } else {
             visible_count >= max_keys as usize
         };
-        if should_truncate {
+        if delimiter.is_some()
+            && include_version_id
+            && let Some(last_scanned) = last_scanned_key
+        {
+            is_truncated = true;
+            next_marker = Some(append_list_cache_id_to_marker(last_scanned.to_owned(), cache_id));
+        } else if should_truncate {
             is_truncated = true;
             if include_version_id {
                 (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes, cache_id);
@@ -8695,6 +8701,120 @@ mod test {
         assert!(prefixes.is_empty());
         assert!(is_truncated);
         assert_eq!(next_marker.as_deref(), Some("obj-0002"));
+    }
+
+    // ECA-03 / #944 (versioned variant): a versions listing whose raw keys fully
+    // collapse into fewer than max_keys common prefixes must still report
+    // truncation and carry a continuation marker, otherwise every key and every
+    // version past the scan window is silently dropped.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_refold_reports_truncation() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            1000,
+            true, // disk_has_more: walker filled its raw candidate limit
+            None,
+            true,
+            Some("data-1001"), // last RAW scanned key
+        );
+
+        assert!(objects.is_empty());
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(is_truncated, "versioned re-folded page with more on disk must be truncated");
+        // The marker must be the last RAW key, NOT the folded prefix "data-":
+        // versioned walks are excluded from the gather-level common-prefix
+        // collector, so a prefix marker could never advance `forward_past`.
+        assert_eq!(next_marker.as_deref(), Some("data-1001"));
+        assert!(next_version_idmarker.is_none(), "a folded prefix page carries no version marker");
+    }
+
+    // Same contract when the page is FILLED by folded common prefixes
+    // (`visible_count >= max_keys`): the versioned path must still prefer the
+    // raw scanned key over `prefixes.last()`, which would loop forever.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_full_prefix_page_uses_raw_marker() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, 1, true, None, true, Some("data-0002"));
+
+        assert!(objects.is_empty());
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(is_truncated, "a prefix-filled versioned page with more on disk must be truncated");
+        assert_eq!(next_marker.as_deref(), Some("data-0002"));
+        assert!(next_version_idmarker.is_none());
+    }
+
+    // End-to-end simulation of versioned pagination with `max_keys=1`, where the
+    // next page resumes via a bare key marker (`forward_past` keeps `name > marker`
+    // only, matching `inner_list_object_versions_with_projection` without a version
+    // marker). Before the raw-key marker the same window replayed forever, so
+    // `other-`/`zzz` were never listed.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_prefix_filled_pages_terminate() {
+        use std::collections::BTreeSet;
+
+        let all: Vec<String> = ["data-0001", "data-0002", "other-0001", "other-0002", "zzz"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let delimiter = Some("-".to_string());
+        let max_keys = 1i32;
+        let limit = max_keys_plus_one(max_keys, true) as usize;
+
+        let mut marker: Option<String> = None;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut pages = 0;
+
+        loop {
+            pages += 1;
+            assert!(pages <= 16, "versioned pagination did not terminate (possible infinite loop)");
+
+            let start = match &marker {
+                Some(m) => all.partition_point(|k| k.as_str() <= m.as_str()),
+                None => 0,
+            };
+            let window: Vec<String> = all[start..].iter().take(limit).cloned().collect();
+            let disk_has_more = window.len() == limit;
+            let last_scanned = window.last().cloned();
+
+            let (objects, prefixes, is_truncated, next_marker, _v) = list_objects_paginate(
+                fold_delimiter_page(&window, "", "-"),
+                &delimiter,
+                max_keys,
+                disk_has_more,
+                None,
+                true,
+                last_scanned.as_deref(),
+            );
+
+            seen.extend(objects.into_iter().map(|object| object.name));
+            seen.extend(prefixes);
+
+            if !is_truncated {
+                assert!(next_marker.is_none());
+                break;
+            }
+
+            let next = next_marker.expect("truncated versioned page must carry a continuation marker");
+            if let Some(prev) = &marker {
+                assert!(
+                    next.as_str() > prev.as_str(),
+                    "next_marker must strictly advance to stay finite, got {next} after {prev}"
+                );
+            }
+            marker = Some(next);
+        }
+
+        let expected: BTreeSet<String> = ["data-".to_string(), "other-".to_string(), "zzz".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(seen, expected, "versioned pagination must cover every prefix and object");
     }
 
     // End-to-end pagination over 5000 `data-*` + 100 `other-*` with delimiter '-'.
