@@ -48,24 +48,21 @@ pub trait IamInterface: Send + Sync {
 }
 
 /// Published federation runtime handles for authentication and OIDC configuration consumers.
-pub type FederatedIdentityRuntimeSnapshot = (Arc<FederatedIdentityService>, Option<Arc<dyn OidcConfigQuery>>);
+pub type FederatedIdentityRuntimeSnapshot = (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>);
 
 pub trait FederatedIdentityInterface: Send + Sync {
-    fn handle(&self) -> Option<Arc<FederatedIdentityService>>;
+    fn runtime_snapshot(&self) -> Option<FederatedIdentityRuntimeSnapshot>;
+
+    fn handle(&self) -> Option<Arc<FederatedIdentityService>> {
+        self.runtime_snapshot().map(|(service, _)| service)
+    }
+
     fn oidc_config_query(&self) -> Option<Arc<dyn OidcConfigQuery>> {
-        None
+        self.runtime_snapshot().map(|(_, oidc_config_query)| oidc_config_query)
     }
-    fn runtime_snapshot(&self) -> Option<FederatedIdentityRuntimeSnapshot> {
-        self.handle().map(|service| (service, self.oidc_config_query()))
-    }
-    /// Compatibility publication hook for service-only implementations.
-    /// Standard OIDC runtimes publish the paired query through
-    /// [`Self::publish_runtime`].
-    fn publish_handle(&self, _service: Arc<FederatedIdentityService>) -> bool {
+
+    fn publish_runtime(&self, _service: Arc<FederatedIdentityService>, _oidc_config_query: Arc<dyn OidcConfigQuery>) -> bool {
         false
-    }
-    fn publish_runtime(&self, service: Arc<FederatedIdentityService>, _oidc_config_query: Arc<dyn OidcConfigQuery>) -> bool {
-        self.publish_handle(service)
     }
 }
 

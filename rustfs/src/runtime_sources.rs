@@ -35,7 +35,6 @@ pub(crate) use context::{
     resolve_bucket_monitor_handle as current_bucket_monitor_handle, resolve_buffer_config as current_buffer_config,
     resolve_daily_tier_stats as current_daily_tier_stats, resolve_deployment_id as current_deployment_id,
     resolve_encryption_service as current_encryption_service, resolve_endpoints_handle as current_endpoints_handle,
-    resolve_federated_identity_runtime as current_federated_identity_runtime,
     resolve_federated_identity_service as current_federated_identity_service, resolve_iam_handle as current_iam_handle,
     resolve_iam_ready as current_iam_ready, resolve_internode_metrics as current_internode_metrics,
     resolve_kms_runtime_service_manager as current_kms_runtime_service_manager,
@@ -47,6 +46,7 @@ pub(crate) use context::{
     resolve_object_data_cache_handle_for_context as current_object_data_cache_handle_for_context,
     resolve_object_store_handle as current_object_store_handle,
     resolve_object_store_handle_for_context as current_object_store_handle_for_context,
+    resolve_oidc_config_query as current_oidc_config_query,
     resolve_or_init_kms_runtime_service_manager as current_or_init_kms_runtime_service_manager,
     resolve_outbound_tls_generation as current_outbound_tls_generation, resolve_outbound_tls_state as current_outbound_tls_state,
     resolve_performance_metrics as current_performance_metrics, resolve_ready_iam_handle as current_ready_iam_handle,
@@ -63,13 +63,13 @@ pub(crate) fn publish_federated_identity_runtime(
     service: Arc<FederatedIdentityService>,
     oidc_config_query: Arc<dyn OidcConfigQuery>,
 ) -> bool {
-    warn_on_browser_redirect_fallback(&service);
+    warn_on_browser_redirect_fallback(service.has_providers());
     context::publish_federated_identity_runtime(service, oidc_config_query)
 }
 
-fn warn_on_browser_redirect_fallback(service: &FederatedIdentityService) {
+fn warn_on_browser_redirect_fallback(has_providers: bool) {
     let browser_redirect_url = rustfs_utils::get_env_opt_str(ENV_RUSTFS_BROWSER_REDIRECT_URL);
-    if service.has_providers() && browser_redirect_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+    if has_providers && browser_redirect_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
         warn!(
             event = EVENT_OIDC_BROWSER_REDIRECT_FALLBACK,
             component = LOG_COMPONENT_MAIN,
@@ -103,75 +103,18 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_iam::federation::oidc::OidcConfigQuery;
-    use rustfs_iam::federation::{
-        FederatedAuthorization, FederatedCodeExchange, FederatedIdentityProvider, FederatedIdentityRegistry,
-        FederatedProviderView, FederatedRedirectPolicy, Result as FederationResult,
+    use rustfs_iam::{
+        federation::{
+            CoreFederatedAuthorizationMapper,
+            oidc::{OidcConfigQuery, StandardOidcAdapter},
+        },
+        oidc::{OidcSys, make_test_sys, test_config},
     };
-    use rustfs_iam::oidc::OidcConfigSnapshot;
     use std::{
         io::{self, Write},
         sync::Mutex,
     };
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
-
-    struct TestProvider {
-        has_providers: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl FederatedIdentityProvider for TestProvider {
-        fn has_providers(&self) -> bool {
-            self.has_providers
-        }
-
-        fn list_providers(&self) -> Vec<FederatedProviderView> {
-            Vec::new()
-        }
-
-        fn list_visible_providers(&self) -> Vec<FederatedProviderView> {
-            Vec::new()
-        }
-
-        fn redirect_policy(&self, _provider_id: &str) -> Option<FederatedRedirectPolicy> {
-            None
-        }
-
-        async fn authorize_url(
-            &self,
-            _provider_id: &str,
-            _redirect_uri: &str,
-            _redirect_after: Option<String>,
-        ) -> FederationResult<String> {
-            unreachable!("startup publication test does not authorize")
-        }
-
-        async fn exchange_code(&self, _state: &str, _code: &str, _redirect_uri: &str) -> FederationResult<FederatedCodeExchange> {
-            unreachable!("startup publication test does not exchange codes")
-        }
-
-        async fn verify_web_identity_token(&self, _jwt: &str) -> FederationResult<FederatedAuthorization> {
-            unreachable!("startup publication test does not verify tokens")
-        }
-
-        async fn create_logout_token(&self, _provider_id: &str, _id_token: &str) -> FederationResult<String> {
-            unreachable!("startup publication test does not create logout tokens")
-        }
-
-        async fn build_logout_url(
-            &self,
-            _logout_token: &str,
-            _post_logout_redirect_uri: &str,
-        ) -> FederationResult<Option<String>> {
-            unreachable!("startup publication test does not build logout URLs")
-        }
-    }
-
-    impl OidcConfigQuery for TestProvider {
-        fn config_snapshot(&self) -> OidcConfigSnapshot {
-            OidcConfigSnapshot::new(Vec::new())
-        }
-    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -197,14 +140,14 @@ mod tests {
         }
     }
 
-    fn test_runtime(has_providers: bool) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
-        let provider = Arc::new(TestProvider { has_providers });
-        let service = Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(provider.clone())));
-        (service, provider)
-    }
-
-    fn capture_startup_publication(has_providers: bool, browser_redirect_url: Option<&str>) -> String {
+    fn capture_startup_publication(oidc: OidcSys, browser_redirect_url: Option<&str>) -> String {
         temp_env::with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, browser_redirect_url, || {
+            let adapter = Arc::new(StandardOidcAdapter::new(Arc::new(oidc)));
+            let oidc_config_query: Arc<dyn OidcConfigQuery> = adapter.clone();
+            let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+            let service = Arc::new(adapter.into_service(mapper));
+            let expected_service = service.clone();
+            let expected_oidc_config_query = oidc_config_query.clone();
             let logs = CapturedLogs::default();
             let captured = logs.0.clone();
             let subscriber = Registry::default().with(
@@ -217,8 +160,12 @@ mod tests {
             );
 
             tracing::subscriber::with_default(subscriber, || {
-                let (service, oidc_config_query) = test_runtime(has_providers);
                 assert!(publish_federated_identity_runtime(service, oidc_config_query));
+                let (published_service, published_oidc_config_query) = context::default_federated_identity_interface()
+                    .runtime_snapshot()
+                    .expect("published federated identity runtime should resolve");
+                assert!(Arc::ptr_eq(&published_service, &expected_service));
+                assert!(Arc::ptr_eq(&published_oidc_config_query, &expected_oidc_config_query));
             });
 
             String::from_utf8(captured.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8")
@@ -226,16 +173,20 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(federated_identity_runtime)]
     fn oidc_startup_publication_warns_only_for_request_header_fallback() {
-        let output = capture_startup_publication(true, None);
+        let output = capture_startup_publication(make_test_sys(vec![test_config("default")]), None);
 
         assert!(output.contains("WARN"), "{output}");
         assert!(output.contains(EVENT_OIDC_BROWSER_REDIRECT_FALLBACK), "{output}");
         assert!(output.contains(ENV_RUSTFS_BROWSER_REDIRECT_URL), "{output}");
         assert!(output.contains("request_host_and_forwarded_proto"), "{output}");
         assert!(output.contains("trusted_console_origin_not_configured"), "{output}");
-        assert!(capture_startup_publication(false, None).is_empty());
-        assert!(capture_startup_publication(true, Some("https://console.example.com")).is_empty());
-        assert!(!capture_startup_publication(true, Some("  ")).is_empty());
+        assert!(capture_startup_publication(OidcSys::empty().expect("empty OIDC system should initialize"), None).is_empty());
+        assert!(
+            capture_startup_publication(make_test_sys(vec![test_config("default")]), Some("https://console.example.com"),)
+                .is_empty()
+        );
+        assert!(!capture_startup_publication(make_test_sys(vec![test_config("default")]), Some("  ")).is_empty());
     }
 }

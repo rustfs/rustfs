@@ -389,6 +389,7 @@ symbolic-demangle = { version = "=13.9.0", default-features = false, features = 
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
+rustfs-iam = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
