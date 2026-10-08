@@ -3411,7 +3411,8 @@ mod tests {
     async fn rpc_capability_responses_keep_their_wire_bytes() {
         let _ = rustfs_credentials::set_global_rpc_secret("put-file-capability-server-test-secret".to_string());
         let challenge = uuid::Uuid::new_v4();
-        let builders: [(&str, Box<dyn Fn() -> Response<super::Body>>); 3] = [
+        type ResponseBuilder = Box<dyn Fn() -> Response<super::Body>>;
+        let builders: [(&str, ResponseBuilder); 3] = [
             ("put_file", Box::new(move || put_file_capability_response(challenge))),
             ("ns_scanner", Box::new(move || super::ns_scanner_capability_response(challenge, false))),
             (
