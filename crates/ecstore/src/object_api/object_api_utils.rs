@@ -29,7 +29,7 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
-use s3s::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 
 //#[derive(Clone)]
 pub struct PutObjReader {
@@ -229,6 +229,45 @@ mod tests {
 
         assert_eq!(result.1, 5 * 1024 * 1024);
         assert_eq!(result.2, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_new_getobjectreader_rejects_a_range_past_the_object_as_invalid_range() {
+        let oi = multipart_object_info();
+        let past_the_end = Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: oi.size,
+            end: oi.size + 10,
+        });
+
+        let err = new_getobjectreader(&past_the_end, &oi, &ObjectOptions::default(), &HeaderMap::new())
+            .err()
+            .expect("a range starting at the object size must be rejected");
+
+        assert_eq!(err.code, S3ErrorCode::InvalidRange);
+        assert_eq!(err.code.as_str(), "InvalidRange");
+        assert_eq!(err.key, None);
+        assert_eq!(err.bucket_name, None);
+    }
+
+    #[test]
+    fn test_new_getobjectreader_rejects_an_unknown_size_without_a_range_as_invalid_range() {
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: -1,
+            ..Default::default()
+        };
+
+        let err = new_getobjectreader(&None, &oi, &ObjectOptions::default(), &HeaderMap::new())
+            .err()
+            .expect("an object of unknown size cannot be read without a range");
+
+        assert_eq!(err.code, S3ErrorCode::InvalidRange);
+        assert_eq!(err.code.as_str(), "InvalidRange");
+        assert_eq!(err.message, "Invalid range");
+        assert_eq!(err.key.as_deref(), Some("object"));
+        assert_eq!(err.bucket_name.as_deref(), Some("bucket"));
     }
 
     #[test]
