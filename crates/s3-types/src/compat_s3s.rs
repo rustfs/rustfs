@@ -696,11 +696,7 @@ mod tests {
             for (name, pair) in wire_pairs() {
                 let (ours, theirs) = pair();
                 let (ours, theirs) = (wire(ours, &method).await, wire(theirs, &method).await);
-                assert_eq!(
-                    String::from_utf8_lossy(&ours),
-                    String::from_utf8_lossy(&theirs),
-                    "{method} {name}: the wire bytes changed"
-                );
+                assert_eq!(ours, theirs, "{method} {name}: the wire bytes changed");
             }
         }
     }
