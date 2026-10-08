@@ -178,7 +178,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(
             Method::GET,
             "/v3/target/{target_type}/{target_name}/subscriptions",
-            "/v3/target/webhook/test-target/subscriptions",
+            "/v3/target/notify_webhook/test-target/subscriptions",
         ),
         admin_route(Method::POST, "/v3/service"),
         admin_route(Method::POST, "/v3/update"),

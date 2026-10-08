@@ -423,7 +423,7 @@ pub(crate) mod startup {
     pub(crate) mod shutdown {
         pub(crate) use crate::storage::storage_api::{
             mark_get_metadata_read_version_coalescing_service_ready, shutdown_background_monitors, shutdown_background_services,
-            store_compression_total_in_backend,
+            store_compression_total_in_backend, wait_for_detached_mutations,
         };
     }
 
