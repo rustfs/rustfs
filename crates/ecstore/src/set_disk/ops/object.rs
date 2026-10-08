@@ -7078,6 +7078,82 @@ async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
     }
 }
 
+/// Pauses a delete after its per-disk commit and before the cleanup or rollback
+/// pass, the window in which an abandoned delete used to leave metadata-less
+/// residue behind.
+#[cfg(test)]
+struct DeleteCleanupBarrierState {
+    bucket: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DeleteCleanupBarrier {
+    state: Arc<DeleteCleanupBarrierState>,
+}
+
+#[cfg(test)]
+static DELETE_CLEANUP_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DeleteCleanupBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DeleteCleanupBarrier {
+    pub(crate) fn install(bucket: &str) -> Self {
+        let state = Arc::new(DeleteCleanupBarrierState {
+            bucket: bucket.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DELETE_CLEANUP_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete cleanup barrier mutex should not poison");
+        assert!(slot.is_none(), "delete cleanup barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("delete should reach the cleanup barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeleteCleanupBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DELETE_CLEANUP_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete cleanup barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_delete_before_cleanup(bucket: &str) {
+    let barrier = DELETE_CLEANUP_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete cleanup barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 fn persisted_transition_version_with_gate(
     remote_version: &str,
     remote_version_state_writer_enabled: bool,
@@ -7658,6 +7734,8 @@ impl SetDisks {
 
         let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
         let should_rollback = quorum_result.is_err();
+        #[cfg(test)]
+        pause_delete_before_cleanup(bucket).await;
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
             // backlog#1158: when rolling back, fan the idempotent undo out to every
@@ -8667,6 +8745,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        #[cfg(test)]
+        pause_delete_before_cleanup(bucket).await;
 
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =

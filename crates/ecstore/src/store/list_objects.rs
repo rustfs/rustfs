@@ -9644,6 +9644,67 @@ mod test {
         }
     }
 
+    // #6898: what an abandoned DeleteObjects left on every disk (rollback
+    // backup plus marked data dir) no longer blocks DeleteBucket after an empty
+    // recursive listing of the bucket.
+    #[tokio::test]
+    async fn empty_recursive_listing_purges_stranded_delete_rollback_backups() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-rollback-backup";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let transaction = uuid::Uuid::new_v4();
+        for object in ["repro/obj-00001.bin", "repro/obj-00002.bin"] {
+            let data_dir = uuid::Uuid::new_v4();
+            for dir in &dirs {
+                let object_dir = dir.path().join(bucket).join(object);
+                let residue = object_dir.join(data_dir.to_string());
+                tokio::fs::create_dir_all(&residue)
+                    .await
+                    .expect("committed data dir should be created");
+                tokio::fs::write(residue.join("part.1"), b"stale")
+                    .await
+                    .expect("stale part should be written");
+                tokio::fs::write(
+                    residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                    [],
+                )
+                .await
+                .expect("committed delete marker should be written");
+                let backup = object_dir.join(transaction.to_string());
+                tokio::fs::create_dir_all(&backup)
+                    .await
+                    .expect("rollback dir should be created");
+                tokio::fs::write(backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                    .await
+                    .expect("rollback backup should be written");
+            }
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive bucket listing should succeed");
+        assert!(result.objects.is_empty());
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("repro").exists(),
+                "the empty listing should reclaim the stranded delete residue"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the bucket is empty once the residue is reclaimed");
+    }
+
     #[tokio::test]
     async fn empty_recursive_bucket_listing_purges_orphan_directory_prefixes() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};

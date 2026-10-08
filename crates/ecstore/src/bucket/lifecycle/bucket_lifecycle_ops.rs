@@ -5652,8 +5652,10 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     } else {
         None
     };
+    // The delete owns the publication guard from here on, so a cancelled
+    // expiry worker cannot let table-bucket publication overtake it.
     let mut dobj = match api
-        .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
+        .delete_object_with_tier_delete_journal_and_guards(&oi.bucket, &encode_dir_object(&oi.name), opts, [publication_guard])
         .await
     {
         Ok(dobj) => dobj,

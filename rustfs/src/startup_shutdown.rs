@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::shutdown::shutdown_background_services;
+use crate::storage_api::startup::shutdown::{shutdown_background_services, wait_for_detached_mutations};
 use crate::{
     server::{
         SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier,
@@ -50,6 +50,7 @@ const BACKGROUND_SERVICE_CAPACITY: &str = "capacity";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const DETACHED_MUTATION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn join_failure_reason(error: &tokio::task::JoinError) -> &'static str {
     if error.is_cancelled() {
@@ -197,6 +198,46 @@ fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<Bac
         steps.push(BackgroundShutdownStep::Ahm);
     }
     steps
+}
+
+/// Last step of the shutdown sequence, once every front end has drained.
+///
+/// A delete whose client disconnected keeps running on its own task; wait for
+/// those to reach the end of their on-disk steps. Then record the shutdown as
+/// clean, so the next startup skips the unclean-restart erasure-set heal, but
+/// only if nothing was left unfinished: a detached mutation still running at
+/// the deadline can be cut short with the runtime, and the heal handoff may
+/// not have completed. Returns whether the markers were cleared.
+async fn finish_detached_mutations_and_clear_unclean_shutdown_markers<W, WaitFut, ClearFut>(
+    heal_handoff_complete: bool,
+    detached_mutation_timeout: std::time::Duration,
+    wait_for_detached_mutations: W,
+    clear_unclean_shutdown_markers: ClearFut,
+) -> bool
+where
+    W: FnOnce(std::time::Duration) -> WaitFut,
+    WaitFut: Future<Output = bool>,
+    ClearFut: Future<Output = ()>,
+{
+    let detached_mutations_drained = wait_for_detached_mutations(detached_mutation_timeout).await;
+    if !detached_mutations_drained {
+        warn!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = "detached_mutations",
+            state = "stop_failed",
+            reason = "timeout",
+            timeout_secs = detached_mutation_timeout.as_secs(),
+            "Detached mutations did not finish before shutdown; retaining unclean-shutdown markers"
+        );
+    }
+    if !(heal_handoff_complete && detached_mutations_drained) {
+        return false;
+    }
+    clear_unclean_shutdown_markers.await;
+    true
 }
 
 pub(crate) async fn run_startup_shutdown_sequence(
@@ -422,11 +463,15 @@ pub(crate) async fn run_startup_shutdown_sequence(
         console_shutdown_handle.shutdown().await;
     }
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
-    // The data plane is drained: record this shutdown as clean so the next
-    // startup skips the unclean-restart erasure-set heal.
-    if heal_handoff_complete {
-        rustfs_heal::heal::clear_unclean_shutdown_markers().await;
-    }
+    // FTP, SFTP and WebDAV can start deletes too: wait for detached mutations
+    // only after every front end has stopped.
+    finish_detached_mutations_and_clear_unclean_shutdown_markers(
+        heal_handoff_complete,
+        DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
+        wait_for_detached_mutations,
+        rustfs_heal::heal::clear_unclean_shutdown_markers(),
+    )
+    .await;
     state_manager.update(ServiceState::Stopped);
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -605,7 +650,8 @@ pub(crate) async fn run_embedded_server_shutdown(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundShutdownStep, EmbeddedRuntimeOwners, background_shutdown_steps, finish_embedded_server_cleanup,
+        BackgroundShutdownStep, EmbeddedRuntimeOwners, background_shutdown_steps,
+        finish_detached_mutations_and_clear_unclean_shutdown_markers, finish_embedded_server_cleanup,
         run_embedded_server_drop_cleanup, signal_embedded_startup_shutdown,
     };
     use crate::server::ShutdownHandle;
@@ -626,6 +672,61 @@ mod tests {
         );
         assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
         assert!(background_shutdown_steps(false, false).is_empty());
+    }
+
+    async fn finish_shutdown_with_marker(
+        marker: &std::path::Path,
+        heal_handoff_complete: bool,
+        timeout: Duration,
+        detached_mutation: &mut tokio::task::JoinHandle<()>,
+    ) -> bool {
+        finish_detached_mutations_and_clear_unclean_shutdown_markers(
+            heal_handoff_complete,
+            timeout,
+            |timeout| async move { tokio::time::timeout(timeout, detached_mutation).await.is_ok() },
+            async {
+                std::fs::remove_file(marker).expect("unclean-shutdown marker should be removable");
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unclean_shutdown_markers_are_kept_while_a_detached_mutation_runs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let marker = temp_dir.path().join("unclean-shutdown");
+        std::fs::write(&marker, b"").expect("unclean-shutdown marker should be written");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut detached_mutation = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+
+        assert!(
+            !finish_shutdown_with_marker(&marker, true, Duration::from_millis(50), &mut detached_mutation).await,
+            "a detached mutation still running at the deadline must keep the markers"
+        );
+        assert!(marker.exists(), "the next startup must still see the unclean-shutdown marker");
+
+        release_tx.send(()).expect("detached mutation should be released");
+        assert!(
+            finish_shutdown_with_marker(&marker, true, Duration::from_secs(5), &mut detached_mutation).await,
+            "the markers should be cleared once every detached mutation has finished"
+        );
+        assert!(!marker.exists(), "a clean shutdown should clear the unclean-shutdown marker");
+    }
+
+    #[tokio::test]
+    async fn unclean_shutdown_markers_are_kept_after_a_failed_heal_handoff() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let marker = temp_dir.path().join("unclean-shutdown");
+        std::fs::write(&marker, b"").expect("unclean-shutdown marker should be written");
+        let mut detached_mutation = tokio::spawn(async {});
+
+        assert!(
+            !finish_shutdown_with_marker(&marker, false, Duration::from_secs(5), &mut detached_mutation).await,
+            "a failed heal handoff must keep the markers"
+        );
+        assert!(marker.exists(), "the next startup must still see the unclean-shutdown marker");
     }
 
     #[tokio::test]
