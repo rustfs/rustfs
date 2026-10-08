@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The legacy condition values, pinned before `auth::facts` replaces them.
+//! `auth::facts` against the legacy condition values.
 //!
-//! Every request in [`cases`] runs through the legacy derivation frozen in
-//! `auth::legacy_condition_oracle`, which must reproduce
-//! `legacy_conditions.tsv` and agree with the production derivation it was
-//! copied from. Run with `RUSTFS_AUTHZ_FACTS_BLESS=1` to rewrite the golden file
-//! from the oracle.
+//! Every request in [`cases`] runs through the legacy derivation kept in
+//! `auth::legacy_condition_oracle` and through [`build_conditions`]. The two
+//! must agree key for key, value for value, and both must reproduce
+//! `legacy_conditions.tsv`, which the legacy derivation wrote before
+//! `auth::facts` existed. Run with `RUSTFS_AUTHZ_FACTS_BLESS=1` to rewrite it
+//! from the legacy derivation.
 
+use super::{
+    AuthzFacts, AuthzPrincipal, AuthzTarget, SECRET_HEADERS, base_conditions, build_args, build_conditions,
+    forward_secret_headers, list_query_pairs, merge_list_query_conditions,
+};
 use crate::auth::legacy_condition_oracle as oracle;
+use crate::runtime_sources::current_action_credentials;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -128,7 +134,7 @@ fn credentials(who: Who) -> Credentials {
     }
 }
 
-/// One request, as the legacy derivation is given it.
+/// One request: what the legacy derivation and `AuthzFacts` are both given.
 #[derive(Clone)]
 struct Case {
     name: &'static str,
@@ -231,6 +237,27 @@ impl Case {
         })
     }
 
+    fn target(&self) -> AuthzTarget<'_> {
+        AuthzTarget {
+            action: self.action,
+            bucket: "facts-bucket",
+            object: "facts/object.txt",
+            version_id: self.version_id,
+            location_constraint: self.region,
+        }
+    }
+
+    fn facts(&self, now: OffsetDateTime) -> AuthzFacts {
+        AuthzFacts::from_request_parts(
+            &self.header_map(),
+            self.query,
+            self.remote_addr(),
+            self.client_info().as_ref(),
+            self.target(),
+            now,
+        )
+    }
+
     /// The legacy derivation, including the listing merge `storage/access.rs` applied after it.
     fn legacy(&self, credentials: &Credentials) -> Conditions {
         let mut conditions = oracle::get_condition_values_with_query_and_client_info(
@@ -246,20 +273,19 @@ impl Case {
         conditions
     }
 
-    /// The production derivation the oracle was copied from.
-    fn current(&self, credentials: &Credentials, _now: OffsetDateTime) -> Conditions {
-        let mut conditions = crate::auth::get_condition_values_with_query_and_client_info(
-            &self.header_map(),
-            credentials,
-            self.version_id,
-            self.region.map(|region| region.parse().expect("test region")),
-            self.remote_addr(),
-            self.query,
-            self.client_info().as_ref(),
-        );
-        oracle::merge_list_bucket_query_conditions(self.action, self.query, &mut conditions);
+    /// What the legacy edge now derives: the facts, plus the secret headers it still forwards.
+    fn current(&self, credentials: &Credentials, now: OffsetDateTime) -> Conditions {
+        let root = root_access_key();
+        let principal = AuthzPrincipal::new(credentials, &root);
+        let mut conditions = build_conditions(&principal, &self.facts(now));
+        forward_secret_headers(&self.header_map(), &mut conditions);
         conditions
     }
+}
+
+/// The root access key the legacy derivation compared against.
+fn root_access_key() -> String {
+    current_action_credentials().map(|root| root.access_key).unwrap_or_default()
 }
 
 /// The time the legacy derivation read, recovered from its `CurrentTime`, after
@@ -484,6 +510,37 @@ fn render_all(runs: &[(Case, Conditions, Conditions)], pick: impl Fn(&(Case, Con
     runs.iter().map(|run| render(run.0.name, pick(run))).collect()
 }
 
+/// Asserts that `key` agrees with the legacy derivation for every case, and that
+/// the case table has it present in `min_present` cases and absent in `min_absent`.
+fn assert_key_matches_legacy(key: &str, min_present: usize, min_absent: usize) {
+    let (mut present, mut absent) = (0, 0);
+    for (case, legacy, current) in run_cases() {
+        assert_eq!(current.get(key), legacy.get(key), "{}: condition key {key}", case.name);
+        if legacy.contains_key(key) {
+            present += 1;
+        } else {
+            absent += 1;
+        }
+    }
+    assert!(present >= min_present, "{key}: present in {present} cases, need {min_present}");
+    assert!(absent >= min_absent, "{key}: absent in {absent} cases, need {min_absent}");
+}
+
+/// Asserts that every legacy value `key` takes in the case table is in `expected`
+/// and every value in `expected` is taken, so the comparison above saw them all.
+fn assert_legacy_values_seen(key: &str, expected: &[&str]) {
+    let mut seen: Vec<String> = run_cases()
+        .into_iter()
+        .filter_map(|(_, legacy, _)| legacy.get(key).cloned())
+        .flatten()
+        .collect();
+    seen.sort();
+    seen.dedup();
+    let mut expected: Vec<String> = expected.iter().map(|value| (*value).to_owned()).collect();
+    expected.sort();
+    assert_eq!(seen, expected, "{key}: values the case table exercises");
+}
+
 #[test]
 fn case_table_covers_forty_requests_with_unique_names() {
     let cases = cases();
@@ -504,15 +561,386 @@ fn legacy_oracle_reproduces_the_committed_golden() {
 }
 
 #[test]
+fn facts_reproduce_the_committed_golden() {
+    assert_eq!(render_all(&run_cases(), |run| &run.2), GOLDEN);
+}
+
+#[test]
 fn every_condition_value_matches_legacy() {
-    for (case, legacy, mut current) in run_cases() {
-        // The production derivation reads its own clock.
-        let _ = legacy_now(case.name, &current, OffsetDateTime::UNIX_EPOCH, OffsetDateTime::now_utc());
-        let mut legacy = legacy;
-        for key in ["CurrentTime", "EpochTime"] {
-            legacy.remove(key);
-            current.remove(key);
-        }
+    for (case, legacy, current) in run_cases() {
         assert_eq!(current, legacy, "{}", case.name);
     }
+}
+
+#[test]
+fn facts_alone_leave_out_exactly_the_secret_headers() {
+    let mut left_out = 0;
+    for (case, legacy, _) in run_cases() {
+        let credentials = credentials(case.who);
+        let now = OffsetDateTime::parse(&legacy["CurrentTime"][0], &Rfc3339).expect("legacy CurrentTime");
+        let root = root_access_key();
+        let facts_only = build_conditions(&AuthzPrincipal::new(&credentials, &root), &case.facts(now));
+        // The legacy value of a secret header's key came from the header unless a
+        // claim of the same name took the key first; only the former is left out.
+        let headers = case.header_map();
+        let mut expected = legacy.clone();
+        for name in SECRET_HEADERS {
+            let sent: Vec<String> = headers
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("").to_owned())
+                .collect();
+            if !sent.is_empty() && legacy.get(name) == Some(&sent) {
+                expected.remove(name);
+                left_out += 1;
+            }
+        }
+        assert_eq!(facts_only, expected, "{}", case.name);
+    }
+    assert!(left_out >= SECRET_HEADERS.len(), "only {left_out} secret headers were left out");
+}
+
+#[test]
+fn current_time_matches_legacy() {
+    assert_key_matches_legacy("CurrentTime", cases().len(), 0);
+}
+
+#[test]
+fn epoch_time_matches_legacy() {
+    assert_key_matches_legacy("EpochTime", cases().len(), 0);
+}
+
+#[test]
+fn secure_transport_matches_legacy() {
+    assert_key_matches_legacy("SecureTransport", cases().len(), 0);
+    assert_legacy_values_seen("SecureTransport", &["false", "true"]);
+}
+
+#[test]
+fn source_ip_matches_legacy() {
+    assert_key_matches_legacy("SourceIp", cases().len(), 0);
+    assert_legacy_values_seen(
+        "SourceIp",
+        &[
+            "",
+            "192.0.2.10",
+            "192.0.2.11",
+            "192.0.2.20",
+            "2001:db8::7",
+            "2001:db8::9",
+            "203.0.113.9",
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+        ],
+    );
+}
+
+#[test]
+fn user_agent_matches_legacy() {
+    assert_key_matches_legacy("UserAgent", 3, 1);
+}
+
+#[test]
+fn referer_matches_legacy() {
+    assert_key_matches_legacy("Referer", 2, 1);
+}
+
+#[test]
+fn userid_matches_legacy() {
+    assert_key_matches_legacy("userid", cases().len(), 0);
+}
+
+#[test]
+fn username_matches_legacy() {
+    assert_key_matches_legacy("username", cases().len(), 0);
+}
+
+#[test]
+fn principal_type_matches_legacy() {
+    assert_key_matches_legacy("principaltype", cases().len(), 0);
+    assert_legacy_values_seen("principaltype", &["Anonymous", "AssumedRole", "User"]);
+}
+
+#[test]
+fn version_id_matches_legacy() {
+    assert_key_matches_legacy("versionid", 1, 1);
+}
+
+#[test]
+fn signature_version_matches_legacy() {
+    assert_key_matches_legacy("signatureversion", 2, 1);
+    assert_legacy_values_seen("signatureversion", &["AWS2", "AWS4-HMAC-SHA256"]);
+}
+
+#[test]
+fn auth_type_matches_legacy() {
+    assert_key_matches_legacy("authType", 6, 1);
+    assert_legacy_values_seen("authType", &["Anonymous", "JWT", "POST", "REST-HEADER", "REST-QUERY-STRING", "STS"]);
+}
+
+#[test]
+fn location_constraint_matches_legacy() {
+    assert_key_matches_legacy("LocationConstraint", 2, 1);
+}
+
+#[test]
+fn signature_age_matches_legacy() {
+    assert_key_matches_legacy("signatureAge", 1, 1);
+}
+
+#[test]
+fn object_lock_keys_match_legacy() {
+    for key in ["object-lock-mode", "object-lock-legal-hold", "object-lock-retain-until-date"] {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+#[test]
+fn grant_keys_match_legacy() {
+    for key in [
+        "x-amz-grant-full-control",
+        "x-amz-grant-read",
+        "x-amz-grant-write",
+        "x-amz-grant-read-acp",
+        "x-amz-grant-write-acp",
+    ] {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+#[test]
+fn list_keys_match_legacy() {
+    for key in ["prefix", "delimiter", "max-keys"] {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+#[test]
+fn amz_header_keys_match_legacy() {
+    for key in [
+        "x-amz-copy-source",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-content-sha256",
+        "x-amz-acl",
+        "x-amz-metadata-directive",
+        "x-amz-storage-class",
+        "x-amz-meta-color",
+        "x-amz-date",
+    ] {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+#[test]
+fn claim_keys_match_legacy() {
+    for key in ["groups", "roles", "email", "sub", "parent", "sa-policy"] {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+#[test]
+fn secret_header_keys_match_legacy_through_forwarding() {
+    for key in SECRET_HEADERS {
+        assert_key_matches_legacy(key, 1, 1);
+    }
+}
+
+// Negative cases: what must never happen.
+
+fn request_with_every_secret() -> Case {
+    Case::new("every_secret", Who::Sts)
+        .header("Authorization", SIGV4_AUTHORIZATION)
+        .header("X-Amz-Security-Token", SESSION_TOKEN)
+        .header("X-Amz-Server-Side-Encryption-Customer-Key", CUSTOMER_KEY)
+        .header("X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key", CUSTOMER_KEY)
+        .header("User-Agent", "facts-agent-value")
+        .action(S3Action::ListBucketAction)
+        .query(
+            "prefix=facts-prefix-value&X-Amz-Security-Token=facts-query-session-token\
+             &X-Amz-Signature=d0d1d2d3d4d5d6d7d8d9dadbdcdddedf&X-Amz-Credential=facts-sts%2F20261009",
+        )
+}
+
+#[test]
+fn facts_debug_prints_no_header_or_query_value() {
+    let facts = request_with_every_secret().facts(OffsetDateTime::now_utc());
+    let debug = format!("{facts:?}");
+    for secret in [
+        SIGV4_AUTHORIZATION,
+        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        SESSION_TOKEN,
+        CUSTOMER_KEY,
+        "facts-query-session-token",
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        "facts-agent-value",
+        "facts-prefix-value",
+    ] {
+        assert!(!debug.contains(secret), "Debug printed {secret}: {debug}");
+    }
+    assert!(debug.contains("user-agent"), "Debug names the headers it holds: {debug}");
+    assert!(debug.contains("\"prefix\""), "Debug names the query keys it holds: {debug}");
+}
+
+#[test]
+fn facts_never_hold_secret_headers_or_query_credentials() {
+    let facts = request_with_every_secret().facts(OffsetDateTime::now_utc());
+    for name in SECRET_HEADERS {
+        assert!(!facts.headers.contains_key(name), "{name} reached the facts");
+    }
+    assert_eq!(facts.list_query, vec![("prefix".to_owned(), "facts-prefix-value".to_owned())]);
+}
+
+#[test]
+fn facts_conditions_carry_no_secret_value() {
+    let case = request_with_every_secret();
+    let credentials = credentials(case.who);
+    let conditions = build_conditions(&AuthzPrincipal::new(&credentials, ""), &case.facts(OffsetDateTime::now_utc()));
+    let values: Vec<&String> = conditions.values().flatten().collect();
+    for secret in [SIGV4_AUTHORIZATION, SESSION_TOKEN, CUSTOMER_KEY, "facts-query-session-token"] {
+        assert!(!values.iter().any(|value| value.contains(secret)), "{secret} reached a condition value");
+    }
+}
+
+#[test]
+fn unknown_client_address_is_the_empty_string_not_an_absent_key() {
+    // The legacy derivation always emits `SourceIp`; an IP condition fails to parse
+    // the empty string rather than finding no value. Kept as it was.
+    let conditions = build_conditions(
+        &AuthzPrincipal::new(&Credentials::default(), ""),
+        &Case::new("peerless", Who::Anonymous).facts(OffsetDateTime::now_utc()),
+    );
+    assert_eq!(conditions.get("SourceIp"), Some(&vec![String::new()]));
+}
+
+#[test]
+fn plaintext_and_unattested_transports_are_not_secure() {
+    for case in [
+        Case::new("no_client_info", Who::User).peer("192.0.2.30:80"),
+        Case::new("spoofed_scheme_header", Who::User)
+            .peer("192.0.2.31:80")
+            .header("X-Forwarded-Proto", "https")
+            .header("Forwarded", "proto=https"),
+        Case::new("trusted_http", Who::User).trusted("203.0.113.30", Some("http")),
+        Case::new("trusted_unknown_scheme", Who::User).trusted("203.0.113.31", None),
+    ] {
+        let conditions =
+            build_conditions(&AuthzPrincipal::new(&credentials(case.who), ""), &case.facts(OffsetDateTime::now_utc()));
+        assert_eq!(conditions["SecureTransport"], vec!["false".to_owned()], "{}", case.name);
+    }
+}
+
+#[test]
+fn forwarding_headers_never_set_the_source_ip() {
+    let case = Case::new("spoofed", Who::User)
+        .peer("192.0.2.32:443")
+        .header("X-Forwarded-For", "198.51.100.40")
+        .header("X-Real-IP", "198.51.100.41")
+        .header("Forwarded", "for=198.51.100.42");
+    let conditions = build_conditions(&AuthzPrincipal::new(&credentials(case.who), ""), &case.facts(OffsetDateTime::now_utc()));
+    assert_eq!(conditions["SourceIp"], vec!["192.0.2.32".to_owned()]);
+}
+
+#[test]
+fn absent_request_facts_leave_their_keys_absent() {
+    let conditions = build_conditions(
+        &AuthzPrincipal::new(&credentials(Who::User), ""),
+        &Case::new("bare", Who::User)
+            .header("Authorization", "AWS4-ECDSA-P256-SHA256 Credential=unknown")
+            .facts(OffsetDateTime::now_utc()),
+    );
+    for key in [
+        "UserAgent",
+        "Referer",
+        "versionid",
+        "signatureversion",
+        "authType",
+        "LocationConstraint",
+        "signatureAge",
+        "groups",
+        "roles",
+        "prefix",
+    ] {
+        assert!(!conditions.contains_key(key), "{key} was invented: {:?}", conditions.get(key));
+    }
+}
+
+#[test]
+fn listing_keys_ignore_other_actions_and_other_spellings() {
+    let pairs = list_query_pairs(Some("Prefix=a&PREFIX=b&max_keys=1&delimiter%20=x&prefix=kept"));
+    assert_eq!(pairs, vec![("prefix".to_owned(), "kept".to_owned())]);
+    let mut conditions = HashMap::new();
+    merge_list_query_conditions(Action::S3Action(S3Action::GetObjectAction), &pairs, &mut conditions);
+    merge_list_query_conditions(Action::None, &pairs, &mut conditions);
+    assert!(conditions.is_empty(), "{conditions:?}");
+}
+
+#[test]
+fn root_account_needs_the_matching_root_key() {
+    let root = credentials(Who::User);
+    let conditions = |root_access_key: &str| {
+        build_conditions(
+            &AuthzPrincipal::new(&root, root_access_key),
+            &Case::new("root", Who::User).facts(OffsetDateTime::now_utc()),
+        )
+    };
+    assert_eq!(conditions("facts-user")["principaltype"], vec!["Account".to_owned()]);
+    for other in ["", "facts-user-other", "facts-use", "FACTS-USER"] {
+        assert_eq!(conditions(other)["principaltype"], vec!["User".to_owned()], "root key {other:?}");
+    }
+}
+
+#[test]
+fn conditions_depend_on_the_given_instant_only() {
+    let case = Case::new("clock", Who::User).sigv4();
+    let credentials = credentials(case.who);
+    let principal = AuthzPrincipal::new(&credentials, "");
+    let instant = OffsetDateTime::from_unix_timestamp(1_791_504_000).expect("instant");
+    let facts = case.facts(instant);
+    let first = build_conditions(&principal, &facts);
+    assert_eq!(first, build_conditions(&principal, &facts));
+    assert_eq!(first["CurrentTime"], vec!["2026-10-09T00:00:00Z".to_owned()]);
+    assert_eq!(first["EpochTime"], vec!["1791504000".to_owned()]);
+}
+
+#[test]
+fn internal_base_conditions_have_no_listing_keys() {
+    let case = Case::new("internal_listing", Who::User)
+        .action(S3Action::ListBucketAction)
+        .query("prefix=a&delimiter=%2F&max-keys=2");
+    let credentials = credentials(case.who);
+    let principal = AuthzPrincipal::new(&credentials, "");
+    let facts = case.facts(OffsetDateTime::now_utc());
+    let base = base_conditions(&principal, &facts);
+    for key in ["prefix", "delimiter", "max-keys"] {
+        assert!(!base.contains_key(key), "{key}");
+    }
+    assert_eq!(build_conditions(&principal, &facts)["prefix"], vec!["a".to_owned()]);
+}
+
+#[test]
+fn build_args_asks_about_the_target_as_the_principal() {
+    let case = Case::new("args", Who::Federated).sigv4().version("v1");
+    let credentials = credentials(case.who);
+    let principal = AuthzPrincipal::new(&credentials, "").with_owner(true);
+    let facts = case.facts(OffsetDateTime::now_utc());
+    let conditions = build_conditions(&principal, &facts);
+    let args = build_args(&principal, &facts, &conditions);
+    assert_eq!(args.account, "facts-fed");
+    assert_eq!(args.groups, &Some(vec!["fed-credential-group".to_owned()]));
+    assert_eq!(args.action, Action::S3Action(S3Action::GetObjectAction));
+    assert_eq!(args.bucket, "facts-bucket");
+    assert_eq!(args.object, "facts/object.txt");
+    assert!(args.is_owner);
+    assert!(!args.deny_only);
+    assert_eq!(args.claims, credentials.claims.as_ref().expect("federated claims"));
+    assert!(std::ptr::eq(args.conditions, &conditions));
+
+    let anonymous = Credentials::default();
+    let principal = AuthzPrincipal::new(&anonymous, "");
+    let args = build_args(&principal, &facts, &conditions);
+    assert!(args.claims.is_empty());
+    assert!(!args.is_owner, "ownership is never assumed");
+    assert_eq!(args.account, "");
 }

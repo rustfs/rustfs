@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
+use facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
@@ -20,10 +21,10 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
-use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
+use rustfs_policy::policy::action::Action;
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
-use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -36,7 +37,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tracing::{debug, trace, warn};
 use url::form_urlencoded;
 
@@ -575,20 +575,6 @@ pub(crate) fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_n
     }
 }
 
-fn policy_source_ip(remote_addr: Option<SocketAddr>, client_info: Option<&ClientInfo>) -> String {
-    client_info
-        .map(|info| info.real_ip.to_string())
-        .or_else(|| remote_addr.map(|addr| addr.ip().to_string()))
-        .unwrap_or_default()
-}
-
-fn policy_secure_transport(client_info: Option<&ClientInfo>) -> bool {
-    client_info
-        .and_then(|info| info.forwarded_proto.as_deref())
-        .map(|proto| proto.eq_ignore_ascii_case("https"))
-        .unwrap_or(false)
-}
-
 /// Get condition values for policy evaluation
 ///
 /// # Arguments
@@ -620,7 +606,7 @@ pub fn get_condition_values_with_client_info(
     remote_addr: Option<SocketAddr>,
     client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, None, client_info)
+    condition_values(header, cred, version_id, region, remote_addr, None, client_info)
 }
 
 /// Get condition values for policy evaluation with optional query-string values.
@@ -643,12 +629,13 @@ pub fn get_condition_values_with_query(
     remote_addr: Option<SocketAddr>,
     query: Option<&str>,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, query, None)
+    condition_values(header, cred, version_id, region, remote_addr, query, None)
 }
 
-/// Get condition values for policy evaluation with optional query-string values
-/// and verified client information from trusted proxy middleware.
-pub fn get_condition_values_with_query_and_client_info(
+/// The condition values the legacy edge evaluates policies with: what
+/// [`facts::build_conditions`] derives for a caller that names no action, plus
+/// the secret headers [`facts::forward_secret_headers`] still copies in.
+fn condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
@@ -657,188 +644,20 @@ pub fn get_condition_values_with_query_and_client_info(
     query: Option<&str>,
     client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
-    let username = if cred.is_temp() || cred.is_service_account() {
-        cred.parent_user.clone()
-    } else {
-        cred.access_key.clone()
+    let root = current_action_credentials().unwrap_or_default();
+    let principal = AuthzPrincipal::new(cred, &root.access_key);
+    let target = AuthzTarget {
+        action: Action::None,
+        bucket: "",
+        object: "",
+        version_id,
+        location_constraint: region.as_ref().map(|region| region.as_str()),
     };
-
-    let sys_cred = current_action_credentials().unwrap_or_default();
-
-    let claims = &cred.claims;
-
-    let principal_type = if !username.is_empty() {
-        if claims.is_some() {
-            "AssumedRole"
-        } else if constant_time_eq(&sys_cred.access_key, &username) {
-            "Account"
-        } else {
-            "User"
-        }
-    } else {
-        "Anonymous"
-    };
-
-    // Get current time
-    let curr_time = OffsetDateTime::now_utc();
-    let epoch_time = curr_time.unix_timestamp();
-
-    // Use provided version ID or empty string
-    let vid = version_id.unwrap_or("");
-
-    // Determine auth type and signature version from headers and query
-    let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
-
-    let is_tls = policy_secure_transport(client_info);
-    let source_ip = policy_source_ip(remote_addr, client_info);
-
-    let mut args = HashMap::new();
-
-    // Add basic time and security info
-    args.insert("CurrentTime".to_owned(), vec![curr_time.format(&Rfc3339).unwrap_or_default()]);
-    args.insert("EpochTime".to_owned(), vec![epoch_time.to_string()]);
-    args.insert("SecureTransport".to_owned(), vec![is_tls.to_string()]);
-    args.insert("SourceIp".to_owned(), vec![source_ip]);
-
-    // Add user agent and referer
-    if let Some(user_agent) = header.get("user-agent") {
-        args.insert("UserAgent".to_owned(), vec![user_agent.to_str().unwrap_or("").to_string()]);
-    }
-    if let Some(referer) = header.get("referer") {
-        args.insert("Referer".to_owned(), vec![referer.to_str().unwrap_or("").to_string()]);
-    }
-
-    // Add user and principal info
-    args.insert("userid".to_owned(), vec![username.clone()]);
-    args.insert("username".to_owned(), vec![username]);
-    args.insert("principaltype".to_owned(), vec![principal_type.to_string()]);
-
-    // Add version ID
-    if !vid.is_empty() {
-        args.insert("versionid".to_owned(), vec![vid.to_string()]);
-    }
-
-    // Add signature version and auth type
-    if !signature_version.is_empty() {
-        args.insert("signatureversion".to_owned(), vec![signature_version]);
-    }
-    if !auth_type.is_empty() {
-        args.insert("authType".to_owned(), vec![auth_type]);
-    }
-
-    if let Some(lc) = region
-        && !lc.as_str().is_empty()
-    {
-        args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
-    }
-
-    let mut clone_header = header.clone();
-    if let Some(v) = clone_header.get("x-amz-signature-age") {
-        args.insert("signatureAge".to_string(), vec![v.to_str().unwrap_or("").to_string()]);
-        clone_header.remove("x-amz-signature-age");
-    }
-
-    for obj_lock in &[
-        AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    ] {
-        let values = clone_header
-            .get_all(*obj_lock)
-            .iter()
-            .map(|v| v.to_str().unwrap_or("").to_string())
-            .collect::<Vec<String>>();
-        if !values.is_empty() {
-            args.insert(obj_lock.trim_start_matches("x-amz-").to_string(), values);
-        }
-        clone_header.remove(*obj_lock);
-    }
-
-    // S3 policy condition keys use "x-amz-grant-*" (policy key s3:x-amz-grant-* -> name() returns x-amz-grant-*)
-    for grant_header in &[
-        "x-amz-grant-full-control",
-        "x-amz-grant-read",
-        "x-amz-grant-write",
-        "x-amz-grant-read-acp",
-        "x-amz-grant-write-acp",
-    ] {
-        let values = clone_header
-            .get_all(*grant_header)
-            .iter()
-            .map(|v| v.to_str().unwrap_or("").to_string())
-            .collect::<Vec<String>>();
-        if !values.is_empty() {
-            args.insert((*grant_header).to_string(), values);
-        }
-        clone_header.remove(*grant_header);
-    }
-
-    // Claims and group membership are part of the verified identity, so they are
-    // resolved before request headers are merged in below.
-    if let Some(claims) = &cred.claims {
-        for (k, v) in claims {
-            if let Some(v_str) = v.as_str() {
-                args.insert(k.trim_start_matches("ldap").to_lowercase(), vec![v_str.to_string()]);
-            }
-        }
-
-        let grps = extract_string_list_claim(claims, "groups");
-        if !grps.is_empty() {
-            args.insert("groups".to_string(), grps);
-        }
-
-        let roles = extract_string_list_claim(claims, "roles");
-        if !roles.is_empty() {
-            args.insert("roles".to_string(), roles);
-        }
-    }
-
-    if let Some(groups) = &cred.groups
-        && !args.contains_key("groups")
-    {
-        args.insert("groups".to_string(), groups.clone());
-    }
-
-    // Every remaining header is attacker-controlled. A header must never contribute
-    // to a condition key that describes the caller's own identity or the connection,
-    // otherwise sending `userid: admin` (or any `jwt:`/`ldap:` claim name) would let a
-    // request satisfy a policy condition about itself. Reject those names outright --
-    // both the ones already populated above and the well-known identity keys that are
-    // absent for this credential, since an absent key is exactly what a spoofed header
-    // would fill in.
-    for key in clone_header.keys() {
-        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
-            continue;
-        }
-        if is_reserved_condition_key(key.as_str(), &args) {
-            continue;
-        }
-        args.insert(
-            key.as_str().to_string(),
-            header
-                .get_all(key)
-                .iter()
-                .map(|v| v.to_str().unwrap_or("").to_string())
-                .collect(),
-        );
-    }
-
-    args
-}
-
-/// Whether a request header is forbidden from contributing to policy condition key
-/// `key`, either because the server already derived that key from verified state or
-/// because it is a well-known identity/context key that only the server may populate.
-fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<String>>) -> bool {
-    server_derived.contains_key(key)
-        || [
-            AMZ_OBJECT_LOCK_MODE_LOWER,
-            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
-            AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        ]
-        .iter()
-        .any(|header| key.eq_ignore_ascii_case(header.trim_start_matches("x-amz-")))
-        || is_server_derived_condition_key(key)
+    let request_facts =
+        AuthzFacts::from_request_parts(header, query, remote_addr, client_info, target, OffsetDateTime::now_utc());
+    let mut conditions = facts::build_conditions(&principal, &request_facts);
+    facts::forward_secret_headers(header, &mut conditions);
+    conditions
 }
 
 /// Get request authentication type
@@ -878,23 +697,6 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
         AuthType::Anonymous
     } else {
         AuthType::Unknown
-    }
-}
-
-fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
-    match get_request_auth_type_with_query(header, query) {
-        AuthType::JWT => ("JWT".to_string(), String::new()),
-        AuthType::SignedV2 => ("REST-HEADER".to_string(), "AWS2".to_string()),
-        AuthType::PresignedV2 => ("REST-QUERY-STRING".to_string(), "AWS2".to_string()),
-        AuthType::StreamingSigned | AuthType::StreamingSignedTrailer | AuthType::StreamingUnsignedTrailer => {
-            ("REST-HEADER".to_string(), "AWS4-HMAC-SHA256".to_string())
-        }
-        AuthType::Signed => ("REST-HEADER".to_string(), "AWS4-HMAC-SHA256".to_string()),
-        AuthType::Presigned => ("REST-QUERY-STRING".to_string(), "AWS4-HMAC-SHA256".to_string()),
-        AuthType::PostPolicy => ("POST".to_string(), String::new()),
-        AuthType::STS => ("STS".to_string(), String::new()),
-        AuthType::Anonymous => ("Anonymous".to_string(), String::new()),
-        AuthType::Unknown => (String::new(), String::new()),
     }
 }
 
@@ -1428,6 +1230,9 @@ mod tests {
     use rustfs_kms::KmsServiceManager;
     use rustfs_policy::auth::get_new_credentials_with_metadata;
     use rustfs_trusted_proxies::ValidationMode;
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+    };
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
