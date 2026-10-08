@@ -1443,6 +1443,172 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
+    async fn non_inline_two_phase_get_rejects_generation_change_before_late_refresh() {
+        use crate::object_api::WriteCompletion;
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (dirs, set_disks) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        let bucket = "non-inline-late-generation";
+        let object = object_with_initial_data_shards(bucket, "late-generation-object");
+        let generation_a_body = vec![0x5a; 1024 * 1024];
+        let generation_b_body = vec![0xa5; generation_a_body.len()];
+        // This unlocked, real-disk fixture exercises the internal generation
+        // boundary, not concurrent HTTP writes through a namespace read lock.
+        let opts = ObjectOptions {
+            no_lock: true,
+            suppress_read_repair: true,
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create late generation bucket");
+        set_disks
+            .put_object(bucket, &object, &mut PutObjReader::from_vec(generation_a_body), &opts)
+            .await
+            .expect("commit every generation A shard before GET");
+        let disks = set_disks.get_disks_internal().await;
+        let original = SetDisks::read_metadata_observed(&disks, "", bucket, &object, "", true, false, false, false, 2)
+            .await
+            .expect("read every generation A disk slot");
+        assert!(original.is_complete());
+        let (original_metadata, original_errors, _) = original.into_legacy();
+        assert!(original_errors.iter().all(Option::is_none));
+        let (_, generation_a, _) = SetDisks::select_valid_fileinfo(&disks, &original_metadata, &original_errors, "", 2, 3)
+            .expect("generation A must have real metadata quorum");
+        assert!(!generation_a.inline_data(), "fixture must use non-inline shard files");
+        let order = bounded_metadata_fanout_order(bucket, &object, 4, 2);
+        for disk_index in order.iter().take(2) {
+            let data_dir = original_metadata[*disk_index]
+                .data_dir
+                .expect("generation A metadata must name its real shard directory");
+            let part_path = dirs[*disk_index]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(data_dir.to_string())
+                .join("part.1");
+            let mut shard = std::fs::read(&part_path).expect("selected generation A shard must exist");
+            *shard.first_mut().expect("real shard must contain a checksum frame") ^= 0xff;
+            std::fs::write(part_path, shard).expect("corrupt selected shard without changing generation A metadata");
+        }
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
+                let refresh = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_LATE_METADATA_REFRESH);
+                let calls = disk_call_counters::observe(&object);
+                let get = set_disks.get_object_reader(bucket, &object, None, HeaderMap::new(), &opts);
+                tokio::pin!(get);
+                tokio::time::timeout(READ_VERSION_BARRIER_GUARD, async {
+                    tokio::select! {
+                        result = &mut get => panic!("GET returned before the late refresh boundary: {:?}", result.err()),
+                        () = refresh.wait_until_paused() => {}
+                    }
+                })
+                .await
+                .expect("failed generation A decode must reach the real late refresh boundary");
+                assert!(refresh.is_paused());
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    3,
+                    "A must be an early metadata candidate"
+                );
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_READ_VERSION, order[3]),
+                    0,
+                    "late refresh must not have read the omitted disk before replacement"
+                );
+
+                set_disks
+                    .put_object(bucket, &object, &mut PutObjReader::from_vec(generation_b_body.clone()), &opts)
+                    .await
+                    .expect("commit every healthy generation B shard while the late GET is paused");
+                let replacement = SetDisks::read_metadata_observed(&disks, "", bucket, &object, "", true, false, false, false, 2)
+                    .await
+                    .expect("read every committed generation B disk slot");
+                assert!(replacement.is_complete());
+                let (replacement_metadata, replacement_errors, _) = replacement.into_legacy();
+                assert!(replacement_errors.iter().all(Option::is_none));
+                let (online, generation_b, _) =
+                    SetDisks::select_valid_fileinfo(&disks, &replacement_metadata, &replacement_errors, "", 2, 3)
+                        .expect("replacement must have healthy real metadata quorum");
+                assert_eq!(online.iter().flatten().count(), 4);
+                assert_ne!(generation_a.data_dir, generation_b.data_dir);
+                assert_ne!(
+                    SetDisks::file_info_quorum_hash(&generation_a),
+                    SetDisks::file_info_quorum_hash(&generation_b)
+                );
+                assert_eq!(generation_a.size, generation_b.size);
+                assert_eq!(generation_a.erasure.distribution, generation_b.erasure.distribution);
+                let before_late = (0..4)
+                    .map(|index| calls.for_disk(disk_call_counters::KIND_READ_VERSION, index))
+                    .collect::<Vec<_>>();
+                refresh.release();
+                let result = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut get)
+                    .await
+                    .expect("late GET must finish after its refresh boundary is released");
+                for (index, before) in before_late.into_iter().enumerate() {
+                    assert_eq!(
+                        calls.for_disk(disk_call_counters::KIND_READ_VERSION, index) - before,
+                        1,
+                        "late refresh must read each real disk exactly once"
+                    );
+                }
+                match result {
+                    Err(Error::InsufficientReadQuorum(failed_bucket, failed_object)) => {
+                        assert_eq!(failed_bucket, bucket);
+                        assert_eq!(failed_object, object);
+                    }
+                    Err(error) => panic!("changed late generation must return InsufficientReadQuorum, got {error:?}"),
+                    Ok(mut reader) => {
+                        assert_eq!(reader.object_info.size, i64::try_from(generation_b_body.len()).expect("fixture size"));
+                        let mut body = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut body)
+                            .await
+                            .expect("unexpected replacement body must be readable");
+                        assert_eq!(body.len(), generation_b_body.len());
+                        assert_eq!(body, generation_b_body);
+                        println!(
+                            "late generation oracle exposed complete B: initial_reads=3, late_reads=4, bytes={}",
+                            body.len()
+                        );
+                        panic!("late GET must reject a changed object generation before exposing a body");
+                    }
+                }
+                drop(refresh);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("fresh GET must open the healthy replacement generation");
+                assert_eq!(reader.object_info.size, i64::try_from(generation_b_body.len()).expect("fixture size"));
+                let mut body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut body)
+                    .await
+                    .expect("fresh generation B must stream completely");
+                assert_eq!(body.len(), generation_b_body.len());
+                assert_eq!(body, generation_b_body);
+                println!(
+                    "late generation oracle rejected crossing: initial_reads=3, late_per_disk=[1,1,1,1], fresh_bytes={}",
+                    body.len()
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
     async fn four_data_two_parity_two_phase_read_recovers_one_failed_data_shard() {
         let (dirs, set_disks) = make_local_set_disks(6, 2).await;
         let bucket = "four-data-two-parity-late-read";
