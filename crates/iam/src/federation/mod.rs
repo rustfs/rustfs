@@ -26,6 +26,6 @@ pub use model::{
     FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedProviderRef,
     FederatedSession, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM, VerifiedFederatedIdentity,
 };
-pub use provider::FederatedIdentityProvider;
+pub use provider::{FederatedIdentityProvider, FederatedProviderView, FederatedRedirectPolicy};
 pub use registry::FederatedIdentityRegistry;
 pub use transaction::FederatedIdentityService;

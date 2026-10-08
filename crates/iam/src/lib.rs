@@ -332,7 +332,7 @@ async fn init_oidc_sys_with_extra_root_ca_provider_inner(
                     event = EVENT_OIDC_STATE,
                     component = LOG_COMPONENT_IAM,
                     subsystem = LOG_SUBSYSTEM_OIDC,
-                    provider_count = sys.list_providers().len(),
+                    provider_count = sys.provider_configs().count(),
                     state = "ready",
                     "OIDC runtime ready"
                 );
