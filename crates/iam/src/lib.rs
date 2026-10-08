@@ -194,7 +194,6 @@ pub(crate) async fn notify_iam_load_policy_mapping(
 }
 
 static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
-static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
 /// Build an IAM system bound to the given store without touching the process
 /// singleton (backlog#1052 S3): a per-server context can own the returned
@@ -284,36 +283,11 @@ pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
     IAM_SYS.get().cloned()
 }
 
-/// Initialize the global OIDC system. Non-fatal if no OIDC providers are configured.
-pub async fn init_oidc_sys() -> Result<()> {
-    init_oidc_sys_with_extra_root_ca(None).await
-}
-
-/// Initialize the global OIDC system with an additional outbound root CA bundle.
-pub async fn init_oidc_sys_with_extra_root_ca(root_ca_pem: Option<&[u8]>) -> Result<()> {
-    init_oidc_sys_with_extra_root_ca_provider_inner(None, root_ca_pem).await
-}
-
-/// Initialize the global OIDC system with a reload-aware outbound root CA provider.
-pub async fn init_oidc_sys_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<()> {
-    init_oidc_sys_with_extra_root_ca_provider_inner(Some(extra_root_ca_provider), None).await
-}
-
-async fn init_oidc_sys_with_extra_root_ca_provider_inner(
-    extra_root_ca_provider: Option<OidcExtraRootCaProvider>,
-    root_ca_pem: Option<&[u8]>,
-) -> Result<()> {
-    if OIDC_SYS.get().is_some() {
-        debug!(
-            event = EVENT_OIDC_STATE,
-            component = LOG_COMPONENT_IAM,
-            subsystem = LOG_SUBSYSTEM_OIDC,
-            state = "already_initialized",
-            "OIDC runtime already initialized"
-        );
-        return Ok(());
-    }
-
+/// Build the OIDC system with reload-aware outbound root CA material.
+///
+/// Invalid OIDC setup remains non-fatal: the returned system has no providers,
+/// matching the server startup behavior when OIDC cannot be initialized.
+pub async fn build_oidc_sys_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<Arc<OidcSys>> {
     debug!(
         event = EVENT_OIDC_STATE,
         component = LOG_COMPONENT_IAM,
@@ -322,10 +296,10 @@ async fn init_oidc_sys_with_extra_root_ca_provider_inner(
         "OIDC runtime starting"
     );
 
-    let oidc_sys_result = match extra_root_ca_provider {
-        Some(provider) => OidcSys::new_with_extra_root_ca_provider(provider).await,
-        None => OidcSys::new_with_extra_root_ca(root_ca_pem).await,
-    };
+    finish_oidc_sys_build(OidcSys::new_with_extra_root_ca_provider(extra_root_ca_provider).await)
+}
+
+fn finish_oidc_sys_build(oidc_sys_result: std::result::Result<OidcSys, String>) -> Result<Arc<OidcSys>> {
     let oidc_sys = match oidc_sys_result {
         Ok(sys) => {
             if sys.has_providers() {
@@ -361,20 +335,117 @@ async fn init_oidc_sys_with_extra_root_ca_provider_inner(
         }
     };
 
-    if OIDC_SYS.set(Arc::new(oidc_sys)).is_err() {
-        warn!(
-            event = EVENT_OIDC_STATE,
-            component = LOG_COMPONENT_IAM,
-            subsystem = LOG_SUBSYSTEM_OIDC,
-            state = "singleton_set_race",
-            "OIDC runtime singleton set raced"
-        );
-    }
-
-    Ok(())
+    Ok(Arc::new(oidc_sys))
 }
 
-/// Get the global OIDC system.
-pub fn get_oidc() -> Option<Arc<OidcSys>> {
-    OIDC_SYS.get().cloned()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{self, Write},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log lock should be available")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_oidc_build(result: std::result::Result<OidcSys, String>) -> (Arc<OidcSys>, String) {
+        let logs = CapturedLogs::default();
+        let captured = Arc::clone(&logs.0);
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false)
+                .with_level(true)
+                .with_ansi(false)
+                .with_writer(logs),
+        );
+
+        let oidc = tracing::subscriber::with_default(subscriber, || {
+            finish_oidc_sys_build(result).expect("OIDC build completion should succeed")
+        });
+        let output = String::from_utf8(captured.lock().expect("captured log lock should be available").clone())
+            .expect("captured logs should be UTF-8");
+        (oidc, output)
+    }
+
+    #[test]
+    fn oidc_build_reports_empty_configuration() {
+        let (oidc, output) = capture_oidc_build(OidcSys::empty());
+
+        assert!(!oidc.has_providers());
+        assert!(output.contains(EVENT_OIDC_STATE), "{output}");
+        assert!(output.contains("state=\"empty\""), "{output}");
+    }
+
+    #[test]
+    fn oidc_build_reports_ready_configuration() {
+        let oidc = crate::oidc::make_test_sys(vec![crate::oidc::test_config("default")]);
+        let (oidc, output) = capture_oidc_build(Ok(oidc));
+
+        assert!(oidc.has_providers());
+        assert_eq!(oidc.config_snapshot().providers().len(), 1);
+        assert!(output.contains(EVENT_OIDC_STATE), "{output}");
+        assert!(output.contains("state=\"ready\""), "{output}");
+        assert!(output.contains("provider_count=1"), "{output}");
+    }
+
+    #[test]
+    fn oidc_build_reports_error_and_returns_empty_runtime() {
+        let (oidc, output) = capture_oidc_build(Err("configured OIDC root CA is invalid".to_string()));
+
+        assert!(!oidc.has_providers());
+        assert!(output.contains("WARN"), "{output}");
+        assert!(output.contains(EVENT_OIDC_STATE), "{output}");
+        assert!(output.contains("state=\"init_failed_non_fatal\""), "{output}");
+        assert!(output.contains("configured OIDC root CA is invalid"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn oidc_builder_loads_root_ca_provider_and_keeps_failure_non_fatal() {
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let observed_load_count = Arc::clone(&load_count);
+        let provider = OidcExtraRootCaProvider::new(move || {
+            let observed_load_count = Arc::clone(&observed_load_count);
+            async move {
+                observed_load_count.fetch_add(1, Ordering::SeqCst);
+                Err("test root CA load failure".to_string())
+            }
+        });
+
+        let oidc = build_oidc_sys_with_extra_root_ca_provider(provider)
+            .await
+            .expect("root CA load failure should produce an empty OIDC runtime");
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        assert!(!oidc.has_providers());
+    }
 }

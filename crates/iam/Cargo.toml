@@ -125,6 +125,7 @@ rustls-pki-types.workspace = true
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [lib]
 doctest = false

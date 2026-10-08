@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use rustfs_iam::{
+    build_oidc_sys_with_extra_root_ca_provider,
     federation::{
         CoreFederatedAuthorizationMapper, FederatedIdentityService,
         oidc::{OidcConfigQuery, StandardOidcAdapter},
     },
-    get_oidc, init_oidc_sys_with_extra_root_ca_provider,
     oidc::{OidcExtraRootCaMaterial, OidcExtraRootCaProvider, OidcSys},
 };
 use std::{
@@ -56,12 +56,10 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
         }
     }
 
-    match init_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
-        Ok(()) => {
-            if let Some(oidc) = get_oidc() {
-                let (service, oidc_config_query) = standard_oidc_runtime(oidc);
-                crate::runtime_sources::publish_federated_identity_runtime(service, oidc_config_query);
-            }
+    match build_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
+        Ok(oidc) => {
+            let (service, oidc_config_query) = standard_oidc_runtime(oidc);
+            crate::runtime_sources::publish_federated_identity_runtime(service, oidc_config_query);
         }
         Err(e) => {
             warn!(
