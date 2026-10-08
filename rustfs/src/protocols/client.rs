@@ -635,7 +635,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         session_context: &SessionContext,
         request_headers: &HeaderMap,
         secure_transport: bool,
-    ) -> Result<ListBucketsOutput, Self::Error> {
+    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -649,7 +649,11 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
         let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
-        self.fs.list_buckets(request).await.map(|response| response.output)
+        self.fs
+            .list_buckets(request)
+            .await
+            .map(|response| response.output)
+            .map_err(Into::into)
     }
 
     /// Every input is a cache or snapshot read: quota reporting never triggers
@@ -660,7 +664,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         session_context: &SessionContext,
         request_headers: &HeaderMap,
         secure_transport: bool,
-    ) -> Result<Option<SessionCapacityView>, Self::Error> {
+    ) -> rustfs_s3_types::S3Result<Option<SessionCapacityView>> {
         // List buckets under the session's own authorization so the view
         // never covers buckets the caller cannot see.
         let input = ListBucketsInput::builder().build().map_err(|e| {
@@ -685,7 +689,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                     return Err(s3s::S3Error::with_message(
                         s3s::S3ErrorCode::InternalError,
                         format!("Failed to read bucket quota config: {e}"),
-                    ));
+                    )
+                    .into());
                 }
             };
             let usage = match capacity::get_bucket_usage_memory(&name).await {
