@@ -288,6 +288,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
         admin_route(Method::PUT, "/v3/import-bucket-metadata"),
+        admin_route_sample(
+            Method::POST,
+            "/v3/recover-orphaned-bucket/{bucket}",
+            "/v3/recover-orphaned-bucket/test-bucket",
+        ),
         admin_route(Method::GET, "/v3/get-config-kv"),
         admin_route(Method::PUT, "/v3/set-config-kv"),
         admin_route(Method::DELETE, "/v3/del-config-kv"),
@@ -1389,6 +1394,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/import-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
+    assert_route(&router, Method::POST, &admin_path("/v3/recover-orphaned-bucket/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
     assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));

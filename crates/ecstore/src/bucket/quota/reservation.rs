@@ -1099,6 +1099,43 @@ async fn load_current_ledger_locked(
     }
 }
 
+/// Remove the single-ledger reservation state for an incarnation after its
+/// durable bucket retirement has been published. The caller holds the bucket
+/// lifecycle and metadata transaction write fences, so no live reservation
+/// owner can outlast this cleanup. Keep the ledger namespace lock as the local
+/// serialization boundary and delete only the exact V1 object key.
+pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &str, incarnation: Uuid) -> Result<()> {
+    let object = ledger_object(bucket);
+    let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+    let guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+    match load_ledger_locked(Arc::clone(&store), &object).await {
+        Ok(ledger) if ledger.bucket_incarnation == incarnation => {}
+        Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {}
+        Ok(_) => return Err(StorageError::PreconditionFailed),
+        Err(StorageError::ConfigNotFound) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    if guard.is_lock_lost() {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "quota_ledger_retirement",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object,
+            required: 1,
+            achieved: 0,
+        });
+    }
+    let mut options = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    options.add_namespace_lock_guard(&guard);
+    match store.delete_object(RUSTFS_META_BUCKET, &object, options).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_err_object_not_found(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_object: &str) -> Result<()> {
     let now = now_unix();
     let (candidates, reconcile_required, next_cursor) = {
@@ -1921,6 +1958,8 @@ fn log_deferred_settlement(data: &ReservationLedgerData, state: &'static str, er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use serial_test::serial;
 
     fn ledger(accounted_usage: u64) -> QuotaLedger {
         QuotaLedger::new(Uuid::new_v4(), OffsetDateTime::now_utc(), accounted_usage)
@@ -1971,6 +2010,67 @@ mod tests {
         );
 
         assert!(matches!(ledger.admitted_usage(), Err(StorageError::PartMissingOrCorrupt)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retired_bucket_cleanup_removes_stale_v1_reservation_before_new_admission() {
+        let (_directories, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("quota-orphan-recovery-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create old bucket generation");
+        let old_incarnation = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("old bucket incarnation");
+        let new_incarnation = Uuid::new_v4();
+        let ledger_path = ledger_object(&bucket);
+        let mut stale = QuotaLedger::new(old_incarnation, OffsetDateTime::now_utc(), 0);
+        stale
+            .reserve(
+                Uuid::new_v4(),
+                PersistedReservation {
+                    object: "crashed-put".to_string(),
+                    old_size: 0,
+                    new_size: 100,
+                    created_at: now_unix(),
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                    commit_started: false,
+                },
+            )
+            .expect("crash-left reservation is structurally valid");
+        crate::config::com::save_config(Arc::clone(&store), &ledger_path, serde_json::to_vec(&stale).expect("encode ledger"))
+            .await
+            .expect("persist crash-left reservation fixture");
+
+        assert!(matches!(
+            load_current_ledger_locked(Arc::clone(&store), &bucket, &ledger_path, new_incarnation, OffsetDateTime::now_utc())
+                .await,
+            Err(StorageError::PartMissingOrCorrupt)
+        ));
+        assert!(matches!(
+            cleanup_retired_bucket_ledger(Arc::clone(&store), &bucket, Uuid::new_v4()).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        crate::bucket::retirement::commit_retirement(Arc::clone(&store), &bucket, old_incarnation, &ObjectOptions::default())
+            .await
+            .expect("publish predecessor generation retirement proof");
+        cleanup_retired_bucket_ledger(Arc::clone(&store), &bucket, new_incarnation)
+            .await
+            .expect("a proven retired predecessor ledger cannot block the replacement generation");
+        assert!(matches!(
+            load_ledger_locked(Arc::clone(&store), &ledger_path).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        let replacement =
+            load_current_ledger_locked(Arc::clone(&store), &bucket, &ledger_path, new_incarnation, OffsetDateTime::now_utc())
+                .await
+                .expect("new quota admission must not inherit a fresh stale reservation");
+        assert!(replacement.reservations.is_empty());
     }
 
     #[test]

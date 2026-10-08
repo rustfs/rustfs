@@ -204,6 +204,52 @@ where
     .await
 }
 
+fn bucket_recovery_lock_unavailable(bucket: &str, object: &str) -> StorageError {
+    StorageError::NamespaceLockQuorumUnavailable {
+        mode: "write",
+        bucket: bucket.to_string(),
+        object: object.to_string(),
+        required: 1,
+        achieved: 0,
+    }
+}
+
+async fn await_orphan_bucket_recovery<T, F>(
+    bucket: &str,
+    publication_guard: &rustfs_lock::NamespaceLockGuard,
+    lifecycle_guard: &rustfs_lock::NamespaceLockGuard,
+    metadata_guard: &rustfs_lock::NamespaceLockGuard,
+    namespace_guard: &rustfs_lock::NamespaceLockGuard,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let metadata_lock_object = crate::bucket::metadata_sys::bucket_metadata_transaction_lock_key(bucket);
+    for ((lock_bucket, lock_object), guard) in [
+        (
+            (bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH),
+            publication_guard,
+        ),
+        ((bucket, BUCKET_LIFECYCLE_LOCK_OBJECT), lifecycle_guard),
+        ((RUSTFS_META_BUCKET, metadata_lock_object.as_str()), metadata_guard),
+        ((bucket, bucket), namespace_guard),
+    ] {
+        if guard.is_lock_lost() {
+            return Err(bucket_recovery_lock_unavailable(lock_bucket, lock_object));
+        }
+    }
+
+    tokio::select! {
+        biased;
+        _ = publication_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)),
+        _ = lifecycle_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)),
+        _ = metadata_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(RUSTFS_META_BUCKET, &metadata_lock_object)),
+        _ = namespace_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, bucket)),
+        result = future => result,
+    }
+}
+
 async fn run_bucket_usage_cleanup<F>(guard: Option<&rustfs_lock::NamespaceLockGuard>, bucket: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>>,
@@ -272,12 +318,133 @@ async fn bucket_delete_local_blocker(
 }
 
 impl ECStore {
+    /// Run a multi-step storage mutation on the instance task tracker so its
+    /// caller may stop waiting without releasing guards before the mutation
+    /// finishes.
+    pub async fn run_detached_mutation<F>(&self, mutation: F) -> Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.ctx
+            .run_detached_mutation(mutation)
+            .await
+            .map_err(|error| StorageError::other_with_context("detached ECStore mutation failed", error))
+    }
+
     fn bucket_sets(&self) -> impl Iterator<Item = (usize, usize, Arc<crate::set_disk::SetDisks>)> + '_ {
         self.pools.iter().flat_map(|pool| {
             pool.disk_set
                 .iter()
                 .map(|set| (set.pool_index, set.set_index, Arc::clone(set)))
         })
+    }
+
+    async fn ensure_bucket_volume_absent_on_all_sets(&self, bucket: &str) -> Result<()> {
+        let sets: Vec<_> = self.bucket_sets().map(|(_, _, set)| set).collect();
+        if sets.is_empty() {
+            return Err(StorageError::ErasureReadQuorum);
+        }
+        let results = join_all(sets.iter().map(|set| set.ensure_bucket_volume_absent_on_every_disk(bucket))).await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Return whether an old bucket generation has a durable retirement record.
+    /// A live matching incarnation is never considered retired, even if a stale
+    /// record exists from a previous generation.
+    pub async fn is_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        if expected.is_nil() {
+            return Ok(false);
+        }
+        let retirement_store = metadata_sys::object_store_if_initialized_in(&self.ctx).await.ok_or_else(|| {
+            StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-retirements".to_string())
+        })?;
+        if crate::bucket::metadata::load_bucket_incarnation(retirement_store.clone(), bucket).await? == Some(expected) {
+            return Ok(false);
+        }
+        crate::bucket::retirement::is_retired(retirement_store, bucket, expected).await
+    }
+
+    /// Reconcile bucket metadata after an operator removed all physical volume
+    /// directories. The expected generation, all-disk absence proof and durable
+    /// retirement record make retries safe after partial metadata cleanup.
+    pub fn recover_orphaned_bucket<'a>(&'a self, bucket: &'a str, expected: Uuid) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Box::pin(self.recover_orphaned_bucket_inner(bucket, expected)).await })
+    }
+
+    async fn recover_orphaned_bucket_inner(&self, bucket: &str, expected: Uuid) -> Result<()> {
+        if let Err(error) = check_valid_bucket_name_strict(bucket) {
+            return Err(StorageError::BucketNameInvalid(error.to_string()));
+        }
+        if is_meta_bucketname(bucket) || expected.is_nil() {
+            return Err(StorageError::InvalidArgument(
+                "RecoverOrphanedBucket".to_string(),
+                "bucket".to_string(),
+                "a user bucket and non-nil incarnation are required".to_string(),
+            ));
+        }
+
+        // Lock order matches bucket deletion: publication -> lifecycle ->
+        // metadata transaction -> exact namespace.
+        let publication_guard = self.acquire_bucket_publication_write_lock(bucket).await?;
+        let lifecycle_guard = self.acquire_bucket_lifecycle_write_lock(bucket).await?;
+        let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_lock_in(&self.ctx, bucket).await?;
+        let ns_lock = self.new_ns_lock(bucket, bucket).await?;
+        let ns_guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|error| match error {
+                rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "write",
+                    bucket: bucket.to_string(),
+                    object: bucket.to_string(),
+                    required,
+                    achieved,
+                },
+                other => StorageError::Lock(other),
+            })?;
+
+        let recover = Box::pin(async {
+            self.ensure_bucket_volume_absent_on_all_sets(bucket).await?;
+            let retirement_store = metadata_sys::object_store_if_initialized_in(&self.ctx).await.ok_or_else(|| {
+                StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-retirements".to_string())
+            })?;
+            let current_incarnation = crate::bucket::metadata::load_bucket_incarnation(retirement_store.clone(), bucket).await?;
+            if current_incarnation.is_some_and(|current| current != expected) {
+                return Err(StorageError::PreconditionFailed);
+            }
+
+            let retired = crate::bucket::retirement::is_retired(retirement_store.clone(), bucket, expected).await?;
+            if current_incarnation.is_none() && !retired {
+                return Err(StorageError::PreconditionFailed);
+            }
+            if !retired {
+                let mut record_opts = ObjectOptions {
+                    max_parity: true,
+                    ..Default::default()
+                };
+                record_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+                record_opts.add_namespace_lock_guard(&ns_guard);
+                let publish_retirement = Box::pin(crate::bucket::retirement::commit_retirement(
+                    retirement_store.clone(),
+                    bucket,
+                    expected,
+                    &record_opts,
+                ));
+                publish_retirement.await?;
+            }
+
+            crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(retirement_store.clone(), bucket, expected).await?;
+            crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, Some(&ns_guard)).await?;
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, Some(&ns_guard)).await?;
+            self.cleanup_deleted_bucket_metadata_strict(bucket, true).await?;
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+            Ok(())
+        });
+        await_orphan_bucket_recovery(bucket, &publication_guard, &lifecycle_guard, &metadata_guard, &ns_guard, recover).await
     }
 
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -604,6 +771,25 @@ impl ECStore {
         Ok(())
     }
 
+    async fn cleanup_deleted_bucket_metadata_strict(&self, bucket: &str, include_deleted_marker: bool) -> Result<()> {
+        let options = ObjectOptions {
+            delete_prefix_object: true,
+            ..Default::default()
+        };
+        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
+            self.delete_prefix(RUSTFS_META_BUCKET, &prefix, &options).await?;
+        }
+
+        if include_deleted_marker {
+            let marker_prefix = bucket_deleted_marker_prefix(bucket);
+            self.delete_prefix(RUSTFS_META_BUCKET, &marker_prefix, &options).await?;
+        }
+
+        metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket).await?;
+        runtime_sources::delete_bucket_monitor_entry(bucket);
+        Ok(())
+    }
+
     async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
         run_bucket_usage_cleanup(guard, bucket, async {
             crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
@@ -715,6 +901,32 @@ impl ECStore {
             }
         };
         let confirmed_missing = existing_bucket_info.is_none();
+        if confirmed_missing
+            && !opts.no_lock
+            && !is_meta_bucketname(bucket)
+            && let Some(metadata_store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await
+            && let Some(old_incarnation) = crate::bucket::metadata::load_bucket_incarnation(metadata_store, bucket).await?
+        {
+            // A quorum-level absence is not proof that every disk lost the old
+            // generation. Require the explicit recovery path to verify all disks
+            // and retire this incarnation before a same-name create can mutate
+            // any volume.
+            self.ensure_bucket_volume_absent_on_all_sets(bucket)
+                .await
+                .map_err(|error| match error {
+                    StorageError::BucketExists(_) => StorageError::InvalidArgument(
+                        "CreateBucket".to_string(),
+                        "bucket".to_string(),
+                        "an old bucket volume remains on disk; administrator recovery refused".to_string(),
+                    ),
+                    other => other,
+                })?;
+            return Err(StorageError::InvalidArgument(
+                "CreateBucket".to_string(),
+                "bucket".to_string(),
+                format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
+            ));
+        }
         let existing_metadata = if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {
@@ -1608,6 +1820,65 @@ mod tests {
 
     async fn setup_multi_pool_bucket_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
         setup_bucket_quorum_test_env(&[4, 4], None).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn orphaned_bucket_recovery_requires_every_volume_absent_and_is_retryable() {
+        let (temp_dir, store) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-recovery-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket before simulated operator removal");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("persisted bucket generation");
+
+        let first_disk_volume = temp_dir.path().join("pool0-disk0").join(&bucket);
+        tokio::fs::remove_dir_all(&first_disk_volume)
+            .await
+            .expect("simulate operator removal on one disk");
+        let blocked = store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect_err("recovery must refuse while any configured disk still has the volume");
+        assert!(matches!(blocked, StorageError::BucketExists(_)), "unexpected error: {blocked}");
+        assert_eq!(
+            crate::bucket::metadata::load_bucket_incarnation(store.clone(), &bucket)
+                .await
+                .expect("generation sidecar remains readable"),
+            Some(incarnation),
+            "a refused recovery must preserve the old generation identity"
+        );
+
+        for disk_index in 1..4 {
+            tokio::fs::remove_dir_all(temp_dir.path().join(format!("pool0-disk{disk_index}")).join(&bucket))
+                .await
+                .expect("remove remaining volume from first set");
+        }
+        for disk_index in 0..4 {
+            tokio::fs::remove_dir_all(temp_dir.path().join(format!("pool1-disk{disk_index}")).join(&bucket))
+                .await
+                .expect("remove volume from second set");
+        }
+
+        store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect("recovery should retire the exact generation and clean stale metadata");
+        assert!(
+            store
+                .is_bucket_incarnation_retired(&bucket, incarnation)
+                .await
+                .expect("retirement proof remains readable")
+        );
+        store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect("retry after metadata cleanup should converge from durable retirement proof");
     }
 
     async fn setup_bucket_quorum_test_env(
