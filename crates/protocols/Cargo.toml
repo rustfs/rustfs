@@ -148,6 +148,7 @@ rustls = { workspace = true, default-features = false, optional = true, features
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
+rustfs-s3-types = { workspace = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true, features = ["timeout"] }
 regex = { workspace = true, optional = true }

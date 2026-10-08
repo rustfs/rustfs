@@ -561,3 +561,6 @@ mod tests {
         assert_eq!(ours.is_end_stream(), legacy.is_end_stream(), "empty: end of stream");
     }
 }
+
+#[cfg(test)]
+mod call_site_codes;
