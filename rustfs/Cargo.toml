@@ -249,7 +249,7 @@ rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }
-rustfs-s3-types = { workspace = true }
+rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }

@@ -10703,6 +10703,8 @@ name = "rustfs-s3-types"
 version = "1.0.1"
 dependencies = [
  "hotpath",
+ "http 1.5.0",
+ "s3s",
  "serde",
  "serde_json",
 ]
