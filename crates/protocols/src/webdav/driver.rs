@@ -23,9 +23,9 @@ use dav_server::fs::{
 use futures_util::{FutureExt, StreamExt, stream};
 use percent_encoding::percent_decode_str;
 use rustfs_credentials::Credentials;
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
-use s3s::S3ErrorCode;
 use s3s::dto::*;
 use std::fmt::Debug;
 use std::io::SeekFrom;
@@ -1959,7 +1959,10 @@ mod tests {
     #[tokio::test]
     async fn list_buckets_maps_typed_access_denied_to_forbidden() {
         let storage = DummyBackend::new();
-        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(s3s::S3ErrorCode::AccessDenied, "policy denied"));
+        storage.queue_session_list_buckets_err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::AccessDenied,
+            "policy denied",
+        ));
         let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
             .with_request_context(http::HeaderMap::new(), false);
 
@@ -1973,8 +1976,8 @@ mod tests {
     #[tokio::test]
     async fn list_buckets_does_not_classify_error_text_as_access_denied() {
         let storage = DummyBackend::new();
-        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(
-            s3s::S3ErrorCode::InternalError,
+        storage.queue_session_list_buckets_err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InternalError,
             "AccessDenied appears only in the message",
         ));
         let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
@@ -2653,8 +2656,8 @@ mod tests {
     #[tokio::test]
     async fn get_quota_maps_backend_failure_to_general_failure() {
         let storage = DummyBackend::new();
-        storage.queue_session_capacity_view_err(s3s::S3Error::with_message(
-            s3s::S3ErrorCode::InternalError,
+        storage.queue_session_capacity_view_err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InternalError,
             "quota config unreadable",
         ));
         let driver = quota_driver(storage);

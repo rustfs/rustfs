@@ -18,11 +18,7 @@
 //! Upstream: the crate's public API only. Downstream: none.
 
 use http::{HeaderMap, HeaderValue, StatusCode};
-// Imported under an alias on purpose: the s3s footprint ratchet still counts
-// `s3_error` invocation lines as s3s usage, and tests of the RustFS-owned macro
-// must not move that counter.
-use rustfs_s3_types::s3_error as s3err;
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use std::convert::Infallible;
 use std::io;
 
@@ -44,7 +40,7 @@ fn cause_text(err: &S3Error) -> Option<String> {
 
 #[test]
 fn macro_code_only_form() {
-    let err = s3err!(NoSuchKey);
+    let err = s3_error!(NoSuchKey);
     assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
     assert_eq!(err.message(), None);
     assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
@@ -52,7 +48,7 @@ fn macro_code_only_form() {
 
 #[test]
 fn macro_literal_message_form() {
-    let err = s3err!(InvalidRequest, "bucket name is empty");
+    let err = s3_error!(InvalidRequest, "bucket name is empty");
     assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     assert_eq!(err.message(), Some("bucket name is empty"));
 }
@@ -60,7 +56,7 @@ fn macro_literal_message_form() {
 #[test]
 fn macro_format_form_with_positional_and_captured_arguments() {
     let bucket = "b1";
-    let err = s3err!(InvalidArgument, "bucket {bucket} part {}", 7);
+    let err = s3_error!(InvalidArgument, "bucket {bucket} part {}", 7);
     assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     assert_eq!(err.message(), Some("bucket b1 part 7"));
 }
@@ -69,28 +65,28 @@ fn macro_format_form_with_positional_and_captured_arguments() {
 #[rustfmt::skip]
 #[test]
 fn macro_multi_line_and_trailing_comma_forms_match_the_single_line_form() {
-    let multi = s3err!(
+    let multi = s3_error!(
         InternalError,
         "disk {} offline",
         3,
     );
-    let single = s3err!(InternalError, "disk {} offline", 3);
+    let single = s3_error!(InternalError, "disk {} offline", 3);
     assert_eq!(multi.code(), single.code());
     assert_eq!(multi.message(), single.message());
-    let bare = s3err!(InternalError,);
+    let bare = s3_error!(InternalError,);
     assert_eq!(bare.message(), None);
 }
 
 #[test]
 fn macro_literal_form_does_not_treat_braces_as_a_message_to_format_later() {
-    let err = s3err!(InvalidRequest, "{{literal braces}}");
+    let err = s3_error!(InvalidRequest, "{{literal braces}}");
     assert_eq!(err.message(), Some("{literal braces}"));
 }
 
 #[test]
 fn macro_errors_propagate_with_the_question_mark_operator() {
     fn inner() -> S3Result<()> {
-        Err(s3err!(AccessDenied))
+        Err(s3_error!(AccessDenied))
     }
     fn outer() -> S3Result<u8> {
         inner()?;

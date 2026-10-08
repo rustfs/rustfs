@@ -10740,6 +10740,7 @@ dependencies = [
  "parking_lot",
  "rustfs-common",
  "rustfs-ecstore",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
  "s3s",

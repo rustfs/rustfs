@@ -10,6 +10,10 @@ rewrite:
     plus `use s3s::dto::X;` (attributes and visibility are kept on both);
   * a qualified path in code (`s3s::S3ErrorCode::Foo`, `s3s::s3_error!(...)`)
     gets the `rustfs_s3_types::` prefix;
+  * a child module file that calls `s3_error!` through a file-level
+    `use super::*;` gets its own `use rustfs_s3_types::s3_error;` once the
+    file declaring it imports that macro by name (listed as `glob`); when that
+    parent does not, the child is left alone and listed as `GLOB`;
   * the manifest of a crate the run rewrote gains `rustfs-s3-types = { workspace
     = true }` in [dependencies] when absent there, and loses its `s3s`
     dependency only when no source file of the crate names s3s any more and no
@@ -83,6 +87,20 @@ OLD_CRATE_PATH = re.compile(r"(?<![A-Za-z0-9_])" + OLD_CRATE + r"(?:::|[ \t]*;|[
 NEW_CRATE_PATH = re.compile(r"(?<![A-Za-z0-9_])" + NEW_CRATE + r"::")
 ATTR_LINE = re.compile(r"^[ \t]*#\[[^\n]*\][ \t]*$")
 TOML_KEY = re.compile(r"^(?P<key>[A-Za-z0-9_-]+)(?:\.[A-Za-z0-9_.-]+)?[ \t]*=")
+_VIS = r"(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?"
+_ATTRS = r"(?:#\[[^\]\n]*\][ \t]*)*"
+MOD_BLOCK = re.compile(r"(?m)^[ \t]*" + _ATTRS + _VIS + r"(?P<mod>mod)[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{")
+ANY_USE = re.compile(r"(?m)^[ \t]*" + _ATTRS + _VIS + r"(?P<use>use)[ \t]+")
+GLOB_SUPER = re.compile(r"(?m)^(?P<indent>[ \t]*)(?P<use>use)[ \t]+super::\*[ \t]*;")
+MACRO_CALL = re.compile(r"(?<![A-Za-z0-9_])s3_error[ \t]*!")
+MACRO_NAME = re.compile(r"(?<![A-Za-z0-9_])s3_error(?![A-Za-z0-9_])")
+MACRO_DEFINITION = re.compile(r"macro_rules![ \t]*s3_error(?![A-Za-z0-9_])")
+# The import spellings scripts/check_s3s_footprint.sh accepts as clearing a file.
+RUSTFS_MACRO_IMPORT = re.compile(
+    r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?P<use>use)[ \t]+(?:::)?"
+    + NEW_CRATE
+    + r"::(?:s3_error[ \t]*;|\{[^;]*\bs3_error\s*[,}][^;]*;)"
+)
 
 
 class UsageError(Exception):
@@ -336,6 +354,170 @@ def names_crate(text: str, pattern: re.Pattern[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Children that reach the macro through `use super::*`
+#
+# A file whose module is declared in a parent file and that opens with
+# `use super::*;` takes the parent's private imports, the `s3_error` macro
+# among them. Once the parent imports the macro from rustfs_s3_types, the
+# child's calls resolve there too, but nothing in the child says so: the s3s
+# footprint counter keeps counting those lines (fail closed), and a later edit
+# to the parent's imports would silently move the child to whichever macro the
+# parent names next. So the child gets its own `use rustfs_s3_types::s3_error;`,
+# right after the glob that used to supply the macro. An explicit import
+# shadows the glob, so the call sites resolve exactly as before.
+
+
+@dataclass
+class GlobChildResult:
+    text: str
+    inserted: int = 0
+    dependent_calls: int = 0
+
+
+def _module_blocks(text: str, kinds: bytearray) -> list[tuple[int, int]]:
+    """(open brace, closing brace) of every inline `mod name { ... }` in code."""
+    blocks = []
+    for match in MOD_BLOCK.finditer(text):
+        if kinds[match.start("mod")] != CODE:
+            continue
+        depth = 0
+        for i in range(match.end() - 1, len(text)):
+            if kinds[i] != CODE:
+                continue
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append((match.end() - 1, i))
+                    break
+    return blocks
+
+
+def _outermost_block(position: int, blocks: list[tuple[int, int]]) -> tuple[int, int] | None:
+    """The outermost inline module containing `position`; None at file level."""
+    containing = [block for block in blocks if block[0] < position < block[1]]
+    return min(containing) if containing else None
+
+
+def _use_trees(text: str, kinds: bytearray) -> list[tuple[int, str]]:
+    """(start, code-only tree text) of every `use` declaration in code."""
+    trees = []
+    for match in ANY_USE.finditer(text):
+        if kinds[match.start("use")] != CODE:
+            continue
+        end = match.end()
+        while end < len(text) and not (kinds[end] == CODE and text[end] == ";"):
+            end += 1
+        trees.append((match.start(), code_only(text, kinds, match.end(), end)))
+    return trees
+
+
+def imports_rustfs_macro_at_file_level(text: str) -> bool:
+    """True when the file imports rustfs_s3_types's macro by name outside any inline module.
+
+    The spellings are the ones the s3s footprint counter accepts as clearing a
+    file, so a child given the import here is also cleared there.
+    """
+    kinds = classify(text)
+    blocks = _module_blocks(text, kinds)
+    return any(
+        kinds[match.start("use")] == CODE and _outermost_block(match.start(), blocks) is None
+        for match in RUSTFS_MACRO_IMPORT.finditer(text)
+    )
+
+
+def glob_child_import(child: str, parent: str) -> GlobChildResult:
+    """Give `child` its own rustfs_s3_types macro import when it relies on `parent`'s through `use super::*`.
+
+    Pure, so a second pass over its output is a no-op: the inserted import names
+    the macro, and a file that names it is left alone. `dependent_calls` counts
+    the unqualified `s3_error!` calls in code that can only resolve through the
+    file-level glob; it is non-zero with no insertion when the parent does not
+    import rustfs_s3_types's macro by name, which the driver reports.
+    """
+    result = GlobChildResult(child)
+    kinds = classify(child)
+    globs = [match for match in GLOB_SUPER.finditer(child) if kinds[match.start("use")] == CODE]
+    blocks = _module_blocks(child, kinds)
+    file_glob = next((match for match in globs if _outermost_block(match.start(), blocks) is None), None)
+    if file_glob is None:
+        return result
+    if any(MACRO_NAME.search(tree) for _, tree in _use_trees(child, kinds)):
+        return result
+    if any(kinds[match.start()] == CODE for match in MACRO_DEFINITION.finditer(child)):
+        return result
+    calls = [
+        match.start()
+        for match in MACRO_CALL.finditer(child)
+        if kinds[match.start()] == CODE and child[max(0, match.start() - 2) : match.start()] != "::"
+    ]
+    if not calls:
+        return result
+    # A call inside an inline module reaches the file-level glob only through
+    # that module's own `use super::*`; without one it never resolved through
+    # the parent, so it is not ours to anchor.
+    module_globs = {}
+    for match in globs:
+        containing = [block for block in blocks if block[0] < match.start() < block[1]]
+        if len(containing) == 1:
+            module_globs[containing[0]] = match
+    file_level_calls = [call for call in calls if _outermost_block(call, blocks) is None]
+    module_calls: dict[tuple[int, int], int] = {}
+    for call in calls:
+        block = _outermost_block(call, blocks)
+        if block is not None and block in module_globs:
+            module_calls[block] = module_calls.get(block, 0) + 1
+    result.dependent_calls = len(file_level_calls) + sum(module_calls.values())
+    if not result.dependent_calls or not imports_rustfs_macro_at_file_level(parent):
+        return result
+    # Anchor at file level when file-level code calls the macro; otherwise in
+    # each inline module that does, so a test-only module does not leave an
+    # unused import in the non-test build.
+    anchors = [file_glob] if file_level_calls else [module_globs[block] for block in sorted(module_calls)]
+    pieces, cursor = [], 0
+    for anchor in anchors:
+        indent = anchor.group("indent")
+        attrs = _preceding_attribute_lines(child, anchor.start())
+        line_end = child.find("\n", anchor.end())
+        line_end = len(child) if line_end < 0 else line_end
+        pieces.append(child[cursor:line_end])
+        pieces.append(f"\n{attrs}{indent}use {NEW_CRATE}::s3_error;")
+        cursor = line_end
+        result.inserted += 1
+    pieces.append(child[cursor:])
+    result.text = "".join(pieces)
+    return result
+
+
+def parent_module_file(root: Path, relative: str) -> str | None:
+    """The tracked file that declares the module `relative` holds, or None.
+
+    `a/b/c.rs` is declared in `a/b/mod.rs`, `a/b.rs`, `a/b/lib.rs` or
+    `a/b/main.rs`; `a/b/mod.rs` one level up. The candidate must declare
+    `mod <name>` in code, so a crate root, a binary and a `#[path]` module
+    resolve to None rather than to a guess.
+    """
+    path = Path(relative)
+    if path.name in ("lib.rs", "main.rs"):
+        return None
+    if path.name == "mod.rs":
+        name, directory = path.parent.name, path.parent.parent
+    else:
+        name, directory = path.stem, path.parent
+    declares = re.compile(r"(?m)^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?mod[ \t]+" + name + r"[ \t]*;")
+    for candidate in (directory / "mod.rs", directory.with_suffix(".rs"), directory / "lib.rs", directory / "main.rs"):
+        file = root / candidate
+        if not file.is_file():
+            continue
+        text = file.read_text(encoding="utf-8")
+        kinds = classify(text)
+        if any(kinds[match.end() - 1] == CODE for match in declares.finditer(text)):
+            return candidate.as_posix()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Repository inputs
 
 
@@ -479,6 +661,8 @@ class CrateCensus:
     in_literals: int = 0
     remaining: list[str] = field(default_factory=list)
     manifest: list[str] = field(default_factory=list)
+    glob_children: list[tuple[str, int]] = field(default_factory=list)
+    glob_unresolved: list[tuple[str, int, str]] = field(default_factory=list)
 
 
 def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=sys.stdout) -> int:
@@ -520,11 +704,36 @@ def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=s
                 path.write_text(result.text, encoding="utf-8")
                 census.changed.append(relative)
                 rewritten.append(path)
+        censuses.append(census)
+
+    # Second pass, once every parent of this run is rewritten: a child is judged
+    # against its parent's text as it now stands, whichever run rewrote it.
+    for census in censuses:
+        for relative in sources[census.crate]:
+            if relative in refused_files or relative in hold_set:
+                continue
+            path = root / relative
+            text = path.read_text(encoding="utf-8")
+            parent = parent_module_file(root, relative)
+            if parent is None:
+                continue
+            result = glob_child_import(text, (root / parent).read_text(encoding="utf-8"))
+            if result.inserted:
+                path.write_text(result.text, encoding="utf-8")
+                if relative not in census.changed:
+                    census.changed.append(relative)
+                    rewritten.append(path)
+                census.glob_children.append((relative, result.dependent_calls))
+            elif result.dependent_calls:
+                census.glob_unresolved.append((relative, result.dependent_calls, parent))
+
+    for census in censuses:
         # A crate this run did not rewrite keeps its manifest: a dev-only use of
         # rustfs-s3-types or an s3s entry kept for other reasons is not ours to edit.
         # Whether the package still names either crate is read from all of its
         # sources, not only from the directory this run was given.
         if census.changed:
+            crate = census.crate
             package = packages[crate]
             texts = [(root / f).read_text(encoding="utf-8") for f in package_sources(root, package, package)]
             crate_names_old = any(names_crate(text, OLD_CRATE_PATH) for text in texts)
@@ -534,7 +743,6 @@ def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=s
             edited, census.manifest = edit_manifest(manifest, crate_names_new, not crate_names_old)
             if edited != manifest:
                 manifest_path.write_text(edited, encoding="utf-8")
-        censuses.append(census)
 
     if fmt and rewritten:
         edition = _workspace_edition(root)
@@ -570,6 +778,14 @@ def _print_census(censuses: list[CrateCensus], out) -> int:
             print(f"  held     {path} ({count} lines still name s3s error types)", file=out)
         for path, count in census.refused:
             print(f"  refused  {path} ({count} lines still name s3s error types)", file=out)
+        for path, calls in census.glob_children:
+            print(f"  glob     {path}: use {NEW_CRATE}::s3_error; added ({calls} calls)", file=out)
+        for path, calls, parent in census.glob_unresolved:
+            print(
+                f"  GLOB     {path} ({calls} s3_error! calls reach the macro through `use super::*` from {parent}, "
+                f"which does not import it from {NEW_CRATE})",
+                file=out,
+            )
         for location in census.remaining:
             print(f"  REMAINS  {location}", file=out)
     print(f"total: {total} files changed in {len(censuses)} crates", file=out)
@@ -818,6 +1034,153 @@ class SelfTest(unittest.TestCase):
         with self.assertRaisesRegex(UsageError, "allowlist"):
             run(root, ["crates/a"], [], fmt=False, out=_Capture())
         self.assertEqual((root / "crates/a/src/lib.rs").read_text(), self.base_files()["crates/a/src/lib.rs"])
+
+    # -- children that reach the macro through `use super::*` --
+
+    RUSTFS_PARENT = "use rustfs_s3_types::{S3Error, s3_error};\nmod child;\n"
+
+    def glob_child(self, child: str, parent: str | None = None) -> GlobChildResult:
+        return glob_child_import(child, self.RUSTFS_PARENT if parent is None else parent)
+
+    def test_glob_child_with_a_top_level_call_gets_the_import_after_its_glob(self):
+        child = "use super::*;\nuse crate::x::Y;\n\nfn f() -> S3Error {\n    s3_error!(NoSuchKey)\n}\n"
+        result = self.glob_child(child)
+        self.assertEqual(
+            result.text,
+            "use super::*;\nuse rustfs_s3_types::s3_error;\nuse crate::x::Y;\n\nfn f() -> S3Error {\n    s3_error!(NoSuchKey)\n}\n",
+        )
+        self.assertEqual((result.inserted, result.dependent_calls), (1, 1))
+        self.assertEqual(glob_child_import(result.text, self.RUSTFS_PARENT).text, result.text)
+
+    def test_glob_child_with_calls_only_in_a_test_module_gets_the_import_there(self):
+        child = (
+            "use super::*;\n\npub fn f() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n"
+            "    #[test]\n    fn t() {\n        let _ = s3_error!(InternalError, \"x\");\n    }\n}\n"
+        )
+        result = self.glob_child(child)
+        self.assertEqual(
+            result.text,
+            child.replace("    use super::*;\n", "    use super::*;\n    use rustfs_s3_types::s3_error;\n"),
+        )
+        self.assertEqual((result.inserted, result.dependent_calls), (1, 1))
+
+    def test_glob_child_attribute_on_the_glob_is_repeated_on_the_import(self):
+        child = "#[allow(unused_imports)]\nuse super::*;\nfn f() { s3_error!(A); s3_error!(B, \"m\"); }\n"
+        result = self.glob_child(child)
+        self.assertEqual(
+            result.text,
+            "#[allow(unused_imports)]\nuse super::*;\n#[allow(unused_imports)]\nuse rustfs_s3_types::s3_error;\n"
+            "fn f() { s3_error!(A); s3_error!(B, \"m\"); }\n",
+        )
+        self.assertEqual(result.dependent_calls, 2)
+
+    def test_glob_child_that_already_names_the_macro_is_untouched(self):
+        for use_line in (
+            "use rustfs_s3_types::s3_error;",
+            "use rustfs_s3_types::{S3Error, s3_error as se};",
+            "use crate::facade::s3_error;",
+            "use s3s::s3_error;",
+        ):
+            child = f"use super::*;\n{use_line}\nfn f() {{ s3_error!(A); }}\n"
+            with self.subTest(use_line=use_line):
+                self.assertEqual(self.glob_child(child), GlobChildResult(child))
+
+    def test_glob_child_with_only_qualified_commented_or_quoted_calls_is_untouched(self):
+        child = (
+            "use super::*;\nfn f() { rustfs_s3_types::s3_error!(A); ::rustfs_s3_types::s3_error!(B); }\n"
+            "// s3_error!(C)\n/* s3_error!(D) */\nconst M: &str = \"s3_error!(E)\";\n"
+        )
+        self.assertEqual(self.glob_child(child), GlobChildResult(child))
+
+    def test_child_without_a_top_level_glob_is_untouched(self):
+        for child in (
+            "fn f() { s3_error!(A); }\n",
+            "mod inner {\n    use super::*;\n    fn f() { s3_error!(A); }\n}\n",
+            "// use super::*;\nfn f() { s3_error!(A); }\n",
+            "use super::{S3Error, f};\nfn g() { s3_error!(A); }\n",
+        ):
+            with self.subTest(child=child):
+                self.assertEqual(self.glob_child(child), GlobChildResult(child))
+
+    def test_glob_child_whose_parent_does_not_import_rustfs_s3_types_macro_is_reported_not_rewritten(self):
+        child = "use super::*;\nfn f() { s3_error!(A); s3_error!(B); }\n"
+        for parent in (
+            "use s3s::{S3Error, s3_error};\n",
+            "use crate::storage_api::s3::{S3Error, s3_error};\n",
+            "use rustfs_s3_types::S3Error;\n",
+            "use rustfs_s3_types::s3_error as se;\n",
+            "// use rustfs_s3_types::s3_error;\n",
+            "/*\nuse rustfs_s3_types::s3_error;\n*/\n",
+            "mod nested {\n    use rustfs_s3_types::s3_error;\n}\n",
+        ):
+            with self.subTest(parent=parent):
+                self.assertEqual(self.glob_child(child, parent), GlobChildResult(child, dependent_calls=2))
+
+    def test_calls_in_an_inline_module_without_its_own_glob_do_not_depend_on_the_parent(self):
+        for child in (
+            "use super::*;\nfn f() {}\nmod helpers {\n    use crate::facade::*;\n    fn g() { s3_error!(A); }\n}\n",
+            "use super::*;\nmod tests {\n    mod inner {\n        use super::*;\n        fn g() { s3_error!(A); }\n    }\n}\n",
+        ):
+            with self.subTest(child=child):
+                self.assertEqual(self.glob_child(child), GlobChildResult(child))
+
+    def test_glob_child_that_defines_its_own_macro_is_untouched(self):
+        child = "use super::*;\nmacro_rules! s3_error { ($c:ident) => { () }; }\nfn f() { s3_error!(A); }\n"
+        self.assertEqual(self.glob_child(child), GlobChildResult(child))
+
+    def test_driver_gives_glob_children_the_import_and_reports_the_rest(self):
+        files = self.base_files()
+        files.update(
+            {
+                "crates/a/src/held.rs": "pub struct H;\n",
+                "crates/a/src/object/mod.rs": "use s3s::{S3Error, S3Request, s3_error};\nmod get;\nmod put;\n",
+                "crates/a/src/object/get.rs": "use super::*;\nfn f() -> S3Error { s3_error!(NoSuchKey) }\n",
+                "crates/a/src/object/put.rs": "use super::*;\nfn f() -> S3Error { rustfs_s3_types::s3_error!(A) }\n",
+                "crates/a/src/site.rs": "use crate::facade::s3_error;\nmod hooks;\n",
+                "crates/a/src/site/hooks.rs": "use super::*;\nfn f() { s3_error!(A); }\n",
+                "crates/a/src/edge.rs": "use rustfs_s3_types::s3_error;\nmod inner;\n",
+                "crates/a/src/edge/inner.rs": "use super::*;\nfn f() { s3_error!(A); }\n",
+                ALLOWLIST: "# edge\ncrates/edge/src/edge.rs\ncrates/a/src/edge/inner.rs\n",
+            }
+        )
+        root = self.scratch_repo(files)
+        first = _Capture()
+        self.assertEqual(run(root, ["crates/a"], [], fmt=False, out=first), 0, first.text)
+        self.assertEqual(
+            (root / "crates/a/src/object/get.rs").read_text(),
+            "use super::*;\nuse rustfs_s3_types::s3_error;\nfn f() -> S3Error { s3_error!(NoSuchKey) }\n",
+        )
+        for untouched in ("crates/a/src/object/put.rs", "crates/a/src/site/hooks.rs", "crates/a/src/edge/inner.rs"):
+            self.assertEqual((root / untouched).read_text(), files[untouched], untouched)
+        self.assertIn("  changed  crates/a/src/object/get.rs", first.text)
+        self.assertIn("  glob     crates/a/src/object/get.rs: use rustfs_s3_types::s3_error; added (1 calls)", first.text)
+        self.assertIn(
+            "  GLOB     crates/a/src/site/hooks.rs (1 s3_error! calls reach the macro through `use super::*`"
+            " from crates/a/src/site.rs, which does not import it from rustfs_s3_types)",
+            first.text,
+        )
+        self.assertNotIn("edge/inner.rs: use", first.text)
+        second = _Capture()
+        self.assertEqual(run(root, ["crates/a"], [], fmt=False, out=second), 0, second.text)
+        self.assertIn("total: 0 files changed in 1 crates", second.text)
+        self.assertNotIn("  glob     ", second.text)
+
+    def test_driver_skips_a_child_whose_parent_file_does_not_declare_it(self):
+        files = self.base_files()
+        files.update(
+            {
+                "crates/a/src/held.rs": "pub struct H;\n",
+                "crates/a/src/object/mod.rs": "use rustfs_s3_types::s3_error;\nmod get;\n",
+                "crates/a/src/object/stray.rs": "use super::*;\nfn f() { s3_error!(A); }\n",
+                "crates/a/src/bin/tool.rs": "use super::*;\nfn f() { s3_error!(A); }\n",
+            }
+        )
+        root = self.scratch_repo(files)
+        out = _Capture()
+        self.assertEqual(run(root, ["crates/a"], [], fmt=False, out=out), 0, out.text)
+        for untouched in ("crates/a/src/object/stray.rs", "crates/a/src/bin/tool.rs"):
+            self.assertEqual((root / untouched).read_text(), files[untouched], untouched)
+        self.assertNotIn("glob", out.text.lower())
 
     def test_driver_rejects_a_bad_crate_or_hold(self):
         root = self.scratch_repo(self.base_files())

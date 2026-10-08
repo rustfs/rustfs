@@ -51,13 +51,11 @@ use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
 use memchr::{memchr, memmem};
 use rustfs_common::DEFAULT_DELIMITER;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use s3s::dto::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput};
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-};
-use s3s::{
-    S3Error, S3ErrorCode, S3Result,
-    dto::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput},
 };
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -1416,8 +1414,8 @@ mod test {
     use futures::{StreamExt, TryStreamExt, stream};
     use http::HeaderMap;
     use parking_lot::Mutex;
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_test_utils::PutObjectCommitBarrier;
-    use s3s::S3ErrorCode;
     use s3s::dto::{
         CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput,
         JSONType, OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,

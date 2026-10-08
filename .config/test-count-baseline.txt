@@ -47,7 +47,7 @@ rustfs-rio	198	0
 rustfs-rio-v2	34	6
 rustfs-s3-client	65	0
 rustfs-s3-ops	8	0
-rustfs-s3-types	96	0
+rustfs-s3-types	97	0
 rustfs-s3select-api	206	0
 rustfs-s3select-query	188	2
 rustfs-scanner	971	20

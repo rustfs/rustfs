@@ -147,10 +147,10 @@ struct Inner {
     head_bucket: VecDeque<Result<HeadBucketOutput, DummyError>>,
     list_objects_v2: VecDeque<Result<ListObjectsV2Output, DummyError>>,
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
-    session_list_buckets: VecDeque<s3s::S3Result<ListBucketsOutput>>,
+    session_list_buckets: VecDeque<rustfs_s3_types::S3Result<ListBucketsOutput>>,
     last_session_list_context: Option<(http::HeaderMap, bool)>,
     #[cfg(feature = "webdav")]
-    session_capacity_view: VecDeque<s3s::S3Result<Option<SessionCapacityView>>>,
+    session_capacity_view: VecDeque<rustfs_s3_types::S3Result<Option<SessionCapacityView>>>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -385,7 +385,7 @@ impl DummyBackend {
     }
 
     /// Queue a session-aware list_buckets error.
-    pub fn queue_session_list_buckets_err(&self, error: s3s::S3Error) {
+    pub fn queue_session_list_buckets_err(&self, error: rustfs_s3_types::S3Error) {
         self.inner.lock().expect("lock").session_list_buckets.push_back(Err(error));
     }
 
@@ -403,7 +403,7 @@ impl DummyBackend {
 
     /// Queue a session_capacity_view error.
     #[cfg(feature = "webdav")]
-    pub fn queue_session_capacity_view_err(&self, error: s3s::S3Error) {
+    pub fn queue_session_capacity_view_err(&self, error: rustfs_s3_types::S3Error) {
         self.inner.lock().expect("lock").session_capacity_view.push_back(Err(error));
     }
 
@@ -854,7 +854,7 @@ impl StorageBackend for DummyBackend {
         session_context: &SessionContext,
         request_headers: &http::HeaderMap,
         secure_transport: bool,
-    ) -> s3s::S3Result<ListBucketsOutput> {
+    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
         let _ = session_context;
         let mut inner = self.inner.lock().expect("lock");
         inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
@@ -872,7 +872,7 @@ impl StorageBackend for DummyBackend {
         _session_context: &SessionContext,
         _request_headers: &http::HeaderMap,
         _secure_transport: bool,
-    ) -> s3s::S3Result<Option<SessionCapacityView>> {
+    ) -> rustfs_s3_types::S3Result<Option<SessionCapacityView>> {
         self.inner
             .lock()
             .expect("lock")

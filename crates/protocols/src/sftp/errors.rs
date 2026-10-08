@@ -19,6 +19,11 @@
 use super::constants::{http_error_codes, s3_error_codes};
 use russh_sftp::protocol::{Status, StatusCode};
 use russh_sftp::server::StatusReply;
+// Must stay the error type the production backend returns
+// (`rustfs/src/protocols/client.rs`, `type Error = s3s::S3Error`):
+// `classify_backend_error` finds it with `downcast_ref`, so moving this import
+// alone still compiles and sends every backend error to `Failure`. It moves
+// together with the backend error type.
 use s3s::{S3Error, S3ErrorCode};
 use std::{any::Any, fmt::Display};
 
