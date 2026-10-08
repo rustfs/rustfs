@@ -1,0 +1,16 @@
+# Exact baseline for the direct s3s footprint, consumed only by
+# scripts/check_s3s_footprint.sh (rustfs/backlog#1677; rustfs/backlog#2734 T0.4).
+#
+# Each value is the exact measurement of the tree, not a ceiling. CI fails when a
+# measured counter differs from its line here in either direction:
+#   - a larger measurement means new code widened the s3s surface: route it
+#     through the gateway abstractions instead; never raise a value here;
+#   - a smaller measurement means the PR shrank the surface: lower the matching
+#     value to the measured number in the same PR.
+#
+# files           Rust files referencing s3s paths, repo-wide minus crates/e2e_test
+# s3_error_lines  s3_error! invocation lines, same scope, summed
+# ecstore_files   Rust files referencing s3s paths under crates/ecstore/src
+files=209
+s3_error_lines=1585
+ecstore_files=36

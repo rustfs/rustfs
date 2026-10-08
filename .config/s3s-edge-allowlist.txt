@@ -1,0 +1,37 @@
+# Files that may still reference s3s (`s3s::` or `s3s_sigv4`) when Phase 1 of
+# the gateway migration ends (rustfs/backlog#2734 task T0.6, rustfs/backlog#2741).
+# Consumed only by `scripts/check_s3s_footprint.sh --mode allowlist`.
+#
+# One entry per line: a repository-relative file path or a git `:(glob)`
+# pathspec. `**` matches across directories, `*` stays within one path
+# component, and a directory entry matches everything under it. Blank lines
+# and lines starting with `#` are ignored; an entry may not contain whitespace,
+# so a note belongs on its own comment line.
+#
+# Every Rust file listed by `git grep -l '\bs3s\(::\|_sigv4\)' -- '*.rs'` that
+# no entry matches fails the allowlist mode. Task T1.9 switches CI to that
+# mode; until then `--dry-run` prints the files still outside this list, which
+# is the Phase 1 tracking list.
+#
+# Never add crates/** other than crates/e2e_test: the engine crates leave s3s
+# entirely, and the script rejects such an entry. Only the s3s-facing edge of
+# the rustfs binary and the e2e oracle keep it.
+
+# rustfs binary: the s3s-facing edge that survives Phase 1
+rustfs/src/storage/ecfs.rs
+rustfs/src/storage/s3_compat/**
+rustfs/src/storage/access.rs
+rustfs/src/auth.rs
+rustfs/src/error.rs
+rustfs/src/storage_api.rs
+rustfs/src/app/storage_api.rs
+rustfs/src/admin/router.rs
+rustfs/src/app/metadata_route.rs
+rustfs/src/server/http.rs
+rustfs/src/server/layer.rs
+rustfs/src/server/hybrid.rs
+rustfs/src/protocols/client.rs
+
+# e2e oracle: the test target that verifies S3 behaviour against s3s
+crates/e2e_test/src/fake_s3_target/**
+crates/e2e_test/src/**
