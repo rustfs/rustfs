@@ -25,15 +25,16 @@
 //! Not responsible for: validating configurations, touching the bucket
 //! metadata store, or choosing a canonical shape.
 //!
-//! Upstream: `rustfs_ecstore::api::bucket::utils::{deserialize, serialize}`
-//! and the s3s DTOs they are generic over. Downstream: the DTO/codec
+//! Upstream: the bucket-config `deserialize`/`serialize` pair, reached through the
+//! integration-test facade `tests/storage_api.rs`, and the s3s DTOs they are generic over. Downstream: the DTO/codec
 //! replacement (T1.4) and the persisted-bytes comparison (T3.7), which must
 //! keep every golden green without regenerating it. Regeneration is reserved
 //! to `scripts/gen_bucket_config_goldens.sh`, which sets
 //! `BUCKET_CONFIG_GOLDENS_WRITE`: in that mode every test writes its files
 //! and then fails on purpose, so a write run never prints a green line.
 
-use rustfs_ecstore::api::bucket::utils::{deserialize, serialize};
+mod storage_api;
+
 use s3s::dto::{
     AbortIncompleteMultipartUpload, AccelerateConfiguration, BucketAccelerateStatus, BucketLifecycleConfiguration,
     BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule, Condition, DefaultRetention, DelMarkerExpiration,
@@ -50,6 +51,7 @@ use s3s::dto::{
 };
 use s3s::xml;
 use std::path::{Path, PathBuf};
+use storage_api::bucket_config_codec::{deserialize, serialize};
 
 /// Set only by `scripts/gen_bucket_config_goldens.sh`. Every pair test then
 /// writes its `.out.xml` (and, for the `rustfs` shape, its `.in.xml`) and
