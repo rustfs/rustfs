@@ -13,9 +13,22 @@
 // limitations under the License.
 
 use crate::{
-    federation::FederatedRedirectPolicy,
+    federation::{FederatedAuthorizationRule, FederatedAuthorizationRules, FederatedRedirectPolicy},
     oidc::{OidcConfigSnapshot, OidcSys},
 };
+
+pub(crate) fn authorization_rules(oidc: &OidcSys) -> FederatedAuthorizationRules {
+    FederatedAuthorizationRules::new(oidc.provider_configs().map(|config| {
+        FederatedAuthorizationRule::new(
+            config.id.clone(),
+            config.claim_name.clone(),
+            config.claim_prefix.clone(),
+            config.role_policy.clone(),
+            config.groups_claim.clone(),
+            config.roles_claim.clone(),
+        )
+    }))
+}
 
 /// Read-only access to the active standard OIDC configuration.
 ///
@@ -32,21 +45,9 @@ pub(super) fn redirect_policy(oidc: &OidcSys, provider_id: &str) -> Option<Feder
     })
 }
 
-pub(super) fn roles_claim_key(oidc: &OidcSys, provider_id: &str) -> Option<String> {
-    oidc.get_provider_config(provider_id)
-        .map(|config| config.roles_claim.trim().to_string())
-        .filter(|claim| !claim.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn roles_claim_key_requires_explicit_provider_config() {
-        let oidc = OidcSys::empty().expect("empty OIDC configuration should be valid");
-        assert_eq!(roles_claim_key(&oidc, "default"), None);
-    }
 
     #[test]
     fn redirect_policy_keeps_configured_uri_and_dynamic_setting() {

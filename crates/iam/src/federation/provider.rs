@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{FederatedAuthorization, FederatedCodeExchange, Result};
+use super::{FederatedAuthorization, FederatedCodeExchange, OpaqueLogoutContinuation, Result, VerifiedFederatedIdentity};
 use crate::oidc::OidcProviderConfig;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,37 @@ pub struct FederatedProviderView {
 pub struct FederatedRedirectPolicy {
     pub redirect_uri: Option<String>,
     pub allow_request_origin: bool,
+}
+
+pub(crate) struct VerifiedFederatedCodeExchange {
+    identity: VerifiedFederatedIdentity,
+    redirect_after: Option<String>,
+    logout_continuation: OpaqueLogoutContinuation,
+}
+
+impl VerifiedFederatedCodeExchange {
+    pub(crate) fn new(
+        identity: VerifiedFederatedIdentity,
+        redirect_after: Option<String>,
+        logout_continuation: OpaqueLogoutContinuation,
+    ) -> Self {
+        Self {
+            identity,
+            redirect_after,
+            logout_continuation,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (VerifiedFederatedIdentity, Option<String>, OpaqueLogoutContinuation) {
+        (self.identity, self.redirect_after, self.logout_continuation)
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait StandardOidcAuthentication: Send + Sync {
+    async fn exchange_identity(&self, state: &str, code: &str, redirect_uri: &str) -> Result<VerifiedFederatedCodeExchange>;
+    async fn verify_identity(&self, jwt: &str) -> Result<VerifiedFederatedIdentity>;
+    async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String>;
 }
 
 #[async_trait::async_trait]

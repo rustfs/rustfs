@@ -18,7 +18,11 @@
 //! `openidconnect` crate for standards-compliant discovery, token exchange,
 //! and ID token verification.
 
-use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
+use crate::{
+    EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC,
+    federation::{CoreFederatedAuthorizationMapper, FederatedAuthorizationRuleRef},
+    oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
+};
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
 };
@@ -47,9 +51,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 use url::Url;
 
-const LOG_COMPONENT_IAM: &str = "iam";
-const LOG_SUBSYSTEM_OIDC: &str = "oidc";
-const EVENT_OIDC_DIAGNOSTICS: &str = "oidc_diagnostics";
 const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
@@ -1502,88 +1503,10 @@ impl OidcSys {
 
     /// Map OIDC claims to rustfs policy names.
     pub fn map_claims_to_policies(&self, provider_id: &str, claims: &OidcClaims) -> (Vec<String>, Vec<String>) {
-        let config = match self.get_provider_config(provider_id) {
-            Some(c) => c,
-            None => return (vec![], vec![]),
+        let Some(rule) = self.authorization_rule(provider_id) else {
+            return (Vec::new(), Vec::new());
         };
-
-        let mut policies = Vec::new();
-        let mut groups = Vec::new();
-
-        // Role-policy and claim-based authorization are separate OIDC modes. When a
-        // role policy is configured, group claims still provide group context but
-        // must not also become policy names.
-        let has_role_policy = !config.role_policy.trim().is_empty();
-        if has_role_policy {
-            for policy in config.role_policy.split(',') {
-                let policy = policy.trim();
-                if !policy.is_empty() {
-                    policies.push(policy.to_string());
-                }
-            }
-        }
-
-        for group in &claims.groups {
-            groups.push(group.clone());
-            if !has_role_policy {
-                policies.push(claim_policy_name(&config.claim_prefix, group));
-            }
-        }
-
-        if !has_role_policy && config.claim_name != config.groups_claim {
-            for val in extract_groups_claim(&claims.raw, &config.claim_name) {
-                policies.push(claim_policy_name(&config.claim_prefix, &val));
-            }
-        }
-
-        // Deduplicate
-        policies.sort();
-        policies.dedup();
-        groups.sort();
-        groups.dedup();
-
-        let mut raw_claim_keys: Vec<&str> = claims.raw.keys().map(String::as_str).collect();
-        raw_claim_keys.sort_unstable();
-        let (claim_name_lookup, claim_name_raw_value) = claim_lookup_for_log(&claims.raw, &config.claim_name);
-        let (groups_claim_lookup, groups_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.groups_claim);
-        let (roles_claim_lookup, roles_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.roles_claim);
-        let claim_name_values = extract_groups_claim(&claims.raw, &config.claim_name);
-        let groups_claim_values = extract_groups_claim(&claims.raw, &config.groups_claim);
-        let roles_claim_values = extract_groups_claim(&claims.raw, &config.roles_claim);
-
-        debug!(
-            event = EVENT_OIDC_DIAGNOSTICS,
-            component = LOG_COMPONENT_IAM,
-            subsystem = LOG_SUBSYSTEM_OIDC,
-            result = "claims_policy_mapped",
-            provider_id = %provider_id,
-            claim_name = %config.claim_name,
-            claim_prefix = %config.claim_prefix,
-            groups_claim = %config.groups_claim,
-            roles_claim = %config.roles_claim,
-            role_policy = %config.role_policy,
-            policy_count = policies.len(),
-            group_count = groups.len(),
-            policies = ?policies,
-            groups = ?groups,
-            raw_claim_keys = ?raw_claim_keys,
-            raw_claims = ?claims.raw,
-            claim_name_lookup = %claim_name_lookup,
-            claim_name_type = claim_value_type_for_log(claim_name_raw_value),
-            claim_name_value = ?claim_name_raw_value,
-            claim_name_values = ?claim_name_values,
-            groups_claim_lookup = %groups_claim_lookup,
-            groups_claim_type = claim_value_type_for_log(groups_claim_raw_value),
-            groups_claim_value = ?groups_claim_raw_value,
-            groups_claim_values = ?groups_claim_values,
-            roles_claim_lookup = %roles_claim_lookup,
-            roles_claim_type = claim_value_type_for_log(roles_claim_raw_value),
-            roles_claim_value = ?roles_claim_raw_value,
-            roles_claim_values = ?roles_claim_values,
-            "oidc claims mapped to policies"
-        );
-
-        (policies, groups)
+        CoreFederatedAuthorizationMapper::map_policies_and_groups(provider_id, rule, &claims.groups, &claims.raw, true)
     }
 
     /// Policy names produced only by the canonical groups in claim-based mode: the groups claim
@@ -1595,30 +1518,22 @@ impl OidcSys {
     /// dedicated policy claim are never included, so those configurations keep requiring every
     /// policy to resolve.
     pub fn group_claim_policy_names(&self, provider_id: &str, claims: &OidcClaims) -> Vec<String> {
-        let Some(config) = self.get_provider_config(provider_id) else {
+        let Some(rule) = self.authorization_rule(provider_id) else {
             return Vec::new();
         };
-        if !config.role_policy.trim().is_empty() {
-            return Vec::new();
-        }
+        CoreFederatedAuthorizationMapper::group_claim_policy_names(rule, &claims.groups, &claims.raw)
+    }
 
-        let explicit_policy_names: Vec<String> = if config.claim_name != config.groups_claim {
-            extract_groups_claim(&claims.raw, &config.claim_name)
-                .iter()
-                .map(|value| claim_policy_name(&config.claim_prefix, value))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut policies: Vec<String> = claims
-            .groups
-            .iter()
-            .map(|group| claim_policy_name(&config.claim_prefix, group))
-            .filter(|policy| !explicit_policy_names.contains(policy))
-            .collect();
-        policies.sort();
-        policies.dedup();
-        policies
+    fn authorization_rule(&self, provider_id: &str) -> Option<FederatedAuthorizationRuleRef<'_>> {
+        self.get_provider_config(provider_id).map(|config| {
+            FederatedAuthorizationRuleRef::new(
+                &config.claim_name,
+                &config.claim_prefix,
+                &config.role_policy,
+                &config.groups_claim,
+                &config.roles_claim,
+            )
+        })
     }
 
     /// Verify a raw JWT (id_token) for the AssumeRoleWithWebIdentity flow.
@@ -2415,10 +2330,6 @@ fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) 
     }
 }
 
-fn claim_policy_name(claim_prefix: &str, value: &str) -> String {
-    format!("{claim_prefix}{value}")
-}
-
 /// Extract a groups/array claim from raw claims with case-insensitive fallback. Handles both string arrays and single strings.
 fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
     match get_claim_case_insensitive(claims, key) {
@@ -2441,29 +2352,6 @@ fn extract_canonical_group_values(
     groups.sort();
     groups.dedup();
     groups
-}
-
-fn claim_lookup_for_log<'a>(
-    claims: &'a HashMap<String, serde_json::Value>,
-    key: &str,
-) -> (&'static str, Option<&'a serde_json::Value>) {
-    match get_claim_case_insensitive(claims, key) {
-        ClaimLookup::Found(value) => ("found", Some(value)),
-        ClaimLookup::Missing => ("missing", None),
-        ClaimLookup::Ambiguous => ("ambiguous", None),
-    }
-}
-
-fn claim_value_type_for_log(value: Option<&serde_json::Value>) -> &'static str {
-    match value {
-        Some(serde_json::Value::Null) => "null",
-        Some(serde_json::Value::Bool(_)) => "bool",
-        Some(serde_json::Value::Number(_)) => "number",
-        Some(serde_json::Value::String(_)) => "string",
-        Some(serde_json::Value::Array(_)) => "array",
-        Some(serde_json::Value::Object(_)) => "object",
-        None => "none",
-    }
 }
 
 #[cfg(test)]
