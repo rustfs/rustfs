@@ -204,6 +204,40 @@ where
     .await
 }
 
+async fn await_orphan_bucket_recovery<T, F>(
+    bucket: &str,
+    publication_guard: &rustfs_lock::NamespaceLockGuard,
+    lifecycle_guard: &rustfs_lock::NamespaceLockGuard,
+    metadata_guard: &rustfs_lock::NamespaceLockGuard,
+    namespace_guard: &rustfs_lock::NamespaceLockGuard,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    for (name, guard) in [
+        ("publication", publication_guard),
+        ("lifecycle", lifecycle_guard),
+        ("metadata transaction", metadata_guard),
+        ("namespace", namespace_guard),
+    ] {
+        if guard.is_lock_lost() {
+            return Err(StorageError::other(format!(
+                "bucket {name} lock was lost before orphan recovery: {bucket}"
+            )));
+        }
+    }
+
+    tokio::select! {
+        biased;
+        _ = publication_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket publication lock was lost during orphan recovery: {bucket}"))),
+        _ = lifecycle_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket lifecycle lock was lost during orphan recovery: {bucket}"))),
+        _ = metadata_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket metadata transaction lock was lost during orphan recovery: {bucket}"))),
+        _ = namespace_guard.lock_lost_notified() => Err(StorageError::other(format!("bucket namespace lock was lost during orphan recovery: {bucket}"))),
+        result = future => result,
+    }
+}
+
 async fn run_bucket_usage_cleanup<F>(guard: Option<&rustfs_lock::NamespaceLockGuard>, bucket: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>>,
@@ -272,6 +306,20 @@ async fn bucket_delete_local_blocker(
 }
 
 impl ECStore {
+    /// Run a multi-step storage mutation on the instance task tracker so its
+    /// caller may stop waiting without releasing guards before the mutation
+    /// finishes.
+    pub async fn run_detached_mutation<F>(&self, mutation: F) -> Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.ctx
+            .run_detached_mutation(mutation)
+            .await
+            .map_err(|error| StorageError::other_with_context("detached ECStore mutation failed", error))
+    }
+
     fn bucket_sets(&self) -> impl Iterator<Item = (usize, usize, Arc<crate::set_disk::SetDisks>)> + '_ {
         self.pools.iter().flat_map(|pool| {
             pool.disk_set
@@ -311,7 +359,11 @@ impl ECStore {
     /// Reconcile bucket metadata after an operator removed all physical volume
     /// directories. The expected generation, all-disk absence proof and durable
     /// retirement record make retries safe after partial metadata cleanup.
-    pub async fn recover_orphaned_bucket(&self, bucket: &str, expected: Uuid) -> Result<()> {
+    pub fn recover_orphaned_bucket<'a>(&'a self, bucket: &'a str, expected: Uuid) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Box::pin(self.recover_orphaned_bucket_inner(bucket, expected)).await })
+    }
+
+    async fn recover_orphaned_bucket_inner(&self, bucket: &str, expected: Uuid) -> Result<()> {
         if let Err(error) = check_valid_bucket_name_strict(bucket) {
             return Err(StorageError::BucketNameInvalid(error.to_string()));
         }
@@ -364,57 +416,23 @@ impl ECStore {
                 };
                 record_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
                 record_opts.add_namespace_lock_guard(&ns_guard);
-                await_bucket_lifecycle_operation(
-                    Some(&lifecycle_guard),
-                    Some(&ns_guard),
+                let publish_retirement = Box::pin(crate::bucket::retirement::commit_retirement(
+                    retirement_store.clone(),
                     bucket,
-                    "orphaned bucket retirement publication",
-                    crate::bucket::retirement::commit_retirement(retirement_store, bucket, expected, &record_opts),
-                )
-                .await?;
+                    expected,
+                    &record_opts,
+                ));
+                publish_retirement.await?;
             }
 
-            await_bucket_lifecycle_operation(
-                Some(&lifecycle_guard),
-                Some(&ns_guard),
-                bucket,
-                "orphaned bucket usage cleanup",
-                self.cleanup_bucket_usage(bucket, Some(&ns_guard)),
-            )
-            .await?;
-            await_bucket_namespace_operation(
-                Some(&metadata_guard),
-                bucket,
-                "orphaned bucket recovery cleanup",
-                await_bucket_namespace_operation(
-                    Some(&publication_guard),
-                    bucket,
-                    "orphaned table catalog cleanup",
-                    self.cleanup_deleted_bucket_metadata(bucket, true, Some(&ns_guard)),
-                ),
-            )
-            .await?;
+            crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(retirement_store.clone(), bucket, expected).await?;
+            crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, Some(&ns_guard)).await?;
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, Some(&ns_guard)).await?;
+            self.cleanup_deleted_bucket_metadata_strict(bucket, true).await?;
             crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
             Ok(())
         });
-        await_bucket_lifecycle_operation(
-            Some(&lifecycle_guard),
-            Some(&ns_guard),
-            bucket,
-            "orphaned bucket recovery",
-            await_bucket_namespace_operation(
-                Some(&metadata_guard),
-                bucket,
-                "orphaned bucket recovery metadata transaction",
-                await_bucket_namespace_operation(
-                    Some(&publication_guard),
-                    bucket,
-                    "orphaned bucket recovery publication fence",
-                    recover,
-                ),
-            ),
-        )
-        .await
+        await_orphan_bucket_recovery(bucket, &publication_guard, &lifecycle_guard, &metadata_guard, &ns_guard, recover).await
     }
 
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -737,6 +755,25 @@ impl ECStore {
             metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket),
         )
         .await?;
+        runtime_sources::delete_bucket_monitor_entry(bucket);
+        Ok(())
+    }
+
+    async fn cleanup_deleted_bucket_metadata_strict(&self, bucket: &str, include_deleted_marker: bool) -> Result<()> {
+        let options = ObjectOptions {
+            delete_prefix_object: true,
+            ..Default::default()
+        };
+        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
+            self.delete_prefix(RUSTFS_META_BUCKET, &prefix, &options).await?;
+        }
+
+        if include_deleted_marker {
+            let marker_prefix = bucket_deleted_marker_prefix(bucket);
+            self.delete_prefix(RUSTFS_META_BUCKET, &marker_prefix, &options).await?;
+        }
+
+        metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket).await?;
         runtime_sources::delete_bucket_monitor_entry(bucket);
         Ok(())
     }
@@ -1773,7 +1810,7 @@ mod tests {
         setup_bucket_quorum_test_env(&[4, 4], None).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn orphaned_bucket_recovery_requires_every_volume_absent_and_is_retryable() {
         let (temp_dir, store) = setup_multi_pool_bucket_test_env().await;

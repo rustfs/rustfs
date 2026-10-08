@@ -83,20 +83,30 @@ impl Operation for RecoverOrphanedBucketHandler {
         };
 
         let operation_bucket = bucket.to_owned();
+        let lock_store = store.clone();
         let operation_store = store.clone();
-        with_site_replication_bucket_mutation_lock(store, bucket, move || async move {
-            if site_replication_enabled().await? {
-                return Err(s3_error!(
-                    OperationAborted,
-                    "orphaned bucket recovery is local; reconcile every site before recreating this bucket"
-                ));
-            }
-            operation_store
-                .recover_orphaned_bucket(&operation_bucket, request.expected_incarnation_id)
-                .await
-                .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))
-        })
-        .await??;
+        let expected_incarnation = request.expected_incarnation_id;
+        let completed = store
+            .run_detached_mutation(async move {
+                let lock_bucket = operation_bucket.clone();
+                with_site_replication_bucket_mutation_lock(lock_store, &lock_bucket, move || async move {
+                    if site_replication_enabled().await? {
+                        return Err(s3_error!(
+                            OperationAborted,
+                            "orphaned bucket recovery is local; reconcile every site before recreating this bucket"
+                        ));
+                    }
+                    operation_store
+                        .recover_orphaned_bucket(&operation_bucket, expected_incarnation)
+                        .await
+                        .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))
+                })
+                .await??;
+                Ok::<(), s3s::S3Error>(())
+            })
+            .await
+            .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
+        completed?;
 
         info!(
             event = EVENT_ADMIN_ORPHAN_BUCKET_RECOVERY,
