@@ -55,11 +55,9 @@ pub const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal
 
 /// Reserved RustFS-branded twin of the MinIO-internal SSE key family.
 ///
-/// No RustFS writer emits these keys today — the SSE writer persists the
-/// MinIO-branded `X-Minio-Internal-Server-Side-Encryption-*` keys verbatim for
-/// interoperability — but redaction (`rustfs_filemeta`) and replication
-/// stripping treat the family as sensitive so that a future or third-party
-/// writer cannot leak sealed material through the reserved names.
+/// The SSE writer persists sealed material under the MinIO-branded names for
+/// interoperability. Redaction and replication stripping also cover this twin
+/// family, including the encrypted ETag format marker.
 pub const RUSTFS_INTERNAL_ENCRYPTION_PREFIX: &str = "x-rustfs-internal-server-side-encryption-";
 
 pub const REPLICATION_SSEC_ALGORITHM_HEADER: &str = "X-Rustfs-Replication-Ssec-Algorithm";
@@ -70,6 +68,15 @@ pub const REPLICATION_SSE_IV_HEADER: &str = "X-Rustfs-Replication-Server-Side-En
 pub const REPLICATION_SSE_SEAL_ALGORITHM_HEADER: &str = "X-Rustfs-Replication-Server-Side-Encryption-Seal-Algorithm";
 pub const REPLICATION_SSE_SEALED_KEY_HEADER: &str = "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key";
 pub const REPLICATION_ENCRYPTED_MULTIPART_HEADER: &str = "X-Rustfs-Replication-Encrypted-Multipart";
+
+pub const SUFFIX_OPAQUE_ENCRYPTED_ETAG: &str = "server-side-encryption-opaque-etag";
+
+/// Old encrypted objects can carry a plaintext MD5. Keyless listings expose
+/// an encrypted ETag only when its producer recorded the protected format.
+pub fn etag_can_be_listed(metadata: &HashMap<String, String>) -> bool {
+    !metadata.keys().any(|key| is_replication_stripped_encryption_key(key))
+        || super::metadata_compat::get_consistent_str(metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+}
 
 /// Stored SSE-C metadata keys and the wire names they replicate under.
 ///
@@ -306,6 +313,28 @@ pub fn stored_managed_encryption_key(metadata: &HashMap<String, String>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyless_listings_hide_unproven_encrypted_etags() {
+        assert!(etag_can_be_listed(&HashMap::from([("content-type".to_owned(), "text/plain".to_owned())])));
+        for key in [
+            SSEC_ALGORITHM_HEADER,
+            INTERNAL_ENCRYPTION_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
+            "X-AMZ-SERVER-SIDE-ENCRYPTION",
+            "x-rustfs-internal-server-side-encryption-sealed-key",
+        ] {
+            let mut metadata = HashMap::from([(key.to_owned(), "encryption-metadata".to_owned())]);
+            assert!(!etag_can_be_listed(&metadata), "legacy encrypted metadata: {key}");
+            super::super::metadata_compat::insert_str(&mut metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG, "unknown".to_owned());
+            assert!(!etag_can_be_listed(&metadata), "unknown producer format: {key}");
+            super::super::metadata_compat::insert_str(&mut metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            assert!(etag_can_be_listed(&metadata), "protected encrypted metadata: {key}");
+            metadata.insert("x-minio-internal-server-side-encryption-opaque-etag".to_owned(), "unknown".to_owned());
+            assert!(!etag_can_be_listed(&metadata), "conflicting format markers: {key}");
+        }
+    }
 
     #[test]
     fn ssec_transport_projection_retains_only_redacted_reader_headers() {
