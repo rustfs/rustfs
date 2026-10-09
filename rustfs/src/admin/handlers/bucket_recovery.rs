@@ -17,12 +17,13 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_object_store_handle;
+use crate::admin::storage_api::s3::{Body, S3Error, S3Request, S3Response, S3Result};
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::{site_replication_enabled, with_site_replication_bucket_mutation_lock};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::s3_error;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
@@ -76,10 +77,10 @@ impl Operation for RecoverOrphanedBucketHandler {
         let request: RecoverOrphanedBucketRequest = serde_json::from_slice(&body)
             .map_err(|_| s3_error!(InvalidRequest, "expected JSON with a non-nil expectedIncarnationId"))?;
         if request.expected_incarnation_id.is_nil() {
-            return Err(s3_error!(InvalidRequest, "expectedIncarnationId must be non-nil"));
+            return Err(s3_error!(InvalidRequest, "expectedIncarnationId must be non-nil").into());
         }
         let Some(store) = current_object_store_handle() else {
-            return Err(s3_error!(InternalError, "object store is not initialized"));
+            return Err(s3_error!(InternalError, "object store is not initialized").into());
         };
 
         let operation_bucket = bucket.to_owned();
@@ -94,18 +95,19 @@ impl Operation for RecoverOrphanedBucketHandler {
                         return Err(s3_error!(
                             OperationAborted,
                             "orphaned bucket recovery is local; reconcile every site before recreating this bucket"
-                        ));
+                        )
+                        .into());
                     }
                     operation_store
                         .recover_orphaned_bucket(&operation_bucket, expected_incarnation)
                         .await
-                        .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))
+                        .map_err(|error| S3Error::from(crate::error::ApiError::from(error)))
                 })
                 .await??;
-                Ok::<(), s3s::S3Error>(())
+                Ok::<(), S3Error>(())
             })
             .await
-            .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
+            .map_err(|error| S3Error::from(crate::error::ApiError::from(error)))?;
         completed?;
 
         info!(

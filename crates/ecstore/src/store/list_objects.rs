@@ -2368,8 +2368,7 @@ fn list_objects_paginate_versions<'a>(
     disk_has_more: bool,
     cache_id: Option<&str>,
     marker: Option<&str>,
-    last_scanned_key: Option<&str>,
-    raw_keys: impl Iterator<Item = &'a str>,
+    (last_scanned_key, raw_keys): (Option<&str>, impl Iterator<Item = &'a str>),
 ) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
     filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), marker);
     let prefix_at_page_boundary =
@@ -4331,8 +4330,7 @@ impl ECStore {
             disk_has_more,
             next_cache_id.as_deref(),
             opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            (last_scanned_key.as_deref(), entries.entries().iter().map(|entry| entry.name.as_str())),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -5759,8 +5757,7 @@ impl Sets {
             disk_has_more,
             next_cache_id.as_deref(),
             opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            (last_scanned_key.as_deref(), entries.entries().iter().map(|entry| entry.name.as_str())),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -6573,8 +6570,7 @@ impl SetDisks {
             disk_has_more,
             next_cache_id.as_deref(),
             opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            (last_scanned_key.as_deref(), entries.entries().iter().map(|entry| entry.name.as_str())),
         );
 
         Ok(ListObjectVersionsInfo {
@@ -8853,8 +8849,7 @@ mod test {
                 disk_has_more,
                 None,
                 marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                (last_scanned.as_deref(), window.iter().map(String::as_str)),
             );
 
             assert!(
@@ -8932,8 +8927,7 @@ mod test {
                 disk_has_more,
                 None,
                 marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                (last_scanned.as_deref(), window.iter().map(String::as_str)),
             );
 
             assert_eq!(objects.len() + prefixes.len(), 1, "a page must respect max-keys");

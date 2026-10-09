@@ -1901,6 +1901,20 @@ mod tests {
     use super::{LocalTraceCaptureError, request_local_trace_capture, spawn_local_trace_capture_runtime};
     use crate::connect::{TelemetryOperation, TelemetryProducerError, TraceRecordCompletion, TraceRecordLimits};
 
+    async fn wait_for_sealed_socket(state: &std::path::Path) -> Result<(), tokio::time::error::Elapsed> {
+        let socket = state.join(super::SOCKET_FILE);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Binding publishes the socket path before its private permissions are set.
+            while super::private_state_owner(state)
+                .and_then(|owner| super::socket_identity(&socket, owner))
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
     async fn wait_for_subscriber() {
         tokio::time::timeout(Duration::from_secs(1), async {
             while telemetry_trace_subscriber_count() == 0 {
@@ -2519,12 +2533,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.path().join(super::SOCKET_FILE).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        let ready = wait_for_sealed_socket(state.path()).await;
         let result = if ready.is_ok() {
             super::request_local_top_rpc(state.path(), request.clone(), &CancellationToken::new()).await
         } else {
@@ -2694,12 +2703,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.path().join(super::SOCKET_FILE).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        let ready = wait_for_sealed_socket(state.path()).await;
         let result = if ready.is_ok() {
             super::request_local_top_locks(state.path(), request.clone(), &CancellationToken::new()).await
         } else {
