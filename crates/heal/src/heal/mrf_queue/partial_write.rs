@@ -16,10 +16,14 @@ use super::{
     HealManager, MrfConsumerConfig, MrfDurableRepairAnchor, MrfIntent, MrfLegacyRiskAcceptanceRequest, MrfQueueKey, queue_key,
     submit_mrf_heal_request,
 };
-use rustfs_common::mrf_channel::{MrfDurableAdmissionError, MrfIngressResult, release_mrf_intent, try_rearm_mrf_replay_intent};
+use rustfs_common::mrf_channel::{
+    MrfDurableAdmissionError, MrfIngressResult, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent, release_mrf_intent,
+    try_rearm_mrf_replay_intent,
+};
 use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -29,6 +33,7 @@ const MAX_OPERATOR_ACTOR_BYTES: usize = 256;
 const MAX_OPERATOR_REFERENCE_BYTES: usize = 256;
 const LIFECYCLE_CHECKPOINT_RECORD_OVERHEAD_BYTES: usize = 256;
 const MAX_UNVERIFIED_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const MRF_RETIREMENT_PROOF_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PartialWriteKey {
@@ -229,6 +234,7 @@ pub(super) struct PartialWrites {
     entries: HashMap<PartialWriteKey, Responsibility>,
     retry_order: VecDeque<PartialWriteKey>,
     retry_index: HashSet<PartialWriteKey>,
+    retirement_checks: HashMap<(Arc<str>, Uuid), (Instant, bool)>,
     bytes: usize,
 }
 
@@ -333,6 +339,66 @@ impl PartialWrites {
 
     pub(super) fn anchors(&self) -> impl Iterator<Item = &MrfDurableRepairAnchor> {
         self.entries.values().filter_map(|entry| entry.anchor.as_ref())
+    }
+
+    pub(super) async fn note_retired_generation_proofs(&mut self, manager: &HealManager) {
+        let mut anchors_by_generation: HashMap<(Arc<str>, Uuid), Vec<MrfDurableRepairAnchor>> = HashMap::new();
+        for entry in self.entries.values() {
+            if !entry.persisted {
+                continue;
+            }
+            let Some(source_incarnation) = entry.source_bucket_incarnation_id else {
+                continue;
+            };
+            let Some(anchor) = MrfDurableRepairAnchor::from_intent(&entry.intent, source_incarnation)
+                .filter(|anchor| anchor.bucket_incarnation_id == source_incarnation)
+            else {
+                continue;
+            };
+            anchors_by_generation
+                .entry((anchor.bucket.clone(), source_incarnation))
+                .or_default()
+                .push(anchor);
+        }
+
+        self.retirement_checks
+            .retain(|generation, _| anchors_by_generation.contains_key(generation));
+        let now = Instant::now();
+        for ((bucket, incarnation), anchors) in anchors_by_generation {
+            let retired = match self.retirement_checks.get(&(bucket.clone(), incarnation)) {
+                Some((_, true)) => true,
+                Some((checked_at, false))
+                    if now.saturating_duration_since(*checked_at) < MRF_RETIREMENT_PROOF_RECHECK_INTERVAL =>
+                {
+                    false
+                }
+                _ => {
+                    let retired = manager
+                        .mrf_bucket_incarnation_retired(bucket.as_ref(), incarnation)
+                        .await
+                        .unwrap_or(false);
+                    self.retirement_checks.insert((bucket.clone(), incarnation), (now, retired));
+                    retired
+                }
+            };
+            if !retired {
+                continue;
+            }
+
+            for anchor in anchors {
+                rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+                    kind: anchor.kind,
+                    bucket: anchor.bucket.clone(),
+                    object: anchor.object.clone(),
+                    version_id: anchor.version_id,
+                    scope: anchor.scope,
+                    delete_marker_purge: anchor.delete_marker_purge,
+                    lease: Some(anchor.lease),
+                    bucket_incarnation_id: anchor.bucket_incarnation_id,
+                    disposition: MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
+                });
+            }
+        }
     }
 
     pub(super) fn park_unverified_legacy(&mut self, anchor: &MrfDurableRepairAnchor) -> bool {
@@ -945,6 +1011,7 @@ mod tests {
     use super::*;
     use crate::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
+    use crate::heal::storage_api::storage::{BucketOperations as _, DeleteBucketOptions};
     use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
     use serial_test::serial;
     use std::sync::Arc;
@@ -1859,6 +1926,94 @@ mod tests {
         rustfs_common::mrf_channel::note_mrf_verified_repair(verified_event(&replayed_current_anchor));
         runtime.discharge_durable_replay_anchors();
         assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn durable_mrf_anchor_retires_only_after_exact_bucket_generation_is_deleted() {
+        use super::super::{MrfQueue, MrfRuntime};
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_retirement_proof")
+            .build()
+            .await;
+        let bucket = "mrf-retired-generation";
+        env.make_bucket(bucket, false).await;
+        let incarnation = env
+            .ecstore
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("current generation identity");
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
+
+        let mut item = intent("durable-object");
+        item.bucket = Arc::from(bucket);
+        let mut partial_writes = PartialWrites::default();
+        partial_writes
+            .admit_with_source_incarnation(item.clone(), Some(incarnation), 1, 8192)
+            .expect("retain exact old-generation responsibility");
+        partial_writes.mark_persisted();
+        let key = PartialWriteKey::new(&item, Some(incarnation));
+        let anchor = MrfDurableRepairAnchor::from_intent(&item, incarnation).expect("exact retirement anchor");
+        partial_writes.entries.get_mut(&key).expect("durable responsibility").anchor = Some(anchor);
+
+        assert!(
+            !manager
+                .mrf_bucket_incarnation_retired(bucket, incarnation)
+                .await
+                .expect("live generation is queryable"),
+            "a live generation cannot retire its MRF anchors"
+        );
+        env.ecstore
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("normal bucket deletion publishes durable retirement evidence");
+
+        partial_writes.note_retired_generation_proofs(manager.as_ref()).await;
+        let config = MrfConsumerConfig::default();
+        let mut runtime = MrfRuntime {
+            partial_writes,
+            queue: MrfQueue::new(config.queue_capacity, config.journal_max_bytes),
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        runtime.discharge_durable_replay_anchors();
+        assert_eq!(
+            runtime.partial_writes.depth(),
+            0,
+            "retirement proof should discharge the exact old anchor"
+        );
+        assert!(runtime.dirty, "discharging durable responsibility must publish a successor checkpoint");
+
+        let manually_removed_bucket = "mrf-manually-removed-volume";
+        env.make_bucket(manually_removed_bucket, false).await;
+        let manual_incarnation = env
+            .ecstore
+            .bucket_incarnation_id_from_disk(manually_removed_bucket)
+            .await
+            .expect("manual-removal bucket generation identity");
+        for disk_path in &env.disk_paths {
+            tokio::fs::remove_dir_all(disk_path.join(manually_removed_bucket))
+                .await
+                .expect("simulate out-of-band volume removal");
+        }
+        assert!(
+            !manager
+                .mrf_bucket_incarnation_retired(manually_removed_bucket, manual_incarnation)
+                .await
+                .expect("missing retirement proof is authoritative absence of proof"),
+            "out-of-band disk removal must not be mistaken for a durable retirement record"
+        );
     }
 
     #[test]

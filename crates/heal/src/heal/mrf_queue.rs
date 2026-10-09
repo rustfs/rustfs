@@ -1366,8 +1366,10 @@ impl MrfRuntime {
             rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(bucket.as_ref(), &mut anchors);
         }
         let remaining: HashSet<_> = anchors.into_iter().collect();
+        let previous_replay_anchor_count = self.durable_replay_anchors.len();
         self.durable_replay_anchors.retain(|anchor| remaining.contains(anchor));
-        self.dirty |= self.partial_writes.retain_unproven(&remaining);
+        let replay_anchors_changed = self.durable_replay_anchors.len() != previous_replay_anchor_count;
+        self.dirty |= replay_anchors_changed || self.partial_writes.retain_unproven(&remaining);
         for bucket in buckets {
             for event in rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(bucket.as_ref()) {
                 if self.partial_writes.park_unverified_legacy(&event.anchor) {
@@ -1944,6 +1946,7 @@ async fn run_mrf_consumer(
                 }
             }
             _ = flush_tick.tick() => {
+                runtime.partial_writes.note_retired_generation_proofs(manager.as_ref()).await;
                 runtime.discharge_durable_replay_anchors();
                 match tick_action(
                     runtime.dirty,

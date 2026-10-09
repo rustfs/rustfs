@@ -46,6 +46,9 @@ pub struct SetBucketQuotaRequest {
     pub quota: Option<u64>,
     #[serde(default = "default_quota_type")]
     pub quota_type: String,
+    /// Optional durable reservation protocol. Omitted keeps the v1 default.
+    #[serde(default)]
+    pub reservation_protocol: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +59,8 @@ struct CompatibleBucketQuotaRequest {
     size: Option<u64>,
     #[serde(default, alias = "quotatype")]
     quota_type: Option<String>,
+    #[serde(default)]
+    reservation_protocol: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +106,7 @@ fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, 
         return Ok(SetBucketQuotaRequest {
             quota: None,
             quota_type: default_quota_type(),
+            reservation_protocol: None,
         });
     }
 
@@ -113,6 +119,7 @@ fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, 
             .filter(|quota| *quota > 0)
             .or_else(|| request.quota.filter(|quota| *quota > 0)),
         quota_type: request.quota_type.unwrap_or_else(default_quota_type),
+        reservation_protocol: request.reservation_protocol,
     })
 }
 
@@ -307,7 +314,18 @@ impl Operation for SetBucketQuotaHandler {
             None
         };
 
-        let quota = BucketQuota::new(request.quota);
+        let quota = match request.reservation_protocol {
+            None | Some(crate::admin::storage_api::bucket::quota::QUOTA_RESERVATION_PROTOCOL_V1) => {
+                BucketQuota::new(request.quota)
+            }
+            Some(crate::admin::storage_api::bucket::quota::QUOTA_RESERVATION_PROTOCOL_V2) => match request.quota {
+                Some(limit) => BucketQuota::new_sharded(limit),
+                None => BucketQuota::new(None),
+            },
+            Some(_) => {
+                return Err(rustfs_s3_types::s3_error!(InvalidArgument, "unsupported quota reservation protocol").into());
+            }
+        };
 
         let metadata_sys_lock = bucket_metadata_from_context()
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
@@ -741,6 +759,7 @@ mod tests {
 
         assert_eq!(request.quota, Some(1073741824));
         assert_eq!(request.quota_type, "hard");
+        assert_eq!(request.reservation_protocol, None);
     }
 
     #[test]
@@ -750,6 +769,15 @@ mod tests {
 
         assert_eq!(request.quota, Some(1073741824));
         assert_eq!(request.quota_type, "hard");
+    }
+
+    #[test]
+    fn parse_set_bucket_quota_request_accepts_sharded_protocol() {
+        let request = parse_set_bucket_quota_request(br#"{"quota":1073741824,"reservation_protocol":2,"quota_type":"hard"}"#)
+            .expect("parse sharded quota request");
+
+        assert_eq!(request.quota, Some(1073741824));
+        assert_eq!(request.reservation_protocol, Some(2));
     }
 
     #[test]

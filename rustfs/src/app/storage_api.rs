@@ -277,6 +277,7 @@ pub(crate) mod access {
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 

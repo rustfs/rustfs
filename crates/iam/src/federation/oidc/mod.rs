@@ -18,4 +18,5 @@ mod discovery;
 mod flow;
 mod http;
 
+pub use config::OidcConfigQuery;
 pub use flow::StandardOidcAdapter;
