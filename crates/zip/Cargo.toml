@@ -49,6 +49,10 @@ rustfs-rio.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 thiserror = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keep XZ decoding self-contained in macOS binaries instead of linking Homebrew liblzma.
+liblzma = { version = "0.4.8", features = ["static"] }
+
 [dev-dependencies]
 rustfs-tokio-tar = { workspace = true }
 futures = { workspace = true }
