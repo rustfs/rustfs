@@ -58,6 +58,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 time = { workspace = true, features = ["serde", "parsing", "formatting", "macros"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["raw_value"] }
+uuid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 strum = { workspace = true, features = ["derive"] }
 rustfs-crypto = { workspace = true }
