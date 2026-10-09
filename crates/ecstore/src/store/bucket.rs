@@ -901,6 +901,7 @@ impl ECStore {
             }
         };
         let confirmed_missing = existing_bucket_info.is_none();
+        let mut pending_creation_metadata = None;
         if confirmed_missing
             && !opts.no_lock
             && !is_meta_bucketname(bucket)
@@ -921,13 +922,25 @@ impl ECStore {
                     ),
                     other => other,
                 })?;
-            return Err(StorageError::InvalidArgument(
-                "CreateBucket".to_string(),
-                "bucket".to_string(),
-                format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
-            ));
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            let metadata_store = metadata_sys::object_store_in(&self.ctx).await?;
+            let pending_intent = persisted
+                && metadata.bucket_incarnation_id == old_incarnation
+                && metadata.needs_bucket_creation_commit()
+                && !crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?;
+            if pending_intent {
+                pending_creation_metadata = Some(metadata);
+            } else {
+                return Err(StorageError::InvalidArgument(
+                    "CreateBucket".to_string(),
+                    "bucket".to_string(),
+                    format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
+                ));
+            }
         }
-        let existing_metadata = if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
+        let existing_metadata = if let Some(metadata) = pending_creation_metadata {
+            Some(metadata)
+        } else if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {
                 metadata = BucketMetadata::new(bucket);
