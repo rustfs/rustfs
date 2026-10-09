@@ -305,3 +305,149 @@ fn test_oidc_provider_config_defaults() {
     assert_eq!(config.scopes.len(), 3);
     assert!(config.redirect_uri_dynamic);
 }
+
+#[test]
+fn config_input_preserves_secret_and_defaults() {
+    let input = OidcProviderConfigInput {
+        config_url: " https://example.com/.well-known/openid-configuration ".to_string(),
+        client_id: " client ".to_string(),
+        client_secret: Some(String::new()),
+        scopes: vec![" openid ".to_string(), " profile ".to_string()],
+        roles_claim: "app_roles".to_string(),
+        ..Default::default()
+    };
+    let config = build_upsert_provider_config("default", input, Some("existing-secret".to_string()))
+        .expect("valid config should preserve existing secret");
+
+    assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
+    assert_eq!(config.config_url, "https://example.com/.well-known/openid-configuration");
+    assert_eq!(config.client_id, "client");
+    assert_eq!(config.scopes, ["openid", "profile"]);
+    assert_eq!(config.roles_claim, "app_roles");
+    assert_eq!(config.claim_name, OIDC_DEFAULT_CLAIM_NAME);
+
+    let raw_secret = build_upsert_provider_config(
+        "default",
+        OidcProviderConfigInput {
+            config_url: config.config_url,
+            client_id: config.client_id,
+            client_secret: Some(" raw secret ".to_string()),
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("a nonempty client secret should be accepted");
+    assert_eq!(raw_secret.client_secret.as_deref(), Some(" raw secret "));
+}
+
+#[test]
+fn config_input_rejects_invalid_fields() {
+    let input = OidcProviderConfigInput {
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        scopes: vec!["profile".to_string()],
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_upsert_provider_config("default", input, None),
+        Err(OidcConfigError::OpenidScopeRequired)
+    ));
+
+    let input = OidcProviderConfigInput {
+        config_url: "https://127.0.0.1/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_upsert_provider_config("default", input, None),
+        Err(OidcConfigError::ForbiddenOutbound { field: "config_url", .. })
+    ));
+
+    assert!(serde_json::from_str::<OidcProviderConfigInput>(r#"{"unexpected_field":true}"#).is_err());
+    assert!(serde_json::from_str::<OidcProviderValidationInput>(r#"{"unexpected_field":true}"#).is_err());
+    assert!(matches!(
+        validate_mutable_provider_id("../escape"),
+        Err(OidcConfigError::InvalidProviderId)
+    ));
+}
+
+#[test]
+fn validation_input_defaults_to_default_provider() {
+    let input = OidcProviderValidationInput {
+        provider_id: "  ".to_string(),
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        ..Default::default()
+    };
+    let config = build_validation_provider_config(input).expect("validation input should use default provider");
+    assert_eq!(config.id, "default");
+}
+
+#[test]
+fn persisted_config_codec_keeps_instance_keys_and_fields() {
+    let mut config = ServerConfig::new();
+    let mut provider = build_upsert_provider_config(
+        "default",
+        OidcProviderConfigInput {
+            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            issuer: Some("https://issuer.example.com".to_string()),
+            client_id: "client".to_string(),
+            client_secret: Some("secret".to_string()),
+            hide_from_ui: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("provider should be valid");
+    upsert_persisted_provider_config(&mut config, &provider);
+
+    let default = config
+        .0
+        .get(IDENTITY_OPENID_SUB_SYS)
+        .and_then(|subsystem| subsystem.get(DEFAULT_DELIMITER))
+        .expect("default provider KVS should exist");
+    assert_eq!(default.get(OIDC_ISSUER), "https://issuer.example.com");
+    assert_eq!(default.get(OIDC_HIDE_FROM_UI), EnableState::On.to_string());
+    assert_eq!(persisted_provider_secret(&config, "default").as_deref(), Some("secret"));
+
+    provider.hide_from_ui = false;
+    upsert_persisted_provider_config(&mut config, &provider);
+    let default = config
+        .0
+        .get(IDENTITY_OPENID_SUB_SYS)
+        .and_then(|subsystem| subsystem.get(DEFAULT_DELIMITER))
+        .expect("updated default provider KVS should exist");
+    assert_eq!(default.get(OIDC_HIDE_FROM_UI), EnableState::Off.to_string());
+
+    delete_persisted_provider_config(&mut config, "default").expect("default provider should be deleted");
+    assert!(matches!(
+        delete_persisted_provider_config(&mut config, "default"),
+        Err(OidcConfigError::ProviderNotFound)
+    ));
+}
+
+#[test]
+fn site_replication_snapshot_hashes_secret_without_exposing_config() {
+    let provider = build_upsert_provider_config(
+        "default",
+        OidcProviderConfigInput {
+            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            client_id: "client".to_string(),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("provider should be valid");
+    let snapshot = OidcSiteReplicationSnapshot::from_config_snapshot(&OidcConfigSnapshot::new(vec![SourcedOidcProviderConfig {
+        config: provider,
+        source: OidcProviderConfigSource::Persisted,
+    }]));
+    assert_eq!(
+        snapshot.providers()[0].hashed_client_secret,
+        "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols"
+    );
+    assert!(!format!("{snapshot:?}").contains("\"secret\""));
+    assert_eq!(hash_client_secret(None), "");
+    assert_eq!(hash_client_secret(Some("")), "");
+}

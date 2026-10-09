@@ -13,8 +13,8 @@
 // limitations under the License.
 use super::{
     config::{
-        OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderSummary, SourcedOidcProviderConfig,
-        load_oidc_config_snapshot,
+        OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderSummary, OidcSiteReplicationSnapshot,
+        SourcedOidcProviderConfig, load_oidc_config_snapshot,
     },
     provider::{ProviderRuntime, discover_provider},
     state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
@@ -806,8 +806,8 @@ impl StandardOidcAdapter {
 }
 
 impl OidcConfigQuery for StandardOidcAdapter {
-    fn config_snapshot(&self) -> OidcConfigSnapshot {
-        self.oidc.config_snapshot()
+    fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot {
+        OidcSiteReplicationSnapshot::from_config_snapshot(&self.oidc.config_snapshot())
     }
 }
 

@@ -2063,34 +2063,32 @@ fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: St
     settings
 }
 
-fn open_id_settings_from_snapshot(snapshot: &rustfs_iam::oidc::OidcConfigSnapshot, region: String) -> OpenIDSettings {
+fn open_id_settings_from_snapshot(snapshot: &rustfs_iam::oidc::OidcSiteReplicationSnapshot, region: String) -> OpenIDSettings {
     let providers = snapshot
         .providers()
         .iter()
         .map(|provider| {
-            let config = &provider.config;
-            (config.id.clone(), open_id_provider_settings(config))
+            (
+                provider.provider_id.clone(),
+                OpenIDProviderSettings {
+                    claim_name: provider.claim_name.clone(),
+                    claim_userinfo_enabled: false,
+                    role_policy: provider.role_policy.clone(),
+                    client_id: provider.client_id.clone(),
+                    hashed_client_secret: provider.hashed_client_secret.clone(),
+                },
+            )
         })
         .collect();
 
     open_id_settings(providers, region)
 }
 
-fn open_id_provider_settings(config: &rustfs_iam::oidc::OidcProviderConfig) -> OpenIDProviderSettings {
-    OpenIDProviderSettings {
-        claim_name: config.claim_name.clone(),
-        claim_userinfo_enabled: false,
-        role_policy: config.role_policy.clone(),
-        client_id: config.client_id.clone(),
-        hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-    }
-}
-
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
     let region = current_region().map(|region| region.to_string()).unwrap_or_default();
     settings.open_id = current_oidc_config_query()
-        .map(|query| open_id_settings_from_snapshot(&query.config_snapshot(), region))
+        .map(|query| open_id_settings_from_snapshot(&query.site_replication_snapshot(), region))
         .unwrap_or_default();
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
@@ -11547,16 +11545,18 @@ mod tests {
 
     #[test]
     fn oidc_config_snapshot_preserves_site_replication_settings() {
-        let snapshot = rustfs_iam::oidc::OidcConfigSnapshot::new(vec![
-            oidc_snapshot_provider("corp", "client-b"),
-            oidc_snapshot_provider("default", "client-a"),
-        ]);
+        let snapshot = rustfs_iam::oidc::OidcSiteReplicationSnapshot::from_config_snapshot(
+            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![
+                oidc_snapshot_provider("corp", "client-b"),
+                oidc_snapshot_provider("default", "client-a"),
+            ]),
+        );
 
         assert_eq!(
             snapshot
                 .providers()
                 .iter()
-                .map(|provider| provider.config.id.as_str())
+                .map(|provider| provider.provider_id.as_str())
                 .collect::<Vec<_>>(),
             ["default", "corp"]
         );
