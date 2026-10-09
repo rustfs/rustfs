@@ -2361,24 +2361,36 @@ fn list_objects_paginate(
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
+#[derive(Clone, Copy)]
+struct VersionedListMarkers<'a> {
+    cache_id: Option<&'a str>,
+    marker: Option<&'a str>,
+    last_scanned_key: Option<&'a str>,
+}
+
 fn list_objects_paginate_versions<'a>(
     mut get_objects: Vec<ObjectInfo>,
     delimiter: &Option<String>,
     max_keys: i32,
     disk_has_more: bool,
-    cache_id: Option<&str>,
-    marker: Option<&str>,
-    last_scanned_key: Option<&str>,
+    markers: VersionedListMarkers<'_>,
     raw_keys: impl Iterator<Item = &'a str>,
 ) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
-    filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), marker);
+    filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), markers.marker);
     let prefix_at_page_boundary =
         versioned_prefix_page_boundary_key(&get_objects, raw_keys, delimiter.as_deref(), max_keys, disk_has_more);
 
-    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) =
-        list_objects_paginate(get_objects, delimiter, max_keys, disk_has_more, cache_id, true, last_scanned_key);
+    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) = list_objects_paginate(
+        get_objects,
+        delimiter,
+        max_keys,
+        disk_has_more,
+        markers.cache_id,
+        true,
+        markers.last_scanned_key,
+    );
     if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
-        next_marker = Some(append_list_cache_id_to_marker(raw_key, cache_id));
+        next_marker = Some(append_list_cache_id_to_marker(raw_key, markers.cache_id));
         next_version_idmarker = None;
     }
 
@@ -4329,9 +4341,11 @@ impl ECStore {
             &delimiter,
             max_keys,
             disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
+            VersionedListMarkers {
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+            },
             entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
@@ -5757,9 +5771,11 @@ impl Sets {
             &delimiter,
             max_keys,
             disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
+            VersionedListMarkers {
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+            },
             entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
@@ -6571,9 +6587,11 @@ impl SetDisks {
             &delimiter,
             max_keys,
             disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
+            VersionedListMarkers {
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+            },
             entries.entries().iter().map(|entry| entry.name.as_str()),
         );
 
@@ -8851,9 +8869,11 @@ mod test {
                 &delimiter,
                 max_keys,
                 disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
+                super::VersionedListMarkers {
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                },
                 window.iter().map(String::as_str),
             );
 
@@ -8930,9 +8950,11 @@ mod test {
                 &delimiter,
                 max_keys,
                 disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
+                super::VersionedListMarkers {
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                },
                 window.iter().map(String::as_str),
             );
 
