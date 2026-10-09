@@ -11060,6 +11060,7 @@ dependencies = [
  "async-compression",
  "futures",
  "hotpath",
+ "liblzma",
  "rustfs-rio",
  "rustfs-tokio-tar",
  "serde",
