@@ -31,6 +31,8 @@ A previously published gauge can remain visible after a statistic becomes unavai
 
 When live requested bytes are unavailable, capture a supported heap profile or allocation/free trace. Preserve attribution to allocation stacks and lifetime; committed bytes and RSS alone cannot establish a leak. Other raw allocator statistics, including page accounting, depend on the allocator build and are not interchangeable with live application bytes.
 
+For Linux diagnostics, build with `--features diagnostic-allocator-live` to export `rustfs_memory_allocator_rust_global_requested_live_bytes` and its availability gauge. Use the byte gauge only when `rustfs_memory_allocator_rust_global_requested_live_bytes_available` is `1`; it remains unavailable on Windows and with `hotpath-alloc`. The feature wraps MiMalloc and updates an atomic counter for successful Rust `GlobalAlloc` allocations (including zeroed allocations), reallocations, and deallocations. It excludes direct native allocator calls and adds per-allocation overhead, so use it to observe memory behavior, not to compare throughput. Enabling `--cfg tokio_unstable` for Tokio blocking-pool metrics does not enable this allocator wrapper; enable both explicitly when both measurements are needed.
+
 ### Idle reclaim
 
 The reclaim loop waits for request, delete-tail, scanner, heal, EC and GET-buffer activity to become idle. Continuous traffic can skip reclaim. Check the activity gauges, skipped reasons and idle streak rather than assuming that waiting a fixed period guarantees collection.
