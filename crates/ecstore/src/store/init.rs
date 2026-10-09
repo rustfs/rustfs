@@ -14521,15 +14521,19 @@ mod tests {
             let barrier = TierDeleteChunkTestBarrier::install(stage);
             let worker_store = store.clone();
             let worker_bucket = bucket.clone();
+            // Simulate a crash at the barrier. Aborting a caller of the public entry
+            // point no longer stops the delete, which runs on a detached task, so
+            // drive the delete below that task.
             let worker = tokio::spawn(async move {
                 worker_store
-                    .delete_object_with_tier_delete_journal(
+                    .handle_delete_object_with_journal(
                         &worker_bucket,
                         prefix,
                         ObjectOptions {
                             delete_prefix: true,
                             ..Default::default()
                         },
+                        Some(worker_store.clone()),
                     )
                     .await
             });
@@ -14538,6 +14542,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("chunk delete did not reach crash boundary {stage:?}"));
             worker.abort();
             let _ = worker.await;
+            assert_eq!(
+                ctx.detached_mutation_count(),
+                0,
+                "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+            );
             drop(barrier);
             let released_bucket_guard =
                 tokio::time::timeout(Duration::from_secs(5), store.acquire_bucket_lifecycle_write_lock(&bucket))
@@ -14683,15 +14692,19 @@ mod tests {
 
         let barrier = TierDeleteChunkTestBarrier::install(TierDeleteChunkTestStage::DispatchAuthorized);
         let worker_store = store.clone();
+        // Simulate a crash at the barrier. Aborting a caller of the public entry
+        // point no longer stops the delete, which runs on a detached task, so
+        // drive the delete below that task.
         let worker = tokio::spawn(async move {
             worker_store
-                .delete_object_with_tier_delete_journal(
+                .handle_delete_object_with_journal(
                     bucket,
                     prefix,
                     ObjectOptions {
                         delete_prefix: true,
                         ..Default::default()
                     },
+                    Some(worker_store.clone()),
                 )
                 .await
         });
@@ -14700,6 +14713,11 @@ mod tests {
             .expect("chunk delete should persist its authorization before corruption injection");
         worker.abort();
         let _ = worker.await;
+        assert_eq!(
+            ctx.detached_mutation_count(),
+            0,
+            "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+        );
         drop(barrier);
 
         let records = store
@@ -17534,6 +17552,332 @@ mod tests {
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
             .expect("new-generation object must survive the old batch delete");
+    }
+
+    async fn put_detached_delete_fixture(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create detached delete bucket");
+        // Large enough for a data dir, so the delete commit leaves a marked
+        // data dir and a rollback backup until its cleanup pass runs.
+        let mut reader = PutObjReader::from_vec(vec![7u8; 2 * 1024 * 1024]);
+        store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put detached delete fixture");
+    }
+
+    async fn assert_delete_lock_moved_to_detached_task(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let lock = store
+            .handle_new_ns_lock(bucket, object)
+            .await
+            .expect("namespace lock handle for the deleted key");
+        lock.get_write_lock_quiet(Duration::from_millis(200))
+            .await
+            .expect_err("the detached delete must keep its object lock after the caller is dropped");
+    }
+
+    fn assert_no_delete_residue(temp_dir: &std::path::Path, bucket: &str, object: &str, disks: usize) {
+        for disk in 0..disks {
+            let object_dir = temp_dir.join(format!("pool0/set0/disk{disk}")).join(bucket).join(object);
+            assert!(
+                !object_dir.exists(),
+                "disk {disk} must hold neither metadata, rollback backup nor data of the deleted object: {object_dir:?}"
+            );
+        }
+    }
+
+    // #6898: a DeleteObjects request dropped between the per-disk commit and the
+    // cleanup pass (client disconnect) must not leave metadata-less residue.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-batch-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-batch-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/batch.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_objects_with_tier_delete_journal_and_accounting(
+            &bucket,
+            vec![ObjectToDelete {
+                object_name: object.to_string(),
+                ..Default::default()
+            }],
+            ObjectOptions::default(),
+        );
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("batch delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached batch delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_object_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-single-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-single-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/single.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal(&bucket, object, ObjectOptions::default());
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("single delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached single delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
+    // A recursive (force) delete runs under its caller's bucket lifecycle write
+    // lock and carries only that lock's fence. If the caller is dropped, the
+    // detached delete must still hold the lock: otherwise a PUT under the prefix
+    // succeeds and is then removed by the delete that is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_delete_keeps_bucket_lock_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-recursive-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-recursive-delete-{}", uuid::Uuid::new_v4());
+        let old_object = "folder/old.bin";
+        let new_object = "folder/new.bin";
+        put_detached_delete_fixture(&store, &bucket, old_object).await;
+
+        // The S3 force-delete path: the caller owns the lock, opts carry its fence.
+        let guard = store
+            .lock_bucket_for_recursive_delete(&bucket)
+            .await
+            .expect("recursive delete should lock the bucket");
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            ..Default::default()
+        };
+        opts.add_bucket_lifecycle_lock_guard(&guard);
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal_and_guards(&bucket, "folder/", opts, Some(guard));
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("recursive delete must pause inside its detached task"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped caller must leave its delete running");
+
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let mut put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"written while the delete runs".to_vec());
+            put_store
+                .put_object(&put_bucket, new_object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut put).await.is_err(),
+            "a PUT under the prefix must wait while the detached recursive delete runs"
+        );
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached recursive delete should finish"
+        );
+        put.await
+            .expect("PUT task should join")
+            .expect("the PUT should succeed once the recursive delete has finished");
+        store
+            .get_object_info(&bucket, old_object, &ObjectOptions::default())
+            .await
+            .expect_err("the recursive delete must remove the object it covered");
+        store
+            .get_object_info(&bucket, new_object, &ObjectOptions::default())
+            .await
+            .expect("the PUT that waited for the recursive delete must survive it");
+        for disk in 0..4 {
+            let metadata = temp
+                .path()
+                .join(format!("pool0/set0/disk{disk}"))
+                .join(&bucket)
+                .join(new_object)
+                .join(crate::disk::STORAGE_FORMAT_FILE);
+            assert!(
+                metadata.exists(),
+                "disk {disk} must keep the object written after the delete: {metadata:?}"
+            );
+        }
+    }
+
+    // Lifecycle expiry holds the table-bucket publication read lock and passes
+    // only its lock-lost signal to the delete. A cancelled expiry worker must not
+    // release that lock while its detached delete is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn lifecycle_expiry_keeps_publication_lock_after_worker_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-lifecycle-expiry", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-lifecycle-expiry-{}", uuid::Uuid::new_v4());
+        let object = "expired.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create lifecycle bucket");
+        let mut reader = PutObjReader::from_vec(b"expired data".to_vec());
+        let object_info = store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put expired object");
+        let bucket_incarnation_id = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let expiry_store = Arc::clone(&store);
+        let expiry = tokio::spawn(async move {
+            crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                expiry_store,
+                &object_info,
+                &crate::bucket::lifecycle::lifecycle::Event {
+                    action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                    ..Default::default()
+                },
+                &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                bucket_incarnation_id,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("lifecycle delete should pause inside its detached task");
+        // A cancelled worker drops its future while the delete keeps running.
+        expiry.abort();
+        assert!(
+            expiry
+                .await
+                .expect_err("aborted expiry worker should not join")
+                .is_cancelled(),
+            "expiry worker should be cancelled"
+        );
+        assert_eq!(ctx.detached_mutation_count(), 1, "the cancelled worker must leave its delete running");
+
+        let publication_lock = store
+            .handle_new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock handle");
+        publication_lock
+            .get_write_lock_quiet(Duration::from_millis(300))
+            .await
+            .expect_err("table-bucket publication must wait for the detached lifecycle delete");
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached lifecycle delete should finish"
+        );
+        let publication_guard = publication_lock
+            .get_write_lock_quiet(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket publication should proceed once the lifecycle delete has finished");
+        drop(publication_guard);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the detached lifecycle delete should still remove the expired object");
+    }
+
+    // #6898: residue that an older build stranded (every disk committed the
+    // delete, the cleanup pass never ran) is reclaimed by deleting the key again.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn repeated_delete_objects_finishes_committed_delete_residue() {
+        use crate::disk::DiskAPI as _;
+
+        for drives in [1, 4] {
+            let temp = tempfile::tempdir().expect("create temp store dir");
+            let (_ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp.path(), "residue-retry", &[drives])).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("residue-retry-{drives}-{}", uuid::Uuid::new_v4());
+            let object = "residue/retry.bin";
+            put_detached_delete_fixture(&store, &bucket, object).await;
+
+            let transaction = uuid::Uuid::new_v4();
+            let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+            for disk in disks.iter().flatten() {
+                let errors = disk
+                    .delete_versions(
+                        &bucket,
+                        vec![crate::disk::FileInfoVersions {
+                            name: object.to_string(),
+                            versions: vec![rustfs_filemeta::FileInfo {
+                                name: object.to_string(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        crate::disk::DeleteOptions {
+                            old_data_dir: Some(transaction),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "the delete should commit on every disk: {errors:?}");
+            }
+            for disk in 0..drives {
+                let object_dir = temp.path().join(format!("pool0/set0/disk{disk}")).join(&bucket).join(object);
+                assert!(!object_dir.join(crate::disk::STORAGE_FORMAT_FILE).exists());
+                assert!(
+                    object_dir
+                        .join(transaction.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                        .exists(),
+                    "disk {disk} should hold the stranded rollback backup"
+                );
+            }
+
+            let (_deleted, errors) = store
+                .delete_objects(
+                    &bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "a missing key deletes successfully: {errors:?}");
+            assert_no_delete_residue(temp.path(), &bucket, object, drives);
+        }
     }
 
     #[tokio::test]

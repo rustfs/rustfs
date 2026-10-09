@@ -20,7 +20,7 @@ use tracing::{Level, info, instrument};
 #[tokio::main]
 async fn main() {
     let obs_conf = Some("http://localhost:4318".to_string());
-    let _guard = init_obs(obs_conf).await;
+    let _guard = init_obs(obs_conf, None).await;
     let span = tracing::span!(Level::INFO, "main");
     let _enter = span.enter();
     info!("Program starts");

@@ -29,6 +29,7 @@ pub type S3HttpCompletionObserver = fn(S3Operation, Duration, bool);
 pub type S3HttpCompletionObserverEnabled = fn() -> bool;
 
 const METRIC: &str = "rustfs_s3_http_requests_total";
+const LOCK_FAILURE_METRIC: &str = "rustfs_s3_lock_failures_total";
 const METHODS: [&str; 10] = [
     "GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE", "OTHER",
 ];
@@ -109,6 +110,21 @@ pub(crate) fn observe_s3_http_operation(op: S3Operation) {
         if current.get() == UNKNOWN_OPERATION {
             current.set(op.metric_index());
         }
+    });
+}
+
+/// Attribute a lock-related S3 failure to the request operation without
+/// exporting bucket, object, owner, or request identifiers as metric labels.
+pub fn record_s3_http_lock_failure(resource_class: &'static str, mode: &'static str, reason: &'static str) {
+    let _ = CURRENT_OPERATION.try_with(|current| {
+        counter!(
+            LOCK_FAILURE_METRIC,
+            "op" => operation_label(current.get()),
+            "resource_class" => resource_class,
+            "mode" => mode,
+            "reason" => reason
+        )
+        .increment(1);
     });
 }
 
@@ -196,7 +212,7 @@ pub fn s3_http_metrics_snapshot() -> Vec<S3HttpMetricSnapshot> {
 mod tests {
     use super::*;
     use metrics::with_local_recorder;
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     #[test]
     fn completion_observer_sees_each_dispatched_request_once() {
@@ -302,5 +318,43 @@ mod tests {
         let other = S3HttpRequestGuard::new("attacker-controlled-method");
         assert_eq!(other.method, METHODS.len() - 1);
         assert_eq!(other.operation, UNKNOWN_OPERATION);
+    }
+
+    #[test]
+    fn lock_failure_metric_uses_bounded_request_labels() {
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::PutObject);
+                record_s3_http_lock_failure("system_metadata", "write", "timeout");
+            });
+            record_s3_http_lock_failure("object_namespace", "read", "quorum");
+        });
+
+        let exported = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == LOCK_FAILURE_METRIC)
+            .collect::<Vec<_>>();
+        assert_eq!(exported.len(), 1, "background lock errors must not be attributed to an S3 request");
+        let (key, _, _, value) = &exported[0];
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            labels,
+            std::collections::BTreeMap::from([
+                ("mode", "write"),
+                ("op", S3Operation::PutObject.as_str()),
+                ("reason", "timeout"),
+                ("resource_class", "system_metadata"),
+            ])
+        );
     }
 }

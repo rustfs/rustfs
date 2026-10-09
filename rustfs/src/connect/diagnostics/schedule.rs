@@ -702,6 +702,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consent_revoke_cancels_retry_and_persists_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::new(temp.path());
+        let (policy_tx, policy_rx) = watch::channel(policy(4, true));
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let failed = Arc::new(Notify::new());
+        let runner: Runner = Arc::new({
+            let attempts = Arc::clone(&attempts);
+            let release = Arc::clone(&release);
+            let failed = Arc::clone(&failed);
+            move |_| {
+                let attempts = Arc::clone(&attempts);
+                let release = Arc::clone(&release);
+                let failed = Arc::clone(&failed);
+                Box::pin(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    failed.notify_one();
+                    Err(DiagnosticScheduleError::InventoryUnavailable)
+                })
+            }
+        });
+        let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), runner);
+        let mut receipts = runtime.receipts();
+        wait_running(&mut runtime.status).await;
+
+        // Pause only after real state IO completes, then revoke within the retry backoff.
+        tokio::time::pause();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), failed.notified())
+            .await
+            .expect("first attempt should fail before revocation");
+        let mut revoked = policy(5, false);
+        revoked.reason_code = Some(ReasonCode::ConsentInactive);
+        policy_tx.send(revoked).expect("revoke consent");
+        tokio::time::resume();
+
+        tokio::time::timeout(Duration::from_secs(10), receipts.changed())
+            .await
+            .expect("cancel receipt timeout")
+            .expect("cancel receipt should be published");
+        let cancelled = receipts.borrow().clone().expect("cancel receipt");
+        assert_eq!(cancelled.outcome, ReceiptOutcome::Cancelled);
+        assert_eq!(cancelled.policy_revision, 4);
+        assert_eq!(cancelled.attempt_count, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "revocation must prevent another attempt");
+        shutdown.cancel();
+        runtime.shutdown().await;
+        let persisted = store.read().await.expect("durable cancelled state");
+        assert_eq!(persisted.last_receipt, Some(cancelled));
+        assert!(persisted.active_interval_started_at.is_none());
+    }
+
+    #[tokio::test]
     async fn bootstrap_stopped_policy_preserves_a_due_interval_until_fresh_policy_arrives() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = StateStore::new(temp.path());

@@ -96,7 +96,7 @@ async fn quota_reset_preservation_unknown_protocol_rejects_put_after_restart() {
         let (_directory, store, incarnation, path, bytes) = reservation_fixture().await;
         let mut quota = serde_json::json!({
             "quota_type": "Hard",
-            "reservation_protocol": 2,
+            "reservation_protocol": 3,
             "reservation_quota": 1024
         });
         match quota_shape {

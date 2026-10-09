@@ -39,6 +39,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use opentelemetry::global;
 use rust_embed::RustEmbed;
+use rustfs_iam::federation::FederatedProviderView;
 use serde::Serialize;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -185,13 +186,7 @@ pub(crate) struct Config {
     license: License,
     doc: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    oidc: Vec<OidcProviderInfo>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct OidcProviderInfo {
-    provider_id: String,
-    display_name: String,
+    oidc: Vec<FederatedProviderView>,
 }
 
 impl Config {
@@ -200,16 +195,7 @@ impl Config {
 
         // Collect OIDC provider info if available
         let oidc = current_federated_identity_service()
-            .map(|federation| {
-                federation
-                    .list_visible_providers()
-                    .into_iter()
-                    .map(|p| OidcProviderInfo {
-                        provider_id: p.provider_id,
-                        display_name: p.display_name,
-                    })
-                    .collect()
-            })
+            .map(|federation| federation.list_visible_providers())
             .unwrap_or_default();
 
         Config {

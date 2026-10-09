@@ -31,6 +31,7 @@ use super::harness::{
 use crate::common::{
     AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via, init_logging,
 };
+use crate::upgrade_compatibility_test::wait_for_upgrade_write_readiness;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use std::path::{Path, PathBuf};
@@ -400,6 +401,19 @@ async fn four_node_direct_upgrade_preserves_history_and_iam_credentials() -> Tes
     Ok(())
 }
 
+async fn replace_node_and_wait_for_write_readiness(dist: &mut DistCluster, seed: &UpgradeSeed, node_idx: usize) -> TestResult {
+    dist.replace_node_with_current_binary(node_idx).await?;
+    // Node readiness proves reads can succeed; a rolling writer must also
+    // recover before replacing the next peer or checking upgrade contracts.
+    wait_for_upgrade_write_readiness(
+        &dist.clients()?,
+        &seed.history_bucket,
+        &format!("replaced-node-{node_idx}"),
+        CREDENTIAL_TIMEOUT,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> TestResult {
     init_logging();
@@ -410,15 +424,15 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
 
     let seed = seed_history_and_iam(&dist).await?;
 
-    dist.replace_node_with_current_binary(0).await?;
+    replace_node_and_wait_for_write_readiness(&mut dist, &seed, 0).await?;
     assert_history_and_iam(&dist, &seed, "one-current-node").await?;
 
     for node_idx in [1, 2] {
-        dist.replace_node_with_current_binary(node_idx).await?;
+        replace_node_and_wait_for_write_readiness(&mut dist, &seed, node_idx).await?;
     }
     assert_history_and_iam(&dist, &seed, "one-previous-node").await?;
 
-    dist.replace_node_with_current_binary(3).await?;
+    replace_node_and_wait_for_write_readiness(&mut dist, &seed, 3).await?;
     assert_history_and_iam(&dist, &seed, "homogeneous-current").await?;
     Ok(())
 }

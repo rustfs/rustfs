@@ -24,7 +24,7 @@ use super::storage_api::object_usecase::access::{
     apply_copy_source_bucket_generation_guard, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
     load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
     recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
-    retained_table_data_plane_publication_guards,
+    retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;

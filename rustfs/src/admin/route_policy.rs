@@ -55,6 +55,7 @@ const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespa
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
+const RECOVER_ORPHANED_BUCKET: AdminActionRef = AdminActionRef::new("RecoverOrphanedBucketAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
 const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
 const KMS_BACKUP: AdminActionRef = AdminActionRef::new("kms:Backup");
@@ -468,6 +469,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Put,
         "/rustfs/admin/v3/import-bucket-metadata",
         IMPORT_BUCKET_METADATA,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/recover-orphaned-bucket/{bucket}",
+        RECOVER_ORPHANED_BUCKET,
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/get-config-kv", CONFIG_UPDATE, RouteRiskLevel::High),
