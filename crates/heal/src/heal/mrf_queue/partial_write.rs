@@ -392,7 +392,7 @@ impl PartialWrites {
                     object: anchor.object.clone(),
                     version_id: anchor.version_id,
                     scope: anchor.scope,
-                    delete_marker_purge: anchor.delete_marker_purge.clone(),
+                    delete_marker_purge: anchor.delete_marker_purge,
                     lease: Some(anchor.lease),
                     bucket_incarnation_id: anchor.bucket_incarnation_id,
                     disposition: MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
