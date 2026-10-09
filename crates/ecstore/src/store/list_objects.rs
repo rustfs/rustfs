@@ -448,8 +448,8 @@ const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 2;
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v2";
+const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 3;
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v3";
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
@@ -656,7 +656,10 @@ impl PersistentListMetadataObject {
             name: object.name.clone(),
             size: object.size,
             mod_time: object.mod_time,
-            etag: object.etag.clone(),
+            etag: object
+                .etag
+                .clone()
+                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined)),
             storage_class: object.storage_class.clone(),
         }
     }
@@ -2361,24 +2364,43 @@ fn list_objects_paginate(
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
-fn list_objects_paginate_versions<'a>(
-    mut get_objects: Vec<ObjectInfo>,
-    delimiter: &Option<String>,
+struct VersionedListPagination<'a, I> {
+    delimiter: &'a Option<String>,
     max_keys: i32,
     disk_has_more: bool,
-    cache_id: Option<&str>,
-    marker: Option<&str>,
-    last_scanned_key: Option<&str>,
-    raw_keys: impl Iterator<Item = &'a str>,
-) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
-    filter_versions_common_prefixes_after_marker(&mut get_objects, delimiter.as_deref(), marker);
-    let prefix_at_page_boundary =
-        versioned_prefix_page_boundary_key(&get_objects, raw_keys, delimiter.as_deref(), max_keys, disk_has_more);
+    cache_id: Option<&'a str>,
+    marker: Option<&'a str>,
+    last_scanned_key: Option<&'a str>,
+    raw_keys: I,
+}
 
-    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) =
-        list_objects_paginate(get_objects, delimiter, max_keys, disk_has_more, cache_id, true, last_scanned_key);
+fn list_objects_paginate_versions<'a, I>(
+    mut get_objects: Vec<ObjectInfo>,
+    pagination: VersionedListPagination<'a, I>,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    filter_versions_common_prefixes_after_marker(&mut get_objects, pagination.delimiter.as_deref(), pagination.marker);
+    let prefix_at_page_boundary = versioned_prefix_page_boundary_key(
+        &get_objects,
+        pagination.raw_keys,
+        pagination.delimiter.as_deref(),
+        pagination.max_keys,
+        pagination.disk_has_more,
+    );
+
+    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) = list_objects_paginate(
+        get_objects,
+        pagination.delimiter,
+        pagination.max_keys,
+        pagination.disk_has_more,
+        pagination.cache_id,
+        true,
+        pagination.last_scanned_key,
+    );
     if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
-        next_marker = Some(append_list_cache_id_to_marker(raw_key, cache_id));
+        next_marker = Some(append_list_cache_id_to_marker(raw_key, pagination.cache_id));
         next_version_idmarker = None;
     }
 
@@ -4326,13 +4348,15 @@ impl ECStore {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -5754,13 +5778,15 @@ impl Sets {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -6568,13 +6594,15 @@ impl SetDisks {
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            opts.marker.as_deref(),
-            last_scanned_key.as_deref(),
-            entries.entries().iter().map(|entry| entry.name.as_str()),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -8848,13 +8876,15 @@ mod test {
             let get_objects = fold_delimiter_page(&window, "", "-");
             let (objects, prefixes, is_truncated, next_marker, _v) = super::list_objects_paginate_versions(
                 get_objects,
-                &delimiter,
-                max_keys,
-                disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
             );
 
             assert!(
@@ -8927,13 +8957,15 @@ mod test {
             let get_objects = fold_delimiter_page(&window, "", "-");
             let (objects, prefixes, is_truncated, next_marker, _) = super::list_objects_paginate_versions(
                 get_objects,
-                &delimiter,
-                max_keys,
-                disk_has_more,
-                None,
-                marker.as_deref(),
-                last_scanned.as_deref(),
-                window.iter().map(String::as_str),
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
             );
 
             assert_eq!(objects.len() + prefixes.len(), 1, "a page must respect max-keys");
@@ -9174,6 +9206,38 @@ mod test {
         let parsed = parse_persistent_list_metadata_object(&encoded).expect("metadata object should parse");
 
         assert_eq!(parsed, object);
+    }
+
+    #[test]
+    fn persistent_listing_snapshots_cannot_restore_legacy_encrypted_fingerprints() {
+        let mut object = ObjectInfo {
+            name: "encrypted".to_owned(),
+            etag: Some("fbfcbcc6d2f035411e6268c8b119593e".to_owned()),
+            user_defined: Arc::new(HashMap::from([(
+                "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+                "AES256".to_owned(),
+            )])),
+            ..Default::default()
+        };
+        let snapshot = PersistentListMetadataObject::from_object_info(&object);
+        assert!(snapshot.to_object_info("bucket").etag.is_none());
+        let mut old_snapshot = snapshot.clone();
+        old_snapshot.etag = object.etag.clone();
+        let old_contents = format!(
+            "# rustfs-listobjects-key-only-v2\n{}\n",
+            encode_persistent_list_metadata_object(&old_snapshot)
+        );
+        let old_index = parse_persistent_key_only_index(&old_contents);
+        assert_ne!(old_index.format_version, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION);
+
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut object.user_defined),
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+            "v1".to_owned(),
+        );
+        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
+        object.user_defined = Arc::new(HashMap::new());
+        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
     }
 
     #[test]

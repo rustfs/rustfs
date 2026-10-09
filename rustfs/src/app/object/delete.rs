@@ -511,6 +511,15 @@ impl DefaultObjectUsecase {
         // cannot flood the log.
         let mut bulk_denial_logged = false;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
+            if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
+                delete_results[idx].error = Some(s3s::dto::Error {
+                    code: Some(err.code().as_str().to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(err.to_string()),
+                    version_id: obj_id.version_id.clone(),
+                });
+                continue;
+            }
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
                 Ok(parsed) => parsed,

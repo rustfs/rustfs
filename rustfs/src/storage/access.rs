@@ -141,6 +141,9 @@ struct InternalObjectAuthorization;
 struct RequestedObjectLockRetainUntil(OffsetDateTime);
 
 #[derive(Clone, Debug)]
+struct RequestedObjectLockRetention(ObjectLockRetention);
+
+#[derive(Clone, Debug)]
 struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
@@ -885,6 +888,21 @@ fn authorization_conditions<T>(
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    if let Some(RequestedObjectLockRetention(retention)) = req.extensions.get::<RequestedObjectLockRetention>() {
+        // Standalone retention writes apply the XML body, so headers must not
+        // supply a different value to the policy decision.
+        conditions.remove("object-lock-mode");
+        conditions.remove("object-lock-retain-until-date");
+        if let Some(mode) = &retention.mode {
+            conditions.insert("object-lock-mode".to_string(), vec![mode.as_str().to_string()]);
+        }
+        if let Some(date) = &retention.retain_until_date {
+            let date = OffsetDateTime::from(date.clone())
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+            conditions.insert("object-lock-retain-until-date".to_string(), vec![date]);
+        }
+    }
     merge_object_lock_remaining_retention_days_condition(
         req.extensions.get::<RequestedObjectLockRetainUntil>(),
         OffsetDateTime::now_utc(),
@@ -906,6 +924,12 @@ pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, 
             req.extensions.remove::<RequestedObjectLockRetainUntil>();
         }
     }
+}
+
+fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
+    let retention = req.input.retention.clone().unwrap_or_default();
+    set_requested_object_lock_retain_until(req, retention.retain_until_date.as_ref());
+    req.extensions.insert(RequestedObjectLockRetention(retention));
 }
 
 fn merge_object_lock_remaining_retention_days_condition(
@@ -1123,17 +1147,28 @@ pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action
 /// conflated at the authorization boundary.
 ///
 /// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
-/// `s3:GetObject` request. That mapping is intentionally left in place until the
-/// remaining version-aware read paths (HeadObject, GetObjectAcl, tagging) get the
-/// same treatment — see the GHSA-3ppv follow-up audit. It does not re-open this
-/// disclosure: it only broadens a Version grant toward current reads, never the
-/// reverse.
+/// `s3:GetObject` request. It only broadens a Version grant toward current
+/// reads, never the reverse.
 fn versioned_read_action(version_id: Option<&str>) -> Action {
     if version_id.is_some() {
         Action::S3Action(S3Action::GetObjectVersionAction)
     } else {
         Action::S3Action(S3Action::GetObjectAction)
     }
+}
+
+fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
+    let action = if version_id.is_some() {
+        match action {
+            S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
+            S3Action::PutObjectTaggingAction => S3Action::PutObjectVersionTaggingAction,
+            S3Action::DeleteObjectTaggingAction => S3Action::DeleteObjectVersionTaggingAction,
+            action => action,
+        }
+    } else {
+        action
+    };
+    Action::S3Action(action)
 }
 
 async fn get_or_fetch_object_tag_conditions<T>(
@@ -2560,7 +2595,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::DeleteObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -2881,7 +2920,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::GetObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -2933,7 +2976,7 @@ impl S3Access for FS {
             return Ok(());
         }
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -3336,12 +3379,7 @@ impl S3Access for FS {
 
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
-        let requested_retain_until = req
-            .input
-            .retention
-            .as_ref()
-            .and_then(|retention| retention.retain_until_date.clone());
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+        set_requested_object_lock_retention(req);
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -3362,7 +3400,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::PutObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -3481,9 +3523,9 @@ mod tests {
         owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
         request_object_store, require_owned_reserved_table_object, retention_write_requested, table_data_plane_admin_action,
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
-        validate_post_object_success_controls, versioned_read_action,
+        validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::{remaining_retention_days, set_requested_object_lock_retain_until};
+    use super::{remaining_retention_days, set_requested_object_lock_retain_until, set_requested_object_lock_retention};
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -4285,9 +4327,114 @@ mod tests {
         );
     }
 
-    fn remaining_retention_days_conditions(req: &S3Request<()>, action: Action) -> HashMap<String, Vec<String>> {
+    #[tokio::test]
+    async fn versioned_tagging_requires_version_permissions() {
+        use rustfs_policy::policy::{Args, Policy};
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":"arn:aws:s3:::bucket/*"}]
+        }"#).expect("current-object tagging policy should parse");
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (current, versioned) in [
+            (S3Action::GetObjectTaggingAction, S3Action::GetObjectVersionTaggingAction),
+            (S3Action::PutObjectTaggingAction, S3Action::PutObjectVersionTaggingAction),
+            (S3Action::DeleteObjectTaggingAction, S3Action::DeleteObjectVersionTaggingAction),
+        ] {
+            for version in [None, Some("null"), Some("0194e0f1-0000-7000-8000-000000000000")] {
+                let action = versioned_tagging_action(current.clone(), version);
+                assert_eq!(
+                    action,
+                    Action::S3Action(if version.is_some() {
+                        versioned.clone()
+                    } else {
+                        current.clone()
+                    })
+                );
+                let args = Args {
+                    account: "writer",
+                    groups: &groups,
+                    action,
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "object",
+                    claims: &claims,
+                    deny_only: false,
+                };
+                assert_eq!(policy.is_allowed(&args).await, version.is_none(), "version selector {version:?}");
+            }
+        }
+    }
+
+    fn remaining_retention_days_conditions<T>(req: &S3Request<T>, action: Action) -> HashMap<String, Vec<String>> {
         let credentials = rustfs_credentials::Credentials::default();
         authorization_conditions(req, &credentials, None, None, None, None, action).expect("conditions should build")
+    }
+
+    #[tokio::test]
+    async fn retention_policy_checks_body_instead_of_conflicting_headers() {
+        use rustfs_policy::policy::{Args, Policy};
+        let mut req = build_request(
+            PutObjectRetentionInput {
+                retention: Some(ObjectLockRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static("COMPLIANCE")),
+                    retain_until_date: Some(
+                        Timestamp::parse(TimestampFormat::DateTime, "2035-01-02T00:00:00+23:59").expect("body date should parse"),
+                    ),
+                }),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        req.headers
+            .insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        req.headers
+            .insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2029-01-01T00:00:00Z"));
+        set_requested_object_lock_retention(&mut req);
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["COMPLIANCE".to_string()]));
+        let applied = OffsetDateTime::from(
+            req.input
+                .retention
+                .as_ref()
+                .expect("body retention")
+                .retain_until_date
+                .clone()
+                .expect("body date"),
+        );
+        let authorized = OffsetDateTime::parse(
+            &conditions["object-lock-retain-until-date"][0],
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("condition date should parse");
+        assert_eq!(authorized.unix_timestamp(), applied.unix_timestamp());
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*",
+            "Condition":{"DateLessThan":{"s3:object-lock-retain-until-date":"2030-01-01T00:00:00Z"}}}]
+        }"#).expect("bounded retention policy should parse");
+        let args = Args {
+            account: "writer",
+            groups: &None,
+            action,
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&args).await,
+            "an in-range header cannot authorize an out-of-range body"
+        );
+        req.input.retention = None;
+        set_requested_object_lock_retention(&mut req);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert!(!conditions.contains_key("object-lock-mode"));
+        assert!(!conditions.contains_key("object-lock-retain-until-date"));
     }
 
     fn request_retaining_for(retain_for: time::Duration) -> S3Request<()> {

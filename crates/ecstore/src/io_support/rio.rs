@@ -442,12 +442,19 @@ impl WritePlan {
         }
 
         if let Some(encryption) = self.encryption {
+            let etag_nonce = match encryption.mode {
+                WriteEncryptionMode::Singlepart { base_nonce } | WriteEncryptionMode::MultipartLegacy { base_nonce, .. } => {
+                    base_nonce
+                }
+                WriteEncryptionMode::SinglepartObjectKey | WriteEncryptionMode::MultipartObjectKey { .. } => [0u8; 12],
+            };
+            let protected_reader = rustfs_rio::EtagReader::new_encrypted(reader, encryption.key_bytes, etag_nonce)?;
             reader = match encryption.mode {
                 WriteEncryptionMode::SinglepartObjectKey => HashReader::from_reader(
                     #[cfg(feature = "rio-v2")]
-                    EncryptReader::new_with_object_key(reader, encryption.key_bytes),
+                    EncryptReader::new_with_object_key(protected_reader, encryption.key_bytes),
                     #[cfg(not(feature = "rio-v2"))]
-                    EncryptReader::new(reader, encryption.key_bytes, [0u8; 12]),
+                    EncryptReader::new(protected_reader, encryption.key_bytes, [0u8; 12]),
                     HashReader::SIZE_PRESERVE_LAYER,
                     actual_size,
                     None,
@@ -457,12 +464,12 @@ impl WritePlan {
                 WriteEncryptionMode::Singlepart { base_nonce } => {
                     #[cfg(not(feature = "rio-v2"))]
                     let encrypt_reader = if encryption_frame_v2_enabled() {
-                        EncryptReader::new_v2(reader, encryption.key_bytes, base_nonce)
+                        EncryptReader::new_v2(protected_reader, encryption.key_bytes, base_nonce)
                     } else {
-                        EncryptReader::new(reader, encryption.key_bytes, base_nonce)
+                        EncryptReader::new(protected_reader, encryption.key_bytes, base_nonce)
                     };
                     #[cfg(feature = "rio-v2")]
-                    let encrypt_reader = EncryptReader::new(reader, encryption.key_bytes, base_nonce);
+                    let encrypt_reader = EncryptReader::new(protected_reader, encryption.key_bytes, base_nonce);
                     HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
                 }
                 WriteEncryptionMode::MultipartLegacy {
@@ -471,20 +478,25 @@ impl WritePlan {
                 } => {
                     #[cfg(not(feature = "rio-v2"))]
                     let encrypt_reader = if encryption_frame_v2_enabled() {
-                        EncryptReader::new_multipart_v2(reader, encryption.key_bytes, base_nonce, multipart_part_number)
+                        EncryptReader::new_multipart_v2(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     } else {
-                        EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number)
+                        EncryptReader::new_multipart(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     };
                     #[cfg(feature = "rio-v2")]
                     let encrypt_reader =
-                        EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number);
+                        EncryptReader::new_multipart(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number);
                     HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
                 }
                 WriteEncryptionMode::MultipartObjectKey { multipart_part_number } => HashReader::from_reader(
                     #[cfg(feature = "rio-v2")]
-                    EncryptReader::new_multipart_with_object_key(reader, encryption.key_bytes, multipart_part_number),
+                    EncryptReader::new_multipart_with_object_key(protected_reader, encryption.key_bytes, multipart_part_number),
                     #[cfg(not(feature = "rio-v2"))]
-                    EncryptReader::new_multipart(reader, encryption.key_bytes, [0u8; 12], multipart_part_number as usize),
+                    EncryptReader::new_multipart(
+                        protected_reader,
+                        encryption.key_bytes,
+                        [0u8; 12],
+                        multipart_part_number as usize,
+                    ),
                     HashReader::SIZE_PRESERVE_LAYER,
                     actual_size,
                     None,
@@ -497,6 +509,7 @@ impl WritePlan {
         // `ignore_value` deliberately avoids a second hasher over compressed or
         // encrypted bytes. The inner reader still validates the plaintext request
         // checksum while this outer reader exposes the request checksum context.
+        reader.encrypted_etag = encrypted;
         reader.add_non_trailing_checksum(checksum, true)?;
         reader.set_trailer(trailer);
 
@@ -512,6 +525,36 @@ mod tests {
     use rustfs_utils::CompressionAlgorithm;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn write_plan_encryption_persists_protected_etags_for_every_mode() {
+        let data = b"Salary 2026: 85000 EUR";
+        let size = i64::try_from(data.len()).expect("test data size");
+        let mut control =
+            HashReader::from_stream(Cursor::new(data), size, size, None, None, false).expect("create control reader");
+        control.read_to_end(&mut Vec::new()).await.expect("read control plaintext");
+        let md5 = control.try_resolve_etag().expect("control MD5");
+        for encryption in [
+            WriteEncryption::singlepart([1; 32], [1; 12]),
+            WriteEncryption::singlepart_object_key([1; 32]),
+            WriteEncryption::multipart([1; 32], [1; 12], 1),
+            WriteEncryption::multipart_object_key([1; 32], 1),
+        ] {
+            let plaintext = HashReader::from_stream(Cursor::new(data), size, size, Some(md5.clone()), None, false)
+                .expect("create checked reader");
+            let mut reader = WritePlan::new()
+                .with_encryption(encryption)
+                .apply(plaintext, size)
+                .expect("apply encryption");
+            let mut ciphertext = Vec::new();
+            reader.read_to_end(&mut ciphertext).await.expect("stream ciphertext");
+            assert_ne!(ciphertext, data);
+            let tag = reader.try_resolve_etag().expect("resolve persisted encrypted ETag");
+            assert_ne!(tag, md5, "stored ETag must not reveal the plaintext MD5");
+            assert_eq!(tag.len(), 32, "multipart ETags require a 16-byte hexadecimal part tag");
+            assert_eq!(reader.try_resolve_etag().as_ref(), Some(&tag));
+        }
+    }
 
     async fn assert_non_trailing_checksum_survives(plan: WritePlan) {
         let plaintext = b"checksum-context-through-write-plan".repeat(256);

@@ -252,6 +252,13 @@ impl PolicyVariableResolver for VariableResolver {
 }
 
 pub async fn resolve_aws_variables(pattern: &str, resolver: &dyn PolicyVariableResolver) -> Vec<String> {
+    resolve_aws_variables_with_depth(pattern, resolver, 0).await
+}
+
+async fn resolve_aws_variables_with_depth(pattern: &str, resolver: &dyn PolicyVariableResolver, depth: usize) -> Vec<String> {
+    if depth >= 10 {
+        return vec![pattern.to_string()];
+    }
     let mut results = vec![pattern.to_string()];
 
     let mut changed = true;
@@ -264,7 +271,7 @@ pub async fn resolve_aws_variables(pattern: &str, resolver: &dyn PolicyVariableR
 
         let mut new_results = Vec::new();
         for result in &results {
-            let resolved = resolve_single_pass(result, resolver).await;
+            let resolved = resolve_single_pass(result, resolver, depth).await;
             if resolved.len() > 1 || (resolved.len() == 1 && &resolved[0] != result) {
                 changed = true;
             }
@@ -288,30 +295,31 @@ pub async fn resolve_aws_variables(pattern: &str, resolver: &dyn PolicyVariableR
 fn resolve_aws_variables_boxed<'a>(
     pattern: &'a str,
     resolver: &'a dyn PolicyVariableResolver,
+    depth: usize,
 ) -> std::pin::Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
-    Box::pin(resolve_aws_variables(pattern, resolver))
+    Box::pin(resolve_aws_variables_with_depth(pattern, resolver, depth))
 }
 
 /// Single pass resolution of variables in a string
-async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolver) -> Vec<String> {
+async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolver, depth: usize) -> Vec<String> {
     // Find all ${...} format variables
-    let mut results = vec![pattern.to_string()];
+    let mut results = vec![(pattern.to_string(), 0)];
 
     // Process each result string
     let mut i = 0;
     while i < results.len() {
-        let mut start = 0;
+        let mut start = results[i].1;
         let mut modified = false;
 
         // Find variables in current string
-        while let Some(pos) = results[i][start..].find("${") {
+        while let Some(pos) = results[i].0[start..].find("${") {
             let actual_pos = start + pos;
 
             // Find the matching closing brace, taking into account nested braces
             let mut brace_count = 1;
             let mut end_pos = actual_pos + 2; // Start after "${"
 
-            let bytes = results[i].as_bytes();
+            let bytes = results[i].0.as_bytes();
             while end_pos < bytes.len() && brace_count > 0 {
                 match bytes[end_pos] {
                     b'{' => brace_count += 1,
@@ -324,19 +332,23 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
             }
 
             if brace_count == 0 {
-                let var_name = &results[i][actual_pos + 2..end_pos];
+                let var_name = &results[i].0[actual_pos + 2..end_pos];
 
                 // Check if this is a nested variable (contains ${...} inside)
                 if var_name.contains("${") {
                     // For nested variables like ${${a}-${b}}, we need to resolve the inner variables first
                     // Then use the resolved result as a new variable to resolve
-                    let resolved_inner = resolve_aws_variables_boxed(var_name, resolver).await;
+                    let resolved_inner = resolve_aws_variables_boxed(var_name, resolver, depth + 1).await;
+                    if resolved_inner.len() == 1 && resolved_inner[0] == var_name {
+                        start = end_pos + 1;
+                        continue;
+                    }
                     let mut new_results = Vec::new();
 
                     for resolved_var_name in resolved_inner {
-                        let prefix = &results[i][..actual_pos];
-                        let suffix = &results[i][end_pos + 1..];
-                        new_results.push(format!("{prefix}{resolved_var_name}{suffix}"));
+                        let prefix = &results[i].0[..actual_pos];
+                        let suffix = &results[i].0[end_pos + 1..];
+                        new_results.push((format!("{prefix}{resolved_var_name}{suffix}"), actual_pos + resolved_var_name.len()));
                     }
 
                     if !new_results.is_empty() {
@@ -354,11 +366,13 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
                         if !values.is_empty() {
                             // If there are multiple values, create a new result for each value
                             let mut new_results = Vec::new();
-                            let prefix = &results[i][..actual_pos];
-                            let suffix = &results[i][end_pos + 1..];
+                            let prefix = &results[i].0[..actual_pos];
+                            let suffix = &results[i].0[end_pos + 1..];
 
                             for value in values {
-                                new_results.push(format!("{prefix}{value}{suffix}"));
+                                // Resume after the substitution; a generated placeholder
+                                // belongs to the next bounded pass, not this one.
+                                new_results.push((format!("{prefix}{value}{suffix}"), actual_pos + value.len()));
                             }
 
                             results.splice(i..i + 1, new_results);
@@ -367,9 +381,9 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
                         } else {
                             // Variable resolved to empty, just remove the variable placeholder
                             let mut new_results = Vec::new();
-                            let prefix = &results[i][..actual_pos];
-                            let suffix = &results[i][end_pos + 1..];
-                            new_results.push(format!("{prefix}{suffix}"));
+                            let prefix = &results[i].0[..actual_pos];
+                            let suffix = &results[i].0[end_pos + 1..];
+                            new_results.push((format!("{prefix}{suffix}"), actual_pos));
 
                             results.splice(i..i + 1, new_results);
                             modified = true;
@@ -391,7 +405,7 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
         }
     }
 
-    results
+    results.into_iter().map(|(value, _)| value).collect()
 }
 
 #[cfg(test)]
@@ -399,6 +413,62 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CycleResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PolicyVariableResolver for CycleResolver {
+        async fn resolve(&self, name: &str) -> Option<String> {
+            // Make the vulnerable implementation terminate so a regression
+            // reports an assertion failure instead of hanging the test runner.
+            if self.calls.fetch_add(1, Ordering::Relaxed) >= 100 {
+                return None;
+            }
+            match name {
+                "aws:AccountId" => Some("$$".to_string()),
+                "aws:username" => Some("{aws:AccountId}{aws:username}".to_string()),
+                _ => None,
+            }
+        }
+
+        fn is_dynamic(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_policy_variable_cycles_are_bounded() {
+        let resolver = CycleResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let result = resolve_aws_variables("${aws:AccountId}{aws:username}", &resolver).await;
+        assert!(resolver.calls.load(Ordering::Relaxed) <= 10);
+        assert_eq!(result, vec!["${aws:AccountId}{aws:username}".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_single_pass_resolves_all_original_variables() {
+        let mut context = VariableContext::new();
+        context.username = Some("alice".to_string());
+        let resolver = VariableResolver::new(context);
+        let pattern = "${aws:username}".repeat(20);
+        assert_eq!(resolve_single_pass(&pattern, &resolver, 0).await, vec!["alice".repeat(20)]);
+    }
+
+    #[tokio::test]
+    async fn nested_policy_variables_have_a_depth_limit() {
+        let resolver = CycleResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let pattern = format!("{}aws:username{}", "${".repeat(100), "}".repeat(100));
+        let result = resolve_aws_variables(&pattern, &resolver).await;
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("${"));
+        assert!(resolver.calls.load(Ordering::Relaxed) <= 10);
+    }
 
     #[tokio::test]
     async fn test_resolve_aws_variables_with_username() {
