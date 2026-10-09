@@ -2911,7 +2911,7 @@ mod tests {
 
         let timed = wrapper.track_disk_health_with_op(
             "write_all",
-            || std::future::pending::<Result<()>>(),
+            std::future::pending::<Result<()>>,
             SLOW_DISK_OPERATION_THRESHOLD + Duration::from_secs(1),
         );
         tokio::pin!(timed);

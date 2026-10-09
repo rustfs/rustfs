@@ -92,6 +92,12 @@ setup = 'ecstore-large-stack'
 filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
 setup = 'ecstore-base-stack'
 
+# These handler/store fixtures and the relocated-pool GET compose deep storage
+# futures in libtest threads; on Linux they overflow the default 2 MiB stack.
+[[profile.default.scripts]]
+filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body))'
+setup = 'ecstore-base-stack'
+
 [[profile.default.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
@@ -335,6 +341,10 @@ setup = 'ecstore-large-stack'
 
 [[profile.ci.scripts]]
 filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+setup = 'ecstore-base-stack'
+
+[[profile.ci.scripts]]
+filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body))'
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
