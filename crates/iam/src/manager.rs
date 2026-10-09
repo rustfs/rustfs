@@ -3345,27 +3345,23 @@ mod tests {
 
     #[test]
     fn test_extract_jwt_claims_basic() {
-        let user_identity = UserIdentity {
-            version: 1,
-            credentials: Credentials {
-                access_key: "test-access-key".to_string(),
-                secret_key: "test-secret-key".to_string(),
-                session_token: "invalid-token".to_string(), // Invalid token for testing error handling
-                expiration: None,
-                status: "enabled".to_string(),
-                parent_user: "".to_string(),
-                groups: None,
-                claims: Some({
-                    let mut claims = HashMap::new();
-                    claims.insert("sub".to_string(), json!("test-user"));
-                    claims.insert("aud".to_string(), json!("test-audience"));
-                    claims
-                }),
-                name: None,
-                description: None,
-            },
-            update_at: Some(OffsetDateTime::now_utc()),
-        };
+        let user_identity = UserIdentity::new(Credentials {
+            access_key: "test-access-key".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            session_token: "invalid-token".to_string(), // Invalid token for testing error handling
+            expiration: None,
+            status: "enabled".to_string(),
+            parent_user: "".to_string(),
+            groups: None,
+            claims: Some({
+                let mut claims = HashMap::new();
+                claims.insert("sub".to_string(), json!("test-user"));
+                claims.insert("aud".to_string(), json!("test-audience"));
+                claims
+            }),
+            name: None,
+            description: None,
+        });
 
         let result = extract_jwt_claims(&user_identity);
         // In test environment without proper JWT setup, this should fail
@@ -3374,22 +3370,18 @@ mod tests {
 
     #[test]
     fn test_extract_jwt_claims_no_claims() {
-        let user_identity = UserIdentity {
-            version: 1,
-            credentials: Credentials {
-                access_key: "test-access-key".to_string(),
-                secret_key: "test-secret-key".to_string(),
-                session_token: "".to_string(), // Empty token
-                expiration: None,
-                status: "enabled".to_string(),
-                parent_user: "".to_string(),
-                groups: None,
-                claims: None,
-                name: None,
-                description: None,
-            },
-            update_at: Some(OffsetDateTime::now_utc()),
-        };
+        let user_identity = UserIdentity::new(Credentials {
+            access_key: "test-access-key".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            session_token: "".to_string(), // Empty token
+            expiration: None,
+            status: "enabled".to_string(),
+            parent_user: "".to_string(),
+            groups: None,
+            claims: None,
+            name: None,
+            description: None,
+        });
 
         let result = extract_jwt_claims(&user_identity);
         // Should fail with empty session token
@@ -3448,11 +3440,7 @@ mod tests {
             description: None,
         };
 
-        let user_identity = UserIdentity {
-            version: 1,
-            credentials,
-            update_at: Some(OffsetDateTime::now_utc()),
-        };
+        let user_identity = UserIdentity::new(credentials);
 
         // Test basic structure
         assert_eq!(user_identity.version, 1);

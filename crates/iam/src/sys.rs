@@ -2667,11 +2667,7 @@ mod tests {
                     name: None,
                     description: None,
                 };
-                let parent_identity = UserIdentity {
-                    version: 1,
-                    credentials: creds,
-                    update_at: Some(OffsetDateTime::now_utc()),
-                };
+                let parent_identity = UserIdentity::new(creds);
                 let mut users = HashMap::new();
                 users.insert(PARENT_USER.to_string(), parent_identity);
 
@@ -2703,11 +2699,7 @@ mod tests {
                 name: None,
                 description: None,
             };
-            let parent_identity = UserIdentity {
-                version: 1,
-                credentials: creds,
-                update_at: Some(OffsetDateTime::now_utc()),
-            };
+            let parent_identity = UserIdentity::new(creds);
             let mut users = HashMap::new();
             users.insert(PARENT_USER.to_string(), parent_identity);
 
@@ -2820,16 +2812,12 @@ mod tests {
     async fn group_writes_stamped_before_the_cache_load_time_still_publish() {
         let iam_sys = test_iam_sys().await;
         let member = "group-stamp-member";
-        let identity = UserIdentity {
-            version: 1,
-            credentials: Credentials {
-                access_key: member.to_string(),
-                secret_key: "longenoughsecret".to_string(),
-                status: "on".to_string(),
-                ..Default::default()
-            },
-            update_at: Some(OffsetDateTime::now_utc()),
-        };
+        let identity = UserIdentity::new(Credentials {
+            access_key: member.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        });
         iam_sys.store.cache.with_write_lock(|cache| {
             cache.add_or_update_user(member, &identity, OffsetDateTime::now_utc());
             // The startup load publishes every entity with the load time.
