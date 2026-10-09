@@ -34,6 +34,14 @@ source lines. If it fails after a doc edit, you reworded or removed a
 guarded line — restore the wording or update the script deliberately in the
 same PR, with rationale.
 
+## OIDC architecture boundaries
+
+`check_architecture_migration_rules.sh` also runs `scripts/check_oidc_architecture_boundaries.sh`. Its rule identifier and `file:line` point to the source boundary that changed. Keep OIDC provider configuration, discovery, transport, state, and runtime under `crates/iam/src/oidc/`; keep verified identity mapping under `crates/iam/src/federation/mapper.rs`; construct the runtime in IAM startup and `rustfs/src/startup_auth.rs`; publish the federation service and OIDC query together through `AppContext`. The Keycloak workflow must include the OIDC module path for pull requests and pushes.
+
+The Admin OIDC handler delegates persisted configuration reads, updates, and provider validation to `admin/service/oidc_config.rs`. Site replication uses `OidcConfigQuery::site_replication_snapshot()` and receives only the fields required for its response, including a hashed client secret. The Keycloak workflow also tracks the Admin configuration service path for both events.
+
+Run `bash scripts/check_oidc_architecture_boundaries.sh --self-test` after editing a rule. Its negative and accepted examples under `scripts/fixtures/architecture_migration_rules/oidc/` must produce the exact expected rule identifiers. Then run the full architecture guard.
+
 ## `check_unsafe_code_allowances.sh`
 
 Every `#[allow(unsafe_code)]` needs a `SAFETY:` comment within a few lines.

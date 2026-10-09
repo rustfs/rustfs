@@ -1,0 +1,303 @@
+[
+  {
+    "id": "legacy_registry",
+    "path": "rustfs/src/admin/handlers/sts.rs",
+    "source": "let registry = FederatedIdentityRegistry::new(provider);\n",
+    "expected": ["oidc-legacy-runtime"]
+  },
+  {
+    "id": "legacy_global_initializer",
+    "path": "rustfs/src/startup_auth.rs",
+    "source": "init_oidc_sys_with_extra_root_ca_provider(provider).await?;\n",
+    "expected": ["oidc-legacy-runtime"]
+  },
+  {
+    "id": "federation_imports_oidc_runtime",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "use crate::oidc::OidcSys;\n",
+    "expected": ["federation-oidc-detail"]
+  },
+  {
+    "id": "federation_imports_oidc_module",
+    "path": "crates/iam/src/federation/provider.rs",
+    "source": "use crate::oidc::config::OidcProviderConfig;\n",
+    "expected": ["federation-oidc-detail"]
+  },
+  {
+    "id": "federation_aliases_oidc_module",
+    "path": "crates/iam/src/federation/provider.rs",
+    "source": "use crate::{oidc as oidc_impl};\n",
+    "expected": ["federation-oidc-detail"]
+  },
+  {
+    "id": "federation_aliases_oidc_after_nested_import",
+    "path": "crates/iam/src/federation/provider.rs",
+    "source": "use crate::{other::{Foo}, oidc as oidc_impl};\n",
+    "expected": ["federation-oidc-detail"]
+  },
+  {
+    "id": "federation_constructs_authorization",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "let authorization = FederatedAuthorization { policies, groups };\n",
+    "expected": ["federation-authorization-owner"]
+  },
+  {
+    "id": "config_imports_provider_runtime",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; }\nuse super::provider::ProviderRuntime;\n",
+    "expected": ["oidc-config-direction"]
+  },
+  {
+    "id": "broad_oidc_config_query",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn config_snapshot(&self) -> OidcConfigSnapshot; }\n",
+    "expected": ["oidc-query-shape"]
+  },
+  {
+    "id": "replication_view_contains_raw_secret",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String, pub client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; }\n",
+    "expected": ["oidc-site-replication-shape"]
+  },
+  {
+    "id": "replication_view_contains_private_secret",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String, client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; }\n",
+    "expected": ["oidc-site-replication-shape"]
+  },
+  {
+    "id": "query_adds_full_config_method",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; fn raw_snapshot(&self) -> OidcConfigSnapshot; }\n",
+    "expected": ["oidc-query-shape"]
+  },
+  {
+    "id": "admin_constructs_runtime",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "let adapter = StandardOidcAdapter::new(oidc);\n",
+    "expected": ["oidc-runtime-owner"]
+  },
+  {
+    "id": "admin_builds_runtime",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "let oidc = build_oidc_sys_with_extra_root_ca_provider(ca).await?;\n",
+    "expected": ["oidc-runtime-owner"]
+  },
+  {
+    "id": "iam_sys_builds_oidc_runtime",
+    "path": "crates/iam/src/sys/mod.rs",
+    "source": "let oidc = OidcSys::empty()?;\n",
+    "expected": ["oidc-runtime-owner"]
+  },
+  {
+    "id": "handler_reads_config_storage",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "let snapshot = read_admin_server_config_snapshot(store).await?;\n",
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "handler_validates_provider_directly",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "let result = validate_oidc_provider_config_with_extra_root_ca(&provider, ca).await?;\n",
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "compat_handler_saves_oidc_config",
+    "path": "rustfs/src/admin/handlers/idp_compat.rs",
+    "source": "save_admin_server_config_snapshot(store, &config, &snapshot).await?;\n",
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "service_imports_http_error",
+    "path": "rustfs/src/admin/service/oidc_config.rs",
+    "source": "use s3s::S3Error;\npub(crate) async fn list_config() {}\npub(crate) async fn upsert_config() {}\npub(crate) async fn delete_config() {}\npub(crate) async fn validate_config() {}\nfn storage() { read_admin_server_config_snapshot(store); save_admin_server_config_snapshot(store); }\n",
+    "expected": ["oidc-admin-service-layer"]
+  },
+  {
+    "id": "service_omits_config_write",
+    "path": "rustfs/src/admin/service/oidc_config.rs",
+    "source": "pub(crate) async fn list_config() {}\npub(crate) async fn upsert_config() {}\npub(crate) async fn delete_config() {}\npub(crate) async fn validate_config() {}\nfn storage() { read_admin_server_config_snapshot(store); }\n",
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "replication_reads_full_config",
+    "path": "rustfs/src/admin/handlers/site_replication.rs",
+    "source": "let providers = query.config_snapshot().providers();\n",
+    "expected": ["oidc-site-replication-consumer"]
+  },
+  {
+    "id": "replication_reads_raw_secret",
+    "path": "rustfs/src/admin/handlers/site_replication.rs",
+    "source": "fn open_id_settings_from_snapshot(snapshot: &OidcSiteReplicationSnapshot) -> OpenIDSettings { let secret = provider.client_secret.clone(); }\nlet snapshot = query.site_replication_snapshot();\n",
+    "expected": ["oidc-site-replication-consumer"]
+  },
+  {
+    "id": "single_runtime_snapshot",
+    "path": "rustfs/src/app/context/interfaces.rs",
+    "source": "pub type FederatedIdentityRuntimeSnapshot = Arc<FederatedIdentityService>;\n",
+    "expected": ["oidc-runtime-pair"]
+  },
+  {
+    "id": "single_runtime_handle",
+    "path": "rustfs/src/app/context/handles.rs",
+    "source": "struct FederatedIdentityRuntime { service: Arc<FederatedIdentityService> }\n",
+    "expected": ["oidc-runtime-pair"]
+  },
+  {
+    "id": "old_single_file",
+    "path": "crates/iam/src/oidc.rs",
+    "source": "pub struct OidcSys;\n",
+    "expected": ["oidc-module-owner"]
+  },
+  {
+    "id": "old_federation_directory",
+    "path": "crates/iam/src/federation/oidc/flow.rs",
+    "source": "pub fn exchange_code() {}\n",
+    "expected": ["oidc-module-owner"]
+  },
+  {
+    "id": "missing_oidc_owner_module",
+    "layout": { "missing": ["crates/iam/src/oidc/provider.rs"] },
+    "expected": ["oidc-module-owner"]
+  },
+  {
+    "id": "restored_legacy_module",
+    "layout": { "restored": ["crates/iam/src/federation/oidc"] },
+    "expected": ["oidc-module-owner"]
+  },
+  {
+    "id": "missing_admin_config_service",
+    "layout": { "missing": ["rustfs/src/admin/service/oidc_config.rs"] },
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "missing_admin_service_registration",
+    "layout": { "service_modules": "mod other;" },
+    "expected": ["oidc-admin-config-owner"]
+  },
+  {
+    "id": "missing_live_workflow_path",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n",
+    "expected": ["oidc-live-workflow"]
+  },
+  {
+    "id": "service_path_missing_from_push",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n",
+    "expected": ["oidc-live-workflow"]
+  },
+  {
+    "id": "commented_workflow_path",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      # - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n",
+    "expected": ["oidc-live-workflow"]
+  },
+  {
+    "id": "workflow_path_in_paths_ignore",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths-ignore:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n",
+    "expected": ["oidc-live-workflow"]
+  },
+  {
+    "id": "comment_and_string_literals",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "// StandardOidcAdapter and OIDC_SYS are inert here.\n/* FederatedIdentityRegistry /* OidcSys */ */\nlet message = r#\"FederatedCodeExchange StandardOidcAdapter\"#;\n",
+    "expected": []
+  },
+  {
+    "id": "test_module_exclusion_and_recovery",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "#[cfg(test)]\nmod tests {\n    fn test() { let _ = OidcSys::empty(); }\n}\nfn production() { let _ = OidcSys::empty(); }\n",
+    "expected": ["oidc-runtime-owner"]
+  },
+  {
+    "id": "test_module_with_extra_attribute",
+    "path": "rustfs/src/admin/handlers/oidc.rs",
+    "source": "#[cfg(test)]\n#[allow(dead_code)]\nmod tests { fn test() { let _ = OidcSys::empty(); } }\n",
+    "expected": []
+  },
+  {
+    "id": "test_function_exclusion_and_recovery",
+    "path": "rustfs/src/app/context.rs",
+    "source": "#[cfg(test)]\nfn test_runtime() { let _ = OidcSys::empty(); }\nfn production() { let _ = OidcSys::empty(); }\n",
+    "expected": ["oidc-runtime-owner"]
+  },
+  {
+    "id": "test_crate_visible_function",
+    "path": "rustfs/src/app/context.rs",
+    "source": "#[cfg(test)]\npub(crate) fn test_runtime() { let _ = OidcSys::empty(); }\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_runtime_owner",
+    "path": "rustfs/src/startup_auth.rs",
+    "source": "let adapter = StandardOidcAdapter::new(oidc);\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_iam_builder_owner",
+    "path": "crates/iam/src/lib.rs",
+    "source": "let oidc = OidcSys::empty()?;\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_mapper_owner",
+    "path": "crates/iam/src/federation/mapper.rs",
+    "source": "return FederatedAuthorization { policies, groups };\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_runtime_snapshot",
+    "path": "rustfs/src/app/context/interfaces.rs",
+    "source": "pub type FederatedIdentityRuntimeSnapshot = (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>);\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_runtime_handle",
+    "path": "rustfs/src/app/context/handles.rs",
+    "source": "struct FederatedIdentityRuntime { service: Arc<FederatedIdentityService>, oidc_config_query: Arc<dyn OidcConfigQuery> }\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_replication_query",
+    "path": "crates/iam/src/oidc/config.rs",
+    "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; }\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_admin_service",
+    "path": "rustfs/src/admin/service/oidc_config.rs",
+    "source": "pub(crate) async fn list_config() {}\npub(crate) async fn upsert_config() {}\npub(crate) async fn delete_config() {}\npub(crate) async fn validate_config() {}\nfn storage() { read_admin_server_config_snapshot(store); save_admin_server_config_snapshot(store); }\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_replication_consumer",
+    "path": "rustfs/src/admin/handlers/site_replication.rs",
+    "source": "fn open_id_settings_from_snapshot(snapshot: &OidcSiteReplicationSnapshot) -> OpenIDSettings { let secret_hash = provider.hashed_client_secret.clone(); }\nlet snapshot = query.site_replication_snapshot();\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_unrelated_replication_secret",
+    "path": "rustfs/src/admin/handlers/site_replication.rs",
+    "source": "fn open_id_settings_from_snapshot(snapshot: &OidcSiteReplicationSnapshot) -> OpenIDSettings { let secret_hash = provider.hashed_client_secret.clone(); }\nfn ldap_settings() { let secret = ldap_provider.client_secret.clone(); }\nlet snapshot = query.site_replication_snapshot();\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_live_workflow_paths",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_workflow_comment_between_paths",
+    "path": ".github/workflows/oidc-keycloak.yml",
+    "source": "on:\n  pull_request:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      # Keep configuration changes in the live gate.\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n  push:\n    paths:\n      - \"crates/iam/src/oidc/**\"\n      - \"rustfs/src/admin/service/oidc_config.rs\"\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_owner_layout",
+    "layout": {},
+    "expected": []
+  }
+]
