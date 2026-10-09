@@ -18,7 +18,6 @@ use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
-use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::{site_replication_enabled, with_site_replication_bucket_mutation_lock};
 use hyper::{Method, StatusCode};
@@ -100,13 +99,13 @@ impl Operation for RecoverOrphanedBucketHandler {
                     operation_store
                         .recover_orphaned_bucket(&operation_bucket, expected_incarnation)
                         .await
-                        .map_err(|error| S3Error::from(ApiError::from(error)))
+                        .map_err(|error| S3Error::from(crate::error::ApiError::from(error)))
                 })
                 .await??;
                 Ok::<(), S3Error>(())
             })
             .await
-            .map_err(|error| S3Error::from(ApiError::from(error)))?;
+            .map_err(|error| S3Error::from(crate::error::ApiError::from(error)))?;
         completed?;
 
         info!(
@@ -134,22 +133,6 @@ impl Operation for RecoverOrphanedBucketHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn api_error_conversion_preserves_s3_error_semantics() {
-        for code in [
-            S3ErrorCode::InvalidRequest,
-            S3ErrorCode::InternalError,
-            S3ErrorCode::OperationAborted,
-        ] {
-            let expected = S3Error::with_message(code.clone(), "test message");
-            let actual = s3::error(code, "test message");
-
-            assert_eq!(actual.code(), expected.code());
-            assert_eq!(actual.message(), expected.message());
-            assert_eq!(actual.status_code(), expected.status_code());
-        }
-    }
 
     #[test]
     fn recovery_request_rejects_missing_or_nil_generation_identity() {

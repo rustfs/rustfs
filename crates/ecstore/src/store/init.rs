@@ -18318,7 +18318,7 @@ mod tests {
         let bucket = format!("lock-create-intent-retry-{}", uuid::Uuid::new_v4());
         let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
         intent.lock_enabled = true;
-        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+        crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
             .await
             .expect("persist pre-visibility lock intent");
         assert!(

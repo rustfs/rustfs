@@ -2939,6 +2939,20 @@ fn resolve_tier_free_version_recovery_enabled(value: Result<String, env::VarErro
 }
 
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
+    spawn_tier_free_version_recovery_once_with_options(
+        api,
+        started,
+        TIER_FREE_VERSION_RECOVERY_LEADER_LOCK.to_string(),
+        tier_free_version_recovery_leader_retry_delay,
+    )
+}
+
+fn spawn_tier_free_version_recovery_once_with_options(
+    api: Arc<ECStore>,
+    started: &OnceLock<()>,
+    leader_lock_name: String,
+    retry_delay: fn() -> StdDuration,
+) -> Option<JoinHandle<()>> {
     if !tier_free_version_recovery_enabled() {
         warn!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
@@ -2956,15 +2970,15 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
     Some(tokio::spawn(async move {
         let cancel_token = api.ctx.background_cancel_token().unwrap_or_default();
         let acquire_api = Arc::clone(&api);
+        let acquire_lock_name = Arc::<str>::from(leader_lock_name);
         run_tier_free_version_recovery_coordinator(
             cancel_token,
-            tier_free_version_recovery_leader_retry_delay,
+            retry_delay,
             move || {
                 let api = Arc::clone(&acquire_api);
+                let lock_name = Arc::clone(&acquire_lock_name);
                 async move {
-                    let lock = api
-                        .new_ns_lock(RUSTFS_META_BUCKET, TIER_FREE_VERSION_RECOVERY_LEADER_LOCK)
-                        .await?;
+                    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &lock_name).await?;
                     match lock.get_write_lock_quiet(TIER_FREE_VERSION_RECOVERY_LOCK_TIMEOUT).await {
                         Ok(guard) => Ok(Some(guard)),
                         Err(LockError::Timeout { .. }) => Ok(None),
@@ -14193,6 +14207,10 @@ mod tests {
         .await;
     }
 
+    fn fast_tier_free_version_recovery_leader_retry_delay() -> StdDuration {
+        StdDuration::from_millis(10)
+    }
+
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
@@ -14208,8 +14226,13 @@ mod tests {
         seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
 
         let started = OnceLock::new();
-        let recovery = super::spawn_tier_free_version_recovery_once(Arc::clone(&ecstore), &started)
-            .expect("production recovery entrypoint should start once");
+        let recovery = super::spawn_tier_free_version_recovery_once_with_options(
+            Arc::clone(&ecstore),
+            &started,
+            format!("tier-free-version-recovery/test/{}", Uuid::new_v4()),
+            fast_tier_free_version_recovery_leader_retry_delay,
+        )
+        .expect("production recovery entrypoint should start once");
         let task = tokio::time::timeout(StdDuration::from_secs(30), async { recovery_rx.lock().await.recv().await })
             .await
             .expect("production recovery entrypoint should enqueue the seeded item")
