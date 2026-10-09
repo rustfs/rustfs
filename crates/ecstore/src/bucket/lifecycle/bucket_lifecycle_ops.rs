@@ -14196,7 +14196,11 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
-        let (disk_paths, ecstore) = setup_test_env().await;
+        let (disk_paths, ecstore) =
+            temp_env::async_with_vars([(super::ENV_TIER_FREE_VERSION_RECOVERY_ENABLED, Some("false"))], async {
+                setup_test_env().await
+            })
+            .await;
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
         let recovery_rx = {
             let state = runtime_state.read().await;
