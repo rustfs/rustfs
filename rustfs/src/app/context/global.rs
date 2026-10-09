@@ -169,11 +169,6 @@ impl AppContext {
         self.federated_identity.publish_runtime(service, oidc_config_query)
     }
 
-    /// Publish a service-only federation runtime for compatibility integrations.
-    pub fn publish_federated_identity_service(&self, service: Arc<FederatedIdentityService>) -> bool {
-        self.federated_identity.publish_handle(service)
-    }
-
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }

@@ -16,10 +16,9 @@ use super::config::OidcConfigQuery;
 use super::{claims, config, discovery, http};
 use crate::{
     federation::{
-        CoreFederatedAuthorizationMapper, FederatedAuthorization, FederatedAuthorizationRules, FederatedCodeExchange,
-        FederatedIdentityProvider, FederatedIdentityService, FederatedProviderRef, FederatedProviderView,
-        FederatedRedirectPolicy, FederationError, OpaqueLogoutContinuation, Result, StandardOidcAuthentication,
-        VerifiedFederatedCodeExchange,
+        CoreFederatedAuthorizationMapper, FederatedAuthorizationRules, FederatedIdentityService, FederatedProviderQuery,
+        FederatedProviderRef, FederatedProviderView, FederatedRedirectPolicy, FederationError, OpaqueLogoutContinuation, Result,
+        StandardOidcAuthentication, VerifiedFederatedCodeExchange,
     },
     oidc::{OidcConfigSnapshot, OidcSys},
 };
@@ -45,8 +44,8 @@ impl StandardOidcAdapter {
 
     pub fn into_service(self: Arc<Self>, mapper: CoreFederatedAuthorizationMapper) -> FederatedIdentityService {
         let authentication: Arc<dyn StandardOidcAuthentication> = self.clone();
-        let provider: Arc<dyn FederatedIdentityProvider> = self;
-        FederatedIdentityService::from_standard_oidc_parts(provider, authentication, mapper)
+        let provider_query: Arc<dyn FederatedProviderQuery> = self;
+        FederatedIdentityService::from_standard_oidc_parts(provider_query, authentication, mapper)
     }
 }
 
@@ -58,6 +57,10 @@ impl OidcConfigQuery for StandardOidcAdapter {
 
 #[async_trait::async_trait]
 impl StandardOidcAuthentication for StandardOidcAdapter {
+    async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String> {
+        http::authorize_url(&self.oidc, provider_id, redirect_uri, redirect_after).await
+    }
+
     async fn exchange_identity(&self, state: &str, code: &str, redirect_uri: &str) -> Result<VerifiedFederatedCodeExchange> {
         let (oidc_claims, provider_id, session, id_token) = http::exchange_code(&self.oidc, state, code, redirect_uri).await?;
         let provider = FederatedProviderRef::new(provider_id);
@@ -81,10 +84,13 @@ impl StandardOidcAuthentication for StandardOidcAdapter {
         let (provider, id_token) = continuation.into_parts();
         http::create_logout_token(&self.oidc, provider.as_str(), &id_token).await
     }
+
+    async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>> {
+        http::build_logout_url(&self.oidc, logout_token, post_logout_redirect_uri).await
+    }
 }
 
-#[async_trait::async_trait]
-impl FederatedIdentityProvider for StandardOidcAdapter {
+impl FederatedProviderQuery for StandardOidcAdapter {
     fn has_providers(&self) -> bool {
         self.oidc.has_providers()
     }
@@ -97,40 +103,7 @@ impl FederatedIdentityProvider for StandardOidcAdapter {
         discovery::list_visible_providers(&self.oidc)
     }
 
-    fn provider_config(&self, provider_id: &str) -> Option<&crate::oidc::OidcProviderConfig> {
-        self.oidc.get_provider_config(provider_id)
-    }
-
     fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy> {
         config::redirect_policy(&self.oidc, provider_id)
-    }
-
-    async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String> {
-        http::authorize_url(&self.oidc, provider_id, redirect_uri, redirect_after).await
-    }
-
-    async fn exchange_code(&self, state: &str, code: &str, redirect_uri: &str) -> Result<FederatedCodeExchange> {
-        let exchange = StandardOidcAuthentication::exchange_identity(self, state, code, redirect_uri).await?;
-        let (identity, redirect_after, continuation) = exchange.into_parts();
-        let authorization = CoreFederatedAuthorizationMapper::new(self.authorization_rules()).map(identity);
-        let (_, id_token) = continuation.into_parts();
-        Ok(FederatedCodeExchange {
-            authorization,
-            redirect_after,
-            id_token,
-        })
-    }
-
-    async fn verify_web_identity_token(&self, jwt: &str) -> Result<FederatedAuthorization> {
-        let identity = StandardOidcAuthentication::verify_identity(self, jwt).await?;
-        Ok(CoreFederatedAuthorizationMapper::new(self.authorization_rules()).map(identity))
-    }
-
-    async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String> {
-        http::create_logout_token(&self.oidc, provider_id, id_token).await
-    }
-
-    async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>> {
-        http::build_logout_url(&self.oidc, logout_token, post_logout_redirect_uri).await
     }
 }

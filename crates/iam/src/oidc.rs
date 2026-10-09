@@ -2354,8 +2354,9 @@ fn extract_canonical_group_values(
     groups
 }
 
-#[cfg(test)]
-pub(crate) fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
     let configs = configs
         .into_iter()
         .map(test_sourced_config)
@@ -2369,7 +2370,7 @@ pub(crate) fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn test_sourced_config(config: OidcProviderConfig) -> SourcedOidcProviderConfig {
     SourcedOidcProviderConfig {
         config,
@@ -2377,8 +2378,9 @@ fn test_sourced_config(config: OidcProviderConfig) -> SourcedOidcProviderConfig 
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_config(id: &str) -> OidcProviderConfig {
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn test_config(id: &str) -> OidcProviderConfig {
     OidcProviderConfig {
         id: id.to_string(),
         enabled: true,
