@@ -1123,17 +1123,28 @@ pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action
 /// conflated at the authorization boundary.
 ///
 /// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
-/// `s3:GetObject` request. That mapping is intentionally left in place until the
-/// remaining version-aware read paths (HeadObject, GetObjectAcl, tagging) get the
-/// same treatment — see the GHSA-3ppv follow-up audit. It does not re-open this
-/// disclosure: it only broadens a Version grant toward current reads, never the
-/// reverse.
+/// `s3:GetObject` request. It only broadens a Version grant toward current
+/// reads, never the reverse.
 fn versioned_read_action(version_id: Option<&str>) -> Action {
     if version_id.is_some() {
         Action::S3Action(S3Action::GetObjectVersionAction)
     } else {
         Action::S3Action(S3Action::GetObjectAction)
     }
+}
+
+fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
+    let action = if version_id.is_some() {
+        match action {
+            S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
+            S3Action::PutObjectTaggingAction => S3Action::PutObjectVersionTaggingAction,
+            S3Action::DeleteObjectTaggingAction => S3Action::DeleteObjectVersionTaggingAction,
+            action => action,
+        }
+    } else {
+        action
+    };
+    Action::S3Action(action)
 }
 
 async fn get_or_fetch_object_tag_conditions<T>(
@@ -2560,7 +2571,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::DeleteObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -2881,7 +2896,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::GetObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -2933,7 +2952,7 @@ impl S3Access for FS {
             return Ok(());
         }
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -3362,7 +3381,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::PutObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -3481,7 +3504,7 @@ mod tests {
         owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
         request_object_store, require_owned_reserved_table_object, retention_write_requested, table_data_plane_admin_action,
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
-        validate_post_object_success_controls, versioned_read_action,
+        validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
     use super::{remaining_retention_days, set_requested_object_lock_retain_until};
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
@@ -4283,6 +4306,47 @@ mod tests {
             destination_conditions.get("RequestObjectTagKeys"),
             Some(&vec!["classification".to_string(), "label".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn versioned_tagging_requires_version_permissions() {
+        use rustfs_policy::policy::{Args, Policy};
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":"arn:aws:s3:::bucket/*"}]
+        }"#).expect("current-object tagging policy should parse");
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (current, versioned) in [
+            (S3Action::GetObjectTaggingAction, S3Action::GetObjectVersionTaggingAction),
+            (S3Action::PutObjectTaggingAction, S3Action::PutObjectVersionTaggingAction),
+            (S3Action::DeleteObjectTaggingAction, S3Action::DeleteObjectVersionTaggingAction),
+        ] {
+            for version in [None, Some("null"), Some("0194e0f1-0000-7000-8000-000000000000")] {
+                let action = versioned_tagging_action(current.clone(), version);
+                assert_eq!(
+                    action,
+                    Action::S3Action(if version.is_some() {
+                        versioned.clone()
+                    } else {
+                        current.clone()
+                    })
+                );
+                let args = Args {
+                    account: "writer",
+                    groups: &groups,
+                    action,
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "object",
+                    claims: &claims,
+                    deny_only: false,
+                };
+                assert_eq!(policy.is_allowed(&args).await, version.is_none(), "version selector {version:?}");
+            }
+        }
     }
 
     fn remaining_retention_days_conditions(req: &S3Request<()>, action: Action) -> HashMap<String, Vec<String>> {
