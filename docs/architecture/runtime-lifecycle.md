@@ -55,3 +55,9 @@ Embedded startup reuses the same phase owners as the binary: server and storage 
 ## AppContext Foundation
 
 AppContext is a context-first facade, not a full replacement for every process global. Resolver files are split and covered by compatibility tests before boot extraction or consumer migration, so the old global fallback path keeps working during transition. New migration work keeps fallback reads inside owner-local runtime-source boundaries and follows the target inventory in [global-state-inventory.md](global-state-inventory.md).
+
+## OIDC Runtime Publication
+
+`startup_auth.rs` builds the OIDC runtime and publishes its `FederatedIdentityService` and `OidcConfigQuery` together. `FederatedIdentityRuntimeSnapshot` in `app/context/interfaces.rs` and the owning handle in `app/context/handles.rs` retain this pair. Authentication and configuration consumers resolve their respective interfaces from the same published runtime; the OIDC runtime is created only at IAM startup construction and this startup phase.
+
+The query exposes `site_replication_snapshot()` for active, narrow replication settings. Admin configuration changes use `admin/service/oidc_config.rs` to read and save persisted configuration and report whether a restart is required; they do not replace the active runtime pair during the request.

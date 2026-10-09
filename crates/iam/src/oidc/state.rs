@@ -25,32 +25,32 @@ const OIDC_STATE_CAPACITY_LOG_INTERVAL_SECS: u64 = 60;
 
 /// Stores the PKCE verifier and nonce for an in-flight OIDC authorization flow.
 #[derive(Debug, Clone)]
-pub struct OidcAuthSession {
-    pub provider_id: String,
-    pub pkce_verifier: String,
-    pub nonce: String,
-    pub redirect_after: Option<String>,
+pub(super) struct OidcAuthSession {
+    pub(super) provider_id: String,
+    pub(super) pkce_verifier: String,
+    pub(super) nonce: String,
+    pub(super) redirect_after: Option<String>,
 }
 
 /// Stores an ID token behind a one-time opaque handle so the console can trigger
 /// RP-initiated logout without persisting the raw token in browser storage.
 #[derive(Debug, Clone)]
-pub struct OidcLogoutSession {
-    pub provider_id: String,
-    pub id_token: String,
+pub(super) struct OidcLogoutSession {
+    pub(super) provider_id: String,
+    pub(super) id_token: String,
 }
 
 /// TTL cache for OIDC auth state (PKCE verifiers + nonces) during the authorization flow.
 /// Entries expire after 5 minutes and are single-use (removed on retrieval).
 #[derive(Clone)]
-pub struct OidcStateStore {
+pub(super) struct OidcStateStore {
     cache: Cache<String, OidcAuthSession>,
     logout_cache: Cache<String, OidcLogoutSession>,
     last_capacity_log_at: Arc<AtomicU64>,
 }
 
 impl OidcStateStore {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         let cache = Cache::builder()
             .max_capacity(OIDC_STATE_CAPACITY)
             .time_to_live(Duration::from_secs(300)) // 5 minute TTL
@@ -67,7 +67,7 @@ impl OidcStateStore {
     }
 
     /// Store a new auth session keyed by the OAuth2 `state` parameter.
-    pub async fn insert(&self, state: String, session: OidcAuthSession) {
+    pub(super) async fn insert(&self, state: String, session: OidcAuthSession) {
         self.cache.insert(state, session).await;
         let size = self.cache.entry_count();
 
@@ -104,27 +104,29 @@ impl OidcStateStore {
 
     /// Retrieve and remove an auth session (single-use). Returns None if expired or not found.
     /// Uses `remove` which returns the value and removes it in a single operation.
-    pub async fn take(&self, state: &str) -> Option<OidcAuthSession> {
+    pub(super) async fn take(&self, state: &str) -> Option<OidcAuthSession> {
         self.cache.remove(state).await
     }
 
     /// Check if a state key exists (without consuming it).
-    pub async fn contains(&self, state: &str) -> bool {
+    #[cfg(test)]
+    pub(super) async fn contains(&self, state: &str) -> bool {
         self.cache.get(state).await.is_some()
     }
 
     /// Store a new one-time logout session keyed by an opaque logout token.
-    pub async fn insert_logout(&self, token: String, session: OidcLogoutSession) {
+    pub(super) async fn insert_logout(&self, token: String, session: OidcLogoutSession) {
         self.logout_cache.insert(token, session).await;
     }
 
     /// Retrieve and remove a logout session (single-use). Returns None if expired or not found.
-    pub async fn take_logout(&self, token: &str) -> Option<OidcLogoutSession> {
+    pub(super) async fn take_logout(&self, token: &str) -> Option<OidcLogoutSession> {
         self.logout_cache.remove(token).await
     }
 
     /// Check if a logout token exists (without consuming it).
-    pub async fn contains_logout(&self, token: &str) -> bool {
+    #[cfg(test)]
+    pub(super) async fn contains_logout(&self, token: &str) -> bool {
         self.logout_cache.get(token).await.is_some()
     }
 }

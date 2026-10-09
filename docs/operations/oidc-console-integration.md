@@ -1,7 +1,7 @@
 # OIDC Console integration
 
 **Use this when:** connecting RustFS Console login to an OpenID Connect provider (Keycloak, Authing, or any standards-compliant IdP), or debugging an OIDC redirect, token, or policy-mapping failure.
-**Source of truth:** `crates/config/src/constants/oidc.rs` (provider keys and `RUSTFS_IDENTITY_OPENID_*`), `crates/iam/src/oidc.rs` (discovery, PKCE, token validation, per-provider env suffixes), `rustfs/src/admin/handlers/oidc.rs` (authorize/callback handlers), `crates/config/src/constants/app.rs` (`ENV_RUSTFS_BROWSER_REDIRECT_URL`), `crates/utils/src/egress.rs` (`ENV_OUTBOUND_ALLOW_ORIGINS`), `crates/policy/src/policy/policy.rs` (built-in policies).
+**Source of truth:** `crates/config/src/constants/oidc.rs` (provider keys and `RUSTFS_IDENTITY_OPENID_*`), `crates/iam/src/oidc/config.rs` (per-provider env suffixes), `crates/iam/src/oidc/provider.rs` (discovery and JWKS), `crates/iam/src/oidc/runtime.rs` (PKCE and token validation), `rustfs/src/admin/handlers/oidc.rs` (authorize/callback handlers), `crates/config/src/constants/app.rs` (`ENV_RUSTFS_BROWSER_REDIRECT_URL`), `crates/utils/src/egress.rs` (`ENV_OUTBOUND_ALLOW_ORIGINS`), `crates/policy/src/policy/policy.rs` (built-in policies).
 
 The RustFS side is vendor-neutral and is described once; what RustFS requires from any provider is tabulated in [oidc-provider-requirements.md](oidc-provider-requirements.md). The [Keycloak](#keycloak) and [Authing](#authing) sections contain only IdP-side steps and vendor caveats. Examples use provider id `default` and public origin `https://rustfs.example.com`.
 
@@ -48,7 +48,7 @@ Process-level settings (environment only, never suffixed per provider):
 | `RUSTFS_BROWSER_REDIRECT_URL` | Public browser origin used for callback generation, Console success redirects, and logout fallback. |
 | `RUSTFS_OUTBOUND_ALLOW_ORIGINS` | Exact `scheme://host[:port]` origins RustFS may contact for discovery, JWKS, and token requests when the IdP resolves to a private, loopback, or container-network address. See [outbound-connection-policy.md](outbound-connection-policy.md). |
 
-Named providers: to use provider id `<id>`, suffix every provider env var with `_<id>` (for example `RUSTFS_IDENTITY_OPENID_CLIENT_ID_keycloak`) and register the callback `/rustfs/admin/v3/oidc/callback/<id>`. Suffix scanning is `parse_single_provider` in `crates/iam/src/oidc.rs`.
+Named providers: to use provider id `<id>`, suffix every provider env var with `_<id>` (for example `RUSTFS_IDENTITY_OPENID_CLIENT_ID_keycloak`) and register the callback `/rustfs/admin/v3/oidc/callback/<id>`. Suffix scanning is `parse_single_provider` in `crates/iam/src/oidc/config.rs`.
 
 Restart RustFS after changing any of these settings.
 
