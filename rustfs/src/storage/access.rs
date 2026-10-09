@@ -4343,15 +4343,8 @@ mod tests {
             (S3Action::DeleteObjectTaggingAction, S3Action::DeleteObjectVersionTaggingAction),
         ] {
             for version in [None, Some("null"), Some("0194e0f1-0000-7000-8000-000000000000")] {
-                let action = versioned_tagging_action(current.clone(), version);
-                assert_eq!(
-                    action,
-                    Action::S3Action(if version.is_some() {
-                        versioned.clone()
-                    } else {
-                        current.clone()
-                    })
-                );
+                let action = versioned_tagging_action(current, version);
+                assert_eq!(action, Action::S3Action(if version.is_some() { versioned } else { current }));
                 let args = Args {
                     account: "writer",
                     groups: &groups,
