@@ -16,7 +16,7 @@ RustFS validates every operator-configured outbound destination to close a serve
 | --- | --- | --- |
 | Event-notification webhooks (`RUSTFS_NOTIFY_WEBHOOK_*`) and audit webhooks (`RUSTFS_AUDIT_WEBHOOK_*`) | Full policy | Proxies disabled and redirects not followed, so the endpoint must be reachable directly (`crates/targets/src/target/webhook.rs`) |
 | Target configuration validation (startup and admin API) | Full policy | `crates/targets/src/config/common.rs` `validate_outbound_http_url`; `rustfs/src/admin/handlers/target_descriptor.rs` |
-| OIDC discovery, JWKS, and token requests | Full policy | A blocked provider logs `OIDC provider discovery blocked by outbound policy` naming the origin to allowlist (`crates/iam/src/oidc.rs`) |
+| OIDC discovery, JWKS, and token requests | Full policy | A blocked provider logs `OIDC provider discovery blocked by outbound policy` naming the origin to allowlist (`crates/iam/src/oidc/provider.rs`, `crates/iam/src/oidc/transport.rs`) |
 | Object Lambda targets | Full policy | `rustfs/src/admin/router.rs` `outbound_policy` |
 | Bucket replication targets | Literal check, relaxed | Private addresses are always allowed; loopback only with `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true` (`crates/ecstore/src/bucket/remote_s3_client.rs` `validate_remote_endpoint`, shared with on-demand migration sources) |
 | On-demand migration sources | Literal check, relaxed | Same guard and same escape hatch as replication targets (see below) |

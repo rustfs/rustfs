@@ -15,5 +15,6 @@
 pub(crate) mod caller_identity;
 pub mod config;
 pub(crate) mod federated_identity;
+pub(crate) mod oidc_config;
 pub(crate) mod session_policy;
 pub mod site_replication;

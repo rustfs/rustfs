@@ -39,9 +39,7 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
-    error::Error as IamError,
-    federation::{FederatedIdentityService, oidc::OidcConfigQuery},
-    store::object::ObjectStore,
+    error::Error as IamError, federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore,
     sys::IamSys,
 };
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
@@ -103,22 +101,12 @@ pub fn resolve_oidc_config_query() -> Option<Arc<dyn OidcConfigQuery>> {
     resolve_oidc_config_query_with(get_global_app_context())
 }
 
-/// Resolve the paired federation service and OIDC configuration query from one runtime observation.
-pub(crate) fn resolve_federated_identity_runtime() -> Option<FederatedIdentityRuntimeSnapshot> {
-    resolve_federated_identity_runtime_with(get_global_app_context())
-}
-
 /// Publish the initialized federation service and OIDC configuration query.
 pub fn publish_federated_identity_runtime(
     service: Arc<FederatedIdentityService>,
     oidc_config_query: Arc<dyn OidcConfigQuery>,
 ) -> bool {
     handles::publish_default_federated_identity_runtime(service, oidc_config_query)
-}
-
-/// Publish a service-only federation runtime for compatibility integrations.
-pub fn publish_federated_identity_service(service: Arc<FederatedIdentityService>) -> bool {
-    handles::publish_default_federated_identity_service(service)
 }
 
 /// Resolve a ready IAM system handle using AppContext-first precedence.
@@ -360,6 +348,7 @@ fn resolve_oidc_config_query_with(context: Option<Arc<AppContext>>) -> Option<Ar
     context.and_then(|context| context.federated_identity().oidc_config_query())
 }
 
+#[cfg(test)]
 fn resolve_federated_identity_runtime_with(context: Option<Arc<AppContext>>) -> Option<FederatedIdentityRuntimeSnapshot> {
     context.and_then(|context| context.federated_identity().runtime_snapshot())
 }
@@ -553,11 +542,8 @@ mod tests {
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
     use rustfs_iam::{
-        federation::{
-            FederatedIdentityRegistry, FederatedIdentityService,
-            oidc::{OidcConfigQuery, StandardOidcAdapter},
-        },
-        oidc::OidcSys,
+        federation::{CoreFederatedAuthorizationMapper, FederatedIdentityService},
+        oidc::{OidcConfigQuery, OidcSys, StandardOidcAdapter},
         store::object::ObjectStore,
         sys::IamSys,
     };
@@ -617,25 +603,11 @@ mod tests {
     }
 
     impl FederatedIdentityInterface for TestFederatedIdentityInterface {
-        fn handle(&self) -> Option<Arc<FederatedIdentityService>> {
-            self.runtime
-                .read()
-                .ok()
-                .and_then(|runtime| runtime.as_ref().map(|runtime| Arc::clone(&runtime.service)))
-        }
-
-        fn oidc_config_query(&self) -> Option<Arc<dyn OidcConfigQuery>> {
-            self.runtime
-                .read()
-                .ok()
-                .and_then(|runtime| runtime.as_ref().map(|runtime| Arc::clone(&runtime.oidc_config_query)))
-        }
-
         fn runtime_snapshot(&self) -> Option<FederatedIdentityRuntimeSnapshot> {
             self.runtime.read().ok().and_then(|runtime| {
                 runtime
                     .as_ref()
-                    .map(|runtime| (Arc::clone(&runtime.service), Some(Arc::clone(&runtime.oidc_config_query))))
+                    .map(|runtime| (Arc::clone(&runtime.service), Arc::clone(&runtime.oidc_config_query)))
             })
         }
 
@@ -654,7 +626,8 @@ mod tests {
     fn test_federated_identity_runtime(oidc: OidcSys) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
         let adapter = Arc::new(StandardOidcAdapter::new(Arc::new(oidc)));
         let oidc_config_query = adapter.clone();
-        let service = Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(adapter)));
+        let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+        let service = Arc::new(adapter.into_service(mapper));
         (service, oidc_config_query)
     }
 
@@ -1206,11 +1179,7 @@ mod tests {
         let (resolved_oidc, resolved_oidc_query) =
             resolve_federated_identity_runtime_with(Some(context.clone())).expect("context federated identity runtime");
         assert!(Arc::ptr_eq(&resolved_oidc, &context_oidc));
-        assert!(
-            resolved_oidc_query
-                .as_ref()
-                .is_some_and(|query| Arc::ptr_eq(query, &context_oidc_query))
-        );
+        assert!(Arc::ptr_eq(&resolved_oidc_query, &context_oidc_query));
         assert!(publish_federated_identity_runtime_with(
             Some(context.clone()),
             fallback_oidc.clone(),
