@@ -80,11 +80,7 @@ fn request(scratch_root: &Path) -> DrivePerformanceRequest {
 async fn real_local_write_read_is_measured_and_scratch_is_removed() {
     let _guard = TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("scratch root");
-    let mut request = request(root.path());
-    // This exercises real sync_all and filesystem reads. Keep a generous
-    // deadline so a slow CI filesystem does not turn the integration test
-    // into an assertion about runner load.
-    request.duration = Duration::from_secs(10);
+    let request = request(root.path());
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("real drive benchmark");
@@ -112,7 +108,7 @@ async fn real_local_write_read_is_measured_and_scratch_is_removed() {
     assert_eq!(measurement.target.reason_code, DriveTargetReasonCode::Complete);
     assert_eq!(measurement.target.parameters.scratch_bytes, 32_768);
     assert_eq!(measurement.target.parameters.block_bytes, 4_096);
-    assert_eq!(measurement.target.parameters.duration_millis, 10_000);
+    assert_eq!(measurement.target.parameters.duration_millis, 1_000);
     assert_eq!(measurement.target.parameters.concurrency, 1);
     assert_eq!(measurement.target.units.bytes, "BYTE");
     assert_eq!(measurement.target.units.duration, "MILLISECOND");
@@ -509,7 +505,7 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
         &output,
         "019e3ae0-0000-7000-8000-000000000014",
         32_768,
-        Duration::from_secs(10),
+        Duration::from_secs(1),
         true,
     )
     .output()
@@ -528,7 +524,7 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     assert_eq!(target["reasonCode"], "COMPLETE");
     assert_eq!(target["parameters"]["scratchBytes"], 32_768);
     assert_eq!(target["parameters"]["blockBytes"], 4_096);
-    assert_eq!(target["parameters"]["durationMillis"], 10_000);
+    assert_eq!(target["parameters"]["durationMillis"], 1_000);
     assert_eq!(target["parameters"]["concurrency"], 1);
     assert_eq!(target["units"]["bytes"], "BYTE");
     assert_eq!(target["units"]["duration"], "MILLISECOND");
