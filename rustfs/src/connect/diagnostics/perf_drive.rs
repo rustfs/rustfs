@@ -149,6 +149,63 @@ impl Drop for DriveStageTimer {
     }
 }
 
+#[cfg(test)]
+mod drive_stage_timing_tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_stage_is_recorded_as_failed_and_take_clears() {
+        clear_drive_stage_timings();
+        drop(DriveStageTimer::new(DriveStage::ReadbackVerify));
+
+        let timings = take_drive_stage_timings();
+        assert_eq!(timings.len(), 1);
+        assert!(matches!(timings[0].phase, DriveStage::ReadbackVerify));
+        assert!(!timings[0].succeeded);
+        assert!(timings[0].elapsed_micros < u64::MAX);
+        assert!(take_drive_stage_timings().is_empty());
+    }
+
+    #[test]
+    fn stage_records_are_bounded_and_clear_discards_them() {
+        clear_drive_stage_timings();
+        for _ in 0..(MAX_DRIVE_STAGE_TIMINGS + 2) {
+            DriveStageTimer::new(DriveStage::Write).finish(true);
+        }
+
+        let timings = take_drive_stage_timings();
+        assert_eq!(timings.len(), MAX_DRIVE_STAGE_TIMINGS);
+        assert!(timings.iter().all(|timing| timing.succeeded));
+
+        DriveStageTimer::new(DriveStage::Cleanup).finish(true);
+        clear_drive_stage_timings();
+        assert!(take_drive_stage_timings().is_empty());
+    }
+
+    #[test]
+    fn stage_records_are_isolated_between_threads() {
+        clear_drive_stage_timings();
+        DriveStageTimer::new(DriveStage::Open).finish(true);
+
+        let child_timings = std::thread::spawn(|| {
+            assert!(take_drive_stage_timings().is_empty());
+            DriveStageTimer::new(DriveStage::Sync).finish(true);
+            take_drive_stage_timings()
+        })
+        .join()
+        .expect("stage timing thread");
+
+        assert_eq!(child_timings.len(), 1);
+        assert!(matches!(child_timings[0].phase, DriveStage::Sync));
+        assert!(child_timings[0].succeeded);
+
+        let parent_timings = take_drive_stage_timings();
+        assert_eq!(parent_timings.len(), 1);
+        assert!(matches!(parent_timings[0].phase, DriveStage::Open));
+        assert!(parent_timings[0].succeeded);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DriveOutcome {
