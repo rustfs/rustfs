@@ -402,6 +402,25 @@ async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Re
 const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
 const MAXIMUM_RETENTION_YEARS: i32 = 100;
 
+pub(crate) fn object_lock_retention_from_metadata(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRetention> {
+    let mode = metadata
+        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
+        .map(|value| ObjectLockRetentionMode::from(value.as_str().to_string()));
+    let retain_until_date = metadata
+        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        // The S3 timestamp serializer emits a literal Z, so its wall clock
+        // must be UTC before it is serialized.
+        .map(|date| {
+            date.checked_to_offset(time::UtcOffset::UTC)
+                .filter(|date| (0..=9999).contains(&date.year()))
+                .map(Timestamp::from)
+                .ok_or_else(|| s3_error!(InternalError, "Stored retention date is outside the supported UTC range"))
+        })
+        .transpose()?;
+    Ok(ObjectLockRetention { mode, retain_until_date })
+}
+
 fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
 }
@@ -1112,19 +1131,8 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let mode = object_info
-            .user_defined
-            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-            .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()));
-
-        let retain_until_date = object_info
-            .user_defined
-            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-            .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
-            .map(Timestamp::from);
-
         let output = GetObjectRetentionOutput {
-            retention: Some(ObjectLockRetention { mode, retain_until_date }),
+            retention: Some(object_lock_retention_from_metadata(&object_info.user_defined)?),
         };
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(object_info).version_id(version_id);

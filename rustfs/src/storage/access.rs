@@ -141,6 +141,9 @@ struct InternalObjectAuthorization;
 struct RequestedObjectLockRetainUntil(OffsetDateTime);
 
 #[derive(Clone, Debug)]
+struct RequestedObjectLockRetention(ObjectLockRetention);
+
+#[derive(Clone, Debug)]
 struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
@@ -885,6 +888,21 @@ fn authorization_conditions<T>(
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    if let Some(RequestedObjectLockRetention(retention)) = req.extensions.get::<RequestedObjectLockRetention>() {
+        // Standalone retention writes apply the XML body, so headers must not
+        // supply a different value to the policy decision.
+        conditions.remove("object-lock-mode");
+        conditions.remove("object-lock-retain-until-date");
+        if let Some(mode) = &retention.mode {
+            conditions.insert("object-lock-mode".to_string(), vec![mode.as_str().to_string()]);
+        }
+        if let Some(date) = &retention.retain_until_date {
+            let date = OffsetDateTime::from(date.clone())
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+            conditions.insert("object-lock-retain-until-date".to_string(), vec![date]);
+        }
+    }
     merge_object_lock_remaining_retention_days_condition(
         req.extensions.get::<RequestedObjectLockRetainUntil>(),
         OffsetDateTime::now_utc(),
@@ -906,6 +924,12 @@ pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, 
             req.extensions.remove::<RequestedObjectLockRetainUntil>();
         }
     }
+}
+
+fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
+    let retention = req.input.retention.clone().unwrap_or_default();
+    set_requested_object_lock_retain_until(req, retention.retain_until_date.as_ref());
+    req.extensions.insert(RequestedObjectLockRetention(retention));
 }
 
 fn merge_object_lock_remaining_retention_days_condition(
@@ -3355,12 +3379,7 @@ impl S3Access for FS {
 
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
-        let requested_retain_until = req
-            .input
-            .retention
-            .as_ref()
-            .and_then(|retention| retention.retain_until_date.clone());
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+        set_requested_object_lock_retention(req);
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -3506,7 +3525,7 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::{remaining_retention_days, set_requested_object_lock_retain_until};
+    use super::{remaining_retention_days, set_requested_object_lock_retain_until, set_requested_object_lock_retention};
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -4349,9 +4368,73 @@ mod tests {
         }
     }
 
-    fn remaining_retention_days_conditions(req: &S3Request<()>, action: Action) -> HashMap<String, Vec<String>> {
+    fn remaining_retention_days_conditions<T>(req: &S3Request<T>, action: Action) -> HashMap<String, Vec<String>> {
         let credentials = rustfs_credentials::Credentials::default();
         authorization_conditions(req, &credentials, None, None, None, None, action).expect("conditions should build")
+    }
+
+    #[tokio::test]
+    async fn retention_policy_checks_body_instead_of_conflicting_headers() {
+        use rustfs_policy::policy::{Args, Policy};
+        let mut req = build_request(
+            PutObjectRetentionInput {
+                retention: Some(ObjectLockRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static("COMPLIANCE")),
+                    retain_until_date: Some(
+                        Timestamp::parse(TimestampFormat::DateTime, "2035-01-02T00:00:00+23:59").expect("body date should parse"),
+                    ),
+                }),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        req.headers
+            .insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        req.headers
+            .insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2029-01-01T00:00:00Z"));
+        set_requested_object_lock_retention(&mut req);
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["COMPLIANCE".to_string()]));
+        let applied = OffsetDateTime::from(
+            req.input
+                .retention
+                .as_ref()
+                .expect("body retention")
+                .retain_until_date
+                .clone()
+                .expect("body date"),
+        );
+        let authorized = OffsetDateTime::parse(
+            &conditions["object-lock-retain-until-date"][0],
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("condition date should parse");
+        assert_eq!(authorized.unix_timestamp(), applied.unix_timestamp());
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*",
+            "Condition":{"DateLessThan":{"s3:object-lock-retain-until-date":"2030-01-01T00:00:00Z"}}}]
+        }"#).expect("bounded retention policy should parse");
+        let args = Args {
+            account: "writer",
+            groups: &None,
+            action,
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&args).await,
+            "an in-range header cannot authorize an out-of-range body"
+        );
+        req.input.retention = None;
+        set_requested_object_lock_retention(&mut req);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert!(!conditions.contains_key("object-lock-mode"));
+        assert!(!conditions.contains_key("object-lock-retain-until-date"));
     }
 
     fn request_retaining_for(retain_for: time::Duration) -> S3Request<()> {
