@@ -81,14 +81,16 @@ async fn real_local_write_read_is_measured_and_scratch_is_removed() {
     let _guard = TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("scratch root");
     let request = request(root.path());
+    perf_drive::clear_drive_stage_timings();
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("real drive benchmark");
+    let stage_timings = perf_drive::take_drive_stage_timings();
 
     assert_eq!(
         measurement.result.outcome(),
         DriveOutcome::Succeeded,
-        "drive measurement: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        "drive measurement: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}, stage_timings={stage_timings:?}",
         measurement.result.reason_code(),
         measurement.target.reason_code,
         measurement.target.duration_millis,
@@ -366,13 +368,15 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
     let _guard = TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("scratch root");
     let request = request(root.path());
+    perf_drive::clear_drive_stage_timings();
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("drive measurement");
+    let stage_timings = perf_drive::take_drive_stage_timings();
     assert_eq!(
         measurement.result.outcome(),
         DriveOutcome::Succeeded,
-        "drive measurement before signed export: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        "drive measurement before signed export: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}, stage_timings={stage_timings:?}",
         measurement.result.reason_code(),
         measurement.target.reason_code,
         measurement.target.duration_millis,

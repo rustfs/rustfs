@@ -27,6 +27,8 @@ use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::{cell::RefCell, mem};
 
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
@@ -69,6 +71,83 @@ const SCRATCH_MODE: u32 = 0o700;
 const SCRATCH_PREFIX: &str = ".rustfs-connect-drive-";
 
 static DRIVE_COLLECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum DriveStage {
+    ScratchCreate,
+    Open,
+    Write,
+    Sync,
+    ReadbackVerify,
+    Cleanup,
+}
+
+#[cfg(test)]
+const MAX_DRIVE_STAGE_TIMINGS: usize = 6;
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct DriveStageTiming {
+    phase: DriveStage,
+    elapsed_micros: u64,
+    succeeded: bool,
+}
+
+#[cfg(test)]
+// Keep parallel test workers isolated; one measurement emits at most six fixed phases.
+thread_local! {
+    static DRIVE_STAGE_TIMINGS: RefCell<Vec<DriveStageTiming>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub fn clear_drive_stage_timings() {
+    DRIVE_STAGE_TIMINGS.with(|timings| timings.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub fn take_drive_stage_timings() -> Vec<DriveStageTiming> {
+    DRIVE_STAGE_TIMINGS.with(|timings| mem::take(&mut *timings.borrow_mut()))
+}
+
+#[cfg(test)]
+struct DriveStageTimer {
+    phase: DriveStage,
+    started: Instant,
+    succeeded: bool,
+}
+
+#[cfg(test)]
+impl DriveStageTimer {
+    fn new(phase: DriveStage) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+            succeeded: false,
+        }
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        self.succeeded = succeeded;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DriveStageTimer {
+    fn drop(&mut self) {
+        let timing = DriveStageTiming {
+            phase: self.phase,
+            elapsed_micros: u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            succeeded: self.succeeded,
+        };
+        DRIVE_STAGE_TIMINGS.with(|timings| {
+            let mut timings = timings.borrow_mut();
+            if timings.len() < MAX_DRIVE_STAGE_TIMINGS {
+                timings.push(timing);
+            }
+        });
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -389,13 +468,22 @@ pub async fn measure_drive(
     let _lease = CollectorLease::acquire()?;
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + request.duration;
-    let mut scratch = match ScratchGuard::create(request) {
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::ScratchCreate);
+    let created = ScratchGuard::create(request);
+    #[cfg(test)]
+    stage.finish(created.is_ok());
+    let mut scratch = match created {
         Ok(scratch) => scratch,
         Err(error) => return Ok(failed_measurement(request, started.elapsed(), classify_io(&error), 0, 0, 0)),
     };
 
     let measured = run_benchmark(request, &scratch, cancel, deadline).await;
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::Cleanup);
     let cleanup = scratch.cleanup();
+    #[cfg(test)]
+    stage.finish(cleanup.is_ok());
     let elapsed = started.elapsed().min(request.duration);
     if cleanup.is_err() {
         let (read_bytes, write_bytes, io_count) = match &measured {
@@ -661,7 +749,11 @@ async fn run_benchmark(
     cancel: &CancellationToken,
     deadline: tokio::time::Instant,
 ) -> Result<BenchmarkSample, BenchmarkFailure> {
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::Open);
     let std_file = scratch.open_file().map_err(BenchmarkFailure::Io)?;
+    #[cfg(test)]
+    stage.finish(true);
     let mut file = tokio::fs::File::from_std(std_file);
     let block_size = usize::try_from(request.block_bytes).map_err(|_| BenchmarkFailure::Verification)?;
     let write_buffer = vec![0xa5; block_size];
@@ -669,6 +761,8 @@ async fn run_benchmark(
     let mut write_bytes = 0_u64;
     let mut io_count = 0_u64;
     let write_started = Instant::now();
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::Write);
     while remaining > 0 {
         let length = usize::try_from(remaining.min(request.block_bytes)).map_err(|_| BenchmarkFailure::Verification)?;
         cancellable(file.write_all(&write_buffer[..length]), cancel, deadline).await?;
@@ -677,8 +771,16 @@ async fn run_benchmark(
         remaining -= length as u64;
         tokio::task::yield_now().await;
     }
+    #[cfg(test)]
+    stage.finish(true);
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::Sync);
     cancellable(file.sync_all(), cancel, deadline).await?;
+    #[cfg(test)]
+    stage.finish(true);
     let write_latency = write_started.elapsed();
+    #[cfg(test)]
+    let stage = DriveStageTimer::new(DriveStage::ReadbackVerify);
     cancellable(file.seek(std::io::SeekFrom::Start(0)), cancel, deadline).await?;
 
     let mut read_buffer = vec![0_u8; block_size];
@@ -701,6 +803,8 @@ async fn run_benchmark(
     if read_bytes != request.scratch_bytes || write_bytes != request.scratch_bytes || io_count > MAX_OPERATIONS {
         return Err(BenchmarkFailure::Verification);
     }
+    #[cfg(test)]
+    stage.finish(true);
     Ok(BenchmarkSample {
         read_bytes,
         write_bytes,
