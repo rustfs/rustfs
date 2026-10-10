@@ -740,7 +740,7 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
         .version_id(version)
         .send()
         .await?;
-    opa.expect_bucket_tags("s3:GetObject", source, Some("finance")).await?;
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
     client.list_objects_v2().bucket(source).send().await?;
     opa.expect_bucket_tags("s3:ListBucket", source, Some("finance")).await?;
     client.list_object_versions().bucket(source).send().await?;
