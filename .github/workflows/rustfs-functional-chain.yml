@@ -42,6 +42,16 @@ on:
         type: boolean
         required: false
         default: false
+      validation_tools_run_id:
+        description: Successful tool build run; required by Heal physical metadata checks
+        type: string
+        required: false
+        default: ''
+      validation_tools_run_attempt:
+        description: Exact tool build attempt
+        type: string
+        required: false
+        default: '1'
   workflow_run:
     workflows: ["Nightly GNU Build"]
     types: [completed]
@@ -182,6 +192,48 @@ jobs:
           "${RUNNER_TEMP}/rustfs-validation-python/bin/python" -m pip install \
             -r auto-testing/scripts/validation_ilm/requirements.txt
           printf '%s\n' "${RUNNER_TEMP}/rustfs-validation-python/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate Heal tool build identity
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOL_RUN_ID: ${{ inputs.validation_tools_run_id }}
+          TOOL_RUN_ATTEMPT: ${{ inputs.validation_tools_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "${TOOL_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${TOOL_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${TOOL_RUN_ID}/attempts/${TOOL_RUN_ATTEMPT}" \
+            > "${VALIDATION_ROOT}/tool-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          value = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "tool-run.json").read_text())
+          if (value.get("conclusion") != "success" or value.get("status") != "completed"
+                  or value.get("run_attempt") != int(os.environ["TOOL_RUN_ATTEMPT"])
+                  or value.get("path") not in {".github/workflows/rustfs-functional-chain.yml", ".github/workflows/rustfs-validation-tools.yml"}):
+              raise ValueError("Heal tool run is not an exact successful validation build attempt")
+          PY
+
+      - name: Download pinned Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-tools-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-tools-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        run: |
+          set -euo pipefail
+          TOOL_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B auto-testing/scripts/validation_heal/inspector.py \
+            --directory "${TOOL_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/tool-manifest.json"
+          printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Run selected canonical validation case
         if: ${{ !inputs.validation_tools_only }}
