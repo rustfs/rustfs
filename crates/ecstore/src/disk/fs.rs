@@ -223,12 +223,6 @@ pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()
     std::fs::rename(from, to)
 }
 
-#[cfg(any(not(windows), test))]
-#[tracing::instrument(level = "debug", skip_all)]
-pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    fs::read(path.as_ref()).await
-}
-
 // Bucket existence cache - reduces statx syscalls for repeated bucket checks
 
 /// Cache for bucket directory existence checks.
@@ -612,28 +606,6 @@ mod tests {
         // Verify content preserved
         let content = std::fs::read_to_string(&new_path).unwrap();
         assert_eq!(content, "test content");
-    }
-
-    #[tokio::test]
-    async fn test_read_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test_read.txt");
-
-        let test_content = b"This is test content for reading";
-        tokio::fs::write(&file_path, test_content).await.unwrap();
-
-        // Read file
-        let read_content = read_file(&file_path).await.unwrap();
-        assert_eq!(read_content, test_content);
-    }
-
-    #[tokio::test]
-    async fn test_read_file_nonexistent() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("nonexistent.txt");
-
-        // Should fail for non-existent file
-        assert!(read_file(&file_path).await.is_err());
     }
 
     #[tokio::test]

@@ -1,13 +1,15 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics, record_get_object_request_started};
+use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics, record_get_object_timeout_operation_start};
 use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
 use rustfs_s3_ops::S3Operation;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn bench_record_get_object_request_started(c: &mut Criterion) {
-    c.bench_function("record_get_object_request_started", |b| b.iter(record_get_object_request_started));
+fn bench_record_get_object_timeout_operation_start(c: &mut Criterion) {
+    c.bench_function("record_get_object_timeout_operation_start", |b| {
+        b.iter(record_get_object_timeout_operation_start)
+    });
 }
 
 fn bench_s3_http_outcomes(c: &mut Criterion) {
@@ -49,7 +51,7 @@ fn bench_metrics_collector_record_io_operation(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_record_get_object_request_started,
+    bench_record_get_object_timeout_operation_start,
     bench_s3_http_outcomes,
     bench_update_concurrent_requests,
     bench_metrics_collector_record_io_operation

@@ -51,6 +51,8 @@ unparseable = "unparseable"
 # Disaster-recovery objectives: recovery time and recovery point.
 RTO = "RTO"
 rto = "rto"
+# rustix OFlags variant (POSIX O_WRONLY equivalent).
+WRONLY = "WRONLY"
 
 [files]
 extend-exclude = []

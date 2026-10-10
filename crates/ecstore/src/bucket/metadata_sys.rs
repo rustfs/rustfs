@@ -178,6 +178,13 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     Ok(ObjectLockConfigState::ConfirmedAbsent)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CachedQuotaMetadataSnapshot {
+    pub(crate) quota: Option<BucketQuota>,
+    pub(crate) bucket_incarnation: Uuid,
+    pub(crate) quota_revision: OffsetDateTime,
+}
+
 /// Convert the persisted serving-layer configuration into the storage-level
 /// [`DefaultRetention`](crate::bucket::object_lock::types::DefaultRetention)
 /// the WORM evaluation code consumes (rustfs/backlog#1842). A rule without a
@@ -1423,6 +1430,9 @@ fn quota_config_and_incarnation_from_authority(
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+                return Err(Error::other("persisted bucket quota configuration is invalid"));
+            }
             Ok((
                 metadata.quota_config.clone(),
                 metadata.bucket_incarnation_id,
@@ -1435,6 +1445,15 @@ fn quota_config_and_incarnation_from_authority(
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         BucketMetadataAuthority::Fabricated => Err(Error::other(format!("bucket quota metadata is not authoritative: {bucket}"))),
     }
+}
+
+pub(crate) async fn get_cached_quota_config_and_incarnation_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+    bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
 }
 
 pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
@@ -2950,6 +2969,27 @@ impl BucketMetadataSys {
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+
+    async fn cached_quota_config_and_incarnation(&self, bucket: &str) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+        let metadata = {
+            let metadata_map = self.metadata_map.read().await;
+            metadata_map.get(bucket).cloned()
+        };
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        if !metadata.bucket_incarnation_sidecar || metadata.bucket_incarnation_id.is_nil() {
+            return Ok(None);
+        }
+        if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+            return Err(Error::other("persisted bucket quota configuration is invalid"));
+        }
+        Ok(Some(CachedQuotaMetadataSnapshot {
+            quota: metadata.quota_config.clone(),
+            bucket_incarnation: metadata.bucket_incarnation_id,
+            quota_revision: metadata.quota_config_updated_at,
+        }))
     }
 
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
@@ -4854,6 +4894,43 @@ mod tests {
             replacement_incarnation,
             "peer reload must converge the complete cached metadata snapshot"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_admission_rejects_stale_cached_no_quota() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("scoped metadata system");
+        let bucket = "stale-no-quota-admission";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let (stale, _) = sys.read().await.get_config(bucket).await.expect("cache initial metadata");
+        store
+            .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+            .await
+            .expect("publish quota to authoritative storage");
+        // Model a peer that has not received the newer configuration snapshot.
+        sys.read().await.set(bucket.to_owned(), stale).await;
+        assert!(
+            get_cached_quota_config_and_incarnation_in(&store.ctx, bucket)
+                .await
+                .expect("read stale cache")
+                .expect("cached bucket identity")
+                .quota
+                .is_none()
+        );
+
+        temp_env::async_with_vars([("RUSTFS_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_FAST_PATH", Some("true"))], async {
+            let error = crate::bucket::quota::reservation::begin(&store.ctx, bucket, "object", &ObjectOptions::default(), 0, 0)
+                .await
+                .err()
+                .expect("persisted quota must reject admission without its snapshot");
+            assert!(matches!(error, Error::PartMissingOrCorrupt), "{error:?}");
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

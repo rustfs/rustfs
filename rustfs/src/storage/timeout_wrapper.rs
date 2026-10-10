@@ -412,21 +412,21 @@ impl RequestTimeoutWrapper {
 
         debug!(timeout_secs = timeout_duration.as_secs(), "Starting timed operation");
 
-        rustfs_io_metrics::record_get_object_request_started();
+        rustfs_io_metrics::record_get_object_timeout_operation_start();
 
         let cancel_token_for_op = self.cancel_token.clone();
 
         match tokio::time::timeout(timeout_duration, operation(cancel_token_for_op)).await {
             Ok(Ok(result)) => {
                 let elapsed = self.elapsed();
-                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("success", elapsed.as_secs_f64());
                 debug!(elapsed_ms = elapsed.as_millis(), "Operation completed successfully");
 
                 TimedGetObjectResult::Success(result)
             }
             Ok(Err(e)) => {
                 let elapsed = self.elapsed();
-                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("error", elapsed.as_secs_f64());
                 debug!(elapsed_ms = elapsed.as_millis(), "Operation failed with error");
 
                 TimedGetObjectResult::Error(e)
@@ -436,7 +436,7 @@ impl RequestTimeoutWrapper {
                 self.cancel_token.cancel();
 
                 rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
-                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     timeout_secs = timeout_duration.as_secs(),

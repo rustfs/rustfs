@@ -1712,12 +1712,36 @@ async fn compensation_driven_copy_still_completes_transition() {
         .build()
         .unwrap();
 
+    let transition_state = get_global_transition_state();
+    let missed_before = transition_state.missed_immediate_tasks();
+    let compensation_before = transition_state.compensation_scheduled_tasks();
+    let put_barrier = backend.arm_put_barrier().await;
+
     with_forced_immediate_enqueue_timeout(&backend, || async {
         Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
             .await
             .expect("Failed to copy object through usecase");
     })
     .await;
+
+    assert!(
+        transition_state.missed_immediate_tasks() > missed_before,
+        "copy should exercise the forced immediate enqueue failure"
+    );
+    assert!(
+        transition_state.compensation_scheduled_tasks() > compensation_before,
+        "copy should schedule automatic compensation backfill"
+    );
+
+    // Observe automatic compensation reaching the tier before timing its final
+    // metadata commit; discovery and queue latency are separate from that commit.
+    put_barrier.wait_until_paused().await;
+    assert_eq!(
+        backend.object_count().await,
+        1,
+        "compensation should store the copied body before committing"
+    );
+    put_barrier.release();
 
     let info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
         .await

@@ -192,6 +192,91 @@ async fn wait_for_quorum_read_admission(clients: &[Client], bucket: &str) -> Tes
 }
 
 #[tokio::test]
+async fn test_cold_degraded_object_mutations_require_only_storage_quorum() -> TestResult {
+    crate::common::init_logging();
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+    cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+    cluster.set_env("RUSTFS_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_ENABLE", "false");
+    cluster.start().await?;
+    let clients = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bucket = "cold-degraded-mutations";
+    clients[0].create_bucket().bucket(bucket).send().await?;
+    // No object mutation may warm a process-wide configuration probe before
+    // the missing peer is introduced. Three shards still satisfy EC:2 writes.
+    cluster.stop_node(3)?;
+    let admission_deadline = Instant::now() + Duration::from_secs(30);
+    for client in &clients[..3] {
+        loop {
+            match client
+                .get_object()
+                .bucket(bucket)
+                .key("never-created-readiness-probe")
+                .send()
+                .await
+            {
+                Err(error) if error.as_service_error().and_then(|error| error.meta().code()) == Some("NoSuchKey") => break,
+                Err(error)
+                    if error.raw_response().is_some_and(|response| response.status().as_u16() == 503)
+                        && Instant::now() < admission_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => panic!("a cold readiness probe must not create an object"),
+            }
+        }
+    }
+    let body = b"first write while one peer is offline";
+    clients[0]
+        .put_object()
+        .bucket(bucket)
+        .key("object")
+        .body(Bytes::from_static(body).into())
+        .send()
+        .await?;
+    for client in &clients[..3] {
+        assert_quorum_object_body(client, bucket, "object", body).await?;
+    }
+    // This coordinator has not previously committed an object mutation either.
+    clients[1].delete_object().bucket(bucket).key("object").send().await?;
+    let error = clients[2]
+        .get_object()
+        .bucket(bucket)
+        .key("object")
+        .send()
+        .await
+        .expect_err("acknowledged deletion must be visible at another entrypoint");
+    assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchKey"));
+
+    cluster.stop_node(2)?;
+    let error = clients[0]
+        .put_object()
+        .bucket(bucket)
+        .key("below-quorum")
+        .body(Bytes::from_static(body).into())
+        .send()
+        .await
+        .expect_err("removing the cache gate must not weaken storage write quorum");
+    assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+    cluster.stop();
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResult {
     crate::common::init_logging();
 

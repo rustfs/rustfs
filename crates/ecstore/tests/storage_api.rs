@@ -61,6 +61,17 @@ pub(crate) mod minio_generated_read {
     };
 }
 
+pub(crate) mod cleanup_isolation {
+    pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{DeleteOptions, DiskError};
+}
+
+#[cfg(all(feature = "test-util", target_os = "linux"))]
+pub(crate) mod fd_relative {
+    pub(crate) use super::{DiskAPI, DiskOption, DiskStore, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions};
+}
+
 pub(crate) mod pinned_erasure_fixtures {
     pub(crate) use super::storage_contracts::{BucketOperations, HTTPRangeSpec, MakeBucketOptions, ObjectIO};
     pub(crate) use super::{ECStore, Endpoint, Erasure, Error, ObjectOptions};

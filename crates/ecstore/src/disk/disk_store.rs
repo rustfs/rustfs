@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::cleanup_runtime;
 use crate::disk::io_admission::{
     AdmissionReader, BoxedChunkReader, DiskIoAdmission, DiskIoClass, DiskIoContext, current_disk_io_context,
     with_disk_io_context, with_disk_io_permit,
@@ -485,10 +486,10 @@ impl LocalDiskWrapper {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
-        self.track_disk_health_mutation(
+        self.track_cleanup_mutation(
             "delete",
             DiskMetricMutation::Delete,
-            || async { Box::pin(self.disk.delete_with_namespace_owner(volume, path, opts, namespace_owner)).await },
+            || async { Box::pin(self.cleanup_delete(volume, path, opts, namespace_owner)).await },
             get_max_timeout_duration(),
         )
         .await
@@ -1476,6 +1477,28 @@ impl LocalDiskWrapper {
         )
     }
 
+    async fn cleanup_delete(
+        &self,
+        volume: &str,
+        path: &str,
+        options: DeleteOptions,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        if !cleanup_runtime::enabled()? {
+            return self.disk.delete_with_namespace_owner(volume, path, options, owner).await;
+        }
+        let disk = self.disk.clone();
+        let volume = volume.to_owned();
+        let path = path.to_owned();
+        let guarded = owner.is_some();
+        let operation = async move { disk.delete_with_namespace_owner(&volume, &path, options, owner).await };
+        if guarded {
+            cleanup_runtime::guarded_disk_operation(operation).await
+        } else {
+            cleanup_runtime::disk_operation(operation).await
+        }
+    }
+
     /// Run a delete under an owned coordinator task when a publication guard
     /// is present. This keeps the guard alive if the RPC waiter is cancelled
     /// while the local namespace mutation is still in progress.
@@ -1494,12 +1517,13 @@ impl LocalDiskWrapper {
         } else {
             get_max_timeout_duration()
         };
+        let cleanup_owner = external_guard.clone();
         run_owned_mutation(external_guard, move || async move {
             operation
-                .track_disk_health_mutation(
+                .track_cleanup_mutation(
                     "delete",
                     DiskMetricMutation::Delete,
-                    || async { operation.disk.delete(&volume, &path, options).await },
+                    || async { operation.cleanup_delete(&volume, &path, options, cleanup_owner).await },
                     timeout_duration,
                 )
                 .await
@@ -2015,6 +2039,31 @@ impl LocalDiskWrapper {
         self.track_disk_health_with_op("unknown", operation, timeout_duration).await
     }
 
+    /// Cleanup latency includes waiting behind a node-wide execution budget,
+    /// so a waiter deadline alone is not evidence that this disk is faulty.
+    /// The active disk health probe retains its original timeout policy.
+    async fn track_cleanup_mutation<T, F, Fut>(
+        &self,
+        op: &'static str,
+        mutation: DiskMetricMutation,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Runtime initialization must not prevent control-plane release of
+        // reader tokens. Disk I/O entries still propagate configuration errors.
+        let action = if cleanup_runtime::enabled().unwrap_or(false) {
+            TimeoutHealthAction::IgnoreFailure
+        } else {
+            TimeoutHealthAction::MarkFailure
+        };
+        self.track_disk_health_with_op_timeout_action_and_mutation(op, operation, timeout_duration, action, mutation)
+            .await
+    }
+
     async fn track_disk_health_mutation<T, F, Fut>(
         &self,
         op: &'static str,
@@ -2470,9 +2519,37 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
-        self.track_disk_health_with_op(
+        // Quota fence release is control-plane work and may wait for in-flight
+        // mutations. Keep its original waiter lifecycle instead of creating
+        // detached cleanup tasks for repeated fence-release RPCs.
+        if volume == super::RUSTFS_META_BUCKET && super::is_quota_mutation_fence_path(path) {
+            return self
+                .track_disk_health_with_op(
+                    "release_snapshot_lease",
+                    || async { self.disk.release_snapshot_lease(volume, path, token).await },
+                    get_max_timeout_duration(),
+                )
+                .await;
+        }
+        self.track_cleanup_mutation(
             "release_snapshot_lease",
-            || async { self.disk.release_snapshot_lease(volume, path, token).await },
+            DiskMetricMutation::None,
+            || async {
+                if self.disk.release_snapshot_lease_without_cleanup(volume, path, token).await {
+                    return Ok(());
+                }
+                if !cleanup_runtime::enabled().unwrap_or(false) {
+                    // The raw release removes the token before trying the
+                    // reclaim budget. Initialization failure therefore keeps
+                    // the cleanup intent and data, without leaking a reader
+                    // or falling back to unbudgeted filesystem deletion.
+                    return self.disk.release_snapshot_lease(volume, path, token).await;
+                }
+                let disk = self.disk.clone();
+                let volume = volume.to_owned();
+                let path = path.to_owned();
+                cleanup_runtime::release_lease(async move { disk.release_snapshot_lease(&volume, &path, token).await }).await
+            },
             get_max_timeout_duration(),
         )
         .await
@@ -2497,10 +2574,22 @@ impl DiskAPI for LocalDiskWrapper {
         } else {
             get_max_timeout_duration()
         };
-        self.track_disk_health_mutation(
+        self.track_cleanup_mutation(
             "delete_data_dir",
             DiskMetricMutation::Delete,
-            || async { self.disk.delete_data_dir(volume, path, opts).await },
+            || async {
+                if !cleanup_runtime::enabled()? {
+                    return self.disk.delete_data_dir(volume, path, opts).await;
+                }
+                let disk = self.disk.clone();
+                let volume = volume.to_owned();
+                let path = path.to_owned();
+                cleanup_runtime::disk_operation(async move {
+                    let _scope = scope;
+                    disk.delete_data_dir(&volume, &path, opts).await
+                })
+                .await
+            },
             timeout,
         )
         .await
@@ -2747,10 +2836,10 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        self.track_disk_health_mutation(
+        self.track_cleanup_mutation(
             "delete",
             DiskMetricMutation::Delete,
-            || async { self.disk.delete(volume, path, opt).await },
+            || async { self.cleanup_delete(volume, path, opt, None).await },
             get_max_timeout_duration(),
         )
         .await
@@ -2783,11 +2872,25 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
-        self.track_disk_health_mutation(
+        let cleanup = path.rsplit('/').next() == Some(cleanup_runtime::OLD_DATA_CLEANUP_RECEIPT_FILE);
+        self.track_disk_health_with_op_timeout_action_and_mutation(
             "write_all",
-            DiskMetricMutation::Write,
-            || async { self.disk.write_all(volume, path, data).await },
+            || async {
+                if !cleanup || !cleanup_runtime::enabled()? {
+                    return self.disk.write_all(volume, path, data).await;
+                }
+                let disk = self.disk.clone();
+                let volume = volume.to_owned();
+                let path = path.to_owned();
+                cleanup_runtime::disk_operation(async move { disk.write_all(&volume, &path, data).await }).await
+            },
             get_max_timeout_duration(),
+            if cleanup && cleanup_runtime::enabled()? {
+                TimeoutHealthAction::IgnoreFailure
+            } else {
+                TimeoutHealthAction::MarkFailure
+            },
+            DiskMetricMutation::Write,
         )
         .await
     }
@@ -3178,6 +3281,256 @@ mod tests {
         drop(checkpoint_permit);
         walk.abort();
         let _ = walk.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_cleanup_config_does_not_leak_snapshot_readers() {
+        const CHILD: &str = "RUSTFS_CLEANUP_INVALID_LEASE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "disk::disk_store::tests::invalid_cleanup_config_does_not_leak_snapshot_readers",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_CLEANUP_ASYNC_THREADS", "0")
+                    .output()
+                    .expect("run with invalid cleanup configuration")
+            })
+            .await
+            .expect("child process task");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let volume = "invalid-cleanup-config";
+        let path = "object/data";
+        wrapper.make_volume(volume).await.expect("bucket");
+        wrapper
+            .write_all(volume, "object/data/part.1", Bytes::from_static(b"live shard"))
+            .await
+            .expect("write shard");
+        let token = wrapper.acquire_snapshot_lease(volume, path).await.expect("GET lease");
+        wrapper
+            .release_snapshot_lease(volume, path, token)
+            .await
+            .expect("control-only release must not depend on cleanup initialization");
+        assert!(matches!(
+            wrapper.renew_snapshot_lease(volume, path, token).await,
+            Err(DiskError::FileNotFound)
+        ));
+
+        let token = wrapper
+            .acquire_snapshot_lease(volume, path)
+            .await
+            .expect("reader of old data");
+        // Register reclaim intent directly; this only updates the lease
+        // registry while a reader is present and performs no filesystem I/O.
+        assert_eq!(
+            disk.delete_data_dir(
+                volume,
+                path,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer reclaim"),
+            DataDirDeleteStatus::Deferred
+        );
+        assert!(
+            wrapper.release_snapshot_lease(volume, path, token).await.is_err(),
+            "invalid configuration must still reject reclamation"
+        );
+        assert!(
+            matches!(wrapper.renew_snapshot_lease(volume, path, token).await, Err(DiskError::FileNotFound)),
+            "failed reclamation must not strand a reader token"
+        );
+        assert_eq!(
+            wrapper.read_all(volume, "object/data/part.1").await.expect("retained data"),
+            Bytes::from_static(b"live shard"),
+            "configuration failure must not fall back to unbudgeted deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_cleanup_entries_share_disk_budget() {
+        const CHILD: &str = "RUSTFS_CLEANUP_RPC_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "disk::disk_store::tests::rpc_cleanup_entries_share_disk_budget",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_CLEANUP_ASYNC_THREADS", "1")
+                    .env("RUSTFS_CLEANUP_DISK_MAX_PENDING", "1")
+                    .env("RUSTFS_CLEANUP_DISK_WORKERS", "1")
+                    .env("RUSTFS_CLEANUP_GC_WORKERS", "1")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.unwrap());
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        let volume = "cleanup-receiver";
+        let path = "object/old-data";
+        let body_path = format!("{path}/part.1");
+        let receipt_path = format!("{path}/{}", cleanup_runtime::OLD_DATA_CLEANUP_RECEIPT_FILE);
+        wrapper.make_volume(volume).await.unwrap();
+        wrapper
+            .write_all(volume, &body_path, Bytes::from_static(b"old body"))
+            .await
+            .unwrap();
+        let read_lease = wrapper
+            .acquire_snapshot_lease(volume, path)
+            .await
+            .expect("ordinary GET lease");
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let occupied = tokio::spawn(cleanup_runtime::disk_operation(async move {
+            entered.send(()).unwrap();
+            // Deliberately stall the only cleanup scheduler to prove that
+            // ordinary GET completion does not dispatch to it.
+            released
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release stalled scheduler");
+            Ok(())
+        }));
+        tokio::time::timeout(Duration::from_secs(20), entry).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wrapper.release_snapshot_lease(volume, path, read_lease))
+            .await
+            .expect("ordinary GET release must progress while the cleanup scheduler is stalled")
+            .expect("release without reclamation");
+        let fence_path = super::super::quota_mutation_fence_path(volume, "object");
+        let fence = wrapper
+            .acquire_snapshot_lease(super::super::RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .unwrap();
+        wrapper
+            .release_snapshot_lease(super::super::RUSTFS_META_BUCKET, &fence_path, fence)
+            .await
+            .unwrap();
+        let timeout = wrapper
+            .track_cleanup_mutation(
+                "delete",
+                DiskMetricMutation::Delete,
+                || std::future::pending::<Result<()>>(),
+                Duration::from_millis(10),
+            )
+            .await;
+        assert!(matches!(timeout, Err(DiskError::Timeout)));
+        assert!(!wrapper.health.is_faulty(), "cleanup queue delay must not mark a healthy disk faulty");
+        let options = DeleteOptions {
+            recursive: true,
+            ..Default::default()
+        };
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // This is the same entry point used after RPC authentication and
+        // scanner publication-lease validation by handle_delete.
+        let result = wrapper
+            .delete_with_publication_guard(volume, path, options.clone(), Some(Arc::new(DropProbe(drops.clone()))))
+            .await;
+        assert!(matches!(result, Err(DiskError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(wrapper.delete_data_dir(volume, path, options.clone()).await,
+            Err(DiskError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock));
+        assert!(matches!(wrapper.write_all(volume, &receipt_path, Bytes::from_static(b"receipt")).await,
+            Err(DiskError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(wrapper.read_all(volume, &body_path).await.unwrap(), Bytes::from_static(b"old body"));
+        release.send(()).unwrap();
+        occupied.await.unwrap().unwrap();
+        wrapper
+            .write_all(volume, &receipt_path, Bytes::from_static(b"receipt"))
+            .await
+            .unwrap();
+        wrapper
+            .delete_with_publication_guard(volume, path, options, None)
+            .await
+            .unwrap();
+        assert!(matches!(wrapper.read_all(volume, &body_path).await, Err(DiskError::FileNotFound)));
+        // Snapshot readers defer old-data cleanup. Saturation must release
+        // their token while retaining reclaim intent, rather than leaking a
+        // live token or performing an unbudgeted delete on the RPC runtime.
+        wrapper
+            .write_all(volume, &body_path, Bytes::from_static(b"leased body"))
+            .await
+            .unwrap();
+        let lease = wrapper.acquire_snapshot_lease(volume, path).await.unwrap();
+        assert_eq!(
+            wrapper
+                .delete_data_dir(
+                    volume,
+                    path,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            DataDirDeleteStatus::Deferred
+        );
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let occupied = tokio::spawn(cleanup_runtime::disk_operation(async move {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            Ok(())
+        }));
+        tokio::time::timeout(Duration::from_secs(20), entry).await.unwrap().unwrap();
+        assert!(matches!(wrapper.release_snapshot_lease(volume, path, lease).await,
+            Err(DiskError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(wrapper.read_all(volume, &body_path).await.unwrap(), Bytes::from_static(b"leased body"));
+        release.send(()).unwrap();
+        occupied.await.unwrap().unwrap();
+        assert_eq!(
+            wrapper
+                .delete_data_dir(
+                    volume,
+                    path,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            DataDirDeleteStatus::Deleted
+        );
+        assert!(matches!(wrapper.read_all(volume, &body_path).await, Err(DiskError::FileNotFound)));
     }
 
     #[tokio::test]
