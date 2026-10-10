@@ -2157,6 +2157,7 @@ impl BucketMetadataSys {
 
     async fn persist_new_bucket_metadata_intent(&self, mut bm: BucketMetadata) -> Result<()> {
         bm.bucket_creation_committed = false;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;

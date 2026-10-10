@@ -18318,7 +18318,8 @@ mod tests {
         let bucket = format!("lock-create-intent-retry-{}", uuid::Uuid::new_v4());
         let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
         intent.lock_enabled = true;
-        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+        let incarnation = intent.bucket_incarnation_id;
+        crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
             .await
             .expect("persist pre-visibility lock intent");
         assert!(
@@ -18331,6 +18332,11 @@ mod tests {
         );
 
         store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect_err("an unlocked retry must not discard the Object Lock intent");
+
+        store
             .make_bucket(
                 &bucket,
                 &MakeBucketOptions {
@@ -18340,6 +18346,15 @@ mod tests {
             )
             .await
             .expect("retry lock-enabled creation");
+        let (metadata, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read committed intent");
+        assert!(persisted && metadata.bucket_creation_committed);
+        assert_eq!(
+            store.bucket_incarnation_id(&bucket).await.expect("read retried generation"),
+            incarnation,
+            "retry must keep the intent's generation"
+        );
         assert!(matches!(
             crate::bucket::metadata_sys::get_object_lock_config_state_in(&ctx, &bucket)
                 .await

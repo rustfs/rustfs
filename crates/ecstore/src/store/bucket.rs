@@ -901,16 +901,17 @@ impl ECStore {
             }
         };
         let confirmed_missing = existing_bucket_info.is_none();
+        let mut creation_intent = None;
         if confirmed_missing
             && !opts.no_lock
             && !is_meta_bucketname(bucket)
             && let Some(metadata_store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await
-            && let Some(old_incarnation) = crate::bucket::metadata::load_bucket_incarnation(metadata_store, bucket).await?
+            && let Some(old_incarnation) =
+                crate::bucket::metadata::load_bucket_incarnation(metadata_store.clone(), bucket).await?
         {
             // A quorum-level absence is not proof that every disk lost the old
-            // generation. Require the explicit recovery path to verify all disks
-            // and retire this incarnation before a same-name create can mutate
-            // any volume.
+            // generation. Verify every disk before resuming an intent or
+            // requiring administrator recovery of an old generation.
             self.ensure_bucket_volume_absent_on_all_sets(bucket)
                 .await
                 .map_err(|error| match error {
@@ -921,11 +922,24 @@ impl ECStore {
                     ),
                     other => other,
                 })?;
-            return Err(StorageError::InvalidArgument(
-                "CreateBucket".to_string(),
-                "bucket".to_string(),
-                format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
-            ));
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            if opts.lock_enabled
+                && persisted
+                && metadata.bucket_creation_commit_record_present
+                && metadata.needs_bucket_creation_commit()
+                && metadata.bucket_incarnation_id == old_incarnation
+                && !crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?
+            {
+                // Resume only an explicit, uncommitted Object Lock intent, keeping
+                // its generation. Published or legacy generations still need recovery.
+                creation_intent = Some(metadata);
+            } else {
+                return Err(StorageError::InvalidArgument(
+                    "CreateBucket".to_string(),
+                    "bucket".to_string(),
+                    format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
+                ));
+            }
         }
         let existing_metadata = if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
@@ -955,7 +969,7 @@ impl ECStore {
             }
             Some(metadata)
         } else {
-            None
+            creation_intent
         };
 
         let mut meta = existing_metadata.unwrap_or_else(|| {
@@ -990,7 +1004,19 @@ impl ECStore {
 
         let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
         if metadata_persisted_before_physical {
-            metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
+            await_bucket_lifecycle_operation(
+                bucket_lifecycle_guard.as_ref(),
+                ns_guard.as_ref(),
+                bucket,
+                "bucket metadata creation intent",
+                await_bucket_namespace_operation(
+                    metadata_transaction_guard.as_ref(),
+                    bucket,
+                    "bucket creation metadata transaction",
+                    metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()),
+                ),
+            )
+            .await?;
             if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -1879,6 +1905,92 @@ mod tests {
             .recover_orphaned_bucket(&bucket, incarnation)
             .await
             .expect("retry after metadata cleanup should converge from durable retirement proof");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lock_creation_retry_rejects_committed_retired_and_legacy_generations() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        for state in ["committed", "retired", "legacy"] {
+            let bucket = format!("lock-retry-{state}-{}", Uuid::new_v4().simple());
+            if state == "committed" {
+                store
+                    .make_bucket(
+                        &bucket,
+                        &MakeBucketOptions {
+                            lock_enabled: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create committed Object Lock bucket");
+                store
+                    .delete_bucket_on_sets(&bucket, &DeleteBucketOptions::default())
+                    .await
+                    .expect("simulate loss of physical volumes while metadata remains");
+            } else {
+                let mut intent = BucketMetadata::new(&bucket);
+                intent.lock_enabled = true;
+                metadata_sys::set_new_bucket_metadata_intent_in(&store.ctx, intent)
+                    .await
+                    .expect("persist uncommitted Object Lock intent");
+            }
+            let incarnation = crate::bucket::metadata::load_bucket_incarnation(store.clone(), &bucket)
+                .await
+                .expect("load fixture generation")
+                .expect("fixture has an incarnation sidecar");
+
+            if state == "retired" {
+                let _guard = store
+                    .acquire_bucket_lifecycle_write_lock(&bucket)
+                    .await
+                    .expect("fence retirement");
+                crate::bucket::retirement::commit_retirement(store.clone(), &bucket, incarnation, &ObjectOptions::default())
+                    .await
+                    .expect("retire the pending generation");
+            } else if state == "legacy" {
+                let path = BucketMetadata::new(&bucket).save_file_path();
+                let mut bytes = crate::config::com::read_config(store.clone(), &path)
+                    .await
+                    .expect("load metadata header");
+                bytes.truncate(4);
+                rmp::encode::write_map_len(&mut bytes, 3).expect("write legacy map");
+                rmp::encode::write_str(&mut bytes, "Name").expect("write name key");
+                rmp::encode::write_str(&mut bytes, &bucket).expect("write name");
+                rmp::encode::write_str(&mut bytes, "LockEnabled").expect("write lock key");
+                rmp::encode::write_bool(&mut bytes, true).expect("write lock state");
+                rmp::encode::write_str(&mut bytes, "BucketIncarnationID").expect("write generation key");
+                rmp::encode::write_bin(&mut bytes, incarnation.as_bytes()).expect("write generation");
+                crate::config::com::save_config(store.clone(), &path, bytes)
+                    .await
+                    .expect("persist legacy metadata");
+            }
+
+            let error = store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("an old or retired generation must not resume as an intent");
+            assert!(matches!(error, StorageError::InvalidArgument(_, _, _)), "{state}: {error}");
+            assert_eq!(
+                crate::bucket::metadata::load_bucket_incarnation(store.clone(), &bucket)
+                    .await
+                    .expect("read preserved generation"),
+                Some(incarnation),
+                "{state}: a refused retry must preserve metadata"
+            );
+            assert!(
+                store.ensure_bucket_volume_absent_on_all_sets(&bucket).await.is_ok(),
+                "{state}: retry must not create volumes"
+            );
+        }
     }
 
     async fn setup_bucket_quorum_test_env(
