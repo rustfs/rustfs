@@ -964,7 +964,11 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
         .await
         .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
 
-    assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        Some("Invalid argument: A destination versionId requires replication authorization")
+    );
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
     assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
 }
