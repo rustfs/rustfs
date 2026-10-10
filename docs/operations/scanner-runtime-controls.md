@@ -172,6 +172,12 @@ catch_up_estimate.discovered_expiry_items
 catch_up_estimate.discovered_transition_items
 ```
 
+### Periodic checkpoint persistence
+
+`metrics.scan_checkpoint` is the in-memory resume hint; it does not confirm a durable save. `metrics.scan_checkpoints_persisted` lists the latest confirmed periodic save for each `(pool_index, set_index)` handled by this process, with its bucket, `saved_unix_secs`, and optional checkpoint cursor. It retains one observation per set, is reset on process restart, and does not include the final bucket save. Query the peer executing the walk for remote-worker observations. `metrics.scan_checkpoint_save_failures` counts failed periodic saves, including failures to refresh CAS revisions after a write; failed attempts do not advance the confirmed saved frontier.
+
+An ordinary failed save drops that snapshot and leaves the bounded checkpoint receiver active, so the next producer interval tries again. A CAS conflict or an unreadable revision after a successful write cancels the bucket attempt and reloads persisted state through the existing retry path. Leader, cycle, and publication fencing remain mandatory. A transient error can therefore lose progress since the last confirmed checkpoint, but cannot permanently disable periodic saves for a continuing bucket walk.
+
 ## Usage State Reset
 
 The supported break-glass route for rebuilding scanner usage state is `POST /v3/scanner/usage-state/reset` with body `{"mode":"full-rebuild"}`, authenticated as an admin identity holding `ConfigUpdateAdminAction` (route registered in `rustfs/src/admin/route_registration_test.rs`). Use it only after the scanner status shows a usage-floor load failure, a conflicting persisted usage floor, or an operator decision to discard the durable usage baseline and rebuild it from a full scanner pass.

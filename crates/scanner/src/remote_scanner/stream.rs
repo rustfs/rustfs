@@ -853,7 +853,7 @@ async fn scan_and_persist_local_bucket(
                 )
                 .await
                 {
-                    ScannerCheckpointPersistResult::Saved => {
+                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
                         if guard.is_lock_lost() {
                             scan_ctx.cancel();
                             let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -869,8 +869,12 @@ async fn scan_and_persist_local_bucket(
                             "remote namespace scanner cache fence changed during checkpoint save",
                         ));
                     }
-                    ScannerCheckpointPersistResult::Failed(_error) => {
-                        checkpoint_channel_closed = true;
+                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(format!(
+                            "remote namespace scanner checkpoint needs reload: {error}",
+                        )));
                     }
                 }
             }

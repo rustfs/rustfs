@@ -1526,7 +1526,7 @@ impl FolderScanner {
 
             let mut abandoned_children: DataUsageHashMap = HashSet::new();
             if !into.compacted {
-                abandoned_children = self.old_cache.find_children_copy(this_hash.clone());
+                abandoned_children = self.old_cache.find_children_copy(&this_hash);
             }
 
             debug!(

@@ -1658,6 +1658,51 @@ fn metadata_for_object_version(bucket: &str, object: &str, version_id: Option<Uu
     meta.marshal_msg().expect("test metadata should marshal")
 }
 
+#[tokio::test]
+#[serial]
+async fn test_scan_folder_keeps_old_cache_bounded_by_loaded_entries() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.is_erasure_mode = true;
+    for directory in 0..16 {
+        for object in 0..32 {
+            write_test_object_metadata(&temp_dir, "bucket", &format!("dir-{directory:03}/obj-{object:03}")).await;
+        }
+    }
+    let initial_capacity = scanner.old_cache.cache.capacity();
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan object directory tree");
+    assert_eq!(
+        scanner
+            .new_cache
+            .size_recursive(&hash_path("bucket").0)
+            .expect("scanned root totals")
+            .objects,
+        512,
+        "all object directories must still be counted",
+    );
+    assert!(scanner.old_cache.cache.is_empty(), "lookups must not retain visited object placeholders");
+    assert_eq!(
+        scanner.old_cache.cache.capacity(),
+        initial_capacity,
+        "old cache must not allocate a growing table"
+    );
+}
+
 async fn write_test_object_metadata(root: &std::path::Path, bucket: &str, object: &str) {
     write_test_object_metadata_bytes(root, bucket, object, &metadata_for_object(bucket, object)).await;
 }

@@ -1221,8 +1221,8 @@ impl DataUsageCache {
         self.cache.get(&hash_path(path).key())
     }
 
-    pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache.entry(h.string()).or_default().children.clone()
+    pub fn find_children_copy(&self, h: &DataUsageHash) -> DataUsageHashMap {
+        self.cache.get(&h.0).map(|entry| entry.children.clone()).unwrap_or_default()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
