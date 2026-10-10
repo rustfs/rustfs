@@ -27,6 +27,16 @@ on:
         description: Exact successful build attempt
         type: string
         required: true
+      validation_case:
+        description: Canonical auto-testing validation case ID; empty runs the functional chain
+        type: string
+        required: false
+        default: ''
+      auto_testing_sha:
+        description: Exact auto-testing commit for a validation case
+        type: string
+        required: false
+        default: ''
   workflow_run:
     workflows: ["Nightly GNU Build"]
     types: [completed]
@@ -41,7 +51,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -88,6 +98,97 @@ jobs:
           else
             echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
           fi
+
+  validation:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_case != '' }}
+    runs-on: smoke-testing
+    timeout-minutes: 90
+    concurrency:
+      group: rustfs-shared-functional-tests-v2
+      cancel-in-progress: false
+    env:
+      RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+      RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+      RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
+      RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+      RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+    steps:
+      - name: Checkout candidate resolver
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize validation evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          VALIDATION_ROOT="${RUNNER_TEMP}/rustfs-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${VALIDATION_ROOT}"
+          printf 'VALIDATION_ROOT=%s\n' "${VALIDATION_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Resolve immutable candidate
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from scripts.resolve_functional_candidate import resolve
+
+          revision = os.environ["AUTO_TESTING_SHA"]
+          if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+              raise ValueError("validation requires an exact auto-testing commit SHA")
+          candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]))
+          manifest = candidate["manifest"]
+          root = Path(os.environ["VALIDATION_ROOT"])
+          (root / "candidate-source.json").write_text(json.dumps(candidate, sort_keys=True) + "\n")
+          (root / "candidate.json").write_text(json.dumps({
+              "package_url": manifest["package_url"],
+              "package_sha256": manifest["package_sha256"],
+              "source_sha": manifest["source_sha"],
+          }, sort_keys=True) + "\n")
+          PY
+
+      - name: Checkout exact auto-testing revision
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Run selected canonical validation case
+        env:
+          VALIDATION_CASE: ${{ inputs.validation_case }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          ./auto-testing/scripts/run_validation_case.sh \
+            "${VALIDATION_CASE}" "${VALIDATION_ROOT}/candidate.json" \
+            "${AUTO_TESTING_SHA}" "${VALIDATION_ROOT}/run"
+
+      - name: Show validation report
+        if: ${{ always() }}
+        run: |
+          if [ -f "${VALIDATION_ROOT}/run/report.md" ]; then
+            cat "${VALIDATION_ROOT}/run/report.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
 
   upgrade:
     needs: [prepare]
