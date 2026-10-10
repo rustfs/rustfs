@@ -1209,7 +1209,7 @@ impl ScannerIOCache for SetDisks {
                                 )
                                 .await
                                 {
-                                    ScannerCheckpointPersistResult::Saved => {
+                                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
                                         if cache_guard.is_lock_lost() || ctx_clone.is_cancelled() {
                                             scan_ctx.cancel();
                                             await_scanner_disk_shutdown(scan.as_mut()).await;
@@ -1221,19 +1221,10 @@ impl ScannerIOCache for SetDisks {
                                         await_scanner_disk_shutdown(scan.as_mut()).await;
                                         break Err(Error::other("scanner bucket cache fence changed during checkpoint save"));
                                     }
-                                    ScannerCheckpointPersistResult::Failed(error) => {
-                                        error!(
-                                            target: "rustfs::scanner::io",
-                                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_IO,
-                                            bucket = %bucket.name,
-                                            cache_name = %cache_name,
-                                            state = "periodic_checkpoint_save_failed",
-                                            error = %error,
-                                            "Scanner periodic checkpoint save failed"
-                                        );
-                                        checkpoint_channel_closed = true;
+                                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                                        scan_ctx.cancel();
+                                        await_scanner_disk_shutdown(scan.as_mut()).await;
+                                        break Err(error);
                                     }
                                 }
                             }

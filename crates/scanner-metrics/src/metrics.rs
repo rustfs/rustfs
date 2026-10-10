@@ -18,7 +18,7 @@ use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -994,6 +994,8 @@ pub struct Metrics {
     scanner_bitrot_cycle_enabled: AtomicBool,
     scanner_bitrot_cycle_millis: AtomicU64,
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
+    scanner_checkpoints_persisted: Mutex<BTreeMap<(usize, usize), ScannerPersistedCheckpointReport>>,
+    scanner_checkpoint_save_failures: AtomicU64,
     scanner_checkpoint_used: AtomicU64,
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
@@ -1135,6 +1137,15 @@ pub struct ScannerCheckpointReport {
     pub resume_after: String,
     pub reason: String,
     pub last_event: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerPersistedCheckpointReport {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub bucket: String,
+    pub saved_unix_secs: u64,
+    pub checkpoint: Option<ScannerCheckpointReport>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1498,6 +1509,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_checkpoint: Option<ScannerCheckpointReport>,
+    #[serde(default)]
+    pub scan_checkpoints_persisted: Vec<ScannerPersistedCheckpointReport>,
+    #[serde(default)]
+    pub scan_checkpoint_save_failures: u64,
     #[serde(default)]
     pub scan_checkpoint_used: u64,
     #[serde(default)]
@@ -2046,6 +2061,8 @@ impl Metrics {
             scanner_bitrot_cycle_enabled: AtomicBool::new(false),
             scanner_bitrot_cycle_millis: AtomicU64::new(0),
             scanner_checkpoint: Mutex::new(None),
+            scanner_checkpoints_persisted: Mutex::new(BTreeMap::new()),
+            scanner_checkpoint_save_failures: AtomicU64::new(0),
             scanner_checkpoint_used: AtomicU64::new(0),
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
@@ -2351,6 +2368,34 @@ impl Metrics {
             Ok(mut current) => *current = Some(checkpoint),
             Err(poisoned) => *poisoned.into_inner() = Some(checkpoint),
         }
+    }
+
+    /// Keep only the latest confirmed periodic save per set on this process.
+    pub fn record_scanner_checkpoint_saved(
+        &self,
+        pool_index: usize,
+        set_index: usize,
+        bucket: &str,
+        checkpoint: Option<ScannerCheckpointReport>,
+    ) {
+        let mut saved = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        saved.insert(
+            (pool_index, set_index),
+            ScannerPersistedCheckpointReport {
+                pool_index,
+                set_index,
+                bucket: bucket.to_string(),
+                saved_unix_secs: unix_now_secs(),
+                checkpoint,
+            },
+        );
+    }
+
+    pub fn record_scanner_checkpoint_save_failed(&self) {
+        self.scanner_checkpoint_save_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_scanner_checkpoint_used(&self) {
@@ -3512,6 +3557,14 @@ impl Metrics {
             Ok(checkpoint) => checkpoint.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
+        m.scan_checkpoints_persisted = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        m.scan_checkpoint_save_failures = self.scanner_checkpoint_save_failures.load(Ordering::Relaxed);
         m.scan_checkpoint_used = self.scanner_checkpoint_used.load(Ordering::Relaxed);
         m.scan_checkpoint_cleared = self.scanner_checkpoint_cleared.load(Ordering::Relaxed);
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
@@ -3973,6 +4026,37 @@ mod tests {
         assert_eq!(report.scan_checkpoint_used, 1);
         assert_eq!(report.scan_checkpoint_stale, 1);
         assert_eq!(report.scan_checkpoint_cleared, 1);
+    }
+
+    #[tokio::test]
+    async fn report_distinguishes_persisted_checkpoints_from_memory_and_failures() {
+        let metrics = Metrics::new();
+        let saved = ScannerCheckpointReport {
+            version: 1,
+            resume_after: "bucket/first".to_string(),
+            reason: "objects".to_string(),
+            last_event: "saved".to_string(),
+        };
+        metrics.record_scanner_checkpoint_saved(0, 1, "bucket", Some(saved.clone()));
+        metrics.record_scanner_checkpoint_set(1, "bucket/second", "objects");
+        metrics.record_scanner_checkpoint_save_failed();
+        let report = metrics.report().await;
+        assert_eq!(report.scan_checkpoint_save_failures, 1);
+        assert_eq!(report.scan_checkpoint.expect("in-memory cursor").resume_after, "bucket/second");
+        assert_eq!(report.scan_checkpoints_persisted.len(), 1);
+        assert_eq!(report.scan_checkpoints_persisted[0].checkpoint, Some(saved));
+        assert_eq!(report.scan_checkpoints_persisted[0].set_index, 1);
+        assert!(report.scan_checkpoints_persisted[0].saved_unix_secs > 0);
+        metrics.record_scanner_checkpoint_saved(0, 1, "other-bucket", None);
+        metrics.record_scanner_checkpoint_saved(0, 2, "bucket", None);
+        let report = metrics.report().await;
+        assert_eq!(
+            report.scan_checkpoints_persisted.len(),
+            2,
+            "retain at most one save per set, not per bucket"
+        );
+        assert_eq!(report.scan_checkpoints_persisted[0].bucket, "other-bucket");
+        assert!(report.scan_checkpoints_persisted[0].checkpoint.is_none());
     }
 
     #[tokio::test]
