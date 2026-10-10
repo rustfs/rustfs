@@ -117,6 +117,9 @@ pub const O_APPEND: FileMode = 0x00400;
 //     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
+    if mode & O_CREATE != 0 {
+        super::os::record_native_publication(path.as_ref());
+    }
     let base_opts = match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
         O_RDONLY => get_readonly_options(),
         O_WRONLY => get_writeonly_options(),
@@ -160,6 +163,7 @@ pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     fs::create_dir_all(path.as_ref()).await
 }
 
@@ -211,15 +215,18 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     fs::create_dir(path.as_ref()).await
 }
 
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     fs::rename(from, to).await
 }
 
 #[cfg(any(not(windows), test))]
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     std::fs::rename(from, to)
 }
 

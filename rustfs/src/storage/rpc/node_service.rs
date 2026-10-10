@@ -6166,6 +6166,291 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    async fn check_remote_bucket_creation(interrupted: bool) {
+        use crate::storage::storage_api::{
+            BucketMetadata,
+            contract::bucket::{BucketOperations as _, MakeBucketOptions},
+            ecstore_bucket::{
+                metadata::{ConfigState, load_bucket_metadata},
+                object_lock::ObjectLockApi as _,
+                versioning::VersioningApi as _,
+            },
+            ecstore_config::com::read_config,
+            ecstore_disk::{BUCKET_META_PREFIX, DiskOption, new_disk},
+            ecstore_error::StorageError,
+            init_bucket_metadata_sys, init_local_disks_with_instance_ctx,
+        };
+        use futures_util::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+
+        #[derive(serde::Deserialize)]
+        struct CreationCommit {
+            #[serde(rename = "BucketCreationCommitted")]
+            committed: bool,
+        }
+
+        let fixture = target_rpc_fixture().await;
+        let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind real creation server");
+        let address = listener.local_addr().expect("creation server address");
+        let set = fixture.env.ecstore.all_set_disks().into_iter().next().expect("erasure set");
+        let original_disks = set.disks.read().await.clone();
+        assert_eq!(original_disks.len(), 4, "retain the configured four-disk quorum");
+        assert!(original_disks.iter().all(Option::is_some), "every configured disk must be present");
+        let mut endpoints = fixture.env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut endpoint = Endpoint::try_from(format!("http://{address}{}", fixture.env.disk_paths[0].display()).as_str())
+            .expect("real remote endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        endpoint.is_local = true;
+        endpoints[0] = endpoint.clone();
+        let mut pool = fixture.env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints.clone());
+        init_local_disks_with_instance_ctx(&fixture.instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register the real backing disk directories");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let mut backing_disks = Vec::new();
+        for endpoint in &endpoints {
+            backing_disks.push(
+                service
+                    .find_disk(&endpoint.to_string())
+                    .await
+                    .expect("registered backing disk"),
+            );
+        }
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            // This fixture exercises the production handler and transport;
+            // authentication middleware has separate coverage.
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        endpoint.is_local = false;
+        let mut remote = None;
+        let outcome = AssertUnwindSafe(super::timeout(Duration::from_secs(90), async {
+            let client = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("real RemoteDisk client");
+            remote = Some(client.clone());
+            assert!(!client.is_local(), "the client must actually use RPC");
+            let disk_id = backing_disks[0]
+                .get_disk_id()
+                .await
+                .expect("backing disk identity")
+                .filter(|id| !id.is_nil())
+                .expect("formatted backing disk identity");
+            client
+                .set_disk_id(Some(disk_id))
+                .await
+                .expect("bind the actual backing disk identity");
+            let mut disks = original_disks.clone();
+            disks[0] = Some(client.clone());
+            *set.disks.write().await = disks;
+
+            let probe = format!("rpc-ready-{}", Uuid::new_v4());
+            let payload = Bytes::from_static(b"real remote creation transport");
+            client.make_volume(&probe).await.expect("remote volume publication must work");
+            client.stat_volume(&probe).await.expect("remote volume inspection must work");
+            client
+                .write_all(&probe, "probe", payload.clone())
+                .await
+                .expect("remote write must work");
+            assert_eq!(client.read_all(&probe, "probe").await.expect("remote read must work"), payload);
+            assert_eq!(
+                backing_disks[0]
+                    .read_all(&probe, "probe")
+                    .await
+                    .expect("actual backing bytes"),
+                payload,
+                "the successful RPC must reach the registered native disk"
+            );
+            client.delete_volume(&probe, true).await.expect("remove the transport probe");
+            init_bucket_metadata_sys(fixture.env.ecstore.clone(), Vec::new()).await;
+
+            let bucket = format!("remote-lock-{}", Uuid::new_v4());
+            let options = MakeBucketOptions {
+                lock_enabled: true,
+                versioning_enabled: true,
+                created_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("explicit creation time")),
+                ..Default::default()
+            };
+            assert!(
+                client
+                    .bucket_creation_witness(&bucket)
+                    .await
+                    .expect("inspect the live remote capability")
+                    .is_none(),
+                "a working RemoteDisk does not provide native retry evidence"
+            );
+            for disk in &backing_disks {
+                assert_eq!(
+                    disk.stat_volume(&bucket).await.expect_err("the new bucket must be absent"),
+                    DiskError::VolumeNotFound
+                );
+            }
+            if interrupted {
+                fixture.env.ecstore.fail_next_bucket_creation_after_intent_for_test(&bucket);
+                let error = fixture
+                    .env
+                    .ecstore
+                    .make_bucket(&bucket, &options)
+                    .await
+                    .expect_err("interrupt the real producer");
+                assert_eq!(error.to_string(), "Io error: injected failure after bucket creation intent persistence");
+            } else {
+                fixture
+                    .env
+                    .ecstore
+                    .make_bucket(&bucket, &options)
+                    .await
+                    .expect("fresh creation must not require native retry proof");
+            }
+
+            let metadata = load_bucket_metadata(fixture.env.ecstore.clone(), &bucket)
+                .await
+                .expect("reload persisted metadata");
+            let metadata_path = metadata.save_file_path();
+            let incarnation_path = format!("{BUCKET_META_PREFIX}/{bucket}/.bucket-incarnation");
+            let metadata_bytes = read_config(fixture.env.ecstore.clone(), &metadata_path)
+                .await
+                .expect("read complete persisted metadata bytes");
+            let incarnation_bytes = read_config(fixture.env.ecstore.clone(), &incarnation_path)
+                .await
+                .expect("read persisted incarnation sidecar");
+            BucketMetadata::check_header(&metadata_bytes).expect("persisted metadata header");
+            let stored = BucketMetadata::unmarshal(&metadata_bytes[4..]).expect("decode every stored metadata field");
+            let creation: CreationCommit =
+                rmp_serde::from_slice(&metadata_bytes[4..]).expect("decode the required persisted commit field");
+            assert_eq!(
+                creation.committed, !interrupted,
+                "only successful physical creation may commit the generation"
+            );
+            assert!(!stored.bucket_incarnation_id.is_nil(), "the producer must persist a real generation");
+            assert_eq!(incarnation_bytes.as_slice(), stored.bucket_incarnation_id.as_bytes());
+            assert_eq!(stored.name, bucket);
+            assert_eq!(stored.created, options.created_at.expect("requested creation time"));
+            assert!(stored.lock_enabled);
+            assert!(!metadata.object_lock_config_xml.is_empty());
+            assert!(matches!(
+                ConfigState::of(&metadata.object_lock_config_xml, &metadata.object_lock_config),
+                ConfigState::Valid(config) if config.enabled()
+            ));
+            assert!(!metadata.versioning_config_xml.is_empty());
+            assert!(matches!(
+                ConfigState::of(&metadata.versioning_config_xml, &metadata.versioning_config),
+                ConfigState::Valid(config) if config.enabled()
+            ));
+            for disk in &backing_disks {
+                if interrupted {
+                    assert_eq!(
+                        disk.stat_volume(&bucket)
+                            .await
+                            .expect_err("the interrupted producer must not publish"),
+                        DiskError::VolumeNotFound
+                    );
+                } else {
+                    disk.stat_volume(&bucket)
+                        .await
+                        .expect("fresh creation must be visible on every actual backing disk");
+                }
+            }
+
+            if interrupted {
+                let retry = fixture.env.ecstore.make_bucket(&bucket, &options).await;
+                assert!(
+                    matches!(
+                        &retry,
+                        Err(StorageError::InvalidArgument(operation, parameter, reason))
+                            if operation == "CreateBucket"
+                                && parameter == "bucket"
+                                && reason == &format!(
+                                    "orphaned bucket generation {} requires administrator recovery before recreation",
+                                    metadata.bucket_incarnation_id
+                                )
+                    ),
+                    "the working Unsupported backend must refuse the same-G retry: {retry:?}"
+                );
+                assert_eq!(
+                    read_config(fixture.env.ecstore.clone(), &metadata_path)
+                        .await
+                        .expect("reread complete intent bytes"),
+                    metadata_bytes,
+                    "retry refusal must preserve every persisted metadata field"
+                );
+                assert_eq!(
+                    read_config(fixture.env.ecstore.clone(), &incarnation_path)
+                        .await
+                        .expect("reread incarnation sidecar"),
+                    incarnation_bytes,
+                    "retry refusal must preserve the original generation bytes"
+                );
+                let after = load_bucket_metadata(fixture.env.ecstore.clone(), &bucket)
+                    .await
+                    .expect("reload the refused intent");
+                assert_eq!(after.bucket_incarnation_id, metadata.bucket_incarnation_id);
+                for disk in &backing_disks {
+                    assert_eq!(
+                        disk.stat_volume(&bucket)
+                            .await
+                            .expect_err("the refused retry must not publish on any backing disk"),
+                        DiskError::VolumeNotFound
+                    );
+                }
+            }
+        }))
+        .catch_unwind()
+        .await;
+
+        // Finish cleanup before propagating an assertion failure or timeout.
+        *set.disks.write().await = original_disks;
+        let close_result = match remote {
+            Some(client) => Some(super::timeout(Duration::from_secs(10), client.close()).await),
+            None => None,
+        };
+        let _ = shutdown.send(());
+        let server_result = super::timeout(Duration::from_secs(10), &mut server).await;
+        if server_result.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        match outcome {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(result) => result.expect("bounded live remote creation scenario"),
+        }
+        if let Some(result) = close_result {
+            result.expect("bounded remote close").expect("close the real remote client");
+        }
+        server_result
+            .expect("bounded creation server shutdown")
+            .expect("creation server task")
+            .expect("creation server result");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unsupported_remote_disk_does_not_block_fresh_lock_enabled_creation() {
+        check_remote_bucket_creation(false).await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unsupported_remote_disk_cannot_retry_interrupted_lock_enabled_creation() {
+        check_remote_bucket_creation(true).await;
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn replacement_resume_selection_falls_back_to_a_remote_survivor() {
         use crate::storage::storage_api::{
