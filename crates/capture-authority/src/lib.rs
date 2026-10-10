@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+mod committed;
 mod truncate;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -50,6 +51,12 @@ pub enum StoreError {
     CorruptRecord,
     #[error("invalid log sequence")]
     InvalidLogSequence,
+    #[error("invalid committed log")]
+    InvalidCommittedLog,
+    #[error("committed regression")]
+    CommittedRegression,
+    #[error("committed log protected")]
+    CommittedLogProtected,
     #[error("log index exhausted")]
     IndexExhausted,
     #[error("store already initialized")]
@@ -80,6 +87,9 @@ impl StoreError {
             Self::UnsupportedSchema => "unsupported_schema",
             Self::CorruptRecord => "corrupt_record",
             Self::InvalidLogSequence => "invalid_log_sequence",
+            Self::InvalidCommittedLog => "invalid_committed_log",
+            Self::CommittedRegression => "committed_regression",
+            Self::CommittedLogProtected => "committed_log_protected",
             Self::IndexExhausted => "index_exhausted",
             Self::AlreadyInitialized => "already_initialized",
             Self::MissingStore => "missing_store",
@@ -153,7 +163,7 @@ impl Store {
         let tx = store.database.begin_read()?;
         let meta = tx.open_table(META)?;
         let schema = meta.get("schema")?.ok_or(StoreError::CorruptRecord)?;
-        if number(schema.value())? != 1 {
+        if !matches!(number(schema.value())?, 1 | 2) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = meta.get("identity")?.ok_or(StoreError::CorruptRecord)?;
@@ -180,6 +190,7 @@ impl Store {
             next = key.value().checked_add(1);
             last = Some(entry.id);
         }
+        committed::validate_committed(&meta, &logs)?;
         let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         if tail != last {
             return Err(StoreError::InvalidLogSequence);
@@ -944,6 +955,225 @@ mod tests {
         child.wait().expect("wait");
         assert_prefix(&Store::open(&path, identity()).expect("reopen"), &truncate_batch()[..2]);
     }
+    fn committed_schema(store: &Store) -> u64 {
+        let tx = store.database.begin_read().expect("read metadata transaction");
+        number(
+            tx.open_table(META)
+                .expect("open committed metadata")
+                .get("schema")
+                .expect("read committed schema")
+                .expect("committed fixture value")
+                .value(),
+        )
+        .expect("committed fixture value")
+    }
+    fn committed_fixture() -> (tempfile::TempDir, CrashBackend, Store) {
+        let (dir, backend, mut store) = media_store();
+        store.save_vote(vote()).expect("save fixture vote");
+        store.append(&truncate_batch()).expect("append fixture logs");
+        (dir, backend, store)
+    }
+    #[test]
+    fn committed_schema1_migration_reopen() {
+        let (_dir, backend, mut store) = committed_fixture();
+        assert_eq!(store.read_committed().expect("read exact committed"), None);
+        assert_eq!(committed_schema(&store), 1);
+        let id = truncate_batch()[2].id;
+        store.save_committed(id).expect("save committed ACK");
+        drop(store);
+        let store =
+            Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen committed fixture");
+        assert_eq!(store.read_committed().expect("read exact committed"), Some(id));
+        assert_eq!(committed_schema(&store), 2);
+        assert_prefix(&store, &truncate_batch());
+        drop(store);
+        for (schema, marker) in [
+            (1u64, Some(encode_id(id))),
+            (2, None),
+            (2, Some(vec![1])),
+            (2, Some(encode_id(LogId { term: 99, ..id }))),
+            (2, Some(encode_id(LogId { leader_node: 99, ..id }))),
+        ] {
+            let db = CrashBackend::new(&backend.path).database();
+            let tx = db.begin_write().expect("write corrupt fixture transaction");
+            {
+                let mut meta = tx.open_table(META).expect("open metadata");
+                meta.insert("schema", schema.to_be_bytes().as_slice())
+                    .expect("insert corrupt fixture schema");
+                meta.remove("committed").expect("remove corrupt fixture marker");
+                if let Some(bytes) = marker {
+                    meta.insert("committed", bytes.as_slice())
+                        .expect("insert corrupt fixture marker");
+                }
+            }
+            tx.commit().expect("commit corrupt fixture");
+            let corrupt = Store {
+                database: db,
+                writable: true,
+            };
+            assert!(
+                matches!(corrupt.read_committed(), Err(StoreError::CorruptRecord)),
+                "U10_INVARIANT corrupt committed read accepted"
+            );
+            assert!(
+                matches!(Store::from_database(corrupt.database, identity()), Err(StoreError::CorruptRecord)),
+                "U10_INVARIANT corrupt committed accepted"
+            );
+        }
+    }
+    #[test]
+    fn committed_rejects_missing_mismatch_and_regression() {
+        let (_dir, _backend, mut store) = committed_fixture();
+        let id = truncate_batch()[2].id;
+        for bad in [
+            LogId { index: 99, ..id },
+            LogId { term: 99, ..id },
+            LogId { leader_node: 99, ..id },
+        ] {
+            assert!(matches!(store.save_committed(bad), Err(StoreError::InvalidCommittedLog)));
+            assert_eq!(store.read_committed().expect("read exact committed"), None);
+            assert_eq!(committed_schema(&store), 1);
+            assert_prefix(&store, &truncate_batch());
+        }
+        store.save_committed(id).expect("save committed ACK");
+        store.save_committed(id).expect("save committed ACK");
+        assert!(matches!(
+            store.save_committed(truncate_batch()[1].id),
+            Err(StoreError::CommittedRegression)
+        ));
+        assert_eq!(store.read_committed().expect("read exact committed"), Some(id));
+        store.save_committed(truncate_batch()[3].id).expect("committed fixture value");
+        assert_eq!(store.read_committed().expect("read exact committed"), Some(truncate_batch()[3].id));
+        assert_eq!(committed_schema(&store), 2);
+        assert_prefix(&store, &truncate_batch());
+    }
+    #[test]
+    fn committed_protects_truncate_and_allows_suffix_replacement() {
+        let (_dir, backend, mut store) = committed_fixture();
+        let id = truncate_batch()[2].id;
+        store.save_committed(id).expect("save committed ACK");
+        for from in [0, 2] {
+            assert!(
+                matches!(store.truncate_suffix(from), Err(StoreError::CommittedLogProtected)),
+                "U10_INVARIANT committed prefix deleted"
+            );
+            assert_prefix(&store, &truncate_batch());
+        }
+        store.truncate_suffix(3).expect("truncate uncommitted suffix");
+        let mut expected = truncate_batch()[..3].to_vec();
+        let replacement: Vec<_> = (3..5)
+            .map(|index| LogEntry {
+                id: LogId {
+                    term: 12,
+                    leader_node: 7,
+                    index,
+                },
+                payload: vec![9],
+            })
+            .collect();
+        store.append(&replacement).expect("append replacement suffix");
+        expected.extend(replacement);
+        drop(store);
+        let store =
+            Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen committed fixture");
+        assert_eq!(store.read_committed().expect("read exact committed"), Some(id));
+        assert_prefix(&store, &expected);
+    }
+    #[test]
+    fn committed_success_survives_power_cut() {
+        for advance in [false, true] {
+            let (_dir, backend, mut store) = committed_fixture();
+            store.save_committed(truncate_batch()[1].id).expect("committed fixture value");
+            let id = truncate_batch()[if advance { 2 } else { 1 }].id;
+            if advance {
+                store.save_committed(id).expect("save committed ACK");
+            }
+            backend.cut();
+            drop(store);
+            let store =
+                Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("committed fixture value");
+            assert_eq!(
+                store.read_committed().expect("read exact committed"),
+                Some(id),
+                "U10_INVARIANT acknowledged committed lost"
+            );
+            assert_eq!(committed_schema(&store), 2);
+            assert_prefix(&store, &truncate_batch());
+        }
+    }
+    #[test]
+    fn committed_power_cut_never_splits_schema_and_marker() {
+        for sync in 1..=2 {
+            for after in [false, true] {
+                let (_dir, backend, mut store) = committed_fixture();
+                let id = truncate_batch()[2].id;
+                backend.arm(sync, after, true);
+                assert!(matches!(store.save_committed(id), Err(StoreError::CommitIndeterminate(_))));
+                backend.cut();
+                drop(store);
+                match Database::builder().create_with_backend(CrashBackend::new(&backend.path)) {
+                    Ok(db) => {
+                        let recovered = Store::from_database(db, identity());
+                        assert!(recovered.is_ok(), "U10_INVARIANT logical schema marker split: {:?}", recovered.err());
+                        let store = recovered.expect("committed fixture value");
+                        let pair = (committed_schema(&store), store.read_committed().expect("read exact committed"));
+                        assert!(pair == (1, None) || pair == (2, Some(id)), "U10_INVARIANT partial migration");
+                        assert_prefix(&store, &truncate_batch());
+                    }
+                    Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))) => {}
+                    Err(error) => panic!("unexpected media recovery error: {error:?}"),
+                }
+            }
+        }
+    }
+    #[test]
+    fn committed_sync_error_disables_all_mutations() {
+        for migrated in [false, true] {
+            let (_dir, backend, mut store) = committed_fixture();
+            let previous = truncate_batch()[1].id;
+            if migrated {
+                store.save_committed(previous).expect("stable first committed");
+            }
+            let id = truncate_batch()[2].id;
+            backend.arm(1, false, false);
+            assert!(matches!(store.save_committed(id), Err(StoreError::CommitIndeterminate(_))));
+            for blocked in [previous, id] {
+                assert!(matches!(store.save_committed(blocked), Err(StoreError::WriteDisabled)));
+            }
+            assert!(matches!(store.save_vote(vote()), Err(StoreError::WriteDisabled)));
+            assert!(matches!(store.append(&[]), Err(StoreError::WriteDisabled)));
+            assert!(matches!(store.append(&truncate_batch()), Err(StoreError::WriteDisabled)));
+            for from in [0, 2, 99] {
+                assert!(matches!(store.truncate_suffix(from), Err(StoreError::WriteDisabled)));
+            }
+            backend.cut();
+            drop(store);
+            let store =
+                Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen after sync error");
+            let pair = (committed_schema(&store), store.read_committed().expect("read recovered committed"));
+            let old = if migrated { (2, Some(previous)) } else { (1, None) };
+            assert!(pair == old || pair == (2, Some(id)), "U10_INVARIANT recovered wrong committed");
+            assert_prefix(&store, &truncate_batch());
+        }
+    }
+    #[test]
+    fn committed_survives_child_kill() {
+        let dir = tempfile::tempdir().expect("committed fixture value");
+        let path = dir.path().join("db");
+        let mut store = Store::initialize(&path, identity()).expect("committed fixture value");
+        store.save_vote(vote()).expect("save fixture vote");
+        store.append(&truncate_batch()).expect("append fixture logs");
+        drop(store);
+        let mut child = child(&path, "committed");
+        ack(&mut child);
+        child.kill().expect("committed fixture value");
+        child.wait().expect("committed fixture value");
+        let mut store = Store::open(&path, identity()).expect("committed fixture value");
+        assert_eq!(store.read_committed().expect("read exact committed"), Some(truncate_batch()[2].id));
+        assert_eq!(committed_schema(&store), 2);
+        assert!(matches!(store.truncate_suffix(2), Err(StoreError::CommittedLogProtected)));
+        assert_prefix(&store, &truncate_batch());
+    }
     fn child(path: &Path, mode: &str) -> std::process::Child {
         Command::new(std::env::current_exe().expect("exe"))
             .args(["--exact", "tests::process_child", "--nocapture"])
@@ -1009,7 +1239,9 @@ mod tests {
                 assert!(Store::open(path, identity()).is_err(), "U08_INVARIANT exclusive lock absent");
             } else {
                 let mut store = Store::open(path, identity()).expect("child open");
-                if std::env::var("U08_CHILD_MODE").expect("mode") == "truncate" {
+                if std::env::var("U08_CHILD_MODE").expect("mode") == "committed" {
+                    store.save_committed(truncate_batch()[2].id).expect("child committed ACK");
+                } else if std::env::var("U08_CHILD_MODE").expect("mode") == "truncate" {
                     store.truncate_suffix(2).expect("truncate ACK");
                 } else {
                     store.save_vote(vote()).expect("vote");

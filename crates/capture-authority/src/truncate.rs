@@ -7,6 +7,11 @@ impl Store {
         let tx = self.write_transaction()?;
         {
             let mut meta = tx.open_table(META)?;
+            let logs = tx.open_table(LOGS)?;
+            if crate::committed::validate_committed(&meta, &logs)?.is_some_and(|id| from <= id.index) {
+                return Err(StoreError::CommittedLogProtected);
+            }
+            drop(logs);
             let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
             if tail.is_none_or(|id| from > id.index) {
                 return Ok(());
