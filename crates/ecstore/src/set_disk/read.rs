@@ -884,6 +884,8 @@ impl SetDisks {
             );
 
             let decode_stage_start = Instant::now();
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
             let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
@@ -941,6 +943,8 @@ impl SetDisks {
         }
 
         let decode_stage_start = Instant::now();
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let body =
             try_read_inline_data_shards_direct(&mut reader_setup.readers, erasure.data_shards, read_length, object_size).await;
         let decode_elapsed = decode_stage_start.elapsed();
@@ -1359,6 +1363,8 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
             let coding::decode::DecodeOutcome {
                 written,
                 error: err,
@@ -1914,6 +1920,8 @@ impl SetDisks {
         .with_deferred_parity_handles(deferred_stripe_handles)
         .with_deferred_parity_reopeners(deferred_reopeners)
         .with_repair_evidence(Arc::clone(&repair));
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = if single_inflight {
             coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
@@ -2533,6 +2541,10 @@ impl Drop for LegacyPerPartDecodeReader {
 }
 
 fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {
+    #[cfg(feature = "test-util")]
+    if super::conditional_read_bench::cache_bypass_applies(bucket) {
+        return Some("benchmark");
+    }
     if !read_data {
         return Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA);
     }

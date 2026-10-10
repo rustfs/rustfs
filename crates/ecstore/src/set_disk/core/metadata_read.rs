@@ -656,6 +656,8 @@ async fn inline_body_miss_reason_from_observations<'a>(
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
 
+    #[cfg(test)]
+    crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
         Some(body) if body.len() == object_size => None,
         _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),

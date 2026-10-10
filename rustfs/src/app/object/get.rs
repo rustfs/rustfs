@@ -72,6 +72,39 @@ type ColdFillReaderOpenProbeState = Option<(rustfs_object_data_cache::ObjectData
 #[cfg(test)]
 static COLD_FILL_READER_OPEN_PROBE: OnceLock<Mutex<ColdFillReaderOpenProbeState>> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Default)]
+struct BodyCacheFillCalls {
+    reservations: AtomicU64,
+    fills: AtomicU64,
+}
+
+#[cfg(test)]
+type BodyCacheFillProbeState = Option<(rustfs_object_data_cache::ObjectDataCacheKey, Arc<BodyCacheFillCalls>)>;
+
+#[cfg(test)]
+static BODY_CACHE_FILL_PROBE: OnceLock<Mutex<BodyCacheFillProbeState>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_body_cache_fill_call_for_test(plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan, reservation: bool) {
+    let Some(key) = plan.key() else { return };
+    let counters = BODY_CACHE_FILL_PROBE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(probe_key, _)| probe_key == key)
+        .map(|(_, counts)| Arc::clone(counts));
+    if let Some(counters) = counters {
+        let counter = if reservation {
+            &counters.reservations
+        } else {
+            &counters.fills
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn adjust_cold_fill_disk_permit_metric(owner: ColdFillDiskPermitOwner, acquired: bool) {
     macro_rules! adjust_gauge {
         ($name:literal) => {{
@@ -1098,6 +1131,8 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
             let publish = async {
                 #[cfg(test)]
                 wait_cold_fill_publication_barrier(&engine_plan).await;
+                #[cfg(test)]
+                record_body_cache_fill_call_for_test(&engine_plan, false);
                 adapter.fill_reserved_body(&engine_plan, reserved).await
             };
             tokio::pin!(publish);
@@ -2860,6 +2895,8 @@ impl DefaultObjectUsecase {
                             return;
                         };
 
+                        #[cfg(test)]
+                        record_body_cache_fill_call_for_test(&engine_plan, true);
                         let reservation = adapter.reserve_body(&engine_plan);
                         #[cfg(test)]
                         let reader_open_plan = engine_plan.clone();
@@ -3508,9 +3545,17 @@ impl DefaultObjectUsecase {
                 let cache_plan = cache_plan.clone();
                 let fill_bytes = buffered_body.clone();
                 tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                        record_body_cache_fill_call_for_test(plan, false);
+                    }
                     let _ = fill_get_object_body_cache_from_buffered_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                 });
             } else if cache_fill_allowed {
+                #[cfg(test)]
+                if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                    record_body_cache_fill_call_for_test(plan, false);
+                }
                 let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
             }
 
@@ -3579,6 +3624,10 @@ impl DefaultObjectUsecase {
                     let cache_plan = cache_plan.clone();
                     let fill_bytes = bytes.clone();
                     tokio::spawn(async move {
+                        #[cfg(test)]
+                        if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                            record_body_cache_fill_call_for_test(plan, false);
+                        }
                         let _ = fill_get_object_body_cache_from_materialized_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                     });
 
@@ -5462,7 +5511,11 @@ mod on_demand_migration_tests {
         let data = payload(512);
         let etag = source_head(&data).etag.expect("etag");
 
-        let source = ScriptedSource::for_object(&data);
+        let head = source_head(&data);
+        let source = ScriptedSource::new(
+            vec![Ok(head.clone()), Ok(head.clone()), Ok(head.clone())],
+            vec![Ok((head, data.clone(), None))],
+        );
         let mut headers = HeaderMap::new();
         headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(&format!("\"{etag}\"")).unwrap());
         let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
@@ -5470,7 +5523,6 @@ mod on_demand_migration_tests {
         assert_eq!(source.head_calls(), 1);
         assert_eq!(source.get_calls(), 0, "a 304 never pulls");
 
-        let source = ScriptedSource::for_object(&data);
         let mut headers = HeaderMap::new();
         headers.insert(http::header::IF_MATCH, HeaderValue::from_static("\"another-etag\""));
         let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
@@ -5479,6 +5531,15 @@ mod on_demand_migration_tests {
         assert_eq!(get_count(&state, OdmOutcome::SourceHit), 2);
         assert_eq!(state.inflight_keys(), 0);
         assert!(rt.write_back.puts().is_empty());
+
+        let (mut output, _) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(
+            collect_body(&mut output).await,
+            data,
+            "positive control still fetches the source representation"
+        );
+        assert_eq!(source.get_calls(), 1, "the same SourceClient counter observes the positive-control GET");
+        assert_eq!(source.head_calls(), 3, "each conditional and ordinary request reads source metadata");
     }
 
     #[tokio::test]
@@ -6960,6 +7021,94 @@ mod tests {
         assert_eq!(coordinator.global_waiter_count_for_test(), 0);
         drop(producer);
         assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn conditional_get_304_skips_cache_fill_calls_with_live_positive_control() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        struct ResetProbes;
+        impl Drop for ResetProbes {
+            fn drop(&mut self) {
+                *BODY_CACHE_FILL_PROBE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("cache-fill probe") = None;
+                *COLD_FILL_READER_OPEN_PROBE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("reader-open probe") = None;
+            }
+        }
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("conditional-fill-calls-{}", Uuid::new_v4());
+        let object = "object.bin";
+        let payload: Vec<_> = (0..1_300_000)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+            .collect();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let info = put_real_cold_fill_object(&store, &bucket, object, &payload).await;
+        let adapter = context.object_data_cache();
+        let plan = real_cold_fill_plan(&adapter, &bucket, object, &info);
+        let key = plan.key().expect("cacheable key").clone();
+        let fills = Arc::new(BodyCacheFillCalls::default());
+        let reader_opens = Arc::new(AtomicU64::new(0));
+        let _reset = ResetProbes;
+        *BODY_CACHE_FILL_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("cache-fill probe") = Some((key.clone(), Arc::clone(&fills)));
+        *COLD_FILL_READER_OPEN_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("reader-open probe") = Some((key, Arc::clone(&reader_opens)));
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let input = GetObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_owned())
+            .build()
+            .expect("GET input");
+        let mut req = build_request(input.clone(), Method::GET);
+        req.headers.insert(
+            http::header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("\"{}\"", info.etag.expect("ETag"))).expect("condition"),
+        );
+        let error = usecase.execute_get_object(req).await.expect_err("matching condition");
+        assert_eq!(error.code(), &S3ErrorCode::NotModified);
+        assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
+        assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
+        assert_eq!(fills.fills.load(Ordering::Relaxed), 0, "no cache-fill publish call");
+        assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
+
+        let mut response = usecase
+            .execute_get_object(build_request(input, Method::GET))
+            .await
+            .expect("positive-control GET");
+        let mut body = response.output.body.take().expect("body");
+        let mut actual = Vec::new();
+        while let Some(chunk) = body.next().await {
+            actual.extend_from_slice(&chunk.expect("positive-control chunk"));
+        }
+        assert_eq!(actual, payload);
+        assert!(
+            reader_opens.load(Ordering::Relaxed) > 0,
+            "the same factory probe observes the positive control"
+        );
+        assert!(
+            fills.reservations.load(Ordering::Relaxed) > 0,
+            "the same reservation probe observes the positive control"
+        );
+        assert!(
+            fills.fills.load(Ordering::Relaxed) > 0,
+            "the same fill probe observes the positive control"
+        );
+        assert!(
+            matches!(adapter.lookup_body(&plan).await, rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)),
+            "the positive control really populated the cache"
+        );
     }
 
     #[tokio::test]

@@ -108,6 +108,9 @@ their issue closes.
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner (warp/s3bench) | internode + scanner runbooks |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
+| `prepare_conditional_read_baseline.py` | dev-tool | Installs only the matching conditional-read benchmark harness in a clean detached baseline | `docs/testing/conditional-read-benchmark.md` |
+| `run_conditional_read_abba.py` | dev-tool | Serial ordinary/hit/miss GET ABBA with cache/slow-disk controls and drift/regression gates | `docs/testing/conditional-read-benchmark.md` |
+| `test_conditional_read_abba.py` | dev-tool | Parser, drift rejection, and throughput/lock regression tests for conditional-read evidence | `run_conditional_read_abba.py` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation; usage in the module docstring | `test_issue_2007_coalescer_prometheus_report.sh` |

@@ -1324,8 +1324,8 @@ pub(crate) mod test {
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
-            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
-            fail_next_quota_ledger_save_for_test,
+            ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
+            PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
         };
     }
 

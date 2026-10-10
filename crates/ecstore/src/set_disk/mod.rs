@@ -793,6 +793,11 @@ const DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: bool = false;
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
 
+#[cfg(feature = "test-util")]
+mod conditional_read_bench;
+#[cfg(feature = "test-util")]
+pub use conditional_read_bench::ConditionalReadBenchmarkMetadataGuard;
+
 const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS";
 const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS";
 const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET";
@@ -1211,6 +1216,21 @@ mod prepared_get_object_metadata_tests {
                 .expect("reader task")
                 .expect("metadata-only result");
             assert_eq!(reader.object_info.etag, info.etag);
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN),
+                0,
+                "damaged inline data was never opened"
+            );
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                0,
+                "missing shards were never opened"
+            );
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_BODY_DECODE),
+                0,
+                "the body verifier and decoder were never entered"
+            );
             let mut body = Vec::new();
             assert!(
                 reader.stream.read_to_end(&mut body).await.is_err(),
@@ -1228,6 +1248,74 @@ mod prepared_get_object_metadata_tests {
             assert!(
                 calls.total(disk_call_counters::KIND_READ_VERSION) > first_calls,
                 "an incomplete terminal snapshot must not satisfy the next metadata read from cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn read_condition_skips_shard_open_and_decode_with_live_positive_controls() {
+        for size in [4096, 1_300_000] {
+            let (_dirs, set) = make_local_set_disks(4, 2).await;
+            let bucket = "read-condition-body-counters";
+            let object = object_with_initial_data_shards(bucket, &format!("body-counters-{size}"));
+            let opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            let payload: Vec<_> = (0..size)
+                .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+                .collect();
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let mut put = PutObjReader::from_vec(payload.clone());
+            let info = set.put_object(bucket, &object, &mut put, &opts).await.expect("write object");
+            let calls = disk_call_counters::observe(&object);
+            let reader = crate::object_api::with_get_object_read_condition(
+                Arc::new(StopReadForEtag(info.etag.expect("committed ETag"))),
+                set.get_object_reader(bucket, &object, None, HeaderMap::new(), &opts),
+            )
+            .await
+            .expect("terminal metadata reader");
+            drop(reader);
+            assert!(calls.total(disk_call_counters::KIND_READ_VERSION) > 0, "metadata really was read");
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN),
+                0,
+                "no inline shard source opened"
+            );
+            assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 0, "no disk shard source opened");
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_BODY_DECODE),
+                0,
+                "no body verifier or decoder entered"
+            );
+
+            let mut reader = crate::object_api::with_get_object_read_condition(
+                Arc::new(StopReadForEtag("different-etag".to_owned())),
+                set.get_object_reader(bucket, &object, None, HeaderMap::new(), &opts),
+            )
+            .await
+            .expect("unmatched condition opens the intact object");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("positive-control body");
+            assert_eq!(body, payload);
+            let source_kind = if size == 4096 {
+                disk_call_counters::KIND_INLINE_SHARD_OPEN
+            } else {
+                disk_call_counters::KIND_DISK_SHARD_OPEN
+            };
+            assert!(
+                calls.total(source_kind) > 0,
+                "the same source counter observes the positive control: size={size}, inline={}, disk={}, decode={}",
+                calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN),
+                calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                calls.total(disk_call_counters::KIND_BODY_DECODE),
+            );
+            assert!(
+                calls.total(disk_call_counters::KIND_BODY_DECODE) > 0,
+                "the same decode counter observes the positive control"
             );
         }
     }
@@ -2933,7 +3021,11 @@ fn load_get_metadata_slowtail_fault_config() -> Option<GetMetadataSlowtailFaultC
 }
 
 fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {
-    if !read_data {
+    #[cfg(feature = "test-util")]
+    let benchmark_metadata = conditional_read_bench::applies(bucket, object);
+    #[cfg(not(feature = "test-util"))]
+    let benchmark_metadata = false;
+    if !read_data && !benchmark_metadata {
         return None;
     }
 

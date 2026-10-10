@@ -3280,6 +3280,246 @@ mod tests {
         assert_eq!(bytes_polled.load(Ordering::Relaxed), 0);
     }
 
+    mod conditional_object_http {
+        use super::*;
+        use crate::app::storage_api::object_usecase::{StorageObjectInfo, check_preconditions};
+        use crate::server::hybrid::HybridBody;
+
+        #[derive(Clone)]
+        struct ConditionalObjectS3 {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[derive(Debug)]
+        struct FixtureTransportError(String);
+
+        impl std::fmt::Display for FixtureTransportError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl std::error::Error for FixtureTransportError {}
+
+        impl<'a> From<Box<dyn std::error::Error + Send + Sync + 'a>> for FixtureTransportError {
+            fn from(error: Box<dyn std::error::Error + Send + Sync + 'a>) -> Self {
+                Self(error.to_string())
+            }
+        }
+
+        fn object_info() -> StorageObjectInfo {
+            StorageObjectInfo {
+                etag: Some("abc".to_owned()),
+                mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture timestamp")),
+                user_defined: HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into(),
+                ..Default::default()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl s3s::S3 for ConditionalObjectS3 {
+            async fn get_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::GetObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::GetObjectOutput {
+                    body: Some(s3s::dto::StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+
+            async fn head_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::HeadObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::HeadObjectOutput {
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+        }
+
+        #[tokio::test]
+        async fn conditional_get_head_http1_http2_parse_headers_and_apply_precedence() {
+            let cases: &[(&str, &[(&str, &str)], StatusCode, bool)] = &[
+                ("strong list", &[("if-none-match", "\"other\", \"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak list", &[("if-none-match", "\"other\", W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak tag", &[("if-none-match", "W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("wildcard", &[("if-none-match", "*")], StatusCode::NOT_MODIFIED, true),
+                ("strong match list", &[("if-match", "\"other\", \"abc\"")], StatusCode::OK, true),
+                ("weak match fails", &[("if-match", "W/\"abc\"")], StatusCode::PRECONDITION_FAILED, true),
+                ("wildcard match", &[("if-match", "*")], StatusCode::OK, true),
+                (
+                    "If-Match precedes matching If-None-Match",
+                    &[("if-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching If-Match does not suppress If-None-Match",
+                    &[("if-match", "\"abc\""), ("if-none-match", "W/\"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                (
+                    "If-Match suppresses If-Unmodified-Since",
+                    &[
+                        ("if-match", "\"abc\""),
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-None-Match suppresses If-Modified-Since",
+                    &[
+                        ("if-none-match", "\"other\""),
+                        ("if-modified-since", "Tue, 14 Nov 2023 22:13:21 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Unmodified-Since precedes wildcard If-None-Match",
+                    &[
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                        ("if-none-match", "*"),
+                    ],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "date matches at same second",
+                    &[("if-modified-since", "Tue, 14 Nov 2023 22:13:20 GMT")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                ("unmatched list", &[("if-none-match", "\"other\", W/\"different\"")], StatusCode::OK, true),
+                // These existing s3s parse boundaries reject the request before the handler.
+                ("malformed ETag", &[("if-none-match", "\"abc")], StatusCode::BAD_REQUEST, false),
+                ("invalid date", &[("if-modified-since", "not-a-date")], StatusCode::BAD_REQUEST, false),
+                (
+                    "obsolete date",
+                    &[("if-modified-since", "Tuesday, 14-Nov-23 22:13:20 GMT")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+                (
+                    "duplicate condition",
+                    &[("if-none-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+            ];
+            for http2 in [false, true] {
+                for method in [Method::GET, Method::HEAD] {
+                    for (name, headers, expected_status, reaches_handler) in cases {
+                        let calls = Arc::new(AtomicUsize::new(0));
+                        let inner = S3ServiceBuilder::new(ConditionalObjectS3 {
+                            calls: Arc::clone(&calls),
+                        })
+                        .build();
+                        let service = ServiceBuilder::new()
+                            .layer(BodylessStatusFixLayer)
+                            .layer(HeadRequestBodyFixLayer)
+                            .map_response(|response: Response<s3s::Body>| {
+                                response.map(|rest_body| HybridBody::<s3s::Body, Empty<Bytes>>::Rest { rest_body })
+                            })
+                            .map_err(|error: s3s::HttpError| FixtureTransportError(error.to_string()))
+                            .service(inner);
+                        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                        let server = tokio::spawn(async move {
+                            let service = TowerToHyperService::new(service);
+                            if http2 {
+                                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/2 server");
+                            } else {
+                                hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/1 server");
+                            }
+                        });
+                        let mut request = HttpRequest::builder()
+                            .method(method.clone())
+                            .uri("http://localhost/bucket/object");
+                        for (header, value) in *headers {
+                            request = request.header(*header, *value);
+                        }
+                        let request = request.body(Empty::<Bytes>::new()).expect("conditional request");
+                        let (response, client) = if http2 {
+                            let (mut sender, connection) =
+                                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                                    .await
+                                    .expect("HTTP/2 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/2 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/2 response deadline")
+                                .expect("HTTP/2 response");
+                            (response, client)
+                        } else {
+                            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                                .await
+                                .expect("HTTP/1 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/1 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/1 response deadline")
+                                .expect("HTTP/1 response");
+                            (response, client)
+                        };
+                        assert_eq!(response.status(), *expected_status, "{name}: {method}, HTTP/2={http2}");
+                        assert_eq!(calls.load(Ordering::Relaxed), usize::from(*reaches_handler), "{name}: parser routing");
+                        if *expected_status == StatusCode::NOT_MODIFIED {
+                            assert_eq!(response.headers()[http::header::ETAG], "\"abc\"", "{name}");
+                            assert_eq!(response.headers()[http::header::CACHE_CONTROL], "max-age=60", "{name}");
+                            assert!(response.headers().contains_key(http::header::LAST_MODIFIED), "{name}");
+                            assert!(response.headers().contains_key(http::header::DATE), "{name}");
+                            assert!(!response.headers().contains_key(CONTENT_LENGTH), "{name}");
+                            assert!(!response.headers().contains_key(http::header::TRANSFER_ENCODING), "{name}");
+                        }
+                        let bytes = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+                            .await
+                            .expect("body deadline")
+                            .expect("response body")
+                            .to_bytes();
+                        if method == Method::HEAD || *expected_status == StatusCode::NOT_MODIFIED {
+                            assert!(bytes.is_empty(), "{name}: {method}, HTTP/2={http2}");
+                        } else if *expected_status == StatusCode::OK {
+                            assert_eq!(&bytes[..], b"payload", "{name}");
+                        } else if *expected_status == StatusCode::PRECONDITION_FAILED {
+                            assert!(String::from_utf8_lossy(&bytes).contains("<Code>PreconditionFailed</Code>"), "{name}");
+                        }
+                        client.abort();
+                        server.abort();
+                    }
+                }
+            }
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct UploadPartTimeoutS3 {
         timeout: Duration,

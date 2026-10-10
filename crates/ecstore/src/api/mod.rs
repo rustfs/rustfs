@@ -591,6 +591,7 @@ pub mod set_disk {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::set_disk::ConditionalReadBenchmarkMetadataGuard;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 
         /// Keep a namespace commit pending until the returned owner is dropped.
