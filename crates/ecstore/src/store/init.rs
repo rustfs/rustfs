@@ -866,7 +866,6 @@ mod tests {
         should_defer_rebalance_auto_start, should_retry_format_load, wait_for_local_decommission_resume_delay,
     };
     use crate::core::pools::PoolMetaBootstrapAuthority;
-    #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
     #[cfg(feature = "test-util")]
     use crate::{
@@ -18316,11 +18315,25 @@ mod tests {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let bucket = format!("lock-create-intent-retry-{}", uuid::Uuid::new_v4());
-        let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
-        intent.lock_enabled = true;
-        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
             .await
-            .expect("persist pre-visibility lock intent");
+            .expect_err("fail the real fenced producer before physical publication");
+        let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the real pre-visibility lock intent");
+        assert!(persisted, "the original complete intent must be persisted");
+        assert!(!intent.bucket_creation_committed, "the producer must not have committed");
+        assert!(intent.bucket_incarnation_sidecar, "the pending UUID must have a sidecar");
+        assert!(!intent.bucket_incarnation_id.is_nil(), "the fresh producer must bind a real UUID");
+        let original_intent = intent.marshal_msg().expect("encode the original intent");
         assert!(
             store
                 .peer_sys
@@ -18346,6 +18359,350 @@ mod tests {
                 .expect("read retried lock state"),
             crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
         ));
+        let (mut committed, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read committed retry metadata");
+        assert!(committed.bucket_creation_committed, "the retry must commit the original generation");
+        assert_eq!(
+            committed.bucket_incarnation_id, intent.bucket_incarnation_id,
+            "retry must not rotate the UUID"
+        );
+        committed.bucket_creation_committed = false;
+        assert_eq!(
+            committed.marshal_msg().expect("encode retried intent"),
+            original_intent,
+            "retry must preserve all original creation and configuration values"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn committed_lock_intent_without_volumes_requires_recovery() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-committed-intent-reject", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-committed-intent-reject-{}", uuid::Uuid::new_v4());
+        let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
+        intent.lock_enabled = true;
+        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+            .await
+            .expect("persist the original committed fixture");
+        let error = store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("committed metadata is not a never-published proof");
+        assert!(error.to_string().contains("administrator recovery"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn pending_lock_intent_setter_cannot_grant_creation_retry() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-pending-setter-reject", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-pending-setter-reject-{}", uuid::Uuid::new_v4());
+        let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
+        intent.lock_enabled = true;
+        crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
+            .await
+            .expect("persist an uncommitted fixture without a fresh producer");
+        let error = store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("false alone is not trusted publication history");
+        assert!(error.to_string().contains("administrator recovery"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn metadata_without_sidecar_cannot_become_fresh_retry_proof() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-metadata-only-residue", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-metadata-only-residue-{}", uuid::Uuid::new_v4());
+        let mut residue = crate::bucket::metadata::BucketMetadata::new(&bucket);
+        residue.lock_enabled = true;
+        residue
+            .save_with_store(store.clone())
+            .await
+            .expect("persist only the old metadata, without a sidecar");
+
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("stop the real producer after replacing the metadata residue");
+        let error = store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("replacing old metadata must not turn it into never-published proof");
+        assert!(error.to_string().contains("administrator recovery"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn creation_retry_rejects_publication_removal_and_changed_intent() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-retry-history", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        for case in [
+            "volume",
+            "implicit_parent",
+            "lock_intent",
+            "version_intent",
+            "reload",
+            "same_instance_reload",
+            "setter_restore",
+            "cohort_order",
+            "created_at",
+            "generation",
+            "retired",
+        ] {
+            let bucket = format!("lock-retry-{case}-{}", uuid::Uuid::new_v4());
+            let original = MakeBucketOptions {
+                lock_enabled: true,
+                ..Default::default()
+            };
+            crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+            store
+                .make_bucket(&bucket, &original)
+                .await
+                .expect_err("stop the real producer before publication");
+            let sys = crate::bucket::metadata_sys::require_bucket_metadata_sys_in(&ctx).expect("instance metadata sys");
+            let sys = sys.read().await.clone();
+            sys.pending_bucket_creation(&bucket)
+                .await
+                .expect("the fresh producer must issue positive proof");
+            let mut retry = MakeBucketOptions {
+                lock_enabled: true,
+                ..Default::default()
+            };
+            match case {
+                "volume" | "implicit_parent" => {
+                    let set = &store.pools[0].disk_set[0];
+                    let disk = set.disks.read().await[0].clone().expect("native disk");
+                    if case == "volume" {
+                        disk.make_volume(&bucket).await.expect("raw disk publication");
+                    } else {
+                        crate::disk::fs::make_dir_all(disk.path().join(&bucket).join("implicit/parent"))
+                            .await
+                            .expect("implicit parent publication");
+                    }
+                    disk.delete_volume(&bucket, true).await.expect("remove the published volume");
+                }
+                "lock_intent" => retry.lock_enabled = false,
+                "version_intent" => retry.versioning_enabled = true,
+                "reload" => crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await,
+                "same_instance_reload" => {
+                    sys.reload_from_store(&bucket)
+                        .await
+                        .expect_err("an absent physical bucket cannot be peer-adopted");
+                }
+                "setter_restore" => {
+                    let (intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("load the producer's original intent");
+                    let mut changed = intent.clone();
+                    changed.created += time::Duration::seconds(1);
+                    crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, changed)
+                        .await
+                        .expect("ordinary setter replaces the intent");
+                    crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
+                        .await
+                        .expect("ordinary setter restores the original bytes and generation");
+                }
+                "cohort_order" => store.pools[0].disk_set[0].disks.write().await.rotate_left(1),
+                "created_at" => {
+                    let (intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("read the original creation time");
+                    retry.created_at = Some(intent.created + time::Duration::seconds(1));
+                }
+                "generation" => {
+                    let (mut intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("read the original generation");
+                    intent.bucket_incarnation_id = uuid::Uuid::new_v4();
+                    intent
+                        .save_with_store(store.clone())
+                        .await
+                        .expect("replace the actual persisted metadata generation");
+                    crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, intent.bucket_incarnation_id)
+                        .await
+                        .expect("replace the actual sidecar generation");
+                }
+                "retired" => {
+                    let (intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("read the pending generation");
+                    let lifecycle_guard = store
+                        .acquire_bucket_lifecycle_write_lock(&bucket)
+                        .await
+                        .expect("retirement lifecycle fence");
+                    let namespace = store.new_ns_lock(&bucket, &bucket).await.expect("retirement namespace");
+                    let namespace_guard = namespace
+                        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+                        .await
+                        .expect("retirement namespace fence");
+                    let mut opts = ObjectOptions {
+                        max_parity: true,
+                        ..Default::default()
+                    };
+                    opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+                    opts.add_namespace_lock_guard(&namespace_guard);
+                    crate::bucket::retirement::commit_retirement(store.clone(), &bucket, intent.bucket_incarnation_id, &opts)
+                        .await
+                        .expect("persist retirement of the pending generation under the real fences");
+                }
+                _ => unreachable!(),
+            }
+            let error = store
+                .make_bucket(&bucket, &retry)
+                .await
+                .expect_err("unproven continuation must remain manual");
+            assert!(error.to_string().contains("administrator recovery"), "{case}: {error}");
+            if case == "cohort_order" {
+                store.pools[0].disk_set[0].disks.write().await.rotate_right(1);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn creation_retry_retains_the_verified_cohort_through_physical_fanout() {
+        use crate::disk::os::prepared_publication_test_hooks;
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-retry-cohort-lease", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-retry-cohort-lease-{}", uuid::Uuid::new_v4());
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("stop the real producer before physical publication");
+        let set = store.pools[0].disk_set[0].clone();
+        let path = set.disks.read().await[0].as_ref().expect("native disk").path().join(&bucket);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::CreateDirectory,
+            &path,
+            move || {
+                entered_tx.send(()).expect("signal real make-volume entry");
+                let _ = release_rx.recv();
+            },
+        );
+        let retry_store = store.clone();
+        let retry_bucket = bucket.clone();
+        let retry = tokio::spawn(async move {
+            retry_store
+                .make_bucket(
+                    &retry_bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(30)))
+            .await
+            .expect("publication waiter")
+            .expect("retry must reach the actual disk publication call");
+        let inventory_is_locked = set.disks.try_write().is_err();
+        release_tx.send(()).expect("release physical publication");
+        retry
+            .await
+            .expect("retry task")
+            .expect("the verified cohort should finish physical creation");
+        assert!(
+            inventory_is_locked,
+            "the whole verified cohort must remain read-locked through actual disk fanout"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn creation_retry_rejects_a_present_missing_or_unknown_native_disk() {
+        for case in ["present", "missing", "unknown"] {
+            let temp = tempfile::tempdir().expect("create temp store dir");
+            let (_ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp.path(), "lock-retry-disk-denial", &[4])).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("lock-retry-disk-{case}-{}", uuid::Uuid::new_v4());
+            crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("stop the real producer before publication");
+            let set = &store.pools[0].disk_set[0];
+            let disk = set.disks.read().await[0].clone().expect("native disk");
+            match case {
+                "present" => disk.make_volume(&bucket).await.expect("leave one physical volume present"),
+                "missing" => set.disks.write().await[0] = None,
+                "unknown" => disk.close().await.expect("invalidate the actual native backend"),
+                _ => unreachable!(),
+            }
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("one disk's absent-or-never-published evidence cannot be assumed");
+            if case == "missing" {
+                set.disks.write().await[0] = Some(disk);
+            }
+        }
     }
 
     #[tokio::test]

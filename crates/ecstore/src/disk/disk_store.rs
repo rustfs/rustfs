@@ -2320,6 +2320,15 @@ impl DiskAPI for LocalDiskWrapper {
         })
     }
 
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<super::os::NativeBucketCreationWitness>> {
+        self.track_disk_health_with_op(
+            "bucket_creation_witness",
+            || async { self.disk.bucket_creation_witness(volume).await },
+            Duration::ZERO,
+        )
+        .await
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()> {
         // Scoped heal must drain directory creation before releasing its lifecycle owner.
         let timeout = if crate::store::bucket_heal_scope(volume).is_some() {

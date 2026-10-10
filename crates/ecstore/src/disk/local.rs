@@ -262,6 +262,7 @@ fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> s
 }
 
 fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, restore: &Path) -> std::io::Result<()> {
+    os::record_native_publication(current);
     match std::fs::symlink_metadata(backup) {
         Ok(metadata) if metadata.is_file() => {
             remove_file_if_exists(restore)?;
@@ -287,6 +288,7 @@ async fn write_delete_rollback_file(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
+    os::record_native_publication(&backup_dir);
     let path = backup_dir.join(name);
     let lease = os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
     let data = data.to_vec();
@@ -2148,6 +2150,7 @@ impl AsyncWrite for DirectWriter {
 fn open_direct_writer(file_path: &Path, state: &DirectIoWriteState) -> Result<Option<DirectWriter>> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    os::record_native_publication(file_path);
     let open_result = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -3920,6 +3923,7 @@ impl LocalIoBackend for StdBackend {
                 if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
+                    os::record_native_publication(&direct_path);
                     let direct = tokio::task::spawn_blocking(move || open_direct_writer(&direct_path, &write_state))
                         .await
                         .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
@@ -5167,6 +5171,7 @@ async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
+    publication_history: Option<os::NativePublicationRegistration>,
     /// I/O root pinned to the mount instance that was opened while the disk
     /// was initialized. On Linux this is `/proc/self/fd/<dirfd>/.`; resolving
     /// paths beneath it keeps repair I/O on that mount even if the configured
@@ -5535,6 +5540,8 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
+        let publication_history = os::register_native_publication_root(&root, &io_root);
+
         ensure_data_usage_layout(&io_root)
             .await
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))
@@ -5670,6 +5677,7 @@ impl LocalDisk {
         let mut disk = Self {
             root: root.clone(),
             publication_root,
+            publication_history,
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
             mount_lease,
@@ -7439,6 +7447,7 @@ impl LocalDisk {
                 };
                 if let Some(rollback_dir) = rollback_dir {
                     let rollback_path = object_dir.join(rollback_dir.to_string());
+                    os::record_native_publication(&rollback_path);
                     if let Err(err) = fs::create_dir_all(&rollback_path).await {
                         let err: DiskError = to_file_error(err).into();
                         if reserved_version_delete {
@@ -7961,6 +7970,7 @@ impl LocalDisk {
             }
             InternalBuf::Owned(buf) => {
                 let path = file_path.to_path_buf();
+                os::record_native_publication(&path);
                 if let Some(parent) = path.parent()
                     && parent != skip_parent
                 {
@@ -7968,6 +7978,7 @@ impl LocalDisk {
                 }
 
                 tokio::task::spawn_blocking(move || {
+                    os::record_native_publication(&path);
                     #[cfg(test)]
                     run_owned_file_write_before_open(&path);
 
@@ -9581,6 +9592,9 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn close(&self) -> Result<()> {
+        if let Some(history) = self.publication_history.as_ref() {
+            history.invalidate();
+        }
         // This disk instance is being retired (e.g. replaced by renew_disk on
         // reconnect). Drop its cached descriptors so a replacement instance's
         // invalidations are never defeated by this one continuing to serve stale
@@ -9738,6 +9752,7 @@ impl DiskAPI for LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            os::record_native_publication(&file_path);
             return Ok(tokio::task::spawn_blocking(move || {
                 // A persistent directory lock bounds metadata growth. Removing
                 // per-target lock files can split flock ownership across inodes.
@@ -10126,6 +10141,7 @@ impl DiskAPI for LocalDisk {
                     .map_err(to_file_error)?;
             }
         }
+        os::record_native_publication(&transaction_path);
         tokio::task::spawn_blocking(move || {
             let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
             if !source.is_file() {
@@ -10197,6 +10213,7 @@ impl DiskAPI for LocalDisk {
         }
         let durability = effective_durability(volume);
 
+        os::record_native_publication(&current_data_path);
         tokio::task::spawn_blocking(move || {
             match std::fs::symlink_metadata(&transaction_path) {
                 Ok(metadata) if metadata.is_dir() => {}
@@ -10807,12 +10824,27 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        let Some(history) = self.publication_history.as_ref() else {
+            return Ok(None);
+        };
+        let Some(disk_id) = self.get_disk_id().await? else {
+            return Ok(None);
+        };
+        Ok(history.witness(volume, disk_id, Arc::clone(&self.io_backend)))
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()> {
         if !Self::is_valid_volname(volume) {
             return Err(Error::other("Invalid arguments specified"));
         }
 
         let volume_dir = self.io_get_bucket_path(volume)?;
+        #[cfg(all(test, not(windows)))]
+        os::prepared_publication_test_hooks::run(
+            os::prepared_publication_test_hooks::Stage::CreateDirectory,
+            &self.root.join(volume),
+        );
 
         // Volume creation is a mutation boundary, so it must observe the live
         // filesystem rather than a potentially stale existence-cache entry.
@@ -11551,6 +11583,54 @@ mod test {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_direct_child_open_attempt_consumes_native_history() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let bucket = format!("owned-open-attempt-{}", Uuid::new_v4());
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native registration")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh history");
+
+        disk.write_all_public(&bucket, "direct-child", Bytes::from_static(b"payload"))
+            .await
+            .expect_err("the direct child has no bucket parent");
+        assert!(
+            !os::validate_native_creation_witnesses(&[witness]),
+            "even a failed O_CREATE in the real owned executor must permanently consume native history"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn synchronous_direct_open_attempt_consumes_native_history() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let bucket = format!("direct-io-open-attempt-{}", Uuid::new_v4());
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native registration")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh history");
+        let path = disk.io_get_object_path(&bucket, "direct-child").expect("direct I/O path");
+
+        assert!(
+            open_direct_writer(&path, &DirectIoWriteState::new()).is_err(),
+            "the actual synchronous O_DIRECT entry must observe the missing bucket parent"
+        );
+        assert!(
+            !os::validate_native_creation_witnesses(&[witness]),
+            "a directly callable O_CREATE helper cannot retain retry permission after a failed publication attempt"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

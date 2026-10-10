@@ -1554,8 +1554,26 @@ struct MetadataPublishGuard {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PendingBucketCreationProof {
+    pub(crate) generation: Uuid,
+    pub(crate) intent: Vec<u8>,
+    pub(crate) versioning_requested: bool,
+    pub(crate) witnesses: Vec<crate::disk::os::NativeBucketCreationWitness>,
+}
+
+impl PendingBucketCreationProof {
+    pub(crate) fn matches_metadata(&self, metadata: &BucketMetadata) -> Result<bool> {
+        Ok(!metadata.bucket_creation_committed
+            && metadata.bucket_incarnation_sidecar
+            && metadata.bucket_incarnation_id == self.generation
+            && metadata.marshal_msg()? == self.intent)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BucketMetadataSys {
     metadata_map: Arc<RwLock<HashMap<String, Arc<BucketMetadata>>>>,
+    pending_bucket_creations: Arc<RwLock<HashMap<String, PendingBucketCreationProof>>>,
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
     metadata_publish_locks: Arc<MetadataPublishLockRegistry>,
@@ -1599,6 +1617,7 @@ impl BucketMetadataSys {
     pub fn new(api: Arc<ECStore>) -> Self {
         Self {
             metadata_map: Arc::new(RwLock::new(HashMap::new())),
+            pending_bucket_creations: Arc::new(RwLock::new(HashMap::new())),
             metadata_publish_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
             }),
@@ -1627,6 +1646,43 @@ impl BucketMetadataSys {
     pub(crate) fn object_store(&self) -> Arc<ECStore> {
         self.object_store_if_live()
             .expect("bucket metadata object store should still be live")
+    }
+
+    pub(crate) async fn pending_bucket_creation(&self, bucket: &str) -> Option<PendingBucketCreationProof> {
+        self.pending_bucket_creations.read().await.get(bucket).cloned()
+    }
+
+    pub(crate) async fn grant_pending_bucket_creation(&self, bucket: &str, proof: PendingBucketCreationProof) {
+        self.pending_bucket_creations.write().await.insert(bucket.to_owned(), proof);
+    }
+
+    pub(crate) async fn revoke_pending_bucket_creation(&self, bucket: &str) {
+        self.pending_bucket_creations.write().await.remove(bucket);
+    }
+
+    pub(crate) async fn consume_pending_bucket_creation(
+        &self,
+        bucket: &str,
+        metadata: &BucketMetadata,
+        witnesses: &[crate::disk::os::NativeBucketCreationWitness],
+    ) -> Result<bool> {
+        let mut pending = self.pending_bucket_creations.write().await;
+        let Some(proof) = pending.get(bucket) else {
+            return Ok(false);
+        };
+        if !proof.matches_metadata(metadata)?
+            || proof.witnesses.len() != witnesses.len()
+            || !proof
+                .witnesses
+                .iter()
+                .zip(witnesses)
+                .all(|(old, current)| old.matches(current))
+            || !crate::disk::os::consume_native_creation_witnesses(witnesses)
+        {
+            return Ok(false);
+        }
+        pending.remove(bucket);
+        Ok(true)
     }
 
     fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
@@ -1819,6 +1875,7 @@ impl BucketMetadataSys {
         expected: Option<&Arc<BucketMetadata>>,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         if !await_bucket_namespace_operation(
             Some(namespace_guard),
             bucket,
@@ -1902,6 +1959,7 @@ impl BucketMetadataSys {
         persisted: bool,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         if !persisted {
             let _publish_guard = self
                 .lock_metadata_publish(bucket, namespace_guard, "refreshed bucket metadata absence publish")
@@ -1963,6 +2021,7 @@ impl BucketMetadataSys {
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
+        self.revoke_pending_bucket_creation(&bucket).await;
         if !is_meta_bucketname(&bucket) {
             let publish_lock = self.metadata_publish_lock(&bucket);
             let _publish_guard = publish_lock.lock().await;
@@ -1984,6 +2043,7 @@ impl BucketMetadataSys {
         if is_meta_bucketname(bucket) {
             return false;
         }
+        self.revoke_pending_bucket_creation(bucket).await;
         let publish_lock = self.metadata_publish_lock(bucket);
         let _publish_guard = publish_lock.lock().await;
         let mut map = self.metadata_map.write().await;
@@ -2001,6 +2061,7 @@ impl BucketMetadataSys {
     }
 
     async fn _reset(&mut self) {
+        self.pending_bucket_creations.write().await.clear();
         let mut map = self.metadata_map.write().await;
         map.clear();
         drop(map);
@@ -2139,6 +2200,7 @@ impl BucketMetadataSys {
     /// server's metadata never leaks into the ambient (first) instance.
     pub(crate) async fn persist_and_set(&self, bm: BucketMetadata) -> Result<()> {
         let mut bm = bm;
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.save_with_store(self.object_store()).await?;
 
         self.set(bm.name.clone(), Arc::new(bm)).await;
@@ -2147,6 +2209,7 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = true;
         bm.save_with_store_committed(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
@@ -2156,6 +2219,7 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_bucket_metadata_intent(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = false;
         bm.save_with_store(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
@@ -2166,6 +2230,7 @@ impl BucketMetadataSys {
     }
 
     async fn commit_bucket_metadata(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.parse_all_configs()?;
         bm.bucket_incarnation_sidecar = true;
         // The caller holds the full bucket creation fence (lifecycle, metadata
@@ -2214,6 +2279,7 @@ impl BucketMetadataSys {
         bucket: &str,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         let expected = self.metadata_map.read().await.get(bucket).cloned();
         if !self
             .bucket_exists(bucket, namespace_guard, "peer bucket metadata existence check")
@@ -2270,6 +2336,7 @@ impl BucketMetadataSys {
             #[cfg(test)]
             self.lazy_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+            self.revoke_pending_bucket_creation(bucket).await;
             let lock = self.object_store().new_ns_lock(bucket, bucket).await?;
             let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
             #[cfg(test)]
@@ -2578,6 +2645,7 @@ impl BucketMetadataSys {
     /// revalidated at write quorum, so a stale snapshot can neither revert an
     /// acknowledged configuration update nor outlive a delete/recreate.
     async fn migrate_bucket_creation_commit(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
+        self.revoke_pending_bucket_creation(bucket).await;
         let transaction_lock = self
             .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
@@ -2655,6 +2723,7 @@ impl BucketMetadataSys {
         &self,
         bucket: &str,
     ) -> Result<BucketMetadataAuthority> {
+        self.revoke_pending_bucket_creation(bucket).await;
         #[cfg(test)]
         if self.object_lock_disk_read_errors.write().await.remove(bucket) {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));

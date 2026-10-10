@@ -21,7 +21,7 @@ use futures::TryStreamExt;
 use parking_lot::Mutex;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
@@ -276,6 +276,10 @@ pub(crate) mod prepared_publication_test_hooks {
         Rollback,
         #[cfg(test)]
         DirFsync,
+        #[cfg(test)]
+        CreateDirectory,
+        #[cfg(test)]
+        NativeRootIdentity,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -1381,6 +1385,216 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
 }
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Publication history outlives disk handles, cleanup, and metadata snapshots.
+// Reusing a pathname or descriptor for another physical root is not new proof.
+#[derive(Debug, Default)]
+struct NativePublicationHistory {
+    roots: HashMap<(u64, u64), NativeRootHistory>,
+    aliases: HashMap<PathBuf, HashSet<(u64, u64)>>,
+}
+
+#[derive(Debug, Default)]
+struct NativeRootHistory {
+    unknown: bool,
+    started: HashSet<String>,
+}
+
+static NATIVE_PUBLICATION_HISTORY: LazyLock<Mutex<NativePublicationHistory>> =
+    LazyLock::new(|| Mutex::new(NativePublicationHistory::default()));
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativePublicationRegistration {
+    identity: (u64, u64),
+    root: PathBuf,
+    io_root: PathBuf,
+}
+
+/// Opaque, process-local observation. Unsupported disks cannot construct it.
+#[derive(Clone, Debug)]
+pub struct NativeBucketCreationWitness {
+    registration: NativePublicationRegistration,
+    backend: Arc<dyn super::local::LocalIoBackend>,
+    bucket: String,
+    disk_id: uuid::Uuid,
+}
+
+fn native_root_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::NativeRootIdentity, path);
+        let metadata = std::fs::metadata(path).ok()?;
+        metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> Option<NativePublicationRegistration> {
+    let identity = native_root_identity(root)?;
+    if native_root_identity(io_root) != Some(identity) {
+        return None;
+    }
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    history.roots.entry(identity).or_default();
+    for alias in [root, io_root] {
+        let alias: PathBuf = alias.components().collect();
+        let previous = history.aliases.entry(alias).or_default();
+        let collisions: Vec<_> = previous.iter().copied().filter(|old| *old != identity).collect();
+        previous.insert(identity);
+        if !collisions.is_empty() {
+            history.roots.get_mut(&identity)?.unknown = true;
+            for old in collisions {
+                history.roots.get_mut(&old)?.unknown = true;
+            }
+        }
+    }
+    Some(NativePublicationRegistration {
+        identity,
+        root: root.to_path_buf(),
+        io_root: io_root.to_path_buf(),
+    })
+}
+
+/// Record before queueing filesystem work. Cancellation never removes Started.
+pub(crate) fn record_native_publication(path: &Path) {
+    let aliases: Vec<_> = {
+        let history = NATIVE_PUBLICATION_HISTORY.lock();
+        path.ancestors()
+            .filter(|alias| history.aliases.contains_key(*alias))
+            .map(Path::to_path_buf)
+            .collect()
+    };
+    // Physical lookups must never hold the process-wide publication mutex.
+    let observations: Vec<_> = aliases
+        .into_iter()
+        .filter_map(|alias| {
+            let relative = path.strip_prefix(&alias).ok()?;
+            let mut components = relative.components().filter(|part| !matches!(part, Component::CurDir));
+            let Some(first) = components.next() else {
+                return None;
+            };
+            let bucket = match first {
+                Component::Normal(bucket) if components.all(|part| matches!(part, Component::Normal(_))) => {
+                    bucket.to_str().map(str::to_owned)
+                }
+                _ => None,
+            };
+            let physical = native_root_identity(&alias);
+            Some((alias, physical, bucket))
+        })
+        .collect();
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    for (alias, physical, bucket) in observations {
+        // Aliases only accumulate identities. Include registration concurrent
+        // with the stat, rather than using a stale captured identity list.
+        let identities = history.aliases.get(&alias).cloned().unwrap_or_default();
+        if physical.is_none() || identities.iter().any(|identity| Some(*identity) != physical) {
+            for identity in identities {
+                history.roots.entry(identity).or_default().unknown = true;
+            }
+            if let Some(identity) = physical {
+                history.roots.entry(identity).or_default().unknown = true;
+            }
+        } else if let Some(identity) = physical {
+            let root = history.roots.entry(identity).or_default();
+            match bucket {
+                Some(bucket) => {
+                    root.started.insert(bucket);
+                }
+                None => root.unknown = true,
+            }
+        }
+    }
+}
+
+impl NativePublicationRegistration {
+    pub(crate) fn invalidate(&self) {
+        if let Some(root) = NATIVE_PUBLICATION_HISTORY.lock().roots.get_mut(&self.identity) {
+            root.unknown = true;
+        }
+    }
+
+    pub(crate) fn witness(
+        &self,
+        bucket: &str,
+        disk_id: uuid::Uuid,
+        backend: Arc<dyn super::local::LocalIoBackend>,
+    ) -> Option<NativeBucketCreationWitness> {
+        if disk_id.is_nil()
+            || !matches!(Path::new(bucket).components().next(), Some(Component::Normal(_)))
+            || Path::new(bucket).components().count() != 1
+        {
+            return None;
+        }
+        let witness = NativeBucketCreationWitness {
+            registration: self.clone(),
+            backend,
+            bucket: bucket.to_owned(),
+            disk_id,
+        };
+        validate_native_creation_witnesses(std::slice::from_ref(&witness)).then_some(witness)
+    }
+}
+
+impl NativeBucketCreationWitness {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.registration.identity == other.registration.identity
+            && Arc::ptr_eq(&self.backend, &other.backend)
+            && self.disk_id == other.disk_id
+            && self.bucket == other.bucket
+    }
+
+    fn physical_root_is_current(&self) -> bool {
+        let root = native_root_identity(&self.registration.root);
+        let io_root = native_root_identity(&self.registration.io_root);
+        if root == Some(self.registration.identity) && io_root == Some(self.registration.identity) {
+            return true;
+        }
+        let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+        history.roots.entry(self.registration.identity).or_default().unknown = true;
+        for identity in [root, io_root].into_iter().flatten() {
+            history.roots.entry(identity).or_default().unknown = true;
+        }
+        false
+    }
+
+    fn valid_in(&self, history: &NativePublicationHistory) -> bool {
+        history
+            .roots
+            .get(&self.registration.identity)
+            .is_some_and(|root| !root.unknown && !root.started.contains(&self.bucket))
+    }
+}
+
+pub(crate) fn validate_native_creation_witnesses(witnesses: &[NativeBucketCreationWitness]) -> bool {
+    if witnesses.is_empty() || !witnesses.iter().all(NativeBucketCreationWitness::physical_root_is_current) {
+        return false;
+    }
+    let history = NATIVE_PUBLICATION_HISTORY.lock();
+    witnesses.iter().all(|witness| witness.valid_in(&history))
+}
+
+pub(crate) fn consume_native_creation_witnesses(witnesses: &[NativeBucketCreationWitness]) -> bool {
+    if witnesses.is_empty() || !witnesses.iter().all(NativeBucketCreationWitness::physical_root_is_current) {
+        return false;
+    }
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    if !witnesses.iter().all(|witness| witness.valid_in(&history)) {
+        return false;
+    }
+    for witness in witnesses {
+        if let Some(root) = history.roots.get_mut(&witness.registration.identity) {
+            root.started.insert(witness.bucket.clone());
+        }
+    }
+    true
+}
 type NamespaceMutationLock = AsyncMutex<()>;
 type NamespaceMutationLockRegistry = HashMap<PathBuf, Weak<NamespaceMutationLock>>;
 static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
@@ -2083,6 +2297,7 @@ pub(in crate::disk) async fn rename_with_namespace_owner(
     dst: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
+    record_native_publication(dst);
     if namespace_owner.is_none() {
         return tokio::fs::rename(src, dst).await;
     }
@@ -2104,12 +2319,19 @@ pub(in crate::disk) async fn create_dir_all_with_namespace_owner(
     path: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
+    record_native_publication(path);
     if namespace_owner.is_none() {
         return tokio::fs::create_dir_all(path).await;
     }
     let path = path.to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
-    run_blocking_namespace_operation(lease, move || std::fs::create_dir_all(path)).await
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::CreateDirectory, &path);
+        record_native_publication(&path);
+        std::fs::create_dir_all(path)
+    })
+    .await
 }
 
 #[tracing::instrument(name = "rename_all", level = "debug", skip_all)]
@@ -2120,6 +2342,7 @@ pub(crate) async fn rename_all_with_owner(
     publication_root: &PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
     rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
 }
@@ -2131,6 +2354,7 @@ pub(crate) async fn rename_all_with_lease(
     publication_root: &PublicationRoot,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     reliable_rename_inner_with_lease(
         src_file_path.as_ref().to_path_buf(),
         dst_file_path.as_ref().to_path_buf(),
@@ -2155,6 +2379,7 @@ pub(crate) async fn rename_reconciled_metadata(
     owner: Option<Arc<dyn Send + Sync>>,
     authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
 ) -> Result<()> {
+    record_native_publication(&destination);
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
     run_blocking_namespace_operation(lease, move || {
         let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
@@ -2399,6 +2624,7 @@ pub(crate) async fn rename_all_ignore_missing_source_with_owner(
     publication_root: &PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let src_file_path = src_file_path.as_ref();
     let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
     match reliable_rename_inner_with_lease(
@@ -2453,6 +2679,7 @@ async fn reliable_rename_inner(
     publication_root: &PublicationRoot,
     warn_on_missing_source: bool,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
@@ -2476,6 +2703,7 @@ async fn reliable_rename_inner_with_lease(
     warn_on_missing_source: bool,
     lease: Arc<NamespaceMutationLease>,
 ) -> io::Result<()> {
+    record_native_publication(&dst_file_path);
     let operation = {
         let src_file_path = src_file_path.clone();
         let dst_file_path = dst_file_path.clone();
@@ -2878,6 +3106,7 @@ fn rename_into_existing_parent(
     dst_file_path: &Path,
     parent_guard: Option<&ExistingBaseDirectoryGuard>,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path);
     use rustix::fs::{Mode, OFlags, open, renameat};
 
     let Some(parent_guard) = parent_guard else {
@@ -2926,6 +3155,7 @@ fn rename_into_existing_parent(
     parent_guard: Option<&ExistingBaseDirectoryGuard>,
     source: &winapi_util::Handle,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path);
     use std::{
         mem::size_of,
         os::windows::{ffi::OsStrExt, io::AsRawHandle},
@@ -4214,6 +4444,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     base_dir: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<ExistingBaseDirectoryGuard> {
+    record_native_publication(dir_path);
     let relative = dir_path
         .strip_prefix(base_dir)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory"))?;
@@ -7735,5 +7966,274 @@ mod tests {
 
         let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_creation_history_tests {
+    use super::*;
+
+    struct NativeFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        registration: NativePublicationRegistration,
+        backend: Arc<dyn super::super::local::LocalIoBackend>,
+        disk_id: uuid::Uuid,
+    }
+
+    impl NativeFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("native root");
+            let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+            let registration = register_native_publication_root(&root, &root).expect("native registration");
+            let backend = Arc::new(super::super::local::StdBackend::new(root.clone()));
+            Self {
+                _temp: temp,
+                root,
+                registration,
+                backend,
+                disk_id: uuid::Uuid::new_v4(),
+            }
+        }
+
+        fn witness(&self, bucket: &str) -> Option<NativeBucketCreationWitness> {
+            self.registration.witness(bucket, self.disk_id, Arc::clone(&self.backend))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_native_directory_publication_entry_invalidates_retry() {
+        let fixture = NativeFixture::new();
+        for operation in [
+            "recursive",
+            "single",
+            "open",
+            "rename",
+            "rename_std",
+            "fallback",
+            "owned_mkdir",
+            "owned_rename",
+            "handle_relative",
+        ] {
+            let bucket = format!("native-{operation}-{}", uuid::Uuid::new_v4());
+            let path = fixture.root.join(&bucket);
+            let witness = fixture.witness(&bucket).expect("fresh native witness");
+            match operation {
+                "recursive" => super::super::fs::make_dir_all(path.join("object/child"))
+                    .await
+                    .expect("recursive mkdir"),
+                "single" => super::super::fs::mkdir(&path).await.expect("single mkdir"),
+                "open" => {
+                    let file = super::super::fs::open_file(&path, super::super::fs::O_CREATE | super::super::fs::O_WRONLY)
+                        .await
+                        .expect("create file");
+                    drop(file);
+                }
+                "rename" | "rename_std" | "owned_rename" => {
+                    let source = fixture.root.join(format!("source-{}", uuid::Uuid::new_v4()));
+                    std::fs::create_dir(&source).expect("rename source");
+                    match operation {
+                        "rename" => super::super::fs::rename(&source, &path).await.expect("async rename"),
+                        "rename_std" => super::super::fs::rename_std(&source, &path).expect("sync rename"),
+                        _ => rename_with_namespace_owner(&source, &path, Some(Arc::new(())))
+                            .await
+                            .expect("owned rename"),
+                    }
+                }
+                "fallback" => make_dir_all(path.join("object/child"), &path)
+                    .await
+                    .expect("implicit volume fallback"),
+                "owned_mkdir" => create_dir_all_with_namespace_owner(&path.join("child"), Some(Arc::new(())))
+                    .await
+                    .expect("owned recursive mkdir"),
+                "handle_relative" => {
+                    let publication_root = PublicationRoot::new(&fixture.root).expect("publication root");
+                    let guard = mkdir_all_below_existing_base_std(&path.join("child"), &fixture.root, &publication_root)
+                        .expect("first-level handle-relative mkdir");
+                    drop(guard);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                "{operation}: old proof remains live"
+            );
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).expect("remove published directory");
+            } else {
+                std::fs::remove_file(&path).expect("remove published file");
+            }
+            assert!(fixture.witness(&bucket).is_none(), "{operation}: removal must not regrant proof");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_namespace_waiter_cannot_restore_native_proof() {
+        let fixture = NativeFixture::new();
+        let bucket = format!("native-cancel-{}", uuid::Uuid::new_v4());
+        let path = fixture.root.join(&bucket);
+        let witness = fixture.witness(&bucket).expect("fresh witness");
+        let lease = acquire_namespace_mutation_lease(&path).await;
+        let mut attempt = Box::pin(create_dir_all_with_namespace_owner(&path, Some(Arc::new(()))));
+        assert!(matches!(futures::poll!(&mut attempt), std::task::Poll::Pending));
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "Started must precede admission wait"
+        );
+        assert!(!path.exists(), "the namespace wait must still precede the syscall");
+        drop(attempt);
+        drop(lease);
+        assert!(fixture.witness(&bucket).is_none(), "cancellation cannot undo an admitted attempt");
+    }
+
+    #[tokio::test]
+    async fn queued_mkdir_cancellation_retains_lease_and_consumed_history() {
+        use futures::FutureExt;
+        use std::sync::mpsc;
+
+        let fixture = NativeFixture::new();
+        let bucket = format!("native-queued-cancel-{}", uuid::Uuid::new_v4());
+        let path = fixture.root.join(&bucket);
+        let witness = fixture.witness(&bucket).expect("fresh witness");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::CreateDirectory,
+            &path,
+            move || {
+                entered_tx.send(()).expect("signal real executor entry");
+                let _ = release_rx.recv();
+            },
+        );
+        let operation_path = path.clone();
+        let operation =
+            tokio::spawn(async move { create_dir_all_with_namespace_owner(&operation_path, Some(Arc::new(()))).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(30)))
+            .await
+            .expect("entry waiter")
+            .expect("the real blocking executor must enter");
+        operation.abort();
+        assert!(operation.await.expect_err("cancel the async waiter").is_cancelled());
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "queued publication is permanently Started"
+        );
+        assert!(
+            acquire_namespace_mutation_lease(&path).now_or_never().is_none(),
+            "the actual blocked executor must still own the namespace lease"
+        );
+        release_tx.send(()).expect("release the syscall");
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(30), acquire_namespace_mutation_lease(&path))
+            .await
+            .expect("the lease must drain with the syscall");
+        drop(drained);
+        assert!(path.is_dir(), "the cancelled waiter cannot discard the already queued syscall");
+        std::fs::remove_dir_all(&path).expect("remove the published directory");
+        assert!(fixture.witness(&bucket).is_none(), "drain and removal cannot restore proof");
+    }
+
+    #[tokio::test]
+    async fn publication_detects_retargeted_physical_alias_without_registration() {
+        let source = NativeFixture::new();
+        let destination = NativeFixture::new();
+        let bucket = format!("native-retarget-{}", uuid::Uuid::new_v4());
+        let witness = destination.witness(&bucket).expect("destination witness");
+        let retired = source.root.with_extension("retired");
+        std::fs::rename(&source.root, &retired).expect("move the original physical root");
+        std::os::unix::fs::symlink(&destination.root, &source.root).expect("retarget the registered alias");
+        super::super::fs::mkdir(source.root.join(&bucket))
+            .await
+            .expect("publish through the changed alias");
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "publication-time alias drift must invalidate the actual destination root"
+        );
+        std::fs::remove_dir(destination.root.join(&bucket)).expect("remove the published bucket");
+        assert!(destination.witness(&bucket).is_none(), "removal must not undo alias uncertainty");
+        std::fs::remove_file(&source.root).expect("remove the symlink");
+        std::fs::rename(retired, &source.root).expect("restore the test root");
+    }
+
+    #[test]
+    fn blocked_physical_identity_lookup_does_not_block_other_publication() {
+        use std::sync::mpsc;
+        let stalled = NativeFixture::new();
+        let healthy = NativeFixture::new();
+        let witness = stalled.witness("unpublished").expect("stalled root witness");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &stalled.root,
+            move || {
+                entered_tx.send(()).expect("signal physical lookup");
+                let _ = release_rx.recv();
+            },
+        );
+        let validator = std::thread::spawn(move || validate_native_creation_witnesses(&[witness]));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("enter the actual identity lookup");
+        let (published_tx, published_rx) = mpsc::channel();
+        let path = healthy.root.join("published");
+        let publisher = std::thread::spawn(move || {
+            record_native_publication(&path);
+            published_tx.send(()).expect("signal independent publication");
+        });
+        let published = published_rx.recv_timeout(std::time::Duration::from_secs(5));
+        release_tx.send(()).expect("release the identity lookup");
+        validator.join().expect("identity lookup thread");
+        publisher.join().expect("publication thread");
+        assert!(
+            published.is_ok(),
+            "a slow physical lookup must not retain the process-wide publication mutex"
+        );
+    }
+
+    #[test]
+    fn native_consume_is_atomic_and_history_survives_reconnect() {
+        let fixture = NativeFixture::new();
+        let first = format!("native-first-{}", uuid::Uuid::new_v4());
+        let second = format!("native-second-{}", uuid::Uuid::new_v4());
+        let first_witness = fixture.witness(&first).expect("first witness");
+        let second_witness = fixture.witness(&second).expect("second witness");
+        record_native_publication(&fixture.root.join(&second));
+        assert!(!consume_native_creation_witnesses(&[first_witness.clone(), second_witness]));
+        assert!(
+            validate_native_creation_witnesses(std::slice::from_ref(&first_witness)),
+            "failed cohort consume must be atomic"
+        );
+        assert!(consume_native_creation_witnesses(std::slice::from_ref(&first_witness)));
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&first_witness)));
+        let reconnected = register_native_publication_root(&fixture.root, &fixture.root).expect("reconnected registration");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(fixture.root.clone()));
+        assert!(
+            reconnected.witness(&first, fixture.disk_id, backend).is_none(),
+            "reconnect must retain Started"
+        );
+    }
+
+    #[test]
+    fn physical_alias_reuse_is_unknown_and_backend_identity_is_real() {
+        let temp = tempfile::tempdir().expect("alias parent");
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).expect("first physical root");
+        let old = register_native_publication_root(&root, &root).expect("first registration");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let id = uuid::Uuid::new_v4();
+        let witness = old.witness("same-name", id, Arc::clone(&backend)).expect("old witness");
+        let other_backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let other = old.witness("same-name", id, other_backend).expect("new backend witness");
+        assert!(!witness.matches(&other), "a different actual backend cannot reuse a pending observation");
+        std::fs::rename(&root, temp.path().join("retired-root")).expect("retire physical root");
+        std::fs::create_dir(&root).expect("replacement root at the same alias");
+        let replacement = register_native_publication_root(&root, &root).expect("replacement registration");
+        assert!(replacement.witness("same-name", id, backend).is_none(), "alias reuse must remain Unknown");
+        assert!(
+            !validate_native_creation_witnesses(&[witness]),
+            "old physical identity must not validate at a new root"
+        );
     }
 }

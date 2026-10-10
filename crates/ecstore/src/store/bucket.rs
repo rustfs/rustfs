@@ -17,6 +17,11 @@ use crate::bucket::{
     metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
+use crate::disk::{
+    DiskAPI,
+    error::DiskError,
+    error_reduce::{BUCKET_OP_IGNORED_ERRS, reduce_write_quorum_errs},
+};
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
@@ -31,6 +36,30 @@ const DELETED_BUCKETS_PREFIX: &str = ".deleted";
 const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
 const EVENT_BUCKET_DELETE_BLOCKED: &str = "bucket_delete_blocked";
 const EVENT_BUCKET_DELETE_ROLLBACK_FAILED: &str = "bucket_delete_rollback_failed";
+
+#[cfg(test)]
+static FAIL_BEFORE_BUCKET_PUBLICATION: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(crate) fn fail_next_bucket_creation_after_intent(bucket: &str) {
+    FAIL_BEFORE_BUCKET_PUBLICATION
+        .lock()
+        .expect("creation fault mutex")
+        .insert(bucket.to_owned());
+}
+
+fn orphaned_creation_requires_recovery(generation: Uuid) -> StorageError {
+    StorageError::InvalidArgument(
+        "CreateBucket".to_string(),
+        "bucket".to_string(),
+        format!("orphaned bucket generation {generation} requires administrator recovery before recreation"),
+    )
+}
+
+fn creation_intent_lock_lost(bucket: &str) -> StorageError {
+    Error::other(format!("bucket metadata creation intent lock was lost: {bucket}"))
+}
 
 /// Record why `DeleteBucket` refused, and at a level that matches who can act
 /// on it.
@@ -350,6 +379,169 @@ impl ECStore {
             result?;
         }
         Ok(())
+    }
+
+    async fn native_creation_witnesses(&self, bucket: &str) -> Option<Vec<crate::disk::os::NativeBucketCreationWitness>> {
+        let mut witnesses = Vec::new();
+        for (_, _, set) in self.bucket_sets() {
+            let disks = set.disks.read().await.clone();
+            if disks.is_empty() {
+                return None;
+            }
+            for disk in disks {
+                let disk = disk?;
+                if !matches!(disk.stat_volume(bucket).await, Err(DiskError::VolumeNotFound)) {
+                    return None;
+                }
+                witnesses.push(disk.bucket_creation_witness(bucket).await.ok()??);
+            }
+        }
+        crate::disk::os::validate_native_creation_witnesses(&witnesses).then_some(witnesses)
+    }
+
+    async fn grant_native_pending_creation<F>(
+        &self,
+        bucket: &str,
+        opts: &MakeBucketOptions,
+        metadata: &BucketMetadata,
+        before: &[crate::disk::os::NativeBucketCreationWitness],
+        fences_valid: F,
+    ) -> Option<()>
+    where
+        F: Fn() -> bool + Send,
+    {
+        let after = self.native_creation_witnesses(bucket).await?;
+        if before.len() != after.len() || !before.iter().zip(&after).all(|(old, current)| old.matches(current)) {
+            return None;
+        }
+        let (persisted, present) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket)
+            .await
+            .ok()?;
+        let mut expected = metadata.clone();
+        expected.bucket_creation_committed = false;
+        expected.bucket_incarnation_sidecar = true;
+        expected.default_timestamps();
+        let intent = persisted.marshal_msg().ok()?;
+        if !present
+            || persisted.bucket_creation_committed
+            || !persisted.bucket_incarnation_sidecar
+            || intent != expected.marshal_msg().ok()?
+        {
+            return None;
+        }
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx).ok()?;
+        let sys = sys.read().await.clone();
+        if !fences_valid() || !crate::disk::os::validate_native_creation_witnesses(&after) {
+            return None;
+        }
+        sys.grant_pending_bucket_creation(
+            bucket,
+            metadata_sys::PendingBucketCreationProof {
+                generation: persisted.bucket_incarnation_id,
+                intent,
+                versioning_requested: opts.versioning_enabled,
+                witnesses: after,
+            },
+        )
+        .await;
+        Some(())
+    }
+
+    async fn continue_native_bucket_creation<F>(
+        &self,
+        bucket: &str,
+        opts: &MakeBucketOptions,
+        metadata: &BucketMetadata,
+        fences_valid: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> bool + Send,
+    {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let sys = sys.read().await.clone();
+        let sets: Vec<_> = self.bucket_sets().map(|(_, _, set)| set).collect();
+        let mut inventories = Vec::with_capacity(sets.len());
+        for set in &sets {
+            inventories.push(set.disks.read().await);
+        }
+        if inventories.is_empty() || inventories.iter().any(|disks| disks.is_empty()) {
+            return Err(orphaned_creation_requires_recovery(metadata.bucket_incarnation_id));
+        }
+        let mut witnesses = Vec::new();
+        for disks in &inventories {
+            for disk in disks.iter() {
+                let Some(disk) = disk else {
+                    return Err(orphaned_creation_requires_recovery(metadata.bucket_incarnation_id));
+                };
+                match disk.stat_volume(bucket).await {
+                    Err(DiskError::VolumeNotFound) => {}
+                    Ok(_) => {
+                        return Err(StorageError::InvalidArgument(
+                            "CreateBucket".to_owned(),
+                            "bucket".to_owned(),
+                            "an old bucket volume remains on disk; administrator recovery refused".to_owned(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let Some(witness) = disk.bucket_creation_witness(bucket).await? else {
+                    return Err(orphaned_creation_requires_recovery(metadata.bucket_incarnation_id));
+                };
+                witnesses.push(witness);
+            }
+        }
+        if !fences_valid() {
+            return Err(creation_intent_lock_lost(bucket));
+        }
+        if !sys.consume_pending_bucket_creation(bucket, metadata, &witnesses).await? {
+            return Err(orphaned_creation_requires_recovery(metadata.bucket_incarnation_id));
+        }
+        if !fences_valid() {
+            return Err(creation_intent_lock_lost(bucket));
+        }
+
+        // Use the verified handles, retaining inventory locks through fanout.
+        // Calling set.make_bucket here would recursively read the same locks.
+        let results = futures::future::join_all(inventories.iter().map(|disks| async move {
+            let results = futures::future::join_all(disks.iter().map(|disk| async move {
+                match disk {
+                    Some(disk) => match disk.make_volume(bucket).await {
+                        Ok(()) => Ok(()),
+                        Err(err) if opts.force_create && matches!(err, DiskError::VolumeExists) => Ok(()),
+                        Err(err) => Err(err),
+                    },
+                    None => Err(DiskError::DiskNotFound),
+                }
+            }))
+            .await;
+            let errs = results
+                .into_iter()
+                .map(|result| result.err())
+                .collect::<Vec<Option<DiskError>>>();
+            match reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (disks.len() / 2) + 1) {
+                Some(err) => Err(err.into()),
+                None => Ok(()),
+            }
+        }))
+        .await;
+        let mut bucket_exists_error = None;
+        let mut first_hard_error = None;
+        for result in results {
+            let Err(err) = result else {
+                continue;
+            };
+            if matches!(err, StorageError::VolumeExists) || is_err_bucket_exists(&err) {
+                if bucket_exists_error.is_none() {
+                    bucket_exists_error = Some(err);
+                }
+            } else if first_hard_error.is_none() {
+                first_hard_error = Some(err);
+            }
+        }
+        match first_hard_error.or(bucket_exists_error) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Return whether an old bucket generation has a durable retirement record.
@@ -901,6 +1093,7 @@ impl ECStore {
             }
         };
         let confirmed_missing = existing_bucket_info.is_none();
+        let mut retry_metadata = None;
         if confirmed_missing
             && !opts.no_lock
             && !is_meta_bucketname(bucket)
@@ -921,13 +1114,30 @@ impl ECStore {
                     ),
                     other => other,
                 })?;
-            return Err(StorageError::InvalidArgument(
-                "CreateBucket".to_string(),
-                "bucket".to_string(),
-                format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
-            ));
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+            let sys = sys.read().await.clone();
+            let proof = sys.pending_bucket_creation(bucket).await;
+            let metadata_store = metadata_sys::object_store_in(&self.ctx).await?;
+            if !persisted
+                || metadata.bucket_incarnation_id != old_incarnation
+                || !metadata.lock_enabled
+                || !opts.lock_enabled
+                || opts.created_at.is_some_and(|created| created != metadata.created)
+                || crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?
+                || !match proof {
+                    Some(proof) => proof.versioning_requested == opts.versioning_enabled && proof.matches_metadata(&metadata)?,
+                    None => false,
+                }
+            {
+                return Err(orphaned_creation_requires_recovery(old_incarnation));
+            }
+            retry_metadata = Some(metadata);
         }
-        let existing_metadata = if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
+        let continuing_creation = retry_metadata.is_some();
+        let existing_metadata = if let Some(metadata) = retry_metadata {
+            Some(metadata)
+        } else if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {
                 metadata = BucketMetadata::new(bucket);
@@ -966,7 +1176,7 @@ impl ECStore {
             }
         });
         let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
-        if confirmed_missing || is_meta_bucketname(bucket) {
+        if (confirmed_missing || is_meta_bucketname(bucket)) && !continuing_creation {
             meta.set_created(opts.created_at);
 
             if opts.versioning_enabled {
@@ -982,7 +1192,7 @@ impl ECStore {
         // replica unlocked, so replicated versions could be deleted without the
         // retention the source enforces.
         let lock_newly_enabled = opts.lock_enabled && !meta.lock_enabled;
-        if opts.lock_enabled {
+        if opts.lock_enabled && !continuing_creation {
             meta.lock_enabled = true;
             meta.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)?;
             meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
@@ -990,12 +1200,59 @@ impl ECStore {
 
         let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
         if metadata_persisted_before_physical {
-            metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
+            if !continuing_creation {
+                // Only the fenced producer that saw neither authoritative
+                // metadata nor a sidecar may grant a continuation witness.
+                // Unknown observations disable proof, without changing the
+                // ordinary fresh creation's persistence and error behavior.
+                let prior_intent_absent = if !opts.no_lock {
+                    match metadata_sys::object_store_if_initialized_in(&self.ctx).await {
+                        Some(store) => {
+                            matches!(crate::bucket::metadata::load_bucket_incarnation(store, bucket).await, Ok(None))
+                                && matches!(
+                                    metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await,
+                                    Ok((_, false))
+                                )
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let before = if prior_intent_absent {
+                    self.native_creation_witnesses(bucket).await
+                } else {
+                    None
+                };
+                metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
+                if let Some(before) = before {
+                    // Optional proof failure does not change an ordinary fresh create.
+                    let _ = self
+                        .grant_native_pending_creation(bucket, opts, &meta, &before, || {
+                            !bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                && !metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                && !ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        })
+                        .await;
+                }
+            }
             if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             {
-                return Err(Error::other(format!("bucket metadata creation intent lock was lost: {bucket}")));
+                if let Ok(sys) = metadata_sys::require_bucket_metadata_sys_in(&self.ctx) {
+                    let sys = sys.read().await.clone();
+                    sys.revoke_pending_bucket_creation(bucket).await;
+                }
+                return Err(creation_intent_lock_lost(bucket));
+            }
+            #[cfg(test)]
+            if FAIL_BEFORE_BUCKET_PUBLICATION
+                .lock()
+                .expect("creation fault mutex")
+                .remove(bucket)
+            {
+                return Err(Error::other("injected failure after bucket creation intent persistence"));
             }
         }
 
@@ -1017,9 +1274,21 @@ impl ECStore {
                 bucket,
                 "bucket creation metadata transaction",
                 async {
-                    self.make_bucket_on_sets(bucket, opts)
+                    let result = if continuing_creation {
+                        self.continue_native_bucket_creation(bucket, opts, &meta, || {
+                            !bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                && !metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                && !ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        })
                         .await
-                        .map_err(|err| to_object_err(err, vec![bucket]))
+                    } else {
+                        if let Ok(sys) = metadata_sys::require_bucket_metadata_sys_in(&self.ctx) {
+                            let sys = sys.read().await.clone();
+                            sys.revoke_pending_bucket_creation(bucket).await;
+                        }
+                        self.make_bucket_on_sets(bucket, opts).await
+                    };
+                    result.map_err(|err| to_object_err(err, vec![bucket]))
                 },
             ),
         )
