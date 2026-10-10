@@ -1752,6 +1752,14 @@ impl SetDisks {
         }
 
         let use_mmap_read = object_mmap_read_enabled();
+        let quantum_label = quantized_range_quantum_label(frame_size);
+        rustfs_io_metrics::record_get_object_quantized_range_request(
+            metrics_path,
+            metrics_object_class,
+            metrics_size_bucket,
+            quantum_label,
+            u64::try_from(length).unwrap_or(u64::MAX),
+        );
         let mut total_read = 0usize;
         for current_part in part_index..=last_part_index {
             if total_read == length {
@@ -1760,11 +1768,18 @@ impl SetDisks {
 
             let part_number = fi.parts[current_part].number;
             let part_size = fi.parts[current_part].size;
-            let part_length = (part_size - part_offset).min(length - total_read);
+            let part_remaining = quantized_part_remaining(part_size, part_offset)?;
+            let part_length = part_remaining.min(length - total_read);
             let mut segment_offset = part_offset;
             let mut segment_remaining = part_length;
 
             while segment_remaining > 0 {
+                rustfs_io_metrics::record_get_object_quantized_range_segment(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                );
                 let block_index = segment_offset / erasure.block_size;
                 let within_block = segment_offset % erasure.block_size;
                 let block_data_start = block_index
@@ -1851,6 +1866,12 @@ impl SetDisks {
                     metrics_size_bucket,
                 )
                 .await;
+                rustfs_io_metrics::record_get_object_quantized_range_reader_setup(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                );
                 rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
                 rustfs_io_metrics::record_get_object_stage_duration_by_size(
                     metrics_path,
@@ -1867,6 +1888,18 @@ impl SetDisks {
                         erasure.data_shards
                     )));
                 }
+
+                let quorum_window_bytes = read_shard_size
+                    .saturating_mul(available_shards)
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                rustfs_io_metrics::record_get_object_quantized_range_quorum_window_bytes(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    quorum_window_bytes,
+                );
 
                 let missing_shards = reader_setup.completed_failed_shards();
                 if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
@@ -2547,6 +2580,36 @@ fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Re
         return Err(Error::other("EC read quantum marker cannot be combined with protected shard integrity"));
     }
     Ok(quantum)
+}
+
+fn quantized_range_quantum_label(frame_size: usize) -> &'static str {
+    const Q_4KIB: usize = 4 * 1024;
+    const Q_8KIB: usize = 8 * 1024;
+    const Q_16KIB: usize = 16 * 1024;
+    const Q_32KIB: usize = 32 * 1024;
+    const Q_64KIB: usize = 64 * 1024;
+    const Q_128KIB: usize = 128 * 1024;
+    const Q_256KIB: usize = 256 * 1024;
+    const Q_512KIB: usize = 512 * 1024;
+    const Q_1MIB: usize = 1024 * 1024;
+    match frame_size {
+        Q_4KIB => "4kib",
+        Q_8KIB => "8kib",
+        Q_16KIB => "16kib",
+        Q_32KIB => "32kib",
+        Q_64KIB => "64kib",
+        Q_128KIB => "128kib",
+        Q_256KIB => "256kib",
+        Q_512KIB => "512kib",
+        Q_1MIB => "1mib",
+        _ => "other",
+    }
+}
+
+fn quantized_part_remaining(part_size: usize, part_offset: usize) -> Result<usize> {
+    part_size
+        .checked_sub(part_offset)
+        .ok_or_else(|| Error::other("EC read quantum part offset exceeds part size"))
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
@@ -5947,6 +6010,12 @@ mod tests {
             metadata_quorum_outcome(&StorageError::Io(std::io::Error::other("disk unavailable"))),
             "unavailable"
         );
+    }
+
+    #[test]
+    fn quantized_part_remaining_rejects_offsets_past_part_end() {
+        assert_eq!(quantized_part_remaining(1024, 768).expect("valid part offset"), 256);
+        assert!(quantized_part_remaining(1024, 1025).is_err());
     }
 
     fn capture_read_repair_submitter(

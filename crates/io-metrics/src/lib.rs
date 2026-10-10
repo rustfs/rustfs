@@ -1102,6 +1102,104 @@ pub fn record_get_object_stage_duration_by_size(
     .record(duration_secs);
 }
 
+/// Record the shape of a quantized Range request.
+///
+/// These counters deliberately use bounded labels. The requested-byte and
+/// quorum-window totals estimate program-visible read amplification without
+/// pretending to measure physical media or RPC bytes.
+#[inline(always)]
+pub fn record_get_object_quantized_range_request(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+    requested_bytes: u64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_requests_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(1);
+    counter!(
+        "rustfs_io_get_object_quantized_range_requested_bytes_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(requested_bytes);
+}
+
+/// Record one q-aligned segment planned for a quantized Range request.
+#[inline(always)]
+pub fn record_get_object_quantized_range_segment(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_segments_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(1);
+}
+
+/// Record one reader setup performed for a quantized Range segment.
+#[inline(always)]
+pub fn record_get_object_quantized_range_reader_setup(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_reader_setups_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(1);
+}
+
+/// Record the q-window bytes made available by one quantized Range setup.
+#[inline(always)]
+pub fn record_get_object_quantized_range_quorum_window_bytes(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+    bytes: u64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_quorum_window_bytes_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(bytes);
+}
+
 /// Record GetObject metadata fanout duration.
 #[inline(always)]
 pub fn record_get_object_metadata_fanout_duration(path: &'static str, duration_secs: f64) {
@@ -3601,6 +3699,16 @@ mod tests {
     fn test_record_get_object_stage_metrics() {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
         record_get_object_stage_duration_by_size("legacy_duplex", "metadata", "plain_single_part", "le_4kib", 0.001);
+        record_get_object_quantized_range_request("legacy_duplex", "plain_single_part", "le_1mib", "1mib", 64 * 1024);
+        record_get_object_quantized_range_segment("legacy_duplex", "plain_single_part", "le_1mib", "1mib");
+        record_get_object_quantized_range_reader_setup("legacy_duplex", "plain_single_part", "le_1mib", "1mib");
+        record_get_object_quantized_range_quorum_window_bytes(
+            "legacy_duplex",
+            "plain_single_part",
+            "le_1mib",
+            "1mib",
+            2 * 1024 * 1024,
+        );
         record_get_object_reader_path("codec_streaming");
         record_get_object_reader_path_by_size("codec_streaming", "plain_single_part", "le_1mib");
         record_get_object_codec_streaming_fallback("range");
