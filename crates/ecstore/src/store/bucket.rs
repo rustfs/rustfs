@@ -922,7 +922,7 @@ impl ECStore {
                     ),
                     other => other,
                 })?;
-            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            let (metadata, persisted) = Box::pin(metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket)).await?;
             if opts.lock_enabled
                 && persisted
                 && metadata.bucket_creation_commit_record_present
@@ -1013,7 +1013,7 @@ impl ECStore {
                     metadata_transaction_guard.as_ref(),
                     bucket,
                     "bucket creation metadata transaction",
-                    metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()),
+                    Box::pin(metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone())),
                 ),
             )
             .await?;
