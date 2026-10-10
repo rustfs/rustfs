@@ -12477,6 +12477,227 @@ mod test {
         }
     }
 
+    // SIGKILL tests process death on a healthy filesystem, not power loss.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_data_process_kill_preserves_publication_boundary() {
+        use std::io::Write as _;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Child, Command, ExitStatus, Stdio};
+        use std::time::{Duration, Instant};
+
+        const TEST: &str = "disk::local::test::rename_data_process_kill_preserves_publication_boundary";
+        const ROLE: &str = "RUSTFS_TEST_PUBLICATION_KILL_ROLE";
+        const ROOT: &str = "RUSTFS_TEST_PUBLICATION_KILL_ROOT";
+        const NONCE: &str = "RUSTFS_TEST_PUBLICATION_KILL_NONCE";
+        const BUCKET: &str = "bucket";
+        const OBJECT: &str = "process-kill-object";
+        const STAGED: &str = "process-kill-staged";
+        const VERSION: Uuid = Uuid::from_u128(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa);
+        const OLD: Uuid = Uuid::from_u128(0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb);
+        const NEW: Uuid = Uuid::from_u128(0xcccccccccccccccccccccccccccccccc);
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        async fn wait_exit(child: &mut ChildGuard) -> ExitStatus {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if child.0.try_wait().expect("poll owned child").is_some() {
+                    return child.0.wait().expect("reap owned child");
+                }
+                assert!(Instant::now() < deadline, "owned child exceeded exit deadline");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn spawn(root: &std::path::Path, nonce: &str, role: &str) -> ChildGuard {
+            let stdout = std::fs::File::create(root.join(format!("{role}.stdout"))).expect("child stdout file");
+            let stderr = std::fs::File::create(root.join(format!("{role}.stderr"))).expect("child stderr file");
+            ChildGuard(
+                Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, role)
+                    .env(ROOT, root)
+                    .env(NONCE, nonce)
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr))
+                    .spawn()
+                    .expect("spawn owned publication child"),
+            )
+        }
+
+        fn child_logs(root: &std::path::Path, role: &str) -> String {
+            let stdout = std::fs::read_to_string(root.join(format!("{role}.stdout"))).expect("child stdout");
+            let stderr = std::fs::read_to_string(root.join(format!("{role}.stderr"))).expect("child stderr");
+            format!("{stdout} {stderr}")
+        }
+
+        fn file_info(data_dir: Uuid) -> FileInfo {
+            let mut fi = test_file_info(OBJECT, VERSION, Some(data_dir), None);
+            fi.size = 8;
+            fi.parts[0].size = 8;
+            fi.parts[0].actual_size = 8;
+            fi
+        }
+
+        if let Some(role) = std::env::var_os(ROLE) {
+            let role = role.to_str().expect("child role is UTF-8");
+            assert!(matches!(role, "writer-before" | "writer-after" | "verify-before" | "verify-after"));
+            let root = std::path::PathBuf::from(std::env::var_os(ROOT).expect("private child root"));
+            let nonce = std::env::var(NONCE).expect("private child nonce");
+            Uuid::parse_str(&nonce).expect("nonce is a UUID");
+            assert_eq!(root.file_name().and_then(|name| name.to_str()), Some(nonce.as_str()));
+            assert_eq!(std::fs::read_to_string(root.join("control-nonce")).expect("bound root nonce"), nonce);
+            let endpoint = Endpoint::try_from(root.to_str().expect("private root UTF-8")).expect("private endpoint");
+            let _strict = durability_mode_override::set(DurabilityMode::Strict);
+            let disk = LocalDisk::new(&endpoint, false).await.expect("child opens real disk");
+            let object_dir = root.join(BUCKET).join(OBJECT);
+            if role.starts_with("verify-") {
+                let fi = disk
+                    .read_version("", BUCKET, OBJECT, &VERSION.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("fresh verifier reads actual version");
+                let (expected_dir, expected_bytes) = if role == "verify-before" {
+                    assert_eq!(
+                        fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("read old metadata"),
+                        fs::read(root.join("old-meta")).await.expect("read old fixture"),
+                        "prepublication metadata must remain byte-for-byte old"
+                    );
+                    (OLD, b"old-data")
+                } else {
+                    (NEW, b"new-data")
+                };
+                assert_eq!(fi.data_dir, Some(expected_dir), "{role}: actual reopened version data_dir");
+                let part = object_dir
+                    .join(fi.data_dir.expect("referenced data dir").to_string())
+                    .join("part.1");
+                assert_eq!(fs::read(part).await.expect("read referenced shard"), expected_bytes);
+                return;
+            }
+
+            let staged = root.join(RUSTFS_META_TMP_BUCKET).join(STAGED).join(NEW.to_string());
+            fs::create_dir_all(&staged).await.expect("staged shard directory");
+            fs::write(staged.join("part.1"), b"new-data")
+                .await
+                .expect("stage new shard bytes");
+            let ready = root.join(format!("{role}.ready"));
+            let pause = move || {
+                let pending = ready.with_extension("pending");
+                std::fs::write(&pending, &nonce).expect("write actual writer cut marker");
+                std::fs::rename(pending, &ready).expect("announce complete writer cut marker");
+                let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+                receiver.recv().expect("writer remains paused until SIGKILL");
+            };
+            let _hook = if role == "writer-before" {
+                // Use the executor's exact path spelling, including canonical
+                // macOS roots and Linux mount-pinned I/O roots.
+                let destination = disk
+                    .io_get_object_path(BUCKET, &format!("{OBJECT}/{STORAGE_FORMAT_FILE}"))
+                    .expect("actual metadata publication path");
+                assert_eq!(
+                    std::fs::canonicalize(&destination).expect("canonical publication destination"),
+                    disk.root.join(BUCKET).join(OBJECT).join(STORAGE_FORMAT_FILE),
+                    "hook destination must identify this disk's seeded metadata"
+                );
+                Some(os::prepared_publication_test_hooks::install_at(
+                    os::prepared_publication_test_hooks::Stage::PreparedRename,
+                    &destination,
+                    pause,
+                ))
+            } else {
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, STAGED, file_info(NEW), BUCKET, OBJECT)
+                    .await
+                    .expect("Strict real rename_data completes before cut");
+                pause();
+                return;
+            };
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, STAGED, file_info(NEW), BUCKET, OBJECT)
+                .await
+                .expect("before writer must remain in physical hook");
+            panic!("prepublication hook unexpectedly returned");
+        }
+
+        let temp = tempfile::tempdir().expect("parent owns private disk roots");
+        for phase in ["before", "after"] {
+            let nonce = Uuid::new_v4().to_string();
+            let root = temp.path().join(&nonce);
+            fs::create_dir(&root).await.expect("private scenario root");
+            fs::write(root.join("control-nonce"), &nonce)
+                .await
+                .expect("bind private root");
+            let endpoint = Endpoint::try_from(root.to_str().expect("private root UTF-8")).expect("private endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("seed real disk");
+            ensure_test_volume(&disk, BUCKET).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let object_dir = root.join(BUCKET).join(OBJECT);
+            fs::create_dir_all(object_dir.join(OLD.to_string()))
+                .await
+                .expect("old shard directory");
+            fs::write(object_dir.join(OLD.to_string()).join("part.1"), b"old-data")
+                .await
+                .expect("seed old shard bytes");
+            let old_meta = test_meta(file_info(OLD));
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &old_meta)
+                .await
+                .expect("seed old metadata");
+            fs::write(root.join("old-meta"), &old_meta)
+                .await
+                .expect("retain exact old fixture");
+            drop(disk);
+
+            let writer_role = format!("writer-{phase}");
+            let mut writer = spawn(&root, &nonce, &writer_role);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let ready = root.join(format!("{writer_role}.ready"));
+            loop {
+                if let Some(status) = writer.0.try_wait().expect("poll writer") {
+                    panic!(
+                        "writer exited before cut: {writer_role} status={status}: {}",
+                        child_logs(&root, &writer_role)
+                    );
+                }
+                match fs::read_to_string(&ready).await {
+                    Ok(marker) => {
+                        assert_eq!(marker, nonce, "cut marker belongs to this private writer");
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("read cut marker: {error}"),
+                }
+                if Instant::now() >= deadline {
+                    panic!("writer cut deadline: {writer_role}: {}", child_logs(&root, &writer_role));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let pid = writer.0.id();
+            writer.0.kill().expect("SIGKILL owned writer at verified cut");
+            let status = wait_exit(&mut writer).await;
+            assert_eq!(status.signal(), Some(9), "owned writer must actually die by SIGKILL");
+            writeln!(std::io::stdout(), "{writer_role} pid={pid} signal={:?}", status.signal())
+                .expect("record actual writer wait status");
+
+            let verifier_role = format!("verify-{phase}");
+            let mut verifier = spawn(&root, &nonce, &verifier_role);
+            let status = wait_exit(&mut verifier).await;
+            let logs = child_logs(&root, &verifier_role);
+            assert!(status.success(), "{verifier_role} status={status}: {logs}");
+            let stdout = std::fs::read_to_string(root.join(format!("{verifier_role}.stdout"))).expect("verifier stdout");
+            assert!(
+                stdout.contains(TEST) && stdout.contains("1 passed"),
+                "verifier must execute exact test: {logs}"
+            );
+            writeln!(std::io::stdout(), "{verifier_role} status={status}").expect("record actual verifier exit");
+        }
+    }
+
     /// Crash-consistency harness for the rename_data commit sequence
     /// (rustfs/backlog#935 HP-14, test plan rustfs/backlog#896; hard rule from
     /// rustfs/backlog#878: "After partial commit, the object can only be an old or new version; it cannot be mixed").
