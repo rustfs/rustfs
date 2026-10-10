@@ -1,0 +1,174 @@
+# Build source-bound helpers separately so live validation needs only artifacts.
+name: RustFS Validation Tools
+
+on:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        type: string
+        required: true
+      auto_testing_sha:
+        type: string
+        required: true
+      build_native_heal:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      PF_TESTING_GH_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact RustFS source SHA from the validation candidate manifest
+        type: string
+        required: true
+      auto_testing_sha:
+        description: Exact auto-testing SHA containing the Heal metadata inspector
+        type: string
+        required: true
+      build_native_heal:
+        description: Also compile and run separate exact-source native Heal regressions
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native-heal-regressions:
+    if: ${{ inputs.build_native_heal }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+    steps:
+      - name: Validate immutable native source inputs
+        run: |
+          set -euo pipefail
+          [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${AUTO_TESTING_SHA}" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout exact native candidate source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout exact native collector source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang lld cmake pkg-config libssl-dev protobuf-compiler
+          df -h .
+
+      - name: Build and enumerate the unmodified candidate test executable
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          python3 -B auto-testing/scripts/validation_heal/native_regressions.py build \
+            --source candidate --commit "${CANDIDATE_SHA}" --out native-tools
+
+      - name: Run exact native regressions separately from fleet validation
+        run: |
+          set -euo pipefail
+          python3 -B auto-testing/scripts/validation_heal/native_regressions.py run \
+            --directory native-tools --out native-evidence
+
+      - name: Upload native executable identities and original diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-tools/ecstore-native-tests
+            native-tools/*.json
+            native-tools/*.jsonl
+            native-tools/*.stderr
+            native-tools/*.log
+            native-evidence/
+          if-no-files-found: warn
+
+  heal-metadata-inspector:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+    steps:
+      - name: Validate immutable source inputs
+        run: |
+          set -euo pipefail
+          [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${AUTO_TESTING_SHA}" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout exact candidate source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout exact inspector source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Build the read-only candidate metadata decoder
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = "${CANDIDATE_SHA}"
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          df -h .
+          python3 auto-testing/scripts/validation_heal/prepare_heal_meta_inspector.py \
+            --source candidate --commit "${CANDIDATE_SHA}" --out inspector-build
+          # Seed the helper's separate graph from the candidate's frozen graph.
+          # Cargo adds the helper package; both lock identities are retained.
+          cp candidate/Cargo.lock inspector-build/Cargo.lock
+          cargo build --release --manifest-path inspector-build/Cargo.toml
+          python3 auto-testing/scripts/validation_heal/check_bitrot_tool.py \
+            --binary inspector-build/target/release/heal-meta-inspect --source candidate
+          mkdir validation-tools
+          cp inspector-build/target/release/heal-meta-inspect validation-tools/
+          cp inspector-build/Cargo.lock validation-tools/inspector-Cargo.lock
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          source = json.loads(Path("inspector-build/source.json").read_text())
+          binary = Path("validation-tools/heal-meta-inspect")
+          source.update(built=True, testingCommit=os.environ["AUTO_TESTING_SHA"],
+                        binarySha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                        inspectorLockSha256=hashlib.sha256(Path("validation-tools/inspector-Cargo.lock").read_bytes()).hexdigest(),
+                        toolchain=subprocess.check_output(["rustc", "-vV"], text=True),
+                        target="x86_64-unknown-linux-gnu", runId=os.environ["GITHUB_RUN_ID"],
+                        runAttempt=os.environ["GITHUB_RUN_ATTEMPT"])
+          Path("validation-tools/heal-meta-inspect.json").write_text(json.dumps(source, indent=2) + "\n")
+          PY
+          git -C candidate diff --exit-code
+
+      - name: Upload immutable validation tools
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validation-tools/
+          if-no-files-found: error

@@ -27,6 +27,41 @@ on:
         description: Exact successful build attempt
         type: string
         required: true
+      validation_case:
+        description: Canonical auto-testing validation case ID; empty runs the functional chain
+        type: string
+        required: false
+        default: ''
+      auto_testing_sha:
+        description: Exact auto-testing commit for a validation case
+        type: string
+        required: false
+        default: ''
+      validation_tools_only:
+        description: Build candidate-bound validation tools without running a fleet case
+        type: boolean
+        required: false
+        default: false
+      validation_native_tools:
+        description: Include exact-source native regressions in a tools-only build
+        type: boolean
+        required: false
+        default: false
+      validation_cleanup_run_id:
+        description: Failed validation run whose rejected fault environment needs evidence-based finalization
+        type: string
+        required: false
+        default: ''
+      validation_tools_run_id:
+        description: Successful tool build run; required by Heal physical metadata checks
+        type: string
+        required: false
+        default: ''
+      validation_tools_run_attempt:
+        description: Exact tool build attempt
+        type: string
+        required: false
+        default: '1'
   workflow_run:
     workflows: ["Nightly GNU Build"]
     types: [completed]
@@ -36,12 +71,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: rustfs-functional-chain-runs
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only && 'rustfs-functional-validation-tools' || 'rustfs-functional-chain-runs' }}
   cancel-in-progress: false
 
 jobs:
   prepare:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -88,6 +123,201 @@ jobs:
           else
             echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
           fi
+
+  validation:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_cleanup_run_id != '') }}
+    runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
+    timeout-minutes: 90
+    outputs:
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
+    concurrency:
+      group: ${{ inputs.validation_tools_only && 'rustfs-validation-tools-resolver' || 'rustfs-shared-functional-tests-v2' }}
+      cancel-in-progress: false
+    env:
+      RUSTFS_ACCESS_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_ACCESS_KEY || '' }}
+      RUSTFS_SECRET_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_SECRET_KEY || '' }}
+      RUSTFS_API_ENDPOINT: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT) || '' }}
+      RUSTFS_NODES: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_NODES || vars.RUSTFS_NODES) || '' }}
+      RUSTFS_SSH_USER: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER) || '' }}
+    steps:
+      - name: Checkout candidate resolver
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize validation evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          VALIDATION_ROOT="${RUNNER_TEMP}/rustfs-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${VALIDATION_ROOT}"
+          printf 'VALIDATION_ROOT=%s\n' "${VALIDATION_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Resolve immutable candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          CLEANUP_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          SELECTED_CASE: ${{ inputs.validation_case }}
+          TOOLS_ONLY: ${{ inputs.validation_tools_only }}
+          NATIVE_TOOLS: ${{ inputs.validation_native_tools }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from scripts.resolve_functional_candidate import resolve
+
+          revision = os.environ["AUTO_TESTING_SHA"]
+          cleanup = os.environ["CLEANUP_RUN_ID"]
+          if os.environ["TOOLS_ONLY"] == "true" and (cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("tools-only execution cannot select a fleet case or cleanup")
+          if os.environ["NATIVE_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("native regressions require tools-only execution, without a fleet case or cleanup")
+          if cleanup and (not cleanup.isdigit() or int(cleanup) <= 0 or os.environ["SELECTED_CASE"] or os.environ["TOOLS_ONLY"] == "true"):
+              raise ValueError("cleanup requires one exact failed run and is exclusive with case/tool execution")
+          if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+              raise ValueError("validation requires an exact auto-testing commit SHA")
+          candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]))
+          manifest = candidate["manifest"]
+          root = Path(os.environ["VALIDATION_ROOT"])
+          (root / "candidate-source.json").write_text(json.dumps(candidate, sort_keys=True) + "\n")
+          (root / "candidate.json").write_text(json.dumps({
+              "package_url": manifest["package_url"],
+              "package_sha256": manifest["package_sha256"],
+              "source_sha": manifest["source_sha"],
+          }, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("source_sha=" + manifest["source_sha"] + "\n")
+          PY
+
+      - name: Checkout exact auto-testing revision
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Install validation Python client
+        if: ${{ !inputs.validation_tools_only && (startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.')) }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
+          "${RUNNER_TEMP}/rustfs-validation-python/bin/python" -m pip install \
+            -r auto-testing/scripts/validation_ilm/requirements.txt
+          printf '%s\n' "${RUNNER_TEMP}/rustfs-validation-python/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate Heal tool build identity
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOL_RUN_ID: ${{ inputs.validation_tools_run_id }}
+          TOOL_RUN_ATTEMPT: ${{ inputs.validation_tools_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "${TOOL_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${TOOL_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${TOOL_RUN_ID}/attempts/${TOOL_RUN_ATTEMPT}" \
+            > "${VALIDATION_ROOT}/tool-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          value = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "tool-run.json").read_text())
+          if (value.get("conclusion") != "success" or value.get("status") != "completed"
+                  or value.get("run_attempt") != int(os.environ["TOOL_RUN_ATTEMPT"])
+                  or value.get("path") not in {".github/workflows/rustfs-functional-chain.yml", ".github/workflows/rustfs-validation-tools.yml"}):
+              raise ValueError("Heal tool run is not an exact successful validation build attempt")
+          PY
+
+      - name: Download pinned Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-tools-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-tools-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        run: |
+          set -euo pipefail
+          TOOL_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B auto-testing/scripts/validation_heal/inspector.py \
+            --directory "${TOOL_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/tool-manifest.json"
+          printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Run selected canonical validation case
+        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' }}
+        env:
+          VALIDATION_CASE: ${{ inputs.validation_case }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          ./auto-testing/scripts/run_validation_case.sh \
+            "${VALIDATION_CASE}" "${VALIDATION_ROOT}/candidate.json" \
+            "${AUTO_TESTING_SHA}" "${VALIDATION_ROOT}/run"
+
+      - name: Audit and finalize retained rejected-fault environment
+        if: ${{ inputs.validation_cleanup_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          gh run view "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --json status,conclusion,headBranch,workflowName > "${VALIDATION_ROOT}/failed-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          run = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "failed-run.json").read_text())
+          if (run["status"] != "completed" or run["conclusion"] != "failure"
+              or run["workflowName"] != "RustFS Functional Chain" or run["headBranch"] != os.environ["GITHUB_REF_NAME"]):
+              raise ValueError("cleanup source must be a completed failed Functional Chain run")
+          PY
+          gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"
+          python3 -B auto-testing/scripts/validation_heal/recover_environment.py \
+            --failed-run-id "${FAILED_RUN_ID}" --artifact "${VALIDATION_ROOT}/failed-artifact" \
+            --candidate "${VALIDATION_ROOT}/candidate.json" --evidence "${VALIDATION_ROOT}/recovery"
+
+      - name: Show validation report
+        if: ${{ always() }}
+        run: |
+          if [ -f "${VALIDATION_ROOT}/run/report.md" ]; then
+            cat "${VALIDATION_ROOT}/run/report.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+
+  validation-tools:
+    needs: [validation]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only }}
+    uses: ./.github/workflows/rustfs-validation-tools.yml
+    with:
+      candidate_sha: ${{ needs.validation.outputs.source_sha }}
+      auto_testing_sha: ${{ inputs.auto_testing_sha }}
+      build_native_heal: ${{ inputs.validation_native_tools }}
+    secrets: inherit
 
   upgrade:
     needs: [prepare]
