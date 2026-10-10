@@ -1410,6 +1410,77 @@ mod tests {
     }
 
     #[test]
+    fn test_check_preconditions_rfc304() {
+        let modified = OffsetDateTime::from_unix_timestamp(1700000000).expect("valid timestamp");
+        let mut info = ObjectInfo {
+            etag: Some("abc".to_owned()),
+            mod_time: Some(modified),
+            expires: Some(modified + time::Duration::days(1)),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        info.user_defined = std::collections::HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into();
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("W/\"abc\""));
+        let error = check_preconditions(&headers, &info).expect_err("weak ETag must validate the cache");
+        assert_eq!(error.code(), &S3ErrorCode::NotModified);
+        let response = error.headers().expect("304 carries cache headers");
+        assert_eq!(response["etag"], "\"abc\"");
+        assert_eq!(response["cache-control"], "max-age=60");
+        assert!(response.contains_key("expires"));
+        assert!(response.contains_key("last-modified"));
+        assert_eq!(response["x-amz-version-id"], "null");
+
+        headers.insert("if-match", HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            check_preconditions(&headers, &info).expect_err("If-Match is first").code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        headers.remove("if-none-match");
+        headers.insert("if-match", HeaderValue::from_static("W/\"abc\""));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("If-Match requires strong comparison")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("\"other\""));
+        let date = modified.format(&crate::storage::RFC1123).expect("format timestamp");
+        headers.insert("if-modified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        assert!(check_preconditions(&headers, &info).is_ok(), "If-None-Match suppresses the date");
+        headers.clear();
+        headers.insert("if-unmodified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        info.mod_time = Some(modified + time::Duration::seconds(1));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("next second was modified")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        info.etag = None;
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("existing object wildcard needs no ETag")
+                .code(),
+            &S3ErrorCode::NotModified
+        );
+        headers.clear();
+        headers.insert("if-match", HeaderValue::from_static("*"));
+        assert!(check_preconditions(&headers, &info).is_ok());
+        headers.insert("if-match", HeaderValue::from_static("\"other\", \"abc,def\""));
+        info.etag = Some("abc,def".to_owned());
+        assert!(
+            check_preconditions(&headers, &info).is_ok(),
+            "commas inside an opaque tag are not list delimiters"
+        );
+    }
+
+    #[test]
     fn test_parse_etag() {
         // [1] ETag without quotes → adds quotes
         let result1 = parse_etag("d41d8cd98f00b204e9800998ecf8427e").unwrap();

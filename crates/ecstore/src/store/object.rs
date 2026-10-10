@@ -986,6 +986,22 @@ impl PreparedGetObjectReader {
         Ok(ECStore::attach_read_lock_guard(reader, self.read_lock_guard))
     }
 
+    /// Opens the prepared snapshot when the caller has not probed the body cache.
+    pub async fn into_reader_with_cache_hook(self) -> Result<GetObjectReader> {
+        let reader = self
+            .pool
+            .get_object_reader_with_prepared_metadata(
+                &self.bucket,
+                &self.object,
+                self.range,
+                self.headers,
+                &self.opts,
+                self.metadata,
+            )
+            .await?;
+        Ok(ECStore::attach_read_lock_guard(reader, self.read_lock_guard))
+    }
+
     /// Open the prepared source with bounded copy prefetch and request-owned
     /// cancellation, including cancellation during reader construction.
     pub async fn into_reader_for_copy(self) -> Result<(GetObjectReader, tokio_util::sync::DropGuard)> {
@@ -10224,6 +10240,20 @@ mod tests {
 
         assert_eq!(restored, payload);
         assert_eq!(hook.calls.load(Ordering::Relaxed), 1, "reader construction must not probe the hook again");
+
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("prepare unprobed reader");
+        let mut reader = prepared.into_reader_with_cache_hook().await.expect("open unprobed reader");
+        let mut restored = Vec::new();
+        reader.stream.read_to_end(&mut restored).await.expect("read unprobed body");
+        assert_eq!(restored, payload);
+        assert_eq!(
+            hook.calls.load(Ordering::Relaxed),
+            2,
+            "unprobed prepared reader preserves one cache lookup"
+        );
     }
 
     #[tokio::test]

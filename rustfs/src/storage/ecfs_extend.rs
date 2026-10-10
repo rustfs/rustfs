@@ -536,14 +536,11 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     let if_modified_since = non_empty_header_value(headers, IF_MODIFIED_SINCE);
     let if_unmodified_since = non_empty_header_value(headers, IF_UNMODIFIED_SINCE);
 
-    if mod_time.is_none() && etag.is_none() {
-        return Ok(());
-    }
-
-    // If-Match: requires ETag to exist
+    // The caller has resolved an existing object, so '*' does not require an ETag.
     if let Some(if_match_val) = if_match {
         match etag {
-            Some(e) if is_etag_equal(e, if_match_val) => {}
+            _ if if_match_val == "*" => {}
+            Some(e) if read_etag_matches(e, if_match_val, false) => {}
             _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
         }
     }
@@ -553,32 +550,16 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Some(t) = mod_time
         && let Some(if_unmodified_since) = if_unmodified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
-        && t > given_time.add(time::Duration::seconds(1))
+        && t.unix_timestamp() > given_time.unix_timestamp()
     {
         return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
     }
 
     // If-None-Match
     if let Some(if_none_match) = if_none_match
-        && let Some(e) = etag
-        && is_etag_equal(e, if_none_match)
+        && (if_none_match == "*" || etag.is_some_and(|e| read_etag_matches(e, if_none_match, true)))
     {
-        let mut error_headers = HeaderMap::new();
-        if let Ok(etag_header) = parse_etag(e) {
-            error_headers.insert("etag", etag_header);
-        }
-        if let Some(t) = mod_time
-            && let Ok(last_modified_str) = t.format(&RFC1123)
-            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
-        {
-            error_headers.insert("last-modified", last_modified_header);
-        }
-
-        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
-        s3_error.set_message("Not Modified".to_string());
-        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
-        s3_error.set_headers(error_headers);
-        return Err(s3_error);
+        return Err(not_modified_error(info)?);
     }
 
     // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
@@ -586,29 +567,71 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Some(t) = mod_time
         && let Some(if_modified_since) = if_modified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
-        && t < given_time.add(time::Duration::seconds(1))
+        && t.unix_timestamp() <= given_time.unix_timestamp()
     {
-        let mut error_headers = HeaderMap::new();
-        if let Some(e) = etag
-            && let Ok(etag_header) = parse_etag(e)
-        {
-            error_headers.insert("etag", etag_header);
-        }
-        if let Ok(last_modified_str) = t.format(&RFC1123)
-            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
-        {
-            error_headers.insert("last-modified", last_modified_header);
-        }
-
-        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
-        s3_error.set_message("Not Modified".to_string());
-        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
-        s3_error.set_headers(error_headers);
-
-        return Err(s3_error);
+        return Err(not_modified_error(info)?);
     }
 
     Ok(())
+}
+
+fn not_modified_error(info: &ObjectInfo) -> S3Result<S3Error> {
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = info.etag.as_deref() {
+        headers.insert(http::header::ETAG, parse_etag(etag).map_err(S3Error::internal_error)?);
+    }
+    if let Some(mod_time) = info.mod_time {
+        let value = mod_time.format(&RFC1123).map_err(S3Error::internal_error)?;
+        headers.insert(
+            http::header::LAST_MODIFIED,
+            HeaderValue::from_str(&value).map_err(S3Error::internal_error)?,
+        );
+    }
+    for name in ["cache-control", "content-location", "vary", "expires"] {
+        if let Some(value) = info.user_defined.get(name) {
+            headers.insert(name, HeaderValue::from_str(value).map_err(S3Error::internal_error)?);
+        }
+    }
+    if let Some(expires) = info.expires {
+        let value = expires.format(&RFC1123).map_err(S3Error::internal_error)?;
+        headers.insert(http::header::EXPIRES, HeaderValue::from_str(&value).map_err(S3Error::internal_error)?);
+    }
+    if let Some(version) = info.version_id {
+        let value = if version.is_nil() {
+            "null".to_owned()
+        } else {
+            version.to_string()
+        };
+        headers.insert("x-amz-version-id", HeaderValue::from_str(&value).map_err(S3Error::internal_error)?);
+    }
+    let mut error = S3Error::new(S3ErrorCode::NotModified);
+    error.set_status_code(StatusCode::NOT_MODIFIED);
+    error.set_message("Not Modified".to_owned());
+    error.set_headers(headers);
+    Ok(error)
+}
+
+/// GET/HEAD use weak comparison for If-None-Match and strong comparison for If-Match.
+fn read_etag_matches(object_etag: &str, condition: &str, allow_weak: bool) -> bool {
+    let object_etag = object_etag.trim();
+    let object_weak = object_etag.starts_with("W/");
+    let object_value = object_etag.strip_prefix("W/").unwrap_or(object_etag).trim_matches('"');
+    let mut remaining = condition.trim();
+    while !remaining.is_empty() {
+        let weak = remaining.starts_with("W/");
+        let value = remaining.strip_prefix("W/").unwrap_or(remaining);
+        let (value, rest) = if let Some(quoted) = value.strip_prefix('"') {
+            let Some(pair) = quoted.split_once('"') else { return false };
+            pair
+        } else {
+            value.split_once(',').unwrap_or((value, ""))
+        };
+        if value == object_value && (allow_weak || (!weak && !object_weak)) {
+            return true;
+        }
+        remaining = rest.trim().strip_prefix(',').unwrap_or(rest).trim();
+    }
+    false
 }
 
 fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {
@@ -617,6 +640,12 @@ fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
+}
+
+pub(crate) fn has_read_preconditions(headers: &HeaderMap) -> bool {
+    [IF_MATCH, IF_UNMODIFIED_SINCE, IF_NONE_MATCH, IF_MODIFIED_SINCE]
+        .into_iter()
+        .any(|name| non_empty_header_value(headers, name).is_some())
 }
 
 /// Compares an object ETag with an ETag value from an HTTP header.

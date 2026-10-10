@@ -312,10 +312,6 @@ impl DefaultObjectUsecase {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -343,6 +339,7 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        let opts = internal_object_info_lookup_opts(opts);
 
         prepare_odm_read_generation(&store, &mut req, &bucket).await;
 
@@ -413,41 +410,6 @@ impl DefaultObjectUsecase {
                 opts.version_id.as_deref(),
             ));
         }
-        if let Some(match_etag) = if_none_match
-            && let Some(strong_etag) = match_etag.into_etag()
-            && info
-                .etag
-                .as_ref()
-                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-        {
-            return Err(S3Error::new(S3ErrorCode::NotModified));
-        }
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-        if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.into_etag()
-                && info
-                    .etag
-                    .as_ref()
-                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-            {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since
-            && info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            })
-        {
-            return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-        }
         // An authorized replication convergence check only needs etag/size/mtime
         // to compare source and replica; it holds no customer key, so the SSE-C
         // read validation is skipped for it (and only it).
@@ -464,6 +426,14 @@ impl DefaultObjectUsecase {
                 req.input.sse_customer_key_md5.as_ref(),
             )?;
         }
+
+        let conditions = check_preconditions(&req.headers, &info);
+        if conditions.is_err() && !replication_check {
+            let principal = SseKmsPrincipal::from_request(&req);
+            crate::storage::sse::validate_conditional_read(&bucket, &key, &info.user_defined, &req.headers, principal.as_ref())
+                .await?;
+        }
+        conditions?;
 
         // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
         let expiration_header = resolve_put_object_expiration(&bucket, &info).await;
