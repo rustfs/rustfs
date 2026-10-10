@@ -9,10 +9,12 @@ use std::{
 mod application;
 mod committed;
 mod created;
+mod node;
 pub use created::{
     CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedResult, CreatedVersion, DecideCreated,
     MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
 };
+pub use node::{CaptureNode, CaptureNodeError};
 #[cfg(test)]
 mod application_tests;
 mod truncate;
