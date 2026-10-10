@@ -16,7 +16,9 @@ pub use created::{
     MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
 };
 pub use node::{CaptureNode, CaptureNodeError};
-pub use raft_types::{CaptureMembership, MembershipError};
+pub use raft_types::{
+    CaptureCommand, CaptureMembership, CaptureRaftEntry, CaptureResponse, CaptureResponseKind, CaptureTypeConfig, MembershipError,
+};
 #[cfg(test)]
 mod application_tests;
 mod truncate;

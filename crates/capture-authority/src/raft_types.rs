@@ -1,6 +1,146 @@
 //! Exact OpenRaft values and an independent CMEM v1 membership codec.
-use super::{CaptureNode, CaptureNodeError, LogId, VoteRecord};
+use super::{CaptureNode, CaptureNodeError, CreatedApplyResult, CreatedResult, DecideCreated, LogId, StoreError, VoteRecord};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureCommand(DecideCreated);
+impl CaptureCommand {
+    pub fn try_created(command: DecideCreated) -> Result<Self, StoreError> {
+        command.encode()?;
+        Ok(Self(command))
+    }
+    pub fn created(&self) -> &DecideCreated {
+        &self.0
+    }
+}
+impl Serialize for CaptureCommand {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let bytes = self
+            .0
+            .encode()
+            .map_err(|_| serde::ser::Error::custom("invalid capture command"))?;
+        bytes.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for CaptureCommand {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer).map_err(|_| serde::de::Error::custom("invalid capture command"))?;
+        let command = DecideCreated::decode(&bytes).map_err(|_| serde::de::Error::custom("invalid capture command"))?;
+        Self::try_created(command).map_err(|_| serde::de::Error::custom("invalid capture command"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureResponseKind {
+    Blank,
+    Created,
+    Membership,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureResponse {
+    log_id: LogId,
+    kind: CaptureResponseKind,
+    result: Option<CreatedResult>,
+}
+impl CaptureResponse {
+    pub fn blank(log_id: LogId) -> Result<Self, StoreError> {
+        Ok(Self {
+            log_id,
+            kind: CaptureResponseKind::Blank,
+            result: None,
+        })
+    }
+    pub fn created(applied: CreatedApplyResult) -> Result<Self, StoreError> {
+        Self::decode_result(&super::created::result_bytes(&applied.result))?;
+        Ok(Self {
+            log_id: applied.log_id,
+            kind: CaptureResponseKind::Created,
+            result: Some(applied.result),
+        })
+    }
+    pub fn membership(log_id: LogId) -> Result<Self, StoreError> {
+        Ok(Self {
+            log_id,
+            kind: CaptureResponseKind::Membership,
+            result: None,
+        })
+    }
+    fn decode_result(bytes: &[u8]) -> Result<CreatedResult, StoreError> {
+        let mut decoder = super::created::Decoder::new(bytes);
+        let result = decoder.result()?;
+        decoder.finish()?;
+        Ok(result)
+    }
+    pub fn kind(&self) -> CaptureResponseKind {
+        self.kind
+    }
+    pub fn log_id(&self) -> &LogId {
+        &self.log_id
+    }
+    pub fn created_result(&self) -> Option<&CreatedResult> {
+        self.result.as_ref()
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ResponseWire {
+    Blank { version: u8, log_id: Vec<u8> },
+    Created { version: u8, log_id: Vec<u8>, result: Vec<u8> },
+    Membership { version: u8, log_id: Vec<u8> },
+}
+impl Serialize for CaptureResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let log_id = super::encode_id(self.log_id);
+        let wire = match (self.kind, &self.result) {
+            (CaptureResponseKind::Blank, None) => ResponseWire::Blank { version: 1, log_id },
+            (CaptureResponseKind::Membership, None) => ResponseWire::Membership { version: 1, log_id },
+            (CaptureResponseKind::Created, Some(result)) => {
+                let result = super::created::result_bytes(result);
+                Self::decode_result(&result).map_err(|_| serde::ser::Error::custom("invalid capture response"))?;
+                ResponseWire::Created {
+                    version: 1,
+                    log_id,
+                    result,
+                }
+            }
+            _ => return Err(serde::ser::Error::custom("invalid capture response")),
+        };
+        wire.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for CaptureResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ResponseWire::deserialize(deserializer).map_err(|_| serde::de::Error::custom("invalid capture response"))?;
+        let (version, log_id, kind, result) = match wire {
+            ResponseWire::Blank { version, log_id } => (version, log_id, CaptureResponseKind::Blank, None),
+            ResponseWire::Membership { version, log_id } => (version, log_id, CaptureResponseKind::Membership, None),
+            ResponseWire::Created { version, log_id, result } => {
+                let result = Self::decode_result(&result).map_err(|_| serde::de::Error::custom("invalid capture response"))?;
+                (version, log_id, CaptureResponseKind::Created, Some(result))
+            }
+        };
+        if version != 1 {
+            return Err(serde::de::Error::custom("invalid capture response"));
+        }
+        let log_id = super::decode_id(&log_id).map_err(|_| serde::de::Error::custom("invalid capture response"))?;
+        Ok(Self { log_id, kind, result })
+    }
+}
+
+openraft::declare_raft_types!(
+    pub CaptureTypeConfig:
+        D = CaptureCommand,
+        R = CaptureResponse,
+        NodeId = u64,
+        Node = CaptureNode,
+        Entry = openraft::Entry<Self>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
+        AsyncRuntime = openraft::TokioRuntime,
+        Responder = openraft::impls::OneshotResponder<Self>,
+);
+pub type CaptureRaftEntry = openraft::Entry<CaptureTypeConfig>;
 
 type Stored = openraft::StoredMembership<u64, CaptureNode>;
 
@@ -515,5 +655,402 @@ mod tests {
         assert!(matches!(error, MembershipError::InvalidNode(_)));
         assert!(error.source().is_some());
         assert!(!format!("{error:?} {error}").contains("http://"));
+    }
+    fn command_fixture() -> DecideCreated {
+        DecideCreated {
+            operation_id: [1; 16],
+            object: crate::ObjectIdentity {
+                bucket_incarnation: [2; 16],
+                key: b"k".to_vec(),
+            },
+            expected_head: Some([3; 16]),
+            prepared: crate::PreparedIdentity {
+                version_id: [4; 16],
+                preparation_id: [5; 16],
+                content_digest: [6; 32],
+                content_length: u64::MAX,
+            },
+            binding_revision: 17,
+        }
+    }
+    fn checked_command(command: DecideCreated) -> CaptureCommand {
+        let result = CaptureCommand::try_created(command);
+        assert!(result.is_ok(), "valid command must be admitted");
+        result.expect("asserted valid command")
+    }
+    fn checked_response(applied: CreatedApplyResult) -> CaptureResponse {
+        let result = CaptureResponse::created(applied);
+        assert!(result.is_ok(), "valid Created result must be admitted");
+        result.expect("asserted valid response")
+    }
+    fn serde_roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let encoded = serde_json::to_vec(value);
+        assert!(encoded.is_ok(), "valid value must serialize");
+        let recovered = serde_json::from_slice(&encoded.expect("asserted valid serialization"));
+        assert!(recovered.is_ok(), "valid value must deserialize");
+        recovered.expect("asserted valid deserialization")
+    }
+    fn reject_command(bytes: &[u8]) {
+        let json = serde_json::to_vec(bytes).expect("bytes JSON");
+        let result = serde_json::from_slice::<CaptureCommand>(&json);
+        assert!(result.is_err(), "corrupt command must reject");
+        let error = result.expect_err("asserted corrupt command rejection");
+        assert!(error.to_string().starts_with("invalid capture command"));
+    }
+    fn response_wire(kind: &str, result: Option<Vec<u8>>) -> serde_json::Value {
+        let mut wire = serde_json::json!({"version": 1, "kind": kind, "log_id": crate::encode_id(id())});
+        if let Some(result) = result {
+            wire["result"] = serde_json::json!(result);
+        }
+        wire
+    }
+    fn reject_response(wire: serde_json::Value) {
+        let result = serde_json::from_value::<CaptureResponse>(wire);
+        assert!(result.is_err(), "corrupt response must reject");
+        let error = result.expect_err("asserted corrupt response rejection");
+        assert_eq!(error.to_string(), "invalid capture response");
+    }
+    #[test]
+    fn capture_command_canonical_serde_roundtrip() {
+        for key in [Vec::new(), b"k".to_vec(), vec![255; crate::MAX_OBJECT_KEY_LENGTH]] {
+            for expected_head in [None, Some([3; 16])] {
+                let mut input = command_fixture();
+                input.object.key = key.clone();
+                input.expected_head = expected_head;
+                let command = checked_command(input.clone());
+                assert_eq!(command.created(), &input);
+                let recovered: CaptureCommand = serde_roundtrip(&command);
+                assert_eq!(recovered.created(), &input);
+                assert_eq!(
+                    recovered.created().encode().expect("canonical bytes"),
+                    input.encode().expect("original bytes")
+                );
+            }
+        }
+    }
+    #[test]
+    fn capture_command_serde_rejects_corruption() {
+        let bytes = command_fixture().encode().expect("fixture bytes");
+        for offset in [5, 21, 43, 59, 75] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + 16].fill(0);
+            reject_command(&corrupt);
+        }
+        let mut bad_version = bytes.clone();
+        bad_version[4] = 2;
+        reject_command(&bad_version);
+        let mut oversized = bytes.clone();
+        oversized[37..41].copy_from_slice(&4097u32.to_be_bytes());
+        reject_command(&oversized);
+        for length in 0..bytes.len() {
+            reject_command(&bytes[..length]);
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        reject_command(&trailing);
+        let error = serde_json::from_value::<CaptureCommand>(serde_json::json!({"secret-object-key": "payload"}))
+            .expect_err("wrong shape");
+        assert_eq!(error.to_string(), "invalid capture command");
+    }
+    #[test]
+    fn capture_command_constructor_rejects_invalid_values() {
+        for field in 0..6 {
+            let mut command = command_fixture();
+            match field {
+                0 => command.operation_id = [0; 16],
+                1 => command.object.bucket_incarnation = [0; 16],
+                2 => command.prepared.version_id = [0; 16],
+                3 => command.prepared.preparation_id = [0; 16],
+                4 => command.expected_head = Some([0; 16]),
+                _ => command.object.key = vec![0; crate::MAX_OBJECT_KEY_LENGTH + 1],
+            }
+            assert!(CaptureCommand::try_created(command).is_err());
+        }
+        let mut valid = command_fixture();
+        valid.object.key.clear();
+        valid.prepared.content_digest = [0; 32];
+        assert_eq!(checked_command(valid.clone()).created(), &valid);
+    }
+    #[test]
+    fn capture_response_all_created_results_roundtrip() {
+        let original = LogId {
+            term: 7,
+            leader_node: 0,
+            index: 3,
+        };
+        for result in [
+            CreatedResult::Created {
+                version_id: [4; 16],
+                event_id: [8; 16],
+                decision_log_id: original,
+            },
+            CreatedResult::HeadMismatch { actual_head: None },
+            CreatedResult::HeadMismatch {
+                actual_head: Some([9; 16]),
+            },
+            CreatedResult::OperationConflict,
+            CreatedResult::BindingMismatch,
+            CreatedResult::VersionConflict,
+        ] {
+            let response = checked_response(CreatedApplyResult {
+                log_id: id(),
+                result: result.clone(),
+            });
+            assert_eq!(response.kind(), CaptureResponseKind::Created);
+            assert_eq!(*response.log_id(), id());
+            assert_eq!(response.created_result(), Some(&result));
+            let recovered: CaptureResponse = serde_roundtrip(&response);
+            assert_eq!(recovered, response);
+            assert_eq!(recovered.created_result(), Some(&result));
+            let wire = serde_json::to_value(&response).expect("response wire");
+            assert_eq!(wire["result"], serde_json::json!(crate::created::result_bytes(&result)));
+        }
+    }
+    #[test]
+    fn capture_response_control_kinds_distinct() {
+        let blank = CaptureResponse::blank(id());
+        let membership = CaptureResponse::membership(id());
+        assert!(blank.is_ok(), "Blank response must be admitted");
+        assert!(membership.is_ok(), "Membership response must be admitted");
+        let blank = blank.expect("asserted Blank");
+        let membership = membership.expect("asserted Membership");
+        assert_ne!(blank, membership);
+        for (response, kind) in [
+            (blank, CaptureResponseKind::Blank),
+            (membership, CaptureResponseKind::Membership),
+        ] {
+            assert_eq!(response.kind(), kind);
+            assert_eq!(*response.log_id(), id());
+            assert!(response.created_result().is_none());
+            let recovered: CaptureResponse = serde_roundtrip(&response);
+            assert_eq!(recovered, response);
+        }
+    }
+    #[test]
+    fn capture_response_serde_rejects_corruption() {
+        let valid_result = crate::created::result_bytes(&CreatedResult::Created {
+            version_id: [4; 16],
+            event_id: [8; 16],
+            decision_log_id: id(),
+        });
+        for field in ["version", "kind", "log_id", "result"] {
+            let mut wire = response_wire("created", Some(valid_result.clone()));
+            wire.as_object_mut().expect("wire object").remove(field);
+            reject_response(wire);
+        }
+        for kind in ["unknown", "secret-object-key"] {
+            reject_response(response_wire(kind, None));
+        }
+        let mut wire = response_wire("created", Some(valid_result.clone()));
+        wire["version"] = serde_json::json!(2);
+        reject_response(wire);
+        let mut wire = response_wire("created", Some(valid_result.clone()));
+        wire["secret-object-key"] = serde_json::json!("secret-payload");
+        reject_response(wire);
+        for kind in ["blank", "membership"] {
+            reject_response(response_wire(kind, Some(vec![2])));
+            reject_response(response_wire(kind, Some(Vec::new())));
+        }
+        for bytes in [
+            vec![255],
+            vec![0],
+            {
+                let mut b = valid_result.clone();
+                b[1..17].fill(0);
+                b
+            },
+            {
+                let mut b = valid_result.clone();
+                b[17..33].fill(0);
+                b
+            },
+            vec![1, 1],
+            vec![1, 2],
+        ] {
+            reject_response(response_wire("created", Some(bytes)));
+        }
+        for length in 0..valid_result.len() {
+            reject_response(response_wire("created", Some(valid_result[..length].to_vec())));
+        }
+        for result in [valid_result, vec![1, 0], vec![2], vec![3], vec![4]] {
+            let mut trailing = result;
+            trailing.push(0);
+            reject_response(response_wire("created", Some(trailing)));
+        }
+        for length in [0, 23, 25] {
+            let mut wire = response_wire("blank", None);
+            wire["log_id"] = serde_json::json!(vec![0; length]);
+            reject_response(wire);
+        }
+        for result in [
+            CreatedResult::Created {
+                version_id: [0; 16],
+                event_id: [8; 16],
+                decision_log_id: id(),
+            },
+            CreatedResult::Created {
+                version_id: [4; 16],
+                event_id: [0; 16],
+                decision_log_id: id(),
+            },
+            CreatedResult::HeadMismatch {
+                actual_head: Some([0; 16]),
+            },
+        ] {
+            assert!(
+                CaptureResponse::created(CreatedApplyResult {
+                    log_id: id(),
+                    result: result.clone()
+                })
+                .is_err()
+            );
+            let unchecked = CaptureResponse {
+                log_id: id(),
+                kind: CaptureResponseKind::Created,
+                result: Some(result),
+            };
+            let error = serde_json::to_value(&unchecked).expect_err("serializer validates malformed private fixture");
+            assert_eq!(error.to_string(), "invalid capture response");
+        }
+    }
+    #[test]
+    fn capture_type_config_exact_associated_types() {
+        fn exact<
+            C: openraft::RaftTypeConfig<
+                    D = CaptureCommand,
+                    R = CaptureResponse,
+                    NodeId = u64,
+                    Node = CaptureNode,
+                    Entry = CaptureRaftEntry,
+                    SnapshotData = std::io::Cursor<Vec<u8>>,
+                    AsyncRuntime = openraft::TokioRuntime,
+                    Responder = openraft::impls::OneshotResponder<CaptureTypeConfig>,
+                >,
+        >() {
+        }
+        exact::<CaptureTypeConfig>();
+        let command = checked_command(command_fixture());
+        assert!(!command.created().object.key.is_empty());
+        let responses = [
+            CaptureResponse::blank(id()),
+            CaptureResponse::membership(id()),
+            CaptureResponse::created(CreatedApplyResult {
+                log_id: id(),
+                result: CreatedResult::BindingMismatch,
+            }),
+        ];
+        for response in responses {
+            assert!(response.is_ok(), "concrete response binding admits valid kinds");
+        }
+    }
+    #[test]
+    fn capture_raft_entry_normal_roundtrip() {
+        for leader_node in [0, u64::MAX] {
+            let native_id = LogId {
+                term: u64::MAX,
+                leader_node,
+                index: u64::MAX,
+            };
+            let input = command_fixture();
+            let entry = CaptureRaftEntry {
+                log_id: native_id.into(),
+                payload: openraft::EntryPayload::Normal(checked_command(input.clone())),
+            };
+            let recovered: CaptureRaftEntry = serde_roundtrip(&entry);
+            assert_eq!(recovered.log_id, entry.log_id);
+            assert_eq!(recovered, entry);
+            assert!(matches!(&recovered.payload,openraft::EntryPayload::Normal(command) if command.created()==&input));
+            if let openraft::EntryPayload::Normal(command) = recovered.payload {
+                assert_eq!(command.created().prepared.content_digest, input.prepared.content_digest);
+                assert_eq!(
+                    command.created().encode().expect("entry command"),
+                    input.encode().expect("legacy command")
+                );
+            }
+        }
+    }
+    #[test]
+    fn capture_raft_entry_control_roundtrip() {
+        let native = fixture();
+        let stored = Stored::try_from(&native).expect("valid membership conversion");
+        for payload in [
+            openraft::EntryPayload::Blank,
+            openraft::EntryPayload::Membership(stored.membership().clone()),
+        ] {
+            let entry = CaptureRaftEntry {
+                log_id: id().into(),
+                payload,
+            };
+            let recovered: CaptureRaftEntry = serde_roundtrip(&entry);
+            assert_eq!(recovered, entry);
+            match recovered.payload {
+                openraft::EntryPayload::Blank => assert!(matches!(entry.payload, openraft::EntryPayload::Blank)),
+                openraft::EntryPayload::Membership(membership) => {
+                    let recovered = CaptureMembership::try_from(&Stored::new(Some(recovered.log_id), membership))
+                        .expect("recovered metadata admission");
+                    assert_eq!(recovered, native);
+                    assert_eq!(recovered.configs(), groups());
+                    assert_eq!(recovered.nodes(), &nodes());
+                }
+                openraft::EntryPayload::Normal(_) => panic!("control became business command"),
+            }
+        }
+        let invalid = openraft::Membership::new(vec![BTreeSet::from([0])], BTreeMap::from([(0, CaptureNode::default())]));
+        let entry = CaptureRaftEntry {
+            log_id: id().into(),
+            payload: openraft::EntryPayload::Membership(invalid),
+        };
+        assert!(serde_json::to_value(&entry).is_err(), "invalid node metadata must reject serialization");
+        let entry = CaptureRaftEntry {
+            log_id: id().into(),
+            payload: openraft::EntryPayload::Membership(stored.membership().clone()),
+        };
+        let mut wire = serde_json::to_value(&entry).expect("valid membership entry wire");
+        let removed = wire["payload"]["Membership"]["nodes"]
+            .as_object_mut()
+            .expect("membership nodes wire")
+            .remove("0");
+        assert!(removed.is_some(), "remove actual voter metadata");
+        let recovered = serde_json::from_value::<CaptureRaftEntry>(wire);
+        assert!(recovered.is_ok(), "library serde permits missing voter metadata");
+        let recovered = recovered.expect("asserted library serde recovery");
+        if let openraft::EntryPayload::Membership(membership) = recovered.payload {
+            assert!(matches!(
+                CaptureMembership::try_from(&Stored::new(Some(recovered.log_id), membership)),
+                Err(MembershipError::MissingVoter)
+            ));
+        } else {
+            panic!("membership must remain membership");
+        }
+    }
+    #[test]
+    fn capture_serde_preserves_legacy_codecs() {
+        let mut command = command_fixture();
+        command.expected_head = None;
+        command.prepared.content_length = 7;
+        command.binding_revision = 8;
+        const COMMAND:&[u8]=b"CRTD\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x00\x00\x00\x01k\x00\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x08";
+        assert_eq!(command.encode().expect("legacy encode"), COMMAND);
+        assert_eq!(DecideCreated::decode(COMMAND).expect("golden decode"), command);
+        let typed = checked_command(command);
+        let recovered: CaptureCommand = serde_roundtrip(&typed);
+        assert_eq!(recovered.created().encode().expect("typed golden"), COMMAND);
+        const RESULT:&[u8]=b"\x00\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03";
+        let result = CreatedResult::Created {
+            version_id: [4; 16],
+            event_id: [8; 16],
+            decision_log_id: LogId {
+                term: 7,
+                leader_node: 0,
+                index: 3,
+            },
+        };
+        assert_eq!(crate::created::result_bytes(&result), RESULT);
+        let response = checked_response(CreatedApplyResult { log_id: id(), result });
+        let recovered: CaptureResponse = serde_roundtrip(&response);
+        assert_eq!(crate::created::result_bytes(recovered.created_result().expect("Created result")), RESULT);
     }
 }
