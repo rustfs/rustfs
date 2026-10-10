@@ -8,10 +8,14 @@ repository.workspace = true
 description = "Durable local storage for capture authority"
 
 [dependencies]
+openraft = { workspace = true }
 redb = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

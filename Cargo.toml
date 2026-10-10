@@ -315,6 +315,7 @@ ratelimit = "2.0.0"
 rayon = "1.12.0"
 rustfs-erasure-codec = { version = "9.0.0" }
 reed-solomon-simd = "3.1.0"
+openraft = { version = "=0.9.25", default-features = false, features = ["serde"] }
 redb = "=4.3.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
