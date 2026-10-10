@@ -3412,6 +3412,49 @@ mod tests {
                     true,
                 ),
                 ("unmatched list", &[("if-none-match", "\"other\", W/\"different\"")], StatusCode::OK, true),
+                (
+                    "empty list member is allowed",
+                    &[("if-none-match", "\"other\", , \"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                // s3s accepts these quoted fields; the canonical matcher must validate every member.
+                (
+                    "adjacent tags cannot validate cache",
+                    &[("if-none-match", "\"other\"\"abc\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "adjacent tags cannot satisfy If-Match",
+                    &[("if-match", "\"other\"\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching prefix with trailing garbage",
+                    &[("if-none-match", "\"abc\"garbage\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "matching prefix cannot satisfy If-Match",
+                    &[("if-match", "\"abc\"garbage\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching first tag with malformed later member",
+                    &[("if-none-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Match validates malformed later member",
+                    &[("if-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
                 // These existing s3s parse boundaries reject the request before the handler.
                 ("malformed ETag", &[("if-none-match", "\"abc")], StatusCode::BAD_REQUEST, false),
                 ("invalid date", &[("if-modified-since", "not-a-date")], StatusCode::BAD_REQUEST, false),

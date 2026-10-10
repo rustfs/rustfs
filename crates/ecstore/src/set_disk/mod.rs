@@ -3021,11 +3021,7 @@ fn load_get_metadata_slowtail_fault_config() -> Option<GetMetadataSlowtailFaultC
 }
 
 fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {
-    #[cfg(feature = "test-util")]
-    let benchmark_metadata = conditional_read_bench::applies(bucket, object);
-    #[cfg(not(feature = "test-util"))]
-    let benchmark_metadata = false;
-    if !read_data && !benchmark_metadata {
+    if !read_data {
         return None;
     }
 

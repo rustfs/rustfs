@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Keeps metadata off the cache and applies configured slow-disk faults to
-/// metadata-only prepared reads as well as ordinary GET reads. Only the
-/// benchmark's isolated bucket is affected; body-cache policy remains intact.
+/// Keeps metadata off the cache in the benchmark's isolated bucket so GET
+/// metadata reads exercise the configured slow disk. Body-cache policy
+/// remains intact.
 #[must_use]
 pub struct ConditionalReadBenchmarkMetadataGuard {
     _private: (),
@@ -47,10 +47,6 @@ pub(super) fn cache_bypass_applies(bucket: &str) -> bool {
     bucket == "conditional-bench" && ACTIVE.load(Ordering::Acquire)
 }
 
-pub(super) fn applies(bucket: &str, object: &str) -> bool {
-    cache_bypass_applies(bucket) && object.starts_with("bench-")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,9 +55,8 @@ mod tests {
     fn benchmark_metadata_profile_is_scoped_to_its_bucket_and_owner() {
         assert!(!cache_bypass_applies("conditional-bench"));
         let owner = ConditionalReadBenchmarkMetadataGuard::acquire();
-        assert!(applies("conditional-bench", "bench-4096"));
-        assert!(!applies("other-bucket", "bench-4096"));
-        assert!(!applies("conditional-bench", "other-object"));
+        assert!(cache_bypass_applies("conditional-bench"));
+        assert!(!cache_bypass_applies("other-bucket"));
         drop(owner);
         assert!(!cache_bypass_applies("conditional-bench"));
     }

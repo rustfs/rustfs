@@ -1217,6 +1217,49 @@ mod tests {
     }
 
     #[test]
+    fn test_read_etag_comparison_requires_complete_field() {
+        for (etag, condition, matches) in [
+            ("abc", "\"other\"\"abc\"", false),
+            ("abc", "\"abc\"garbage\"", false),
+            ("abc", "\"abc\", \"other\"\"different\"", false),
+            ("abc", "\"abc\", W/ \"other\"", false),
+            ("abc", "\"abc\", \"contains space\"", false),
+            ("abc", "\"abc\", *", false),
+            ("abc", "\"other\", , \"abc\"", true),
+            ("abc", ", \"abc\",,", true),
+            ("a,b", "\"other\", \"a,b\"", true),
+            ("", ",,,", false),
+            ("", "\"\"", true),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(etag.to_owned()),
+                ..Default::default()
+            };
+            for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name.clone(), HeaderValue::from_str(condition).unwrap());
+                let result = check_preconditions(&headers, &info);
+                if name == http::header::IF_MATCH {
+                    if matches {
+                        assert!(result.is_ok(), "{condition}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::PreconditionFailed, "{condition}");
+                    }
+                } else if matches {
+                    // The empty ETag case validates matching via If-Match above;
+                    // emitting that invalid stored response validator fails closed.
+                    assert!(result.is_err(), "{condition}");
+                    if !etag.is_empty() {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified, "{condition}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{condition}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_check_preconditions() {
         use time::{format_description::FormatItem, macros::format_description};
         const RFC1123: &[FormatItem<'_>] =

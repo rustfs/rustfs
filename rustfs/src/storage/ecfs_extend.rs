@@ -626,21 +626,42 @@ fn read_etag_matches(object_etag: &str, condition: &str, allow_weak: bool) -> bo
     let object_weak = object_etag.starts_with("W/");
     let object_value = object_etag.strip_prefix("W/").unwrap_or(object_etag).trim_matches('"');
     let mut remaining = condition.trim();
+    let mut matched = false;
     while !remaining.is_empty() {
+        // Recipients ignore empty list members, but tags still need commas.
+        if let Some(rest) = remaining.strip_prefix(',') {
+            remaining = rest.trim();
+            continue;
+        }
         let weak = remaining.starts_with("W/");
         let value = remaining.strip_prefix("W/").unwrap_or(remaining);
         let (value, rest) = if let Some(quoted) = value.strip_prefix('"') {
             let Some(pair) = quoted.split_once('"') else { return false };
             pair
         } else {
-            value.split_once(',').unwrap_or((value, ""))
+            // Preserve bare tags used by legacy internal callers.
+            if weak {
+                return false;
+            }
+            let (value, rest) = value.split_at(value.find(',').unwrap_or(value.len()));
+            let value = value.trim();
+            if value.is_empty() || value == "*" {
+                return false;
+            }
+            (value, rest)
         };
-        if value == object_value && (allow_weak || (!weak && !object_weak)) {
-            return true;
+        if !value.bytes().all(|byte| byte == b'!' || (byte >= b'#' && byte != 0x7f)) {
+            return false;
         }
-        remaining = rest.trim().strip_prefix(',').unwrap_or(rest).trim();
+        matched |= value == object_value && (allow_weak || (!weak && !object_weak));
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return matched;
+        }
+        let Some(rest) = rest.strip_prefix(',') else { return false };
+        remaining = rest.trim();
     }
-    false
+    matched
 }
 
 fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {

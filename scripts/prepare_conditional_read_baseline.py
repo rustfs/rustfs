@@ -36,11 +36,6 @@ def prepare(root, baseline, revision):
          '#[cfg(feature = "test-util")]\nmod conditional_read_bench;\n'
          '#[cfg(feature = "test-util")]\npub use conditional_read_bench::ConditionalReadBenchmarkMetadataGuard;\n\n'
          'const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS";')
-    edit("crates/ecstore/src/set_disk/mod.rs",
-         "fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {\n    if !read_data {",
-         'fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {\n'
-         '    #[cfg(feature = "test-util")]\n    let benchmark_metadata = conditional_read_bench::applies(bucket, object);\n'
-         '    #[cfg(not(feature = "test-util"))]\n    let benchmark_metadata = false;\n    if !read_data && !benchmark_metadata {')
     edit("crates/ecstore/src/set_disk/read.rs",
          "fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {",
          "fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {\n"

@@ -16,11 +16,12 @@ and warmed, and a 20 ms delay on one metadata disk. It excludes network ingress,
 authentication, external tiers, cold-fill contention, and distributed capacity.
 
 The test-util-only metadata guard bypasses metadata caching in the dedicated
-`conditional-bench` bucket and permits the existing delay injector to affect
-metadata-only prepared reads. This prevents cache hits or `read_data=false`
-from silently hiding the slow-disk scenario. The guard has no effect in ordinary
-builds or outside its bucket, and ownership drop restores the default policy.
-Both compared revisions must include these identical benchmark controls.
+`conditional-bench` bucket so cache hits cannot hide the slow-disk scenario.
+Both ordinary GET and prepared GET metadata reads already use `read_data=true`
+and therefore exercise the existing delay injector without an additional override.
+The guard has no effect in ordinary builds or outside its bucket, and ownership
+drop restores the default policy. Both compared revisions must include this
+identical benchmark control.
 
 ## Build paired artifacts
 

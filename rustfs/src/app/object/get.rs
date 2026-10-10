@@ -2373,11 +2373,6 @@ impl DefaultObjectUsecase {
         Ok(())
     }
 
-    fn validate_get_object_before_cold_fill(headers: &HeaderMap, part_number: Option<usize>, info: &ObjectInfo) -> S3Result<()> {
-        check_preconditions(headers, info)?;
-        Self::validate_get_object_part_number(part_number, info)
-    }
-
     async fn validate_get_object_before_body(
         req: &S3Request<GetObjectInput>,
         bucket: &str,
@@ -2393,7 +2388,8 @@ impl DefaultObjectUsecase {
             };
             return Err(with_delete_marker_read_headers(S3Error::new(code), info, req.input.version_id.as_deref()));
         }
-        let result = Self::validate_get_object_before_cold_fill(&req.headers, part_number, info);
+        let result =
+            check_preconditions(&req.headers, info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
             let principal = SseKmsPrincipal::from_request(req);
             crate::storage::sse::validate_conditional_read(bucket, key, &info.user_defined, &req.headers, principal.as_ref())
@@ -2734,7 +2730,6 @@ impl DefaultObjectUsecase {
             if matches!(legacy_probe, GetObjectBodyCacheHookLookup::Ineligible) {
                 break 'snapshot;
             }
-            Self::validate_get_object_part_number(part_number, info)?;
             if let GetObjectBodyCacheHookLookup::Hit(body) = legacy_probe {
                 drop(metadata_admission.take());
                 let info = prepared
@@ -7025,7 +7020,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn conditional_get_304_skips_cache_fill_calls_with_live_positive_control() {
+    async fn conditional_get_terminal_response_skips_cache_fill_calls_with_live_positive_control() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
         struct ResetProbes;
         impl Drop for ResetProbes {
@@ -7071,17 +7066,23 @@ mod tests {
             .key(object.to_owned())
             .build()
             .expect("GET input");
-        let mut req = build_request(input.clone(), Method::GET);
-        req.headers.insert(
-            http::header::IF_NONE_MATCH,
-            HeaderValue::from_str(&format!("\"{}\"", info.etag.expect("ETag"))).expect("condition"),
-        );
-        let error = usecase.execute_get_object(req).await.expect_err("matching condition");
-        assert_eq!(error.code(), &S3ErrorCode::NotModified);
-        assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
-        assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
-        assert_eq!(fills.fills.load(Ordering::Relaxed), 0, "no cache-fill publish call");
-        assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
+        for (header, value, expected) in [
+            (
+                http::header::IF_NONE_MATCH,
+                format!("\"{}\"", info.etag.as_deref().expect("ETag")),
+                S3ErrorCode::NotModified,
+            ),
+            (http::header::IF_MATCH, "\"other-etag\"".to_owned(), S3ErrorCode::PreconditionFailed),
+        ] {
+            let mut req = build_request(input.clone(), Method::GET);
+            req.headers.insert(header, HeaderValue::from_str(&value).expect("condition"));
+            let error = usecase.execute_get_object(req).await.expect_err("terminal condition");
+            assert_eq!(error.code(), &expected);
+            assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
+            assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
+            assert_eq!(fills.fills.load(Ordering::Relaxed), 0, "no cache-fill publish call");
+            assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
+        }
 
         let mut response = usecase
             .execute_get_object(build_request(input, Method::GET))
@@ -11467,53 +11468,6 @@ mod tests {
         let single_part_multipart = info_with_parts(1, "d41d8cd98f00b204e9800998ecf8427e-1");
         assert!(single_part_multipart.is_multipart());
         assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &single_part_multipart), Some(1));
-    }
-
-    #[test]
-    fn cold_fill_conditions_fail_before_phase_probe_advances() {
-        fn run_phase_probe(headers: &HeaderMap, info: &ObjectInfo) -> (S3Result<()>, [usize; 3]) {
-            let coordination = AtomicUsize::new(0);
-            let permit = AtomicUsize::new(0);
-            let reader = AtomicUsize::new(0);
-            let result = DefaultObjectUsecase::validate_get_object_before_cold_fill(headers, None, info);
-            if result.is_ok() {
-                coordination.fetch_add(1, AtomicOrdering::Relaxed);
-                permit.fetch_add(1, AtomicOrdering::Relaxed);
-                reader.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            (
-                result,
-                [
-                    coordination.load(AtomicOrdering::Relaxed),
-                    permit.load(AtomicOrdering::Relaxed),
-                    reader.load(AtomicOrdering::Relaxed),
-                ],
-            )
-        }
-
-        let info = ObjectInfo {
-            etag: Some("phase-etag".to_string()),
-            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
-                number: 1,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-
-        let mut not_modified = HeaderMap::new();
-        not_modified.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"phase-etag\""));
-        let (result, phases) = run_phase_probe(&not_modified, &info);
-        assert_eq!(result.expect_err("matching If-None-Match must reject").code(), &S3ErrorCode::NotModified);
-        assert_eq!(phases, [0, 0, 0]);
-
-        let mut precondition_failed = HeaderMap::new();
-        precondition_failed.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other-etag\""));
-        let (result, phases) = run_phase_probe(&precondition_failed, &info);
-        assert_eq!(
-            result.expect_err("mismatched If-Match must reject").code(),
-            &S3ErrorCode::PreconditionFailed
-        );
-        assert_eq!(phases, [0, 0, 0]);
     }
 
     #[tokio::test]
