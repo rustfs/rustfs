@@ -41,7 +41,7 @@ use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
 use rustfs_iam::cache::Cache;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::manager::{IamCache, IamState};
-use rustfs_iam::store::object::{IAM_CONFIG_USERS_PREFIX, ObjectStore};
+use rustfs_iam::store::object::{IAM_CONFIG_POLICIES_PREFIX, IAM_CONFIG_USERS_PREFIX, ObjectStore};
 use rustfs_iam::store::{GroupInfo, Store, UserType};
 use rustfs_policy::auth::UserIdentity;
 use serial_test::serial;
@@ -512,4 +512,73 @@ async fn identity_physically_missing_is_no_such_user() {
         "preserve absent name, got {error:?}"
     );
     assert!(users.is_empty(), "missing read must not populate users");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_empty_reads_preserve_crypto_error() {
+    let fixture = IdentityStoreFixture::new().await;
+    fixture.overwrite_parent_bytes(&[]).await;
+    let locked = fixture
+        .manager
+        .api
+        .load_user_identity(IDENTITY_PARENT, UserType::Reg)
+        .await
+        .expect_err("empty stored identity must fail locked read");
+    assert!(matches!(locked, IamError::CryptoError(_)), "preserve crypto error, got {locked:?}");
+    let mut users = HashMap::new();
+    let no_lock = fixture
+        .manager
+        .api
+        .load_user_no_lock(IDENTITY_PARENT, UserType::Reg, &mut users)
+        .await
+        .expect_err("empty stored identity must fail no-lock read");
+    assert!(matches!(no_lock, IamError::CryptoError(_)), "preserve crypto error, got {no_lock:?}");
+    assert!(users.is_empty(), "failed no-lock read must not populate users");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_empty_notification_preserves_child_storage_and_cache() {
+    let fixture = IdentityStoreFixture::new().await;
+    fixture.assert_parent_and_child().await;
+    fixture.overwrite_parent_bytes(&[]).await;
+    let notification = fixture
+        .manager
+        .user_notification_handler(IDENTITY_PARENT, UserType::Reg)
+        .await;
+    fixture.assert_child_storage_and_identity_cache().await;
+    let error = notification.expect_err("empty parent notification must return an error");
+    assert!(
+        matches!(error, IamError::CryptoError(_)),
+        "preserve notification crypto error, got {error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn policy_empty_payload_retains_no_such_policy() {
+    let fixture = IdentityStoreFixture::new().await;
+    let name = "empty-policy";
+    let path = format!("{}{name}/policy.json", IAM_CONFIG_POLICIES_PREFIX.as_str());
+    save_config(fixture.ecstore.clone(), &path, Vec::new())
+        .await
+        .expect("save real empty policy payload");
+    let locked = fixture
+        .manager
+        .api
+        .load_policy(name)
+        .await
+        .err()
+        .expect("empty policy must retain absent-policy behavior");
+    assert!(matches!(locked, IamError::NoSuchPolicy), "preserve policy error, got {locked:?}");
+    let mut policies = HashMap::new();
+    let no_lock = fixture
+        .manager
+        .api
+        .load_policy_doc_no_lock(name, &mut policies)
+        .await
+        .expect_err("empty no-lock policy must retain absent-policy behavior");
+    assert!(matches!(no_lock, IamError::NoSuchPolicy), "preserve policy error, got {no_lock:?}");
+    assert!(policies.is_empty(), "failed no-lock policy read must not populate policies");
 }

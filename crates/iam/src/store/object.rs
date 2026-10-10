@@ -42,6 +42,7 @@ use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
     HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    read_config_preserve_empty_with_metadata_opts,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -414,9 +415,14 @@ impl ObjectStore {
         &self,
         path: impl AsRef<str> + Send,
         mode: LoadMode,
+        preserve_empty: bool,
     ) -> Result<(Vec<u8>, IamObjectInfo)> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &mode.read_opts()).await?;
+        let (data, obj) = if preserve_empty {
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), path_ref, &mode.read_opts()).await?
+        } else {
+            read_iam_config_with_metadata(self.object_api.clone(), path_ref, &mode.read_opts()).await?
+        };
         let outcome = Self::decrypt_data_with_source(&data)?;
         self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
 
@@ -614,7 +620,7 @@ impl ObjectStore {
     /// Parameterized core of [`Store::load_user_identity`].
     async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
         let mut u: UserIdentity = self
-            .load_iamconfig_bytes_with_metadata(get_user_identity_path(name, user_type), mode)
+            .load_iamconfig_bytes_with_metadata(get_user_identity_path(name, user_type), mode, true)
             .await
             .and_then(|(data, _)| serde_json::from_slice(&data).map_err(Error::from))
             .map_err(|err| {
@@ -696,7 +702,7 @@ impl ObjectStore {
     /// Parameterized core of [`Store::load_policy`].
     async fn load_policy_with(&self, name: &str, mode: LoadMode) -> Result<PolicyDoc> {
         let (data, obj) = self
-            .load_iamconfig_bytes_with_metadata(get_policy_doc_path(name), mode)
+            .load_iamconfig_bytes_with_metadata(get_policy_doc_path(name), mode, false)
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
