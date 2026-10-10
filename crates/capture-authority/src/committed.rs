@@ -8,8 +8,13 @@ pub(crate) fn validate_committed(
     let schema = number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?;
     let marker = meta.get("committed")?;
     match (schema, marker) {
-        (1, None) => Ok(None),
-        (2, Some(marker)) => {
+        (1 | 3, None) => {
+            if schema == 3 && meta.get("last_applied")?.is_none_or(|v| v.value() != [0]) {
+                return Err(StoreError::CorruptRecord);
+            }
+            Ok(None)
+        }
+        (2 | 3, Some(marker)) => {
             let id = decode_id(marker.value())?;
             let record = logs.get(id.index)?.ok_or(StoreError::CorruptRecord)?;
             if decode_log(record.value())?.id != id {
@@ -49,7 +54,7 @@ impl Store {
                 }
             }
             meta.insert("committed", encode_id(id).as_slice())?;
-            if previous.is_none() {
+            if previous.is_none() && number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())? != 3 {
                 meta.insert("schema", 2u64.to_be_bytes().as_slice())?;
             }
         }

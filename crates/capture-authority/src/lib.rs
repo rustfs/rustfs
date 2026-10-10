@@ -6,7 +6,15 @@ use std::{
     path::Path,
 };
 
+mod application;
 mod committed;
+mod created;
+pub use created::{
+    CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedResult, CreatedVersion, DecideCreated,
+    MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
+};
+#[cfg(test)]
+mod application_tests;
 mod truncate;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -57,6 +65,12 @@ pub enum StoreError {
     CommittedRegression,
     #[error("committed log protected")]
     CommittedLogProtected,
+    #[error("capture binding not pinned")]
+    BindingNotPinned,
+    #[error("capture binding conflict")]
+    BindingConflict,
+    #[error("invalid application sequence")]
+    InvalidApplySequence,
     #[error("log index exhausted")]
     IndexExhausted,
     #[error("store already initialized")]
@@ -90,6 +104,9 @@ impl StoreError {
             Self::InvalidCommittedLog => "invalid_committed_log",
             Self::CommittedRegression => "committed_regression",
             Self::CommittedLogProtected => "committed_log_protected",
+            Self::BindingNotPinned => "binding_not_pinned",
+            Self::BindingConflict => "binding_conflict",
+            Self::InvalidApplySequence => "invalid_apply_sequence",
             Self::IndexExhausted => "index_exhausted",
             Self::AlreadyInitialized => "already_initialized",
             Self::MissingStore => "missing_store",
@@ -163,7 +180,7 @@ impl Store {
         let tx = store.database.begin_read()?;
         let meta = tx.open_table(META)?;
         let schema = meta.get("schema")?.ok_or(StoreError::CorruptRecord)?;
-        if !matches!(number(schema.value())?, 1 | 2) {
+        if !matches!(number(schema.value())?, 1..=3) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = meta.get("identity")?.ok_or(StoreError::CorruptRecord)?;
@@ -191,6 +208,7 @@ impl Store {
             last = Some(entry.id);
         }
         committed::validate_committed(&meta, &logs)?;
+        application::validate_application(&tx)?;
         let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         if tail != last {
             return Err(StoreError::InvalidLogSequence);
@@ -394,12 +412,12 @@ mod tests {
         time::Duration,
     };
     #[derive(Debug, Default)]
-    struct Gate {
+    pub(super) struct Gate {
         arrivals: Mutex<usize>,
         changed: Condvar,
     }
     impl Gate {
-        fn wait(&self) {
+        pub(super) fn wait(&self) {
             let mut arrivals = self.arrivals.lock().expect("gate");
             *arrivals += 1;
             self.changed.notify_all();
@@ -444,12 +462,12 @@ mod tests {
         pause: Option<(usize, bool, Arc<Gate>, Arc<Gate>)>,
     }
     #[derive(Debug, Clone)]
-    struct CrashBackend {
+    pub(super) struct CrashBackend {
         path: std::path::PathBuf,
         media: Arc<Mutex<Media>>,
     }
     impl CrashBackend {
-        fn new(path: &Path) -> Self {
+        pub(super) fn new(path: &Path) -> Self {
             let mut bytes = Vec::new();
             File::open(path)
                 .expect("stable exists")
@@ -466,7 +484,7 @@ mod tests {
                 })),
             }
         }
-        fn cut(&self) {
+        pub(super) fn cut(&self) {
             let mut m = self.media.lock().expect("media");
             m.dead = true;
             m.volatile.clear();
@@ -476,7 +494,7 @@ mod tests {
             m.syncs = 0;
             m.fault = Some((sync, after, cut));
         }
-        fn pause_sync(&self, sync: usize, after: bool) -> (Arc<Gate>, Arc<Gate>) {
+        pub(super) fn pause_sync(&self, sync: usize, after: bool) -> (Arc<Gate>, Arc<Gate>) {
             let entered = Arc::new(Gate::default());
             let resume = Arc::new(Gate::default());
             let mut m = self.media.lock().expect("media");
@@ -484,7 +502,7 @@ mod tests {
             m.pause = Some((sync, after, entered.clone(), resume.clone()));
             (entered, resume)
         }
-        fn database(&self) -> Database {
+        pub(super) fn database(&self) -> Database {
             Database::builder()
                 .create_with_backend(self.clone())
                 .expect("backend database")
