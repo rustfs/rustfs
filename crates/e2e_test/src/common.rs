@@ -1542,6 +1542,15 @@ impl RustFSTestClusterEnvironment {
         self.start_node_from_binary(node_idx, &binary_path).await
     }
 
+    /// Start a process and wait only for TCP, allowing tests to bring up a
+    /// quorum one node at a time before the S3 service can become ready.
+    pub async fn start_node_process(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, &binary_path, &volumes_arg)?;
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await
+    }
+
     /// Start one stopped cluster node with a specific RustFS binary while
     /// preserving the cluster's volume layout and that node's data directory.
     pub async fn start_node_from_binary(
