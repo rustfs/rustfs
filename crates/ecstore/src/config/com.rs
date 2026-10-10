@@ -476,7 +476,7 @@ where
     read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true, Some(max_bytes)).await
 }
 
-pub(crate) async fn read_config_limited_preserve_empty_with_metadata_opts<S>(
+pub async fn read_config_limited_preserve_empty_with_metadata_opts<S>(
     api: Arc<S>,
     file: &str,
     opts: &ObjectOptions,
