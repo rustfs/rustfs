@@ -1386,12 +1386,17 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(windows)]
+type NativeRootIdentity = (u64, [u8; 16]);
+#[cfg(not(windows))]
+type NativeRootIdentity = (u64, u64);
+
 // Publication history outlives disk handles, cleanup, and metadata snapshots.
 // Reusing a pathname or descriptor for another physical root is not new proof.
 #[derive(Debug, Default)]
 struct NativePublicationHistory {
-    roots: HashMap<(u64, u64), NativeRootHistory>,
-    aliases: HashMap<PathBuf, HashSet<(u64, u64)>>,
+    roots: HashMap<NativeRootIdentity, NativeRootHistory>,
+    aliases: HashMap<PathBuf, HashSet<NativeRootIdentity>>,
 }
 
 #[derive(Debug, Default)]
@@ -1405,7 +1410,7 @@ static NATIVE_PUBLICATION_HISTORY: LazyLock<Mutex<NativePublicationHistory>> =
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativePublicationRegistration {
-    identity: (u64, u64),
+    identity: NativeRootIdentity,
     root: PathBuf,
     io_root: PathBuf,
 }
@@ -1419,7 +1424,7 @@ pub struct NativeBucketCreationWitness {
     disk_id: uuid::Uuid,
 }
 
-fn native_root_identity(path: &Path) -> Option<(u64, u64)> {
+fn native_root_identity(path: &Path) -> Option<NativeRootIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1428,7 +1433,14 @@ fn native_root_identity(path: &Path) -> Option<(u64, u64)> {
         let metadata = std::fs::metadata(path).ok()?;
         metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Resolve and validate the same directory anchor used for publication;
+        // keep its volume and complete 128-bit file ID in the history key.
+        let (_, directory) = open_windows_publication_root(path).ok()?;
+        windows_file_identity(directory.handle.as_ref()).ok()
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = path;
         None
@@ -5947,6 +5959,77 @@ mod tests {
         .expect_err("a supported extended rename failure must replace the stale legacy error");
         assert_eq!(attempts, 2);
         assert_eq!(err.raw_os_error(), Some(disk_full));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_root_identity_matches_directory_handles() {
+        let temp = tempdir().expect("create native identity fixture");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).expect("create first root");
+        std::fs::create_dir(&second).expect("create second root");
+        let (_, first_anchor) = open_windows_publication_root(&first).expect("open first directory anchor");
+        let (_, second_anchor) = open_windows_publication_root(&second).expect("open second directory anchor");
+        let first_identity = windows_file_identity(first_anchor.handle.as_ref()).expect("query full first identity");
+        let second_identity = windows_file_identity(second_anchor.handle.as_ref()).expect("query full second identity");
+
+        assert_eq!(native_root_identity(&first), Some(first_identity));
+        assert_eq!(native_root_identity(&first.join(".")), Some(first_identity));
+        assert_eq!(native_root_identity(&second), Some(second_identity));
+        assert_ne!(first_identity, second_identity, "distinct physical roots must have distinct identities");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_native_creation_witness_retains_started_history() {
+        let temp = tempdir().expect("create native witness fixture");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical native root");
+        let _publication_root = PublicationRoot::new(&root).expect("retain native directory anchor");
+        let registration = register_native_publication_root(&root, &root.join(".")).expect("register same physical root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let disk_id = uuid::Uuid::new_v4();
+        let witness = registration
+            .witness("published", disk_id, Arc::clone(&backend))
+            .expect("fresh native witness");
+        let bucket = root.join("published");
+
+        super::super::fs::mkdir(&bucket)
+            .await
+            .expect("publish through the actual native entry");
+        assert!(bucket.is_dir(), "the production entry must create the directory");
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness)));
+        std::fs::remove_dir(&bucket).expect("remove published directory");
+        assert!(registration.witness("published", disk_id, Arc::clone(&backend)).is_none());
+        let reconnected = register_native_publication_root(&root, &root).expect("reconnect same physical root");
+        assert!(reconnected.witness("published", disk_id, Arc::clone(&backend)).is_none());
+
+        let unstarted = reconnected
+            .witness("unstarted", disk_id, Arc::clone(&backend))
+            .expect("untouched bucket keeps its witness");
+        assert!(consume_native_creation_witnesses(std::slice::from_ref(&unstarted)));
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&unstarted)));
+        assert!(reconnected.witness("unstarted", disk_id, backend).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_creation_witness_rejects_unknown_roots() {
+        let temp = tempdir().expect("create unknown identity fixture");
+        let root = temp.path().join("root");
+        let other = temp.path().join("other");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&root).expect("create native root");
+        std::fs::create_dir(&other).expect("create distinct native root");
+        std::fs::write(&file, b"not a directory").expect("create regular file");
+
+        assert!(native_root_identity(&temp.path().join("missing")).is_none());
+        assert!(native_root_identity(&file).is_none());
+        assert!(register_native_publication_root(&root, &other).is_none());
+        let registration = register_native_publication_root(&root, &root).expect("register actual native root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root));
+        registration.invalidate();
+        assert!(registration.witness("unstarted", uuid::Uuid::new_v4(), backend).is_none());
     }
 
     #[cfg(windows)]
