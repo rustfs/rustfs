@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::RustFSTestClusterEnvironment;
+use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use bytes::Bytes;
@@ -195,11 +195,14 @@ async fn wait_for_quorum_read_admission(clients: &[Client], bucket: &str) -> Tes
 async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResult {
     crate::common::init_logging();
 
-    for (node_count, parity) in [(4, 2), (6, 3), (6, 2)] {
+    for (node_count, parity) in [(3, 1), (4, 2), (6, 3), (6, 2), (4, 0)] {
         let read_quorum = node_count - parity;
         let write_quorum = read_quorum + usize::from(read_quorum == parity);
         let mut cluster = RustFSTestClusterEnvironment::new(node_count).await?;
         cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
+        if parity == 0 {
+            cluster.set_env("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
+        }
         // Wait for every seed fanout before removing any physical shard.
         cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
         cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
@@ -328,13 +331,221 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
         for node in 0..read_quorum - 1 {
             cluster.stop_node(node)?;
         }
-        cluster.start().await?;
+        // Rebuild every process's in-memory state below read quorum, then
+        // cross the EC boundary. A format bootstrap must not admit S3 reads
+        // merely because half the peers are online (e.g. six disks, EC:2).
+        for node in 0..read_quorum - 1 {
+            cluster.start_node_process(node).await?;
+        }
+        let error = clients[0]
+            .get_object()
+            .bucket(&bucket)
+            .key("below-quorum")
+            .send()
+            .await
+            .expect_err("cold startup below the configured EC read quorum must stay unavailable");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+        cluster.start_node_process(read_quorum - 1).await?;
+        wait_for_quorum_read_admission(&clients[..read_quorum], &bucket).await?;
+        for client in clients.iter().take(read_quorum) {
+            assert_quorum_object_body(client, &bucket, "warm-small", &small).await?;
+            assert_quorum_object_body(client, &bucket, "cold-large", &large).await?;
+            let write = client
+                .put_object()
+                .bucket(&bucket)
+                .key("cold-quorum-write")
+                .body(Bytes::copy_from_slice(&small).into())
+                .send()
+                .await;
+            if read_quorum >= write_quorum {
+                write?;
+                assert_quorum_object_body(client, &bucket, "cold-quorum-write", &small).await?;
+            } else {
+                let error = write.expect_err("cold startup at read quorum must preserve the EC write quorum");
+                assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            }
+        }
+        for node in read_quorum..node_count {
+            cluster.start_node(node).await?;
+        }
         for client in &clients {
             assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
             assert_quorum_object_body(client, &bucket, "below-quorum", &large).await?;
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_four_by_six_cold_start_at_read_quorum() -> TestResult {
+    crate::common::init_logging();
+    let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, 6)).await?;
+    // Explicit URLs are consumed in order. Place one drive from each node in
+    // every set, matching a four-host, six-drive-per-host deployment.
+    let volumes = (0..6)
+        .flat_map(|drive| {
+            cluster
+                .nodes
+                .iter()
+                .map(move |node| format!("http://{}{}", node.address, node.data_dirs[drive]))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    cluster.set_env("RUSTFS_VOLUMES", volumes);
+    cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", "4");
+    cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+    cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+    cluster.set_env("RUST_LOG", "error");
+    cluster.start().await?;
+    let clients = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bucket = "cold-start-read-quorum";
+    clients[0].create_bucket().bucket(bucket).send().await?;
+    let mut fixtures = Vec::new();
+    let mut covered = [[false; 2]; 6];
+    for index in 0..128 {
+        let key = match index {
+            0 => "warm-small".to_string(),
+            1 => "warm-large".to_string(),
+            _ => format!("cold-{index}"),
+        };
+        let size_class = index % 2;
+        let size = if size_class == 0 { 71 } else { 256 * 1024 };
+        let body = (0..size)
+            .map(|offset| u8::try_from(offset % 251).expect("bounded fixture byte"))
+            .collect::<Vec<_>>();
+        clients[0]
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(Bytes::copy_from_slice(&body).into())
+            .send()
+            .await?;
+        for node in &cluster.nodes {
+            let mut complete_shards = 0;
+            for (drive, path) in node.data_dirs.iter().enumerate() {
+                let census = crate::chaos::census_object_version_on_disk(std::path::Path::new(path), bucket, &key, None)?;
+                if census.has_xl_meta {
+                    assert!(census.is_complete(), "seed shard must be complete before shutdown: {census:?}");
+                    assert_eq!((census.data_blocks, census.parity_blocks), (Some(2), Some(2)));
+                    covered[drive][size_class] = true;
+                    complete_shards += 1;
+                }
+            }
+            assert_eq!(complete_shards, 1, "each node must own one shard of every seed object");
+        }
+        fixtures.push((key, body));
+        if covered.iter().flatten().all(|covered| *covered) {
+            break;
+        }
+    }
+    assert!(
+        covered.iter().flatten().all(|covered| *covered),
+        "fixtures must cover all six sets with inline and large objects"
+    );
+
+    for first in 0..4 {
+        for second in first + 1..4 {
+            for node in 0..4 {
+                cluster.stop_node(node)?;
+            }
+            cluster.start_node_process(first).await?;
+            let error = clients[first]
+                .get_object()
+                .bucket(bucket)
+                .key("warm-large")
+                .send()
+                .await
+                .expect_err("one node cannot satisfy read quorum after a cold start");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            cluster.start_node_process(second).await?;
+            wait_for_quorum_read_admission(&[clients[first].clone(), clients[second].clone()], bucket).await?;
+            for node in [first, second] {
+                for (key, body) in &fixtures {
+                    assert_quorum_object_body(&clients[node], bucket, key, body).await?;
+                }
+                let range = clients[node]
+                    .get_object()
+                    .bucket(bucket)
+                    .key("warm-large")
+                    .range("bytes=17-1023")
+                    .send()
+                    .await?;
+                assert_eq!(range.body.collect().await?.into_bytes().as_ref(), &fixtures[1].1[17..1024]);
+                let listing = clients[node].list_objects_v2().bucket(bucket).send().await?;
+                for (key, _) in &fixtures {
+                    assert!(
+                        listing.contents().iter().any(|object| object.key() == Some(key.as_str())),
+                        "listing omitted {key}"
+                    );
+                }
+                let error = clients[node]
+                    .put_object()
+                    .bucket(bucket)
+                    .key("recovery-write")
+                    .body(Bytes::from_static(b"after recovery").into())
+                    .send()
+                    .await
+                    .expect_err("two nodes must not authorize a write");
+                assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            }
+            let error = clients[first]
+                .delete_object()
+                .bucket(bucket)
+                .key("warm-large")
+                .send()
+                .await
+                .expect_err("two nodes must not authorize a delete");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            assert_quorum_object_body(&clients[first], bucket, "warm-large", &fixtures[1].1).await?;
+
+            let remaining = (0..4).filter(|node| *node != first && *node != second).collect::<Vec<_>>();
+            cluster.start_node(remaining[0]).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                match clients[first]
+                    .put_object()
+                    .bucket(bucket)
+                    .key("recovery-write")
+                    .body(Bytes::from_static(b"after recovery").into())
+                    .send()
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.raw_response().is_some_and(|response| response.status().as_u16() == 503)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(200)).await
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for node in [first, second, remaining[0]] {
+                assert_quorum_object_body(&clients[node], bucket, "recovery-write", b"after recovery").await?;
+            }
+            cluster.start_node(remaining[1]).await?;
+            for client in &clients {
+                for (key, body) in &fixtures {
+                    assert_quorum_object_body(client, bucket, key, body).await?;
+                }
+                assert_quorum_object_body(client, bucket, "recovery-write", b"after recovery").await?;
+            }
+        }
+    }
     Ok(())
 }
 
