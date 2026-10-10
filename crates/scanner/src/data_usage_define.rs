@@ -234,7 +234,7 @@ pub static DATA_USAGE_BLOOM_RECOVERY_PATH: LazyLock<String> =
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
-const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
+pub(crate) const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
 
 /// Scanner-side accounting on the shared [`SizeSummary`].
 ///
@@ -948,6 +948,42 @@ impl DataUsageCache {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
+            let had_resume_state = self.info.scan_checkpoint.is_some()
+                || self.info.scan_resume_after.is_some()
+                || self.info.scan_coverage_receipt.is_some()
+                || self.info.scan_raw_enumeration_cursor.is_some()
+                || self.info.scan_raw_enumeration_page_index.is_some();
+            if had_resume_state {
+                let reason = if name == DATA_USAGE_ROOT {
+                    "invalid_bucket_scope"
+                } else if !identity.is_valid() {
+                    "invalid_identity"
+                } else if self.info.name != name {
+                    "bucket_mismatch"
+                } else if self.info.source != Some(source) {
+                    "source_mismatch"
+                } else if self.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT {
+                    "key_format_mismatch"
+                } else if self.info.scan_identity != Some(identity)
+                    || self.info.tier_registry_generation != Some(identity.tier_registry_generation)
+                {
+                    "identity_mismatch"
+                } else if self.info.leader_epoch != leader_epoch && !cross_epoch_checkpoint {
+                    "unvalidated_handoff"
+                } else {
+                    "incomplete_cache_scope"
+                };
+                warn!(
+                    target: "rustfs::scanner::data_usage",
+                    event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_CACHE,
+                    state = "checkpoint_reset",
+                    bucket = %name,
+                    reason,
+                    "Scanner bucket checkpoint cannot be adopted"
+                );
+            }
             let keep_debts = self.info.name == name
                 && self
                     .info

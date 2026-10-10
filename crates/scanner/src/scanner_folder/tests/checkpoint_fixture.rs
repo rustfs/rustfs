@@ -21,6 +21,7 @@ use std::io::Cursor;
 use tokio::io::AsyncReadExt;
 
 mod deep_compacted;
+mod periodic_snapshot;
 mod segment_observation;
 
 const CACHE_NAME: &str = "bucket/checkpoint-fixture.bin";

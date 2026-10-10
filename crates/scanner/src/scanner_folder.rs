@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
     DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
-    DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal,
-    PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
+    DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, MAX_DATA_USAGE_CACHE_DEPTH,
+    PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageWriter};
@@ -426,6 +426,10 @@ fn folder_resume_match(folder_name: &str, resume_after: &str) -> Option<FolderRe
         .map(|_| FolderResumeMatch::Descendant)
 }
 
+fn folder_is_covered_by_frontier(folder: &str, frontier: &str) -> bool {
+    folder <= frontier && !matches!(folder_resume_match(folder, frontier), Some(FolderResumeMatch::Descendant))
+}
+
 fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F) -> FolderResumeOrder
 where
     F: Fn(&T) -> &str,
@@ -704,6 +708,12 @@ impl ScannerBucketPrefixScanScope {
 }
 
 /// Folder scanner for scanning directory structures
+#[derive(Default)]
+struct ScannerCheckpointAncestor {
+    hash: DataUsageHash,
+    entry: DataUsageEntry,
+}
+
 pub struct FolderScanner {
     root: String,
     old_cache: DataUsageCache,
@@ -728,6 +738,8 @@ pub struct FolderScanner {
 
     updates: Option<mpsc::Sender<DataUsageEntry>>,
     checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
+    checkpoint_ancestors: Vec<ScannerCheckpointAncestor>,
+    checkpoint_depth: usize,
     last_update: SystemTime,
     checkpoint_objects: u64,
     last_checkpoint_objects: u64,
@@ -1210,10 +1222,42 @@ impl FolderScanner {
             .map_or((None, None), |progress| (progress.cursor(), progress.page_index()))
     }
 
-    fn maybe_send_checkpoint(&mut self) {
+    async fn scan_child_folder(
+        &mut self,
+        ctx: CancellationToken,
+        folder: CachedFolder,
+        parent_hash: &mut DataUsageHash,
+        parent_entry: &mut DataUsageEntry,
+        child_entry: &mut DataUsageEntry,
+    ) -> Result<(), ScannerError> {
+        if self.checkpoint_tx.is_none() || self.old_cache.info.scan_progress.is_none() {
+            return Box::pin(self.scan_folder(ctx, folder, child_entry)).await;
+        }
+        let depth = self.checkpoint_depth;
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            return Err(ScannerError::Other("scanner checkpoint ancestor depth limit exceeded".to_string()));
+        }
+        if self.checkpoint_ancestors.len() == depth {
+            self.checkpoint_ancestors.push(ScannerCheckpointAncestor::default());
+        }
+        // Reuse the empty frame slots: moving suspended accumulators avoids
+        // cloning a growing child set or allocating histogram vectors per child.
+        std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
+        std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
+        self.checkpoint_depth += 1;
+        let result = Box::pin(self.scan_folder(ctx, folder, child_entry)).await;
+        self.checkpoint_depth -= 1;
+        // Restore the parent before cancellation/error handling stitches partial work.
+        std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
+        std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
+        result
+    }
+
+    fn maybe_send_checkpoint(&mut self, folder: &CachedFolder, hash: &DataUsageHash, into: &DataUsageEntry) {
         let Some(checkpoint_tx) = self.checkpoint_tx.clone() else { return };
         let elapsed = self.last_checkpoint_at.elapsed();
-        if self.new_cache.info.scan_progress.is_none()
+        if into.compacted
+            || self.new_cache.info.scan_progress.is_none()
             || elapsed < SCANNER_CHECKPOINT_MIN_INTERVAL
             || (self.checkpoint_objects.saturating_sub(self.last_checkpoint_objects) < SCANNER_CHECKPOINT_OBJECT_INTERVAL
                 && elapsed < SCANNER_CHECKPOINT_INTERVAL)
@@ -1233,34 +1277,49 @@ impl FolderScanner {
         }
         let Ok(permit) = checkpoint_tx.try_reserve() else { return };
 
-        let mut snapshot = self.new_cache.clone();
-        snapshot.info.last_update = Some(SystemTime::now());
-        snapshot.info.snapshot_complete = false;
-        let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
-        if cursor.is_some() || page_index.is_some() {
-            snapshot.info.scan_raw_enumeration_cursor = cursor;
-            snapshot.info.scan_raw_enumeration_page_index = page_index;
-            snapshot.info.scan_resume_after = None;
-            snapshot.info.scan_checkpoint = None;
-            snapshot.info.scan_coverage_receipt = None;
-        } else if snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).is_err() {
-            return;
-        }
-        if snapshot.root().is_none()
-            && snapshot.info.scan_raw_enumeration_cursor.is_none()
-            && snapshot.info.scan_raw_enumeration_page_index.is_none()
+        // Invalid partial graphs must not trigger a fresh O(N) clone on every object.
+        self.last_checkpoint_objects = self.checkpoint_objects;
+        self.last_checkpoint_at = Instant::now();
+        // Heal revisits are not sorted with the forward sweep. An unfinished
+        // earlier sibling must not be signed as completed prefix coverage.
+        if self
+            .coverage_frontier
+            .as_deref()
+            .is_some_and(|frontier| folder_is_covered_by_frontier(&folder.name, frontier))
         {
             return;
         }
+        let mut snapshot = self.new_cache.clone();
+        let mut parent = None;
+        for ancestor in &self.checkpoint_ancestors[..self.checkpoint_depth] {
+            snapshot.replace_hashed(&ancestor.hash, &parent, &ancestor.entry);
+            parent = Some(ancestor.hash.clone());
+        }
+        snapshot.replace_hashed(hash, &folder.parent, into);
+        if snapshot.checked_flatten_complete_scope(&snapshot.info.name).is_none() {
+            return;
+        }
+        snapshot.info.last_update = Some(SystemTime::now());
+        snapshot.info.snapshot_complete = false;
+        let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
+        snapshot.info.scan_raw_enumeration_cursor = cursor;
+        snapshot.info.scan_raw_enumeration_page_index = page_index;
+        if snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).is_err() {
+            return;
+        }
+        // A resumed readdir can run before covered subtrees are copied. Keep
+        // its durable receipt until this snapshot can represent that coverage.
+        if self.coverage_frontier.is_some() && snapshot.info.scan_coverage_receipt.is_none() {
+            return;
+        }
+        // The receipt was just sealed from this snapshot; do not hash it twice.
         if snapshot.info.scan_raw_enumeration_cursor.is_none()
             && snapshot.info.scan_raw_enumeration_page_index.is_none()
-            && snapshot.validated_scan_frontier().is_none()
+            && snapshot.info.scan_coverage_receipt.is_none()
         {
             return;
         }
         permit.send(snapshot);
-        self.last_checkpoint_objects = self.checkpoint_objects;
-        self.last_checkpoint_at = Instant::now();
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
@@ -1297,6 +1356,15 @@ impl FolderScanner {
         child_entry: &DataUsageEntry,
     ) {
         if data_usage_entry_has_progress(child_entry) {
+            // A cancelled out-of-order heal revisit is not completed prefix work.
+            if self
+                .coverage_frontier
+                .as_deref()
+                .is_some_and(|frontier| folder_is_covered_by_frontier(&child_hash.0, frontier))
+            {
+                self.coverage_frontier = None;
+                self.coverage_gap = true;
+            }
             let mut child_entry = child_entry.clone();
             self.carry_forward_old_children(child_hash, &mut child_entry);
             self.record_scan_resume_hint_if_not_ancestor(&child_hash.key());
@@ -1513,7 +1581,7 @@ impl FolderScanner {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
 
-        let this_hash = hash_path(&folder.name);
+        let mut this_hash = hash_path(&folder.name);
         // Store initial compaction state.
         let was_compacted = into.compacted;
 
@@ -1651,7 +1719,7 @@ impl FolderScanner {
                     }
                 }
                 self.record_raw_enumeration_entry(&folder.name, &file_name);
-                self.maybe_send_checkpoint();
+                self.maybe_send_checkpoint(&folder, &this_hash, into);
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
 
                 let file_path = entry.path().to_string_lossy().to_string();
@@ -1958,7 +2026,7 @@ impl FolderScanner {
                 object_count += 1;
                 self.budget.record_object_scanned();
                 self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
-                self.maybe_send_checkpoint();
+                self.maybe_send_checkpoint(&folder, &this_hash, into);
 
                 timer.sleep().await;
 
@@ -2159,10 +2227,9 @@ impl FolderScanner {
                 let h = hash_path(&folder_item.name);
                 if forward_sweep
                     && !into.compacted
-                    && forward_resume_after.as_deref().is_some_and(|resume| {
-                        folder_item.name.as_str() <= resume
-                            && !matches!(folder_resume_match(&folder_item.name, resume), Some(FolderResumeMatch::Descendant))
-                    })
+                    && forward_resume_after
+                        .as_deref()
+                        .is_some_and(|resume| folder_is_covered_by_frontier(&folder_item.name, resume))
                     && self.old_cache.find(&folder_item.name).is_some()
                 {
                     self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
@@ -2233,8 +2300,10 @@ impl FolderScanner {
                     let mut dst = DataUsageEntry::default();
 
                     // Use Box::pin for recursive async call
-                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    if let Err(e) = fut.await {
+                    if let Err(e) = self
+                        .scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst)
+                        .await
+                    {
                         if ctx.is_cancelled() {
                             self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
                                 .await;
@@ -2258,7 +2327,7 @@ impl FolderScanner {
 
                     into.add_child(&h);
                     self.record_completed_child(&folder_item.name, dst.failed_objects == 0);
-                    self.maybe_send_checkpoint();
+                    self.maybe_send_checkpoint(&folder, &this_hash, into);
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
@@ -2635,8 +2704,10 @@ impl FolderScanner {
                         let h = hash_path(&folder_item.name);
 
                         // Use Box::pin for recursive async call
-                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                        if let Err(e) = fut.await {
+                        if let Err(e) = self
+                            .scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst)
+                            .await
+                        {
                             if ctx.is_cancelled() {
                                 self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
                                     .await;
@@ -2662,7 +2733,7 @@ impl FolderScanner {
                         self.update_cache.delete_recursive(&h);
                         self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
                         self.send_update().await;
-                        self.maybe_send_checkpoint();
+                        self.maybe_send_checkpoint(&folder, &this_hash, into);
                     }
                 }
             }
@@ -2803,6 +2874,9 @@ pub(crate) async fn scan_data_folder_scoped(
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
     let resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
+    if resume_frontier.is_some() {
+        global_metrics().record_scanner_checkpoint_used();
+    }
     let bucket_name = cache.info.name.clone();
     let next_cycle = cache.info.next_cycle;
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
@@ -2834,6 +2908,8 @@ pub(crate) async fn scan_data_folder_scoped(
         disks_quorum,
         updates,
         checkpoint_tx,
+        checkpoint_ancestors: Vec::new(),
+        checkpoint_depth: 0,
         last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
         last_checkpoint_objects: 0,

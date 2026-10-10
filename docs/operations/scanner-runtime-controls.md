@@ -178,6 +178,12 @@ catch_up_estimate.discovered_transition_items
 
 An ordinary failed save drops that snapshot and leaves the bounded checkpoint receiver active, so the next producer interval tries again. A CAS conflict or an unreadable revision after a successful write cancels the bucket attempt and reloads persisted state through the existing retry path. Leader, cycle, and publication fencing remain mandatory. This preserves future periodic save attempts for a continuing bucket walk.
 
+Periodic snapshots include the suspended ancestor accounting needed to connect a nested active branch to the bucket root. Completed coverage is sealed independently of raw enumeration bookkeeping. A valid coverage frontier can therefore skip completed subtrees after a fenced leader handoff without counting unfinished work as completed. Emission remains bounded by the existing interval/object thresholds and capacity-one channel; invalid snapshot attempts also consume the producer interval so they cannot repeatedly clone the cache on every object.
+
+A resumed walk retains its previous durable coverage while initial enumeration has not recopied the covered subtrees. Unfinished out-of-order heal revisits cannot be certified as completed prefix work, including in cancellation snapshots.
+
+Shared compacted accumulators defer periodic emission until the owning subtree completes; replay inside that compacted subtree remains possible after an interruption. When bucket checkpoint preparation returns `Reset` for existing resume state, it logs `checkpoint_reset` with the validation reason. The `scan_checkpoint_used` counter includes validated coverage adoption by the forward sweep.
+
 A confirmed periodic save does not prove restart resumability. Adoption still validates bucket/set identity and, for non-empty caches, connected cache scope. Skipping completed subtrees additionally requires a validated coverage frontier; raw enumeration state alone does not prove completed subtree coverage.
 
 ## Usage State Reset
