@@ -63,6 +63,8 @@ pub enum StoreError {
     UnsupportedSchema,
     #[error("corrupt record")]
     CorruptRecord,
+    #[error("invalid membership")]
+    InvalidMembership(#[from] MembershipError),
     #[error("invalid log sequence")]
     InvalidLogSequence,
     #[error("invalid committed log")]
@@ -106,6 +108,7 @@ impl StoreError {
             Self::IdentityMismatch => "identity_mismatch",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::CorruptRecord => "corrupt_record",
+            Self::InvalidMembership(_) => "invalid_membership",
             Self::InvalidLogSequence => "invalid_log_sequence",
             Self::InvalidCommittedLog => "invalid_committed_log",
             Self::CommittedRegression => "committed_regression",
@@ -186,7 +189,7 @@ impl Store {
         let tx = store.database.begin_read()?;
         let meta = tx.open_table(META)?;
         let schema = meta.get("schema")?.ok_or(StoreError::CorruptRecord)?;
-        if !matches!(number(schema.value())?, 1..=3) {
+        if !matches!(number(schema.value())?, 1..=4) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = meta.get("identity")?.ok_or(StoreError::CorruptRecord)?;
@@ -209,6 +212,9 @@ impl Store {
             let entry = decode_log(value.value())?;
             if next != Some(key.value()) || entry.id.index != key.value() {
                 return Err(StoreError::InvalidLogSequence);
+            }
+            if number(schema.value())? == 4 {
+                application::decode_native_entry(entry.clone())?;
             }
             next = key.value().checked_add(1);
             last = Some(entry.id);
@@ -258,6 +264,11 @@ impl Store {
         if !self.writable {
             return Err(StoreError::WriteDisabled);
         }
+        let tx = self.database.begin_read()?;
+        if number(tx.open_table(META)?.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())? == 4 {
+            return Err(StoreError::UnsupportedSchema);
+        }
+        drop(tx);
         if entries.is_empty() {
             return Ok(());
         }
@@ -439,6 +450,763 @@ mod tests {
             cluster_id: [7; 16],
             node_id: 0,
         }
+    }
+    fn u17a_id(index: u64) -> LogId {
+        LogId {
+            term: 11,
+            leader_node: 7,
+            index,
+        }
+    }
+    fn u17a_binding() -> CaptureBinding {
+        CaptureBinding {
+            revision: 9,
+            binding_id: [6; 16],
+            target_id: [7; 16],
+        }
+    }
+    fn u17a_bound() -> (tempfile::TempDir, CrashBackend, Store) {
+        let (dir, backend, mut store) = media_store();
+        store.pin_capture_binding(u17a_binding()).expect("pin empty schema3 fixture");
+        (dir, backend, store)
+    }
+    fn u17a_store() -> (tempfile::TempDir, CrashBackend, Store) {
+        let (dir, backend, mut store) = u17a_bound();
+        store.enable_native_empty().expect("enable native empty fixture");
+        (dir, backend, store)
+    }
+    fn u17a_blank(index: u64) -> CaptureRaftEntry {
+        CaptureRaftEntry {
+            log_id: u17a_id(index).into(),
+            payload: openraft::EntryPayload::Blank,
+        }
+    }
+    fn u17a_command() -> DecideCreated {
+        DecideCreated {
+            operation_id: [1; 16],
+            object: ObjectIdentity {
+                bucket_incarnation: [2; 16],
+                key: b"native-object".to_vec(),
+            },
+            expected_head: None,
+            prepared: PreparedIdentity {
+                version_id: [3; 16],
+                preparation_id: [4; 16],
+                content_digest: [5; 32],
+                content_length: 4097,
+            },
+            binding_revision: 9,
+        }
+    }
+    fn u17a_created(index: u64, command: DecideCreated) -> CaptureRaftEntry {
+        CaptureRaftEntry {
+            log_id: u17a_id(index).into(),
+            payload: openraft::EntryPayload::Normal(CaptureCommand::try_created(command).expect("checked native Created")),
+        }
+    }
+    fn u17a_membership(index: u64) -> (CaptureRaftEntry, CaptureMembership) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let membership = CaptureMembership::new(
+            Some(u17a_id(index)),
+            vec![BTreeSet::from([7, 8]), BTreeSet::from([8, 9])],
+            BTreeMap::from([
+                (7, CaptureNode::new("https://peer-7.example:7007".into()).expect("peer 7")),
+                (8, CaptureNode::new("http://peer-8.example:7008".into()).expect("peer 8")),
+                (9, CaptureNode::new("https://peer-9.example:7009".into()).expect("peer 9")),
+                (10, CaptureNode::new("https://learner.example:7010".into()).expect("learner")),
+            ]),
+        )
+        .expect("full joint membership");
+        let stored = openraft::StoredMembership::try_from(&membership).expect("native membership conversion");
+        (
+            CaptureRaftEntry {
+                log_id: u17a_id(index).into(),
+                payload: openraft::EntryPayload::Membership(stored.membership().clone()),
+            },
+            membership,
+        )
+    }
+    #[test]
+    fn u17a_native_enable_empty_idempotent() {
+        let (_dir, backend, mut store) = u17a_bound();
+        assert_eq!(committed_schema(&store), 3);
+        assert!(store.enable_native_empty().is_ok(), "U17A_ENABLE_SUCCESS empty bound schema3 must enable");
+        assert_eq!(committed_schema(&store), 4);
+        let empty = CaptureMembership::new(None, vec![], std::collections::BTreeMap::new()).expect("empty membership");
+        assert_eq!(store.native_application_state().expect("empty native state"), (None, empty));
+        let syncs = backend.media.lock().expect("sync count").syncs;
+        store.enable_native_empty().expect("idempotent enable");
+        assert_eq!(backend.media.lock().expect("sync count").syncs, syncs);
+        drop(store);
+        let reopened = Store::open(&backend.path, identity()).expect("schema4 reopen");
+        assert_eq!(committed_schema(&reopened), 4);
+        drop(reopened);
+        let (_dir, backend, mut store) = u17a_bound();
+        store.append(&batch()).expect("opaque legacy suffix");
+        assert_eq!(
+            store.enable_native_empty().expect_err("populated must refuse").code(),
+            "unsupported_schema"
+        );
+        assert_eq!(store.read_entries(0, 3).expect("unchanged legacy logs"), batch());
+        drop(store);
+        assert_eq!(
+            committed_schema(&Store::open(&backend.path, identity()).expect("no automatic upgrade")),
+            3
+        );
+    }
+    #[test]
+    fn u17a_native_append_batch_atomic() {
+        let (_dir, _backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_created(1, u17a_command()), u17a_membership(2).0];
+        assert!(
+            store.append_native(&entries).is_ok(),
+            "U17A_APPEND_SUCCESS valid heterogeneous batch must append"
+        );
+        assert_eq!(store.read_native_entries(0, 3).expect("full read"), entries);
+        assert_eq!(store.read_native_entry(3).expect("absent read"), None);
+        assert_eq!(store.read_native_entries(2, 1).expect_err("reverse range").code(), "invalid_log_sequence");
+        let bad = vec![u17a_blank(3), u17a_blank(5)];
+        let rejected = store.append_native(&bad);
+        assert_eq!(
+            store.read_native_entry(3).expect("no partial append"),
+            None,
+            "U17A_APPEND_BATCH_NO_PARTIAL"
+        );
+        assert_eq!(store.log_state().expect("atomic tail").last, Some(u17a_id(2)));
+        assert_eq!(rejected.expect_err("invalid batch").code(), "invalid_log_sequence");
+        let bad_membership = CaptureRaftEntry {
+            log_id: u17a_id(4).into(),
+            payload: openraft::EntryPayload::Membership(openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([7])],
+                std::collections::BTreeMap::<u64, CaptureNode>::new(),
+            )),
+        };
+        assert_eq!(
+            store
+                .append_native(&[u17a_blank(3), bad_membership])
+                .expect_err("missing voter metadata")
+                .code(),
+            "invalid_membership"
+        );
+        assert_eq!(store.read_native_entry(3).expect("invalid membership batch atomic"), None);
+    }
+    #[test]
+    fn u17a_native_heterogeneous_order_replay() {
+        let (_dir, backend, mut store) = u17a_store();
+        let (membership_entry, membership) = u17a_membership(2);
+        let entries = vec![
+            u17a_blank(0),
+            u17a_created(1, u17a_command()),
+            membership_entry,
+            u17a_blank(3),
+        ];
+        store.append_native(&entries).expect("persist heterogeneous prefix");
+        store.save_committed(u17a_id(3)).expect("commit prefix");
+        assert!(
+            store.apply_next_native(u17a_id(0)).is_ok(),
+            "U17A_APPLY_SUCCESS committed Blank must apply"
+        );
+        assert_eq!(store.last_applied().expect("Blank advances"), Some(u17a_id(0)));
+        for index in 1..=3 {
+            store.apply_next_native(u17a_id(index)).expect("ordered native apply");
+        }
+        assert_eq!(
+            store.native_application_state().expect("final pair"),
+            (Some(u17a_id(3)), membership.clone())
+        );
+        assert_eq!(store.created_apply_result(0).expect("blank projection"), None);
+        assert_eq!(store.created_apply_result(2).expect("membership projection"), None);
+        let syncs = backend.media.lock().expect("sync count").syncs;
+        for index in 0..=3 {
+            let response = store.apply_next_native(u17a_id(index)).expect("exact replay");
+            assert_eq!(store.native_apply_response(index).expect("receipt"), Some(response));
+        }
+        assert_eq!(backend.media.lock().expect("sync count").syncs, syncs);
+        drop(store);
+        let reopened = Store::open(&backend.path, identity()).expect("heterogeneous reopen");
+        assert_eq!(
+            reopened.native_application_state().expect("reopened pair"),
+            (Some(u17a_id(3)), membership)
+        );
+        assert_eq!(reopened.read_native_entries(0, 4).expect("reopened prefix"), entries);
+    }
+    #[test]
+    fn u17a_native_envelope_golden_strict() {
+        let (_dir, backend, mut store) = u17a_store();
+        let command = u17a_command();
+        let empty = CaptureMembership::new(Some(u17a_id(2)), vec![], std::collections::BTreeMap::new()).expect("empty config");
+        let stored = openraft::StoredMembership::try_from(&empty).expect("empty conversion");
+        let entries = [
+            u17a_blank(0),
+            u17a_created(1, command.clone()),
+            CaptureRaftEntry {
+                log_id: u17a_id(2).into(),
+                payload: openraft::EntryPayload::Membership(stored.membership().clone()),
+            },
+        ];
+        store.append_native(&entries).expect("golden native append");
+        for (index, kind, body) in [
+            (0, 0, vec![]),
+            (1, 1, command.encode().expect("canonical CRTD")),
+            (2, 2, empty.encode().expect("canonical CMEM")),
+        ] {
+            let raw = store.read_entry(index).expect("opaque reader").expect("golden row");
+            let mut golden = b"CENR\x01".to_vec();
+            golden.push(kind);
+            golden.extend(u64::try_from(body.len()).expect("body length").to_be_bytes());
+            golden.extend(body);
+            assert_eq!(raw.payload, golden, "kind {kind} exact envelope");
+            assert_eq!(raw.id, u17a_id(index));
+        }
+        let original = store.read_entry(0).expect("blank row").expect("blank exists");
+        for bytes in [
+            b"CENR\x01\x00\0\0\0\0\0\0\0\0x".to_vec(),
+            b"CENR\x02\x00\0\0\0\0\0\0\0\0".to_vec(),
+            b"CENR\x01\x03\0\0\0\0\0\0\0\0".to_vec(),
+            b"CENR\x01\x00\xff\xff\xff\xff\xff\xff\xff\xff".to_vec(),
+            vec![],
+        ] {
+            let tx = store.write_transaction().expect("corrupt envelope transaction");
+            tx.open_table(LOGS)
+                .expect("logs")
+                .insert(
+                    0,
+                    encode_log(&LogEntry {
+                        id: original.id,
+                        payload: bytes,
+                    })
+                    .expect("outer record")
+                    .as_slice(),
+                )
+                .expect("replace envelope");
+            store.commit(tx).expect("persist corruption");
+            assert_eq!(store.read_native_entry(0).expect_err("strict decode").code(), "corrupt_record");
+        }
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity()).err().expect("corrupt reopen").code(),
+            "corrupt_record"
+        );
+    }
+    #[test]
+    fn u17a_native_schema_and_legacy_gates() {
+        let (_dir, _backend, mut store) = media_store();
+        assert_eq!(store.enable_native_empty().expect_err("schema1 refused").code(), "unsupported_schema");
+        assert_eq!(store.append_native(&[]).expect_err("schema1 append refused").code(), "unsupported_schema");
+        store.append(&batch()).expect("legacy append");
+        store.save_committed(batch()[0].id).expect("schema2 commit");
+        assert_eq!(store.enable_native_empty().expect_err("schema2 refused").code(), "unsupported_schema");
+        assert_eq!(committed_schema(&store), 2);
+        let (_dir, _backend, mut store) = u17a_store();
+        assert_eq!(store.append(&[]).expect_err("schema4 raw append refused").code(), "unsupported_schema");
+        assert_eq!(
+            store
+                .apply_next_created(u17a_id(0))
+                .expect_err("legacy application refused")
+                .code(),
+            "unsupported_schema"
+        );
+        store.pin_capture_binding(u17a_binding()).expect("schema4 same binding");
+        assert_eq!(store.capture_binding().expect("binding projection"), Some(u17a_binding()));
+        store.append_native(&[u17a_blank(0)]).expect("native append");
+        store.save_committed(u17a_id(0)).expect("native commit");
+        assert_eq!(committed_schema(&store), 4, "save committed cannot downgrade");
+    }
+    #[test]
+    fn u17a_native_full_membership_pair() {
+        let (_dir, backend, mut store) = u17a_store();
+        let (entry, membership) = u17a_membership(0);
+        store.append_native(&[entry]).expect("persist full membership");
+        store.save_committed(u17a_id(0)).expect("commit membership");
+        let response = store.apply_next_native(u17a_id(0)).expect("apply membership");
+        assert_eq!(response.kind(), CaptureResponseKind::Membership);
+        assert_eq!(response.created_result(), None);
+        let pair = store.native_application_state().expect("full pair");
+        assert_eq!(pair, (Some(u17a_id(0)), membership.clone()));
+        assert_eq!(
+            pair.1.nodes().get(&10).expect("learner retained").rpc_uri(),
+            "https://learner.example:7010"
+        );
+        assert_eq!(
+            store
+                .created_head(&u17a_command().object)
+                .expect("control leaves business empty"),
+            None
+        );
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity())
+                .expect("membership reopen")
+                .native_application_state()
+                .expect("reopened pair"),
+            (Some(u17a_id(0)), membership)
+        );
+    }
+    #[test]
+    fn u17a_native_apply_sequence_commit_identity() {
+        let (_dir, _backend, mut store) = u17a_store();
+        store
+            .append_native(&[u17a_blank(0), u17a_blank(1), u17a_blank(2)])
+            .expect("sequence fixtures");
+        assert_eq!(
+            store.apply_next_native(u17a_id(0)).expect_err("uncommitted refused").code(),
+            "invalid_committed_log"
+        );
+        store.save_committed(u17a_id(1)).expect("commit first two");
+        assert_eq!(
+            store.apply_next_native(u17a_id(1)).expect_err("gap refused").code(),
+            "invalid_apply_sequence"
+        );
+        for id in [
+            LogId { term: 12, ..u17a_id(0) },
+            LogId {
+                leader_node: 8,
+                ..u17a_id(0)
+            },
+        ] {
+            assert_eq!(
+                store.apply_next_native(id).expect_err("exact identity refused").code(),
+                "invalid_committed_log"
+            );
+            assert_eq!(store.last_applied().expect("unchanged application"), None);
+        }
+        let response = store.apply_next_native(u17a_id(0)).expect("exact first");
+        assert_eq!(*response.log_id(), u17a_id(0));
+        assert_eq!(
+            store
+                .apply_next_native(LogId { term: 12, ..u17a_id(0) })
+                .expect_err("wrong replay identity")
+                .code(),
+            "invalid_committed_log"
+        );
+        store.apply_next_native(u17a_id(1)).expect("exact second");
+        assert_eq!(
+            store.apply_next_native(u17a_id(2)).expect_err("beyond committed").code(),
+            "invalid_committed_log"
+        );
+        assert_eq!(store.last_applied().expect("exact frontier"), Some(u17a_id(1)));
+    }
+    #[test]
+    fn u17a_native_created_duplicates_precedence() {
+        let (_dir, _backend, mut store) = u17a_store();
+        let command = u17a_command();
+        let mut conflict = command.clone();
+        conflict.binding_revision = 99;
+        let mut binding_mismatch = conflict.clone();
+        binding_mismatch.operation_id = [11; 16];
+        binding_mismatch.expected_head = Some([12; 16]);
+        let mut head_mismatch = command.clone();
+        head_mismatch.operation_id = [13; 16];
+        let mut version_conflict = command.clone();
+        version_conflict.operation_id = [14; 16];
+        version_conflict.expected_head = Some(command.prepared.version_id);
+        let entries = [
+            u17a_created(0, command.clone()),
+            u17a_created(1, command.clone()),
+            u17a_created(2, conflict),
+            u17a_created(3, binding_mismatch),
+            u17a_created(4, head_mismatch),
+            u17a_created(5, version_conflict),
+        ];
+        store.append_native(&entries).expect("duplicate and rejection batch");
+        store.save_committed(u17a_id(5)).expect("commit batch");
+        let first = store.apply_next_native(u17a_id(0)).expect("first Created");
+        assert_eq!(
+            store.apply_next_native(u17a_id(1)).expect("duplicate").created_result(),
+            first.created_result(),
+            "duplicate compares canonical CRTD body"
+        );
+        for (index, expected) in [
+            (2, CreatedResult::OperationConflict),
+            (3, CreatedResult::BindingMismatch),
+            (
+                4,
+                CreatedResult::HeadMismatch {
+                    actual_head: Some(command.prepared.version_id),
+                },
+            ),
+            (5, CreatedResult::VersionConflict),
+        ] {
+            assert_eq!(
+                store
+                    .apply_next_native(u17a_id(index))
+                    .expect("deterministic rejection")
+                    .created_result(),
+                Some(&expected)
+            );
+        }
+        assert_eq!(
+            store
+                .created_operation(command.operation_id)
+                .expect("operation")
+                .expect("first operation")
+                .canonical_command,
+            command.encode().expect("canonical bytes")
+        );
+        assert_eq!(
+            store
+                .created_event(command.operation_id)
+                .expect("event")
+                .expect("Created event")
+                .decision_log_id,
+            u17a_id(0)
+        );
+    }
+    #[test]
+    fn u17a_native_created_history_preserved() {
+        let (_dir, backend, mut store) = u17a_store();
+        let first = u17a_command();
+        let mut second = first.clone();
+        second.operation_id = [15; 16];
+        second.prepared.version_id = [16; 16];
+        second.prepared.content_length = 8193;
+        second.expected_head = Some(first.prepared.version_id);
+        store
+            .append_native(&[
+                u17a_created(0, first.clone()),
+                u17a_blank(1),
+                u17a_membership(2).0,
+                u17a_created(3, second.clone()),
+            ])
+            .expect("history batch");
+        store.save_committed(u17a_id(3)).expect("commit history");
+        for index in 0..=3 {
+            store.apply_next_native(u17a_id(index)).expect("history apply");
+        }
+        assert_eq!(store.created_head(&first.object).expect("latest head"), Some(second.prepared.version_id));
+        for (command, index) in [(first, 0), (second, 3)] {
+            let version = store
+                .created_version(&command.object, command.prepared.version_id)
+                .expect("historical version")
+                .expect("version exists");
+            assert_eq!(version.prepared, command.prepared);
+            assert_eq!(version.decision_log_id, u17a_id(index));
+            assert_eq!(
+                store
+                    .created_event(command.operation_id)
+                    .expect("historical event")
+                    .expect("event exists")
+                    .decision_log_id,
+                u17a_id(index)
+            );
+        }
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity())
+                .expect("history reopen")
+                .last_applied()
+                .expect("history frontier"),
+            Some(u17a_id(3))
+        );
+    }
+    #[test]
+    fn u17a_native_reopen_rejects_corruption() {
+        for corruption in 0..7 {
+            let (_dir, backend, mut store) = u17a_store();
+            store
+                .append_native(&[u17a_blank(0), u17a_membership(1).0])
+                .expect("corruption prefix");
+            store.save_committed(u17a_id(1)).expect("commit prefix");
+            for index in 0..=1 {
+                store.apply_next_native(u17a_id(index)).expect("apply prefix");
+            }
+            let tx = store.write_transaction().expect("corruption transaction");
+            match corruption {
+                0 => {
+                    tx.open_table(META)
+                        .expect("meta")
+                        .insert("tail", encode_id(u17a_id(0)).as_slice())
+                        .expect("corrupt tail");
+                }
+                1 => {
+                    tx.open_table(META)
+                        .expect("meta")
+                        .insert("committed", encode_id(LogId { term: 99, ..u17a_id(1) }).as_slice())
+                        .expect("corrupt committed");
+                }
+                2 => {
+                    tx.open_table(application::APPLY_RESULTS)
+                        .expect("receipts")
+                        .remove(0)
+                        .expect("receipt gap");
+                }
+                3..=5 => {
+                    let mut table = tx.open_table(application::APPLY_RESULTS).expect("receipts");
+                    let mut bytes = table.get(0).expect("receipt read").expect("receipt exists").value().to_vec();
+                    match corruption {
+                        3 => bytes.push(0),
+                        4 => bytes[5] = 2,
+                        _ => bytes[6] ^= 1,
+                    }
+                    table.insert(0, bytes.as_slice()).expect("corrupt receipt");
+                }
+                _ => {
+                    tx.open_table(META)
+                        .expect("meta")
+                        .insert("native_membership", b"bad".as_slice())
+                        .expect("corrupt membership");
+                }
+            }
+            store.commit(tx).expect("persist corruption");
+            drop(store);
+            assert_eq!(
+                Store::open(&backend.path, identity())
+                    .err()
+                    .expect("strict reopen refusal")
+                    .code(),
+                "corrupt_record",
+                "corruption {corruption}"
+            );
+        }
+    }
+    fn u17a_replace_decision(bytes: &mut [u8], from: LogId, to: LogId) {
+        let old = encode_id(from);
+        let new = encode_id(to);
+        let mut offset = 0;
+        while offset + old.len() <= bytes.len() {
+            if bytes[offset..offset + old.len()] == old {
+                bytes[offset..offset + old.len()].copy_from_slice(&new);
+                offset += old.len();
+            } else {
+                offset += 1;
+            }
+        }
+    }
+    #[test]
+    fn u17a_native_first_decision_provenance() {
+        let (_dir, backend, mut store) = u17a_store();
+        let command = u17a_command();
+        store
+            .append_native(&[u17a_created(0, command.clone()), u17a_created(1, command)])
+            .expect("duplicate provenance prefix");
+        store.save_committed(u17a_id(1)).expect("commit duplicate");
+        for index in 0..=1 {
+            store.apply_next_native(u17a_id(index)).expect("duplicate apply");
+        }
+        let tx = store.write_transaction().expect("coherent forgery transaction");
+        for definition in [application::OPERATIONS, application::EVENTS, application::VERSIONS] {
+            let mut table = tx.open_table(definition).expect("business table");
+            let rows = table
+                .iter()
+                .expect("business rows")
+                .map(|row| {
+                    let (k, v) = row.expect("business row");
+                    (k.value().to_vec(), v.value().to_vec())
+                })
+                .collect::<Vec<_>>();
+            for (key, mut value) in rows {
+                u17a_replace_decision(&mut value, u17a_id(0), u17a_id(1));
+                table.insert(key.as_slice(), value.as_slice()).expect("forge decision");
+            }
+        }
+        {
+            let mut table = tx.open_table(application::APPLY_RESULTS).expect("receipts");
+            for index in 0..=1 {
+                let mut value = table
+                    .get(index)
+                    .expect("receipt read")
+                    .expect("receipt exists")
+                    .value()
+                    .to_vec();
+                u17a_replace_decision(&mut value[38..], u17a_id(0), u17a_id(1));
+                table.insert(index, value.as_slice()).expect("forge receipt result only");
+            }
+        }
+        store.commit(tx).expect("persist coherent forgery");
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity())
+                .err()
+                .expect("later duplicate cannot become first decision")
+                .code(),
+            "corrupt_record"
+        );
+    }
+    fn u17a_cut_recovery(backend: &CrashBackend) -> Option<Store> {
+        match Store::open(&backend.path, identity()) {
+            Ok(store) => Some(store),
+            Err(StoreError::Database(_) | StoreError::Storage(_) | StoreError::CorruptRecord) => None,
+            Err(error) => panic!("unexpected cut recovery error: {error:?}"),
+        }
+    }
+    #[test]
+    fn u17a_native_append_ack_and_cut() {
+        let (_dir, backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_created(1, u17a_command()), u17a_membership(2).0];
+        backend.media.lock().expect("reset sync count").syncs = 0;
+        store.append_native(&entries).expect("ack full native append");
+        let reached = backend.media.lock().expect("reached sync count").syncs;
+        assert!(reached > 0);
+        backend.cut();
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity())
+                .expect("ACK recovery")
+                .read_native_entries(0, 3)
+                .expect("durable ACK entries"),
+            entries
+        );
+        for sync in 1..=reached {
+            for after in [false, true] {
+                let (_dir, backend, mut store) = u17a_store();
+                let expected = entries.clone();
+                let (entered, resume) = backend.pause_sync(sync, after);
+                let writer = std::thread::spawn(move || {
+                    let result = store.append_native(&expected);
+                    (store, result)
+                });
+                entered.wait();
+                backend.cut();
+                resume.wait();
+                let (store, result) = writer.join().expect("append cut writer");
+                drop(store);
+                if let Some(store) = u17a_cut_recovery(&backend) {
+                    let actual = store.read_native_entries(0, 3).expect("cut prefix");
+                    assert!(actual.is_empty() || actual == entries, "no partial native batch");
+                    assert_eq!(store.log_state().expect("cut tail").last, actual.last().map(|entry| entry.log_id.into()));
+                    if result.is_ok() {
+                        assert_eq!(actual, entries, "ACK must be complete");
+                    }
+                } else {
+                    assert!(result.is_err(), "ACK cannot reopen corrupt");
+                }
+            }
+        }
+    }
+    #[test]
+    fn u17a_native_control_apply_ack_and_cut() {
+        for membership_kind in [false, true] {
+            let (_dir, backend, mut store) = u17a_store();
+            let (entry, membership) = if membership_kind {
+                u17a_membership(0)
+            } else {
+                (
+                    u17a_blank(0),
+                    CaptureMembership::new(None, vec![], std::collections::BTreeMap::new()).expect("empty membership"),
+                )
+            };
+            store.append_native(&[entry.clone()]).expect("control append");
+            store.save_committed(u17a_id(0)).expect("control commit");
+            backend.media.lock().expect("reset sync count").syncs = 0;
+            let response = store.apply_next_native(u17a_id(0)).expect("control ACK");
+            let reached = backend.media.lock().expect("reached sync count").syncs;
+            assert!(reached > 0);
+            backend.cut();
+            drop(store);
+            let reopened = Store::open(&backend.path, identity()).expect("control ACK recovery");
+            assert_eq!(
+                reopened.native_application_state().expect("ACK pair"),
+                (Some(u17a_id(0)), membership.clone())
+            );
+            assert_eq!(reopened.native_apply_response(0).expect("ACK receipt"), Some(response));
+            drop(reopened);
+            for sync in 1..=reached {
+                for after in [false, true] {
+                    let (_dir, backend, mut store) = u17a_store();
+                    let old = store.native_application_state().expect("old pair");
+                    store.append_native(&[entry.clone()]).expect("cut control append");
+                    store.save_committed(u17a_id(0)).expect("cut control commit");
+                    let (entered, resume) = backend.pause_sync(sync, after);
+                    let writer = std::thread::spawn(move || {
+                        let result = store.apply_next_native(u17a_id(0));
+                        (store, result)
+                    });
+                    entered.wait();
+                    backend.cut();
+                    resume.wait();
+                    let (store, result) = writer.join().expect("apply cut writer");
+                    drop(store);
+                    if let Some(store) = u17a_cut_recovery(&backend) {
+                        let pair = store.native_application_state().expect("cut control pair");
+                        let new = (Some(u17a_id(0)), membership.clone());
+                        assert!(pair == old || pair == new, "control transaction whole old/new");
+                        assert_eq!(store.native_apply_response(0).expect("cut receipt").is_some(), pair.0.is_some());
+                        if result.is_ok() {
+                            assert_eq!(pair, new);
+                        }
+                    } else {
+                        assert!(result.is_err(), "control ACK cannot reopen corrupt");
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn u17a_native_commit_error_disables_writes() {
+        for mutation in 0..3 {
+            let (_dir, backend, mut store) = u17a_bound();
+            if mutation != 0 {
+                store.enable_native_empty().expect("enable before failure");
+            }
+            if mutation == 2 {
+                store.append_native(&[u17a_blank(0)]).expect("append before apply failure");
+                store.save_committed(u17a_id(0)).expect("commit before apply failure");
+            }
+            backend.arm(1, false, false);
+            let result = match mutation {
+                0 => store.enable_native_empty(),
+                1 => store.append_native(&[u17a_blank(0)]),
+                _ => store.apply_next_native(u17a_id(0)).map(|_| ()),
+            };
+            assert_eq!(result.expect_err("uncertain commit refused").code(), "commit_indeterminate");
+            assert_eq!(store.enable_native_empty().expect_err("enable disabled").code(), "write_disabled");
+            assert_eq!(store.append_native(&[]).expect_err("empty append disabled").code(), "write_disabled");
+            assert_eq!(store.append(&[]).expect_err("raw append disabled").code(), "write_disabled");
+            assert_eq!(
+                store
+                    .apply_next_native(u17a_id(0))
+                    .expect_err("apply and replay disabled")
+                    .code(),
+                "write_disabled"
+            );
+            assert_eq!(
+                store
+                    .apply_next_created(u17a_id(0))
+                    .expect_err("legacy apply disabled")
+                    .code(),
+                "write_disabled"
+            );
+            assert_eq!(
+                store
+                    .pin_capture_binding(u17a_binding())
+                    .expect_err("binding disabled")
+                    .code(),
+                "write_disabled"
+            );
+            assert_eq!(store.save_vote(vote()).expect_err("vote disabled").code(), "write_disabled");
+            assert_eq!(store.save_committed(u17a_id(0)).expect_err("commit disabled").code(), "write_disabled");
+            assert_eq!(store.truncate_suffix(0).expect_err("truncate disabled").code(), "write_disabled");
+            backend.cut();
+            drop(store);
+            let store = Store::open(&backend.path, identity()).expect("uncertain commit reopened");
+            assert!(matches!(committed_schema(&store), 3 | 4));
+        }
+    }
+    #[test]
+    fn u17a_native_application_pair_transaction() {
+        let (_dir, backend, mut store) = u17a_store();
+        let (entry, membership) = u17a_membership(0);
+        let old = store.native_application_state().expect("old pair");
+        store.append_native(&[entry]).expect("pair append");
+        store.save_committed(u17a_id(0)).expect("pair commit");
+        let read_tx = store.database.begin_read().expect("real reader transaction");
+        let (entered, resume) = backend.pause_sync(1, false);
+        let writer = std::thread::spawn(move || {
+            let result = store.apply_next_native(u17a_id(0));
+            (store, result)
+        });
+        entered.wait();
+        assert_eq!(application::native_application_state(&read_tx).expect("pair during commit"), old);
+        resume.wait();
+        let (store, result) = writer.join().expect("pair writer");
+        result.expect("pair apply ACK");
+        assert_eq!(application::native_application_state(&read_tx).expect("pinned reader stays old"), old);
+        assert_eq!(
+            store.native_application_state().expect("pair after commit"),
+            (Some(u17a_id(0)), membership)
+        );
+        drop(read_tx);
+        drop(store);
     }
     fn vote() -> VoteRecord {
         VoteRecord {
