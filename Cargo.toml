@@ -18,6 +18,7 @@ members = [
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/checksums", # client checksums
     "crates/common", # Shared utilities and data structures
+    "crates/capture-authority", # Durable capture authority storage
     "crates/data-usage", # Shared data usage models and algorithms
     "crates/config", # Configuration management
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
@@ -314,6 +315,7 @@ ratelimit = "2.0.0"
 rayon = "1.12.0"
 rustfs-erasure-codec = { version = "9.0.0" }
 reed-solomon-simd = "3.1.0"
+redb = "=4.3.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
 redis = { version = "1.7.1" }
