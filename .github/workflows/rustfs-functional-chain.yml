@@ -37,6 +37,11 @@ on:
         type: string
         required: false
         default: ''
+      validation_tools_only:
+        description: Build candidate-bound validation tools without running a fleet case
+        type: boolean
+        required: false
+        default: false
   workflow_run:
     workflows: ["Nightly GNU Build"]
     types: [completed]
@@ -51,7 +56,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '') || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '' && !inputs.validation_tools_only) || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -100,9 +105,11 @@ jobs:
           fi
 
   validation:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_case != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only) }}
     runs-on: smoke-testing
     timeout-minutes: 90
+    outputs:
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
     concurrency:
       group: rustfs-shared-functional-tests-v2
       cancel-in-progress: false
@@ -127,6 +134,7 @@ jobs:
           printf 'VALIDATION_ROOT=%s\n' "${VALIDATION_ROOT}" >> "${GITHUB_ENV}"
 
       - name: Resolve immutable candidate
+        id: candidate
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
@@ -153,6 +161,8 @@ jobs:
               "package_sha256": manifest["package_sha256"],
               "source_sha": manifest["source_sha"],
           }, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("source_sha=" + manifest["source_sha"] + "\n")
           PY
 
       - name: Checkout exact auto-testing revision
@@ -165,7 +175,7 @@ jobs:
           persist-credentials: false
 
       - name: Install validation Python client
-        if: ${{ startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.') }}
+        if: ${{ !inputs.validation_tools_only && (startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.')) }}
         run: |
           set -euo pipefail
           python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
@@ -174,6 +184,7 @@ jobs:
           printf '%s\n' "${RUNNER_TEMP}/rustfs-validation-python/bin" >> "${GITHUB_PATH}"
 
       - name: Run selected canonical validation case
+        if: ${{ !inputs.validation_tools_only }}
         env:
           VALIDATION_CASE: ${{ inputs.validation_case }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
@@ -198,6 +209,15 @@ jobs:
           name: rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
+
+  validation-tools:
+    needs: [validation]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only }}
+    uses: ./.github/workflows/rustfs-validation-tools.yml
+    with:
+      candidate_sha: ${{ needs.validation.outputs.source_sha }}
+      auto_testing_sha: ${{ inputs.auto_testing_sha }}
+    secrets: inherit
 
   upgrade:
     needs: [prepare]

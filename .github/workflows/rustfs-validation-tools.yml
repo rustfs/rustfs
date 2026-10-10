@@ -2,6 +2,17 @@
 name: RustFS Validation Tools
 
 on:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        type: string
+        required: true
+      auto_testing_sha:
+        type: string
+        required: true
+    secrets:
+      PF_TESTING_GH_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       candidate_sha:
