@@ -18,6 +18,7 @@ Pick the lowest layer that can prove the change; add a higher-layer test only wh
 | Chaos / fault-injection | Single-node disk fault injection (`crates/e2e_test/src/chaos.rs`, `crates/e2e_test/src/fault_proxy.rs`) plus the 4-node kill/fresh-drive/blackhole cases in `crates/e2e_test/src/distributed/chaos_test.rs` | Part of the e2e crate (`e2e-reliability` and `e2e-distributed`) | Reliability cases with `e2e-full`; 4-node chaos on storage-sensitive PRs and nightly via `e2e-distributed` |
 | Fuzz | `cargo-fuzz` targets over untrusted parsing surfaces; isolated sub-workspace under `fuzz/` | `./scripts/fuzz/run.sh` (see [`fuzz/README.md`](../../fuzz/README.md)) | PR smoke on the paths listed in `.github/workflows/fuzz.yml`, plus nightly corpus |
 | Benchmarks | Criterion benches under each crate's `benches/` | `cargo bench -p <crate>` | On demand; never a gate |
+| Conditional reads | Paired ordinary/hit/miss GET latency, throughput and read-lock measurements | `scripts/run_conditional_read_abba.py` | Local conditional-read acceptance; [guide and scope](conditional-read-benchmark.md) |
 
 Every script named above is indexed with status and wiring in [`scripts/README.md`](../../scripts/README.md). Fixed GHSA advisories map to named regression tests in [security-regressions.md](security-regressions.md).
 

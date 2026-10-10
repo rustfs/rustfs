@@ -1391,6 +1391,39 @@ fn stored_envelope_master_key_version(metadata: &HashMap<String, String>) -> Opt
 
 pub(crate) struct SseObjectEncryptionResolver;
 
+/// Checks metadata and key access before a conditional read returns without a body.
+pub(crate) async fn validate_conditional_read(
+    bucket: &str,
+    object: &str,
+    metadata: &HashMap<String, String>,
+    headers: &HeaderMap,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<(), ApiError> {
+    let metadata = normalize_encryption_metadata_case(metadata)
+        .map_err(|error| map_get_object_reader_error(StorageError::Io(std::io::Error::other(error))))?;
+    validate_sse_headers_for_read(&metadata, headers)?;
+    let (_, customer_key, customer_key_md5) = extract_ssec_params_from_headers(headers)?;
+    classify_sse_read_response(DecryptionRequest {
+        bucket,
+        key: object,
+        metadata: &metadata,
+        sse_customer_key: customer_key.as_ref(),
+        sse_customer_key_md5: customer_key_md5.as_ref(),
+        principal,
+    })
+    .await?;
+    SseObjectEncryptionResolver
+        .resolve_read_material(ReadEncryptionRequest {
+            bucket,
+            object,
+            metadata: &metadata,
+            headers,
+        })
+        .await
+        .map_err(|error| map_get_object_reader_error(StorageError::Io(std::io::Error::other(error))))?;
+    Ok(())
+}
+
 #[async_trait]
 impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
     async fn resolve_read_material(
@@ -8586,6 +8619,35 @@ mod tests {
         assert_eq!(audit_tag(&tags, "kmsKeyId").as_deref(), Some("finance-key"));
         assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("failure"));
         assert_eq!(audit_tag(&tags, "kmsErrorClass").as_deref(), Some("access_denied"));
+    }
+
+    #[tokio::test]
+    async fn conditional_read_denies_kms_before_unwrap_with_normalized_metadata() {
+        let (principal, audit) = audited_principal(true, false);
+        let metadata = sse_kms_object_metadata()
+            .into_iter()
+            .map(|(name, value)| (name.to_ascii_uppercase(), value))
+            .collect();
+        let error = super::validate_conditional_read("finance", "ledger.csv", &metadata, &HeaderMap::new(), Some(&principal))
+            .await
+            .expect_err("conditional read must authorize the real key before unwrap");
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(audit_tag(&audit.audit_tags(), "kmsKeyId").as_deref(), Some("finance-key"));
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn conditional_read_denies_minio_only_kms_before_unwrap() {
+        let (principal, authorizer) = enforcing_principal(false);
+        let metadata = HashMap::from([
+            (super::MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_owned(), "sealed-key".to_owned()),
+            (super::MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_owned(), "finance-key".to_owned()),
+        ]);
+        let error = super::validate_conditional_read("finance", "ledger.csv", &metadata, &HeaderMap::new(), Some(&principal))
+            .await
+            .expect_err("MinIO metadata must not bypass KMS authorization");
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_owned())]);
     }
 
     #[test]

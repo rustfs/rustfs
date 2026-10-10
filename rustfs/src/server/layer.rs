@@ -1175,15 +1175,9 @@ where
 /// responses whose HTTP status code MUST NOT carry a body per RFC 9110 §6.4.1
 /// and §15 (1xx, 204, 205, 304).
 ///
-/// The inner s3s layer serializes every `S3Error` — including 304 `NotModified`
-/// preconditions — as an XML body. Returning that body for a 304 is a protocol
-/// violation: hyper's HTTP/1.1 encoder forces the body to zero length but
-/// preserves the response, while the HTTP/2 path fills in `content-length`
-/// from the body's size hint and writes DATA frames after a HEADERS frame that
-/// should have carried END_STREAM. h2 clients (curl, browsers) and proxies see
-/// the malformed response as a connection-level failure — in the wild this
-/// surfaces as `GOAWAY error=0` on h2 and as an upstream-disconnect 5xx from
-/// reverse proxies like ngrok (`ERR_NGROK_3004`).
+/// s3s already suppresses bodyless error responses. This layer also protects
+/// REST routes and custom responses: unlike the HTTP/1.1 encoder, hyper's
+/// HTTP/2 sender relies on the body rather than the status to end the stream.
 #[derive(Clone)]
 pub struct BodylessStatusFixLayer;
 
@@ -5310,6 +5304,62 @@ mod tests {
 
             let bytes = collect_body(body).await;
             assert!(bytes.is_empty(), "304 response body must be empty");
+        }
+
+        #[tokio::test]
+        async fn bodyless_304_is_valid_on_http1_and_http2() {
+            use hyper_util::rt::{TokioExecutor, TokioIo};
+            use hyper_util::service::TowerToHyperService;
+            for http2 in [false, true] {
+                let (client_io, server_io) = tokio::io::duplex(4096);
+                let service = TowerToHyperService::new(BodylessStatusFixLayer.layer(FixedResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    body: Bytes::from_static(b"<Error><Code>NotModified</Code></Error>"),
+                    content_type: Some("application/xml"),
+                }));
+                let server = tokio::spawn(async move {
+                    if http2 {
+                        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(server_io), service)
+                            .await
+                            .expect("HTTP/2 server");
+                    } else {
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(server_io), service)
+                            .await
+                            .expect("HTTP/1 server");
+                    }
+                });
+                let request = Request::builder()
+                    .uri("http://localhost/object")
+                    .body(Empty::<Bytes>::new())
+                    .expect("request");
+                let (response, client) = if http2 {
+                    let (mut sender, connection) =
+                        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                            .await
+                            .expect("HTTP/2 handshake");
+                    let client = tokio::spawn(async move {
+                        connection.await.expect("HTTP/2 client");
+                    });
+                    (sender.send_request(request).await.expect("HTTP/2 response"), client)
+                } else {
+                    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                        .await
+                        .expect("HTTP/1 handshake");
+                    let client = tokio::spawn(async move {
+                        connection.await.expect("HTTP/1 client");
+                    });
+                    (sender.send_request(request).await.expect("HTTP/1 response"), client)
+                };
+                assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(response.headers()[http::header::ETAG], "\"abc123\"");
+                assert!(!response.headers().contains_key(http::header::CONTENT_LENGTH));
+                assert!(!response.headers().contains_key(http::header::CONTENT_TYPE));
+                assert!(collect_body(response.into_body()).await.is_empty());
+                client.abort();
+                server.abort();
+            }
         }
 
         #[tokio::test]

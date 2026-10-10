@@ -271,7 +271,7 @@ async fn call_website(
             website_error_with_document(&req, &server_ctx, &target.bucket, config.error_document.as_ref(), StatusCode::NOT_FOUND)
                 .await
         }
-        Err(err) if err.code() == &S3ErrorCode::NotModified => Ok(website_error(StatusCode::NOT_MODIFIED, true)),
+        Err(err) if err.code() == &S3ErrorCode::NotModified => Ok(website_not_modified(&err)),
         Err(_) if status.is_client_error() => {
             website_error_with_document(&req, &server_ctx, &target.bucket, config.error_document.as_ref(), status).await
         }
@@ -518,6 +518,18 @@ fn website_error(status: StatusCode, head: bool) -> S3Response<Body> {
         headers,
         extensions: Extensions::new(),
     }
+}
+
+fn website_not_modified(error: &S3Error) -> S3Response<Body> {
+    let mut response = S3Response::new(Body::empty());
+    response.status = Some(StatusCode::NOT_MODIFIED);
+    if let Some(headers) = error.headers() {
+        response.headers = headers.clone();
+    }
+    response.headers.remove(http::header::CONTENT_LENGTH);
+    response.headers.remove(http::header::CONTENT_TYPE);
+    response.headers.remove(http::header::TRANSFER_ENCODING);
+    response
 }
 
 fn website_location(location: String, status: StatusCode) -> S3Result<S3Response<Body>> {
@@ -826,6 +838,39 @@ fn header_value(headers: &HeaderMap, name: &str) -> S3Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn website_304_preserves_cache_headers_without_content() {
+        use http_body_util::BodyExt;
+        let mut error = s3s::S3Error::new(s3s::S3ErrorCode::NotModified);
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("etag", "\"abc\""),
+            ("cache-control", "max-age=60"),
+            ("expires", "Tue, 14 Nov 2023 22:13:20 GMT"),
+            ("content-length", "123"),
+            ("content-type", "application/xml"),
+        ] {
+            headers.insert(name, http::HeaderValue::from_static(value));
+        }
+        error.set_headers(headers);
+        let response = super::website_not_modified(&error);
+        assert_eq!(response.status, Some(http::StatusCode::NOT_MODIFIED));
+        assert_eq!(response.headers["etag"], "\"abc\"");
+        assert_eq!(response.headers["cache-control"], "max-age=60");
+        assert!(response.headers.contains_key("expires"));
+        assert!(!response.headers.contains_key("content-length"));
+        assert!(!response.headers.contains_key("content-type"));
+        assert!(
+            response
+                .output
+                .collect()
+                .await
+                .expect("empty website body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
     use super::{
         MetadataOperation, list_object_versions_input, list_objects_v2_input, metadata_operation, website_redirect,
         website_relative_redirect, website_rule_matches, website_target,

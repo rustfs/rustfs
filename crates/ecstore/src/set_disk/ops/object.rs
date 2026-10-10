@@ -2481,6 +2481,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
         }
 
+        let condition_terminal =
+            crate::object_api::get_object_read_condition_is_terminal(crate::object_api::GetObjectReadMetadata {
+                bucket,
+                object,
+                etag: object_info.etag.as_deref(),
+                mod_time: object_info.mod_time,
+                parts: &object_info.parts,
+                delete_marker: false,
+            });
+        if snapshot.condition_stopped && !condition_terminal {
+            return Err(Error::other("conditional metadata snapshot no longer satisfies the read condition"));
+        }
+        if condition_terminal {
+            return Ok(GetObjectReader::condition_stopped(object_info));
+        }
+
         // if object_info.size == 0 {
         //     let empty_rd: Box<dyn AsyncRead> = Box::new(Bytes::new());
 
@@ -2580,6 +2596,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 // Decode directly
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                #[cfg(test)]
+                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
                 if let Some(body) = try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
                 {
                     if let Some(decode_stage_start) = decode_stage_start {
@@ -2649,6 +2667,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                 let mut output = Cursor::new(Vec::with_capacity(object_size));
+                #[cfg(test)]
+                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
                 let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));
@@ -17251,6 +17271,44 @@ mod transition_upload_integrity_tests {
 
     /// Plain objects must keep streaming the remote bytes through untouched:
     /// their plan is `Plain`, so the tiered read stays byte-identical.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_conditional_read_skips_remote_get_with_live_positive_control() {
+        struct MatchingEtag(String);
+        impl crate::object_api::GetObjectReadCondition for MatchingEtag {
+            fn is_terminal(&self, metadata: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+                !metadata.delete_marker && metadata.etag == Some(self.0.as_str())
+            }
+        }
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-condition-body-get";
+        let object = "object.bin";
+        let payload = b"conditional remote reads need metadata only".repeat(256);
+        let original = write_source(&set, &disks, bucket, object, &payload).await;
+        let tier = format!("CONDITION{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier).await;
+        set.transition_object(bucket, object, &transition_options(&original, tier))
+            .await
+            .expect("transition object");
+        assert_eq!(backend.get_count().await, 0, "transition setup has not fetched the remote body");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let reader = crate::object_api::with_get_object_read_condition(
+            Arc::new(MatchingEtag(original.etag.expect("source ETag"))),
+            set.get_object_reader(bucket, object, None, HeaderMap::new(), &opts),
+        )
+        .await
+        .expect("terminal transitioned metadata");
+        assert!(reader.object_info.is_remote(), "the condition was evaluated on transitioned metadata");
+        drop(reader);
+        assert_eq!(backend.get_count().await, 0, "a matching condition never calls the warm backend GET");
+        let (body, _) = read_transitioned(&set, bucket, object, None, &opts).await;
+        assert_eq!(body, payload);
+        assert_eq!(backend.get_count().await, 1, "the same backend counter observes a normal remote GET");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn transitioned_plain_object_get_is_unchanged() {

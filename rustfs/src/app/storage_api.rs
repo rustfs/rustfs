@@ -1190,8 +1190,10 @@ pub(crate) mod object_usecase {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::lookup_get_object_body_cache_hook;
         pub(crate) use crate::storage::storage_api::ecstore_object::{
-            GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len,
+            GetObjectBodyCacheHookLookup, GetObjectReadCondition, GetObjectReadMetadata, get_object_body_cache_plaintext_len,
+            with_get_object_read_condition,
         };
+        pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
     pub(crate) mod contract {
@@ -1322,8 +1324,8 @@ pub(crate) mod test {
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
-            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
-            fail_next_quota_ledger_save_for_test,
+            ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
+            PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
         };
     }
 
