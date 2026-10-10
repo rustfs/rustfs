@@ -71,7 +71,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: rustfs-functional-chain-runs
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only && 'rustfs-functional-validation-tools' || 'rustfs-functional-chain-runs' }}
   cancel-in-progress: false
 
 jobs:
@@ -126,19 +126,19 @@ jobs:
 
   validation:
     if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_cleanup_run_id != '') }}
-    runs-on: smoke-testing
+    runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
     timeout-minutes: 90
     outputs:
       source_sha: ${{ steps.candidate.outputs.source_sha }}
     concurrency:
-      group: rustfs-shared-functional-tests-v2
+      group: ${{ inputs.validation_tools_only && 'rustfs-validation-tools-resolver' || 'rustfs-shared-functional-tests-v2' }}
       cancel-in-progress: false
     env:
-      RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
-      RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
-      RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
-      RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
-      RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+      RUSTFS_ACCESS_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_ACCESS_KEY || '' }}
+      RUSTFS_SECRET_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_SECRET_KEY || '' }}
+      RUSTFS_API_ENDPOINT: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT) || '' }}
+      RUSTFS_NODES: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_NODES || vars.RUSTFS_NODES) || '' }}
+      RUSTFS_SSH_USER: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER) || '' }}
     steps:
       - name: Checkout candidate resolver
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -175,6 +175,8 @@ jobs:
 
           revision = os.environ["AUTO_TESTING_SHA"]
           cleanup = os.environ["CLEANUP_RUN_ID"]
+          if os.environ["TOOLS_ONLY"] == "true" and (cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("tools-only execution cannot select a fleet case or cleanup")
           if os.environ["NATIVE_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
               raise ValueError("native regressions require tools-only execution, without a fleet case or cleanup")
           if cleanup and (not cleanup.isdigit() or int(cleanup) <= 0 or os.environ["SELECTED_CASE"] or os.environ["TOOLS_ONLY"] == "true"):
