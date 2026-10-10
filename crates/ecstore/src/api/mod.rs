@@ -372,6 +372,15 @@ pub mod config {
             with_server_config_write_lock,
         };
 
+        /// Read config bytes and metadata without treating an empty payload as absent.
+        pub async fn read_config_preserve_empty_with_metadata_opts(
+            api: std::sync::Arc<crate::store::ECStore>,
+            file: &str,
+            opts: &crate::object_api::ObjectOptions,
+        ) -> crate::error::Result<(Vec<u8>, crate::object_api::ObjectInfo)> {
+            crate::config::com::read_config_preserve_empty_with_metadata_opts(api, file, opts).await
+        }
+
         pub async fn read_config_limited_preserve_empty_with_metadata_opts(
             api: std::sync::Arc<crate::store::ECStore>,
             file: &str,

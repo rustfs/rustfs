@@ -495,8 +495,20 @@ pub(crate) async fn read_config_preserve_empty<S>(api: Arc<S>, file: &str) -> Re
 where
     S: EcstoreObjectIO,
 {
-    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true, None).await?;
+    let (data, _obj) = read_config_preserve_empty_with_metadata_opts(api, file, &ObjectOptions::default()).await?;
     Ok(data)
+}
+
+/// Preserve an empty config payload, its metadata, and caller-supplied read options.
+pub(crate) async fn read_config_preserve_empty_with_metadata_opts<S>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(api, file, opts, true, None).await
 }
 
 pub async fn read_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
@@ -527,15 +539,13 @@ pub(crate) async fn read_config_no_lock_preserve_empty_with_metadata<S>(api: Arc
 where
     S: EcstoreObjectIO,
 {
-    read_config_with_metadata_inner(
+    read_config_preserve_empty_with_metadata_opts(
         api,
         file,
         &ObjectOptions {
             no_lock: true,
             ..Default::default()
         },
-        true,
-        None,
     )
     .await
 }
@@ -2815,9 +2825,10 @@ mod tests {
         config_task_join_error, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
         heal_config_descriptor, is_standard_object_server_config, lookup_configs, map_system_metadata_write_error,
         new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty,
-        read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot, save_config_with_opts_inner,
-        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
+        read_config_preserve_empty_with_metadata_opts, read_config_with_metadata, read_config_without_migrate,
+        read_server_config_snapshot, save_config_with_opts_inner, save_server_config, save_server_config_snapshot,
+        save_server_config_snapshot_with_generation, server_config_transaction_lock_path, should_warn_ignored_scalar_section,
+        storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::{RUSTFS_META_BUCKET, endpoint::Endpoint};
@@ -5065,6 +5076,7 @@ mod tests {
         heal_replacement: Option<Vec<u8>>,
         heal_calls: AtomicUsize,
         write_calls: AtomicUsize,
+        last_get_no_lock: AtomicBool,
         last_put_no_lock: AtomicBool,
         last_put_preconditions: Mutex<Option<HTTPPreconditions>>,
         revision: AtomicUsize,
@@ -5080,6 +5092,7 @@ mod tests {
                 heal_replacement,
                 heal_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
+                last_get_no_lock: AtomicBool::new(false),
                 last_put_no_lock: AtomicBool::new(false),
                 last_put_preconditions: Mutex::new(None),
                 revision: AtomicUsize::new(1),
@@ -5135,8 +5148,9 @@ mod tests {
             _object: &str,
             _range: Option<HTTPRangeSpec>,
             _h: HeaderMap,
-            _opts: &ObjectOptions,
+            opts: &ObjectOptions,
         ) -> Result<GetObjectReader> {
+            self.last_get_no_lock.store(opts.no_lock, Ordering::SeqCst);
             let data = match &*self.state.lock().expect("state lock poisoned") {
                 RecoveryReadState::Missing => return Err(Error::ConfigNotFound),
                 RecoveryReadState::Blob(data) => data.clone(),
@@ -5429,6 +5443,60 @@ mod tests {
             .await
             .expect("no-lock payload-validating callers must observe the empty object");
         assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_config_preserve_empty_metadata_keeps_empty_and_options() {
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(Vec::new()), None));
+        for no_lock in [false, true] {
+            let opts = ObjectOptions {
+                no_lock,
+                ..Default::default()
+            };
+            let (data, info) = read_config_preserve_empty_with_metadata_opts(store.clone(), "config/empty.json", &opts)
+                .await
+                .expect("an existing empty config must retain its payload and metadata");
+            assert!(data.is_empty());
+            assert_eq!(info.size, 0);
+            assert_eq!(info.actual_size, 0);
+            assert_eq!(info.etag.as_deref(), Some("config-1"));
+            assert_eq!(info.data_dir, Some(uuid::Uuid::from_u128(1)));
+            assert_eq!(store.last_get_no_lock.load(Ordering::SeqCst), no_lock);
+        }
+        let err = read_config(store, "config/empty.json")
+            .await
+            .expect_err("the existing reader must still treat empty configs as missing");
+        assert!(matches!(err, Error::ConfigNotFound));
+    }
+
+    #[tokio::test]
+    async fn read_config_preserve_empty_metadata_keeps_payload_and_metadata() {
+        let payload = b"original config bytes".to_vec();
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(payload.clone()), None));
+        let (data, info) =
+            read_config_preserve_empty_with_metadata_opts(store, "config/nonempty.json", &ObjectOptions::default())
+                .await
+                .expect("a nonempty config must retain its payload and metadata");
+        assert_eq!(data, payload);
+        let size = i64::try_from(payload.len()).expect("test payload size fits i64");
+        assert_eq!(info.size, size);
+        assert_eq!(info.actual_size, size);
+        assert_eq!(info.etag.as_deref(), Some("config-1"));
+        assert_eq!(info.data_dir, Some(uuid::Uuid::from_u128(1)));
+    }
+
+    #[tokio::test]
+    async fn read_config_preserve_empty_metadata_preserves_read_errors() {
+        let missing = Arc::new(RecoveryMockStore::new(RecoveryReadState::Missing, None));
+        let err = read_config_preserve_empty_with_metadata_opts(missing, "config/missing.json", &ObjectOptions::default())
+            .await
+            .expect_err("physical absence must remain ConfigNotFound");
+        assert!(matches!(err, Error::ConfigNotFound));
+        let quorum = Arc::new(RecoveryMockStore::new(RecoveryReadState::QuorumError, None));
+        let err = read_config_preserve_empty_with_metadata_opts(quorum, "config/quorum.json", &ObjectOptions::default())
+            .await
+            .expect_err("a quorum failure must retain its typed read error");
+        assert!(matches!(err, Error::ErasureReadQuorum));
     }
 
     #[async_trait::async_trait]
