@@ -69,6 +69,8 @@ jobs:
           # Cargo adds the helper package; both lock identities are retained.
           cp candidate/Cargo.lock inspector-build/Cargo.lock
           cargo build --release --manifest-path inspector-build/Cargo.toml
+          python3 auto-testing/scripts/validation_heal/check_bitrot_tool.py \
+            --binary inspector-build/target/release/heal-meta-inspect --source candidate
           mkdir validation-tools
           cp inspector-build/target/release/heal-meta-inspect validation-tools/
           cp inspector-build/Cargo.lock validation-tools/inspector-Cargo.lock
