@@ -427,6 +427,115 @@ async fn periodic_nested_snapshot_defers_unfinished_paths_at_or_before_completed
 
 #[tokio::test]
 #[serial]
+async fn periodic_nested_snapshot_checks_suspended_ancestors_before_certifying_frontier() {
+    for (ancestor, frontier, may_emit) in [
+        ("bucket/z", "bucket/z", false),
+        ("bucket/a", "bucket/a-", false),
+        ("bucket/a", "bucket/a/done", true),
+    ] {
+        let (mut scanner, root) = build_test_scanner().await;
+        let _guard = TestGuard { temp_dir: Some(root) };
+        let (_, identity) = bound_checkpoint();
+        let mut cache = DataUsageCache::default();
+        cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+        cache.replace("bucket", "", DataUsageEntry::default());
+        cache.replace(ancestor, "bucket", DataUsageEntry::default());
+        let completed = format!("{ancestor}/done");
+        cache.replace(
+            &completed,
+            ancestor,
+            DataUsageEntry {
+                objects: 3,
+                size: 9,
+                ..Default::default()
+            },
+        );
+        let sibling_frontier = frontier != ancestor && frontier != completed;
+        if sibling_frontier {
+            cache.replace(
+                frontier,
+                "bucket",
+                DataUsageEntry {
+                    objects: 3,
+                    size: 9,
+                    ..Default::default()
+                },
+            );
+        }
+        cache.seal_scan_frontier(Some(frontier)).expect("initial completed coverage");
+        prepare_scanner(&mut scanner, cache);
+        scanner.new_cache.replace("bucket", "", DataUsageEntry::default());
+        scanner
+            .new_cache
+            .copy_with_children(&scanner.old_cache, &hash_path(&completed), &Some(hash_path(ancestor)));
+        if sibling_frontier {
+            scanner
+                .new_cache
+                .copy_with_children(&scanner.old_cache, &hash_path(frontier), &Some(hash_path("bucket")));
+        }
+        let root_entry = scanner.new_cache.root().expect("suspended root owner").clone();
+        let mut ancestor_entry = scanner.new_cache.find(ancestor).expect("suspended subtree owner").clone();
+        ancestor_entry.objects = 1;
+        ancestor_entry.size = 2;
+        scanner.checkpoint_ancestors = vec![
+            ScannerCheckpointAncestor {
+                hash: hash_path("bucket"),
+                entry: root_entry,
+            },
+            ScannerCheckpointAncestor {
+                hash: hash_path(ancestor),
+                entry: ancestor_entry,
+            },
+        ];
+        scanner.checkpoint_depth = 2;
+        let current = format!("{ancestor}/next");
+        assert!(
+            current.as_str() > frontier,
+            "the current-folder-only guard must not already reject this fixture"
+        );
+        scanner.record_raw_enumeration_entry(&current, STORAGE_FORMAT_FILE);
+        let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+        scanner.checkpoint_tx = Some(checkpoint_tx);
+        scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+        scanner.last_checkpoint_at = Instant::now()
+            .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+            .expect("suspended ancestor emitter cadence");
+        scanner.maybe_send_checkpoint(
+            &CachedFolder {
+                name: current.clone(),
+                parent: Some(hash_path(ancestor)),
+                object_heal_prob_div: 1,
+            },
+            &hash_path(&current),
+            &DataUsageEntry {
+                objects: 2,
+                size: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL);
+        if may_emit {
+            let snapshot = checkpoint_rx
+                .try_recv()
+                .expect("an ancestor containing the frontier may safely emit");
+            assert_eq!(snapshot.validated_scan_frontier(), Some(frontier));
+            let totals = snapshot
+                .checked_flatten_complete_scope("bucket")
+                .expect("all suspended and current accounting connected");
+            assert_eq!(totals.objects, 6);
+            assert_eq!(totals.size, 16);
+            assert_eq!(snapshot.cache.len(), 4);
+        } else {
+            assert!(
+                matches!(checkpoint_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "unfinished ancestor {ancestor} must not be certified through {frontier}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn periodic_nested_snapshot_partial_preservation_invalidates_covered_child_but_keeps_inner_frontier() {
     for (child, frontier, frontier_inside_child, expected_objects) in [
         ("bucket/a", "bucket/z", false, 5),

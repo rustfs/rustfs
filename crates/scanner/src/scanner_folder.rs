@@ -1281,12 +1281,14 @@ impl FolderScanner {
         self.last_checkpoint_objects = self.checkpoint_objects;
         self.last_checkpoint_at = Instant::now();
         // Heal revisits are not sorted with the forward sweep. An unfinished
-        // earlier sibling must not be signed as completed prefix coverage.
-        if self
-            .coverage_frontier
-            .as_deref()
-            .is_some_and(|frontier| folder_is_covered_by_frontier(&folder.name, frontier))
-        {
+        // earlier subtree, including a suspended ancestor, must not be signed
+        // as completed prefix coverage.
+        if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+            folder_is_covered_by_frontier(&folder.name, frontier)
+                || self.checkpoint_ancestors[..self.checkpoint_depth]
+                    .iter()
+                    .any(|ancestor| folder_is_covered_by_frontier(&ancestor.hash.0, frontier))
+        }) {
             return;
         }
         let mut snapshot = self.new_cache.clone();
