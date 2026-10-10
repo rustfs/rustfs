@@ -6,6 +6,8 @@ use std::{
     path::Path,
 };
 
+mod truncate;
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const VOTE: TableDefinition<u8, &[u8]> = TableDefinition::new("vote");
 const LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
@@ -775,6 +777,173 @@ mod tests {
             assert!(Store::open(&path, identity()).is_err(), "U08_INVARIANT corrupt record accepted {target}");
         }
     }
+    fn truncate_batch() -> Vec<LogEntry> {
+        (0..5)
+            .map(|index| LogEntry {
+                id: LogId {
+                    term: 8,
+                    leader_node: 0,
+                    index,
+                },
+                payload: vec![u8::try_from(index).expect("small index"), 2, 3],
+            })
+            .collect()
+    }
+    fn assert_prefix(store: &Store, expected: &[LogEntry]) {
+        assert_eq!(
+            store.read_entries(0, u64::MAX).expect("entries"),
+            expected,
+            "U09_INVARIANT acknowledged truncate lost"
+        );
+        assert_eq!(
+            store.log_state().expect("state"),
+            LogState {
+                first: expected.first().map(|e| e.id),
+                last: expected.last().map(|e| e.id),
+            },
+            "U09_INVARIANT tail split"
+        );
+        assert_eq!(store.read_vote().expect("vote"), Some(vote()));
+    }
+    #[test]
+    fn truncate_suffix_reopen_then_replace() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("db");
+        let mut store = Store::initialize(&path, identity()).expect("init");
+        store.save_vote(vote()).expect("vote");
+        let old = truncate_batch();
+        store.append(&old).expect("append");
+        store.truncate_suffix(2).expect("truncate");
+        drop(store);
+        let reopened = Store::open(&path, identity());
+        assert!(reopened.is_ok(), "U09_INVARIANT reopened truncate invalid: {:?}", reopened.as_ref().err());
+        let mut store = reopened.expect("asserted reopen");
+        assert_prefix(&store, &old[..2]);
+        let replacement: Vec<_> = (2..4)
+            .map(|index| LogEntry {
+                id: LogId {
+                    term: 9,
+                    leader_node: 17,
+                    index,
+                },
+                payload: vec![9, 0, 7],
+            })
+            .collect();
+        store.append(&replacement).expect("replace suffix");
+        drop(store);
+        let store = Store::open(&path, identity()).expect("reopen replacement");
+        let mut expected = old[..2].to_vec();
+        expected.extend(replacement);
+        assert_prefix(&store, &expected);
+    }
+    #[test]
+    fn truncate_zero_and_noop_preserve_invariants() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("db");
+        let mut store = Store::initialize(&path, identity()).expect("init");
+        store.save_vote(vote()).expect("vote");
+        for from in [0, 1, u64::MAX] {
+            store.truncate_suffix(from).expect("empty no-op");
+        }
+        store.append(&truncate_batch()).expect("append");
+        for from in [5, 6, u64::MAX] {
+            store.truncate_suffix(from).expect("tail no-op");
+        }
+        assert_prefix(&store, &truncate_batch());
+        store.truncate_suffix(0).expect("clear");
+        drop(store);
+        let mut store = Store::open(&path, identity()).expect("reopen empty");
+        assert_prefix(&store, &[]);
+        store.append(&truncate_batch()[..1]).expect("restart at zero");
+        drop(store);
+        assert_prefix(&Store::open(&path, identity()).expect("reopen zero"), &truncate_batch()[..1]);
+    }
+    #[test]
+    fn truncate_success_survives_power_cut() {
+        for from in [2, 0] {
+            let (_dir, backend, mut store) = media_store();
+            store.save_vote(vote()).expect("vote");
+            let old = truncate_batch();
+            store.append(&old).expect("stable append");
+            store.truncate_suffix(from).expect("truncate ACK");
+            backend.cut();
+            drop(store);
+            let store = Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen");
+            assert_prefix(&store, &old[..usize::try_from(from).expect("small from")]);
+        }
+    }
+    #[test]
+    fn truncate_power_cut_never_splits_tail() {
+        for from in [2, 0] {
+            for sync in 1..=2 {
+                for after in [false, true] {
+                    let (_dir, backend, mut store) = media_store();
+                    store.save_vote(vote()).expect("vote");
+                    let old = truncate_batch();
+                    store.append(&old).expect("stable append");
+                    backend.arm(sync, after, true);
+                    assert!(
+                        matches!(store.truncate_suffix(from), Err(StoreError::CommitIndeterminate(_))),
+                        "U09_INVARIANT interrupted truncate ACK"
+                    );
+                    backend.cut();
+                    drop(store);
+                    let fresh = CrashBackend::new(&backend.path);
+                    match Database::builder().create_with_backend(fresh) {
+                        Ok(database) => match Store::from_database(database, identity()) {
+                            Ok(store) => {
+                                let entries = store.read_entries(0, u64::MAX).expect("entries");
+                                let prefix = &old[..usize::try_from(from).expect("small from")];
+                                assert!(entries == old || entries == prefix, "U09_INVARIANT partial truncate");
+                                assert_prefix(&store, &entries);
+                            }
+                            Err(error) => panic!("U09_INVARIANT logical recovery error: {error:?}"),
+                        },
+                        Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))) => {}
+                        Err(error) => panic!("unexpected media recovery error: {error:?}"),
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn truncate_sync_error_fails_closed() {
+        let (_dir, backend, mut store) = media_store();
+        store.save_vote(vote()).expect("vote");
+        let old = truncate_batch();
+        store.append(&old).expect("append");
+        backend.arm(1, false, false);
+        assert!(
+            matches!(store.truncate_suffix(2), Err(StoreError::CommitIndeterminate(_))),
+            "U09_INVARIANT sync error ACK"
+        );
+        assert!(matches!(store.save_vote(vote()), Err(StoreError::WriteDisabled)));
+        assert!(matches!(store.append(&[]), Err(StoreError::WriteDisabled)));
+        for from in [0, 2, 99, u64::MAX] {
+            assert!(
+                matches!(store.truncate_suffix(from), Err(StoreError::WriteDisabled)),
+                "U09_INVARIANT truncate continued after unknown commit"
+            );
+        }
+        backend.cut();
+        drop(store);
+        let store = Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen");
+        assert_prefix(&store, &old);
+    }
+    #[test]
+    fn truncate_survives_child_kill() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("db");
+        let mut store = Store::initialize(&path, identity()).expect("init");
+        store.save_vote(vote()).expect("vote");
+        store.append(&truncate_batch()).expect("append");
+        drop(store);
+        let mut child = child(&path, "truncate");
+        ack(&mut child);
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_prefix(&Store::open(&path, identity()).expect("reopen"), &truncate_batch()[..2]);
+    }
     fn child(path: &Path, mode: &str) -> std::process::Child {
         Command::new(std::env::current_exe().expect("exe"))
             .args(["--exact", "tests::process_child", "--nocapture"])
@@ -840,8 +1009,12 @@ mod tests {
                 assert!(Store::open(path, identity()).is_err(), "U08_INVARIANT exclusive lock absent");
             } else {
                 let mut store = Store::open(path, identity()).expect("child open");
-                store.save_vote(vote()).expect("vote");
-                store.append(&batch()).expect("append");
+                if std::env::var("U08_CHILD_MODE").expect("mode") == "truncate" {
+                    store.truncate_suffix(2).expect("truncate ACK");
+                } else {
+                    store.save_vote(vote()).expect("vote");
+                    store.append(&batch()).expect("append");
+                }
                 println!("U08_ACK");
                 io::stdout().flush().expect("flush");
                 loop {
