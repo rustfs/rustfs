@@ -42,6 +42,11 @@ on:
         type: boolean
         required: false
         default: false
+      validation_cleanup_run_id:
+        description: Failed validation run whose rejected fault environment needs evidence-based finalization
+        type: string
+        required: false
+        default: ''
       validation_tools_run_id:
         description: Successful tool build run; required by Heal physical metadata checks
         type: string
@@ -66,7 +71,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '' && !inputs.validation_tools_only) || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '' && !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -115,7 +120,7 @@ jobs:
           fi
 
   validation:
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_cleanup_run_id != '') }}
     runs-on: smoke-testing
     timeout-minutes: 90
     outputs:
@@ -150,6 +155,9 @@ jobs:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          CLEANUP_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          SELECTED_CASE: ${{ inputs.validation_case }}
+          TOOLS_ONLY: ${{ inputs.validation_tools_only }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -160,6 +168,9 @@ jobs:
           from scripts.resolve_functional_candidate import resolve
 
           revision = os.environ["AUTO_TESTING_SHA"]
+          cleanup = os.environ["CLEANUP_RUN_ID"]
+          if cleanup and (not cleanup.isdigit() or int(cleanup) <= 0 or os.environ["SELECTED_CASE"] or os.environ["TOOLS_ONLY"] == "true"):
+              raise ValueError("cleanup requires one exact failed run and is exclusive with case/tool execution")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise ValueError("validation requires an exact auto-testing commit SHA")
           candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]))
@@ -236,7 +247,7 @@ jobs:
           printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Run selected canonical validation case
-        if: ${{ !inputs.validation_tools_only }}
+        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' }}
         env:
           VALIDATION_CASE: ${{ inputs.validation_case }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
@@ -246,6 +257,32 @@ jobs:
           ./auto-testing/scripts/run_validation_case.sh \
             "${VALIDATION_CASE}" "${VALIDATION_ROOT}/candidate.json" \
             "${AUTO_TESTING_SHA}" "${VALIDATION_ROOT}/run"
+
+      - name: Audit and finalize retained rejected-fault environment
+        if: ${{ inputs.validation_cleanup_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          gh run view "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --json status,conclusion,headBranch,workflowName > "${VALIDATION_ROOT}/failed-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          run = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "failed-run.json").read_text())
+          if (run["status"] != "completed" or run["conclusion"] != "failure"
+              or run["workflowName"] != "RustFS Functional Chain" or run["headBranch"] != os.environ["GITHUB_REF_NAME"]):
+              raise ValueError("cleanup source must be a completed failed Functional Chain run")
+          PY
+          gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"
+          python3 -B auto-testing/scripts/validation_heal/recover_environment.py \
+            --failed-run-id "${FAILED_RUN_ID}" --artifact "${VALIDATION_ROOT}/failed-artifact" \
+            --candidate "${VALIDATION_ROOT}/candidate.json" --evidence "${VALIDATION_ROOT}/recovery"
 
       - name: Show validation report
         if: ${{ always() }}
