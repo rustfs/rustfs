@@ -660,6 +660,7 @@ impl SetDisks {
             .await?
         };
         let metadata_fanout_complete = metadata_read.is_complete();
+        let condition_stopped = metadata_read.condition_stopped;
         let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
         let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
             GET_OBJECT_PATH_INTERNAL_META
@@ -743,20 +744,17 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        if !metadata_fanout_complete
+        let mut snapshot = if !metadata_fanout_complete
             && allow_early_stop
             && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
             && late_materialization_candidate_is_safe(&fi)
         {
-            Ok(GetObjectFileInfo::owned_with_late_metadata_fanout(
-                fi,
-                parts_metadata,
-                op_online_disks,
-                disks,
-            ))
+            GetObjectFileInfo::owned_with_late_metadata_fanout(fi, parts_metadata, op_online_disks, disks)
         } else {
-            Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
-        }
+            GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
+        };
+        snapshot.condition_stopped = condition_stopped;
+        Ok(snapshot)
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]

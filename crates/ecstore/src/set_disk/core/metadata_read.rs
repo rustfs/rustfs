@@ -66,6 +66,7 @@ use tokio::task::JoinSet;
 pub(in crate::set_disk) struct MetadataReadResult {
     pub(in crate::set_disk) slots: Vec<MetadataDiskObservation>,
     pub(in crate::set_disk) diagnostics: MetadataFanoutDiagnostics,
+    pub(in crate::set_disk) condition_stopped: bool,
 }
 
 impl MetadataReadResult {
@@ -1078,7 +1079,11 @@ impl SetDisks {
                 0,
             );
         }
-        Ok(MetadataReadResult { slots, diagnostics })
+        Ok(MetadataReadResult {
+            slots,
+            diagnostics,
+            condition_stopped: false,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1121,6 +1126,7 @@ impl SetDisks {
         let mut next_fanout_index = 0usize;
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
+        let read_condition_active = read_data && crate::object_api::get_object_read_condition_is_active();
         let mut final_miss_reason_override = None;
         let mut non_inline_candidate_eligible = None;
         let mut single_pending_hedge_deadline = None;
@@ -1258,12 +1264,28 @@ impl SetDisks {
                 }
             }
 
-            if !force_full_wait
+            if (!force_full_wait || read_condition_active)
                 && let Some(decision) = accumulator
                     .early_stop_decision()
                     .or_else(|| accumulator.version_early_stop_decision())
             {
-                let should_return_early = if read_data {
+                let condition_stopped = read_condition_active
+                    && decision.reason == crate::diagnostics::get::GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
+                    && accumulator.candidate.as_ref().is_some_and(|candidate| {
+                        !candidate.deleted
+                            && crate::object_api::get_object_read_condition_is_terminal(
+                                crate::object_api::GetObjectReadMetadata::from_file_info(
+                                    bucket.as_ref(),
+                                    object.as_ref(),
+                                    candidate,
+                                ),
+                            )
+                    });
+                let should_return_early = if condition_stopped {
+                    true
+                } else if force_full_wait {
+                    false
+                } else if read_data {
                     match accumulator.candidate.as_ref() {
                         Some(_candidate) if non_inline_candidate_eligible == Some(true) => {
                             accumulator.candidate_has_read_reserve()
@@ -1332,7 +1354,11 @@ impl SetDisks {
                         cancelled_count,
                     );
                     let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
-                    return Ok(MetadataReadResult { slots, diagnostics });
+                    return Ok(MetadataReadResult {
+                        slots,
+                        diagnostics,
+                        condition_stopped,
+                    });
                 }
             }
 
@@ -1410,7 +1436,11 @@ impl SetDisks {
         rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(metrics_path, 0);
         rustfs_io_metrics::record_get_object_metadata_fanout_lifecycle(metrics_path, scheduled_count, scheduled_count, 0);
         let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
-        Ok(MetadataReadResult { slots, diagnostics })
+        Ok(MetadataReadResult {
+            slots,
+            diagnostics,
+            condition_stopped: false,
+        })
     }
 
     /// Test-only seam that records one per-disk `read_version` metadata RPC for

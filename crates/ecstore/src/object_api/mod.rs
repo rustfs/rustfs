@@ -102,9 +102,13 @@ mod body_cache_hook;
 mod encryption;
 mod hook_slot;
 mod object_mutation_hook;
+mod read_condition;
 mod readers;
 mod types;
 pub(crate) mod write_commit_context;
+
+pub use read_condition::{GetObjectReadCondition, GetObjectReadMetadata, with_get_object_read_condition};
+pub(crate) use read_condition::{get_object_read_condition_is_active, get_object_read_condition_is_terminal};
 
 #[cfg(test)]
 mod persisted_metadata_keys_tests;

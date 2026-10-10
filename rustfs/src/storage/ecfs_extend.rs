@@ -529,8 +529,18 @@ pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &Ob
 /// has not changed), allowing the caller to translate this into the correct
 /// HTTP response.
 pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
-    let mod_time = info.mod_time;
-    let etag = info.etag.as_deref();
+    match evaluate_read_preconditions(headers, info.etag.as_deref(), info.mod_time) {
+        Ok(()) => Ok(()),
+        Err(S3ErrorCode::NotModified) => Err(not_modified_error(info)?),
+        Err(code) => Err(S3Error::new(code)),
+    }
+}
+
+pub(crate) fn evaluate_read_preconditions(
+    headers: &HeaderMap,
+    etag: Option<&str>,
+    mod_time: Option<OffsetDateTime>,
+) -> Result<(), S3ErrorCode> {
     let if_match = non_empty_header_value(headers, IF_MATCH);
     let if_none_match = non_empty_header_value(headers, IF_NONE_MATCH);
     let if_modified_since = non_empty_header_value(headers, IF_MODIFIED_SINCE);
@@ -541,7 +551,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         match etag {
             _ if if_match_val == "*" => {}
             Some(e) if read_etag_matches(e, if_match_val, false) => {}
-            _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
+            _ => return Err(S3ErrorCode::PreconditionFailed),
         }
     }
 
@@ -552,14 +562,14 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t.unix_timestamp() > given_time.unix_timestamp()
     {
-        return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+        return Err(S3ErrorCode::PreconditionFailed);
     }
 
     // If-None-Match
     if let Some(if_none_match) = if_none_match
         && (if_none_match == "*" || etag.is_some_and(|e| read_etag_matches(e, if_none_match, true)))
     {
-        return Err(not_modified_error(info)?);
+        return Err(S3ErrorCode::NotModified);
     }
 
     // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
@@ -569,7 +579,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t.unix_timestamp() <= given_time.unix_timestamp()
     {
-        return Err(not_modified_error(info)?);
+        return Err(S3ErrorCode::NotModified);
     }
 
     Ok(())

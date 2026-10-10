@@ -2481,6 +2481,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
         }
 
+        let condition_terminal =
+            crate::object_api::get_object_read_condition_is_terminal(crate::object_api::GetObjectReadMetadata {
+                bucket,
+                object,
+                etag: object_info.etag.as_deref(),
+                mod_time: object_info.mod_time,
+                parts: &object_info.parts,
+                delete_marker: false,
+            });
+        if snapshot.condition_stopped && !condition_terminal {
+            return Err(Error::other("conditional metadata snapshot no longer satisfies the read condition"));
+        }
+        if condition_terminal {
+            return Ok(GetObjectReader::condition_stopped(object_info));
+        }
+
         // if object_info.size == 0 {
         //     let empty_rd: Box<dyn AsyncRead> = Box::new(Bytes::new());
 

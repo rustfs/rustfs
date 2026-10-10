@@ -15,7 +15,30 @@
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
 use super::*;
+use crate::app::storage_api::object_usecase::object_cache::{
+    GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
+    with_get_object_read_condition,
+};
 use crate::on_demand_migration::WriteBackBody;
+
+struct ConditionalRead {
+    bucket: String,
+    object: String,
+    headers: HeaderMap,
+    part_number: Option<usize>,
+}
+
+impl GetObjectReadCondition for ConditionalRead {
+    fn is_terminal(&self, metadata: GetObjectReadMetadata<'_>) -> bool {
+        if metadata.bucket != self.bucket || metadata.object != self.object || metadata.delete_marker {
+            return false;
+        }
+        evaluate_read_preconditions(&self.headers, metadata.etag, metadata.mod_time).is_err()
+            || self
+                .part_number
+                .is_some_and(|number| number > 1 && !metadata.parts.iter().any(|part| part.number == number))
+    }
+}
 use crate::on_demand_migration::{
     BucketOdmState, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, PullError, PullLeader, PullOutcome, PullReason, PullSlot,
     RangeGetPolicy, SourceBody, SourceClient, SourceError, SourceGet, SourceHead, commit_inline, idle_guarded_body,
@@ -2106,6 +2129,42 @@ fn should_buffer_get_object_in_memory_with_threshold(
 }
 
 impl DefaultObjectUsecase {
+    fn with_get_object_conditions<F: std::future::Future>(
+        req: &S3Request<GetObjectInput>,
+        part_number: Option<usize>,
+        read: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        // The concrete reader future is large; keep it out of the request's stack frame.
+        let read = Box::pin(read);
+        let condition = if has_read_preconditions(&req.headers) {
+            let mut headers = HeaderMap::with_capacity(4);
+            for name in [
+                http::header::IF_MATCH,
+                http::header::IF_UNMODIFIED_SINCE,
+                http::header::IF_NONE_MATCH,
+                http::header::IF_MODIFIED_SINCE,
+            ] {
+                if let Some(value) = req.headers.get(&name) {
+                    headers.insert(name, value.clone());
+                }
+            }
+            Some(Arc::new(ConditionalRead {
+                bucket: req.input.bucket.clone(),
+                object: rustfs_utils::path::encode_dir_object_ref(&req.input.key).into_owned(),
+                headers,
+                part_number,
+            }))
+        } else {
+            None
+        };
+        async move {
+            if let Some(condition) = condition {
+                with_get_object_read_condition(condition, read).await
+            } else {
+                read.await
+            }
+        }
+    }
     fn build_memory_bytes_blob(
         bytes: Bytes,
         response_content_length: i64,
@@ -2548,7 +2607,7 @@ impl DefaultObjectUsecase {
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let store_headers = project_ssec_transport_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
-        let conditional = crate::storage::has_read_preconditions(&req.headers);
+        let conditional = has_read_preconditions(&req.headers);
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
                 manager,
@@ -2560,28 +2619,16 @@ impl DefaultObjectUsecase {
                 key,
             )
             .await?;
-            let reader = if conditional {
-                let prepared = track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?;
-                Self::validate_get_object_before_body(req, bucket, key, part_number, prepared.object_info()).await?;
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    prepared.with_headers(store_headers).into_reader_with_cache_hook(),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
-            } else {
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                Self::with_get_object_conditions(
+                    req,
+                    part_number,
                     store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
-            };
+                ),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             let read_setup =
                 Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
             return Ok(GetObjectPreparedRead { io_planning, read_setup });
@@ -2601,23 +2648,18 @@ impl DefaultObjectUsecase {
             )
             .await?,
         );
-        let mut prepared = Some(
-            track_object_read_setup(
-                object_traffic_health.as_deref(),
-                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
-            )
-            .await
-            .map_err(map_get_object_reader_error)?,
-        );
+        let initial_metadata = track_object_read_setup(
+            object_traffic_health.as_deref(),
+            store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+        )
+        .await
+        .map_err(map_get_object_reader_error)?;
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
         if conditional {
-            let info = prepared
-                .as_ref()
-                .ok_or_else(|| s3_error!(InternalError, "prepared metadata snapshot is unavailable"))?
-                .object_info();
-            Self::validate_get_object_before_body(req, bucket, key, part_number, info).await?;
+            Self::validate_get_object_before_body(req, bucket, key, part_number, initial_metadata.object_info()).await?;
         }
+        let mut prepared = Some(initial_metadata);
         'snapshot: {
             let info = prepared
                 .as_ref()
@@ -2874,10 +2916,12 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader =
-                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
-                    .await
-                    .map_err(map_get_object_reader_error)?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -2897,30 +2941,20 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(map_get_object_reader_error)?;
-                if conditional {
-                    Self::validate_get_object_before_body(req, bucket, key, part_number, prepared.object_info()).await?;
-                }
-                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
-                    .await
-                    .map_err(map_get_object_reader_error)?
-            } else if conditional {
-                let prepared = track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?;
-                Self::validate_get_object_before_body(req, bucket, key, part_number, prepared.object_info()).await?;
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    prepared.with_headers(store_headers).into_reader_with_cache_hook(),
+                    Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                    Self::with_get_object_conditions(
+                        req,
+                        part_number,
+                        store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                    ),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
@@ -2965,6 +2999,7 @@ impl DefaultObjectUsecase {
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
 
+        Self::validate_get_object_before_body(req, bucket, key, part_number, &info).await?;
         let read_duration = read_start.elapsed();
 
         // Conditional metrics recording to reduce overhead
@@ -2973,9 +3008,6 @@ impl DefaultObjectUsecase {
             record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
             manager.record_disk_operation(info.size as u64, read_duration, true).await;
         }
-
-        check_preconditions(&req.headers, &info)?;
-        Self::validate_get_object_part_number(part_number, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in info.parts.iter() {
@@ -5735,6 +5767,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
+
+    #[tokio::test]
+    async fn conditional_reader_scope_keeps_large_futures_off_the_request_stack() {
+        let mut req = build_request(GetObjectInput::default(), Method::GET);
+        for conditional in [false, true] {
+            if conditional {
+                req.headers
+                    .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag\""));
+            }
+            let payload = [0u8; 64 * 1024];
+            let read = async move {
+                std::hint::black_box(payload);
+                std::future::ready(()).await;
+            };
+            let read = DefaultObjectUsecase::with_get_object_conditions(&req, None, read);
+            assert!(
+                std::mem::size_of_val(&read) < 2048,
+                "reader scope must not embed the concrete reader future"
+            );
+            read.await;
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn cold_fill_disk_admission_preserves_slow_down() {

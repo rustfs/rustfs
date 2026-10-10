@@ -918,6 +918,7 @@ pub use ops::heal_walk::HealWalkVersion;
 pub(in crate::set_disk) struct GetObjectFileInfo {
     owned: Option<OwnedGetObjectFileInfo>,
     shared: Option<Arc<GetObjectMetadataCacheEntry>>,
+    condition_stopped: bool,
 }
 
 struct OwnedGetObjectFileInfo {
@@ -939,6 +940,7 @@ impl GetObjectFileInfo {
                 late_metadata_fanout_disks: None,
             }),
             shared: None,
+            condition_stopped: false,
         }
     }
 
@@ -956,6 +958,7 @@ impl GetObjectFileInfo {
                 late_metadata_fanout_disks: Some(late_metadata_fanout_disks),
             }),
             shared: None,
+            condition_stopped: false,
         }
     }
 
@@ -963,6 +966,7 @@ impl GetObjectFileInfo {
         Self {
             owned: None,
             shared: Some(entry),
+            condition_stopped: false,
         }
     }
 
@@ -1141,6 +1145,165 @@ mod prepared_get_object_metadata_tests {
         })
         .await;
         assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    struct StopReadForEtag(String);
+    impl crate::object_api::GetObjectReadCondition for StopReadForEtag {
+        fn is_terminal(&self, metadata: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+            !metadata.delete_marker && metadata.etag == Some(self.0.as_str())
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn read_condition_stops_on_quorum_before_slow_disk_and_body_verification() {
+        use crate::object_api::with_get_object_read_condition;
+        for size in [4096, 1_300_000] {
+            let (dirs, set) = make_local_set_disks(4, 2).await;
+            let bucket = "read-condition-quorum";
+            let object = object_with_initial_data_shards(bucket, &format!("read-condition-{size}"));
+            let opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let mut put = PutObjReader::from_vec(vec![b'v'; size]);
+            let info = set.put_object(bucket, &object, &mut put, &opts).await.expect("write object");
+            for dir in &dirs {
+                let object_path = dir.path().join(bucket).join(&object);
+                if size == 4096 {
+                    let path = object_path.join("xl.meta");
+                    let mut bytes = tokio::fs::read(&path).await.expect("read inline metadata");
+                    *bytes.last_mut().expect("inline payload") ^= 1;
+                    tokio::fs::write(path, bytes).await.expect("damage inline data");
+                } else {
+                    tokio::fs::remove_dir_all(object_path.join(info.data_dir.expect("data directory").to_string()))
+                        .await
+                        .expect("remove shards");
+                }
+            }
+            let slow = bounded_initial_parity_disk_index(bucket, &object);
+            let barrier = rename_fanout_barrier::arm(&object, slow, rename_fanout_barrier::PHASE_READ_VERSION);
+            let calls = disk_call_counters::observe(&object);
+            let read_opts = ObjectOptions {
+                metadata_cache_safe: true,
+                ..opts
+            };
+            let followup_opts = read_opts.clone();
+            let condition = Arc::new(StopReadForEtag(info.etag.clone().expect("committed ETag")));
+            let set_for_read = Arc::clone(&set);
+            let object_for_read = object.clone();
+            let mut read = tokio::spawn(async move {
+                with_get_object_read_condition(
+                    condition,
+                    set_for_read.get_object_reader(bucket, &object_for_read, None, HeaderMap::new(), &read_opts),
+                )
+                .await
+            });
+            tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+                .await
+                .expect("slow metadata read is pending");
+            let mut reader = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut read)
+                .await
+                .expect("condition must not wait for the slow disk or decode damaged data")
+                .expect("reader task")
+                .expect("metadata-only result");
+            assert_eq!(reader.object_info.etag, info.etag);
+            let mut body = Vec::new();
+            assert!(
+                reader.stream.read_to_end(&mut body).await.is_err(),
+                "terminal metadata cannot be served as a successful body"
+            );
+            assert!(body.is_empty());
+            let first_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
+            drop(reader);
+            barrier.release();
+            let snapshot = set
+                .get_object_fileinfo_for_get_object_reader(bucket, &object, &followup_opts, true, true)
+                .await
+                .expect("fresh metadata after terminal scope");
+            assert!(!snapshot.condition_stopped);
+            assert!(
+                calls.total(disk_call_counters::KIND_READ_VERSION) > first_calls,
+                "an incomplete terminal snapshot must not satisfy the next metadata read from cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn read_condition_rechecks_selected_metadata_before_body_access() {
+        struct Changing(std::sync::atomic::AtomicUsize);
+        impl crate::object_api::GetObjectReadCondition for Changing {
+            fn is_terminal(&self, _: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+            }
+        }
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let bucket = "read-condition-consistency";
+        let object = object_with_initial_data_shards(bucket, "read-condition-consistency");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let mut put = PutObjReader::from_vec(vec![b'x'; 4096]);
+        set.put_object(bucket, &object, &mut put, &opts).await.expect("write object");
+        let result = crate::object_api::with_get_object_read_condition(
+            Arc::new(Changing(std::sync::atomic::AtomicUsize::new(0))),
+            set.get_object_reader(bucket, &object, None, HeaderMap::new(), &opts),
+        )
+        .await;
+        assert!(result.is_err(), "an unverified terminal snapshot must never become a 200 reader");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn read_condition_miss_preserves_inline_early_stop_and_exact_body() {
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let bucket = "read-condition-miss";
+        let object = object_with_initial_data_shards(bucket, "read-condition-miss");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let payload: Vec<u8> = (0..8192)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+            .collect();
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let mut put = PutObjReader::from_vec(payload.clone());
+        set.put_object(bucket, &object, &mut put, &opts)
+            .await
+            .expect("write inline object");
+        let slow = bounded_initial_parity_disk_index(bucket, &object);
+        let barrier = rename_fanout_barrier::arm(&object, slow, rename_fanout_barrier::PHASE_READ_VERSION);
+        let set_for_read = Arc::clone(&set);
+        let object_for_read = object.clone();
+        let mut read = tokio::spawn(async move {
+            crate::object_api::with_get_object_read_condition(
+                Arc::new(StopReadForEtag("other".to_owned())),
+                set_for_read.get_object_reader(bucket, &object_for_read, None, HeaderMap::new(), &opts),
+            )
+            .await
+        });
+        tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+            .await
+            .expect("slow metadata read is pending");
+        let mut reader = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut read)
+            .await
+            .expect("condition miss preserves the normal early stop")
+            .expect("reader task")
+            .expect("reader");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("normal body");
+        assert_eq!(bytes, payload);
+        barrier.release();
     }
 
     #[test]
