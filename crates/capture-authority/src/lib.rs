@@ -10,11 +10,13 @@ mod application;
 mod committed;
 mod created;
 mod node;
+mod raft_types;
 pub use created::{
     CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedResult, CreatedVersion, DecideCreated,
     MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
 };
 pub use node::{CaptureNode, CaptureNodeError};
+pub use raft_types::{CaptureMembership, MembershipError};
 #[cfg(test)]
 mod application_tests;
 mod truncate;
