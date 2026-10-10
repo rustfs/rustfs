@@ -174,9 +174,11 @@ catch_up_estimate.discovered_transition_items
 
 ### Periodic checkpoint persistence
 
-`metrics.scan_checkpoint` is the in-memory resume hint; it does not confirm a durable save. `metrics.scan_checkpoints_persisted` lists the latest confirmed periodic save for each `(pool_index, set_index)` handled by this process, with its bucket, `saved_unix_secs`, and optional checkpoint cursor. It retains one observation per set, is reset on process restart, and does not include the final bucket save. Query the peer executing the walk for remote-worker observations. `metrics.scan_checkpoint_save_failures` counts failed periodic saves, including failures to refresh CAS revisions after a write; failed attempts do not advance the confirmed saved frontier.
+`metrics.scan_checkpoint` is the in-memory resume hint; it does not confirm a durable save. `metrics.scan_checkpoints_persisted` lists the latest confirmed periodic save for each `(pool_index, set_index)` handled by this process, with its bucket, `saved_unix_secs`, and optional checkpoint cursor. It retains one observation per set, is reset on process restart, and does not include the final bucket save. Query the peer executing the walk for remote-worker observations. `metrics.scan_checkpoint_save_failures` counts failed periodic saves, including failures to refresh CAS revisions after a write; failed attempts do not advance the confirmed save observation.
 
-An ordinary failed save drops that snapshot and leaves the bounded checkpoint receiver active, so the next producer interval tries again. A CAS conflict or an unreadable revision after a successful write cancels the bucket attempt and reloads persisted state through the existing retry path. Leader, cycle, and publication fencing remain mandatory. A transient error can therefore lose progress since the last confirmed checkpoint, but cannot permanently disable periodic saves for a continuing bucket walk.
+An ordinary failed save drops that snapshot and leaves the bounded checkpoint receiver active, so the next producer interval tries again. A CAS conflict or an unreadable revision after a successful write cancels the bucket attempt and reloads persisted state through the existing retry path. Leader, cycle, and publication fencing remain mandatory. This preserves future periodic save attempts for a continuing bucket walk.
+
+A confirmed periodic save does not prove restart resumability. Adoption still validates bucket/set identity and, for non-empty caches, connected cache scope. Skipping completed subtrees additionally requires a validated coverage frontier; raw enumeration state alone does not prove completed subtree coverage.
 
 ## Usage State Reset
 
