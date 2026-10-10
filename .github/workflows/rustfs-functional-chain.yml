@@ -165,7 +165,7 @@ jobs:
           persist-credentials: false
 
       - name: Install ILM validation client
-        if: ${{ startsWith(inputs.validation_case, 'ilm.') }}
+        if: ${{ startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') }}
         run: |
           set -euo pipefail
           python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
