@@ -164,8 +164,8 @@ jobs:
           path: auto-testing
           persist-credentials: false
 
-      - name: Install ILM validation client
-        if: ${{ startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') }}
+      - name: Install validation Python client
+        if: ${{ startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.') }}
         run: |
           set -euo pipefail
           python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
