@@ -164,6 +164,15 @@ jobs:
           path: auto-testing
           persist-credentials: false
 
+      - name: Install ILM validation client
+        if: ${{ startsWith(inputs.validation_case, 'ilm.') }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
+          "${RUNNER_TEMP}/rustfs-validation-python/bin/python" -m pip install \
+            -r auto-testing/scripts/validation_ilm/requirements.txt
+          printf '%s\n' "${RUNNER_TEMP}/rustfs-validation-python/bin" >> "${GITHUB_PATH}"
+
       - name: Run selected canonical validation case
         env:
           VALIDATION_CASE: ${{ inputs.validation_case }}
