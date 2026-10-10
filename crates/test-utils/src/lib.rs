@@ -35,8 +35,9 @@ use std::sync::{Arc, Once};
 #[cfg(feature = "put-object-commit-barrier")]
 use ecstore_test_compat::fixture::ecstore_set_disk;
 use ecstore_test_compat::fixture::{
-    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, ObjectIO as _,
-    PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
+    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, MakeBucketOptions,
+    ObjectIO as _, PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
+    init_local_disks_with_instance_ctx,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -90,7 +91,7 @@ pub struct TestECStoreEnv {
     pub temp_root: PathBuf,
     /// The per-disk directories (`disk1`..`diskN`) under `temp_root`.
     pub disk_paths: Vec<PathBuf>,
-    /// The store, bootstrapped exactly like the historical test setups:
+    /// By default, the store is bootstrapped exactly like the historical test setups:
     /// `init_local_disks` + `ECStore::new` on `127.0.0.1:0` (random port keeps
     /// nextest's process-per-test parallelism safe).
     pub ecstore: Arc<ECStore>,
@@ -155,6 +156,7 @@ pub struct TestECStoreEnvBuilder {
     prefix: String,
     base_dir: Option<PathBuf>,
     init_bucket_metadata: bool,
+    instance_ctx: Option<Arc<InstanceContext>>,
 }
 
 impl Default for TestECStoreEnvBuilder {
@@ -164,6 +166,7 @@ impl Default for TestECStoreEnvBuilder {
             prefix: "rustfs_test_utils".to_string(),
             base_dir: None,
             init_bucket_metadata: true,
+            instance_ctx: None,
         }
     }
 }
@@ -193,6 +196,12 @@ impl TestECStoreEnvBuilder {
     /// (default `true`, as the heal bootstraps did).
     pub fn init_bucket_metadata(mut self, yes: bool) -> Self {
         self.init_bucket_metadata = yes;
+        self
+    }
+
+    /// Use a caller-owned context for local disks and store construction.
+    pub fn instance_ctx(mut self, instance_ctx: Arc<InstanceContext>) -> Self {
+        self.instance_ctx = Some(instance_ctx);
         self
     }
 
@@ -237,14 +246,22 @@ impl TestECStoreEnvBuilder {
         };
         let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
-        init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
-
         // Port 0 keeps ECStore-backed integration binaries parallel-safe under
         // nextest: no fixed peer port is ever shared between test processes.
         let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse test addr");
-        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
-            .await
-            .expect("build test ECStore");
+        let ecstore = if let Some(instance_ctx) = self.instance_ctx {
+            init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+                .await
+                .expect("init instance local disks");
+            ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), CancellationToken::new(), instance_ctx)
+                .await
+                .expect("build instance test ECStore")
+        } else {
+            init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
+            ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
+                .await
+                .expect("build test ECStore")
+        };
 
         // The production bootstrap only persists pool.bin from the elected
         // first cluster node.  Test stores intentionally have no cluster
@@ -276,5 +293,88 @@ impl TestECStoreEnvBuilder {
             ecstore,
             endpoint_pools,
         }
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::{InstanceContext, TestECStoreEnv};
+    use crate::ecstore_test_compat::fixture::{read_config, save_config};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn explicit_context_keeps_stores_isolated() {
+        let root_a = tempfile::tempdir().expect("create context A disk root");
+        let root_b = tempfile::tempdir().expect("create context B disk root");
+        let ctx_a = Arc::new(InstanceContext::new());
+        let ctx_b = Arc::new(InstanceContext::new());
+        let env_a = TestECStoreEnv::builder()
+            .base_dir(root_a.path())
+            .init_bucket_metadata(false)
+            .instance_ctx(ctx_a.clone())
+            .build()
+            .await;
+        let env_b = TestECStoreEnv::builder()
+            .base_dir(root_b.path())
+            .init_bucket_metadata(false)
+            .instance_ctx(ctx_b.clone())
+            .build()
+            .await;
+
+        assert!(env_a.ecstore.instance_endpoints().is_none());
+        assert!(env_b.ecstore.instance_endpoints().is_none());
+        ctx_a.set_endpoints(env_a.endpoint_pools.clone());
+        let endpoints_a = env_a
+            .ecstore
+            .instance_endpoints()
+            .expect("instance A sees its caller-owned context topology");
+        assert_eq!(
+            endpoints_a.0[0]
+                .endpoints
+                .into_ref()
+                .first()
+                .expect("context A first endpoint")
+                .to_string(),
+            env_a.disk_paths[0].to_string_lossy(),
+        );
+        assert!(
+            env_b.ecstore.instance_endpoints().is_none(),
+            "publishing context A must not publish context B"
+        );
+        ctx_b.set_endpoints(env_b.endpoint_pools.clone());
+        let endpoints_b = env_b
+            .ecstore
+            .instance_endpoints()
+            .expect("instance B sees its caller-owned context topology");
+        assert_eq!(
+            endpoints_b.0[0]
+                .endpoints
+                .into_ref()
+                .first()
+                .expect("context B first endpoint")
+                .to_string(),
+            env_b.disk_paths[0].to_string_lossy(),
+        );
+        assert_eq!(
+            env_a.ecstore.instance_endpoints().expect("context A remains published").0[0]
+                .endpoints
+                .into_ref()
+                .first()
+                .expect("context A retained endpoint")
+                .to_string(),
+            env_a.disk_paths[0].to_string_lossy(),
+        );
+
+        let path = "config/test-context-isolation.json";
+        let bytes_a = br#"{"context":"a"}"#.to_vec();
+        let bytes_b = br#"{"context":"b"}"#.to_vec();
+        save_config(env_a.ecstore.clone(), path, bytes_a.clone())
+            .await
+            .expect("write context A config");
+        save_config(env_b.ecstore.clone(), path, bytes_b.clone())
+            .await
+            .expect("write context B config");
+        assert_eq!(read_config(env_a.ecstore.clone(), path).await.expect("read context A config"), bytes_a);
+        assert_eq!(read_config(env_b.ecstore.clone(), path).await.expect("read context B config"), bytes_b);
     }
 }
