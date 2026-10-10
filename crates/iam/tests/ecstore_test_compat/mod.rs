@@ -22,7 +22,11 @@
 #[allow(unused_imports)]
 pub(crate) mod fixture {
     pub(crate) use rustfs_ecstore::api::bucket::migration::try_migrate_iam_config;
+    pub(crate) use rustfs_ecstore::api::config::com::save_config;
+    pub(crate) use rustfs_ecstore::api::global::set_object_store_resolver;
     pub(crate) use rustfs_ecstore::api::layout::SetupType;
+    pub(crate) use rustfs_ecstore::api::runtime::{InstanceContext, first_cluster_node_is_local, object_store_handle};
+    pub(crate) use rustfs_ecstore::api::storage::ECStore;
 
     // `update_erasure_type` is a write-side global facade entry. Its use is
     // restricted to reviewed storage_api boundaries; this test-only module is
