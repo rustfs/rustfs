@@ -18382,7 +18382,7 @@ mod tests {
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "lock-committed-intent-reject", &[4])).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
-        let bucket = format!("lock-committed-intent-reject-{}", uuid::Uuid::new_v4());
+        let bucket = format!("lock-committed-{}", uuid::Uuid::new_v4());
         let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
         intent.lock_enabled = true;
         crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
@@ -18488,7 +18488,7 @@ mod tests {
             "generation",
             "retired",
         ] {
-            let bucket = format!("lock-retry-{case}-{}", uuid::Uuid::new_v4());
+            let bucket = format!("retry-{}-{}", case.replace('_', "-"), uuid::Uuid::new_v4());
             let original = MakeBucketOptions {
                 lock_enabled: true,
                 ..Default::default()
