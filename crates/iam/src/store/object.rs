@@ -614,8 +614,9 @@ impl ObjectStore {
     /// Parameterized core of [`Store::load_user_identity`].
     async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
         let mut u: UserIdentity = self
-            .load_iam_config_with(get_user_identity_path(name, user_type), mode)
+            .load_iamconfig_bytes_with_metadata(get_user_identity_path(name, user_type), mode)
             .await
+            .and_then(|(data, _)| serde_json::from_slice(&data).map_err(Error::from))
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
                     debug!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing");

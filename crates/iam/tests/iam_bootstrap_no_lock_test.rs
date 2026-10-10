@@ -39,6 +39,7 @@ use ecstore_test_compat::fixture::{
 };
 use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
 use rustfs_iam::cache::Cache;
+use rustfs_iam::error::Error as IamError;
 use rustfs_iam::manager::{IamCache, IamState};
 use rustfs_iam::store::object::{IAM_CONFIG_USERS_PREFIX, ObjectStore};
 use rustfs_iam::store::{GroupInfo, Store, UserType};
@@ -292,6 +293,40 @@ impl IdentityStoreFixture {
         assert_eq!(cached_child.credentials.parent_user, IDENTITY_PARENT);
         assert!(cached_child.credentials.is_service_account());
     }
+
+    async fn overwrite_parent_bytes(&self, bytes: &[u8]) {
+        let path = format!("{}{IDENTITY_PARENT}/identity.json", IAM_CONFIG_USERS_PREFIX.as_str());
+        save_config(self.ecstore.clone(), &path, bytes.to_vec())
+            .await
+            .expect("overwrite real parent identity bytes");
+    }
+
+    async fn assert_child_storage_and_identity_cache(&self) {
+        let child = self
+            .manager
+            .api
+            .load_user_identity(IDENTITY_CHILD, UserType::Svc)
+            .await
+            .expect("notification must preserve persisted service child");
+        assert_eq!(child.credentials.access_key, IDENTITY_CHILD);
+        assert_eq!(child.credentials.parent_user, IDENTITY_PARENT);
+        assert!(child.credentials.is_service_account());
+        let parent = self
+            .manager
+            .get_user(IDENTITY_PARENT)
+            .await
+            .expect("failed notification preserves cached parent");
+        assert_eq!(parent.credentials.access_key, IDENTITY_PARENT);
+        assert_eq!(parent.credentials.parent_user, "");
+        let child = self
+            .manager
+            .get_user(IDENTITY_CHILD)
+            .await
+            .expect("failed notification preserves cached child");
+        assert_eq!(child.credentials.access_key, IDENTITY_CHILD);
+        assert_eq!(child.credentials.parent_user, IDENTITY_PARENT);
+        assert!(child.credentials.is_service_account());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -364,4 +399,117 @@ async fn identity_store_fixture_raw_valid_overwrite_is_observed() {
         .expect("read overwritten parent from cache");
     assert_eq!(cached.credentials.name.as_deref(), Some("updated-name"));
     fixture.assert_parent_and_child().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_corrupt_reads_preserve_crypto_error() {
+    let fixture = IdentityStoreFixture::new().await;
+    fixture.overwrite_parent_bytes(&[0xff, 0xfe, 0xfd]).await;
+    let locked = fixture
+        .manager
+        .api
+        .load_user_identity(IDENTITY_PARENT, UserType::Reg)
+        .await
+        .expect_err("corrupt stored identity must fail locked read");
+    assert!(matches!(locked, IamError::CryptoError(_)), "preserve crypto error, got {locked:?}");
+    let mut users = HashMap::new();
+    let no_lock = fixture
+        .manager
+        .api
+        .load_user_no_lock(IDENTITY_PARENT, UserType::Reg, &mut users)
+        .await
+        .expect_err("corrupt stored identity must fail no-lock read");
+    assert!(matches!(no_lock, IamError::CryptoError(_)), "preserve crypto error, got {no_lock:?}");
+    assert!(users.is_empty(), "failed no-lock read must not populate users");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_corrupt_notification_preserves_child_storage_and_cache() {
+    let fixture = IdentityStoreFixture::new().await;
+    fixture.assert_parent_and_child().await;
+    fixture.overwrite_parent_bytes(&[0xff, 0xfe, 0xfd]).await;
+    let notification = fixture
+        .manager
+        .user_notification_handler(IDENTITY_PARENT, UserType::Reg)
+        .await;
+    fixture.assert_child_storage_and_identity_cache().await;
+    let error = notification.expect_err("corrupt parent notification must return an error");
+    assert!(
+        matches!(error, IamError::CryptoError(_)),
+        "preserve notification crypto error, got {error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_invalid_schema_preserves_decode_error() {
+    let fixture = IdentityStoreFixture::new().await;
+    fixture.assert_parent_and_child().await;
+    fixture
+        .overwrite_parent_bytes(br#"{"version":"not-an-integer","credentials":{}}"#)
+        .await;
+    let error = fixture
+        .manager
+        .api
+        .load_user_identity(IDENTITY_PARENT, UserType::Reg)
+        .await
+        .expect_err("invalid identity field type must fail decode");
+    assert_identity_data_error(error);
+    let mut users = HashMap::new();
+    let error = fixture
+        .manager
+        .api
+        .load_user_no_lock(IDENTITY_PARENT, UserType::Reg, &mut users)
+        .await
+        .expect_err("invalid identity field type must fail no-lock decode");
+    assert_identity_data_error(error);
+    assert!(users.is_empty(), "failed decode must not populate users");
+    let notification = fixture
+        .manager
+        .user_notification_handler(IDENTITY_PARENT, UserType::Reg)
+        .await;
+    fixture.assert_child_storage_and_identity_cache().await;
+    assert_identity_data_error(notification.expect_err("invalid parent notification must return decode error"));
+}
+
+fn assert_identity_data_error(error: IamError) {
+    let IamError::Io(inner) = error else {
+        panic!("identity decode must preserve Io serde error, got {error:?}");
+    };
+    let cause = inner
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<serde_json::Error>())
+        .expect("identity decode error retains serde source");
+    assert!(cause.is_data(), "identity field type must produce serde Data error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn identity_physically_missing_is_no_such_user() {
+    let fixture = IdentityStoreFixture::new().await;
+    let name = "physically-missing-identity";
+    let error = fixture
+        .manager
+        .api
+        .load_user_identity(name, UserType::Reg)
+        .await
+        .expect_err("missing identity must be absent");
+    assert!(
+        matches!(error, IamError::NoSuchUser(ref missing) if missing == name),
+        "preserve absent name, got {error:?}"
+    );
+    let mut users = HashMap::new();
+    let error = fixture
+        .manager
+        .api
+        .load_user_no_lock(name, UserType::Reg, &mut users)
+        .await
+        .expect_err("missing no-lock identity must be absent");
+    assert!(
+        matches!(error, IamError::NoSuchUser(ref missing) if missing == name),
+        "preserve absent name, got {error:?}"
+    );
+    assert!(users.is_empty(), "missing read must not populate users");
 }
