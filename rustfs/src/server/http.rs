@@ -3301,6 +3301,8 @@ mod tests {
 
         impl std::error::Error for FixtureTransportError {}
 
+        type HttpConditionCase<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode, bool);
+
         impl<'a> From<Box<dyn std::error::Error + Send + Sync + 'a>> for FixtureTransportError {
             fn from(error: Box<dyn std::error::Error + Send + Sync + 'a>) -> Self {
                 Self(error.to_string())
@@ -3356,7 +3358,7 @@ mod tests {
 
         #[tokio::test]
         async fn conditional_get_head_http1_http2_parse_headers_and_apply_precedence() {
-            let cases: &[(&str, &[(&str, &str)], StatusCode, bool)] = &[
+            let cases: &[HttpConditionCase<'_>] = &[
                 ("strong list", &[("if-none-match", "\"other\", \"abc\"")], StatusCode::NOT_MODIFIED, true),
                 ("weak list", &[("if-none-match", "\"other\", W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
                 ("weak tag", &[("if-none-match", "W/\"abc\"")], StatusCode::NOT_MODIFIED, true),

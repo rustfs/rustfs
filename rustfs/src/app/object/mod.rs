@@ -240,7 +240,6 @@ use self::test_support::*;
 
 use std::collections::HashMap;
 use std::io;
-use std::ops::Add;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};

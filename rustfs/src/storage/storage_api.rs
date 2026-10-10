@@ -401,7 +401,7 @@ pub(crate) mod tonic_service_consumer {
 pub(crate) mod test_consumer {
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,
         parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
         process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
         validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,

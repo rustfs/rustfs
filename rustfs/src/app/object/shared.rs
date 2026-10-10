@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
         let err = build_put_like_object_lock_metadata(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,

@@ -37,7 +37,6 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
-use std::ops::Add;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -656,35 +655,6 @@ pub(crate) fn has_read_preconditions(headers: &HeaderMap) -> bool {
     [IF_MATCH, IF_UNMODIFIED_SINCE, IF_NONE_MATCH, IF_MODIFIED_SINCE]
         .into_iter()
         .any(|name| non_empty_header_value(headers, name).is_some())
-}
-
-/// Compares an object ETag with an ETag value from an HTTP header.
-///
-/// This helper implements HTTP ETag comparison semantics for headers such as
-/// `If-Match` and `If-None-Match`:
-/// - Supports the wildcard `*`, which matches any `object_etag`.
-/// - Supports comma-separated ETag lists (e.g., `"etag1", "etag2"`), returning
-///   `true` if any entry matches `object_etag`.
-/// - Automatically trims surrounding whitespace and double quotes from both the
-///   header entries and `object_etag` before comparison.
-///
-/// # Parameters
-/// - `object_etag`: The ETag associated with the stored object.
-/// - `header_etag`: The raw ETag header value received in the request, which may
-///   be a wildcard, a single ETag, or a comma-separated list of ETags.
-///
-/// # Returns
-/// `true` if the header value matches the object ETag according to the above
-/// HTTP ETag comparison rules, otherwise `false`.
-pub(crate) fn is_etag_equal(object_etag: &str, header_etag: &str) -> bool {
-    let header_etag = header_etag.trim();
-    if header_etag == "*" {
-        return true;
-    }
-    header_etag
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .any(|e| e == object_etag.trim_matches('"'))
 }
 
 /// Converts an object ETag string into an HTTP `HeaderValue` for use in response headers.

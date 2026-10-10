@@ -27,11 +27,11 @@ mod tests {
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
         apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, is_etag_equal,
-        matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
-        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
-        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
+        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
+        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
+        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
+        validate_list_object_unordered_with_delimiter,
     };
     use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
@@ -1191,30 +1191,29 @@ mod tests {
     }
 
     #[test]
-    fn test_is_etag_equal() {
-        // [1] Header ETag is "*", should return true (match any object ETag)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "*"));
-
-        // [2] Exact match (both with double quotes)
-        assert!(is_etag_equal(
-            "\"d41d8cd98f00b204e9800998ecf8427e\"",
-            "\"d41d8cd98f00b204e9800998ecf8427e\""
-        ));
-
-        // [3] Exact match (object ETag with quotes, header ETag without)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e"));
-
-        // [4] Header ETag has multiple values (comma-separated), one matches
-        assert!(is_etag_equal("\"12345\"", "\"67890\", \"12345\", \"abcde\""));
-
-        // [5] Header ETag has multiple values with spaces, one matches after trim
-        assert!(is_etag_equal("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  "));
-
-        // [6] No match (different ETag)
-        assert!(!is_etag_equal("\"12345\"", "\"67890\""));
-
-        // [7] No match in multiple values
-        assert!(!is_etag_equal("\"12345\"", "\"67890\", \"abcde\""));
+    fn test_read_etag_comparison() {
+        for (object_etag, condition, matches) in [
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "*", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "\"d41d8cd98f00b204e9800998ecf8427e\"", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e", true),
+            ("\"12345\"", "\"67890\", \"12345\", \"abcde\"", true),
+            ("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  ", true),
+            ("\"12345\"", "\"67890\"", false),
+            ("\"12345\"", "\"67890\", \"abcde\"", false),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(object_etag.to_owned()),
+                ..Default::default()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(condition).unwrap());
+            let result = check_preconditions(&headers, &info);
+            if matches {
+                assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 
     #[test]
