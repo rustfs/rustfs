@@ -49,6 +49,80 @@ pub(crate) fn fail_next_bucket_creation_after_intent(bucket: &str) {
         .insert(bucket.to_owned());
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) enum BucketCreationPausePoint {
+    AfterIntentPersistence,
+    BeforeRetryPublication,
+}
+
+#[cfg(test)]
+struct BucketCreationPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static BUCKET_CREATION_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, BucketCreationPausePoint), BucketCreationPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct BucketCreationPauseGuard {
+    bucket: String,
+    point: BucketCreationPausePoint,
+}
+
+#[cfg(test)]
+impl Drop for BucketCreationPauseGuard {
+    fn drop(&mut self) {
+        BUCKET_CREATION_PAUSES
+            .lock()
+            .expect("creation pause mutex")
+            .remove(&(self.bucket.clone(), self.point));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_bucket_creation(
+    bucket: &str,
+    point: BucketCreationPausePoint,
+) -> (
+    BucketCreationPauseGuard,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    BUCKET_CREATION_PAUSES.lock().expect("creation pause mutex").insert(
+        (bucket.to_owned(), point),
+        BucketCreationPause {
+            entered: entered_tx,
+            release: release_rx,
+        },
+    );
+    (
+        BucketCreationPauseGuard {
+            bucket: bucket.to_owned(),
+            point,
+        },
+        entered_rx,
+        release_tx,
+    )
+}
+
+#[cfg(test)]
+async fn pause_bucket_creation(bucket: &str, point: BucketCreationPausePoint) {
+    let pause = BUCKET_CREATION_PAUSES
+        .lock()
+        .expect("creation pause mutex")
+        .remove(&(bucket.to_owned(), point));
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.await;
+    }
+}
+
 fn orphaned_creation_requires_recovery(generation: Uuid) -> StorageError {
     StorageError::InvalidArgument(
         "CreateBucket".to_string(),
@@ -1225,6 +1299,8 @@ impl ECStore {
                     None
                 };
                 metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
+                #[cfg(test)]
+                pause_bucket_creation(bucket, BucketCreationPausePoint::AfterIntentPersistence).await;
                 if let Some(before) = before {
                     // Optional proof failure does not change an ordinary fresh create.
                     let _ = self
@@ -1275,6 +1351,8 @@ impl ECStore {
                 "bucket creation metadata transaction",
                 async {
                     let result = if continuing_creation {
+                        #[cfg(test)]
+                        pause_bucket_creation(bucket, BucketCreationPausePoint::BeforeRetryPublication).await;
                         self.continue_native_bucket_creation(bucket, opts, &meta, || {
                             !bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                                 && !metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())

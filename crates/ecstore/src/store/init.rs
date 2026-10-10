@@ -18377,6 +18377,156 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn lock_enabled_creation_retry_preserves_explicit_unix_epoch() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-retry-epoch", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-retry-epoch-{}", uuid::Uuid::new_v4());
+        let options = MakeBucketOptions {
+            lock_enabled: true,
+            created_at: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        store
+            .make_bucket(&bucket, &options)
+            .await
+            .expect_err("stop the real epoch producer before physical publication");
+        let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the persisted epoch intent");
+        assert!(persisted, "the epoch intent must be persisted");
+        assert_eq!(intent.created, OffsetDateTime::UNIX_EPOCH, "persist the exact supplied creation time");
+        let original_intent = intent.marshal_msg().expect("encode the complete epoch intent");
+
+        store
+            .make_bucket(&bucket, &options)
+            .await
+            .expect("retry the original epoch intent");
+        assert!(matches!(
+            crate::bucket::metadata_sys::get_object_lock_config_state_in(&ctx, &bucket)
+                .await
+                .expect("read the retried epoch lock state"),
+            crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
+        ));
+        let (mut committed, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the committed epoch metadata");
+        assert!(committed.bucket_creation_committed, "the epoch retry must commit");
+        assert_eq!(committed.created, OffsetDateTime::UNIX_EPOCH, "retry must preserve the supplied epoch");
+        committed.bucket_creation_committed = false;
+        assert_eq!(
+            committed.marshal_msg().expect("encode the retried epoch intent"),
+            original_intent,
+            "retry must preserve the original generation and complete epoch intent"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn creation_retry_rejects_publication_between_intent_persistence_and_proof() {
+        use crate::store::bucket::{BucketCreationPausePoint, pause_next_bucket_creation};
+
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-post-persist", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lock-post-persist-{}", uuid::Uuid::new_v4());
+        let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+        let disk = disks[0].clone().expect("native disk");
+        let (pause, entered, release) = pause_next_bucket_creation(&bucket, BucketCreationPausePoint::AfterIntentPersistence);
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        let producer_store = store.clone();
+        let producer_bucket = bucket.clone();
+        let producer = tokio::spawn(async move {
+            producer_store
+                .make_bucket(
+                    &producer_bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered)
+            .await
+            .expect("producer persistence pause timeout")
+            .expect("producer must finish real intent persistence");
+        let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the intent while its original fences remain held");
+        assert!(persisted, "the original intent must precede the competing publication");
+        let original_intent = intent
+            .marshal_msg()
+            .expect("encode the original competing-publication intent");
+        disk.make_volume(&bucket)
+            .await
+            .expect("finish the competing native publication");
+        disk.delete_volume(&bucket, true)
+            .await
+            .expect("remove the competing physical volume");
+        release.send(()).expect("resume the original producer");
+        let result = producer.await;
+        drop(pause);
+        let error = result
+            .expect("original producer task")
+            .expect_err("the existing fault must stop the original producer before its own fanout");
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure after bucket creation intent persistence")
+        );
+        let sys = crate::bucket::metadata_sys::require_bucket_metadata_sys_in(&ctx).expect("instance metadata sys");
+        let sys = sys.read().await.clone();
+        assert!(
+            sys.pending_bucket_creation(&bucket).await.is_none(),
+            "a completed publication attempt must prevent the original proof grant"
+        );
+        let (after_producer, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the original intent after the interrupted producer");
+        assert_eq!(
+            after_producer.marshal_msg().expect("encode the interrupted producer intent"),
+            original_intent,
+            "competing publication must not replace the original generation or intent"
+        );
+        for disk in &disks {
+            assert!(matches!(
+                disk.as_ref().expect("native disk").stat_volume(&bucket).await,
+                Err(crate::disk::error::DiskError::VolumeNotFound)
+            ));
+        }
+        let error = store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the old same-generation create must remain manual recovery");
+        assert!(error.to_string().contains("administrator recovery"));
+        let (after_retry, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the unchanged intent after retry rejection");
+        assert_eq!(
+            after_retry.marshal_msg().expect("encode the rejected retry intent"),
+            original_intent,
+            "the denied retry must preserve the complete original intent"
+        );
+        for disk in &disks {
+            assert!(matches!(
+                disk.as_ref().expect("native disk").stat_volume(&bucket).await,
+                Err(crate::disk::error::DiskError::VolumeNotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn committed_lock_intent_without_volumes_requires_recovery() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
@@ -18470,6 +18620,7 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn creation_retry_rejects_publication_removal_and_changed_intent() {
         use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use crate::store::bucket::{BucketCreationPausePoint, pause_next_bucket_creation};
 
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
@@ -18524,9 +18675,26 @@ mod tests {
                 "version_intent" => retry.versioning_enabled = true,
                 "reload" => crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await,
                 "same_instance_reload" => {
+                    let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("read the original intent before same-instance reload");
+                    assert!(persisted, "same-instance reload starts from a real persisted intent");
+                    let original_intent = intent.marshal_msg().expect("encode the intent before reload");
                     sys.reload_from_store(&bucket)
                         .await
                         .expect_err("an absent physical bucket cannot be peer-adopted");
+                    assert!(
+                        sys.pending_bucket_creation(&bucket).await.is_none(),
+                        "same-instance reload must revoke the old retry proof even when its bucket is absent"
+                    );
+                    let (after_reload, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                        .await
+                        .expect("read the persisted intent after same-instance reload rejection");
+                    assert_eq!(
+                        after_reload.marshal_msg().expect("encode the intent after reload"),
+                        original_intent,
+                        "reload rejection must preserve the original generation and complete intent"
+                    );
                 }
                 "setter_restore" => {
                     let (intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
@@ -18541,7 +18709,7 @@ mod tests {
                         .await
                         .expect("ordinary setter restores the original bytes and generation");
                 }
-                "cohort_order" => store.pools[0].disk_set[0].disks.write().await.rotate_left(1),
+                "cohort_order" => {}
                 "created_at" => {
                     let (intent, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
                         .await
@@ -18586,14 +18754,27 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let error = store
-                .make_bucket(&bucket, &retry)
-                .await
-                .expect_err("unproven continuation must remain manual");
-            assert!(error.to_string().contains("administrator recovery"), "{case}: {error}");
-            if case == "cohort_order" {
+            let result = if case == "cohort_order" {
+                let (pause, entered, release) =
+                    pause_next_bucket_creation(&bucket, BucketCreationPausePoint::BeforeRetryPublication);
+                let retry_store = store.clone();
+                let retry_bucket = bucket.clone();
+                let retry_task = tokio::spawn(async move { retry_store.make_bucket(&retry_bucket, &retry).await });
+                tokio::time::timeout(std::time::Duration::from_secs(30), entered)
+                    .await
+                    .expect("retry cohort pause timeout")
+                    .expect("retry must finish metadata reads under its real fences");
+                store.pools[0].disk_set[0].disks.write().await.rotate_left(1);
+                release.send(()).expect("resume retry with a reordered physical cohort");
+                let result = retry_task.await;
                 store.pools[0].disk_set[0].disks.write().await.rotate_right(1);
-            }
+                drop(pause);
+                result.expect("cohort retry task")
+            } else {
+                store.make_bucket(&bucket, &retry).await
+            };
+            let error = result.expect_err("unproven continuation must remain manual");
+            assert!(error.to_string().contains("administrator recovery"), "{case}: {error}");
         }
     }
 
