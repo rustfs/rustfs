@@ -1224,7 +1224,7 @@ impl ScannerIOCache for SetDisks {
                                     ScannerCheckpointPersistResult::RetryBucket(error) => {
                                         scan_ctx.cancel();
                                         await_scanner_disk_shutdown(scan.as_mut()).await;
-                                        break Err(error.into());
+                                        break Err(error);
                                     }
                                 }
                             }
