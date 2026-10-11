@@ -10,6 +10,7 @@ description = "Durable local storage for capture authority"
 [dependencies]
 openraft = { workspace = true }
 redb = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }

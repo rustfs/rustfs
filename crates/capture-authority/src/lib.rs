@@ -11,6 +11,7 @@ mod committed;
 mod created;
 mod node;
 mod raft_types;
+pub mod snapshot;
 pub use created::{
     CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedResult, CreatedVersion, DecideCreated,
     MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
