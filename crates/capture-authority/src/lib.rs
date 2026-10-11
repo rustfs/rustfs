@@ -2633,6 +2633,403 @@ mod tests {
         );
     }
 
+    fn u27b_rows(bytes: Vec<u8>, expected: &[Vec<(Vec<u8>, Vec<u8>)>], cut: LogId, member: LogId) {
+        let mut sink = U27aSink::default();
+        let header = snapshot::decode(io::Cursor::new(bytes), &mut sink, u24_limits()).expect("decode captured bytes");
+        assert_eq!(header.applied, Some(cut), "U27B_SAME_TX");
+        assert_eq!(header.membership, u17a_membership(member.index).1, "U27B_SAME_TX");
+        assert_eq!(header.cluster_id, identity().cluster_id, "U27B_SAME_TX");
+        assert_eq!(header.binding, u17a_binding(), "U27B_SAME_TX");
+        for (section, rows) in [
+            snapshot::Section::Heads,
+            snapshot::Section::Versions,
+            snapshot::Section::Events,
+            snapshot::Section::Operations,
+        ]
+        .into_iter()
+        .zip(&expected[3..7])
+        {
+            let actual: Vec<_> = sink
+                .0
+                .iter()
+                .filter(|row| row.0 == section)
+                .map(|row| (row.1.clone(), row.2.clone()))
+                .collect();
+            assert_eq!(&actual, rows, "U27B_SAME_TX");
+        }
+    }
+
+    #[test]
+    fn u27b_checkpoint_same_tx_cut() {
+        let (_dir, _backend, store, _) = u27a_fixture();
+        let before = u17b_snapshot(&store);
+        let writer = NativeLogWriter::new(store);
+        let owner = writer.store.clone();
+        let _hook = native_snapshot::after_capture(move || {
+            let mut store = owner.lock().expect("live corruption owner");
+            let tx = store.write_transaction().expect("live corruption transaction");
+            tx.open_table(META)
+                .expect("live metadata")
+                .remove("committed")
+                .expect("remove live marker");
+            store.commit(tx).expect("durable live corruption");
+            assert!(
+                matches!(store.read_committed(), Err(StoreError::CorruptRecord)),
+                "live transaction sees missing committed"
+            );
+        });
+        let old = NativeSnapshotView::acquire(writer.store.clone());
+        assert_eq!(old.is_ok(), true, "U27B_SAME_TX");
+        u27b_rows(
+            old.expect("asserted old view")
+                .stream(Vec::new(), u24_limits())
+                .expect("old stream"),
+            &before,
+            u17a_id(10),
+            u17a_id(1),
+        );
+        assert!(
+            matches!(
+                NativeSnapshotView::acquire(writer.store.clone()),
+                Err(NativeSnapshotError::Store(StoreError::CorruptRecord))
+            ),
+            "U27B_SAME_TX"
+        );
+        drop(_hook);
+
+        let (_dir2, _backend2, store, _) = u27a_fixture();
+        let before = u17b_snapshot(&store);
+        let writer = NativeLogWriter::new(store);
+        let old = NativeSnapshotView::acquire(writer.store.clone()).expect("normal old view");
+        let after = {
+            let mut store = writer.store.lock().expect("normal writer");
+            let mut command = u17a_command();
+            command.operation_id = [81; 16];
+            command.object.key = b"u27b-next-object".to_vec();
+            command.prepared.version_id = [82; 16];
+            u24_apply(&mut store, &[u17a_membership(11).0, u17a_created(12, command)]);
+            u17b_snapshot(&store)
+        };
+        for i in 3..7 {
+            assert_ne!(before[i], after[i], "U27B_SAME_TX new table changes");
+        }
+        u27b_rows(
+            old.stream(Vec::new(), u24_limits()).expect("normal old stream"),
+            &before,
+            u17a_id(10),
+            u17a_id(1),
+        );
+        u27b_rows(
+            NativeSnapshotView::acquire(writer.store.clone())
+                .expect("normal fresh view")
+                .stream(Vec::new(), u24_limits())
+                .expect("normal fresh stream"),
+            &after,
+            u17a_id(12),
+            u17a_id(11),
+        );
+    }
+
+    #[test]
+    fn u27b_checkpoint_bounds() {
+        for case in 0..4 {
+            let (_dir, _backend, mut store, _) = u27a_fixture();
+            let tx = store.write_transaction().expect("bounds fixture transaction");
+            {
+                let mut meta = tx.open_table(META).expect("bounds metadata");
+                match case {
+                    0 => {
+                        meta.insert("committed", encode_id(u17a_id(9)).as_slice())
+                            .expect("committed below applied");
+                    }
+                    1 => {
+                        let mut applied = vec![1];
+                        applied.extend(encode_id(LogId { term: 12, ..u17a_id(10) }));
+                        meta.insert("last_applied", applied.as_slice())
+                            .expect("applied term mismatch");
+                    }
+                    2 => {
+                        let mut applied = vec![1];
+                        applied.extend(encode_id(LogId {
+                            leader_node: 8,
+                            ..u17a_id(10)
+                        }));
+                        meta.insert("last_applied", applied.as_slice())
+                            .expect("applied leader mismatch");
+                    }
+                    _ => {
+                        meta.remove("committed").expect("missing committed fixture");
+                    }
+                }
+            }
+            store.commit(tx).expect("persist bounds fixture");
+            let expected_applied = match case {
+                1 => LogId { term: 12, ..u17a_id(10) },
+                2 => LogId {
+                    leader_node: 8,
+                    ..u17a_id(10)
+                },
+                _ => u17a_id(10),
+            };
+            assert_eq!(
+                store.native_application_state().expect("valid applied encoding").0,
+                Some(expected_applied),
+                "U27B_FULL_CUT decoded fixture"
+            );
+            let before = u17b_snapshot(&store);
+            let writer = NativeLogWriter::new(store);
+            let result = NativeSnapshotView::acquire(writer.store.clone());
+            assert_eq!(
+                matches!(result, Err(NativeSnapshotError::Store(StoreError::CorruptRecord))),
+                true,
+                "U27B_FULL_CUT case {case}"
+            );
+            assert_eq!(
+                u17b_snapshot(&writer.store.lock().expect("unchanged bounds owner")),
+                before,
+                "U27B_FULL_CUT zero writes"
+            );
+        }
+        let (_dir, _backend, store, _) = u27a_fixture();
+        let writer = NativeLogWriter::new(store);
+        assert!(NativeSnapshotView::acquire(writer.store.clone()).is_ok(), "U27B_FULL_CUT equal full ID");
+        u19_runtime()
+            .block_on(writer.write(|store| {
+                store.append_native(&[u17a_blank(11)])?;
+                store.save_committed(u17a_id(11))
+            }))
+            .expect("advance committed only");
+        assert!(
+            NativeSnapshotView::acquire(writer.store.clone()).is_ok(),
+            "U27B_FULL_CUT applied below committed"
+        );
+
+        for schema6 in [false, true] {
+            let (_dir, _backend, mut store) = u17a_store();
+            if schema6 {
+                provenance_promote(&mut store);
+            }
+            let schema = if schema6 { 6 } else { 4 };
+            let before = u17b_snapshot(&store);
+            let writer = NativeLogWriter::new(store);
+            let bytes = NativeSnapshotView::acquire(writer.store.clone())
+                .expect("legal empty native view")
+                .stream(Vec::new(), u24_limits())
+                .expect("empty bare stream");
+            let mut sink = U27aSink::default();
+            let header = snapshot::decode(io::Cursor::new(bytes), &mut sink, u24_limits()).expect("empty decode");
+            assert_eq!(header.applied, None, "U27B_FULL_CUT empty applied");
+            assert!(
+                header.membership.log_id().is_none()
+                    && header.membership.configs().is_empty()
+                    && header.membership.nodes().is_empty(),
+                "U27B_FULL_CUT empty membership"
+            );
+            assert!(sink.0.is_empty(), "U27B_FULL_CUT empty rows");
+            let capability = NativeSnapshotView::acquire(writer.store.clone())
+                .expect("empty capability view")
+                .stream_capability_artifact(Vec::new(), u24_limits());
+            if schema6 {
+                assert!(capability.is_ok(), "U27B_FULL_CUT explicit schema6");
+            } else {
+                assert!(
+                    matches!(capability, Err(NativeSnapshotError::Store(StoreError::UnsupportedSchema))),
+                    "U27B_FULL_CUT schema4 gate"
+                );
+            }
+            assert_eq!(
+                committed_schema(&writer.store.lock().expect("schema owner")),
+                schema,
+                "U27B_FULL_CUT no promotion"
+            );
+            assert_eq!(
+                u17b_snapshot(&writer.store.lock().expect("empty unchanged owner")),
+                before,
+                "U27B_FULL_CUT zero writes"
+            );
+            u19_runtime()
+                .block_on(writer.write(|store| {
+                    store.append_native(&[u17a_blank(0)])?;
+                    store.save_committed(u17a_id(0))
+                }))
+                .expect("empty applied with committed log");
+            assert!(
+                NativeSnapshotView::acquire(writer.store.clone()).is_ok(),
+                "U27B_FULL_CUT committed unapplied accepted"
+            );
+        }
+        let (_dir, _backend, mut store) = u17a_store();
+        let tx = store.write_transaction().expect("missing applied fixture");
+        tx.open_table(META)
+            .expect("empty metadata")
+            .remove("last_applied")
+            .expect("remove empty applied encoding");
+        store.commit(tx).expect("commit missing applied");
+        let writer = NativeLogWriter::new(store);
+        assert!(
+            matches!(
+                NativeSnapshotView::acquire(writer.store.clone()),
+                Err(NativeSnapshotError::Store(StoreError::CorruptRecord))
+            ),
+            "U27B_FULL_CUT missing empty encoding"
+        );
+    }
+
+    #[test]
+    fn u27b_checkpoint_retained_log_identity() {
+        for case in 0..5 {
+            let (_dir, _backend, mut store, _) = u27a_fixture();
+            let tx = store.write_transaction().expect("retained log fixture");
+            {
+                let mut logs = tx.open_table(LOGS).expect("retained log table");
+                match case {
+                    0 => {
+                        logs.remove(10).expect("missing committed log");
+                    }
+                    1 => {
+                        logs.insert(10, [0xff].as_slice()).expect("malformed committed log");
+                    }
+                    2 | 3 => {
+                        let raw = logs
+                            .get(10)
+                            .expect("original committed log")
+                            .expect("retained log")
+                            .value()
+                            .to_vec();
+                        let mut entry = decode_log(&raw).expect("valid original log");
+                        if case == 2 {
+                            entry.id.term += 1;
+                        } else {
+                            entry.id.leader_node += 1;
+                        }
+                        logs.insert(10, encode_log(&entry).expect("encoded mismatching log").as_slice())
+                            .expect("mismatching committed log");
+                    }
+                    _ => {}
+                }
+            }
+            store.commit(tx).expect("persist retained log fixture");
+            let before = u17b_snapshot(&store);
+            let writer = NativeLogWriter::new(store);
+            let result = NativeSnapshotView::acquire(writer.store.clone());
+            if case == 4 {
+                assert!(result.is_ok(), "U27B_COMMITTED_RECORD complete identity");
+            } else {
+                assert_eq!(
+                    matches!(result, Err(NativeSnapshotError::Store(StoreError::CorruptRecord))),
+                    true,
+                    "U27B_COMMITTED_RECORD case {case}"
+                );
+            }
+            assert_eq!(
+                u17b_snapshot(&writer.store.lock().expect("retained log owner")),
+                before,
+                "U27B_COMMITTED_RECORD zero writes"
+            );
+        }
+    }
+
+    #[test]
+    fn u27b_checkpoint_owner_and_read_lifetime() {
+        let (_dir, _backend, store, _) = u27a_fixture();
+        let before = u17b_snapshot(&store);
+        let writer = NativeLogWriter::new(store);
+        let view = NativeSnapshotView::acquire(writer.store.clone()).expect("owned captured view");
+        drop(writer);
+        u27b_rows(
+            view.stream(Vec::new(), u24_limits()).expect("view outlives external writer"),
+            &before,
+            u17a_id(10),
+            u17a_id(1),
+        );
+
+        struct PausedOutput {
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            bytes: Vec<u8>,
+        }
+        impl Write for PausedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).map_err(io::Error::other)?;
+                    self.release.recv_timeout(Duration::from_secs(10)).map_err(io::Error::other)?;
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_dir2, _backend2, store, _) = u27a_fixture();
+        let before = u17b_snapshot(&store);
+        let writer = NativeLogWriter::new(store);
+        let view = NativeSnapshotView::acquire(writer.store.clone()).expect("paused view");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let stream = std::thread::spawn(move || {
+            view.stream(
+                PausedOutput {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                    bytes: Vec::new(),
+                },
+                u24_limits(),
+            )
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let owner_available = writer.store.try_lock().is_ok();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_for_thread = writer.clone();
+        let write = std::thread::spawn(move || {
+            let result = u19_runtime().block_on(writer_for_thread.write(|store| {
+                u24_apply(store, &[u17a_blank(11)]);
+                Ok(())
+            }));
+            let _ = done_tx.send(result.is_ok());
+        });
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        let _ = release_tx.send(());
+        let streamed = stream.join().expect("paused stream joined");
+        write.join().expect("writer joined after release");
+        assert!(entered.is_ok(), "U27B_OWNER output rendezvous");
+        assert!(owner_available, "U27B_OWNER owner try_lock while output paused: {owner_available}");
+        assert!(
+            matches!(done, Ok(true)),
+            "U27B_OWNER writer ACK before release: done={done:?}, owner_available={owner_available}"
+        );
+        u27b_rows(streamed.expect("paused stream completed").bytes, &before, u17a_id(10), u17a_id(1));
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "u27b output failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = NativeSnapshotView::acquire(writer.store.clone())
+            .expect("failed output view")
+            .stream(Broken, u24_limits());
+        assert!(
+            matches!(result, Err(NativeSnapshotError::Snapshot(snapshot::SnapshotError::Io(ref error))) if error.kind() == io::ErrorKind::BrokenPipe),
+            "U27B_OWNER typed output failure"
+        );
+        u19_runtime()
+            .block_on(writer.write(|store| {
+                u24_apply(store, &[u17a_blank(12)]);
+                Ok(())
+            }))
+            .expect("write after failed output");
+        assert!(
+            NativeSnapshotView::acquire(writer.store.clone())
+                .expect("capture after failed output")
+                .stream(Vec::new(), u24_limits())
+                .is_ok(),
+            "U27B_OWNER capture after failed output"
+        );
+    }
+
     fn u24_limits() -> snapshot::Limits {
         snapshot::Limits {
             total_bytes: 1_000_000,
@@ -2766,7 +3163,7 @@ mod tests {
         let streamed = stream.join().expect("stream joined");
         write.join().expect("writer joined");
         assert!(entered.is_ok(), "output entered rendezvous");
-        assert!(matches!(done, Ok(true)), "U24_STREAM_RELEASES_WRITER");
+        assert!(matches!(done, Ok(true)), "U24_STREAM_RELEASES_WRITER done={done:?}");
         assert!(streamed.is_ok(), "stream completed");
     }
     #[test]

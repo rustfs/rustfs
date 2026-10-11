@@ -6,6 +6,30 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct CaptureHook;
+#[cfg(test)]
+impl Drop for CaptureHook {
+    fn drop(&mut self) {
+        AFTER_CAPTURE.with(|hook| {
+            hook.borrow_mut().take();
+        });
+    }
+}
+#[cfg(test)]
+pub(crate) fn after_capture(hook: impl FnOnce() + 'static) -> CaptureHook {
+    AFTER_CAPTURE.with(|slot| {
+        assert!(slot.borrow().is_none(), "one capture hook per test thread");
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    CaptureHook
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NativeSnapshotError {
     #[error(transparent)]
@@ -35,9 +59,21 @@ impl NativeSnapshotView {
             }
             store.database.begin_read().map_err(StoreError::from)?
         };
+        #[cfg(test)]
+        if let Some(hook) = AFTER_CAPTURE.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let (applied, membership) = application::native_application_state(&transaction)?;
         let (header, schema) = {
             let meta = transaction.open_table(crate::META).map_err(StoreError::from)?;
+            let logs = transaction.open_table(crate::LOGS).map_err(StoreError::from)?;
+            let committed = crate::committed::validate_committed(&meta, &logs)?;
+            if let Some(applied) = applied {
+                let committed = committed.ok_or(StoreError::CorruptRecord)?;
+                if applied.index > committed.index || (applied.index == committed.index && applied != committed) {
+                    return Err(StoreError::CorruptRecord.into());
+                }
+            }
             let identity = meta
                 .get("identity")
                 .map_err(StoreError::from)?
