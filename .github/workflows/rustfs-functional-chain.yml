@@ -284,6 +284,26 @@ jobs:
             > "${VALIDATION_ROOT}/native-authority-manifest.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
+      - name: Download pinned C10 shared-reference encoder
+        if: ${{ inputs.validation_case == 'heal.dangling-and-orphan-safety' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-shared-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-shared-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify C10 exact-source codec and original tests
+        if: ${{ inputs.validation_case == 'heal.dangling-and-orphan-safety' }}
+        run: |
+          set -euo pipefail
+          SHARED_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-shared-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${SHARED_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/shared_fixture.py \
+            --directory "${SHARED_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/shared-fixture-manifest.json"
+          printf 'VALIDATION_HEAL_SHARED_DIRECTORY=%s\n' "${SHARED_DIRECTORY}" >> "${GITHUB_ENV}"
+
       - name: Run selected canonical validation case
         if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' }}
         env:
