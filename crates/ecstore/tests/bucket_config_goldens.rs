@@ -502,3 +502,151 @@ mod bucket_config_goldens {
         rustfs = rustfs_values::public_access_block()
     );
 }
+
+mod bucket_config_goldens_carrier_compat {
+    use super::storage_api::replication_compat::{BucketTargets, ReplicationConfig};
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule,
+    };
+    use serde::{Deserialize, Serialize};
+
+    fn replication_rule() -> PersistedReplicationRule {
+        PersistedReplicationRule {
+            delete_marker_replication: None,
+            delete_replication: None,
+            destination: PersistedReplicationDestination {
+                bucket: "arn:aws:s3:::target-bucket".to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: None,
+            filter: None,
+            id: Some("rule".to_string()),
+            prefix: Some(String::new()),
+            priority: Some(1),
+            source_selection_criteria: None,
+            status: Status::ENABLED.to_string(),
+        }
+    }
+
+    #[test]
+    fn replication_cache_matches_the_legacy_reader_for_nested_tag_cache_shapes() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyReplicationConfig {
+            config: Option<s3s::dto::ReplicationConfiguration>,
+            remotes: Option<BucketTargets>,
+        }
+
+        fn encode(value: &impl Serialize, named: bool) -> Vec<u8> {
+            if named {
+                rmp_serde::to_vec_named(value).expect("encode the actual cache carrier as a named map")
+            } else {
+                rmp_serde::to_vec(value).expect("encode the actual cache carrier as an array")
+            }
+        }
+
+        let mut rule = replication_rule();
+        rule.prefix = None;
+        rule.filter = Some(PersistedReplicationFilter {
+            prefix: Some("cache-marker/".to_string()),
+            ..Default::default()
+        });
+        let expected = PersistedReplicationConfiguration {
+            role: "arn:aws:iam::123456789012:role/replication".to_string(),
+            rules: vec![rule],
+        };
+        let legacy = LegacyReplicationConfig {
+            config: Some(s3s::dto::ReplicationConfiguration {
+                role: expected.role.clone(),
+                rules: vec![s3s::dto::ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: None,
+                    destination: s3s::dto::Destination {
+                        bucket: "arn:aws:s3:::target-bucket".to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: Some(s3s::dto::ReplicationRuleFilter {
+                        prefix: Some("cache-marker/".to_string()),
+                        ..Default::default()
+                    }),
+                    id: Some("rule".to_string()),
+                    prefix: None,
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+            remotes: None,
+        };
+        let mut mismatches = Vec::new();
+        for named in [false, true] {
+            let bytes = encode(&legacy, named);
+            let marker = if named {
+                let mut marker = rmp_serde::to_vec("cached_tags").expect("encode the legacy cache field name");
+                marker.push(0x80);
+                marker
+            } else {
+                let mut marker = vec![0x80];
+                marker.extend(rmp_serde::to_vec("cache-marker/").expect("encode the unique filter prefix"));
+                marker
+            };
+            let position = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("the real legacy serializer must write the nested empty tag cache");
+            let cache_position = position + if named { marker.len() - 1 } else { 0 };
+            for (name, cache, valid) in [
+                ("empty-map", &[0x80][..], true),
+                ("string-map", &[0x81, 0xa1, b'k', 0xa1, b'v'][..], true),
+                ("nil", &[0xc0][..], false),
+                ("scalar", &[0x01][..], false),
+                ("array", &[0x90][..], false),
+                ("nonstring-key", &[0x81, 0x01, 0xa1, b'v'][..], false),
+                ("nonstring-value", &[0x81, 0xa1, b'k', 0x01][..], false),
+            ] {
+                let mut input = bytes.clone();
+                input.splice(cache_position..=cache_position, cache.iter().copied());
+                let old = rmp_serde::from_slice::<LegacyReplicationConfig>(&input);
+                let new = rmp_serde::from_slice::<ReplicationConfig>(&input);
+                assert_eq!(old.is_ok(), valid, "the real old reader's contract for {name}, named={named}");
+                if new.is_ok() != old.is_ok() {
+                    mismatches.push(format!("{name}, named={named}: old={:?}, new={}", old.as_ref().err(), new.is_ok()));
+                }
+                if let (Ok(old), Ok(new)) = (old, new) {
+                    assert_eq!(old.config, legacy.config, "the old reader must discard only cached tags");
+                    assert_eq!(
+                        new.config.as_ref(),
+                        Some(&expected),
+                        "the new reader must preserve every configuration field"
+                    );
+                    let reread = rmp_serde::from_slice::<LegacyReplicationConfig>(&encode(&new, named))
+                        .expect("the real old reader must read the newly serialized carrier");
+                    assert_eq!(reread.config, legacy.config, "the new writer must preserve the old configuration");
+                    assert!(reread.remotes.is_none(), "the absent remote configuration must remain absent");
+                }
+            }
+            let absent = LegacyReplicationConfig {
+                config: None,
+                remotes: None,
+            };
+            let input = encode(&absent, named);
+            let new = rmp_serde::from_slice::<ReplicationConfig>(&input).expect("read an absent optional configuration");
+            assert!(new.config.is_none());
+            assert_eq!(
+                encode(&new, named),
+                input,
+                "an absent configuration must keep its actual carrier encoding"
+            );
+        }
+        let missing =
+            rmp_serde::to_vec_named(&serde_json::json!({"remotes": null})).expect("encode the named map without config");
+        let old = rmp_serde::from_slice::<LegacyReplicationConfig>(&missing).expect("the old reader permits an omitted config");
+        assert!(old.config.is_none());
+        let new = rmp_serde::from_slice::<ReplicationConfig>(&missing);
+        if !matches!(&new, Ok(value) if value.config.is_none()) {
+            mismatches.push(format!("omitted config, named=true: old=None, new={new:?}"));
+        }
+        assert!(mismatches.is_empty(), "cache acceptance must match the real old reader: {mismatches:?}");
+    }
+}
