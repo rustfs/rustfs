@@ -1407,6 +1407,38 @@ struct NativePublicationHistory {
 struct NativeRootHistory {
     unknown: bool,
     started: HashSet<String>,
+    #[cfg(test)]
+    first_unknown: Option<NativeFirstUnknown>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct NativeFirstUnknown {
+    reason: &'static str,
+    aliases: [Option<PathBuf>; 2],
+    old_identity: Option<NativeRootIdentity>,
+    observed_identities: [Option<NativeRootIdentity>; 2],
+}
+
+#[cfg(test)]
+impl NativeRootHistory {
+    fn record_first_unknown(
+        &mut self,
+        was_unknown: bool,
+        reason: &'static str,
+        aliases: [Option<&Path>; 2],
+        old_identity: Option<NativeRootIdentity>,
+        observed_identities: [Option<NativeRootIdentity>; 2],
+    ) {
+        if !was_unknown && self.first_unknown.is_none() {
+            self.first_unknown = Some(NativeFirstUnknown {
+                reason,
+                aliases: aliases.map(|alias| alias.map(Path::to_path_buf)),
+                old_identity,
+                observed_identities,
+            });
+        }
+    }
 }
 
 static NATIVE_PUBLICATION_HISTORY: LazyLock<Mutex<NativePublicationHistory>> =
@@ -1417,6 +1449,8 @@ pub(crate) struct NativePublicationRegistration {
     identity: NativeRootIdentity,
     root: PathBuf,
     io_root: PathBuf,
+    #[cfg(test)]
+    diagnostic_previous_unknown: Option<bool>,
 }
 
 /// Opaque, process-local observation. Unsupported disks cannot construct it.
@@ -1457,16 +1491,44 @@ pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> O
         return None;
     }
     let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    #[cfg(test)]
+    let diagnostic_previous_unknown = history.roots.get(&identity).map(|root| root.unknown);
     history.roots.entry(identity).or_default();
     for alias in [root, io_root] {
         let alias: PathBuf = alias.components().collect();
+        #[cfg(test)]
+        let diagnostic_alias = alias.clone();
         let previous = history.aliases.entry(alias).or_default();
         let collisions: Vec<_> = previous.iter().copied().filter(|old| *old != identity).collect();
         previous.insert(identity);
         if !collisions.is_empty() {
+            #[cfg(test)]
+            let diagnostic_was_unknown = history.roots.get(&identity).is_some_and(|root| root.unknown);
             history.roots.get_mut(&identity)?.unknown = true;
+            #[cfg(test)]
+            if let Some(root) = history.roots.get_mut(&identity) {
+                root.record_first_unknown(
+                    diagnostic_was_unknown,
+                    "registration-alias-collision",
+                    [Some(&diagnostic_alias), None],
+                    collisions.first().copied(),
+                    [Some(identity), Some(identity)],
+                );
+            }
             for old in collisions {
+                #[cfg(test)]
+                let diagnostic_was_unknown = history.roots.get(&old).is_some_and(|root| root.unknown);
                 history.roots.get_mut(&old)?.unknown = true;
+                #[cfg(test)]
+                if let Some(root) = history.roots.get_mut(&old) {
+                    root.record_first_unknown(
+                        diagnostic_was_unknown,
+                        "registration-alias-collision",
+                        [Some(&diagnostic_alias), None],
+                        Some(old),
+                        [Some(identity), Some(identity)],
+                    );
+                }
             }
         }
     }
@@ -1474,6 +1536,8 @@ pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> O
         identity,
         root: root.to_path_buf(),
         io_root: io_root.to_path_buf(),
+        #[cfg(test)]
+        diagnostic_previous_unknown,
     })
 }
 
@@ -1509,19 +1573,59 @@ pub(crate) fn record_native_publication(path: &Path) {
         // with the stat, rather than using a stale captured identity list.
         let identities = history.aliases.get(&alias).cloned().unwrap_or_default();
         if physical.is_none() || identities.iter().any(|identity| Some(*identity) != physical) {
+            #[cfg(test)]
+            let diagnostic_old_identity = identities.iter().find(|identity| Some(**identity) != physical).copied();
             for identity in identities {
+                #[cfg(test)]
+                let diagnostic_was_unknown = history.roots.get(&identity).is_some_and(|root| root.unknown);
                 history.roots.entry(identity).or_default().unknown = true;
+                #[cfg(test)]
+                if let Some(root) = history.roots.get_mut(&identity) {
+                    root.record_first_unknown(
+                        diagnostic_was_unknown,
+                        "publication-alias-identity-mismatch",
+                        [Some(&alias), None],
+                        Some(identity),
+                        [physical, None],
+                    );
+                }
             }
             if let Some(identity) = physical {
+                #[cfg(test)]
+                let diagnostic_was_unknown = history.roots.get(&identity).is_some_and(|root| root.unknown);
                 history.roots.entry(identity).or_default().unknown = true;
+                #[cfg(test)]
+                if let Some(root) = history.roots.get_mut(&identity) {
+                    root.record_first_unknown(
+                        diagnostic_was_unknown,
+                        "publication-alias-identity-mismatch",
+                        [Some(&alias), None],
+                        diagnostic_old_identity,
+                        [physical, None],
+                    );
+                }
             }
         } else if let Some(identity) = physical {
             let root = history.roots.entry(identity).or_default();
+            #[cfg(test)]
+            let diagnostic_was_unknown = root.unknown;
+            #[cfg(test)]
+            let diagnostic_invalid_bucket = bucket.is_none();
             match bucket {
                 Some(bucket) => {
                     root.started.insert(bucket);
                 }
                 None => root.unknown = true,
+            }
+            #[cfg(test)]
+            if diagnostic_invalid_bucket {
+                root.record_first_unknown(
+                    diagnostic_was_unknown,
+                    "publication-invalid-relative-bucket",
+                    [Some(&alias), None],
+                    Some(identity),
+                    [physical, None],
+                );
             }
         }
     }
@@ -1530,7 +1634,17 @@ pub(crate) fn record_native_publication(path: &Path) {
 impl NativePublicationRegistration {
     pub(crate) fn invalidate(&self) {
         if let Some(root) = NATIVE_PUBLICATION_HISTORY.lock().roots.get_mut(&self.identity) {
+            #[cfg(test)]
+            let diagnostic_was_unknown = root.unknown;
             root.unknown = true;
+            #[cfg(test)]
+            root.record_first_unknown(
+                diagnostic_was_unknown,
+                "registration-invalidate",
+                [Some(&self.root), Some(&self.io_root)],
+                Some(self.identity),
+                [None, None],
+            );
         }
     }
 
@@ -1561,6 +1675,25 @@ impl NativePublicationRegistration {
 }
 
 impl NativeBucketCreationWitness {
+    #[cfg(test)]
+    fn log_first_unknown(&self, root: &NativeRootHistory) {
+        if !self.bucket.starts_with("real-guard-loss-") {
+            return;
+        }
+        let first_unknown = root
+            .first_unknown
+            .as_ref()
+            .map(|cause| (cause.reason, &cause.aliases, cause.old_identity, cause.observed_identities));
+        eprintln!(
+            "[creation-proof-diag] bucket={} stage=native-history-first-unknown key={:?} first_unknown={first_unknown:?} configured_root={:?} configured_io_root={:?} registration_previous_unknown={:?}",
+            self.bucket,
+            self.registration.identity,
+            self.registration.root,
+            self.registration.io_root,
+            self.registration.diagnostic_previous_unknown,
+        );
+    }
+
     pub(crate) fn matches(&self, other: &Self) -> bool {
         self.registration.identity == other.registration.identity
             && Arc::ptr_eq(&self.backend, &other.backend)
@@ -1584,9 +1717,40 @@ impl NativeBucketCreationWitness {
             return true;
         }
         let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+        #[cfg(test)]
+        let diagnostic_was_unknown = history
+            .roots
+            .get(&self.registration.identity)
+            .is_some_and(|root| root.unknown);
         history.roots.entry(self.registration.identity).or_default().unknown = true;
+        #[cfg(test)]
+        if let Some(state) = history.roots.get_mut(&self.registration.identity) {
+            state.record_first_unknown(
+                diagnostic_was_unknown,
+                "witness-physical-root-drift",
+                [Some(&self.registration.root), Some(&self.registration.io_root)],
+                Some(self.registration.identity),
+                [root, io_root],
+            );
+        }
         for identity in [root, io_root].into_iter().flatten() {
+            #[cfg(test)]
+            let diagnostic_was_unknown = history.roots.get(&identity).is_some_and(|root| root.unknown);
             history.roots.entry(identity).or_default().unknown = true;
+            #[cfg(test)]
+            if let Some(state) = history.roots.get_mut(&identity) {
+                state.record_first_unknown(
+                    diagnostic_was_unknown,
+                    "witness-physical-root-drift",
+                    [Some(&self.registration.root), Some(&self.registration.io_root)],
+                    Some(self.registration.identity),
+                    [root, io_root],
+                );
+            }
+        }
+        #[cfg(test)]
+        if let Some(state) = history.roots.get(&self.registration.identity) {
+            self.log_first_unknown(state);
         }
         false
     }
@@ -1600,6 +1764,8 @@ impl NativeBucketCreationWitness {
             return false;
         };
         let known = !root.unknown;
+        #[cfg(test)]
+        self.log_first_unknown(root);
         #[cfg(test)]
         if self.bucket.starts_with("real-guard-loss-") {
             eprintln!("[creation-proof-diag] bucket={} stage=native-history-known known={known}", self.bucket);
