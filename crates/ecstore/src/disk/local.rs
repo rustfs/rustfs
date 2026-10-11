@@ -7263,7 +7263,12 @@ impl LocalDisk {
                     if !entry.file_type()?.is_file() {
                         return Err(corrupt());
                     }
-                    if metadata_less_part_file(name) {
+                    let is_part = metadata_less_part_file(name)
+                        || name.strip_suffix(".meta").is_some_and(metadata_less_part_file)
+                        || name.split_once(".integrity.").is_some_and(|(part, generation)| {
+                            metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
+                        });
+                    if is_part {
                         parts.push(entry.path());
                     } else if name == committed || name == recovery_committed || name == reserved {
                         has_committed_marker |= name == committed || name == recovery_committed;

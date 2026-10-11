@@ -24248,4 +24248,111 @@ mod crash_delete_retry_tests {
             );
         }
     }
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn batch_delete_completed_multipart_reclaims_native_part_sidecars() {
+        assert_completed_multipart_delete_reclaims_sidecars(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn batch_delete_completed_multipart_reclaims_protected_part_sidecars() {
+        assert_completed_multipart_delete_reclaims_sidecars(true).await;
+    }
+
+    async fn assert_completed_multipart_delete_reclaims_sidecars(protected: bool) {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some(if protected { "true" } else { "false" })),
+                (
+                    rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    Some(if protected { "true" } else { "false" }),
+                ),
+            ],
+            assert_completed_multipart_delete_reclaims_sidecars_inner(protected),
+        )
+        .await;
+    }
+
+    async fn assert_completed_multipart_delete_reclaims_sidecars_inner(protected: bool) {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "multipart-delete-cleanup";
+        let object = "completed-object";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let upload = store
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create native multipart upload");
+        let mut reader = PutObjReader::from_vec(vec![37; 6 * 1024 * 1024]);
+        let part = store
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("write native part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete native multipart upload");
+        for dir in &dirs {
+            let bytes = tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("completed metadata");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode completed metadata");
+            let mut info = metadata.versions[0]
+                .into_fileinfo(bucket, object, true)
+                .expect("completed version");
+            info.hydrate_shard_integrity()
+                .expect("decode native completed integrity descriptor");
+            let path = dir
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(info.data_dir.expect("external multipart directory").to_string());
+            assert!(path.join("part.1.meta").exists(), "real multipart completion retains its native sidecar");
+            let integrity = info.parts[0].integrity.as_ref();
+            assert_eq!(integrity.is_some(), protected, "completion must retain the selected native format");
+            if let Some(integrity) = integrity {
+                assert!(
+                    path.join(integrity.file_name()).exists(),
+                    "real protected completion retains its integrity proof"
+                );
+            }
+        }
+        let (_, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "native batch delete must succeed: {errors:?}");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("successful multipart delete must permit ordinary bucket removal");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).exists(),
+                "bucket and completed part sidecars must be removed on every disk"
+            );
+        }
+    }
 }
