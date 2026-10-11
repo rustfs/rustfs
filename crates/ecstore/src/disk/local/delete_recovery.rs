@@ -39,8 +39,7 @@ pub(super) fn digest(bytes: &[u8]) -> DeleteRecoveryDigest {
     Sha256::digest(bytes).into()
 }
 
-fn generation(info: &FileInfo) -> Result<crate::disk::DeleteRecoveryVersionIdentity> {
-    let mut canonical = info.clone();
+fn generation(mut canonical: FileInfo) -> Result<crate::disk::DeleteRecoveryVersionIdentity> {
     canonical.data = None;
     canonical.erasure.index = 0;
     canonical.erasure.checksums.clear();
@@ -113,10 +112,10 @@ fn generation(info: &FileInfo) -> Result<crate::disk::DeleteRecoveryVersionIdent
         }
     }
     Ok(crate::disk::DeleteRecoveryVersionIdentity {
-        version_id: info.version_id,
-        mod_time: info.mod_time,
-        data_dir: info.data_dir,
-        deleted: info.deleted,
+        version_id: canonical.version_id,
+        mod_time: canonical.mod_time,
+        data_dir: canonical.data_dir,
+        deleted: canonical.deleted,
         metadata_digest: digest(&serde_json::to_vec(&ordered(serde_json::to_value(canonical)?))?),
     })
 }
@@ -470,26 +469,31 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
     {
         return Err(DiskError::FileCorrupt);
     }
-    if let Some(journal) = &journal {
-        if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+    if let Some(journal) = &journal
+        && (journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
             || journal.volume != volume
             || journal.object != object
             || journal.transaction != transaction
             || journal.transaction.is_nil()
-            || journal.data_dirs.iter().any(|id| id.is_nil() || *id == transaction)
-            || (!finished
-                && journal.target_digest != target.as_deref().map(digest)
-                && !(target.is_none()
-                    && !committed
-                    && before.is_none()
-                    && journal.original_digest.is_some()
-                    && current.as_deref().map(digest) == journal.original_digest))
-            || target
-                .as_deref()
-                .is_some_and(|bytes| journal.target_digest != Some(digest(bytes)))
-            || before
-                .as_deref()
-                .is_some_and(|bytes| journal.original_digest != Some(digest(bytes)))
+            || journal.data_dirs.iter().any(|id| id.is_nil() || *id == transaction))
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    let backup_digest = before.as_deref().map(digest);
+    let current_digest = current.as_deref().map(digest);
+    let prepared_digest = prepared.as_deref().map(digest);
+    let target_digest = target.as_deref().map(digest);
+    let receipt_digest = receipt_bytes.as_deref().map(digest);
+    if let Some(journal) = &journal {
+        if (!finished
+            && journal.target_digest != target_digest
+            && !(target.is_none()
+                && !committed
+                && before.is_none()
+                && journal.original_digest.is_some()
+                && current_digest == journal.original_digest))
+            || target_digest.is_some_and(|hash| journal.target_digest != Some(hash))
+            || backup_digest.is_some_and(|hash| journal.original_digest != Some(hash))
         {
             return Err(DiskError::FileCorrupt);
         }
@@ -500,10 +504,10 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
     let current_meta = current.as_deref().map(FileMeta::load).transpose()?;
     let before_meta = before.as_deref().map(FileMeta::load).transpose()?;
     let mut fingerprint = Sha256::new();
-    for bytes in [&prepared, &target, &before, &current, &receipt_bytes] {
-        fingerprint.update([u8::from(bytes.is_some())]);
-        if let Some(bytes) = bytes {
-            fingerprint.update(digest(bytes));
+    for hash in [prepared_digest, target_digest, backup_digest, current_digest, receipt_digest] {
+        fingerprint.update([u8::from(hash.is_some())]);
+        if let Some(hash) = hash {
+            fingerprint.update(hash);
         }
     }
     fingerprint.update([u8::from(committed), u8::from(finished)]);
@@ -603,12 +607,10 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
     }
     descriptions.sort();
     fingerprint.update(serde_json::to_vec(&descriptions)?);
-    let current_digest = current.as_deref().map(digest);
     let mut rollback_data_complete = false;
     let mut commit_data_safe = false;
     if let Some(journal) = &journal {
-        rollback_data_complete = (journal.original_digest == before.as_deref().map(digest)
-            || current_digest == journal.original_digest)
+        rollback_data_complete = (journal.original_digest == backup_digest || current_digest == journal.original_digest)
             && (current_digest == journal.original_digest || current_digest == journal.target_digest);
         if let Some(meta) = before_meta
             .as_ref()
@@ -689,7 +691,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
         state,
         journal,
         current_digest,
-        backup_digest: before.as_deref().map(digest),
+        backup_digest,
         rollback_data_complete,
         commit_data_safe,
         explicit_delete_safe,
@@ -698,7 +700,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
             .map(|meta| {
                 meta.versions
                     .iter()
-                    .map(|version| generation(&version.into_fileinfo(volume, object, true)?))
+                    .map(|version| generation(version.into_fileinfo(volume, object, true)?))
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?
@@ -1131,60 +1133,6 @@ impl LocalDisk {
         Ok(target)
     }
 
-    pub(super) async fn write_delete_recovery_journal(
-        &self,
-        volume: &str,
-        object: &str,
-        original: Option<&[u8]>,
-        target: Option<&[u8]>,
-        data_dirs: Vec<Uuid>,
-        context: DeletePreparationContext,
-    ) -> Result<()> {
-        let DeletePreparationContext {
-            transaction,
-            bucket_incarnation: incarnation,
-            namespace_owner: owner,
-        } = context;
-        let old = original.map(FileMeta::load).transpose()?;
-        let new = target.map(FileMeta::load).transpose()?;
-        let surviving: HashSet<_> = new
-            .as_ref()
-            .into_iter()
-            .flat_map(|meta| meta.versions.iter())
-            .map(|version| (version.header.version_id, std::mem::discriminant(&version.header.version_type)))
-            .collect();
-        let deleted_versions = old
-            .as_ref()
-            .map(|old| {
-                old.versions
-                    .iter()
-                    .filter(|old| !surviving.contains(&(old.header.version_id, std::mem::discriminant(&old.header.version_type))))
-                    .map(|version| version.header.version_id.unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let journal = DeleteRecoveryJournal {
-            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
-            volume: volume.to_owned(),
-            object: object.to_owned(),
-            transaction,
-            bucket_incarnation: incarnation,
-            original_digest: original.map(digest),
-            target_digest: target.map(digest),
-            data_dirs,
-            deleted_versions,
-            requests: Vec::new(),
-            original_versions: Vec::new(),
-            predecessors: self
-                .delete_recovery_predecessors(volume, object, transaction, incarnation, owner.clone())
-                .await?,
-        };
-        let _ = self
-            .activate_delete_preparation(&journal, original, target.map(<[u8]>::to_vec), owner)
-            .await?;
-        Ok(())
-    }
-
     pub(super) async fn prepare_delete_recovery(
         &self,
         volume: &str,
@@ -1207,7 +1155,7 @@ impl LocalDisk {
             .collect();
         let mut original_versions = Vec::new();
         for version in &plan.versions {
-            original_versions.push(generation(&version.into_fileinfo(volume, object, true)?)?);
+            original_versions.push(generation(version.into_fileinfo(volume, object, true)?)?);
         }
         let mut data_dirs = Vec::with_capacity(requests.len());
         for request in requests {
@@ -1405,30 +1353,8 @@ impl LocalDisk {
                 self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
                 return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
             }
-            if authority.requests.is_empty() {
+            if !authority.matches_adoption_source(&observed.current_versions) {
                 return Err(DiskError::OutdatedXLMeta);
-            }
-            for request in &authority.requests {
-                if request.deleted && request.mark_deleted {
-                    if observed.current_versions.first() != authority.original_versions.first() {
-                        return Err(DiskError::OutdatedXLMeta);
-                    }
-                } else {
-                    let original = authority
-                        .original_versions
-                        .iter()
-                        .find(|version| version.version_id.unwrap_or_default() == request.version_id.unwrap_or_default())
-                        .ok_or(DiskError::OutdatedXLMeta)?;
-                    let local = observed
-                        .current_versions
-                        .iter()
-                        .find(|version| version.version_id.unwrap_or_default() == request.version_id.unwrap_or_default());
-                    if local.is_some_and(|local| local != original)
-                        || (local.is_none() && request.version_id.is_none_or(|id| id.is_nil()))
-                    {
-                        return Err(DiskError::OutdatedXLMeta);
-                    }
-                }
             }
             let root = self.io_get_object_path(volume, object)?;
             let bytes = self.read_all(volume, &format!("{object}/{STORAGE_FORMAT_FILE}")).await?;
@@ -1472,12 +1398,12 @@ impl LocalDisk {
                 if observed.current_digest.is_some() {
                     return Err(DiskError::OutdatedXLMeta);
                 }
-                self.write_delete_recovery_journal(
+                self.prepare_delete_recovery(
                     volume,
                     object,
                     None,
+                    &[],
                     None,
-                    Vec::new(),
                     DeletePreparationContext {
                         transaction,
                         bucket_incarnation: None,
@@ -2222,12 +2148,15 @@ mod tests {
         let mut modern = legacy.clone();
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_INLINE_DATA, String::new());
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_COMPRESSION, "gzip".into());
-        assert_eq!(generation(&legacy).unwrap(), generation(&modern).unwrap());
+        assert_eq!(
+            generation(legacy.clone()).expect("legacy identity"),
+            generation(modern.clone()).expect("modern identity")
+        );
         modern.metadata.insert(
             format!("{}{}", compat::RUSTFS_INTERNAL_PREFIX, compat::SUFFIX_COMPRESSION),
             "different".into(),
         );
-        assert!(matches!(generation(&modern), Err(DiskError::FileCorrupt)));
+        assert!(matches!(generation(modern), Err(DiskError::FileCorrupt)));
         let mut unknown = legacy.clone();
         legacy
             .metadata
@@ -2235,7 +2164,10 @@ mod tests {
         unknown
             .metadata
             .insert("x-rustfs-internal-unknown-extension".into(), "same".into());
-        assert_ne!(generation(&legacy).unwrap(), generation(&unknown).unwrap());
+        assert_ne!(
+            generation(legacy).expect("legacy unknown field"),
+            generation(unknown).expect("modern unknown field")
+        );
     }
 
     #[tokio::test]
@@ -2847,7 +2779,7 @@ mod tests {
             .expect("physical cleanup");
         assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
         assert_eq!(
-            disk.finish_committed_delete_residue("recovery", "object", None).await,
+            disk.finish_internal_delete_residue("recovery", "object", None).await,
             0,
             "legacy retry must not GC new decision proof"
         );

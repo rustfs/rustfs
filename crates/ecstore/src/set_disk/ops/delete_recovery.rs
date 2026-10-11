@@ -22,7 +22,7 @@ use crate::disk::{
 };
 use crate::set_disk::SetDisks;
 use futures::future::join_all;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -85,9 +85,9 @@ pub(in crate::set_disk) fn unsupported_recovery(error: &DiskError) -> bool {
 /// per-version apply requests carried by returning-drive adoption.
 struct DecisionEvidence {
     transaction: Uuid,
-    deleted_versions: Vec<Uuid>,
-    original_versions: Vec<crate::disk::DeleteRecoveryVersionIdentity>,
-    predecessors: Vec<Uuid>,
+    deleted_versions: HashSet<Uuid>,
+    original_versions: HashSet<crate::disk::DeleteRecoveryVersionIdentity>,
+    predecessors: HashSet<Uuid>,
     target_absent: bool,
 }
 
@@ -193,18 +193,17 @@ async fn settle_group(
         let action = action(copy);
         async move {
             match action {
-                Some(action) => {
-                    settle(
-                        disk.as_ref().ok_or(DiskError::DiskNotFound)?,
-                        bucket,
-                        copy,
-                        action,
-                        can_commit,
-                        namespace_owner,
-                    )
-                    .await
-                }
-                None => Ok(copy.clone()),
+                Some(action) => settle(
+                    disk.as_ref().ok_or(DiskError::DiskNotFound)?,
+                    bucket,
+                    copy,
+                    action,
+                    can_commit,
+                    namespace_owner,
+                )
+                .await
+                .map(Some),
+                None => Ok(None),
             }
         }
     }))
@@ -212,7 +211,8 @@ async fn settle_group(
     let mut pending = false;
     for (copy, result) in copies.iter_mut().zip(results) {
         match result {
-            Ok(next) => *copy = next,
+            Ok(Some(next)) => *copy = next,
+            Ok(None) => {}
             Err(DiskError::DiskOngoingReq) => pending = true,
             Err(error) => return Err(error),
         }
@@ -503,9 +503,9 @@ impl SetDisks {
             .filter_map(|state| state.journal.as_ref())
             .map(|journal| DecisionEvidence {
                 transaction: journal.transaction,
-                deleted_versions: journal.deleted_versions.clone(),
-                original_versions: journal.original_versions.clone(),
-                predecessors: journal.predecessors.clone(),
+                deleted_versions: journal.deleted_versions.iter().copied().collect(),
+                original_versions: journal.original_versions.iter().cloned().collect(),
+                predecessors: journal.predecessors.iter().copied().collect(),
                 target_absent: journal.target_digest.is_none(),
             })
             .collect::<Vec<_>>();
@@ -612,22 +612,7 @@ impl SetDisks {
                                 .as_ref()
                                 .is_none_or(|local| !local.matches_prepared_authority(&reference))
                         } else if copy.state == DeleteRecoveryState::Absent {
-                            copy.current_digest.is_some()
-                                && !reference.requests.iter().all(|request| {
-                                    if request.deleted && request.mark_deleted {
-                                        copy.current_versions.first() == reference.original_versions.first()
-                                    } else {
-                                        let source = reference.original_versions.iter().find(|version| {
-                                            version.version_id.unwrap_or_default() == request.version_id.unwrap_or_default()
-                                        });
-                                        source.is_some()
-                                            && source
-                                                == copy.current_versions.iter().find(|version| {
-                                                    version.version_id.unwrap_or_default()
-                                                        == request.version_id.unwrap_or_default()
-                                                })
-                                    }
-                                })
+                            copy.current_digest.is_some() && !reference.matches_adoption_source(&copy.current_versions)
                         } else {
                             !copy.commit_data_safe
                         }
@@ -696,10 +681,10 @@ impl SetDisks {
                     .iter()
                     .filter_map(|state| state.journal.as_ref())
                     .flat_map(|journal| journal.original_versions.iter())
-                    .collect::<Vec<_>>();
+                    .collect::<HashSet<_>>();
                 if copies.iter().any(|state| {
                     state.state == DeleteRecoveryState::Absent
-                        && state.current_versions.iter().any(|version| !originals.contains(&version))
+                        && state.current_versions.iter().any(|version| !originals.contains(version))
                 }) {
                     summary.blocked += 1;
                     unresolved = true;
@@ -1183,6 +1168,148 @@ mod tests {
             .expect("admin object recovery");
         assert!(result.error.is_none(), "recovered object should heal cleanly: {:?}", result.error);
         assert_eq!(body(&store, bucket, None).await, payload);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_current_version_delete_preserves_legacy_on_missing_participant() {
+        use crate::storage_api_contracts::object::ObjectToDelete;
+        for batch in [false, true] {
+            let bucket = "recover-current-with-legacy";
+            let (dirs, store, disks) = fixture(bucket).await;
+            let original = vec![44; 1024 * 1024];
+            let old_version = put(&store, bucket, &original, true).await.expect("historical version");
+            let legacy = Uuid::new_v4();
+            disks[3]
+                .delete_version(
+                    bucket,
+                    "object",
+                    FileInfo {
+                        name: "object".into(),
+                        version_id: Some(old_version),
+                        ..Default::default()
+                    },
+                    false,
+                    DeleteOptions {
+                        old_data_dir: Some(legacy),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("historical disk-local mutation without a set decision");
+            let backup = dirs[3]
+                .path()
+                .join(bucket)
+                .join("object")
+                .join(legacy.to_string())
+                .join("xl.meta.bkp");
+            let before = tokio::fs::read(&backup).await.expect("historical backup");
+            let set = &store.pools[0].disk_set[0];
+            set.disks.write().await[3] = None;
+            let current = put(&store, bucket, &vec![45; 4096], true)
+                .await
+                .expect("current version at quorum");
+            set.disks.write().await[3] = Some(disks[3].clone());
+            if batch {
+                let (_, errors) = store
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: "object".into(),
+                            version_id: Some(current),
+                            ..Default::default()
+                        }],
+                        ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "current deletion at quorum: {errors:?}");
+            } else {
+                store
+                    .delete_object(
+                        bucket,
+                        "object",
+                        ObjectOptions {
+                            versioned: true,
+                            version_id: Some(current.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("current deletion at quorum");
+            }
+            assert_eq!(tokio::fs::read(&backup).await.expect("legacy backup retained"), before);
+            let state = disks[3]
+                .inspect_delete_transaction(bucket, "object", legacy)
+                .await
+                .expect("legacy inspection");
+            assert_eq!(state.state, DeleteRecoveryState::LegacyAmbiguous);
+            assert_eq!(body(&store, bucket, Some(old_version)).await, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_dry_run_matches_adoption_of_already_absent_non_null_version() {
+        let bucket = "recover-preview-non-null";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        let first = put(&store, bucket, &vec![46; 4096], true).await.expect("first version");
+        let remaining = vec![47; 4096];
+        let second = put(&store, bucket, &remaining, true).await.expect("remaining version");
+        disks[3]
+            .delete_version(
+                bucket,
+                "object",
+                FileInfo {
+                    name: "object".into(),
+                    version_id: Some(first),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions::default(),
+            )
+            .await
+            .expect("returning peer already lacks the explicit version");
+        let transaction = applied(&store, &disks, bucket, Some(first), 3).await;
+        publish(&disks[0], bucket, transaction).await;
+        let preview = store
+            .recover_delete_transactions(
+                bucket,
+                &HealOpts {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preview certified recovery");
+        assert!(
+            preview.detail.contains("committed=1") && preview.detail.contains("blocked=0"),
+            "{}",
+            preview.detail
+        );
+        let actual = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("recover certified removal");
+        assert!(
+            actual.detail.contains("committed=1") && actual.detail.contains("blocked=0"),
+            "{}",
+            actual.detail
+        );
+        assert_eq!(body(&store, bucket, Some(second)).await, remaining);
+        assert!(
+            store
+                .get_object_info(
+                    bucket,
+                    "object",
+                    &ObjectOptions {
+                        version_id: Some(first.to_string()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

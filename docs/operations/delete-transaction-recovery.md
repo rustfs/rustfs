@@ -24,6 +24,13 @@ records instead of immediately restoring the backup.
 | Newer generation or partially overlapping version history | Preserve records and report blocked recovery. |
 | Historical backup or disk-local marker without a structured set decision | Preserve records during automatic recovery. |
 
+Missing local metadata does not authorize user-bucket residue cleanup, even
+when the current object exists on a metadata quorum. Legacy local cleanup is
+restricted to internal system-bucket maintenance. User-bucket legacy residue
+uses only the guarded set-wide removal described below. Dry-run and execution
+share the same source-generation check; an already-absent explicit non-null
+version can converge without touching unrelated live versions.
+
 Rollback preserves native multipart metadata and integrity sidecars. Protected
 parts require their declared proof generation; recovery verifies both the proof
 records and actual shard payloads before restoring metadata or removing

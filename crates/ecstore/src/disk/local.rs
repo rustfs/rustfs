@@ -6576,7 +6576,7 @@ impl LocalDisk {
                 if err != DiskError::FileNotFound {
                     return Err(err);
                 }
-                self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                self.finish_internal_delete_residue(volume, path, namespace_owner.clone())
                     .await;
 
                 if fi.deleted && force_del_marker {
@@ -7831,7 +7831,7 @@ impl LocalDisk {
         {
             Ok(data) => data,
             Err(DiskError::FileNotFound) => {
-                self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                self.finish_internal_delete_residue(volume, path, namespace_owner.clone())
                     .await;
                 // `deleted` alone can be an explicit marker purge; only
                 // `mark_deleted` may create metadata that was not present.
@@ -9818,12 +9818,18 @@ impl LocalDisk {
     /// transaction receipts also prove quorum commitment for inline objects.
     /// Reserved markers, rollback backups without either proof, and object
     /// directories that hold `xl.meta` are left alone.
-    async fn finish_committed_delete_residue(
+    async fn finish_internal_delete_residue(
         &self,
         volume: &str,
         path: &str,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> usize {
+        // RUSTFS_COMPAT_TODO(backlog#2807): retain legacy cleanup for internal
+        // maintenance until old system-bucket records drain. User-bucket
+        // residue requires the explicit set-wide recovery decision.
+        if !crate::bucket::utils::is_meta_bucketname(volume) {
+            return 0;
+        }
         let transactions = match self.committed_delete_transactions(volume, path).await {
             Ok(transactions) => transactions,
             Err(err) => {
@@ -9833,7 +9839,7 @@ impl LocalDisk {
                     subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                     volume,
                     path,
-                    operation = "scan_committed_delete_residue",
+                    operation = "scan_internal_delete_residue",
                     error = ?err,
                     "Disk local delete failed"
                 );
@@ -9901,7 +9907,7 @@ impl LocalDisk {
                     volume,
                     path,
                     transaction = %transaction,
-                    operation = "finish_committed_delete_residue",
+                    operation = "finish_internal_delete_residue",
                     error = ?err,
                     "Disk local delete failed"
                 ),
@@ -18932,8 +18938,7 @@ mod test {
         }
     }
 
-    /// Leave the state a delete reaches once it committed on this disk but
-    /// before its cleanup pass: what a cancelled request used to strand.
+    /// A legacy disk-local mutation without a structured set decision.
     async fn write_committed_delete_residue(disk: &LocalDisk, bucket: &str, object: &str) -> CommittedDeleteResidue {
         let version_id = Uuid::new_v4();
         let data_dir = Uuid::new_v4();
@@ -18973,6 +18978,56 @@ mod test {
         residue
     }
 
+    #[tokio::test]
+    async fn delete_recovery_user_bucket_apply_preserves_ambiguous_legacy_residue() {
+        for batch in [false, true] {
+            for recoverable in [false, true] {
+                let dir = tempfile::tempdir().expect("residue fixture directory");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 endpoint")).expect("endpoint");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                let bucket = "user-legacy-residue";
+                let object = "object";
+                ensure_test_volume(&disk, bucket).await;
+                let residue = write_committed_delete_residue(&disk, bucket, object).await;
+                let original = fs::read(residue.backup()).await.expect("legacy metadata backup");
+                let request = FileInfo {
+                    name: object.to_owned(),
+                    version_id: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                let opts = DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    recoverable_delete: recoverable,
+                    delete_recovery_bucket_incarnation: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                if batch {
+                    let errors = disk
+                        .delete_versions(
+                            bucket,
+                            vec![FileInfoVersions {
+                                name: object.to_owned(),
+                                versions: vec![request],
+                                ..Default::default()
+                            }],
+                            opts,
+                        )
+                        .await;
+                    assert!(matches!(errors.as_slice(), [Some(DiskError::FileNotFound)]), "{errors:?}");
+                } else {
+                    assert!(matches!(
+                        disk.delete_version(bucket, object, request, false, opts).await,
+                        Err(DiskError::FileVersionNotFound)
+                    ));
+                }
+                assert_eq!(fs::read(residue.backup()).await.expect("preserved backup"), original);
+                assert_eq!(fs::read(residue.part()).await.expect("preserved shard"), b"stale");
+                assert!(residue.marker().is_file(), "a missing local apply cannot certify historical deletion");
+                assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
+            }
+        }
+    }
+
     fn residue_delete_request(object: &str) -> Vec<FileInfoVersions> {
         vec![FileInfoVersions {
             name: object.to_string(),
@@ -18984,14 +19039,14 @@ mod test {
         }]
     }
 
-    // #6898: repeating the delete of a key whose earlier delete committed but
-    // never cleaned up reclaims the residue and still reports the key missing.
+    // Internal maintenance retains its legacy cleanup behavior while user
+    // buckets require the separate set-wide authorization boundary.
     #[tokio::test]
     async fn delete_versions_finishes_committed_delete_residue() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "prefix/object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19011,7 +19066,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19031,14 +19086,13 @@ mod test {
         assert!(!residue.object_dir.exists(), "the committed residue must be reclaimed");
     }
 
-    // The rollback backup may already be gone; the committed marker alone
-    // proves the delete.
+    // Internal maintenance can finish its legacy marker after backup cleanup.
     #[tokio::test]
     async fn delete_versions_finishes_committed_marker_without_rollback_backup() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19054,15 +19108,14 @@ mod test {
         assert!(!residue.object_dir.exists(), "the committed marker alone must be enough");
     }
 
-    // Only a committed marker on this disk proves the delete. A reserved marker,
-    // a rollback backup alone, or live metadata beside the marker is left for
-    // the owning transaction, rollback, or heal.
+    // Internal maintenance preserves reserved markers, backup-only states and
+    // live metadata for the owning transaction, rollback or heal.
     #[tokio::test]
     async fn committed_delete_residue_finish_leaves_unproven_state_alone() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         ensure_test_volume(&disk, bucket).await;
 
         // A rollback backup without a committed marker, as an inline object leaves it.
@@ -19091,7 +19144,7 @@ mod test {
 
         for object in ["backup-only", "reserved", "live"] {
             assert_eq!(
-                disk.finish_committed_delete_residue(bucket, object, None).await,
+                disk.finish_internal_delete_residue(bucket, object, None).await,
                 0,
                 "{object} carries no committed proof"
             );
@@ -19118,7 +19171,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "logs";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19130,7 +19183,7 @@ mod test {
             .await
             .expect("nested metadata should be written");
 
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 0);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
         assert!(residue.backup().exists() && residue.marker().exists() && residue.part().exists());
         assert!(nested.exists());
     }
@@ -19146,7 +19199,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19164,7 +19217,7 @@ mod test {
             let _ = release_rx.recv();
         });
 
-        let mut finish = Box::pin(disk.finish_committed_delete_residue(bucket, object, None));
+        let mut finish = Box::pin(disk.finish_internal_delete_residue(bucket, object, None));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 entered = entered_rx => entered.expect("finish should reach the marked data dir"),
@@ -19180,7 +19233,7 @@ mod test {
 
         // The abandoned rename is still parked; the next attempt recognizes the
         // residue by its marker and finishes it.
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists(), "the retried finish must reclaim the residue");
 
         // Let the abandoned rename run into its missing source and wait until
@@ -19202,7 +19255,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let committed = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19221,7 +19274,7 @@ mod test {
             .await
             .expect("unproven backup should be written");
 
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!committed.object_dir.join(committed.data_dir.to_string()).exists());
         assert!(unproven_backup.exists(), "a backup without its own committed marker must remain");
         assert_eq!(recorder.counter_value(METRIC_DISK_DELETE_RESIDUE_FINISHED_TOTAL, &[]), 1);
@@ -19232,7 +19285,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "inline-quorum-recovery";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let object_dir = disk.io_get_object_path(bucket, object).expect("object path");
@@ -19243,11 +19296,11 @@ mod test {
             .await
             .expect("inline rollback backup");
         // Backup alone remains ambiguous. Only the set-quorum receipt permits cleanup.
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 0);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
         fs::write(rollback_path.join(DELETE_QUORUM_COMMITTED_FILE), b"")
             .await
             .expect("quorum receipt");
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!object_dir.exists(), "inline backup and receipt must be reclaimed");
     }
 
@@ -19399,7 +19452,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "quorum-receipt-sync";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19419,7 +19472,7 @@ mod test {
             .await;
         assert!(result.is_err(), "failed receipt durability must stop cleanup");
         assert!(residue.backup().exists() && residue.part().exists() && residue.marker().exists());
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists(), "retry must complete the already-decided deletion");
     }
 
@@ -19431,7 +19484,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "quorum-backup-unlink-sync";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19457,7 +19510,7 @@ mod test {
         assert!(result.is_err(), "backup unlink must become durable before removing commitment proof");
         assert!(receipt.is_file() && residue.part().is_file() && residue.marker().is_file());
         assert!(!residue.backup().exists());
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists());
     }
 
@@ -19468,7 +19521,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "quorum-payload-unlink-sync";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19492,7 +19545,7 @@ mod test {
         assert!(result.is_err(), "payload unlink sync failure must stop marker cleanup");
         assert!(receipt.is_file() && residue.marker().is_file());
         assert!(!residue.part().exists());
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists());
     }
 
@@ -19539,7 +19592,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "receipt-prefix-child";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let transaction = Uuid::new_v4();
@@ -19556,7 +19609,7 @@ mod test {
         fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), b"old backup")
             .await
             .expect("backup");
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 0);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
         let result = disk
             .delete(
                 bucket,
@@ -19705,7 +19758,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "quorum-snapshot-cleanup";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19738,7 +19791,7 @@ mod test {
             .expect("snapshot release finishes physical cleanup");
         assert!(!residue.part().exists());
         assert!(receipt.is_file(), "receipt remains until transaction cleanup observes physical removal");
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists());
     }
 
@@ -19785,7 +19838,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
-        let bucket = "quorum-snapshot-prefix";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -19831,7 +19884,7 @@ mod test {
         fs::remove_dir(child.parent().expect("child directory"))
             .await
             .expect("remove test child directory");
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists());
     }
 

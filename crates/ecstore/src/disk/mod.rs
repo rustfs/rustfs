@@ -1872,6 +1872,35 @@ pub struct DeleteRecoveryJournal {
 }
 
 impl DeleteRecoveryJournal {
+    /// Checks source generations only; the coordinator must supply a certified
+    /// decision and the receiver must retain its namespace/incarnation fences.
+    pub(crate) fn matches_adoption_source(&self, current: &[DeleteRecoveryVersionIdentity]) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        let mut originals = std::collections::HashMap::with_capacity(self.original_versions.len());
+        for version in &self.original_versions {
+            originals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        let mut locals = std::collections::HashMap::with_capacity(current.len());
+        for version in current {
+            locals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        self.requests.iter().all(|request| {
+            if request.deleted && request.mark_deleted {
+                return current.first() == self.original_versions.first();
+            }
+            let id = request.version_id.unwrap_or_default();
+            let Some(original) = originals.get(&id) else {
+                return false;
+            };
+            match locals.get(&id) {
+                Some(local) => local == original,
+                None => !id.is_nil(),
+            }
+        })
+    }
+
     /// Matches immutable local preparation intent against an independently
     /// inspected same-transaction commit receipt. This match is not authority
     /// by itself; the coordinator must supply the certified receipt.
@@ -1920,7 +1949,7 @@ impl DeleteRecoveryJournal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRecoveryVersionIdentity {
     pub version_id: Option<Uuid>,
@@ -2861,5 +2890,56 @@ mod delete_recovery_wire_limit_tests {
             transaction,
         };
         assert_eq!(inspect.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_adoption_tests {
+    use super::*;
+
+    #[test]
+    fn source_matching_preserves_non_null_absence_and_rejects_foreign_or_missing_null() {
+        let id = Uuid::new_v4();
+        let source = DeleteRecoveryVersionIdentity {
+            version_id: Some(id),
+            mod_time: None,
+            data_dir: None,
+            deleted: false,
+            metadata_digest: [1; 32],
+        };
+        let mut journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction: Uuid::new_v4(),
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: vec![id],
+            requests: vec![FileInfo {
+                version_id: Some(id),
+                ..Default::default()
+            }],
+            original_versions: vec![source.clone()],
+            predecessors: Vec::new(),
+        };
+        assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let mut foreign = source.clone();
+        foreign.metadata_digest = [2; 32];
+        assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
+        journal.original_versions.push(foreign.clone());
+        assert!(
+            journal.matches_adoption_source(&[source.clone(), foreign.clone()]),
+            "retain original first-match semantics"
+        );
+        assert!(!journal.matches_adoption_source(&[foreign, source]));
+        journal.requests[0].version_id = None;
+        journal.original_versions[0].version_id = None;
+        assert!(!journal.matches_adoption_source(&[]), "null absence does not establish its generation");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
+        journal.requests.clear();
+        assert!(!journal.matches_adoption_source(&journal.original_versions));
     }
 }
