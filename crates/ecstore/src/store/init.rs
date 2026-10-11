@@ -18500,6 +18500,15 @@ mod tests {
         let mut pause_guard = None;
         let mut pause_release = None;
         let mut clock_paused = false;
+        let rollback = point == BucketCreationPausePoint::BeforeRollbackMetadataCleanup;
+        #[cfg(unix)]
+        let mut publication_hooks = Vec::new();
+        #[cfg(unix)]
+        let mut fault_paths = Vec::new();
+        #[cfg(unix)]
+        let mut rollback_pause_guard = None;
+        #[cfg(unix)]
+        let mut rollback_pause_release = None;
         let outcome = std::panic::AssertUnwindSafe(async {
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
             let bucket = format!("real-guard-loss-{}", uuid::Uuid::new_v4());
@@ -18509,7 +18518,7 @@ mod tests {
             };
             let sys = crate::bucket::metadata_sys::require_bucket_metadata_sys_in(&ctx).expect("instance metadata sys");
             let sys = sys.read().await.clone();
-            if point == BucketCreationPausePoint::BeforeRetryPublication {
+            if point == BucketCreationPausePoint::BeforeRetryPublication || rollback {
                 crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
                 let error = store
                     .make_bucket(&bucket, &options)
@@ -18526,12 +18535,108 @@ mod tests {
                 );
             }
 
+            let original_before_rollback = if rollback {
+                let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+                    .await
+                    .expect("read the original producer intent before the failing retry");
+                assert!(persisted, "rollback must start from a real persisted intent");
+                Some(intent.marshal_msg().expect("encode the original producer intent"))
+            } else {
+                None
+            };
+            #[cfg(unix)]
+            let mut rollback_entered = None;
+            #[cfg(unix)]
+            let publication_observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+            #[cfg(unix)]
+            if rollback {
+                use crate::disk::os::prepared_publication_test_hooks;
+
+                let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+                assert_eq!(disks.len(), 4, "the rollback fixture must use four actual native disks");
+                for (index, disk) in disks.iter().enumerate() {
+                    let path = disk.as_ref().expect("actual native disk").path().join(&bucket);
+                    if index < 3 {
+                        fault_paths.push(path.clone());
+                    }
+                    let callback_path = path.clone();
+                    let observations = publication_observations.clone();
+                    publication_hooks.push(prepared_publication_test_hooks::install_at(
+                        prepared_publication_test_hooks::Stage::CreateDirectory,
+                        &path,
+                        move || {
+                            let installed = if index < 3 {
+                                std::os::unix::fs::symlink(&callback_path, &callback_path)
+                            } else {
+                                Ok(())
+                            };
+                            let observed = std::fs::metadata(&callback_path).map(|_| ());
+                            observations
+                                .lock()
+                                .expect("rollback publication observations mutex")
+                                .push((index, installed, observed));
+                        },
+                    ));
+                }
+                let (pause, entered, release) =
+                    pause_next_bucket_creation(&bucket, BucketCreationPausePoint::BeforeRollbackPhysicalDeletion);
+                rollback_pause_guard = Some(pause);
+                rollback_entered = Some(entered);
+                rollback_pause_release = Some(release);
+            }
+
             let (pause, entered, release) = pause_next_bucket_creation(&bucket, point);
             pause_guard = Some(pause);
             pause_release = Some(release);
             let producer_store = store.clone();
             let producer_bucket = bucket.clone();
             producer = Some(tokio::spawn(async move { producer_store.make_bucket(&producer_bucket, &options).await }));
+            #[cfg(unix)]
+            if let Some(entered) = rollback_entered {
+                tokio::time::timeout(std::time::Duration::from_secs(30), entered)
+                    .await
+                    .expect("actual failing retry rollback timeout")
+                    .expect("the public retry must reach physical rollback");
+                {
+                    let observations = publication_observations
+                        .lock()
+                        .expect("rollback publication observations mutex");
+                    assert_eq!(observations.len(), 4, "all actual native disks must reach retry publication");
+                    for (index, installed, observed) in observations.iter() {
+                        assert!(installed.is_ok(), "native disk {index}: cannot install the owned fault: {installed:?}");
+                        if *index < 3 {
+                            assert_eq!(
+                                observed
+                                    .as_ref()
+                                    .expect_err("the actual metadata syscall must see the loop")
+                                    .raw_os_error(),
+                                Some(libc::ELOOP)
+                            );
+                        } else {
+                            assert_eq!(
+                                observed
+                                    .as_ref()
+                                    .expect_err("the healthy native volume must start absent")
+                                    .kind(),
+                                std::io::ErrorKind::NotFound
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    sys.pending_bucket_creation(&bucket).await.is_none(),
+                    "real retry fanout must consume its permission"
+                );
+                publication_hooks.clear();
+                for path in &fault_paths {
+                    std::fs::remove_file(path).expect("remove only this fixture's native publication loop");
+                }
+                rollback_pause_release
+                    .take()
+                    .expect("owned physical rollback pause sender")
+                    .send(())
+                    .expect("healthy physical rollback must still be paused");
+            }
             tokio::time::timeout(std::time::Duration::from_secs(30), entered)
                 .await
                 .expect("real creation pause timeout")
@@ -18548,6 +18653,22 @@ mod tests {
                     && !intent.bucket_incarnation_id.is_nil()
             );
             let original_intent = intent.marshal_msg().expect("encode the complete original intent");
+            if let Some(original) = original_before_rollback {
+                assert_eq!(
+                    original_intent, original,
+                    "physical rollback must leave the original complete intent and generation"
+                );
+                let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+                for disk in &disks {
+                    assert!(
+                        matches!(
+                            disk.as_ref().expect("native disk").stat_volume(&bucket).await,
+                            Err(crate::disk::error::DiskError::VolumeNotFound)
+                        ),
+                        "physical rollback must finish before the actual metadata guard is lost"
+                    );
+                }
+            }
             let acquisitions = client.acquired.lock().expect("observed acquisitions mutex").clone();
             let roles = [
                 CreationGuardRole::Lifecycle,
@@ -18646,10 +18767,23 @@ mod tests {
                 .expect("lost producer timeout")
                 .expect("lost producer task")
                 .expect_err("public creation must reject real guard loss");
-            assert!(
-                error.to_string().contains("lock was lost"),
-                "the actual heartbeat must fence the public operation: {error}"
-            );
+            if rollback {
+                #[cfg(unix)]
+                assert!(
+                    matches!(
+                        &error,
+                        crate::error::StorageError::Io(source)
+                            if source.kind() == std::io::Error::from_raw_os_error(libc::ELOOP).kind()
+                                && source.to_string() == std::io::Error::from_raw_os_error(libc::ELOOP).to_string()
+                    ),
+                    "rollback guard loss must retain the actual original publication error: {error}"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("lock was lost"),
+                    "the actual heartbeat must fence the public operation: {error}"
+                );
+            }
             let (after_loss, _) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
                 .await
                 .expect("read the original intent after real guard loss");
@@ -18715,6 +18849,11 @@ mod tests {
         }
         drop(pause_release);
         drop(pause_guard);
+        #[cfg(unix)]
+        {
+            drop(rollback_pause_release);
+            drop(rollback_pause_guard);
+        }
         let producer_stopped = if let Some(task) = producer {
             tokio::time::timeout(std::time::Duration::from_secs(30), task).await.is_ok()
         } else {
@@ -18722,6 +18861,15 @@ mod tests {
         };
         shutdown.cancel();
         let mutations_stopped = ctx.wait_for_detached_mutations(std::time::Duration::from_secs(30)).await;
+        #[cfg(unix)]
+        {
+            drop(publication_hooks);
+            for path in &fault_paths {
+                if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                    std::fs::remove_file(path).expect("clean the owned publication fault after the producer stops");
+                }
+            }
+        }
         let released = client.release_observed_leases().await;
         let remaining = client.list_lock_leases().await;
         ctx.update_erasure_type(crate::layout::endpoints::SetupType::Unknown).await;
@@ -18760,6 +18908,25 @@ mod tests {
     creation_guard_loss_test!(real_creation_guard_loss_lifecycle_before_retry_consume, Lifecycle, BeforeRetryPublication);
     creation_guard_loss_test!(real_creation_guard_loss_metadata_before_retry_consume, Metadata, BeforeRetryPublication);
     creation_guard_loss_test!(real_creation_guard_loss_namespace_before_retry_consume, Namespace, BeforeRetryPublication);
+
+    #[cfg(unix)]
+    creation_guard_loss_test!(
+        real_creation_guard_loss_lifecycle_during_rollback_metadata_cleanup,
+        Lifecycle,
+        BeforeRollbackMetadataCleanup
+    );
+    #[cfg(unix)]
+    creation_guard_loss_test!(
+        real_creation_guard_loss_metadata_during_rollback_metadata_cleanup,
+        Metadata,
+        BeforeRollbackMetadataCleanup
+    );
+    #[cfg(unix)]
+    creation_guard_loss_test!(
+        real_creation_guard_loss_namespace_during_rollback_metadata_cleanup,
+        Namespace,
+        BeforeRollbackMetadataCleanup
+    );
 
     #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19725,17 +19892,42 @@ mod tests {
         let bucket = format!("lock-intent-timestamp-{}", uuid::Uuid::new_v4());
         let original_created = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("original timestamp");
         let changed_created = time::OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("changed timestamp");
-        let mut intent = crate::bucket::metadata::BucketMetadata::new_with_default_durability(&bucket);
-        intent.set_created(Some(original_created));
-        intent.lock_enabled = true;
-        intent.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)
-            .expect("serialize production Object Lock intent");
-        intent.versioning_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_VERSIONING_CONFIG)
-            .expect("serialize production versioning intent");
-        let path = intent.save_file_path();
-        crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
+        let original_options = MakeBucketOptions {
+            lock_enabled: true,
+            created_at: Some(original_created),
+            ..Default::default()
+        };
+        crate::store::bucket::fail_next_bucket_creation_after_intent(&bucket);
+        store
+            .make_bucket(&bucket, &original_options)
             .await
-            .expect("persist complete pre-visibility intent");
+            .expect_err("stop the real timestamp producer before physical publication");
+        let (intent, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read the real pre-visibility timestamp intent");
+        assert!(
+            persisted
+                && intent.needs_bucket_creation_commit()
+                && intent.bucket_incarnation_sidecar
+                && !intent.bucket_incarnation_id.is_nil(),
+            "the real producer must persist a complete pending intent and generation"
+        );
+        assert_eq!(intent.created, original_created, "persist the exact original creation time");
+        let incarnation = intent.bucket_incarnation_id;
+        let original_intent = intent.marshal_msg().expect("encode the original timestamp intent");
+        let sys = crate::bucket::metadata_sys::require_bucket_metadata_sys_in(&ctx).expect("instance metadata sys");
+        let sys = sys.read().await.clone();
+        let proof = sys
+            .pending_bucket_creation(&bucket)
+            .await
+            .expect("the real fenced producer must issue pending retry authority");
+        assert_eq!(proof.generation, incarnation, "pending authority must bind the original generation");
+        assert_eq!(proof.intent, original_intent, "pending authority must bind the complete original intent");
+        assert_eq!(
+            proof.versioning_requested, original_options.versioning_enabled,
+            "pending authority must match the unchanged retry options"
+        );
+        let path = intent.save_file_path();
         let before = crate::config::com::read_config(store.clone(), &path)
             .await
             .expect("read original persisted intent");

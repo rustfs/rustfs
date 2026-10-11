@@ -54,6 +54,8 @@ pub(crate) fn fail_next_bucket_creation_after_intent(bucket: &str) {
 pub(crate) enum BucketCreationPausePoint {
     AfterIntentPersistence,
     BeforeRetryPublication,
+    BeforeRollbackPhysicalDeletion,
+    BeforeRollbackMetadataCleanup,
 }
 
 #[cfg(test)]
@@ -1087,34 +1089,58 @@ impl ECStore {
         &self,
         bucket: &str,
         lifecycle_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+        metadata_guard: Option<&rustfs_lock::NamespaceLockGuard>,
         namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
     ) {
-        let rollback_opts = DeleteBucketOptions {
-            no_lock: true,
-            no_recreate: true,
-            ..Default::default()
-        };
-        if let Err(err) =
-            await_bucket_lifecycle_operation(lifecycle_guard, namespace_guard, bucket, "failed bucket creation rollback", async {
-                self.delete_bucket_on_sets(bucket, &rollback_opts)
-                    .await
-                    .map_err(|rollback_err| to_object_err(rollback_err, vec![bucket]))
-            })
-            .await
+        let rollback_result = await_bucket_lifecycle_operation(
+            lifecycle_guard,
+            namespace_guard,
+            bucket,
+            "failed bucket creation rollback",
+            await_bucket_namespace_operation(
+                metadata_guard,
+                bucket,
+                "failed bucket creation rollback metadata transaction",
+                async {
+                    #[cfg(test)]
+                    pause_bucket_creation(bucket, BucketCreationPausePoint::BeforeRollbackPhysicalDeletion).await;
+                    let rollback_opts = DeleteBucketOptions {
+                        no_lock: true,
+                        no_recreate: true,
+                        ..Default::default()
+                    };
+                    if let Err(err) = self
+                        .delete_bucket_on_sets(bucket, &rollback_opts)
+                        .await
+                        .map_err(|rollback_err| to_object_err(rollback_err, vec![bucket]))
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            error = ?err,
+                            "failed bucket creation rollback did not remove every physical bucket volume"
+                        );
+                        return Ok(());
+                    }
+                    #[cfg(test)]
+                    pause_bucket_creation(bucket, BucketCreationPausePoint::BeforeRollbackMetadataCleanup).await;
+                    if let Err(err) = self.cleanup_deleted_bucket_metadata(bucket, false, namespace_guard).await {
+                        warn!(
+                            bucket = %bucket,
+                            error = ?err,
+                            "failed bucket creation rollback left internal bucket metadata"
+                        );
+                    }
+                    Ok(())
+                },
+            ),
+        )
+        .await;
+        // Revocation must outlive the rollback future cancelled by a lost fence.
+        if rollback_result.is_err()
+            && let Ok(sys) = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)
         {
-            warn!(
-                bucket = %bucket,
-                error = ?err,
-                "failed bucket creation rollback did not remove every physical bucket volume"
-            );
-            return;
-        }
-        if let Err(err) = self.cleanup_deleted_bucket_metadata(bucket, false, namespace_guard).await {
-            warn!(
-                bucket = %bucket,
-                error = ?err,
-                "failed bucket creation rollback left internal bucket metadata"
-            );
+            let sys = sys.read().await.clone();
+            sys.revoke_pending_bucket_creation(bucket).await;
         }
     }
 
@@ -1433,8 +1459,13 @@ impl ECStore {
             }
             if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost()) {
                 error!("make bucket failed: {err}");
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
-                    .await;
+                self.rollback_failed_bucket_creation(
+                    bucket,
+                    bucket_lifecycle_guard.as_ref(),
+                    metadata_transaction_guard.as_ref(),
+                    ns_guard.as_ref(),
+                )
+                .await;
             }
             return Err(err);
         };
@@ -1457,8 +1488,13 @@ impl ECStore {
             || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
         if let Err(err) = metadata_result {
             if !metadata_lock_lost {
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
-                    .await;
+                self.rollback_failed_bucket_creation(
+                    bucket,
+                    bucket_lifecycle_guard.as_ref(),
+                    metadata_transaction_guard.as_ref(),
+                    ns_guard.as_ref(),
+                )
+                .await;
             }
             return Err(err);
         }
@@ -5277,7 +5313,7 @@ mod tests {
             .await
             .expect("partial create should have an incarnation sidecar");
 
-        ecstore.rollback_failed_bucket_creation(&bucket, None, None).await;
+        ecstore.rollback_failed_bucket_creation(&bucket, None, None, None).await;
 
         assert!(
             ecstore
