@@ -28,7 +28,7 @@ on:
         type: string
         required: true
       validation_case:
-        description: Canonical auto-testing validation case ID; empty runs the functional chain
+        description: Canonical case ID, environment.inspect for read-only resources, or empty for functional chain
         type: string
         required: false
         default: ''
@@ -305,7 +305,7 @@ jobs:
           printf 'VALIDATION_HEAL_SHARED_DIRECTORY=%s\n' "${SHARED_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Run selected canonical validation case
-        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' }}
+        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' && inputs.validation_case != 'environment.inspect' }}
         env:
           VALIDATION_CASE: ${{ inputs.validation_case }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
@@ -315,6 +315,17 @@ jobs:
           ./auto-testing/scripts/run_validation_case.sh \
             "${VALIDATION_CASE}" "${VALIDATION_ROOT}/candidate.json" \
             "${AUTO_TESTING_SHA}" "${VALIDATION_ROOT}/run"
+
+      - name: Inspect current Heal fleet resources without mutation
+        if: ${{ !inputs.validation_tools_only && inputs.validation_case == 'environment.inspect' }}
+        env:
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          python3 -B auto-testing/scripts/validation_heal/environment.py \
+            --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --testing-commit "${AUTO_TESTING_SHA}" --evidence "${VALIDATION_ROOT}/environment"
 
       - name: Audit and finalize retained rejected-fault environment
         if: ${{ inputs.validation_cleanup_run_id != '' }}
