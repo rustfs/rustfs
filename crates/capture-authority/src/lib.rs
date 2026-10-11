@@ -9,7 +9,9 @@ use std::{
 mod application;
 mod committed;
 mod created;
+mod native_snapshot;
 mod node;
+pub use native_snapshot::{NativeSnapshotError, NativeSnapshotView};
 mod raft_types;
 pub mod snapshot;
 pub use created::{
@@ -61,6 +63,10 @@ impl NativeLogWriter {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
             ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub async fn snapshot_view(&self) -> Result<NativeSnapshotView, NativeSnapshotError> {
+        Err(NativeSnapshotError::Unavailable)
     }
 
     pub fn reader(&self) -> NativeLogReader {
@@ -560,6 +566,7 @@ fn decode_log(b: &[u8]) -> Result<LogEntry, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableTableMetadata;
     use std::{
         io::{BufRead, BufReader, Read, Write},
         process::{Command, Stdio},
@@ -951,6 +958,205 @@ mod tests {
             },
             membership,
         )
+    }
+    fn u24_limits() -> snapshot::Limits {
+        snapshot::Limits {
+            total_bytes: 1_000_000,
+            membership_bytes: 100_000,
+            key_bytes: 100_000,
+            value_bytes: 100_000,
+            records: 1000,
+        }
+    }
+    fn u24_apply(store: &mut Store, entries: &[CaptureRaftEntry]) {
+        store.append_native(entries).expect("append snapshot fixture");
+        store
+            .save_committed(entries.last().expect("nonempty fixture").log_id.into())
+            .expect("commit snapshot fixture");
+        for entry in entries {
+            store.apply_next_native(entry.log_id.into()).expect("apply snapshot fixture");
+        }
+    }
+    fn u24_expected(store: &Store) -> Vec<u8> {
+        let tx = store.database.begin_read().expect("fixture read transaction");
+        let (applied, membership) = application::native_application_state(&tx).expect("fixture application head");
+        let header = snapshot::Header {
+            cluster_id: identity().cluster_id,
+            applied,
+            membership,
+            binding: u17a_binding(),
+        };
+        let definitions = [
+            application::HEADS,
+            application::VERSIONS,
+            application::EVENTS,
+            application::OPERATIONS,
+        ];
+        let mut counts = [0; 4];
+        for (i, definition) in definitions.iter().enumerate() {
+            counts[i] = tx
+                .open_table(*definition)
+                .expect("fixture table")
+                .len()
+                .expect("fixture count");
+        }
+        let mut encoder = snapshot::Encoder::new(Vec::new(), &header, counts, u24_limits()).expect("fixture encoder");
+        for (definition, section) in definitions.into_iter().zip([
+            snapshot::Section::Heads,
+            snapshot::Section::Versions,
+            snapshot::Section::Events,
+            snapshot::Section::Operations,
+        ]) {
+            let table = tx.open_table(definition).expect("fixture rows");
+            for row in table.iter().expect("fixture iterator") {
+                let (key, value) = row.expect("fixture row");
+                encoder
+                    .row(snapshot::Row {
+                        section,
+                        key: key.value(),
+                        value: value.value(),
+                    })
+                    .expect("fixture encode row");
+            }
+        }
+        encoder.finish().expect("fixture complete")
+    }
+    #[test]
+    fn u24_coherent_view() {
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())]);
+        let expected_a = u24_expected(&store);
+        let writer = NativeLogWriter::new(store);
+        let runtime = u19_runtime();
+        let result = runtime.block_on(writer.snapshot_view());
+        assert!(result.is_ok(), "U24_COHERENT_VIEW: acquisition failed");
+        let view = result.expect("A view");
+        let mut command = u17a_command();
+        command.operation_id = [8; 16];
+        command.object.key = b"second-object".to_vec();
+        command.prepared.version_id = [9; 16];
+        let expected_b = {
+            let mut store = writer.store.lock().expect("B store");
+            u24_apply(&mut store, &[u17a_membership(3).0, u17a_created(4, command)]);
+            u24_expected(&store)
+        };
+        assert_eq!(view.stream(Vec::new(), u24_limits()).expect("A stream"), expected_a, "U24_COHERENT_VIEW");
+        let new_view = runtime.block_on(writer.snapshot_view()).expect("B view");
+        assert_eq!(new_view.stream(Vec::new(), u24_limits()).expect("B stream"), expected_b);
+        assert_ne!(expected_a, expected_b, "B changes all tables and application membership cut");
+    }
+    #[test]
+    fn u24_stream_releases_writer() {
+        struct BlockingOutput {
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for BlockingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).map_err(io::Error::other)?;
+                    self.release.recv_timeout(Duration::from_secs(10)).map_err(io::Error::other)?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_blank(0)]);
+        let writer = NativeLogWriter::new(store);
+        let view = u19_runtime().block_on(writer.snapshot_view()).expect("stream view");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let stream = std::thread::spawn(move || {
+            view.stream(
+                BlockingOutput {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                },
+                u24_limits(),
+            )
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let (done_tx, done_rx) = mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let result = u19_runtime().block_on(writer.write(|store| {
+                u24_apply(store, &[u17a_created(1, u17a_command())]);
+                Ok(())
+            }));
+            let _ = done_tx.send(result.is_ok());
+        });
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        let _ = release_tx.send(());
+        let streamed = stream.join().expect("stream joined");
+        write.join().expect("writer joined");
+        assert!(entered.is_ok(), "output entered rendezvous");
+        assert!(matches!(done, Ok(true)), "U24_STREAM_RELEASES_WRITER");
+        assert!(streamed.is_ok(), "stream completed");
+    }
+    #[test]
+    fn u24_view_schema_fence() {
+        let (_dir, _backend, store) = u17a_bound();
+        let writer = NativeLogWriter::new(store);
+        assert!(
+            matches!(
+                u19_runtime().block_on(writer.snapshot_view()),
+                Err(NativeSnapshotError::Store(StoreError::UnsupportedSchema))
+            ),
+            "U24_SCHEMA_FENCE"
+        );
+        assert_eq!(committed_schema(&writer.store.lock().expect("schema unchanged")), 3);
+        let (_dir2, _backend2, mut store) = u17a_store();
+        store.writable = false;
+        let writer = NativeLogWriter::new(store);
+        assert!(
+            matches!(
+                u19_runtime().block_on(writer.snapshot_view()),
+                Err(NativeSnapshotError::Store(StoreError::WriteDisabled))
+            ),
+            "U24_WRITE_FENCE"
+        );
+    }
+    #[test]
+    fn u24_view_lifetime_errors() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "snapshot test output"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_blank(0)]);
+        let expected = u24_expected(&store);
+        let writer = NativeLogWriter::new(store);
+        let view = u19_runtime().block_on(writer.snapshot_view()).expect("owned view");
+        drop(writer);
+        assert_eq!(view.stream(Vec::new(), u24_limits()).expect("view outlives writer"), expected);
+        let (_dir2, _backend2, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        let view = u19_runtime().block_on(writer.snapshot_view()).expect("error view");
+        let result = view.stream(Broken, u24_limits());
+        match result {
+            Err(NativeSnapshotError::Snapshot(snapshot::SnapshotError::Io(error))) => {
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe)
+            }
+            _ => panic!("U24_TYPED_IO_ERROR"),
+        }
+        u19_runtime()
+            .block_on(writer.write(|store| {
+                u24_apply(store, &[u17a_blank(0)]);
+                Ok(())
+            }))
+            .expect("write after failed stream");
+        u19_runtime()
+            .block_on(writer.snapshot_view())
+            .expect("view after failed stream")
+            .stream(Vec::new(), u24_limits())
+            .expect("stream after failed output");
     }
     #[test]
     fn u18_native_read_roundtrip() {
