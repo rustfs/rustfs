@@ -1236,6 +1236,286 @@ mod tests {
         u19_assert_io(error);
     }
 
+    fn u17b_snapshot(store: &Store) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        use crate::application::{APPLY_RESULTS, EVENTS, HEADS, OPERATIONS, VERSIONS};
+        let tx = store.database.begin_read().expect("snapshot transaction");
+        let meta = tx.open_table(META).expect("snapshot metadata");
+        let mut snapshot = vec![
+            meta.iter()
+                .expect("metadata iterator")
+                .map(|row| {
+                    let (key, value) = row.expect("metadata row");
+                    (key.value().as_bytes().to_vec(), value.value().to_vec())
+                })
+                .collect(),
+        ];
+        for table in [LOGS, APPLY_RESULTS] {
+            snapshot.push(
+                tx.open_table(table)
+                    .expect("snapshot indexed table")
+                    .iter()
+                    .expect("indexed iterator")
+                    .map(|row| {
+                        let (key, value) = row.expect("indexed row");
+                        (key.value().to_be_bytes().to_vec(), value.value().to_vec())
+                    })
+                    .collect(),
+            );
+        }
+        for table in [HEADS, VERSIONS, EVENTS, OPERATIONS] {
+            snapshot.push(
+                tx.open_table(table)
+                    .expect("snapshot business table")
+                    .iter()
+                    .expect("business iterator")
+                    .map(|row| {
+                        let (key, value) = row.expect("business row");
+                        (key.value().to_vec(), value.value().to_vec())
+                    })
+                    .collect(),
+            );
+        }
+        snapshot
+    }
+    fn u17b_history() -> (tempfile::TempDir, CrashBackend, Store, Vec<DecideCreated>) {
+        let (dir, backend, mut store) = u17a_bound();
+        let first = u17a_command();
+        let mut rejected = first.clone();
+        rejected.operation_id = [10; 16];
+        rejected.prepared.version_id = [11; 16];
+        let mut second = first.clone();
+        second.operation_id = [12; 16];
+        second.prepared.version_id = [13; 16];
+        second.expected_head = Some(first.prepared.version_id);
+        second.prepared.content_length = 8193;
+        let mut suffix = second.clone();
+        suffix.operation_id = [14; 16];
+        suffix.prepared.version_id = [15; 16];
+        suffix.expected_head = Some(second.prepared.version_id);
+        let commands = vec![first.clone(), first, rejected, second, suffix];
+        let entries = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| LogEntry {
+                id: u17a_id(u64::try_from(index).expect("fixture index")),
+                payload: command.encode().expect("canonical legacy Created"),
+            })
+            .collect::<Vec<_>>();
+        store.append(&entries).expect("legacy history and suffix");
+        store.save_committed(u17a_id(4)).expect("committed suffix");
+        for index in 0..4 {
+            store.apply_next_created(u17a_id(index)).expect("legacy history apply");
+        }
+        assert_eq!(committed_schema(&store), 3);
+        (dir, backend, store, commands)
+    }
+    #[test]
+    fn u17b_native_migration_populated_suffix() {
+        let (_dir, backend, mut store, commands) = u17b_history();
+        let before = u17b_snapshot(&store);
+        let results = (0..4)
+            .map(|index| {
+                store
+                    .created_apply_result(index)
+                    .expect("legacy result")
+                    .expect("applied result")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            store.migrate_legacy_created_to_native().is_ok(),
+            "U17B_MIGRATION_SUCCESS canonical populated schema3 must migrate"
+        );
+        assert_eq!(committed_schema(&store), 4);
+        assert_eq!(&u17b_snapshot(&store)[3..], &before[3..], "business bytes preserved");
+        assert_eq!(store.capture_binding().expect("binding"), Some(u17a_binding()));
+        assert_eq!(store.log_state().expect("tail").last, Some(u17a_id(4)));
+        assert_eq!(store.read_committed().expect("committed"), Some(u17a_id(4)));
+        assert_eq!(
+            store.native_application_state().expect("application pair"),
+            (
+                Some(u17a_id(3)),
+                CaptureMembership::new(None, vec![], std::collections::BTreeMap::new()).expect("empty membership")
+            )
+        );
+        assert_eq!(
+            store.read_native_entries(0, 5).expect("all entries"),
+            commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| u17a_created(u64::try_from(index).expect("index"), command.clone()))
+                .collect::<Vec<_>>()
+        );
+        for result in results {
+            assert_eq!(
+                store.created_apply_result(result.log_id.index).expect("migrated result"),
+                Some(result.clone())
+            );
+            assert_eq!(
+                store
+                    .native_apply_response(result.log_id.index)
+                    .expect("native result")
+                    .expect("response")
+                    .created_result(),
+                Some(&result.result)
+            );
+        }
+        assert!(store.native_apply_response(4).expect("suffix response").is_none());
+        assert_eq!(
+            store
+                .created_operation(commands[0].operation_id)
+                .expect("first operation")
+                .expect("operation")
+                .result,
+            CreatedResult::Created {
+                version_id: commands[0].prepared.version_id,
+                event_id: commands[0].operation_id,
+                decision_log_id: u17a_id(0)
+            }
+        );
+        drop(store);
+        let mut store = Store::open(&backend.path, identity()).expect("migrated reopen");
+        assert_eq!(&u17b_snapshot(&store)[3..], &before[3..]);
+        let response = store.apply_next_native(u17a_id(4)).expect("real suffix application");
+        assert_eq!(
+            response.created_result(),
+            Some(&CreatedResult::Created {
+                version_id: commands[4].prepared.version_id,
+                event_id: commands[4].operation_id,
+                decision_log_id: u17a_id(4)
+            })
+        );
+        assert_eq!(
+            store.created_head(&commands[4].object).expect("suffix head"),
+            Some(commands[4].prepared.version_id)
+        );
+        assert_eq!(store.last_applied().expect("suffix frontier"), Some(u17a_id(4)));
+    }
+    #[test]
+    fn u17b_native_migration_opaque_refusal() {
+        let canonical = u17a_command().encode().expect("canonical command");
+        let mut noncanonical = canonical.clone();
+        noncanonical.push(0);
+        for payload in [
+            b"opaque payload".to_vec(),
+            canonical[..canonical.len() - 1].to_vec(),
+            noncanonical,
+        ] {
+            let (_dir, backend, mut store) = u17a_bound();
+            store
+                .append(&[LogEntry { id: u17a_id(0), payload }])
+                .expect("invalid legacy suffix append");
+            let before = u17b_snapshot(&store);
+            assert!(store.migrate_legacy_created_to_native().is_err(), "invalid payload must refuse");
+            assert_eq!(u17b_snapshot(&store), before, "refusal changes no table bytes");
+            drop(store);
+            let store = Store::open(&backend.path, identity()).expect("refused suffix reopen");
+            assert_eq!(u17b_snapshot(&store), before);
+            assert_eq!(committed_schema(&store), 3);
+        }
+    }
+    #[test]
+    fn u17b_native_migration_empty_idempotent() {
+        let (_dir, backend, store) = u17a_bound();
+        drop(store);
+        let mut store = Store::from_database(backend.database(), identity()).expect("open legacy without upgrade");
+        assert_eq!(committed_schema(&store), 3);
+        store.migrate_legacy_created_to_native().expect("empty migration");
+        assert_eq!(committed_schema(&store), 4);
+        let before = u17b_snapshot(&store);
+        backend.media.lock().expect("reset migration syncs").syncs = 0;
+        // Reopen through the instrumented backend before checking the no-commit path.
+        drop(store);
+        let mut store = Store::from_database(backend.database(), identity()).expect("native reopen");
+        backend.media.lock().expect("reset reopen syncs").syncs = 0;
+        store.migrate_legacy_created_to_native().expect("native repeat");
+        assert_eq!(backend.media.lock().expect("repeat syncs").syncs, 0, "repeat must not commit");
+        assert_eq!(u17b_snapshot(&store), before);
+        store.writable = false;
+        assert_eq!(
+            store
+                .migrate_legacy_created_to_native()
+                .expect_err("disabled even on schema4")
+                .code(),
+            "write_disabled"
+        );
+    }
+    #[test]
+    fn u17b_native_migration_ack_and_cut() {
+        let (_dir, backend, mut store, _) = u17b_history();
+        let old = u17b_snapshot(&store);
+        backend.media.lock().expect("reset migration syncs").syncs = 0;
+        store.migrate_legacy_created_to_native().expect("migration ACK");
+        let reached = backend.media.lock().expect("actual migration syncs").syncs;
+        assert!(reached > 0, "migration must reach durability IO");
+        let new = u17b_snapshot(&store);
+        backend.cut();
+        drop(store);
+        assert_eq!(u17b_snapshot(&Store::open(&backend.path, identity()).expect("ACK recovery")), new);
+        for sync in 1..=reached {
+            for after in [false, true] {
+                let (_dir, backend, mut store, _) = u17b_history();
+                assert_eq!(u17b_snapshot(&store), old);
+                let (entered, resume) = backend.pause_sync(sync, after);
+                let writer = std::thread::spawn(move || {
+                    let result = store.migrate_legacy_created_to_native();
+                    (store, result)
+                });
+                entered.wait();
+                backend.cut();
+                resume.wait();
+                let (store, result) = writer.join().expect("migration cut writer");
+                drop(store);
+                if let Some(store) = u17a_cut_recovery(&backend) {
+                    let actual = u17b_snapshot(&store);
+                    assert!(
+                        actual == old || actual == new,
+                        "migration cut must never mix schema/log/result/business tables"
+                    );
+                    if result.is_ok() {
+                        assert_eq!(actual, new, "ACK cannot recover old state");
+                    }
+                } else {
+                    assert!(result.is_err(), "ACK recovery must succeed");
+                }
+            }
+        }
+        let (_dir, backend, mut store, _) = u17b_history();
+        backend.arm(1, false, false);
+        assert_eq!(
+            store.migrate_legacy_created_to_native().expect_err("uncertain commit").code(),
+            "commit_indeterminate"
+        );
+        assert_eq!(
+            store
+                .migrate_legacy_created_to_native()
+                .expect_err("migration disabled")
+                .code(),
+            "write_disabled"
+        );
+        assert_eq!(store.append_native(&[]).expect_err("native append disabled").code(), "write_disabled");
+        assert_eq!(store.append(&[]).expect_err("legacy append disabled").code(), "write_disabled");
+        assert_eq!(
+            store.apply_next_native(u17a_id(4)).expect_err("native apply disabled").code(),
+            "write_disabled"
+        );
+        assert_eq!(
+            store
+                .apply_next_created(u17a_id(4))
+                .expect_err("legacy apply disabled")
+                .code(),
+            "write_disabled"
+        );
+        assert_eq!(
+            store
+                .pin_capture_binding(u17a_binding())
+                .expect_err("binding disabled")
+                .code(),
+            "write_disabled"
+        );
+        assert_eq!(store.save_committed(u17a_id(4)).expect_err("committed disabled").code(), "write_disabled");
+        assert_eq!(store.save_vote(vote()).expect_err("vote disabled").code(), "write_disabled");
+        assert_eq!(store.truncate_suffix(5).expect_err("truncate disabled").code(), "write_disabled");
+    }
     fn u17a_id(index: u64) -> LogId {
         LogId {
             term: 11,

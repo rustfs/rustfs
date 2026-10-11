@@ -315,6 +315,10 @@ pub(crate) fn native_application_state(tx: &ReadTransaction) -> Result<(Option<L
 }
 
 impl Store {
+    pub fn migrate_legacy_created_to_native(&mut self) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedSchema)
+    }
+
     /// Explicitly opt an empty, bound store into native entry persistence.
     pub fn enable_native_empty(&mut self) -> Result<(), StoreError> {
         let tx = self.write_transaction()?;
