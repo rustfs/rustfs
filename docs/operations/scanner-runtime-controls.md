@@ -172,6 +172,20 @@ catch_up_estimate.discovered_expiry_items
 catch_up_estimate.discovered_transition_items
 ```
 
+### Periodic checkpoint persistence
+
+`metrics.scan_checkpoint` is the in-memory resume hint; it does not confirm a durable save. `metrics.scan_checkpoints_persisted` lists the latest confirmed periodic save for each `(pool_index, set_index)` handled by this process, with its bucket, `saved_unix_secs`, and optional checkpoint cursor. It retains one observation per set, is reset on process restart, and does not include the final bucket save. Query the peer executing the walk for remote-worker observations. `metrics.scan_checkpoint_save_failures` counts failed periodic saves, including failures to refresh CAS revisions after a write; failed attempts do not advance the confirmed save observation.
+
+An ordinary failed save drops that snapshot and leaves the bounded checkpoint receiver active, so the next producer interval tries again. A CAS conflict or an unreadable revision after a successful write cancels the bucket attempt and reloads persisted state through the existing retry path. Leader, cycle, and publication fencing remain mandatory. This preserves future periodic save attempts for a continuing bucket walk.
+
+Periodic snapshots include the suspended ancestor accounting needed to connect a nested active branch to the bucket root. Completed coverage is sealed independently of raw enumeration bookkeeping. A valid coverage frontier can therefore skip completed subtrees after a fenced leader handoff without counting unfinished work as completed. Emission remains bounded by the existing interval/object thresholds and capacity-one channel; invalid snapshot attempts also consume the producer interval so they cannot repeatedly clone the cache on every object.
+
+A resumed walk retains its previous durable coverage while initial enumeration has not recopied the covered subtrees. Unfinished out-of-order heal revisits cannot be certified as completed prefix work, including in cancellation snapshots.
+
+Shared compacted accumulators defer periodic emission until the owning subtree completes; replay inside that compacted subtree remains possible after an interruption. When bucket checkpoint preparation returns `Reset` for existing resume state, it logs `checkpoint_reset` with the validation reason. The `scan_checkpoint_used` counter includes validated coverage adoption by the forward sweep.
+
+A confirmed periodic save does not prove restart resumability. Adoption still validates bucket/set identity and, for non-empty caches, connected cache scope. Skipping completed subtrees additionally requires a validated coverage frontier; raw enumeration state alone does not prove completed subtree coverage.
+
 ## Usage State Reset
 
 The supported break-glass route for rebuilding scanner usage state is `POST /v3/scanner/usage-state/reset` with body `{"mode":"full-rebuild"}`, authenticated as an admin identity holding `ConfigUpdateAdminAction` (route registered in `rustfs/src/admin/route_registration_test.rs`). Use it only after the scanner status shows a usage-floor load failure, a conflicting persisted usage floor, or an operator decision to discard the durable usage baseline and rebuild it from a full scanner pass.
