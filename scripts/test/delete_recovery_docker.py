@@ -665,7 +665,7 @@ def missing_version_returning_peer():
         assert client.get(bucket, key) == newer
         client.delete(bucket, key + '?versionId=' + v2)
         client.delete_bucket(bucket)
-        return {'case': 'missing-specific-version-offline-fence-restat', 'status': 'passed', 'observation': observation, 'initial_delete_status': initial_delete_status}
+        return {'case': 'missing-specific-version-offline-fence', 'status': 'passed', 'observation': observation, 'initial_delete_status': initial_delete_status}
     finally:
         cluster.remove()
 
