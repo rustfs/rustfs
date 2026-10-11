@@ -23,6 +23,7 @@ pub struct NativeSnapshotView {
     transaction: ReadTransaction,
     header: snapshot::Header,
     counts: [u64; 4],
+    schema: u64,
     _owner: Arc<Mutex<Store>>,
 }
 impl NativeSnapshotView {
@@ -35,18 +36,27 @@ impl NativeSnapshotView {
             store.database.begin_read().map_err(StoreError::from)?
         };
         let (applied, membership) = application::native_application_state(&transaction)?;
-        let header = {
+        let (header, schema) = {
             let meta = transaction.open_table(crate::META).map_err(StoreError::from)?;
             let identity = meta
                 .get("identity")
                 .map_err(StoreError::from)?
                 .ok_or(StoreError::CorruptRecord)?;
-            snapshot::Header {
-                cluster_id: crate::decode_identity(identity.value())?.cluster_id,
-                applied,
-                membership,
-                binding: application::read_binding(&meta)?,
-            }
+            let schema = crate::number(
+                meta.get("schema")
+                    .map_err(StoreError::from)?
+                    .ok_or(StoreError::CorruptRecord)?
+                    .value(),
+            )?;
+            (
+                snapshot::Header {
+                    cluster_id: crate::decode_identity(identity.value())?.cluster_id,
+                    applied,
+                    membership,
+                    binding: application::read_binding(&meta)?,
+                },
+                schema,
+            )
         };
         let mut counts = [0; 4];
         for (index, definition) in [
@@ -68,8 +78,21 @@ impl NativeSnapshotView {
             transaction,
             header,
             counts,
+            schema,
             _owner: owner,
         })
+    }
+
+    pub fn stream_capability_artifact<W: Write>(
+        self,
+        writer: W,
+        limits: snapshot::Limits,
+    ) -> Result<snapshot::CapabilityArtifact<W>, NativeSnapshotError> {
+        if self.schema != 6 {
+            return Err(StoreError::UnsupportedSchema.into());
+        }
+        let output = snapshot::CapabilityOutput::new(writer, limits.total_bytes);
+        Ok(self.stream(output, limits)?.finish())
     }
 
     pub fn stream<W: Write>(self, writer: W, limits: snapshot::Limits) -> Result<W, NativeSnapshotError> {
