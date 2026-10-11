@@ -103,6 +103,10 @@ fn decode_provenance(b: &[u8]) -> Result<CreatedOperationProvenance, StoreError>
     })
 }
 
+pub(crate) fn validate_provenance_encoding(bytes: &[u8]) -> Result<(), StoreError> {
+    decode_provenance(bytes).map(|_| ())
+}
+
 fn decode_stored_operation(b: &[u8], schema: u64) -> Result<CreatedOperation, StoreError> {
     if matches!(schema, 5 | 6) {
         Ok(decode_provenance(b)?.operation)

@@ -22,6 +22,7 @@ pub use node::{CaptureNode, CaptureNodeError};
 pub use raft_types::{
     CaptureCommand, CaptureMembership, CaptureRaftEntry, CaptureResponse, CaptureResponseKind, CaptureTypeConfig, MembershipError,
 };
+pub use snapshot::{CapabilityArtifact, CapabilityManifest};
 #[cfg(test)]
 mod application_tests;
 mod truncate;
@@ -2231,6 +2232,407 @@ mod tests {
             membership,
         )
     }
+    #[derive(Default)]
+    struct U27aSink(Vec<(snapshot::Section, Vec<u8>, Vec<u8>)>);
+    impl snapshot::StagingSink for U27aSink {
+        fn row(&mut self, section: snapshot::Section, key: &[u8], value: &[u8]) -> io::Result<()> {
+            self.0.push((section, key.to_vec(), value.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn u27a_manifest(payload: &[u8]) -> snapshot::CapabilityManifest {
+        use sha2::{Digest, Sha256};
+        let mut bytes = [0; 56];
+        bytes[..4].copy_from_slice(b"CCAP");
+        bytes[4] = 1;
+        bytes[5] = 1;
+        bytes[6..14].copy_from_slice(&6u64.to_be_bytes());
+        bytes[14] = 1;
+        bytes[15] = 1;
+        bytes[16..24].copy_from_slice(&u64::try_from(payload.len()).expect("small test payload length").to_be_bytes());
+        bytes[24..].copy_from_slice(&Sha256::digest(payload));
+        snapshot::CapabilityManifest { bytes }
+    }
+
+    fn u27a_fixture() -> (tempfile::TempDir, CrashBackend, Store, Vec<DecideCreated>) {
+        let (dir, backend, mut store) = u17a_store();
+        provenance_promote(&mut store);
+        let commands = provenance_commands();
+        let mut entries = vec![u17a_blank(0), u17a_membership(1).0];
+        for (index, command) in commands.iter().enumerate() {
+            entries.push(u17a_created(u64::try_from(index).expect("fixture index") + 2, command.clone()));
+        }
+        u24_apply(&mut store, &entries);
+        assert_eq!(committed_schema(&store), 6, "schema6 fixture setup");
+        (dir, backend, store, commands)
+    }
+
+    fn u27a_rows(store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let tx = store.database.begin_read().expect("operation fixture transaction");
+        let table = tx.open_table(application::OPERATIONS).expect("operation fixture table");
+        let rows = table
+            .iter()
+            .expect("operation fixture cursor")
+            .map(|row| {
+                let (key, value) = row.expect("operation fixture row");
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect();
+        rows
+    }
+
+    fn u27a_artifact(writer: &NativeLogWriter) -> snapshot::CapabilityArtifact<Vec<u8>> {
+        let view = u19_runtime()
+            .block_on(writer.snapshot_view())
+            .expect("capability fixture view");
+        let result = view.stream_capability_artifact(Vec::new(), u24_limits());
+        assert_eq!(result.is_ok(), true, "U27A_CAPABILITY_ENABLED");
+        result.expect("asserted capability production")
+    }
+
+    fn u27a_decode(
+        artifact: snapshot::CapabilityArtifact<Vec<u8>>,
+    ) -> Result<(snapshot::Header, U27aSink), snapshot::SnapshotError> {
+        let mut sink = U27aSink::default();
+        let header = snapshot::decode_capability_artifact(
+            snapshot::CapabilityArtifact {
+                manifest: artifact.manifest,
+                payload: io::Cursor::new(artifact.payload),
+            },
+            &mut sink,
+            u24_limits(),
+        )?;
+        Ok((header, sink))
+    }
+
+    #[test]
+    fn u27a_checkpoint_schema6_copr_stream() {
+        let (_dir, _backend, store, commands) = u27a_fixture();
+        let expected = u27a_rows(&store);
+        let writer = NativeLogWriter::new(store);
+        let artifact = u27a_artifact(&writer);
+        assert_eq!(
+            artifact.manifest.encode(),
+            u27a_manifest(&artifact.payload).encode(),
+            "U27A_PAYLOAD_BINDING"
+        );
+        let decoded = u27a_decode(artifact);
+        assert_eq!(decoded.is_ok(), true, "U27A_COPR_BYTES");
+        let (header, sink) = decoded.expect("asserted capability consumer");
+        assert_eq!(header.applied, Some(u17a_id(10)), "U27A_COPR_BYTES");
+        assert_eq!(header.membership.log_id(), &Some(u17a_id(1)), "U27A_COPR_BYTES");
+        let operations: Vec<_> = sink
+            .0
+            .into_iter()
+            .filter(|row| row.0 == snapshot::Section::Operations)
+            .map(|(_, key, value)| (key, value))
+            .collect();
+        assert_eq!(operations, expected, "U27A_COPR_BYTES");
+        assert_eq!(operations.len(), 4, "U27A_COPR_BYTES");
+        for (command_index, first_index) in [(0, 2), (3, 5), (4, 6), (5, 7)] {
+            let command = &commands[command_index];
+            let value = &operations
+                .iter()
+                .find(|(key, _)| key.as_slice() == command.operation_id.as_slice())
+                .expect("canonical operation")
+                .1;
+            assert_eq!(&value[..5], b"COPR\x01", "U27A_COPR_BYTES");
+            assert_eq!(&value[5..29], encode_id(u17a_id(first_index)), "U27A_FIRST_ID");
+            let stored = writer
+                .store
+                .lock()
+                .expect("fixture store")
+                .created_operation_provenance(command.operation_id)
+                .expect("provenance read")
+                .expect("operation");
+            assert_eq!(stored.first_decision_log_id, u17a_id(first_index), "U27A_FIRST_ID");
+            assert_eq!(
+                stored.operation.canonical_command,
+                command.encode().expect("original command"),
+                "U27A_COPR_BYTES"
+            );
+        }
+        let store = writer.store.lock().expect("conflict receipt store");
+        assert_eq!(
+            store
+                .native_apply_response(4)
+                .expect("receipt")
+                .expect("response")
+                .created_result(),
+            Some(&CreatedResult::OperationConflict),
+            "U27A_FIRST_ID"
+        );
+    }
+
+    #[test]
+    fn u27a_checkpoint_schema4_legacy_unchanged() {
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())]);
+        let before = u17b_snapshot(&store);
+        // Fixed bytes exported by the accepted pre-capability binary for this schema4 fixture.
+        const LEGACY_PAYLOAD_HEX: &str = concat!(
+            "43534e5001010707070707070707070707070707070701000000000000000b00000000000000070000000000000002000000000000010e434d454d01",
+            "01000000000000000b000000000000000700000000000000010000000200000002000000000000000700000000000000080000000200000000000000",
+            "08000000000000000900000004000000000000000700000024434e4f44010000001b68747470733a2f2f706565722d372e6578616d706c653a373030",
+            "37000000000000000800000023434e4f44010000001a687474703a2f2f706565722d382e6578616d706c653a37303038000000000000000900000024",
+            "434e4f44010000001b68747470733a2f2f706565722d392e6578616d706c653a37303039000000000000000a00000025434e4f44010000001c687474",
+            "70733a2f2f6c6561726e65722e6578616d706c653a373031300000000000000009060606060606060606060606060606060707070707070707070707",
+            "070707070701000000000000000100000000000000210000000000000010020202020202020202020202020202020000000d6e61746976652d6f626a",
+            "656374030303030303030303030303030303030200000000000000010000000000000031000000000000006802020202020202020202020202020202",
+            "0000000d6e61746976652d6f626a65637403030303030303030303030303030303030303030303030303030303030303030404040404040404040404",
+            "040404040405050505050505050505050505050505050505050505050505050505050505050000000000001001000000000000000b00000000000000",
+            "0700000000000000020000000000000009030000000000000001000000000000001000000000000000a9010101010101010101010101010101010202",
+            "02020202020202020202020202020000000d6e61746976652d6f626a6563740303030303030303030303030303030304040404040404040404040404",
+            "04040405050505050505050505050505050505050505050505050505050505050505050000000000001001000000000000000b000000000000000700",
+            "000000000000020000000000000009060606060606060606060606060606060707070707070707070707070707070704000000000000000100000000",
+            "0000001000000000000000c8010101010101010101010101010101010000000000000087435254440101010101010101010101010101010101020202",
+            "020202020202020202020202020000000d6e61746976652d6f626a656374000303030303030303030303030303030304040404040404040404040404",
+            "040404050505050505050505050505050505050505050505050505050505050505050500000000000010010000000000000009000303030303030303",
+            "030303030303030301010101010101010101010101010101000000000000000b000000000000000700000000000000024f43d9e18a25d702afdacde7",
+            "e9b00f87177c40b11232952e61ddb2aa18411bce",
+        );
+        let original: Vec<u8> = LEGACY_PAYLOAD_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digits = std::str::from_utf8(pair).expect("fixed legacy hex");
+                u8::from_str_radix(digits, 16).expect("fixed legacy byte")
+            })
+            .collect();
+        let writer = NativeLogWriter::new(store);
+        let view = u19_runtime().block_on(writer.snapshot_view()).expect("legacy view");
+        let payload = view.stream(Vec::new(), u24_limits()).expect("original stream");
+        assert_eq!(payload, original, "U27A_V1_OPAQUE");
+        assert_eq!(&payload[..6], b"CSNP\x01\x01", "U27A_V1_OPAQUE");
+        let view = u19_runtime()
+            .block_on(writer.snapshot_view())
+            .expect("legacy capability view");
+        let result = view.stream_capability_artifact(Vec::new(), u24_limits());
+        assert_eq!(
+            matches!(result, Err(NativeSnapshotError::Store(StoreError::UnsupportedSchema))),
+            true,
+            "U27A_SCHEMA_GATE"
+        );
+        let store = writer.store.lock().expect("legacy unchanged store");
+        assert_eq!(committed_schema(&store), 4, "U27A_SCHEMA_GATE");
+        assert_eq!(u17b_snapshot(&store), before, "U27A_SCHEMA_GATE");
+    }
+
+    #[test]
+    fn u27a_checkpoint_codec_mismatch_rejected() {
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_created(0, u17a_command())]);
+        let writer = NativeLogWriter::new(store);
+        let old = u19_runtime()
+            .block_on(writer.snapshot_view())
+            .expect("legacy codec view")
+            .stream(Vec::new(), u24_limits())
+            .expect("legacy codec payload");
+        assert_eq!(
+            u27a_decode(snapshot::CapabilityArtifact {
+                manifest: u27a_manifest(&old),
+                payload: old
+            })
+            .is_err(),
+            true,
+            "U27A_CODEC_DISPATCH"
+        );
+        let (_dir6, _backend6, store6, _) = u27a_fixture();
+        let writer6 = NativeLogWriter::new(store6);
+        let artifact = u27a_artifact(&writer6);
+        for (offset, wrong) in [(6, 5), (14, 0), (14, 2), (15, 0), (15, 2)] {
+            let mut manifest = artifact.manifest.clone();
+            if offset == 6 {
+                manifest.bytes[6..14].copy_from_slice(&u64::from(wrong).to_be_bytes());
+            } else {
+                manifest.bytes[offset] = wrong;
+            }
+            assert_eq!(
+                u27a_decode(snapshot::CapabilityArtifact {
+                    manifest,
+                    payload: artifact.payload.clone()
+                })
+                .is_err(),
+                true,
+                "U27A_CODEC_DISPATCH"
+            );
+        }
+    }
+
+    #[test]
+    fn u27a_checkpoint_manifest_binding_rejected() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            interrupted: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let length = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_dir, _backend, store, _) = u27a_fixture();
+        let writer = NativeLogWriter::new(store);
+        let view = u19_runtime().block_on(writer.snapshot_view()).expect("short output view");
+        let result = view.stream_capability_artifact(
+            ShortWriter {
+                bytes: Vec::new(),
+                interrupted: false,
+            },
+            u24_limits(),
+        );
+        assert_eq!(result.is_ok(), true, "U27A_PAYLOAD_BINDING");
+        let artifact = result.expect("asserted short write producer");
+        assert_eq!(
+            artifact.manifest.encode(),
+            u27a_manifest(&artifact.payload.bytes).encode(),
+            "U27A_PAYLOAD_BINDING"
+        );
+        let encoded = artifact.manifest.encode();
+        assert_eq!(snapshot::CapabilityManifest::decode(&encoded).is_ok(), true, "U27A_PAYLOAD_BINDING");
+        for size in [0, 55, 57] {
+            let mut raw = encoded.to_vec();
+            raw.resize(size, 0);
+            assert_eq!(snapshot::CapabilityManifest::decode(&raw).is_err(), true, "U27A_PAYLOAD_BINDING");
+        }
+        for offset in [0, 4, 5, 14, 15] {
+            let mut raw = encoded;
+            raw[offset] = 255;
+            assert_eq!(snapshot::CapabilityManifest::decode(&raw).is_err(), true, "U27A_PAYLOAD_BINDING");
+        }
+        for offset in [16, 23, 24, 55] {
+            let mut manifest = artifact.manifest.clone();
+            manifest.bytes[offset] ^= 1;
+            assert_eq!(
+                u27a_decode(snapshot::CapabilityArtifact {
+                    manifest,
+                    payload: artifact.payload.bytes.clone()
+                })
+                .is_err(),
+                true,
+                "U27A_PAYLOAD_BINDING"
+            );
+        }
+        let mut corrupt = artifact.payload.bytes.clone();
+        *corrupt.last_mut().expect("footer byte") ^= 1;
+        assert_eq!(
+            u27a_decode(snapshot::CapabilityArtifact {
+                manifest: artifact.manifest.clone(),
+                payload: corrupt
+            })
+            .is_err(),
+            true,
+            "U27A_PAYLOAD_BINDING"
+        );
+        let mut extra = artifact.payload.bytes.clone();
+        extra.push(0);
+        assert_eq!(
+            u27a_decode(snapshot::CapabilityArtifact {
+                manifest: artifact.manifest,
+                payload: extra
+            })
+            .is_err(),
+            true,
+            "U27A_PAYLOAD_BINDING"
+        );
+    }
+
+    #[test]
+    fn u27a_checkpoint_negative_bytes_first_id() {
+        let (_dir, _backend, mut store, commands) = u27a_fixture();
+        let before = u27a_rows(&store);
+        let mut later = commands[0].clone();
+        later.operation_id = [20; 16];
+        later.prepared.version_id = [21; 16];
+        later.expected_head = Some(commands[0].prepared.version_id);
+        u24_apply(
+            &mut store,
+            &[
+                u17a_created(11, later),
+                u17a_created(12, commands[4].clone()),
+                u17a_created(13, commands[2].clone()),
+            ],
+        );
+        assert_eq!(
+            store.created_head(&commands[0].object).expect("changed head"),
+            Some([21; 16]),
+            "U27A_FIRST_ID"
+        );
+        let after = u27a_rows(&store);
+        for command_index in [3, 4, 5] {
+            let key = commands[command_index].operation_id.to_vec();
+            let old = before.iter().find(|row| row.0 == key).expect("first negative bytes");
+            assert_eq!(after.iter().find(|row| row.0 == key), Some(old), "U27A_FIRST_ID");
+        }
+        assert_eq!(
+            store
+                .native_apply_response(13)
+                .expect("conflict response")
+                .expect("receipt")
+                .created_result(),
+            Some(&CreatedResult::OperationConflict),
+            "U27A_FIRST_ID"
+        );
+        let writer = NativeLogWriter::new(store);
+        let (_, sink) = u27a_decode(u27a_artifact(&writer)).expect("capability preserves negatives");
+        let captured: Vec<_> = sink
+            .0
+            .into_iter()
+            .filter(|row| row.0 == snapshot::Section::Operations)
+            .map(|(_, key, value)| (key, value))
+            .collect();
+        assert_eq!(captured, after, "U27A_FIRST_ID");
+    }
+
+    #[test]
+    fn u27a_checkpoint_v1_framing_is_opaque() {
+        let (_dir, _backend, mut store) = u17a_store();
+        u24_apply(&mut store, &[u17a_blank(0)]);
+        let tx = store.database.begin_read().expect("opaque header transaction");
+        let (applied, membership) = application::native_application_state(&tx).expect("opaque application pair");
+        let header = snapshot::Header {
+            cluster_id: identity().cluster_id,
+            applied,
+            membership,
+            binding: u17a_binding(),
+        };
+        let mut payload = Vec::new();
+        snapshot::encode(
+            &mut payload,
+            &header,
+            [0, 0, 0, 1],
+            [snapshot::Row {
+                section: snapshot::Section::Operations,
+                key: b"o",
+                value: b"opaque-operation",
+            }],
+            u24_limits(),
+        )
+        .expect("original opaque encode");
+        let mut sink = U27aSink::default();
+        let original = snapshot::decode(payload.as_slice(), &mut sink, u24_limits());
+        assert_eq!(original.is_ok(), true, "U27A_V1_OPAQUE");
+        assert_eq!(sink.0[0].2, b"opaque-operation", "U27A_V1_OPAQUE");
+        assert_eq!(
+            u27a_decode(snapshot::CapabilityArtifact {
+                manifest: u27a_manifest(&payload),
+                payload
+            })
+            .is_err(),
+            true,
+            "U27A_V1_OPAQUE"
+        );
+    }
+
     fn u24_limits() -> snapshot::Limits {
         snapshot::Limits {
             total_bytes: 1_000_000,

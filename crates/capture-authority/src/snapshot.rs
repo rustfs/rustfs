@@ -38,6 +38,161 @@ pub enum SnapshotError {
     #[error("snapshot IO failed")]
     Io(#[from] std::io::Error),
 }
+/// Fixed capability declaration. Consumers validate these untrusted bytes before decoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityManifest {
+    pub bytes: [u8; 56],
+}
+impl CapabilityManifest {
+    pub fn encode(&self) -> [u8; 56] {
+        self.bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        format(bytes.len() == 56, "capability length")?;
+        format(&bytes[..6] == b"CCAP\x01\x01", "capability version/framing")?;
+        format(bytes[6..14] == 6u64.to_be_bytes(), "capability schema")?;
+        format(bytes[14..16] == [1, 1], "operation codec")?;
+        let mut encoded = [0; 56];
+        encoded.copy_from_slice(bytes);
+        Ok(Self { bytes: encoded })
+    }
+
+    fn payload_length(&self) -> u64 {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&self.bytes[16..24]);
+        u64::from_be_bytes(bytes)
+    }
+}
+
+/// Manifest and payload form one explicit input. This does not grant installation authority.
+pub struct CapabilityArtifact<T> {
+    pub manifest: CapabilityManifest,
+    pub payload: T,
+}
+
+pub(crate) struct CapabilityOutput<W> {
+    io: W,
+    hash: Sha256,
+    used: u64,
+    max: u64,
+}
+impl<W: Write> CapabilityOutput<W> {
+    pub(crate) fn new(io: W, max: u64) -> Self {
+        Self {
+            io,
+            hash: Sha256::new(),
+            used: 0,
+            max,
+        }
+    }
+
+    pub(crate) fn finish(self) -> CapabilityArtifact<W> {
+        let mut bytes = [0; 56];
+        bytes[..6].copy_from_slice(b"CCAP\x01\x01");
+        bytes[6..14].copy_from_slice(&6u64.to_be_bytes());
+        bytes[14..16].copy_from_slice(&[1, 1]);
+        bytes[16..24].copy_from_slice(&self.used.to_be_bytes());
+        bytes[24..].copy_from_slice(&self.hash.finalize());
+        CapabilityArtifact {
+            manifest: CapabilityManifest { bytes },
+            payload: self.io,
+        }
+    }
+}
+impl<W: Write> Write for CapabilityOutput<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(bytes.len()).map_err(std::io::Error::other)?;
+        if self.used.checked_add(requested).is_none_or(|n| n > self.max) {
+            return Err(std::io::Error::other("capability payload limit"));
+        }
+        let written = self.io.write(bytes)?;
+        let part = bytes
+            .get(..written)
+            .ok_or_else(|| std::io::Error::other("invalid writer count"))?;
+        let count = u64::try_from(written).map_err(std::io::Error::other)?;
+        self.used = self
+            .used
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("capability length overflow"))?;
+        self.hash.update(part);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io.flush()
+    }
+}
+
+struct CapabilityInput<R> {
+    io: R,
+    hash: Sha256,
+    used: u64,
+    max: u64,
+}
+impl<R: Read> Read for CapabilityInput<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        // At the boundary, permit only the existing decoder's one-byte EOF probe.
+        let remaining = self
+            .max
+            .checked_sub(self.used)
+            .ok_or_else(|| std::io::Error::other("capability length overflow"))?;
+        let requested = u64::try_from(bytes.len()).map_err(std::io::Error::other)?;
+        let allowed = requested.min(if remaining == 0 { 1 } else { remaining });
+        let allowed = usize::try_from(allowed).map_err(std::io::Error::other)?;
+        let read = self.io.read(&mut bytes[..allowed])?;
+        let part = bytes
+            .get(..read)
+            .ok_or_else(|| std::io::Error::other("invalid reader count"))?;
+        let count = u64::try_from(read).map_err(std::io::Error::other)?;
+        let used = self
+            .used
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("capability length overflow"))?;
+        if used > self.max {
+            return Err(std::io::Error::other("capability payload limit"));
+        }
+        self.used = used;
+        self.hash.update(part);
+        Ok(read)
+    }
+}
+
+struct CapabilitySink<'a, S>(&'a mut S);
+impl<S: StagingSink> StagingSink for CapabilitySink<'_, S> {
+    fn row(&mut self, section: Section, key: &[u8], value: &[u8]) -> std::io::Result<()> {
+        if section == Section::Operations {
+            crate::application::validate_provenance_encoding(value).map_err(std::io::Error::other)?;
+        }
+        self.0.row(section, key, value)
+    }
+}
+
+/// Validates framing, declared capability and operation encoding into isolated staging.
+/// Failure may leave partial staging rows, which the caller must discard.
+/// Success does not prove cross-table consistency, historical truth or source authority.
+pub fn decode_capability_artifact(
+    artifact: CapabilityArtifact<impl Read>,
+    sink: &mut impl StagingSink,
+    limits: Limits,
+) -> Result<Header, SnapshotError> {
+    let manifest = CapabilityManifest::decode(&artifact.manifest.bytes)?;
+    let length = manifest.payload_length();
+    limit(length <= limits.total_bytes, "capability payload")?;
+    let mut reader = CapabilityInput {
+        io: artifact.payload,
+        hash: Sha256::new(),
+        used: 0,
+        max: length,
+    };
+    let header = decode(&mut reader, &mut CapabilitySink(sink), limits)?;
+    format(reader.used == length, "capability payload length")?;
+    if reader.hash.finalize().as_slice() != &manifest.bytes[24..] {
+        return Err(SnapshotError::Digest);
+    }
+    Ok(header)
+}
+
 /// Row values remain opaque. Operation values will contain the canonical decision
 /// LogId followed by the existing canonical operation bytes, validated by callers.
 pub struct Row<'a> {
