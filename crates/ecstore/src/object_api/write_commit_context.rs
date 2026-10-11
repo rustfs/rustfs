@@ -68,7 +68,7 @@ impl WriteCommitGuard {
         self.guards.iter().any(|guard| guard.is_lock_lost() || guard.is_released())
     }
 
-    fn matches(&self, bucket: &str, object: &str) -> bool {
+    pub(crate) fn matches(&self, bucket: &str, object: &str) -> bool {
         self.bucket.as_ref() == bucket && self.object.as_ref() == object
     }
 }

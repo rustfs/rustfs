@@ -381,6 +381,16 @@ pub mod config {
             crate::config::com::read_config_observation(api, file, max_bytes).await
         }
 
+        /// Observe bounded config bytes while the caller retains the object's write owner.
+        pub async fn read_config_observation_no_lock(
+            api: std::sync::Arc<crate::store::ECStore>,
+            file: &str,
+            max_bytes: usize,
+            guard: &crate::object_api::WriteCommitGuard,
+        ) -> crate::error::Result<(Vec<u8>, crate::object_api::ObjectInfo)> {
+            crate::config::com::read_config_observation_no_lock(api, file, max_bytes, guard).await
+        }
+
         /// Read config bytes and metadata without treating an empty payload as absent.
         pub async fn read_config_preserve_empty_with_metadata_opts(
             api: std::sync::Arc<crate::store::ECStore>,

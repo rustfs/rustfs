@@ -1146,6 +1146,100 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
+    async fn locked_observation_uses_real_outer_guard() {
+        let object = "config/locked-observation-real.bin";
+        let payload = vec![b'p'; OBSERVATION_HOOK_BODY_LEN];
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let written = set
+            .put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("persist locked observation fixture");
+        let (_hook, calls) = observation_register_hook(object, vec![b'x'; payload.len()]);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; payload.len()]);
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+        let namespace = set
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, object)
+            .await
+            .expect("namespace");
+        let guard = crate::object_api::WriteCommitGuard::acquire(&namespace, std::time::Duration::from_secs(5))
+            .await
+            .expect("matching real owner");
+        let mut contender = Box::pin(crate::object_api::WriteCommitGuard::acquire(
+            &namespace,
+            std::time::Duration::from_secs(30),
+        ));
+        assert_eq!(futures::poll!(contender.as_mut()).is_pending(), true, "I06L_OWNER_RETAINED");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::config::com::read_config_observation_no_lock(set.clone(), object, payload.len(), &guard),
+        )
+        .await
+        .expect("locked observation hang watchdog");
+        assert_eq!(result.is_ok(), true, "I06L_NO_NESTED_LOCK: {result:?}");
+        let (bytes, info) = result.expect("locked observation");
+        assert_eq!(bytes == payload, true, "I06L_HOOK_BYPASS");
+        assert_eq!(calls.load(Ordering::SeqCst) == 0, true, "I06L_HOOK_BYPASS");
+        assert_eq!(info.size, written.size);
+        assert_eq!(info.etag, written.etag);
+        assert_eq!(info.data_dir, written.data_dir);
+        assert_eq!(info.name, object);
+        assert_eq!(futures::poll!(contender.as_mut()).is_pending(), true, "I06L_OWNER_RETAINED");
+        drop(guard);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), contender)
+            .await
+            .expect("owner release watchdog")
+            .expect("competing owner acquired");
+        drop(next);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; payload.len()]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn locked_observation_preserves_empty_missing_and_bound() {
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        for (object, body) in [
+            ("config/locked-empty.bin", Vec::new()),
+            ("config/locked-bound.bin", b"raw".to_vec()),
+        ] {
+            let mut reader = PutObjReader::from_vec(body.clone());
+            let written = set
+                .put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("persist boundary fixture");
+            let namespace = set
+                .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, object)
+                .await
+                .expect("namespace");
+            let guard = crate::object_api::WriteCommitGuard::acquire(&namespace, std::time::Duration::from_secs(5))
+                .await
+                .expect("matching boundary owner");
+            let result = crate::config::com::read_config_observation_no_lock(set.clone(), object, body.len(), &guard).await;
+            assert_eq!(result.is_ok(), true, "I06L_EMPTY_DISTINCT: {result:?}");
+            let (bytes, info) = result.expect("boundary observation");
+            assert_eq!(bytes, body);
+            assert_eq!(info.size, written.size);
+            if !body.is_empty() {
+                let result =
+                    crate::config::com::read_config_observation_no_lock(set.clone(), object, body.len() - 1, &guard).await;
+                assert_eq!(matches!(result, Err(Error::CorruptedFormat)), true, "I06L_BOUND_ENFORCED");
+            }
+        }
+        let object = "config/locked-absent.bin";
+        let namespace = set
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, object)
+            .await
+            .expect("namespace");
+        let guard = crate::object_api::WriteCommitGuard::acquire(&namespace, std::time::Duration::from_secs(5))
+            .await
+            .expect("matching missing owner");
+        let result = crate::config::com::read_config_observation_no_lock(set, object, 0, &guard).await;
+        assert_eq!(matches!(result, Err(Error::ConfigNotFound)), true, "I06L_EMPTY_DISTINCT");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
     async fn observation_real_backend_boundaries() {
         let object = "config/observation-real.bin";
         let payload = b"persisted config";
