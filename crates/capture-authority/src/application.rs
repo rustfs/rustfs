@@ -98,7 +98,7 @@ fn decode_apply(b: &[u8]) -> Result<CreatedApplyResult, StoreError> {
     d.finish()?;
     Ok(r)
 }
-fn read_binding(meta: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<CaptureBinding, StoreError> {
+pub(crate) fn read_binding(meta: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<CaptureBinding, StoreError> {
     let b = meta.get("capture_binding")?.ok_or(StoreError::BindingNotPinned)?;
     let mut d = Decoder::new(b.value());
     let binding = d.binding()?;

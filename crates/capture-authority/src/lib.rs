@@ -66,7 +66,10 @@ impl NativeLogWriter {
     }
 
     pub async fn snapshot_view(&self) -> Result<NativeSnapshotView, NativeSnapshotError> {
-        Err(NativeSnapshotError::Unavailable)
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || NativeSnapshotView::acquire(store))
+            .await
+            .map_err(NativeSnapshotError::Worker)?
     }
 
     pub fn reader(&self) -> NativeLogReader {
