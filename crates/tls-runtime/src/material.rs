@@ -106,6 +106,35 @@ impl TlsMaterialSnapshot {
         let source = snapshot.resolved_source();
         let base_dir = snapshot.base_dir();
         let server = load_server_material(source, server_directory.unwrap_or(base_dir))?;
+        Self::load_from_snapshot_with_loaded_server(snapshot, server)
+    }
+
+    /// Validate an already decoded default server chain while reading trust and client identity from the pinned source.
+    /// Serving validity, EKU and key matching are checked here even when the publication ledger was verified earlier.
+    pub fn load_from_snapshot_with_server_identity(
+        snapshot: &TlsSourceSnapshot,
+        certificates: Vec<CertificateDer<'static>>,
+        private_key_pem: &[u8],
+    ) -> Result<Self, TlsRuntimeError> {
+        snapshot.validate_available()?;
+        let key = parse_private_key_pem(private_key_pem, "default")?;
+        validate_certified_key(&certificates, &key, "default", true)?;
+        Self::load_from_snapshot_with_loaded_server(
+            snapshot,
+            Some(ServerTlsMaterial::SingleCert {
+                certs: certificates,
+                key,
+            }),
+        )
+    }
+
+    fn load_from_snapshot_with_loaded_server(
+        snapshot: &TlsSourceSnapshot,
+        server: Option<ServerTlsMaterial>,
+    ) -> Result<Self, TlsRuntimeError> {
+        snapshot.validate_available()?;
+        let source = snapshot.resolved_source();
+        let base_dir = snapshot.base_dir();
         let public_ca_pem = read_optional_tls_file(&base_dir.join(&source.layout.public_ca_filename))?;
         let fallback_ca_pem = read_optional_tls_file(&base_dir.join(&source.fallback_ca_filename))?;
         let client_ca_pem = read_optional_tls_file(&base_dir.join(&source.layout.client_ca_filename))?;
@@ -263,6 +292,79 @@ mod tests {
         let pair = rcgen::generate_simple_self_signed(vec![domain.to_string()]).expect("generate certificate");
         fs::write(dir.join("rustfs_cert.pem"), pair.cert.pem()).expect("write certificate");
         fs::write(dir.join("rustfs_key.pem"), pair.signing_key.serialize_pem()).expect("write private key");
+    }
+
+    #[test]
+    fn provided_server_identity_does_not_reread_server_files_and_preserves_trust() {
+        let base = TempDir::new().expect("base source");
+        let serving = rcgen::generate_simple_self_signed(vec!["example.com".into()]).expect("server identity");
+        let trust = rcgen::generate_simple_self_signed(vec!["trust.example".into()]).expect("trust source");
+        fs::write(base.path().join("rustfs_cert.pem"), "unusable server certificate").expect("poison base certificate");
+        fs::write(base.path().join("rustfs_key.pem"), "unusable server key").expect("poison base key");
+        fs::write(base.path().join(rustfs_config::RUSTFS_CA_CERT), trust.cert.pem()).expect("trust file");
+        let source = TlsSource::from_directory(base.path()).snapshot().expect("source");
+        let loaded = TlsMaterialSnapshot::load_from_snapshot_with_server_identity(
+            &source,
+            vec![serving.cert.der().clone()],
+            serving.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("provided identity");
+        assert_eq!(loaded.outbound.root_ca_pem, trust.cert.pem().as_bytes());
+        assert!(
+            matches!(loaded.server, Some(ServerTlsMaterial::SingleCert { certs, .. }) if certs == vec![serving.cert.der().clone()])
+        );
+        fs::write(base.path().join(rustfs_config::RUSTFS_CA_CERT), "corrupt trust").expect("corrupt independent trust");
+        assert!(
+            TlsMaterialSnapshot::load_from_snapshot_with_server_identity(
+                &source,
+                vec![serving.cert.der().clone()],
+                serving.signing_key.serialize_pem().as_bytes()
+            )
+            .is_err(),
+            "providing server material must not bypass trust validation"
+        );
+    }
+
+    #[test]
+    fn provided_server_identity_preserves_key_time_and_eku_validation() {
+        let base = TempDir::new().expect("base source");
+        let source = TlsSource::from_directory(base.path()).snapshot().expect("source");
+        let serving = rcgen::generate_simple_self_signed(vec!["example.com".into()]).expect("server identity");
+        let wrong_key = KeyPair::generate().expect("wrong key");
+        assert!(
+            TlsMaterialSnapshot::load_from_snapshot_with_server_identity(
+                &source,
+                vec![serving.cert.der().clone()],
+                wrong_key.serialize_pem().as_bytes()
+            )
+            .is_err(),
+            "key matching remains mandatory"
+        );
+        let mut expired = CertificateParams::new(vec!["example.com".into()]).expect("parameters");
+        expired.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        expired.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let cert = expired.self_signed(&wrong_key).expect("expired certificate");
+        assert!(
+            TlsMaterialSnapshot::load_from_snapshot_with_server_identity(
+                &source,
+                vec![cert.der().clone()],
+                wrong_key.serialize_pem().as_bytes()
+            )
+            .is_err(),
+            "serving validity remains mandatory"
+        );
+        let mut client = CertificateParams::new(vec!["example.com".into()]).expect("parameters");
+        client.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = client.self_signed(&wrong_key).expect("client certificate");
+        assert!(
+            TlsMaterialSnapshot::load_from_snapshot_with_server_identity(
+                &source,
+                vec![cert.der().clone()],
+                wrong_key.serialize_pem().as_bytes()
+            )
+            .is_err(),
+            "server EKU remains mandatory"
+        );
     }
 
     #[tokio::test]

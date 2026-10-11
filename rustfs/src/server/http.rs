@@ -32,12 +32,12 @@ use crate::server::{
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
-        TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_snapshot,
+        PreparedServerTls, TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline,
         load_tls_material, spawn_reload_loop,
     },
 };
 #[cfg(feature = "http3")]
-use crate::server::{http3, hybrid::HybridBody, tls_material::build_http3_server_config_from_snapshot};
+use crate::server::{http3, hybrid::HybridBody};
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 #[cfg(test)]
@@ -1457,26 +1457,29 @@ pub async fn start_http_server(
             ))
         })?;
 
-        #[cfg(feature = "http3")]
-        if http3_enabled {
-            http3_server_config = build_http3_server_config_from_snapshot(&snapshot)
-                .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?;
-        }
-
-        let acceptor = build_acceptor_from_snapshot(&snapshot).map_err(|e| Error::other(e.to_string()))?;
+        let prepared = PreparedServerTls::from_snapshot(&snapshot).map_err(|e| Error::other(e.to_string()))?;
 
         // Fail closed: if TLS was explicitly configured but no server certificates
         // were found, refuse to start rather than silently falling back to plain HTTP.
-        match acceptor {
+        match prepared {
             None => {
                 return Err(Error::other(format!(
                     "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
                     tls_path
                 )));
             }
-            Some(a) => {
-                tls_initial_snapshot = Some(snapshot);
-                Some(a)
+            Some(prepared) => {
+                #[cfg(feature = "http3")]
+                if http3_enabled {
+                    http3_server_config = Some(
+                        prepared
+                            .http3_config()
+                            .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?,
+                    );
+                }
+                let acceptor = prepared.tcp_acceptor().map_err(|e| Error::other(e.to_string()))?;
+                tls_initial_snapshot = Some((snapshot, prepared));
+                Some(acceptor)
             }
         }
     } else {
@@ -1756,11 +1759,13 @@ pub async fn start_http_server(
     } else {
         None
     };
-    let tls_reload_task = if let (Some(holder), Some(initial)) = (tls_acceptor.as_ref(), tls_initial_snapshot.take()) {
+    let tls_reload_task = if let (Some(holder), Some((initial, prepared))) = (tls_acceptor.as_ref(), tls_initial_snapshot.take())
+    {
         spawn_reload_loop(
             tls_path.to_string(),
             holder.clone(),
             initial,
+            prepared,
             #[cfg(feature = "http3")]
             http3_server.as_ref().map(|(endpoint, _)| endpoint.clone()),
         )

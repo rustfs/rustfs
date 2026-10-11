@@ -150,6 +150,12 @@ snapshot before swapping them. A late listener first joins the accepted
 configuration, even if the current files have become invalid. TCP, QUIC and
 separate processes still have a short activation window; there is no global
 atomic certificate switch.
+TCP and QUIC derive their protocol settings from one prepared certificate
+resolver and client verifier for that generation. Publication state and retries
+load each immutable generation once per operation; the next operation validates
+its disk contents again. Reload uses the verified serving identity with the
+independently pinned trust/client source, without reopening its certificate and
+key files. Candidate staging still performs its separate disk validation.
 
 Unchanged material is skipped. A serving certificate renewal does not advance
 the outbound generation unless outbound trust or identity actually changes.

@@ -38,6 +38,42 @@ const INITIALIZED: &str = "initialized";
 const INITIALIZED_CONTENT: &[u8] = b"rustfs.tls-publish/v1alpha1\n";
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OperationReads {
+    certificates: usize,
+    keys: usize,
+    manifests: usize,
+    manifest_decodes: usize,
+    certificate_pem_traversals: usize,
+    leaf_der_decodes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPERATION_READS: std::cell::Cell<OperationReads> = const { std::cell::Cell::new(OperationReads {
+        certificates: 0, keys: 0, manifests: 0, manifest_decodes: 0,
+        certificate_pem_traversals: 0, leaf_der_decodes: 0,
+    }) };
+}
+
+#[cfg(test)]
+fn count_operation(action: impl FnOnce(&mut OperationReads)) {
+    OPERATION_READS.with(|counts| {
+        let mut value = counts.get();
+        action(&mut value);
+        counts.set(value);
+    });
+}
+
+fn certificate_pem_items(
+    bytes: &[u8],
+) -> impl Iterator<Item = Result<CertificateDer<'static>, rustls::pki_types::pem::Error>> + '_ {
+    #[cfg(test)]
+    count_operation(|counts| counts.certificate_pem_traversals += 1);
+    CertificateDer::pem_slice_iter(bytes)
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum FailurePoint {
     None,
@@ -65,6 +101,22 @@ struct Manifest {
     certificate_fingerprint: String,
     not_after_unix: i64,
     payload_digest: String,
+}
+
+// A disk operation pins one immutable generation and verifies its envelope once.
+// This value is never retained across requests or reload ticks.
+struct PublishedGeneration {
+    manifest: Manifest,
+    chain: Vec<CertificateDer<'static>>,
+    leaf: LeafMetadata,
+    key_pem: Vec<u8>,
+}
+
+struct LeafMetadata {
+    fingerprint: String,
+    not_after_unix: i64,
+    names: std::collections::BTreeSet<String>,
+    is_ca: bool,
 }
 
 #[derive(Serialize)]
@@ -123,20 +175,36 @@ fn payload_digest(certificate: &[u8], key: &[u8]) -> String {
     digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn leaf_metadata(certificate: &[u8]) -> Result<(String, i64), PublishError> {
-    let leaf = CertificateDer::pem_slice_iter(certificate)
-        .next()
-        .ok_or(PublishError::Invalid)?
-        .map_err(|_| PublishError::Invalid)?;
-    leaf_der_metadata(leaf.as_ref())
-}
-
-fn leaf_der_metadata(leaf: &[u8]) -> Result<(String, i64), PublishError> {
+fn parse_leaf(leaf: &[u8]) -> Result<LeafMetadata, PublishError> {
+    #[cfg(test)]
+    count_operation(|counts| counts.leaf_der_decodes += 1);
     let (remaining, parsed) = x509_parser::parse_x509_certificate(leaf).map_err(|_| PublishError::Invalid)?;
     if !remaining.is_empty() {
         return Err(PublishError::Invalid);
     }
-    Ok((hex_digest(leaf), parsed.validity().not_after.timestamp()))
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(san) = parsed.subject_alternative_name().map_err(|_| PublishError::Invalid)? {
+        for name in &san.value.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(name) => {
+                    names.insert(format!("dns:{}", name.to_ascii_lowercase()));
+                }
+                x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                    names.insert(format!("ip:{bytes:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(LeafMetadata {
+        fingerprint: hex_digest(leaf),
+        not_after_unix: parsed.validity().not_after.timestamp(),
+        names,
+        is_ca: parsed
+            .basic_constraints()
+            .map_err(|_| PublishError::Invalid)?
+            .is_some_and(|constraints| constraints.value.ca),
+    })
 }
 
 fn snapshot_leaf(snapshot: &TlsMaterialSnapshot) -> Option<String> {
@@ -171,6 +239,13 @@ fn open_regular(path: &Path, writable: bool, create: bool) -> Result<File, Publi
 
 fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>, PublishError> {
     let file = open_regular(path, false, false)?;
+    #[cfg(test)]
+    count_operation(|counts| match path.file_name().and_then(|name| name.to_str()) {
+        Some(RUSTFS_TLS_CERT) => counts.certificates += 1,
+        Some(RUSTFS_TLS_KEY) => counts.keys += 1,
+        Some(MANIFEST) => counts.manifests += 1,
+        _ => {}
+    });
     let mut bytes = Vec::new();
     file.take(u64::try_from(limit).map_err(|_| PublishError::Invalid)? + 1)
         .read_to_end(&mut bytes)?;
@@ -223,7 +298,7 @@ fn single_default_source(tls_path: &str) -> Result<(), PublishError> {
     Ok(())
 }
 
-fn current_directory(root: &Path) -> Result<Option<PathBuf>, PublishError> {
+fn current_generation(root: &Path) -> Result<Option<PublishedGeneration>, PublishError> {
     let initialized = match fs::symlink_metadata(root.join(INITIALIZED)) {
         Ok(_) => {
             if read_limited(&root.join(INITIALIZED), 128)? != INITIALIZED_CONTENT {
@@ -266,11 +341,7 @@ fn current_directory(root: &Path) -> Result<Option<PathBuf>, PublishError> {
     if !fs::symlink_metadata(&directory)?.is_dir() {
         return Err(PublishError::Invalid);
     }
-    let ledger = read_manifest(&directory)?;
-    if ledger.target_revision != id {
-        return Err(PublishError::Invalid);
-    }
-    Ok(Some(directory))
+    PublishedGeneration::load(directory, id).map(Some)
 }
 
 fn validate_source_separation(root: &Path, tls_path: &str) -> Result<(), PublishError> {
@@ -282,68 +353,93 @@ fn validate_source_separation(root: &Path, tls_path: &str) -> Result<(), Publish
     Ok(())
 }
 
-fn read_manifest(directory: &Path) -> Result<Manifest, PublishError> {
-    read_manifest_with_chain(directory).map(|(manifest, _)| manifest)
-}
-
-fn read_manifest_with_chain(directory: &Path) -> Result<(Manifest, Vec<CertificateDer<'static>>), PublishError> {
-    let ledger: Manifest =
-        serde_json::from_slice(&read_limited(&directory.join(MANIFEST), 4096)?).map_err(|_| PublishError::Invalid)?;
-    let certificate = read_limited(&directory.join(RUSTFS_TLS_CERT), MAX_CERT)?;
-    let key = read_limited(&directory.join(RUSTFS_TLS_KEY), MAX_KEY)?;
-    let (fingerprint, expiry) = leaf_metadata(&certificate)?;
-    if ledger.schema_version != SCHEMA
-        || ledger.issuance_id.is_nil()
-        || ledger.target_revision.is_nil()
-        || ledger.certificate_fingerprint != fingerprint
-        || ledger.not_after_unix != expiry
-        || ledger.payload_digest != payload_digest(&certificate, &key)
-    {
-        return Err(PublishError::Invalid);
+impl PublishedGeneration {
+    fn into_snapshot(self, source: &rustfs_tls_runtime::TlsSourceSnapshot) -> Result<TlsMaterialSnapshot, PublishError> {
+        TlsMaterialSnapshot::load_from_snapshot_with_server_identity(source, self.chain, &self.key_pem)
+            .map_err(|_| PublishError::Invalid)
     }
-    let chain = CertificateDer::pem_slice_iter(&certificate)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| PublishError::Invalid)?;
-    Ok((ledger, chain))
+
+    fn load(directory: PathBuf, revision: Uuid) -> Result<Self, PublishError> {
+        let manifest_bytes = read_limited(&directory.join(MANIFEST), 4096)?;
+        #[cfg(test)]
+        count_operation(|counts| counts.manifest_decodes += 1);
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|_| PublishError::Invalid)?;
+        let certificate = read_limited(&directory.join(RUSTFS_TLS_CERT), MAX_CERT)?;
+        let key = read_limited(&directory.join(RUSTFS_TLS_KEY), MAX_KEY)?;
+        let chain = certificate_pem_items(&certificate)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PublishError::Invalid)?;
+        let leaf = parse_leaf(chain.first().ok_or(PublishError::Invalid)?.as_ref())?;
+        if manifest.schema_version != SCHEMA
+            || manifest.issuance_id.is_nil()
+            || manifest.target_revision.is_nil()
+            || manifest.target_revision != revision
+            || manifest.certificate_fingerprint != leaf.fingerprint
+            || manifest.not_after_unix != leaf.not_after_unix
+            || manifest.payload_digest != payload_digest(&certificate, &key)
+        {
+            return Err(PublishError::Invalid);
+        }
+        Ok(Self {
+            manifest,
+            chain,
+            leaf,
+            key_pem: key,
+        })
+    }
 }
 
-pub(crate) fn configured_server_directory(tls_path: &str) -> Result<Option<PathBuf>, PublishError> {
+#[cfg(test)]
+fn current_directory(root: &Path) -> Result<Option<PathBuf>, PublishError> {
+    current_generation(root).map(|generation| {
+        generation.map(|generation| root.join("generations").join(generation.manifest.target_revision.to_string()))
+    })
+}
+
+pub(crate) fn configured_server_snapshot(
+    tls_path: &str,
+    source: &rustfs_tls_runtime::TlsSourceSnapshot,
+) -> Result<Option<TlsMaterialSnapshot>, PublishError> {
     let Some(root) = configured_root()? else {
         return Ok(None);
     };
     validate_source_separation(&root, tls_path)?;
     single_default_source(tls_path)?;
-    current_directory(&root)
+    current_generation(&root)?
+        .map(|generation| generation.into_snapshot(source))
+        .transpose()
 }
 
 fn state_at(root: &Path, tls_path: &str) -> Result<CertificateState, PublishError> {
-    let (target_revision, certificate_fingerprint, not_after_unix, last_issuance_id, expected_chain) =
-        if let Some(directory) = current_directory(root)? {
-            let (ledger, chain) = read_manifest_with_chain(&directory)?;
-            (
-                ledger.target_revision.to_string(),
-                ledger.certificate_fingerprint,
-                ledger.not_after_unix,
-                Some(ledger.issuance_id),
-                chain,
-            )
-        } else {
-            let snapshot = tls_material::observed_server_snapshot(tls_path).ok_or(PublishError::Disabled)?;
-            let Some(ServerTlsMaterial::SingleCert { certs, .. }) = &snapshot.server else {
-                return Err(PublishError::Invalid);
-            };
-            let chain = certs.clone();
-            let (fingerprint, expiry) = leaf_der_metadata(chain.first().ok_or(PublishError::Invalid)?.as_ref())?;
-            (format!("bootstrap-{fingerprint}"), fingerprint, expiry, None, chain)
-        };
+    let generation = current_generation(root)?;
+    state_from_generation(generation.as_ref(), tls_path)
+}
+
+fn state_from_generation(generation: Option<&PublishedGeneration>, tls_path: &str) -> Result<CertificateState, PublishError> {
+    if let Some(generation) = generation {
+        return Ok(CertificateState {
+            schema_version: SCHEMA,
+            resource_id: RESOURCE,
+            target_revision: generation.manifest.target_revision.to_string(),
+            certificate_fingerprint: generation.leaf.fingerprint.clone(),
+            not_after_unix: generation.leaf.not_after_unix,
+            last_issuance_id: Some(generation.manifest.issuance_id),
+            observed_certificate_fingerprint: observed(tls_path, &generation.chain),
+        });
+    }
+    let snapshot = tls_material::observed_server_snapshot(tls_path).ok_or(PublishError::Disabled)?;
+    let Some(ServerTlsMaterial::SingleCert { certs, .. }) = &snapshot.server else {
+        return Err(PublishError::Invalid);
+    };
+    let leaf = parse_leaf(certs.first().ok_or(PublishError::Invalid)?.as_ref())?;
     Ok(CertificateState {
         schema_version: SCHEMA,
         resource_id: RESOURCE,
-        target_revision,
-        certificate_fingerprint,
-        not_after_unix,
-        last_issuance_id,
-        observed_certificate_fingerprint: observed(tls_path, &expected_chain),
+        target_revision: format!("bootstrap-{}", leaf.fingerprint),
+        certificate_fingerprint: leaf.fingerprint,
+        not_after_unix: leaf.not_after_unix,
+        last_issuance_id: None,
+        observed_certificate_fingerprint: observed(tls_path, certs),
     })
 }
 
@@ -436,11 +532,12 @@ fn publish_at_inner(
         std::fs::TryLockError::WouldBlock => PublishError::Busy,
         std::fs::TryLockError::Error(_) => PublishError::Storage,
     })?;
-    let state = state_at(root, tls_path)?;
+    let current = current_generation(root)?;
+    let state = state_from_generation(current.as_ref(), tls_path)?;
     let digest = payload_digest(request.certificate_pem.as_bytes(), request.private_key_pem.as_bytes());
     if state.last_issuance_id == Some(request.issuance_id) {
-        let directory = current_directory(root)?.ok_or(PublishError::Invalid)?;
-        if read_manifest(&directory)?.payload_digest != digest {
+        let generation = current.as_ref().ok_or(PublishError::Invalid)?;
+        if generation.manifest.payload_digest != digest {
             return Err(PublishError::Conflict);
         }
         // A prior response may have been lost after rename or directory sync.
@@ -455,30 +552,19 @@ fn publish_at_inner(
     let Some(ServerTlsMaterial::SingleCert { certs, .. }) = &accepted.server else {
         return Err(PublishError::Invalid);
     };
-    let old_leaf = if let Some(directory) = current_directory(root)? {
-        let (_, chain) = read_manifest_with_chain(&directory)?;
-        chain.into_iter().next().ok_or(PublishError::Invalid)?
+    let old_names = if let Some(generation) = current.as_ref() {
+        generation.leaf.names.clone()
     } else {
         if snapshot_leaf(&accepted).as_ref() != Some(&state.certificate_fingerprint) {
             return Err(PublishError::Conflict);
         }
-        certs.first().ok_or(PublishError::Invalid)?.clone()
+        parse_leaf(certs.first().ok_or(PublishError::Invalid)?.as_ref())?.names
     };
-    let new_leaf = CertificateDer::pem_slice_iter(request.certificate_pem.as_bytes())
-        .next()
-        .ok_or(PublishError::Invalid)?
+    let new_chain = certificate_pem_items(request.certificate_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_| PublishError::Invalid)?;
-    let (_, parsed_leaf) = x509_parser::parse_x509_certificate(new_leaf.as_ref()).map_err(|_| PublishError::Invalid)?;
-    if parsed_leaf
-        .basic_constraints()
-        .map_err(|_| PublishError::Invalid)?
-        .is_some_and(|constraints| constraints.value.ca)
-    {
-        return Err(PublishError::Invalid);
-    }
-    let old_names = tls_material::certificate_names(&old_leaf).map_err(|_| PublishError::Invalid)?;
-    let new_names = tls_material::certificate_names(&new_leaf).map_err(|_| PublishError::Invalid)?;
-    if !old_names.is_subset(&new_names) {
+    let new_leaf = parse_leaf(new_chain.first().ok_or(PublishError::Invalid)?.as_ref())?;
+    if new_leaf.is_ca || !old_names.is_subset(&new_leaf.names) {
         return Err(PublishError::Invalid);
     }
     let generations = root.join("generations");
@@ -514,21 +600,22 @@ fn publish_at_inner(
             Some(&directory),
         )
         .map_err(|_| PublishError::Invalid)?;
+        if !matches!(&candidate.server, Some(ServerTlsMaterial::SingleCert { certs, .. }) if certs == &new_chain) {
+            return Err(PublishError::Invalid);
+        }
         tls_material::validate_candidate_replacement(&accepted, &candidate).map_err(|_| PublishError::Invalid)?;
-        tls_material::build_acceptor_from_snapshot(&candidate)
+        let prepared = tls_material::PreparedServerTls::from_snapshot(&candidate)
             .map_err(|_| PublishError::Invalid)?
             .ok_or(PublishError::Invalid)?;
+        prepared.tcp_acceptor().map_err(|_| PublishError::Invalid)?;
         #[cfg(feature = "http3")]
-        tls_material::build_http3_server_config_from_snapshot(&candidate)
-            .map_err(|_| PublishError::Invalid)?
-            .ok_or(PublishError::Invalid)?;
-        let (fingerprint, expiry) = leaf_metadata(request.certificate_pem.as_bytes())?;
+        prepared.http3_config().map_err(|_| PublishError::Invalid)?;
         let ledger = Manifest {
             schema_version: SCHEMA.into(),
             issuance_id: request.issuance_id,
             target_revision: revision,
-            certificate_fingerprint: fingerprint,
-            not_after_unix: expiry,
+            certificate_fingerprint: new_leaf.fingerprint.clone(),
+            not_after_unix: new_leaf.not_after_unix,
             payload_digest: digest,
         };
         write_new(
@@ -557,8 +644,13 @@ fn publish_at_inner(
         }
         File::open(root)?.sync_all()?;
         mark_initialized(root)?;
-        let state = state_at(root, tls_path)?;
-        Ok(receipt(state, request.issuance_id))
+        let installed = PublishedGeneration {
+            manifest: ledger,
+            chain: new_chain,
+            leaf: new_leaf,
+            key_pem: request.private_key_pem.into_bytes(),
+        };
+        Ok(receipt(state_from_generation(Some(&installed), tls_path)?, request.issuance_id))
     })();
     // Observation errors must never convert an uncertain publication into deletion of serving material.
     if result.is_err() && !pointer_may_reference {
@@ -615,6 +707,114 @@ mod tests {
         }
     }
 
+    fn measure_operation<T>(operation: impl FnOnce() -> T) -> (T, OperationReads) {
+        OPERATION_READS.with(|counts| counts.set(OperationReads::default()));
+        let result = operation();
+        (result, OPERATION_READS.with(std::cell::Cell::get))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_operation_reads_are_bounded() {
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (rustfs_config::ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TLS_PUBLISH_DIR, None),
+            ],
+            async {
+                let base = tempfile::TempDir::new().expect("base");
+                let root = tempfile::TempDir::new().expect("publication root");
+                fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("permissions");
+                let original = pair("server.example");
+                fs::write(base.path().join(RUSTFS_TLS_CERT), original.cert.pem()).expect("certificate");
+                fs::write(base.path().join(RUSTFS_TLS_KEY), original.signing_key.serialize_pem()).expect("key");
+                let path = base.path().to_str().expect("path");
+                let initial = TlsMaterialSnapshot::load(&TlsSource::from_directory(base.path()))
+                    .await
+                    .expect("initial");
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared TLS")
+                    .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
+                let task = tls_material::spawn_reload_loop(
+                    path.into(),
+                    holder,
+                    initial,
+                    prepared,
+                    #[cfg(feature = "http3")]
+                    None,
+                )
+                .expect("registration")
+                .expect("reload task");
+                let bootstrap = state_at(root.path(), path).expect("bootstrap");
+                let request = build_request(&bootstrap.target_revision, &pair("server.example"));
+                let retry = clone_request(&request);
+                publish_at(root.path(), path, request).expect("first publication");
+                let (state, get_counts) = measure_operation(|| state_at(root.path(), path).expect("state"));
+                let (_, retry_counts) = measure_operation(|| publish_at(root.path(), path, retry).expect("retry"));
+                let (_, reload_counts) = measure_operation(|| {
+                    let generation = current_generation(root.path()).expect("generation").expect("published");
+                    generation
+                        .into_snapshot(&TlsSource::from_directory(base.path()).snapshot().expect("source"))
+                        .expect("runtime snapshot")
+                });
+                let (_, publish_counts) = measure_operation(|| {
+                    publish_at(root.path(), path, build_request(&state.target_revision, &pair("server.example")))
+                        .expect("next publication")
+                });
+                println!("GET={get_counts:?}; RETRY={retry_counts:?}; PUBLISH={publish_counts:?}");
+                println!("RELOAD={reload_counts:?}");
+                assert_eq!(
+                    reload_counts,
+                    OperationReads {
+                        certificates: 1,
+                        keys: 1,
+                        manifests: 1,
+                        manifest_decodes: 1,
+                        certificate_pem_traversals: 1,
+                        leaf_der_decodes: 1
+                    }
+                );
+                assert_eq!(
+                    get_counts,
+                    OperationReads {
+                        certificates: 1,
+                        keys: 1,
+                        manifests: 1,
+                        manifest_decodes: 1,
+                        certificate_pem_traversals: 1,
+                        leaf_der_decodes: 1
+                    }
+                );
+                assert_eq!(
+                    retry_counts,
+                    OperationReads {
+                        certificates: 1,
+                        keys: 1,
+                        manifests: 1,
+                        manifest_decodes: 1,
+                        certificate_pem_traversals: 1,
+                        leaf_der_decodes: 1
+                    }
+                );
+                assert_eq!(
+                    publish_counts,
+                    OperationReads {
+                        certificates: 1,
+                        keys: 1,
+                        manifests: 1,
+                        manifest_decodes: 1,
+                        certificate_pem_traversals: 2,
+                        leaf_der_decodes: 2
+                    }
+                );
+                task.abort();
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn publication_preserves_trust_rejects_stale_and_recovers_lost_receipt() {
@@ -641,13 +841,15 @@ mod tests {
                 let initial = TlsMaterialSnapshot::load(&TlsSource::from_directory(base.path()))
                     .await
                     .expect("initial");
-                let holder = tls_material::build_acceptor_from_snapshot(&initial)
-                    .expect("acceptor")
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared TLS")
                     .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
                 let task = tls_material::spawn_reload_loop(
                     path.into(),
                     holder,
                     initial,
+                    prepared,
                     #[cfg(feature = "http3")]
                     None,
                 )
@@ -762,6 +964,120 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn expired_generation_can_renew_and_next_operation_detects_corruption() {
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (rustfs_config::ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TLS_PUBLISH_DIR, None),
+            ],
+            async {
+                let base = tempfile::TempDir::new().expect("base");
+                let root = tempfile::TempDir::new().expect("publication root");
+                fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("permissions");
+                let original = pair("server.example");
+                fs::write(base.path().join(RUSTFS_TLS_CERT), original.cert.pem()).expect("certificate");
+                fs::write(base.path().join(RUSTFS_TLS_KEY), original.signing_key.serialize_pem()).expect("key");
+                let path = base.path().to_str().expect("path");
+                let initial = TlsMaterialSnapshot::load(&TlsSource::from_directory(base.path()))
+                    .await
+                    .expect("initial");
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared")
+                    .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
+                let task = tls_material::spawn_reload_loop(
+                    path.into(),
+                    holder,
+                    initial,
+                    prepared,
+                    #[cfg(feature = "http3")]
+                    None,
+                )
+                .expect("registration")
+                .expect("reload task");
+                let expired_key = rcgen::KeyPair::generate().expect("expired key");
+                let mut params = rcgen::CertificateParams::new(vec!["server.example".into(), "expired-required.example".into()])
+                    .expect("parameters");
+                params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+                params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+                let expired = params.self_signed(&expired_key).expect("expired certificate");
+                let certificate = expired.pem();
+                let key = expired_key.serialize_pem();
+                let revision = Uuid::new_v4();
+                let generations = root.path().join("generations");
+                fs::create_dir(&generations).expect("generations");
+                let directory = generations.join(revision.to_string());
+                fs::create_dir(&directory).expect("generation");
+                write_new(&directory.join(RUSTFS_TLS_CERT), certificate.as_bytes()).expect("expired cert");
+                write_new(&directory.join(RUSTFS_TLS_KEY), key.as_bytes()).expect("expired key");
+                let leaf = parse_leaf(expired.der().as_ref()).expect("expired metadata");
+                let manifest = Manifest {
+                    schema_version: SCHEMA.into(),
+                    issuance_id: Uuid::new_v4(),
+                    target_revision: revision,
+                    certificate_fingerprint: leaf.fingerprint,
+                    not_after_unix: leaf.not_after_unix,
+                    payload_digest: payload_digest(certificate.as_bytes(), key.as_bytes()),
+                };
+                write_new(&directory.join(MANIFEST), &serde_json::to_vec(&manifest).expect("manifest")).expect("manifest file");
+                std::os::unix::fs::symlink(Path::new("generations").join(revision.to_string()), root.path().join(CURRENT))
+                    .expect("pointer");
+                mark_initialized(root.path()).expect("initialized");
+                let state = state_at(root.path(), path).expect("expired visible head remains readable");
+                assert!(state.not_after_unix < 1_000_000_000);
+                assert!(
+                    current_generation(root.path())
+                        .expect("expired generation")
+                        .expect("present")
+                        .into_snapshot(&TlsSource::from_directory(base.path()).snapshot().expect("source"))
+                        .is_err(),
+                    "reading an expired ledger must never bypass serving validity checks"
+                );
+                assert!(
+                    matches!(
+                        publish_at(root.path(), path, build_request(&state.target_revision, &pair("server.example"))),
+                        Err(PublishError::Invalid)
+                    ),
+                    "expired durable SAN coverage must survive renewal"
+                );
+                let renewed =
+                    rcgen::generate_simple_self_signed(vec!["server.example".into(), "expired-required.example".into()])
+                        .expect("renewal");
+                let request = build_request(&state.target_revision, &renewed);
+                let retry = clone_request(&request);
+                let receipt = publish_at(root.path(), path, request).expect("renew expired generation");
+                assert_ne!(receipt.target_revision, state.target_revision);
+                let generation = current_generation(root.path()).expect("published").expect("generation");
+                assert_eq!(
+                    state_at(root.path(), path).expect("first independent read").target_revision,
+                    receipt.target_revision
+                );
+                let directory = root
+                    .path()
+                    .join("generations")
+                    .join(generation.manifest.target_revision.to_string());
+                fs::write(directory.join(RUSTFS_TLS_KEY), "corrupted key").expect("corrupt after read");
+                let snapshot = generation
+                    .into_snapshot(&TlsSource::from_directory(base.path()).snapshot().expect("source"))
+                    .expect("the pinned operation consumes its already verified material without a second file read");
+                assert_eq!(snapshot_leaf(&snapshot), Some(receipt.certificate_fingerprint.clone()));
+                assert!(
+                    matches!(state_at(root.path(), path), Err(PublishError::Invalid)),
+                    "the next operation must revalidate disk"
+                );
+                assert!(
+                    matches!(publish_at(root.path(), path, retry), Err(PublishError::Invalid)),
+                    "idempotent retry must not bypass disk corruption"
+                );
+                task.abort();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn invalid_candidate_never_changes_pointer() {
         temp_env::async_with_vars(
             [
@@ -780,13 +1096,15 @@ mod tests {
                 let initial = TlsMaterialSnapshot::load(&TlsSource::from_directory(base.path()))
                     .await
                     .expect("initial");
-                let holder = tls_material::build_acceptor_from_snapshot(&initial)
-                    .expect("acceptor")
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared TLS")
                     .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
                 let task = tls_material::spawn_reload_loop(
                     path.into(),
                     holder,
                     initial,
+                    prepared,
                     #[cfg(feature = "http3")]
                     None,
                 )
@@ -855,13 +1173,15 @@ mod tests {
             async {
                 let path = base.path().to_str().expect("path");
                 let initial = tls_material::load_tls_material(path).await.expect("initial snapshot");
-                let holder = tls_material::build_acceptor_from_snapshot(&initial)
-                    .expect("acceptor")
-                    .expect("TLS server");
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared TLS")
+                    .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
                 let registration = tls_material::spawn_reload_loop(
                     path.into(),
                     holder.clone(),
                     initial,
+                    prepared,
                     #[cfg(feature = "http3")]
                     None,
                 )
