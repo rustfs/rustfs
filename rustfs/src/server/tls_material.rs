@@ -781,6 +781,8 @@ struct ReloadGroup {
     state: Mutex<ReloadState>,
     changed: tokio::sync::Notify,
     next_id: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pass_completed: tokio::sync::Notify,
 }
 
 // Lock order is registry, then group state, then acceptor. Neither guard crosses an await.
@@ -917,6 +919,8 @@ pub(crate) fn spawn_reload_loop(
             }),
             changed: tokio::sync::Notify::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(test)]
+            pass_completed: tokio::sync::Notify::new(),
         })
     });
     let id = group.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -980,12 +984,19 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
         let result = async {
             let candidate = load_tls_material(&tls_path).await?;
             validate_candidate_replacement(&accepted, &candidate)?;
-            if (!accepted.outbound.root_ca_pem.is_empty() && candidate.outbound.root_ca_pem.is_empty())
-                || (accepted.outbound.mtls_identity.is_some() && candidate.outbound.mtls_identity.is_none())
+            // Listener initialization can load a newer bundle than startup published.
+            let published = startup_runtime_sources::current_outbound_tls_state().await;
+            let required_roots =
+                !accepted.outbound.root_ca_pem.is_empty() || published.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty());
+            let required_identity = accepted.outbound.mtls_identity.is_some() || published.mtls_identity.is_some();
+            if (required_roots && candidate.outbound.root_ca_pem.is_empty())
+                || (required_identity && candidate.outbound.mtls_identity.is_none())
             {
                 return Err(TlsMaterialError::Parse("required outbound TLS material disappeared".into()));
             }
-            let outbound_changed = !outbound_material_matches(&accepted.outbound, &candidate.outbound);
+            let outbound_changed = !outbound_material_matches(&accepted.outbound, &candidate.outbound)
+                || published.root_ca_pem.as_deref().unwrap_or_default() != candidate.outbound.root_ca_pem.as_slice()
+                || published.mtls_identity != candidate.outbound.mtls_identity;
             if accepted.fingerprint == candidate.fingerprint && !outbound_changed {
                 startup_runtime_sources::record_tls_reload_skipped("rustfs_server_reload_loop", "unchanged");
                 return Ok(None);
@@ -1048,6 +1059,8 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
                     result = "rejected", error = %error, "TLS material update rejected");
             }
         }
+        #[cfg(test)]
+        group.pass_completed.notify_one();
     }
 }
 
@@ -1205,6 +1218,177 @@ mod tests {
                 .expect("valid override")
                 .is_some()
         );
+    }
+
+    enum StartupRotation {
+        Outbound,
+        RootsOnly,
+        IdentityOnly,
+        ServerOnly,
+        MissingRoots,
+        MissingIdentity,
+    }
+
+    async fn assert_initial_outbound_reconciliation(rotation: StartupRotation) {
+        ensure_rustls_crypto_provider();
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TRUST_LEAF_CERT_AS_CA, Some("0")),
+                (ENV_TRUST_SYSTEM_CA, Some("0")),
+                (ENV_MTLS_CLIENT_CERT, None),
+                (ENV_MTLS_CLIENT_KEY, None),
+                (ENV_RUSTFS_EXTRA_CA_CERT, None),
+                (super::super::tls_publish::ENV_TLS_PUBLISH_DIR, None),
+            ],
+            async {
+                let previous = startup_runtime_sources::current_outbound_tls_state().await;
+                let dir = TempDir::new().expect("TLS directory");
+                write_test_cert_pair(dir.path(), "server.example");
+                let identity_a = rcgen::generate_simple_self_signed(vec!["client-a.example".into()]).expect("identity A");
+                fs::write(dir.path().join(RUSTFS_CA_CERT), identity_a.cert.pem()).expect("trust A");
+                fs::write(dir.path().join(RUSTFS_CLIENT_CERT_FILENAME), identity_a.cert.pem()).expect("client certificate A");
+                fs::write(dir.path().join(RUSTFS_CLIENT_KEY_FILENAME), identity_a.signing_key.serialize_pem())
+                    .expect("client key A");
+                let path = dir.path().to_str().expect("UTF8 path").to_string();
+                let mut config = crate::config::Config::new("127.0.0.1:0", Vec::new());
+                config.tls_path = Some(path.clone());
+                crate::startup_tls_material::init_outbound_tls_material(&config)
+                    .await
+                    .expect("real startup publication");
+                let startup = startup_runtime_sources::current_outbound_tls_state().await;
+
+                write_test_cert_pair(dir.path(), "server.example");
+                match rotation {
+                    StartupRotation::Outbound | StartupRotation::RootsOnly | StartupRotation::IdentityOnly => {
+                        let identity_b = rcgen::generate_simple_self_signed(vec!["client-b.example".into()]).expect("identity B");
+                        if !matches!(rotation, StartupRotation::IdentityOnly) {
+                            fs::write(dir.path().join(RUSTFS_CA_CERT), identity_b.cert.pem()).expect("trust B");
+                        }
+                        if !matches!(rotation, StartupRotation::RootsOnly) {
+                            fs::write(dir.path().join(RUSTFS_CLIENT_CERT_FILENAME), identity_b.cert.pem())
+                                .expect("client certificate B");
+                            fs::write(dir.path().join(RUSTFS_CLIENT_KEY_FILENAME), identity_b.signing_key.serialize_pem())
+                                .expect("client key B");
+                        }
+                    }
+                    StartupRotation::ServerOnly => {}
+                    StartupRotation::MissingRoots => {
+                        fs::remove_file(dir.path().join(RUSTFS_CA_CERT)).expect("remove startup roots");
+                    }
+                    StartupRotation::MissingIdentity => {
+                        fs::remove_file(dir.path().join(RUSTFS_CLIENT_CERT_FILENAME)).expect("remove startup client certificate");
+                        fs::remove_file(dir.path().join(RUSTFS_CLIENT_KEY_FILENAME)).expect("remove startup client key");
+                    }
+                }
+                let initial = load_tls_material(&path).await.expect("HTTP initialization snapshot");
+                let incomplete = matches!(rotation, StartupRotation::MissingRoots | StartupRotation::MissingIdentity);
+                let expected_roots = if incomplete {
+                    startup.root_ca_pem.clone().expect("startup trust")
+                } else {
+                    initial.outbound.root_ca_pem.clone()
+                };
+                let expected_identity = if incomplete {
+                    startup.mtls_identity.clone()
+                } else {
+                    initial.outbound.mtls_identity.clone()
+                };
+                let holder = build_acceptor_from_snapshot(&initial).expect("config B").expect("TLS B");
+                let initial_acceptor = holder.get();
+                let task = spawn_reload_loop(
+                    path.clone(),
+                    holder.clone(),
+                    initial,
+                    #[cfg(feature = "http3")]
+                    None,
+                )
+                .expect("register HTTP initialization snapshot")
+                .expect("reload enabled");
+                let group = RELOAD_GROUPS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&path)
+                    .and_then(Weak::upgrade)
+                    .expect("registered reload group");
+                notify_server_publication(&path);
+                tokio::time::timeout(Duration::from_secs(10), group.pass_completed.notified())
+                    .await
+                    .expect("first reload pass completed");
+                let first = startup_runtime_sources::current_outbound_tls_state().await;
+                notify_server_publication(&path);
+                tokio::time::timeout(Duration::from_secs(10), group.pass_completed.notified())
+                    .await
+                    .expect("second reload pass completed");
+                let second = startup_runtime_sources::current_outbound_tls_state().await;
+
+                task.abort();
+                let _ = task.await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&path) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("reload group exits before restoring global state");
+                startup_runtime_sources::publish_outbound_tls_state(
+                    TlsGeneration(second.generation.0.saturating_add(1)),
+                    &rustfs_tls_runtime::OutboundTlsMaterial {
+                        root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                        mtls_identity: previous.mtls_identity,
+                    },
+                )
+                .await;
+
+                assert_eq!(first.root_ca_pem.as_deref(), Some(expected_roots.as_slice()));
+                assert!(
+                    first.mtls_identity == expected_identity,
+                    "published identity must match the initialized listener snapshot"
+                );
+                let rotate_outbound = matches!(
+                    rotation,
+                    StartupRotation::Outbound | StartupRotation::RootsOnly | StartupRotation::IdentityOnly
+                );
+                let expected_generation = startup.generation.0.saturating_add(u64::from(rotate_outbound));
+                assert_eq!(first.generation.0, expected_generation);
+                assert_eq!(second.generation, first.generation, "unchanged material must not churn outbound clients");
+                assert!(
+                    rotate_outbound || Arc::ptr_eq(&holder.get(), &initial_acceptor),
+                    "non-publications must retain the initial server configuration"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_reload_reconciles_initial_outbound_after_startup_rotation() {
+        for rotation in [
+            StartupRotation::RootsOnly,
+            StartupRotation::IdentityOnly,
+            StartupRotation::Outbound,
+        ] {
+            assert_initial_outbound_reconciliation(rotation).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_reload_initial_server_rotation_preserves_matching_outbound_generation() {
+        assert_initial_outbound_reconciliation(StartupRotation::ServerOnly).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_reload_initial_missing_roots_retains_startup_material() {
+        assert_initial_outbound_reconciliation(StartupRotation::MissingRoots).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_reload_initial_missing_identity_retains_startup_material() {
+        assert_initial_outbound_reconciliation(StartupRotation::MissingIdentity).await;
     }
 
     #[tokio::test]
