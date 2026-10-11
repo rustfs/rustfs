@@ -5227,6 +5227,42 @@ impl ECStore {
                 return Ok(obj);
             }
             Err(err) => {
+                if is_err_object_not_found(&err)
+                    && opts.version_id.is_none()
+                    && !opts.versioned
+                    && !opts.version_suspended
+                    && opts.http_preconditions.is_none()
+                    && !opts.replication_request
+                {
+                    let mut reclaimed = None;
+                    for pool in &self.pools {
+                        if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+                            return Err(StorageError::SlowDown);
+                        }
+                        let pool_idx = pool.pool_idx;
+                        let pool = pool.clone();
+                        match self
+                            .run_external_decommission_capacity_object_delete(
+                                pool_idx,
+                                bucket,
+                                object,
+                                object,
+                                opts.clone(),
+                                |opts| async move { pool.delete_object(bucket, object, opts).await },
+                            )
+                            .await
+                        {
+                            Ok(result) => reclaimed = Some(result),
+                            Err(missing) if is_err_object_not_found(&missing) || is_err_version_not_found(&missing) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if let Some(mut result) = reclaimed {
+                        result.bucket = bucket.to_owned();
+                        result.name = decode_dir_object(object);
+                        return Ok(result);
+                    }
+                }
                 // A folder key (`prefix/`) with no object metadata may still exist on
                 // disk as an orphan empty-directory tree (issue #4189): listings show
                 // it as a common prefix, but no regular delete path can remove it.

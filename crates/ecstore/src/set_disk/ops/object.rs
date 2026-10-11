@@ -3308,6 +3308,54 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
 }
 
 impl SetDisks {
+    async fn reclaim_missing_delete_residue(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        lock_guard: Option<&super::super::ObjectLockDiagGuard>,
+    ) -> Result<bool> {
+        if is_meta_bucketname(bucket)
+            || opts.version_id.is_some()
+            || opts.versioned
+            || opts.version_suspended
+            || opts.http_preconditions.is_some()
+            || opts.data_movement
+            || opts.transition.expire_restored
+            || opts.replication_request
+            || opts.lifecycle_delete_all.is_some()
+            || opts.delete_prefix
+            || opts.expected_current_version_id.is_some()
+            || !metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                .await
+                .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let lock_state = match opts.object_lock_config_snapshot.as_ref() {
+            Some(snapshot) => Some(snapshot.state().clone()),
+            None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await.ok(),
+        };
+        if !matches!(lock_state, Some(ObjectLockConfigState::ConfirmedAbsent)) {
+            return Ok(false);
+        }
+        if let Some(expected) = opts.expected_bucket_incarnation_id {
+            self.validate_bucket_incarnation(bucket, expected, opts).await?;
+        }
+        ensure_delete_commit_locks_held(lock_guard, bucket, object, opts)?;
+        begin_scanner_publication_delete_mutation(opts.scanner_publication_commit_scope.as_ref())?;
+        let result = self
+            .purge_delete_retry_residue(bucket, object, || {
+                ensure_delete_commit_locks_held(lock_guard, bucket, object, opts).is_ok()
+                    && opts
+                        .scanner_publication_commit_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.can_commit())
+            })
+            .await;
+        ensure_delete_commit_locks_held(lock_guard, bucket, object, opts)?;
+        result.map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+    }
     pub(in crate::set_disk) async fn cleanup_rename_tail(
         &self,
         targets: Vec<RenameTailCleanup>,
@@ -7810,6 +7858,7 @@ impl SetDisks {
                             DeleteOptions {
                                 recursive: true,
                                 immediate: true,
+                                old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
                             disk_namespace_owner,
@@ -8313,6 +8362,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
         let mut delete_marker_purge_candidates = vec![None; objects.len()];
+        let mut missing_delete_retry_indices = Vec::new();
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
@@ -8359,6 +8409,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            if source_missing
+                && dobj.version_id.is_none()
+                && dobj.expected_identity.is_none()
+                && !versioned
+                && !version_suspended
+                && opts.http_preconditions.is_none()
+            {
+                missing_delete_retry_indices.push(i);
+            }
             // A pool-local miss keeps the existing idempotent batch-delete
             // semantics. Exact-version deletes fan out to every pool, and a
             // retry may also arrive after the intended generation is gone.
@@ -8820,6 +8879,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 DeleteOptions {
                                     recursive: true,
                                     immediate: true,
+                                    old_data_dir: Some(rollback_dir),
                                     ..Default::default()
                                 },
                             )
@@ -8854,6 +8914,21 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 candidate.free_version_id,
                 true,
             );
+        }
+
+        // A new explicit DELETE authorizes removal of the exact missing key's
+        // legacy residue; it does not infer whether the interrupted delete committed.
+        for index in missing_delete_retry_indices {
+            if del_errs[index].is_none() {
+                let object = &objects[index].object_name;
+                let result = match ensure_delete_commit_locks_held(None, bucket, object, &opts) {
+                    Ok(()) => self.reclaim_missing_delete_residue(bucket, object, &opts, None).await,
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = result {
+                    del_errs[index] = Some(err);
+                }
+            }
         }
 
         // TODO(backlog): support partial object deletion for multi-part objects
@@ -9140,6 +9215,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if should_force_delete_marker_for_missing_version(&opts) {
                 version_found = false;
             } else {
+                if is_err_object_not_found(err) {
+                    ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                    if self
+                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref())
+                        .await?
+                    {
+                        if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                            let _ = scope.mark_committed();
+                        }
+                        return Ok(ObjectInfo::default());
+                    }
+                }
                 return Err(err.clone());
             }
         }
@@ -23280,9 +23367,14 @@ mod single_delete_namespace_owner_tests {
             for (index, path) in metadata_paths.iter().enumerate() {
                 let tx = entered_tx.clone();
                 let (release, rx) = std::sync::mpsc::channel::<()>();
-                if last || cleanup {
-                    let source = if cleanup { &cleanup_sources[index] } else { path };
-                    destination_guards.push(hooks::observe_rename_destination(source, move |destination| {
+                if cleanup {
+                    let source = cleanup_sources[index].clone();
+                    guards.push(hooks::install_at(hooks::Stage::Remove, &source.join("part.1"), move || {
+                        let _ = tx.send((index, source));
+                        let _ = rx.recv();
+                    }));
+                } else if last {
+                    destination_guards.push(hooks::observe_rename_destination(path, move |destination| {
                         let _ = tx.send((index, destination.to_path_buf()));
                         let _ = rx.recv();
                     }));
@@ -23353,6 +23445,12 @@ mod single_delete_namespace_owner_tests {
                         if !rollback {
                             assert_eq!(Some(&bytes), original.as_ref());
                         }
+                    }
+                }
+                if cleanup {
+                    for (index, source) in cleanup_sources.iter().enumerate() {
+                        assert_eq!(std::fs::read(source.join("part.1")).expect("paused original shard"), cleanup_parts[index],
+                            "the paused physical cleanup must still own the exact original shard");
                     }
                 }
                 if rollback {
@@ -23431,11 +23529,7 @@ mod single_delete_namespace_owner_tests {
                 if cleanup {
                     assert!(!path.exists(), "metadata must remain deleted after cleanup cancellation");
                     assert!(!cleanup_sources[index].exists(), "physical cleanup must remove the shard directory");
-                    assert_eq!(
-                        std::fs::read(physical_keys[&index].join("part.1")).expect("actual trashed shard"),
-                        cleanup_parts[index],
-                        "trash must contain the exact original shard"
-                    );
+                    assert!(!physical_keys[&index].exists(), "the owned physical cleanup must remove its original shard directory");
                     continue;
                 }
                 if last {
@@ -23543,5 +23637,200 @@ mod single_delete_namespace_owner_tests {
     #[serial_test::serial(capacity_dirty_scope)]
     async fn single_delete_failed_quorum_keeps_owner_until_physical_undo() {
         assert_single_delete_physical_owner("rollback").await;
+    }
+}
+
+#[cfg(test)]
+mod crash_delete_retry_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
+    use rustfs_storage_api::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+
+    async fn stage_interrupted_delete(store: &Arc<ECStore>, dirs: &[tempfile::TempDir], bucket: &str, object: &str, size: usize) {
+        let mut reader = PutObjReader::from_vec(vec![37; size]);
+        store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("write the object before simulating an interrupted delete");
+        let transaction = Uuid::new_v4();
+        for dir in dirs {
+            let root = dir.path().join(bucket).join(object);
+            let xl = root.join(STORAGE_FORMAT_FILE);
+            let bytes = tokio::fs::read(&xl).await.expect("read original object metadata");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode original object metadata");
+            let info = metadata.versions[0]
+                .into_fileinfo(bucket, object, false)
+                .expect("read original version");
+            let backup = root.join(transaction.to_string());
+            tokio::fs::create_dir_all(&backup)
+                .await
+                .expect("create transaction directory");
+            tokio::fs::write(backup.join(STORAGE_FORMAT_FILE_BACKUP), bytes)
+                .await
+                .expect("stage intact rollback backup");
+            if let Some(data_dir) = info.data_dir {
+                let parts = root.join(data_dir.to_string());
+                if parts.is_dir() {
+                    tokio::fs::write(
+                        parts.join(format!("{}{}", crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                        [],
+                    )
+                    .await
+                    .expect("reserve external deletion before its local commit");
+                }
+            }
+            tokio::fs::remove_file(&xl)
+                .await
+                .expect("simulate crash after removing metadata");
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_single_reclaims_inline_backup_only() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-single";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        store
+            .delete_object(bucket, "inline", ObjectOptions::default())
+            .await
+            .expect("retry should reclaim the exact missing key");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("inline").exists(),
+                "inline backup residue must be removed on every disk"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the empty bucket must be deletable without force");
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_batch_reclaims_inline_and_reserved_external() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-batch";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        stage_interrupted_delete(&store, &dirs, bucket, "external", 1024 * 1024).await;
+        let objects = ["inline", "external"]
+            .into_iter()
+            .map(|name| ObjectToDelete {
+                object_name: name.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let (_, errors) = store.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "retry must complete for both crash shapes: {errors:?}"
+        );
+        for dir in &dirs {
+            for object in ["inline", "external"] {
+                assert!(!dir.path().join(bucket).join(object).exists(), "retry must remove {object} on every disk");
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("batch retry must unblock non-force bucket deletion");
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_preserves_conditional_and_versioned_residue() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-gates";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        for opts in [
+            ObjectOptions {
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some("old-etag".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ObjectOptions {
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+        ] {
+            let _ = store.delete_object(bucket, "inline", opts).await;
+            for dir in &dirs {
+                assert!(
+                    dir.path().join(bucket).join("inline").exists(),
+                    "conditional/version-specific deletes must retain ambiguous backups"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn crash_delete_retry_preserves_suspended_bucket_null_backup() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-suspended";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>".to_vec())
+            .await.expect("persist suspended versioning state");
+        let _ = store.delete_object(bucket, "inline", ObjectOptions::default()).await;
+        for dir in &dirs {
+            assert!(
+                dir.path().join(bucket).join("inline").exists(),
+                "authoritative suspended state must protect a null-version backup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_rejects_stale_bucket_incarnation_at_set_boundary() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-incarnation";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        let error = store.pools[0].disk_set[0]
+            .delete_object(
+                bucket,
+                "inline",
+                ObjectOptions {
+                    expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the set must reject a stale authorized bucket identity");
+        assert!(
+            matches!(error, StorageError::BucketNotFound(_)),
+            "identity mismatch must retain its typed error: {error:?}"
+        );
+        for dir in &dirs {
+            assert!(
+                dir.path().join(bucket).join("inline").exists(),
+                "a stale request must leave every backup intact"
+            );
+        }
     }
 }
