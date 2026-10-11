@@ -17373,6 +17373,19 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn delete_holds_bucket_incarnation_sentinel_through_object_commit() {
+        // The recreation waits for the delete's sentinel on its lifecycle write lock
+        // from before `barrier.release()`, so that lock wait also has to cover the
+        // delete's commit. Raise the lock acquire timeout from the 5 s default to give
+        // the commit room on a starved runner; a kept sentinel still fails the test,
+        // after 30 s instead of 5 s.
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))],
+            delete_holds_bucket_incarnation_sentinel_through_object_commit_body(),
+        )
+        .await;
+    }
+
+    async fn delete_holds_bucket_incarnation_sentinel_through_object_commit_body() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "delete-bucket-incarnation", &[4])).await;
@@ -17445,13 +17458,19 @@ mod tests {
             "bucket delete and same-name recreation must wait for the in-flight object delete"
         );
         barrier.release();
-        delete
+        // The recreation's lock wait started before the release; give the delete as long.
+        tokio::time::timeout(Duration::from_secs(30), delete)
             .await
+            .expect("delete should finish once the barrier is released")
             .expect("delete task should join")
             .expect("old-generation delete should complete");
-        tokio::time::timeout(Duration::from_secs(10), recreate)
+        // If the delete kept the sentinel, `delete_bucket` would fail on its lifecycle
+        // write lock after the lock acquire timeout (30 s here). The rest of the
+        // recreation is fsync-bound IO on four disks, so this bound, above the lock
+        // timeout, only stops a hang.
+        tokio::time::timeout(Duration::from_secs(120), recreate)
             .await
-            .expect("bucket recreation should finish after delete releases the sentinel")
+            .expect("bucket recreation should not hang after delete releases the sentinel")
             .expect("bucket recreation task should join")
             .expect("bucket recreation should succeed");
 
@@ -17504,6 +17523,19 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn delete_objects_holds_bucket_incarnation_sentinel_through_commit() {
+        // The recreation waits for the delete's sentinel on its lifecycle write lock
+        // from before `barrier.release()`, so that lock wait also has to cover the
+        // delete's commit. Raise the lock acquire timeout from the 5 s default to give
+        // the commit room on a starved runner; a kept sentinel still fails the test,
+        // after 30 s instead of 5 s.
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))],
+            delete_objects_holds_bucket_incarnation_sentinel_through_commit_body(),
+        )
+        .await;
+    }
+
+    async fn delete_objects_holds_bucket_incarnation_sentinel_through_commit_body() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "batch-delete-bucket-incarnation", &[4])).await;
@@ -17565,14 +17597,22 @@ mod tests {
             "bucket recreation must wait for the in-flight batch delete"
         );
         barrier.release();
-        let (_deleted, errors) = delete.await.expect("batch delete task should join");
+        // The recreation's lock wait started before the release; give the delete as long.
+        let (_deleted, errors) = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("batch delete should finish once the barrier is released")
+            .expect("batch delete task should join");
         assert!(
             errors.iter().all(Option::is_none),
             "old-generation batch delete should complete: {errors:?}"
         );
-        tokio::time::timeout(Duration::from_secs(10), recreate)
+        // If the delete kept the sentinel, `delete_bucket` would fail on its lifecycle
+        // write lock after the lock acquire timeout (30 s here). The rest of the
+        // recreation is fsync-bound IO on four disks, so this bound, above the lock
+        // timeout, only stops a hang.
+        tokio::time::timeout(Duration::from_secs(120), recreate)
             .await
-            .expect("bucket recreation should finish after batch delete releases the sentinel")
+            .expect("bucket recreation should not hang after batch delete releases the sentinel")
             .expect("bucket recreation task should join")
             .expect("bucket recreation should succeed");
         store
