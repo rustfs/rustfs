@@ -53,7 +53,7 @@ on:
         required: false
         default: false
       validation_cleanup_run_id:
-        description: Failed validation run whose rejected fault environment needs evidence-based finalization
+        description: Failed validation run whose supported retained environment needs evidence-based finalization
         type: string
         required: false
         default: ''
@@ -327,7 +327,7 @@ jobs:
             --candidate "${VALIDATION_ROOT}/candidate.json" \
             --testing-commit "${AUTO_TESTING_SHA}" --evidence "${VALIDATION_ROOT}/environment"
 
-      - name: Audit and finalize retained rejected-fault environment
+      - name: Audit and finalize retained validation environment
         if: ${{ inputs.validation_cleanup_run_id != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
