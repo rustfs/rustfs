@@ -18,6 +18,10 @@ on:
         type: boolean
         required: false
         default: false
+      build_manager_native:
+        type: boolean
+        required: false
+        default: false
     secrets:
       PF_TESTING_GH_TOKEN:
         required: true
@@ -41,11 +45,80 @@ on:
         type: boolean
         required: false
         default: false
+      build_manager_native:
+        description: Build and run exact candidate checkpoint/MRF/incarnation regressions
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  manager-native-regressions:
+    if: ${{ inputs.build_manager_native }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+    steps:
+      - name: Validate immutable manager native inputs
+        run: |
+          set -euo pipefail
+          [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${AUTO_TESTING_SHA}" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout exact manager candidate source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout exact manager collector source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Install manager native build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang lld cmake pkg-config libssl-dev protobuf-compiler
+          df -h .
+
+      - name: Build exact unmodified candidate manager test executable
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          python3 -B auto-testing/scripts/validation_heal/manager_native.py build \
+            --source candidate --commit "${CANDIDATE_SHA}" --out manager-tools
+
+      - name: Run exact manager regressions independently
+        run: |
+          set -euo pipefail
+          python3 -B auto-testing/scripts/validation_heal/manager_native.py run \
+            --directory manager-tools --out manager-evidence
+
+      - name: Upload manager executable identities and original diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-manager-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            manager-tools/heal-manager-native-tests
+            manager-tools/*.json
+            manager-tools/*.jsonl
+            manager-tools/*.stderr
+            manager-tools/*.log
+            manager-evidence/
+          if-no-files-found: warn
+
   native-heal-regressions:
     if: ${{ inputs.build_native_heal }}
     runs-on: ubuntu-22.04
