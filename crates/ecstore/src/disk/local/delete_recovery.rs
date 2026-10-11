@@ -185,8 +185,121 @@ fn complete_part_sources(live: &Path, staged: &Path, info: &FileInfo) -> Result<
         {
             return Ok(false);
         }
+        if let Some(integrity) = &part.integrity {
+            let name = integrity.file_name();
+            let length = u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)?;
+            if ![live, staged]
+                .iter()
+                .any(|root| std::fs::symlink_metadata(root.join(&name)).is_ok_and(|meta| meta.is_file() && meta.len() == length))
+            {
+                return Ok(false);
+            }
+        }
     }
     Ok(true)
+}
+
+async fn verify_recovery_integrity_sources(
+    live: &Path,
+    staged: &Path,
+    integrity: &rustfs_filemeta::shard_integrity::PartIntegrity,
+    coding_index: usize,
+    algorithm: HashAlgorithm,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Result<()> {
+    let lease = os::acquire_namespace_mutation_lease_with_owner(live, owner).await;
+    let roots = [live.to_path_buf(), staged.to_path_buf()];
+    let integrity = integrity.clone();
+    os::run_blocking_namespace_operation(lease, move || {
+        Ok((|| {
+            integrity.validate()?;
+            if coding_index >= integrity.layout.shards()
+                || !matches!(algorithm, HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy)
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+            let codec = coding::Erasure::try_new_with_options(
+                usize::from(integrity.layout.data),
+                usize::from(integrity.layout.parity),
+                usize::try_from(integrity.layout.block_size).map_err(|_| DiskError::FileCorrupt)?,
+                integrity.layout.legacy,
+            )
+            .map_err(DiskError::from)?;
+            let shard_size = codec.shard_size();
+            let part_size =
+                usize::try_from(codec.shard_file_size(i64::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)?))
+                    .map_err(|_| DiskError::FileCorrupt)?;
+            let encoded_size = u64::try_from(coding::bitrot_shard_file_size(part_size, shard_size, algorithm.clone()))
+                .map_err(|_| DiskError::FileCorrupt)?;
+            let expected = u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)?;
+            let header = integrity.index_header();
+            let mut checked = false;
+            for root in &roots {
+                let path = root.join(integrity.file_name());
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_file() && metadata.len() == expected => {}
+                    Ok(_) => return Err(DiskError::FileCorrupt),
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+                let mut file = std::fs::File::open(path).map_err(to_file_error)?;
+                let mut actual = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                std::io::Read::read_exact(&mut file, &mut actual).map_err(to_file_error)?;
+                if actual != header {
+                    return Err(DiskError::FileCorrupt);
+                }
+                // An interrupted restore can split payload and proof between
+                // live and staged roots. Verify every present payload copy
+                // against the declared proof, independently of its location.
+                let mut shards = Vec::new();
+                for root in &roots {
+                    let path = root.join(format!("part.{}", integrity.number));
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() && metadata.len() == encoded_size => {
+                            shards.push(std::fs::File::open(path).map_err(to_file_error)?);
+                        }
+                        Ok(_) => return Err(DiskError::FileCorrupt),
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(to_file_error(err).into()),
+                    }
+                }
+                if shards.is_empty() {
+                    return Err(DiskError::FileCorrupt);
+                }
+                let mut record = vec![0; integrity.record_size()];
+                let mut payload = vec![0; shard_size];
+                let mut bitrot_hash = vec![0; algorithm.size()];
+                let mut remaining = part_size;
+                for stripe in 0..integrity.stripes {
+                    std::io::Read::read_exact(&mut file, &mut record).map_err(to_file_error)?;
+                    integrity.verify_record(stripe, &record)?;
+                    let length = remaining.min(shard_size);
+                    if length == 0 {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    for shard in &mut shards {
+                        std::io::Read::read_exact(shard, &mut bitrot_hash).map_err(to_file_error)?;
+                        std::io::Read::read_exact(shard, &mut payload[..length]).map_err(to_file_error)?;
+                        integrity.verify_shard(stripe, coding_index, &payload[..length], &record)?;
+                    }
+                    remaining -= length;
+                }
+                if remaining != 0 {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if integrity.stripes == 0 && integrity.root != integrity.root_digest(&integrity.padding_digest(0)) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                checked = true;
+            }
+            if !checked {
+                return Err(DiskError::FileCorrupt);
+            }
+            Ok(())
+        })())
+    })
+    .await
+    .map_err(to_file_error)?
 }
 
 struct ExplicitDeletePlan {
@@ -257,7 +370,7 @@ fn explicit_delete_plan(
                 {
                     proof_files.push(entry.path());
                 } else if kind.is_file()
-                    && (marker_names.contains(&name) || (metadata_less_part_file(&name) && referenced.contains(&transaction)))
+                    && (marker_names.contains(&name) || (delete_recovery_part_file(&name) && referenced.contains(&transaction)))
                 {
                     candidates.push(rollback.clone());
                 } else {
@@ -300,7 +413,7 @@ fn explicit_delete_plan(
                 return Ok(None);
             }
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-            if metadata_less_part_file(&name) {
+            if delete_recovery_part_file(&name) {
                 has_parts = true;
             } else if marker_names.contains(&name) {
             } else if dir == rollback
@@ -438,7 +551,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                         && !(kind.is_dir() && known_staged)
                         && !(journal.is_none()
                             && kind.is_file()
-                            && (metadata_less_part_file(&child_name)
+                            && (delete_recovery_part_file(&child_name)
                                 || [DELETE_DATA_DIR_MARKER_PREFIX, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX]
                                     .iter()
                                     .any(|prefix| child_name == format!("{prefix}{transaction}"))))
@@ -461,7 +574,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                             let kind = file.file_type().map_err(to_file_error)?;
                             let file_name = file.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
                             if !kind.is_file()
-                                || (!metadata_less_part_file(&file_name)
+                                || (!delete_recovery_part_file(&file_name)
                                     && ![
                                         DELETE_DATA_DIR_MARKER_PREFIX,
                                         RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
@@ -508,7 +621,8 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                 if version.header.version_type != rustfs_filemeta::VersionType::Object {
                     continue;
                 }
-                let info = version.into_fileinfo(volume, object, true)?;
+                let mut info = version.into_fileinfo(volume, object, true)?;
+                info.hydrate_shard_integrity()?;
                 if info.is_remote() {
                     continue;
                 }
@@ -1617,7 +1731,8 @@ impl LocalDisk {
                         if version.header.version_type != rustfs_filemeta::VersionType::Object {
                             continue;
                         }
-                        let info = version.into_fileinfo(volume, object, true)?;
+                        let mut info = version.into_fileinfo(volume, object, true)?;
+                        info.hydrate_shard_integrity()?;
                         if info.inline_data() || info.is_remote() {
                             continue;
                         }
@@ -1639,6 +1754,17 @@ impl LocalDisk {
                             } else {
                                 checksum.algorithm
                             };
+                            if let Some(integrity) = &part.integrity {
+                                verify_recovery_integrity_sources(
+                                    &live,
+                                    &staged,
+                                    integrity,
+                                    info.erasure.index.checked_sub(1).ok_or(DiskError::FileCorrupt)?,
+                                    algo.clone(),
+                                    owner.clone(),
+                                )
+                                .await?;
+                            }
                             let mut checked = false;
                             for part_root in [&live, &staged] {
                                 let path = part_root.join(&name);
@@ -1809,6 +1935,215 @@ pub(super) async fn restore_barrier(volume: &str, object_dir: &Path, transaction
 mod tests {
     use super::*;
     use crate::disk::local::test::{ensure_test_volume, test_file_info, test_meta};
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn delete_recovery_native_sidecar_classifier_is_bounded() {
+        assert!(delete_recovery_part_file("part.1"));
+        assert!(delete_recovery_part_file("part.1.meta"));
+        assert!(delete_recovery_part_file(&format!("part.1.integrity.{}", Uuid::new_v4())));
+        for name in [
+            "part.0.meta",
+            "part.1.meta.extra",
+            "part.1.integrity.invalid",
+            "xl.meta",
+            "child/",
+        ] {
+            assert!(!delete_recovery_part_file(name), "unknown sidecar {name} must stay protected");
+        }
+        assert!(!delete_recovery_part_file(&format!("part.1.integrity.{}", Uuid::nil())));
+        assert!(!metadata_less_part_file("part.1.meta"), "the heal shard classifier remains unchanged");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn delete_recovery_multipart_rollback_moves_native_sidecars_and_preserves_proofs() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations};
+        use crate::storage_api_contracts::object::ObjectIO;
+        use http::HeaderMap;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some("true")),
+                (rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                for damage in [None, Some("missing"), Some("corrupt"), Some("payload")] {
+                    let (dirs, store) = isolated_store_over_temp_disks().await;
+                    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+                    let bucket = "recovery-multipart";
+                    let object = "object";
+                    store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+                    let upload = store
+                        .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                        .await
+                        .unwrap();
+                    let payload = vec![63; 6 * 1024 * 1024];
+                    let mut reader = PutObjReader::from_vec(payload.clone());
+                    let part = store
+                        .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+                        .await
+                        .unwrap();
+                    store
+                        .clone()
+                        .complete_multipart_upload(
+                            bucket,
+                            object,
+                            &upload.upload_id,
+                            vec![CompletePart {
+                                part_num: part.part_num,
+                                etag: part.etag,
+                                ..Default::default()
+                            }],
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+                    let transaction = Uuid::new_v4();
+                    let mut originals = Vec::new();
+                    for (dir, disk) in dirs.iter().zip(&disks) {
+                        let root = dir.path().join(bucket).join(object);
+                        let original = fs::read(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+                        let metadata = FileMeta::load(&original).unwrap();
+                        let mut info = metadata.versions[0].into_fileinfo(bucket, object, true).unwrap();
+                        info.hydrate_shard_integrity().unwrap();
+                        let data = info.data_dir.unwrap();
+                        let proof_name = info.parts[0]
+                            .integrity
+                            .as_ref()
+                            .expect("real protected MPU proof")
+                            .file_name();
+                        assert!(root.join(data.to_string()).join("part.1.meta").is_file());
+                        disk.as_ref()
+                            .unwrap()
+                            .delete_version_recoverable(
+                                bucket,
+                                object,
+                                FileInfo {
+                                    name: object.to_owned(),
+                                    ..Default::default()
+                                },
+                                false,
+                                DeleteOptions {
+                                    old_data_dir: Some(transaction),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let staged = root.join(transaction.to_string()).join(data.to_string());
+                        fs::rename(root.join(data.to_string()), &staged).await.unwrap();
+                        originals.push((root, data, proof_name, original));
+                    }
+                    let (root, data, proof, _) = &originals[0];
+                    let proof_path = root.join(transaction.to_string()).join(data.to_string()).join(proof);
+                    if let Some(damage) = damage {
+                        if damage == "missing" {
+                            fs::remove_file(&proof_path).await.unwrap();
+                        } else if damage == "corrupt" {
+                            let mut bytes = fs::read(&proof_path).await.unwrap();
+                            bytes[rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE] ^= 1;
+                            fs::write(&proof_path, bytes).await.unwrap();
+                        } else {
+                            let metadata = FileMeta::load(&originals[0].3).unwrap();
+                            let info = metadata.versions[0].into_fileinfo(bucket, object, true).unwrap();
+                            let codec = coding::Erasure::try_new_with_options(
+                                info.erasure.data_blocks,
+                                info.erasure.parity_blocks,
+                                info.erasure.block_size,
+                                info.uses_legacy_checksum,
+                            )
+                            .unwrap();
+                            let algorithm = info.erasure.get_checksum_info(1).algorithm;
+                            let path = proof_path.parent().unwrap().join("part.1");
+                            let mut bytes = fs::read(&path).await.unwrap();
+                            let hash_size = algorithm.size();
+                            let part_size = usize::try_from(codec.shard_file_size(info.parts[0].size as i64)).unwrap();
+                            let length = part_size.min(codec.shard_size());
+                            bytes[hash_size] ^= 1;
+                            let rewritten = algorithm.hash_encode(&bytes[hash_size..hash_size + length]).as_ref().to_vec();
+                            bytes[..hash_size].copy_from_slice(&rewritten);
+                            coding::bitrot_verify(
+                                std::io::Cursor::new(bytes.clone()),
+                                bytes.len(),
+                                part_size,
+                                algorithm,
+                                codec.shard_size(),
+                            )
+                            .await
+                            .expect("recomputed self-described bitrot checksum passes the former rollback gate");
+                            fs::write(path, bytes).await.unwrap();
+                        }
+                        let disk = disks[0].as_ref().unwrap();
+                        let observed = disk.inspect_delete_transaction(bucket, object, transaction).await.unwrap();
+                        let backup = fs::read(root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            disk.settle_delete_transaction(
+                                bucket,
+                                object,
+                                transaction,
+                                observed.fingerprint,
+                                DeleteRecoveryAction::Rollback
+                            )
+                            .await,
+                            Err(DiskError::FileCorrupt)
+                        ));
+                        assert!(!root.join(STORAGE_FORMAT_FILE).exists());
+                        assert!(root.join(transaction.to_string()).join(PREPARED).is_file());
+                        assert_eq!(
+                            fs::read(root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                                .await
+                                .unwrap(),
+                            backup
+                        );
+                        continue;
+                    }
+                    // Both directions of a partially restored native layout:
+                    // proof still staged with live payload, and the inverse.
+                    for (index, (root, data, proof, _)) in originals.iter().take(2).enumerate() {
+                        let live = root.join(data.to_string());
+                        fs::create_dir(&live).await.unwrap();
+                        let name = if index == 0 { "part.1" } else { proof.as_str() };
+                        fs::rename(root.join(transaction.to_string()).join(data.to_string()).join(name), live.join(name))
+                            .await
+                            .unwrap();
+                    }
+                    for (disk, (root, data, proof, original)) in disks.iter().zip(originals) {
+                        let disk = disk.as_ref().unwrap();
+                        let observed = disk.inspect_delete_transaction(bucket, object, transaction).await.unwrap();
+                        assert!(observed.rollback_data_complete);
+                        disk.settle_delete_transaction(
+                            bucket,
+                            object,
+                            transaction,
+                            observed.fingerprint,
+                            DeleteRecoveryAction::Rollback,
+                        )
+                        .await
+                        .expect("rollback restores native multipart sidecars");
+                        assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.unwrap(), original);
+                        assert!(root.join(data.to_string()).join("part.1.meta").is_file());
+                        assert!(root.join(data.to_string()).join(proof).is_file());
+                        assert!(!root.join(transaction.to_string()).exists());
+                    }
+                    let mut reader = store.pools[0].disk_set[0]
+                        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .unwrap();
+                    let mut restored = Vec::new();
+                    reader.stream.read_to_end(&mut restored).await.unwrap();
+                    assert_eq!(restored, payload, "restored protected MPU remains readable through integrity checks");
+                }
+            },
+        )
+        .await;
+    }
 
     async fn fixture() -> (tempfile::TempDir, LocalDisk, FileInfo, Vec<u8>) {
         let temp = tempfile::tempdir().expect("temporary disk");

@@ -24,6 +24,12 @@ records instead of immediately restoring the backup.
 | Newer generation or partially overlapping version history | Preserve records and report blocked recovery. |
 | Historical backup or disk-local marker without a structured set decision | Preserve records during automatic recovery. |
 
+Rollback preserves native multipart metadata and integrity sidecars. Protected
+parts require their declared proof generation; recovery verifies both the proof
+records and actual shard payloads before restoring metadata or removing
+recovery evidence. Missing or corrupt required proofs leave the transaction
+blocked with its backup intact.
+
 A disk-local `delete-data.<T>` marker does not prove an erasure-set decision.
 Returning drives cannot restore stale data after a certified deletion. Commit
 receipts remain until every participant and related transaction for the key

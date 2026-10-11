@@ -164,6 +164,16 @@ pub(crate) fn metadata_less_part_file(entry: &str) -> bool {
         .is_some_and(|part_number| part_number.parse::<usize>().is_ok_and(|part_number| part_number > 0))
 }
 
+/// Native multipart sidecars travel with their part during delete recovery.
+/// Callers must additionally require a regular file inside a bound data dir.
+fn delete_recovery_part_file(entry: &str) -> bool {
+    metadata_less_part_file(entry)
+        || entry.strip_suffix(".meta").is_some_and(metadata_less_part_file)
+        || entry.split_once(".integrity.").is_some_and(|(part, generation)| {
+            metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
+        })
+}
+
 fn delete_transaction_marker_id(entry: &str, prefix: &str) -> Option<Uuid> {
     entry
         .strip_prefix(prefix)
@@ -180,7 +190,7 @@ fn is_delete_transaction_marker(entry: &str, prefix: &str) -> bool {
 /// an `xl.meta`, an unknown file) means the directory is not plain delete residue.
 fn is_metadata_less_data_dir_entry(entry: &str) -> bool {
     !entry.ends_with(SLASH_SEPARATOR)
-        && (metadata_less_part_file(entry)
+        && (delete_recovery_part_file(entry)
             || entry == STORAGE_FORMAT_FILE_BACKUP
             || entry == DELETE_QUORUM_COMMITTED_FILE
             || entry == delete_recovery::PREPARED
@@ -443,7 +453,7 @@ async fn restore_delete_rollback_with_namespace_owner(
                 let name = entry.file_name();
                 let name = name.to_str().ok_or(DiskError::FileCorrupt)?;
                 if !entry.file_type().await.map_err(to_file_error)?.is_file()
-                    || (!metadata_less_part_file(name)
+                    || (!delete_recovery_part_file(name)
                         && ![
                             DELETE_DATA_DIR_MARKER_PREFIX,
                             RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
@@ -7263,12 +7273,7 @@ impl LocalDisk {
                     if !entry.file_type()?.is_file() {
                         return Err(corrupt());
                     }
-                    let is_part = metadata_less_part_file(name)
-                        || name.strip_suffix(".meta").is_some_and(metadata_less_part_file)
-                        || name.split_once(".integrity.").is_some_and(|(part, generation)| {
-                            metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
-                        });
-                    if is_part {
+                    if delete_recovery_part_file(name) {
                         parts.push(entry.path());
                     } else if name == committed || name == recovery_committed || name == reserved {
                         has_committed_marker |= name == committed || name == recovery_committed;

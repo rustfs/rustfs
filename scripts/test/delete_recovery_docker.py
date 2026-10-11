@@ -20,6 +20,7 @@ and namespace safety, not independent hardware failure or power-loss durability.
 """
 from pathlib import Path
 import base64, hashlib, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
+from urllib.parse import quote
 ROOT = None
 PREFIX = None
 IMAGE = None
@@ -96,6 +97,24 @@ class S3:
         errors = [node for node in response.iter() if node.tag.rsplit('}', 1)[-1] == 'Error']
         assert not errors, f'DeleteObjects returned per-key errors: {body!r}'
         return (status, body)
+
+    def complete_multipart(self, bucket, key, parts):
+        path = bucket + '/' + key
+        (_, response) = self.request('POST', path + '?uploads', expected=200)
+        upload = next(node.text for node in ET.fromstring(response).iter() if node.tag.rsplit('}', 1)[-1] == 'UploadId')
+        assert upload, 'native multipart initiation must return an upload ID'
+        query = '?uploadId=' + quote(upload, safe='')
+        complete = ET.Element('CompleteMultipartUpload')
+        for number, body in enumerate(parts, 1):
+            self.request('PUT', path + query + '&partNumber=' + str(number), body, expected=200)
+            etag = self.last_headers.get('etag')
+            assert etag, 'native UploadPart must return its ETag'
+            part = ET.SubElement(complete, 'Part')
+            ET.SubElement(part, 'PartNumber').text = str(number)
+            ET.SubElement(part, 'ETag').text = etag
+        (_, response) = self.request('POST', path + query, ET.tostring(complete), {'Content-Type': 'application/xml'}, 200)
+        assert ET.fromstring(response).tag.rsplit('}', 1)[-1] == 'CompleteMultipartUploadResult', response
+        return upload
 
 class Cluster:
 
@@ -953,6 +972,59 @@ def retained_decision_newer_undecided():
     finally:
         cluster.remove()
 
+
+def completed_multipart_sidecars(protected=False, crash=False):
+    case = 'multipart-integrity' if protected else 'multipart-sidecars'
+    if crash:
+        case += '-applied'
+    mode = 'true' if protected else 'false'
+    cluster = Cluster(case, drives=4, extra_env={'RUSTFS_SHARD_INTEGRITY_WRITE': mode, 'RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED': mode})
+    try:
+        cluster.create()
+        client = cluster.clients[0]
+        bucket = 'completed-multipart'
+        key = 'payload'
+        parts = [bytes(range(256)) * 20480, bytes(reversed(range(256))) * 4096]
+        payload = b''.join(parts)
+        client.put_bucket(bucket)
+        upload = client.complete_multipart(bucket, key, parts)
+        assert client.get(bucket, key) == payload, 'complete MPU must expose all uploaded bytes'
+        original = residue_inventory(cluster, bucket, key)
+        (ROOT / 'multipart-original-inventory.json').write_text(json.dumps(original, indent=2))
+        for node in original:
+            for drive in node:
+                assert drive['exists'] and 'xl.meta' in drive['files'], 'complete MPU must publish metadata on every drive'
+                for number in (1, 2):
+                    sidecars = [name for name in drive['files'] if Path(name).name == f'part.{number}.meta']
+                    assert len(sidecars) == 1, 'native completed MPU must retain each real part metadata sidecar'
+                    prefix = f'part.{number}.integrity.'
+                    proofs = [name for name in drive['files'] if Path(name).name.startswith(prefix)]
+                    assert len(proofs) == (1 if protected else 0), 'native completion must retain the selected integrity format'
+                    for proof in proofs:
+                        assert uuid.UUID(Path(proof).name[len(prefix):]).int != 0, 'integrity proof generation must be non-nil'
+        observation = None
+        if crash:
+            nonce = arm_barrier(cluster, 0, bucket, key, 'APPLIED', disk='/data/d1')
+            (thread, request) = async_delete(client, bucket, key)
+            observation = reached_barrier(cluster, 0, nonce)
+            cluster.kill()
+            thread.join(5)
+            clear_barriers(cluster)
+            cluster.restart()
+            wait_inventory(cluster, bucket, key, lambda inventory: inventory == original)
+            restored = residue_inventory(cluster, bucket, key)
+            assert restored == original, 'rollback must preserve exact metadata, all shards, part sidecars and integrity proofs'
+            (ROOT / 'multipart-restored-inventory.json').write_text(json.dumps(restored, indent=2))
+            assert client.get(bucket, key) == payload, 'rolled-back native MPU must retain the complete readable body'
+        client.batch_delete(bucket, [key])
+        wait_inventory(cluster, bucket, key, lambda inventory: all(not drive['exists'] for node in inventory for drive in node))
+        client.request('GET', bucket + '/' + key, expected=404)
+        assert client.list(bucket) == []
+        client.delete_bucket(bucket)
+        return {'case': case, 'status': 'passed', 'native_upload_id': upload, 'integrity': protected, 'part_sizes': [len(part) for part in parts], 'bytes': len(payload), 'observation': observation, 'bucket_deletion': 'ordinary non-force204'}
+    finally:
+        cluster.remove()
+
 def ordinary_missing_with_offline_peer():
     cluster = Cluster('missing-offline', nodes=4, drives=1)
     try:
@@ -1156,6 +1228,7 @@ def main():
         if existing:
             parser.error('namespace already owns Docker resources; choose a new namespace')
     cases = {'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
+    cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
     for stage in ('PREACTIVATION', 'PREPARED', 'APPLIED', 'DECISION'):
         for nodes in (1, 4):
             cases[f'{stage.lower()}{nodes}'] = lambda stage=stage, nodes=nodes: process_crash(stage, nodes)
