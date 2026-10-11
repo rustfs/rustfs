@@ -1,3 +1,40 @@
+fn read_native_range_in<R: std::ops::RangeBounds<u64>>(
+    tx: &redb::ReadTransaction,
+    range: R,
+) -> Result<Vec<crate::CaptureRaftEntry>, StoreError> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let logs = tx.open_table(LOGS)?;
+    let start = match range.start_bound() {
+        Included(value) => *value,
+        Excluded(value) => match value.checked_add(1) {
+            Some(value) => value,
+            None => return Ok(Vec::new()),
+        },
+        Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Included(value) => *value,
+        Excluded(value) => match value.checked_sub(1) {
+            Some(value) => value,
+            None => return Ok(Vec::new()),
+        },
+        Unbounded => u64::MAX,
+    };
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for row in logs.range(start..=end)? {
+        let (key, value) = row?;
+        let entry = decode_log(value.value())?;
+        if entry.id.index != key.value() {
+            return Err(StoreError::CorruptRecord);
+        }
+        entries.push(decode_native_entry(entry)?);
+    }
+    Ok(entries)
+}
+
 use crate::{
     LOGS, LogId, META, Store, StoreError, committed::validate_committed, created::*, decode_log, encode_id, encode_log,
     next_index, number,
@@ -368,6 +405,14 @@ impl Store {
             })
             .transpose()
     }
+    /// Read typed native entries within the requested bounds.
+    pub fn read_native_range<R: std::ops::RangeBounds<u64>>(&self, range: R) -> Result<Vec<crate::CaptureRaftEntry>, StoreError> {
+        let tx = self.database.begin_read()?;
+        if number(required(tx.open_table(META)?.get("schema")?)?.value())? != 4 {
+            return Err(StoreError::UnsupportedSchema);
+        }
+        read_native_range_in(&tx, range)
+    }
     pub fn read_native_entries(&self, start: u64, end: u64) -> Result<Vec<crate::CaptureRaftEntry>, StoreError> {
         let tx = self.database.begin_read()?;
         if number(required(tx.open_table(META)?.get("schema")?)?.value())? != 4 {
@@ -376,18 +421,9 @@ impl Store {
         if start > end {
             return Err(StoreError::InvalidLogSequence);
         }
-        let logs = tx.open_table(LOGS)?;
-        let mut entries = Vec::new();
-        for row in logs.range(start..end)? {
-            let (key, value) = row?;
-            let entry = decode_log(value.value())?;
-            if entry.id.index != key.value() {
-                return Err(StoreError::CorruptRecord);
-            }
-            entries.push(decode_native_entry(entry)?);
-        }
-        Ok(entries)
+        read_native_range_in(&tx, start..end)
     }
+
     pub fn apply_next_native(&mut self, id: LogId) -> Result<crate::CaptureResponse, StoreError> {
         let tx = self.write_transaction()?;
         let response;

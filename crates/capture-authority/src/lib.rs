@@ -535,6 +535,89 @@ mod tests {
         )
     }
     #[test]
+    fn u18_native_read_roundtrip() {
+        let (_dir, _backend, mut store) = u17a_store();
+        let command = u17a_command();
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, command.clone())];
+        store.append_native(&entries).expect("append native fixture");
+        let result = store.read_native_range(..);
+        assert!(result.is_ok(), "U18_NATIVE_READ_SUCCESS: {result:?}");
+        let read = result.expect("native read");
+        assert_eq!(read, entries, "full identities and payloads");
+        assert_eq!(
+            store.read_entries(2, 3).expect("canonical row")[0].payload[14..],
+            command.encode().expect("canonical command")
+        );
+    }
+    #[test]
+    fn u18_native_read_range_bounds() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let (_dir, _backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())];
+        store.append_native(&entries).expect("append range fixture");
+        assert_eq!(store.read_native_range(1..2).expect("bounded read"), entries[1..2], "U18_RANGE_BOUNDARY");
+        assert_eq!(store.read_native_range(..=1).expect("inclusive end"), entries[..2]);
+        assert_eq!(store.read_native_range((Excluded(0), Included(2))).expect("excluded start"), entries[1..]);
+        assert_eq!(store.read_native_range(2..).expect("unbounded end"), entries[2..]);
+        assert_eq!(store.read_native_range(..).expect("all"), entries);
+        for range in [
+            (Included(2), Excluded(2)),
+            (Included(2), Included(1)),
+            (Unbounded, Excluded(0)),
+            (Excluded(u64::MAX), Unbounded),
+            (Included(u64::MAX), Included(u64::MAX)),
+        ] {
+            assert!(store.read_native_range(range).expect("empty mathematical range").is_empty());
+        }
+    }
+    #[test]
+    fn u18_native_read_reopen() {
+        let (dir, backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())];
+        store.append_native(&entries).expect("append reopen fixture");
+        drop(store);
+        drop(backend);
+        let store = Store::open(dir.path().join("db"), identity()).expect("reopen native file");
+        assert_eq!(store.read_native_range(..).expect("reopened native read"), entries);
+    }
+    #[test]
+    fn u18_native_read_legacy_rejected() {
+        let (_dir, _backend, store) = u17a_bound();
+        assert!(
+            matches!(store.read_native_range(0..0), Err(StoreError::UnsupportedSchema)),
+            "U18_SCHEMA_GUARD"
+        );
+        assert!(matches!(store.read_native_range(..), Err(StoreError::UnsupportedSchema)));
+    }
+    #[test]
+    fn u18_native_read_corrupt_row() {
+        let (_dir, _backend, mut store) = u17a_store();
+        store.append_native(&[u17a_blank(0)]).expect("append corruption fixture");
+        let original = store.read_entry(0).expect("read stored entry").expect("present entry");
+        let tx = store.database.begin_write().expect("corruption transaction");
+        {
+            let mut logs = tx.open_table(LOGS).expect("logs");
+            let bytes = logs.get(0).expect("get row").expect("present row").value().to_vec();
+            logs.insert(1, bytes.as_slice()).expect("mismatched index row");
+        }
+        tx.commit().expect("persist mismatched row");
+        assert!(matches!(store.read_native_range(1..=1), Err(StoreError::CorruptRecord)));
+        let tx = store.database.begin_write().expect("malformed transaction");
+        {
+            let mut logs = tx.open_table(LOGS).expect("logs");
+            let mut entry = original;
+            entry.payload = b"CENR\x01".to_vec();
+            let bytes = encode_log(&entry).expect("encode malformed native envelope");
+            logs.insert(0, bytes.as_slice()).expect("malformed native row");
+        }
+        tx.commit().expect("persist malformed native row");
+        assert!(matches!(store.read_native_range(..1), Err(StoreError::CorruptRecord)));
+        let tx = store.database.begin_write().expect("missing-table transaction");
+        assert!(tx.delete_table(LOGS).expect("delete logs table"));
+        tx.commit().expect("persist missing logs table");
+        assert!(store.read_native_entries(0, 0).is_err(), "U18_EMPTY_RANGE_TABLE_ERROR");
+    }
+    #[test]
     fn u17a_native_enable_empty_idempotent() {
         let (_dir, backend, mut store) = u17a_bound();
         assert_eq!(committed_schema(&store), 3);
