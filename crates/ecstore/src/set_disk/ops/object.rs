@@ -23645,7 +23645,7 @@ mod crash_delete_retry_tests {
     use super::*;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
     use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
-    use rustfs_storage_api::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+    use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
 
     async fn stage_interrupted_delete(store: &Arc<ECStore>, dirs: &[tempfile::TempDir], bucket: &str, object: &str, size: usize) {
         let mut reader = PutObjReader::from_vec(vec![37; size]);
