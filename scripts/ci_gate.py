@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "offline-enrollment-e2e", "test-ilm-integration-serial", "test-and-lint-rio-v2",
+    "test-and-lint", "offline-enrollment-e2e", "test-and-lint-rio-v2",
     "connect-short-credential-boundary", "test-and-lint-protocols",
     "build-rustfs-debug-binary", "uring-integration", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
@@ -224,6 +224,10 @@ def check_workflow(root: Path) -> list[str]:
         block = yaml_block(jobs, job, 2) or []
         if scalar(block, "if", 4) != "needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'":
             errors.append(f"{job} must retain full validation on every non-PR event")
+    workspace = "\n".join(yaml_block(jobs, "test-and-lint", 2) or [])
+    clippy = re.search(r"^      - name: Run clippy lints\n(?P<body>.*?)(?=^      - name:|\Z)", workspace, re.MULTILINE | re.DOTALL)
+    if clippy is None or scalar(clippy["body"].splitlines(), "if", 8) != "github.event_name != 'pull_request'":
+        errors.append("workspace Clippy must run on every non-PR event")
     if scalar(gate, "shell", 8) != "bash" or scalar(gate, "run", 8) != "python3 scripts/ci_gate.py verify" or scalar(gate, "CI_NEEDS", 10) != "${{ toJSON(needs) }}":
         errors.append("required-checks must verify the actual needs results")
     if any(re.match(r'''\s+(?:- )?(?:["']?continue-on-error["']?\s*:|["']?if["']?\s*:)''', line) and not line.startswith("    if:") for line in gate):
@@ -387,6 +391,9 @@ class SelfTests(unittest.TestCase):
             (root / ".github/workflows").mkdir(parents=True)
             source = (ROOT / ".github/workflows/ci.yml").read_text()
             path = root / ".github/workflows/ci.yml"
+            for condition in ("false", "github.event_name == 'schedule'", "github.event_name == 'pull_request'"):
+                path.write_text(source.replace("      - name: Run clippy lints\n        if: github.event_name != 'pull_request'", f"      - name: Run clippy lints\n        if: {condition}"))
+                self.assertIn("workspace Clippy must run on every non-PR event", check_workflow(root))
             for job in EXTENDED_FEATURE_JOBS:
                 before, block = source.split(f"  {job}:\n", 1)
                 for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
@@ -461,6 +468,39 @@ class SelfTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "verify"], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertIn("ERROR:" if code else "CI contract passed", result.stderr if code else result.stdout)
+
+    def test_merged_ilm_step_preserves_exit_status_and_core_report(self):
+        from check_test_wiring import yaml_block
+        from test_security_workflow import named_steps, shell_body
+
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text().splitlines()
+        step = named_steps(yaml_block(workflow, "test-and-lint", 2))["Run ignored ILM integration tests serially"]
+        body = shell_body(step)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "bin"
+            commands.mkdir()
+            # Exercise the actual pipeline without building the workspace.
+            fake_timeout = commands / "timeout"
+            fake_timeout.write_text('#!/bin/sh\nshift 4\nexec "$@"\n')
+            fake_timeout.chmod(0o755)
+            cargo = commands / "cargo"
+            cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ILM_ARGS"\nexit "$ILM_STATUS"\n')
+            cargo.chmod(0o755)
+            report = root / "target/nextest/ci/junit.xml"
+            report.parent.mkdir(parents=True)
+            report.write_text("existing workspace report")
+            args = root / "args.txt"
+            for status in (0, 23, 124):
+                env = dict(os.environ, PATH=f"{commands}{os.pathsep}{os.environ['PATH']}",
+                           ILM_ARGS=str(args), ILM_STATUS=str(status))
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(report.read_text(), "existing workspace report")
+                arguments = args.read_text().splitlines()
+                self.assertEqual(arguments[:9], ["nextest", "run", "--profile", "default", "-j1", "--run-ignored", "ignored-only", "--all", "--exclude"])
+                self.assertEqual(arguments[9], "e2e_test")
+                self.assertIn(f"exit_status={status}", (root / "artifacts/ilm-integration/diagnostics.txt").read_text())
 
     def test_actual_selector_bootstrap_uses_base_policy_and_fails_closed(self):
         from check_test_wiring import yaml_block
