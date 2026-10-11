@@ -5245,7 +5245,9 @@ impl SetDisks {
     ) -> disk::error::Result<bool> {
         let disks = self.get_disks_internal().await;
         if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
-            return Err(DiskError::DiskNotFound);
+            // Optional residue recovery needs every disk; ordinary DELETE can
+            // still complete with its existing quorum rules.
+            return Ok(false);
         }
         // The remote listing protocol omits special entries, so it cannot
         // establish the same fail-closed classification as a raw local walk.
@@ -5254,7 +5256,7 @@ impl SetDisks {
         }
         for disk in disks.iter().flatten() {
             if !disk.is_online().await {
-                return Err(DiskError::DiskNotFound);
+                return Ok(false);
             }
         }
         let mut plans = Vec::with_capacity(disks.len());
@@ -7210,7 +7212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_retry_rejects_corrupt_backups_and_offline_slots() {
+    async fn delete_retry_rejects_corrupt_backups_and_skips_offline_slots() {
         let (dir, disk) = delete_retry_test_disk().await;
         let backup = format!("object/{}/{STORAGE_FORMAT_FILE_BACKUP}", Uuid::new_v4());
         disk.write_all("bucket", &backup, Bytes::from_static(b"corrupt"))
@@ -7221,15 +7223,26 @@ mod tests {
             set.purge_delete_retry_residue("bucket", "object", || true).await.is_err(),
             "corrupt backup must fail closed"
         );
-        let degraded = io_primitives_test_set(vec![Some(disk), None], 1).await;
-        assert_eq!(
-            degraded
+        let degraded = io_primitives_test_set(vec![Some(disk.clone()), None], 1).await;
+        assert!(
+            !degraded
                 .purge_delete_retry_residue("bucket", "object", || true)
                 .await
-                .expect_err("offline disk must block recovery"),
-            DiskError::DiskNotFound
+                .expect("missing disk should skip recovery")
         );
-        assert!(dir.path().join("bucket").join(backup).exists());
+        disk.set_disk_id(Some(Uuid::new_v4()))
+            .await
+            .expect("change fixture disk identity");
+        assert!(!disk.is_online().await);
+        assert!(
+            !set.purge_delete_retry_residue("bucket", "object", || true)
+                .await
+                .expect("offline disk should skip recovery")
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bucket").join(backup)).expect("backup should survive"),
+            b"corrupt"
+        );
     }
 
     #[tokio::test]

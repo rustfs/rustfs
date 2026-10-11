@@ -11513,3 +11513,65 @@ mod tests {
         .await;
     }
 }
+
+#[cfg(test)]
+mod missing_key_delete_quorum_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+
+    async fn degraded_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative never-versioned bucket");
+        store.pools[0].disk_set[0].disks.write().await[0] = None;
+        let info = store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("existing bucket must remain readable at quorum");
+        assert_eq!(info.name, bucket);
+        let lookup = store
+            .get_object_info_for_delete(bucket, "never-existed", &ObjectOptions::default())
+            .await;
+        assert!(
+            lookup.as_ref().is_err_and(is_err_object_not_found),
+            "remaining disks must establish absence through production lookup: {lookup:?}"
+        );
+        (dirs, store)
+    }
+
+    #[tokio::test]
+    async fn single_delete_missing_key_preserves_quorum_noop() {
+        let (_dirs, store) = degraded_store("missing-key-quorum-single").await;
+        let result = store
+            .delete_object_with_tier_delete_journal("missing-key-quorum-single", "never-existed", ObjectOptions::default())
+            .await;
+        assert!(
+            result.as_ref().is_err_and(is_err_object_not_found),
+            "single missing-key delete must preserve its idempotent not-found outcome at quorum: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_missing_key_preserves_quorum_noop() {
+        let (_dirs, store) = degraded_store("missing-key-quorum-batch").await;
+        let (_, errors, _) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(
+                "missing-key-quorum-batch",
+                vec![ObjectToDelete {
+                    object_name: "never-existed".to_owned(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert_eq!(errors.len(), 1, "batch DELETE must return one result per key");
+        assert!(
+            errors.iter().all(Option::is_none),
+            "batch missing-key delete must preserve its idempotent success at quorum: {errors:?}"
+        );
+    }
+}
