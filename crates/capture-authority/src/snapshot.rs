@@ -167,6 +167,130 @@ fn row_lengths(k: u64, v: u64, limits: Limits) -> Result<u64, SnapshotError> {
     limit(v <= limits.value_bytes, "value bytes")?;
     k.checked_add(v).ok_or(SnapshotError::Limit("record bytes"))
 }
+/// Incremental encoder for isolated snapshot output. Completion verifies framing,
+/// not persistence or installation. A row error permanently fences the writer.
+pub struct Encoder<W: Write> {
+    out: Output<W>,
+    counts: [u64; 4],
+    section: usize,
+    written: u64,
+    previous: Option<Vec<u8>>,
+    limits: Limits,
+    failed: bool,
+}
+impl<W: Write> Encoder<W> {
+    pub fn new(writer: W, header: &Header, counts: [u64; 4], limits: Limits) -> Result<Self, SnapshotError> {
+        header_valid(header)?;
+        let count = counts
+            .iter()
+            .try_fold(0u64, |n, c| n.checked_add(*c).ok_or(SnapshotError::Limit("records")))?;
+        limit(count <= limits.records, "records")?;
+        format(header.applied.is_some() || count == 0, "rows without applied cut")?;
+        membership_size(header, limits)?;
+        let membership = header.membership.encode().map_err(|_| SnapshotError::Format("membership"))?;
+        let membership_len = u64::try_from(membership.len()).map_err(|_| SnapshotError::Limit("membership"))?;
+        limit(membership_len <= limits.membership_bytes, "membership")?;
+        let mut out = Output {
+            io: writer,
+            hash: Sha256::new(),
+            used: 0,
+            max: limits.total_bytes,
+        };
+        out.bytes(MAGIC)?;
+        out.bytes(&header.cluster_id)?;
+        match header.applied {
+            None => out.bytes(&[0])?,
+            Some(id) => {
+                out.bytes(&[1])?;
+                for n in [id.term, id.leader_node, id.index] {
+                    out.number(n)?;
+                }
+            }
+        }
+        out.number(membership_len)?;
+        out.bytes(&membership)?;
+        out.number(header.binding.revision)?;
+        out.bytes(&header.binding.binding_id)?;
+        out.bytes(&header.binding.target_id)?;
+        out.bytes(&[1])?;
+        out.number(counts[0])?;
+        let mut encoder = Self {
+            out,
+            counts,
+            section: 0,
+            written: 0,
+            previous: None,
+            limits,
+            failed: false,
+        };
+        encoder.advance_sections()?;
+        Ok(encoder)
+    }
+
+    fn advance_sections(&mut self) -> Result<(), SnapshotError> {
+        while self.section < SECTIONS.len() && self.written == self.counts[self.section] {
+            self.section += 1;
+            self.written = 0;
+            self.previous = None;
+            if self.section < SECTIONS.len() {
+                self.out
+                    .bytes(&[u8::try_from(self.section + 1).map_err(|_| SnapshotError::Format("section"))?])?;
+                self.out.number(self.counts[self.section])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn row(&mut self, row: Row<'_>) -> Result<(), SnapshotError> {
+        format(!self.failed, "encoder failed")?;
+        let result = self.write_row(row);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn write_row(&mut self, row: Row<'_>) -> Result<(), SnapshotError> {
+        format(self.section < SECTIONS.len(), "record count")?;
+        format(row.section == SECTIONS[self.section], "section order")?;
+        let k = u64::try_from(row.key.len()).map_err(|_| SnapshotError::Limit("key bytes"))?;
+        let v = u64::try_from(row.value.len()).map_err(|_| SnapshotError::Limit("value bytes"))?;
+        let length = row_lengths(k, v, self.limits)?
+            .checked_add(16)
+            .ok_or(SnapshotError::Limit("record bytes"))?;
+        // Reserve the still-unwritten section framing as well as the footer.
+        let framing = u64::try_from(SECTIONS.len() - self.section - 1)
+            .map_err(|_| SnapshotError::Limit("total bytes"))?
+            .checked_mul(9)
+            .ok_or(SnapshotError::Limit("total bytes"))?;
+        limit(
+            self.out
+                .used
+                .checked_add(length)
+                .and_then(|n| n.checked_add(framing))
+                .and_then(|n| n.checked_add(32))
+                .is_some_and(|n| n <= self.out.max),
+            "total bytes",
+        )?;
+        format(self.previous.as_ref().is_none_or(|p| p.as_slice() < row.key), "key order")?;
+        self.out.number(k)?;
+        self.out.number(v)?;
+        self.out.bytes(row.key)?;
+        self.out.bytes(row.value)?;
+        self.previous = Some(row.key.to_vec());
+        self.written += 1;
+        self.advance_sections()
+    }
+
+    pub fn finish(self) -> Result<W, SnapshotError> {
+        format(!self.failed, "encoder failed")?;
+        format(self.section == SECTIONS.len(), "record count")?;
+        let mut out = self.out;
+        out.io.write_all(&out.hash.finalize())?;
+        Ok(out.io)
+    }
+}
+
 pub fn encode<'a>(
     writer: impl Write,
     header: &Header,
@@ -174,68 +298,11 @@ pub fn encode<'a>(
     rows: impl IntoIterator<Item = Row<'a>>,
     limits: Limits,
 ) -> Result<(), SnapshotError> {
-    header_valid(header)?;
-    let count = counts
-        .iter()
-        .try_fold(0u64, |n, c| n.checked_add(*c).ok_or(SnapshotError::Limit("records")))?;
-    limit(count <= limits.records, "records")?;
-    format(header.applied.is_some() || count == 0, "rows without applied cut")?;
-    membership_size(header, limits)?;
-    let membership = header.membership.encode().map_err(|_| SnapshotError::Format("membership"))?;
-    let membership_len = u64::try_from(membership.len()).map_err(|_| SnapshotError::Limit("membership"))?;
-    limit(membership_len <= limits.membership_bytes, "membership")?;
-    let mut out = Output {
-        io: writer,
-        hash: Sha256::new(),
-        used: 0,
-        max: limits.total_bytes,
-    };
-    out.bytes(MAGIC)?;
-    out.bytes(&header.cluster_id)?;
-    match header.applied {
-        None => out.bytes(&[0])?,
-        Some(id) => {
-            out.bytes(&[1])?;
-            for n in [id.term, id.leader_node, id.index] {
-                out.number(n)?;
-            }
-        }
+    let mut encoder = Encoder::new(writer, header, counts, limits)?;
+    for row in rows {
+        encoder.row(row)?;
     }
-    out.number(membership_len)?;
-    out.bytes(&membership)?;
-    out.number(header.binding.revision)?;
-    out.bytes(&header.binding.binding_id)?;
-    out.bytes(&header.binding.target_id)?;
-    let mut rows = rows.into_iter();
-    for (index, section) in SECTIONS.into_iter().enumerate() {
-        out.bytes(&[u8::try_from(index + 1).map_err(|_| SnapshotError::Format("section"))?])?;
-        out.number(counts[index])?;
-        let mut previous: Option<Vec<u8>> = None;
-        for _ in 0..counts[index] {
-            let row = rows.next().ok_or(SnapshotError::Format("record count"))?;
-            format(row.section == section, "section order")?;
-            let k = u64::try_from(row.key.len()).map_err(|_| SnapshotError::Limit("key bytes"))?;
-            let v = u64::try_from(row.value.len()).map_err(|_| SnapshotError::Limit("value bytes"))?;
-            let length = row_lengths(k, v, limits)?
-                .checked_add(16)
-                .ok_or(SnapshotError::Limit("record bytes"))?;
-            limit(
-                out.used
-                    .checked_add(length)
-                    .and_then(|n| n.checked_add(32))
-                    .is_some_and(|n| n <= out.max),
-                "total bytes",
-            )?;
-            format(previous.as_ref().is_none_or(|p| p.as_slice() < row.key), "key order")?;
-            out.number(k)?;
-            out.number(v)?;
-            out.bytes(row.key)?;
-            out.bytes(row.value)?;
-            previous = Some(row.key.to_vec());
-        }
-    }
-    format(rows.next().is_none(), "record count")?;
-    out.io.write_all(&out.hash.finalize())?;
+    encoder.finish()?;
     Ok(())
 }
 pub fn decode(reader: impl Read, sink: &mut impl StagingSink, limits: Limits) -> Result<Header, SnapshotError> {
@@ -403,6 +470,257 @@ mod tests {
         assert!(result.is_ok(), "U22_CODEC_ROUNDTRIP: {result:?}");
         b
     }
+    #[test]
+    fn u23_redb_guard_rows() -> Result<(), Box<dyn std::error::Error>> {
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+        const TABLE: TableDefinition<&str, &str> = TableDefinition::new("u23_rows");
+        let dir = tempfile::tempdir()?;
+        let db = redb::Database::create(dir.path().join("rows.redb"))?;
+        let fixture = [("a", "head"), ("b", "next")];
+        let write = db.begin_write()?;
+        {
+            let mut table = write.open_table(TABLE)?;
+            for (key, value) in fixture {
+                table.insert(key, value)?;
+            }
+        }
+        write.commit()?;
+        let read = db.begin_read()?;
+        let table = read.open_table(TABLE)?;
+        let mut bytes = Vec::new();
+        let result = Encoder::new(&mut bytes, &header(), [2, 0, 0, 0], limits());
+        assert!(result.is_ok(), "U23_STREAM_GUARD: constructor failed");
+        let mut encoder = result?;
+        for row in table.iter()? {
+            let (key, value) = row?;
+            encoder.row(Row {
+                section: Section::Heads,
+                key: key.value().as_bytes(),
+                value: value.value().as_bytes(),
+            })?;
+        }
+        encoder.finish()?;
+        let mut expected = Vec::new();
+        encode(
+            &mut expected,
+            &header(),
+            [2, 0, 0, 0],
+            fixture.into_iter().map(|(key, value)| Row {
+                section: Section::Heads,
+                key: key.as_bytes(),
+                value: value.as_bytes(),
+            }),
+            limits(),
+        )?;
+        assert_eq!(bytes, expected, "U23_STREAM_GUARD: wire changed");
+        let mut sink = Sink::default();
+        assert_eq!(decode(bytes.as_slice(), &mut sink, limits())?, header());
+        assert_eq!(sink.0.len(), fixture.len());
+        for ((section, key, value), (expected_key, expected_value)) in sink.0.iter().zip(fixture) {
+            assert_eq!(*section, Section::Heads);
+            assert_eq!(key, expected_key.as_bytes());
+            assert_eq!(value, expected_value.as_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn u23_failure_fence() {
+        use std::{cell::Cell, rc::Rc};
+        struct Recovering {
+            fail: Rc<Cell<bool>>,
+            writes: Rc<Cell<usize>>,
+        }
+        impl Write for Recovering {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes.set(self.writes.get() + 1);
+                if self.fail.replace(false) {
+                    Err(io::Error::other("once"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let fail = Rc::new(Cell::new(false));
+        let writes = Rc::new(Cell::new(0));
+        let mut encoder = Encoder::new(
+            Recovering {
+                fail: fail.clone(),
+                writes: writes.clone(),
+            },
+            &header(),
+            [1, 0, 0, 0],
+            limits(),
+        )
+        .expect("U23_FAILURE_FENCE: construct");
+        fail.set(true);
+        assert!(matches!(
+            encoder.row(Row {
+                section: Section::Heads,
+                key: b"a",
+                value: b"v"
+            }),
+            Err(SnapshotError::Io(_))
+        ));
+        let after_failure = writes.get();
+        assert!(
+            encoder
+                .row(Row {
+                    section: Section::Heads,
+                    key: b"a",
+                    value: b"v"
+                })
+                .is_err(),
+            "U23_FAILURE_FENCE: recovered after IO error"
+        );
+        assert!(encoder.finish().is_err(), "U23_FAILURE_FENCE: finish after IO error");
+        assert_eq!(writes.get(), after_failure, "U23_FAILURE_FENCE: wrote after error");
+        for invalid in [
+            Row {
+                section: Section::Versions,
+                key: b"a",
+                value: b"v",
+            },
+            Row {
+                section: Section::Heads,
+                key: &[0; 33],
+                value: b"v",
+            },
+        ] {
+            let mut output = Vec::new();
+            let mut encoder = Encoder::new(&mut output, &header(), [1, 0, 0, 0], limits()).expect("construct validation encoder");
+            assert!(encoder.row(invalid).is_err());
+            assert!(
+                encoder
+                    .row(Row {
+                        section: Section::Heads,
+                        key: b"a",
+                        value: b"v"
+                    })
+                    .is_err(),
+                "U23_FAILURE_FENCE: validation retry"
+            );
+            assert!(encoder.finish().is_err(), "U23_FAILURE_FENCE: validation finish");
+        }
+        for key in [b"b".as_slice(), b"a".as_slice()] {
+            let mut output = Vec::new();
+            let mut encoder = Encoder::new(&mut output, &header(), [2, 0, 0, 0], limits()).expect("construct ordered encoder");
+            encoder
+                .row(Row {
+                    section: Section::Heads,
+                    key: b"b",
+                    value: b"v",
+                })
+                .expect("first row");
+            assert!(
+                encoder
+                    .row(Row {
+                        section: Section::Heads,
+                        key,
+                        value: b"v"
+                    })
+                    .is_err()
+            );
+            assert!(encoder.finish().is_err(), "U23_FAILURE_FENCE: key order finish");
+        }
+    }
+
+    #[test]
+    fn u23_finish_counts() {
+        for counts in [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]] {
+            let mut output = Vec::new();
+            let encoder = Encoder::new(&mut output, &header(), counts, limits()).expect("construct incomplete encoder");
+            assert!(encoder.finish().is_err(), "U23_FINISH_COUNT: incomplete accepted");
+            assert!(
+                decode(output.as_slice(), &mut Sink::default(), limits()).is_err(),
+                "U23_FINISH_COUNT: incomplete footer"
+            );
+        }
+        for counts in [[0, 0, 0, 0], [0, 0, 0, 1]] {
+            let mut output = Vec::new();
+            let mut encoder = Encoder::new(&mut output, &header(), counts, limits()).expect("construct empty-section encoder");
+            if counts[3] == 1 {
+                encoder
+                    .row(Row {
+                        section: Section::Operations,
+                        key: b"o",
+                        value: b"v",
+                    })
+                    .expect("skip empty sections");
+            }
+            encoder.finish().expect("U23_FINISH_COUNT: exact count");
+            decode(output.as_slice(), &mut Sink::default(), limits()).expect("valid finished snapshot");
+        }
+        let mut output = Vec::new();
+        let mut encoder = Encoder::new(&mut output, &header(), [1, 0, 0, 0], limits()).expect("construct extra-row encoder");
+        encoder
+            .row(Row {
+                section: Section::Heads,
+                key: b"a",
+                value: b"v",
+            })
+            .expect("declared row");
+        assert!(
+            encoder
+                .row(Row {
+                    section: Section::Heads,
+                    key: b"b",
+                    value: b"v"
+                })
+                .is_err(),
+            "U23_FINISH_COUNT: extra row"
+        );
+        assert!(encoder.finish().is_err(), "U23_FINISH_COUNT: extra row finish");
+    }
+
+    #[test]
+    fn u23_row_limits() {
+        use std::{cell::Cell, rc::Rc};
+        struct Counting(Rc<Cell<usize>>);
+        impl Write for Counting {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.set(self.0.get() + bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let empty = {
+            let mut bytes = Vec::new();
+            encode(&mut bytes, &header(), [0; 4], [], limits()).expect("empty framing length");
+            u64::try_from(bytes.len()).expect("length")
+        };
+        for (bounded, key, value, label) in [
+            (limits(), &[0; 33][..], b"v".as_slice(), "key bytes"),
+            (limits(), b"a".as_slice(), &[0; 65][..], "value bytes"),
+            (
+                Limits {
+                    total_bytes: empty + 17,
+                    ..limits()
+                },
+                b"a".as_slice(),
+                b"v".as_slice(),
+                "total bytes",
+            ),
+        ] {
+            let written = Rc::new(Cell::new(0));
+            let mut encoder =
+                Encoder::new(Counting(written.clone()), &header(), [1, 0, 0, 0], bounded).expect("construct bounded encoder");
+            let before = written.get();
+            assert!(
+                matches!(encoder.row(Row { section: Section::Heads, key, value }), Err(SnapshotError::Limit(name)) if name == label),
+                "U23_ROW_LIMIT: {label}"
+            );
+            assert_eq!(written.get(), before, "U23_ROW_LIMIT: wrote rejected row");
+            assert!(encoder.finish().is_err(), "U23_ROW_LIMIT: failed finish");
+            assert_eq!(written.get(), before, "U23_ROW_LIMIT: wrote footer");
+        }
+    }
+
     // Independent wire fixture: magic, version, hash algorithm, cluster, optional
     // applied ID, length-prefixed complete membership, binding, four sections.
     fn raw(h: &Header, entries: &[(u8, Vec<(Vec<u8>, Vec<u8>)>)]) -> Vec<u8> {
