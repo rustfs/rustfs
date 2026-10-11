@@ -1196,8 +1196,8 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>, buckets: &[String]) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata_for_buckets(store, buckets)
         .await
         .map_err(ecstore_bucket::migration::migration_startup_error)
 }

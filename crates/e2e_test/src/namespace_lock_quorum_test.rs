@@ -185,7 +185,11 @@ async fn wait_for_quorum_read_admission(clients: &[Client], bucket: &str) -> Tes
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("read quorum did not become available after lease convergence for {bucket}").into());
+            let diagnostics = clients[0].get_object().bucket(bucket).key("warm-small").send().await;
+            return Err(format!(
+                "read quorum did not become available after lease convergence for {bucket}: GET={diagnostics:?}"
+            )
+            .into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -331,6 +335,71 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
         for node in 0..read_quorum - 1 {
             cluster.stop_node(node)?;
         }
+        cluster.start().await?;
+        for client in &clients {
+            assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
+            assert_quorum_object_body(client, &bucket, "below-quorum", &large).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cold_start_read_quorum_follows_erasure_layout() -> TestResult {
+    crate::common::init_logging();
+    for (node_count, parity) in [(3, 1), (4, 2), (6, 3), (6, 2), (4, 0)] {
+        let read_quorum = node_count - parity;
+        let write_quorum = read_quorum + usize::from(read_quorum == parity);
+        let mut cluster = RustFSTestClusterEnvironment::new(node_count).await?;
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
+        if parity == 0 {
+            cluster.set_env("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
+        }
+        cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+        cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+        cluster.set_env("RUST_LOG", "warn");
+        cluster.start().await?;
+        let clients = cluster
+            .create_all_clients()?
+            .into_iter()
+            .map(|client| {
+                Client::from_conf(
+                    client
+                        .config()
+                        .to_builder()
+                        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                        .build(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bucket = format!("cold-read-quorum-{node_count}-{parity}");
+        clients[0].create_bucket().bucket(&bucket).send().await?;
+        let small = b"cold startup follows the stored EC layout".to_vec();
+        let large = vec![73; 256 * 1024];
+        for (key, body) in [
+            ("warm-small", &small),
+            ("warm-large", &large),
+            ("cold-large", &large),
+            ("below-quorum", &large),
+        ] {
+            clients[0]
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(Bytes::copy_from_slice(body).into())
+                .send()
+                .await?;
+            for node in &cluster.nodes {
+                let census =
+                    crate::chaos::census_object_version_on_disk(std::path::Path::new(&node.data_dir), &bucket, key, None)?;
+                assert!(census.is_complete(), "seed shard must exist before cold startup: {census:?}");
+                assert_eq!((census.data_blocks, census.parity_blocks), (Some(read_quorum), Some(parity)));
+            }
+        }
+        for node in 0..node_count {
+            cluster.stop_node(node)?;
+        }
         // Rebuild every process's in-memory state below read quorum, then
         // cross the EC boundary. A format bootstrap must not admit S3 reads
         // merely because half the peers are online (e.g. six disks, EC:2).
@@ -369,11 +438,9 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
             cluster.start_node(node).await?;
         }
         for client in &clients {
-            assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
-            assert_quorum_object_body(client, &bucket, "below-quorum", &large).await?;
+            assert_quorum_object_body(client, &bucket, "cold-large", &large).await?;
         }
     }
-
     Ok(())
 }
 

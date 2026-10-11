@@ -123,8 +123,18 @@ impl SetDisks {
     }
 
     pub(crate) async fn list_bucket_for_scanner(&self, _opts: &BucketOptions) -> Result<(Vec<BucketInfo>, bool)> {
+        self.list_bucket_with_quorum(BucketInfoQuorum::Write).await
+    }
+
+    pub(crate) async fn list_bucket_with_quorum(&self, quorum: BucketInfoQuorum) -> Result<(Vec<BucketInfo>, bool)> {
         let disks = self.disk_inventory().await;
         let write_quorum = (disks.len() / 2) + 1;
+        // Discovery uses the same namespace read boundary as stat_bucket.
+        // It grants no authority to mutate buckets or accept object reads.
+        let required = match quorum {
+            BucketInfoQuorum::Read => disks.len().div_ceil(2).max(1),
+            BucketInfoQuorum::Write => write_quorum,
+        };
 
         let mut futures = Vec::with_capacity(disks.len());
         for disk in disks {
@@ -153,7 +163,11 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, write_quorum) {
+        let error = match quorum {
+            BucketInfoQuorum::Read => reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, required),
+            BucketInfoQuorum::Write => reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, required),
+        };
+        if let Some(err) = error {
             return Err(err.into());
         }
 
@@ -179,7 +193,7 @@ impl SetDisks {
         topology_complete &= counts.values().all(|(count, _)| *count >= write_quorum);
         let mut buckets = counts
             .into_values()
-            .filter_map(|(count, bucket)| (count >= write_quorum).then_some(bucket))
+            .filter_map(|(count, bucket)| (count >= required).then_some(bucket))
             .collect::<Vec<_>>();
         buckets.sort_by(|left, right| left.name.cmp(&right.name));
         Ok((buckets, topology_complete))
