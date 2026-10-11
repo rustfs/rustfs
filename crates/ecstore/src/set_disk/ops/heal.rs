@@ -25,6 +25,7 @@ use super::super::{
 use crate::bucket::retirement::MarkerRetirementContext;
 use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::set_disk::{ObjectLockDiagGuard, is_object_lock_diag_enabled};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct ExplicitVersionHeal<'a> {
@@ -3375,11 +3376,11 @@ impl SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+            Some(Arc::new(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                 self.map_namespace_lock_error(bucket, object, "write", e)
                     .narrow_to_disk()
                     .unwrap_or_else(DiskError::other)
-            })?)
+            })?))
         } else {
             None
         };
@@ -3387,6 +3388,61 @@ impl SetDisks {
         if has_suffix(object, SLASH_SEPARATOR) {
             let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
+        }
+
+        if !opts.read_repair
+            && _write_lock_guard.is_some()
+            && let Some(scope) = crate::store::bucket_heal_scope_for_object(bucket, object)
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+        {
+            let explicit_delete = opts.remove
+                && version_id.is_empty()
+                && crate::bucket::metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket).await?
+                && matches!(
+                    crate::bucket::metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
+                    crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+                );
+            let recovery = self
+                .recover_delete_key(
+                    bucket,
+                    object,
+                    crate::set_disk::DeleteRecoveryContext {
+                        dry_run: opts.dry_run,
+                        explicit_delete,
+                        namespace_owner: (!opts.dry_run).then(|| {
+                            Arc::new((scope.clone(), self.ctx.begin_namespace_commit(), _write_lock_guard.clone()))
+                                as Arc<dyn Send + Sync>
+                        }),
+                        ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &|| {
+                            scope.check().is_ok() && !_write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
+                        })
+                    },
+                )
+                .await?;
+            if opts.dry_run && recovery.discovered > 0 {
+                return Ok((
+                    HealResultItem {
+                        heal_item_type: HealItemType::Object.to_string(),
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        version_id: version_id.to_owned(),
+                        detail: format!(
+                            "delete recovery (dry run): discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}, pending={}",
+                            recovery.discovered,
+                            recovery.committed,
+                            recovery.rolled_back,
+                            recovery.reclaimed,
+                            recovery.blocked,
+                            recovery.pending
+                        ),
+                        ..Default::default()
+                    },
+                    None,
+                ));
+            }
+            if recovery.pending > 0 || recovery.blocked > 0 {
+                return Err(StorageError::SlowDown);
+            }
         }
 
         // The inner heal and missing-object report read the registry again;
@@ -3440,7 +3496,7 @@ impl SetDisks {
                 && errs
                     .iter()
                     .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
-                && !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                && !_write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
             {
                 *absence = Some(HealedObjectAbsence {
                     pool_index: self.pool_index,
@@ -3493,7 +3549,7 @@ impl SetDisks {
                         result,
                         err.map(Into::into),
                         absence,
-                        _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+                        _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost()),
                         bucket,
                         object,
                     ));
@@ -3505,7 +3561,7 @@ impl SetDisks {
             result,
             err.map(Into::into),
             absence,
-            _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+            _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost()),
             bucket,
             object,
         ))

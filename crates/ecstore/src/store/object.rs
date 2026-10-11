@@ -4849,7 +4849,9 @@ impl ECStore {
         opts: ObjectOptions,
         guards: impl IntoIterator<Item = rustfs_lock::NamespaceLockGuard>,
     ) -> Result<ObjectInfo> {
-        let guards: Vec<_> = guards.into_iter().collect();
+        let guards = Arc::new(guards.into_iter().collect::<Vec<_>>());
+        let mut opts = opts;
+        opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), guards.clone())));
         let store = Arc::clone(self);
         let bucket = bucket.to_owned();
         let object = object.to_owned();
@@ -4861,7 +4863,7 @@ impl ECStore {
                 if result.is_ok() {
                     list_objects::observe_list_objects_mutation(&store, &bucket).await;
                 }
-                // Keep: the only use of `guards` here, it moves them into the task so the locks outlive a dropped caller.
+                // Transient options also retain these guards through late disk I/O.
                 drop(guards);
                 result
             })
@@ -4955,9 +4957,9 @@ impl ECStore {
             if is_meta_bucketname(bucket) || (opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some()) {
                 None
             } else if opts.delete_prefix {
-                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+                Some(Arc::new(self.acquire_bucket_lifecycle_write_lock(bucket).await?))
             } else {
-                Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+                Some(Arc::new(self.acquire_bucket_lifecycle_read_lock(bucket).await?))
             };
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
@@ -4975,6 +4977,7 @@ impl ECStore {
         opts.tier_delete_journal_api = tier_journal_api.clone();
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
+            opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), guard.clone())));
         }
 
         if !is_meta_bucketname(bucket) {
@@ -5227,10 +5230,8 @@ impl ECStore {
                 return Ok(obj);
             }
             Err(err) => {
-                if is_err_object_not_found(&err)
-                    && opts.version_id.is_none()
-                    && !opts.versioned
-                    && !opts.version_suspended
+                if (is_err_object_not_found(&err) || is_err_version_not_found(&err))
+                    && (opts.version_id.is_some() || (!opts.versioned && !opts.version_suspended))
                     && opts.http_preconditions.is_none()
                     && !opts.replication_request
                 {
@@ -5458,12 +5459,13 @@ impl ECStore {
             None
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
-                Ok(guard) => Some(guard),
+                Ok(guard) => Some(Arc::new(guard)),
                 Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             }
         };
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
+            opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), guard.clone())));
         }
         if opts.delete_replication_config_snapshot.is_none() {
             match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {

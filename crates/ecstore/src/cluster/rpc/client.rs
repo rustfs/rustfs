@@ -142,6 +142,22 @@ pub async fn node_service_time_out_client_for_class(
         .max_encoding_message_size(max_message_size))
 }
 
+pub(crate) async fn node_service_delete_recovery_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+    timeout: std::time::Duration,
+) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, DiskError> {
+    let interceptor = interceptor.with_rpc_audience(addr).map_err(DiskError::from)?;
+    let channel = rustfs_protos::create_channel_with_timeout(addr, timeout)
+        .await
+        .map_err(|error| DiskError::RemoteClientUnavailable(error.to_string()))?;
+    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let max_message_size = rustfs_protos::internode_rpc_max_message_size();
+    Ok(NodeServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size))
+}
+
 pub async fn node_service_time_out_client_no_auth(
     addr: &String,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
@@ -545,6 +561,92 @@ mod tests {
     use tonic::service::Interceptor;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    #[tokio::test]
+    async fn delete_recovery_channel_uses_its_scoped_deadline() {
+        use bytes::Bytes;
+        use http_body_util::StreamBody;
+        use hyper::{body::Frame, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use rustfs_protos::proto_gen::node_service::{RecoverDeleteTransactionRequest, RecoverDeleteTransactionResponse};
+        use tonic_prost::prost::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recovery peer");
+        let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept recovery connection");
+                tokio::spawn(async move {
+                    let service = service_fn(|_request: HttpRequest<hyper::body::Incoming>| async {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let payload = RecoverDeleteTransactionResponse {
+                            success: true,
+                            protocol_version: 1,
+                            result: Bytes::new(),
+                            error: None,
+                        }
+                        .encode_to_vec();
+                        let mut data = vec![0];
+                        data.extend_from_slice(&u32::try_from(payload.len()).expect("small response").to_be_bytes());
+                        data.extend_from_slice(&payload);
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().expect("status"));
+                        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+                            vec![Ok(Frame::data(data.into())), Ok(Frame::trailers(trailers))];
+                        let mut response = HttpResponse::new(StreamBody::new(futures::stream::iter(frames)));
+                        response
+                            .headers_mut()
+                            .insert("content-type", "application/grpc".parse().expect("content type"));
+                        Ok::<_, std::convert::Infallible>(response)
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let request = || RecoverDeleteTransactionRequest {
+            disk: "disk".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: Bytes::new(),
+        };
+        // Seed an existing short-lived control channel to reproduce the inherited deadline.
+        let control = tonic::transport::Endpoint::from_shared(addr.clone())
+            .expect("test endpoint")
+            .timeout(std::time::Duration::from_millis(50))
+            .connect()
+            .await
+            .expect("control connect");
+        rustfs_common::cache_connection(addr.clone(), control).await;
+        let mut foreground = node_service_time_out_client(&addr, TonicInterceptor::NoOp(NoOpInterceptor))
+            .await
+            .expect("control client");
+        let error = foreground
+            .recover_delete_transaction(request())
+            .await
+            .expect_err("short control deadline");
+        assert!(matches!(error.code(), tonic::Code::Cancelled | tonic::Code::DeadlineExceeded));
+        // The 2-second test override bypasses the production range parser, which rejects 2.
+        let mut recovery = node_service_delete_recovery_client(
+            &addr,
+            TonicInterceptor::NoOp(NoOpInterceptor),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("scoped recovery client");
+        assert!(
+            recovery
+                .recover_delete_transaction(request())
+                .await
+                .expect("scoped deadline must survive control deadline")
+                .into_inner()
+                .success
+        );
+        server.abort();
+        rustfs_protos::evict_failed_connection(&addr).await;
+    }
 
     #[derive(Clone)]
     struct EpochProofService {

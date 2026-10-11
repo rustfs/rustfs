@@ -465,6 +465,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn recover_delete_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse>, Status> {
+        Err(Status::unimplemented("delete recovery is not supported by the lock fixture"))
+    }
+
     async fn settle_part_transaction(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::SettlePartTransactionRequest>,

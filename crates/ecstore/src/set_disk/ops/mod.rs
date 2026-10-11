@@ -19,6 +19,7 @@
 
 pub(crate) mod bitrot_self_verify;
 pub(crate) mod bucket;
+pub(crate) mod delete_recovery;
 pub(crate) mod heal;
 pub(crate) mod heal_walk;
 pub(crate) mod list;
