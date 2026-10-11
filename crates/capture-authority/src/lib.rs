@@ -1237,8 +1237,11 @@ mod tests {
     }
 
     fn u17b_snapshot(store: &Store) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        u17b_snapshot_database(&store.database)
+    }
+    fn u17b_snapshot_database(database: &Database) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         use crate::application::{APPLY_RESULTS, EVENTS, HEADS, OPERATIONS, VERSIONS};
-        let tx = store.database.begin_read().expect("snapshot transaction");
+        let tx = database.begin_read().expect("snapshot transaction");
         let meta = tx.open_table(META).expect("snapshot metadata");
         let mut snapshot = vec![
             meta.iter()
@@ -1465,6 +1468,11 @@ mod tests {
                 resume.wait();
                 let (store, result) = writer.join().expect("migration cut writer");
                 drop(store);
+                // A logical open refusal must not hide a physically durable mixed migration.
+                if let Ok(database) = Database::open(&backend.path) {
+                    let actual = u17b_snapshot_database(&database);
+                    assert!(actual == old || actual == new, "U17B_ATOMIC_SCHEMA_MIGRATION");
+                }
                 if let Some(store) = u17a_cut_recovery(&backend) {
                     let actual = u17b_snapshot(&store);
                     assert!(

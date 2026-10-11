@@ -298,11 +298,16 @@ fn entry_command(entry: &crate::LogEntry, native: bool) -> Result<DecideCreated,
 }
 
 pub(crate) fn native_application_state(tx: &ReadTransaction) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
-    let meta = tx.open_table(META)?;
+    native_application_metadata(&tx.open_table(META)?)
+}
+
+fn native_application_metadata(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
     if number(required(meta.get("schema")?)?.value())? != 4 {
         return Err(StoreError::UnsupportedSchema);
     }
-    let last = read_applied(&meta)?;
+    let last = read_applied(meta)?;
     let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())
         .map_err(|_| StoreError::CorruptRecord)?;
     if membership
@@ -316,7 +321,60 @@ pub(crate) fn native_application_state(tx: &ReadTransaction) -> Result<(Option<L
 
 impl Store {
     pub fn migrate_legacy_created_to_native(&mut self) -> Result<(), StoreError> {
-        Err(StoreError::UnsupportedSchema)
+        let tx = self.write_transaction()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            let schema = number(required(meta.get("schema")?)?.value())?;
+            if !matches!(schema, 3 | 4) {
+                return Err(StoreError::UnsupportedSchema);
+            }
+            let mut logs = tx.open_table(LOGS)?;
+            let heads = tx.open_table(HEADS)?;
+            let versions = tx.open_table(VERSIONS)?;
+            let events = tx.open_table(EVENTS)?;
+            let operations = tx.open_table(OPERATIONS)?;
+            let mut results = tx.open_table(APPLY_RESULTS)?;
+            validate_application_tables(&meta, &logs, &heads, &versions, &events, &operations, &results)?;
+            if schema == 4 {
+                return Ok(());
+            }
+            if meta.get("native_membership")?.is_some() {
+                return Err(StoreError::CorruptRecord);
+            }
+            // Validate the entire retained suffix before replacing any record.
+            let mut native_logs = Vec::new();
+            for row in logs.iter()? {
+                let (index, bytes) = row?;
+                let entry = decode_log(bytes.value())?;
+                let command = DecideCreated::decode(&entry.payload)?;
+                if entry.id.index != index.value() || command.encode()? != entry.payload {
+                    return Err(StoreError::CorruptRecord);
+                }
+                let native = crate::CaptureRaftEntry {
+                    log_id: entry.id.into(),
+                    payload: openraft::EntryPayload::Normal(crate::CaptureCommand::try_created(command)?),
+                };
+                native_logs.push((index.value(), encode_native_entry(&native)?));
+            }
+            let mut native_results = Vec::new();
+            for row in results.iter()? {
+                let (index, bytes) = row?;
+                let response = crate::CaptureResponse::created(decode_apply(bytes.value())?)?;
+                native_results.push((index.value(), encode_response(&response)?));
+            }
+            for (index, bytes) in native_logs {
+                logs.insert(index, bytes.as_slice())?;
+            }
+            for (index, bytes) in native_results {
+                results.insert(index, bytes.as_slice())?;
+            }
+            let membership = crate::CaptureMembership::new(None, vec![], BTreeMap::new())?;
+            meta.insert("native_membership", membership.encode()?.as_slice())?;
+            meta.insert("schema", 4u64.to_be_bytes().as_slice())?;
+            // Replay native decisions inside the same durable writer boundary.
+            validate_application_tables(&meta, &logs, &heads, &versions, &events, &operations, &results)?;
+        }
+        self.commit(tx)
     }
 
     /// Explicitly opt an empty, bound store into native entry persistence.
@@ -630,23 +688,40 @@ impl Store {
 
 pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreError> {
     let meta = tx.open_table(META)?;
+    if !matches!(number(required(meta.get("schema")?)?.value())?, 3 | 4) {
+        return Ok(());
+    }
+    validate_application_tables(
+        &tx.open_table(META)?,
+        &tx.open_table(LOGS)?,
+        &tx.open_table(HEADS)?,
+        &tx.open_table(VERSIONS)?,
+        &tx.open_table(EVENTS)?,
+        &tx.open_table(OPERATIONS)?,
+        &tx.open_table(APPLY_RESULTS)?,
+    )
+}
+
+fn validate_application_tables(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    logs: &impl ReadableTable<u64, &'static [u8]>,
+    heads: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    versions: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    events: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    operations: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    results: &impl ReadableTable<u64, &'static [u8]>,
+) -> Result<(), StoreError> {
     let schema = number(required(meta.get("schema")?)?.value())?;
     let native = schema == 4;
     if !matches!(schema, 3 | 4) {
         return Ok(());
     }
-    let binding = read_binding(&meta).map_err(|error| match error {
+    let binding = read_binding(meta).map_err(|error| match error {
         StoreError::BindingNotPinned => StoreError::CorruptRecord,
         other => other,
     })?;
-    let last = read_applied(&meta)?;
-    let logs = tx.open_table(LOGS)?;
-    let committed = validate_committed(&meta, &logs)?;
-    let heads = tx.open_table(HEADS)?;
-    let versions = tx.open_table(VERSIONS)?;
-    let events = tx.open_table(EVENTS)?;
-    let operations = tx.open_table(OPERATIONS)?;
-    let results = tx.open_table(APPLY_RESULTS)?;
+    let last = read_applied(meta)?;
+    let committed = validate_committed(meta, logs)?;
     if last.is_some_and(|last| committed.is_none_or(|c| last.index > c.index)) {
         return Err(StoreError::CorruptRecord);
     }
@@ -745,7 +820,7 @@ pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreErro
         return Err(StoreError::CorruptRecord);
     }
     if native {
-        if native_application_state(tx)?.1 != expected_membership
+        if native_application_metadata(meta)?.1 != expected_membership
             || heads.len()? != u64::try_from(replay_heads.len()).map_err(|_| StoreError::CorruptRecord)?
             || versions.len()? != u64::try_from(replay_versions.len()).map_err(|_| StoreError::CorruptRecord)?
         {
