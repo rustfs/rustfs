@@ -15,8 +15,8 @@ pub use native_snapshot::{NativeSnapshotError, NativeSnapshotView};
 mod raft_types;
 pub mod snapshot;
 pub use created::{
-    CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedResult, CreatedVersion, DecideCreated,
-    MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
+    CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedOperationProvenance, CreatedResult,
+    CreatedVersion, DecideCreated, MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
 };
 pub use node::{CaptureNode, CaptureNodeError};
 pub use raft_types::{
@@ -381,7 +381,7 @@ impl Store {
         let tx = store.database.begin_read()?;
         let meta = tx.open_table(META)?;
         let schema = meta.get("schema")?.ok_or(StoreError::CorruptRecord)?;
-        if !matches!(number(schema.value())?, 1..=4) {
+        if !matches!(number(schema.value())?, 1..=6) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = meta.get("identity")?.ok_or(StoreError::CorruptRecord)?;
@@ -403,13 +403,13 @@ impl Store {
             let (key, value) = row?;
             let entry = decode_log(value.value())?;
             if next != Some(key.value()) || entry.id.index != key.value() {
-                return Err(if number(schema.value())? == 4 {
+                return Err(if matches!(number(schema.value())?, 4 | 6) {
                     StoreError::CorruptRecord
                 } else {
                     StoreError::InvalidLogSequence
                 });
             }
-            if number(schema.value())? == 4 {
+            if matches!(number(schema.value())?, 4 | 6) {
                 application::decode_native_entry(entry.clone())?;
             }
             next = key.value().checked_add(1);
@@ -419,7 +419,7 @@ impl Store {
         application::validate_application(&tx)?;
         let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         if tail != last {
-            return Err(if number(schema.value())? == 4 {
+            return Err(if matches!(number(schema.value())?, 4 | 6) {
                 StoreError::CorruptRecord
             } else {
                 StoreError::InvalidLogSequence
@@ -465,7 +465,10 @@ impl Store {
             return Err(StoreError::WriteDisabled);
         }
         let tx = self.database.begin_read()?;
-        if number(tx.open_table(META)?.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())? == 4 {
+        if matches!(
+            number(tx.open_table(META)?.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?,
+            4 | 6
+        ) {
             return Err(StoreError::UnsupportedSchema);
         }
         drop(tx);
@@ -1236,6 +1239,624 @@ mod tests {
         u19_assert_io(error);
     }
 
+    fn provenance_promote(store: &mut Store) {
+        let result = store.promote_created_provenance();
+        assert_eq!(result.as_ref().map(|_| ()).map_err(StoreError::code), Ok(()), "U26_PROVENANCE_ENABLED");
+    }
+
+    fn provenance_assert(store: &Store, command: &DecideCreated, first: LogId, result: &CreatedResult) {
+        let actual = store
+            .created_operation_provenance(command.operation_id)
+            .expect("provenance read")
+            .expect("permanent operation");
+        assert_eq!(actual.first_decision_log_id, first, "U26_FIRST_ID_STICKY");
+        assert_eq!(actual.operation.canonical_command, command.encode().expect("canonical bytes"));
+        assert_eq!(&actual.operation.result, result);
+        assert_eq!(
+            store.created_operation(command.operation_id).expect("compatible projection"),
+            Some(actual.operation)
+        );
+    }
+
+    fn provenance_commands() -> Vec<DecideCreated> {
+        let success = u17a_command();
+        let mut conflict = success.clone();
+        conflict.binding_revision = 99;
+        let mut binding = conflict.clone();
+        binding.operation_id = [11; 16];
+        binding.expected_head = Some([12; 16]);
+        let mut head = success.clone();
+        head.operation_id = [13; 16];
+        let mut version = success.clone();
+        version.operation_id = [14; 16];
+        version.expected_head = Some(success.prepared.version_id);
+        vec![
+            success.clone(),
+            success,
+            conflict,
+            binding.clone(),
+            head.clone(),
+            version.clone(),
+            binding,
+            head,
+            version,
+        ]
+    }
+
+    fn provenance_history(native: bool) -> (tempfile::TempDir, CrashBackend, Store, Vec<DecideCreated>) {
+        let (dir, backend, mut store) = u17a_bound();
+        store.save_vote(vote()).expect("nonempty provenance fixture vote");
+        let commands = provenance_commands();
+        if native {
+            store.enable_native_empty().expect("native fixture");
+            store
+                .append_native(
+                    &commands
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| u17a_created(u64::try_from(i).expect("index"), c.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("native prefix");
+        } else {
+            store
+                .append(
+                    &commands
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| LogEntry {
+                            id: u17a_id(u64::try_from(i).expect("index")),
+                            payload: c.encode().expect("legacy canonical"),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("legacy prefix");
+        }
+        store.save_committed(u17a_id(8)).expect("complete commit");
+        for i in 0..9 {
+            if native {
+                store.apply_next_native(u17a_id(i)).expect("native apply");
+            } else {
+                store.apply_next_created(u17a_id(i)).expect("legacy apply");
+            }
+        }
+        (dir, backend, store, commands)
+    }
+
+    #[test]
+    fn provenance_first_decisions_and_retries_reopen() {
+        let (_dir, backend, mut store) = u17a_store();
+        provenance_promote(&mut store);
+        assert_eq!(committed_schema(&store), 6);
+        let commands = provenance_commands();
+        let entries = commands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| u17a_created(u64::try_from(i).expect("index"), c.clone()))
+            .collect::<Vec<_>>();
+        store.append_native(&entries).expect("Created entries");
+        store.save_committed(u17a_id(8)).expect("committed Created");
+        for i in 0..9 {
+            store.apply_next_native(u17a_id(i)).expect("decision and retry");
+        }
+        let expected = [
+            (
+                0usize,
+                0u64,
+                CreatedResult::Created {
+                    version_id: [3; 16],
+                    event_id: [1; 16],
+                    decision_log_id: u17a_id(0),
+                },
+            ),
+            (3, 3, CreatedResult::BindingMismatch),
+            (
+                4,
+                4,
+                CreatedResult::HeadMismatch {
+                    actual_head: Some([3; 16]),
+                },
+            ),
+            (5, 5, CreatedResult::VersionConflict),
+        ];
+        for (index, first, result) in &expected {
+            provenance_assert(&store, &commands[*index], u17a_id(*first), result);
+        }
+        assert_eq!(
+            store
+                .native_apply_response(2)
+                .expect("conflict receipt")
+                .expect("receipt")
+                .created_result(),
+            Some(&CreatedResult::OperationConflict)
+        );
+        drop(store);
+        let store = Store::open(&backend.path, identity()).expect("reopen full provenance replay");
+        for (index, first, result) in &expected {
+            provenance_assert(&store, &commands[*index], u17a_id(*first), result);
+        }
+        assert_eq!(store.created_event(commands[3].operation_id).expect("negative event"), None);
+        assert_eq!(encode_id(u17a_id(3)).len(), 24);
+    }
+
+    #[test]
+    fn provenance_native_controls_preserve_state() {
+        let (_dir, backend, mut store) = u17a_store();
+        provenance_promote(&mut store);
+        let (member, membership) = u17a_membership(1);
+        let entries = vec![u17a_blank(0), member, u17a_created(2, u17a_command()), u17a_blank(3)];
+        let writer = NativeLogWriter::new(store);
+        let runtime = u19_runtime();
+        runtime.block_on(writer.append_native(entries.clone())).expect("async append");
+        let responses = runtime
+            .block_on(writer.apply_committed(entries))
+            .expect("async committed apply");
+        assert_eq!(responses[0], CaptureResponse::blank(u17a_id(0)).expect("blank"));
+        assert_eq!(responses[1], CaptureResponse::membership(u17a_id(1)).expect("membership"));
+        assert_eq!(
+            runtime.block_on(writer.applied_state()).expect("applied pair"),
+            (Some(u17a_id(3)), membership.clone())
+        );
+        {
+            let store = writer.store.lock().expect("store");
+            assert_eq!(
+                store
+                    .database
+                    .begin_read()
+                    .expect("read")
+                    .open_table(application::OPERATIONS)
+                    .expect("operations")
+                    .len()
+                    .expect("count"),
+                1
+            );
+            assert_eq!(store.created_apply_result(0).expect("blank projection"), None);
+            assert_eq!(store.created_apply_result(1).expect("membership projection"), None);
+        }
+        let view = runtime.block_on(writer.snapshot_view()).expect("schema6 native view");
+        drop(view);
+        backend.cut();
+        drop(writer);
+        let store = Store::open(&backend.path, identity()).expect("async ACK cut reopen");
+        assert_eq!(store.native_application_state().expect("recovered pair"), (Some(u17a_id(3)), membership));
+        for (i, response) in responses.iter().enumerate() {
+            assert_eq!(
+                store
+                    .native_apply_response(u64::try_from(i).expect("index"))
+                    .expect("receipt")
+                    .as_ref(),
+                Some(response),
+                "U26_DURABLE_ACK"
+            );
+        }
+        assert_eq!(
+            store
+                .created_operation_provenance([1; 16])
+                .expect("durable operation")
+                .expect("operation")
+                .first_decision_log_id,
+            u17a_id(2),
+            "U26_DURABLE_ACK"
+        );
+    }
+
+    #[test]
+    fn provenance_promotes_schema3_and_schema4_exact_history() {
+        for native in [false, true] {
+            let (_dir, backend, mut store, commands) = provenance_history(native);
+            let old = u17b_snapshot(&store);
+            assert_eq!(
+                store
+                    .created_operation_provenance([1; 16])
+                    .expect_err("old schema has no provenance")
+                    .code(),
+                "unsupported_schema"
+            );
+            provenance_promote(&mut store);
+            assert_eq!(committed_schema(&store), if native { 6 } else { 5 });
+            let new = u17b_snapshot(&store);
+            let metadata_without_schema = |rows: &Vec<(Vec<u8>, Vec<u8>)>| {
+                rows.iter()
+                    .filter(|(key, _)| key.as_slice() != b"schema")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                metadata_without_schema(&old[0]),
+                metadata_without_schema(&new[0]),
+                "only schema metadata changes"
+            );
+            for i in 1..6 {
+                assert_eq!(old[i], new[i], "promotion preserves logs, responses and business state");
+            }
+            assert_eq!(old[7], new[7], "promotion preserves vote");
+            for (old_row, new_row) in old[6].iter().zip(&new[6]) {
+                assert_eq!(old_row.0, new_row.0);
+                assert_eq!(&new_row.1[..5], b"COPR\x01");
+                assert_eq!(&new_row.1[29..], old_row.1.as_slice(), "canonical old value must remain byte exact");
+            }
+            for (i, first) in [(0usize, 0u64), (3, 3), (4, 4), (5, 5)] {
+                let row = store
+                    .created_operation_provenance(commands[i].operation_id)
+                    .expect("promoted read")
+                    .expect("operation");
+                assert_eq!(row.first_decision_log_id, u17a_id(first), "U26_PROMOTION_FIRST_ID");
+            }
+            let once = u17b_snapshot(&store);
+            provenance_promote(&mut store);
+            assert_eq!(u17b_snapshot(&store), once);
+            drop(store);
+            let mut store = Store::open(&backend.path, identity()).expect("reopen promoted history");
+            let mut suffix = commands[0].clone();
+            suffix.operation_id = [20; 16];
+            suffix.prepared.version_id = [21; 16];
+            suffix.expected_head = Some([3; 16]);
+            if native {
+                store
+                    .append_native(&[u17a_created(9, suffix.clone())])
+                    .expect("native suffix");
+            } else {
+                store
+                    .append(&[LogEntry {
+                        id: u17a_id(9),
+                        payload: suffix.encode().expect("suffix"),
+                    }])
+                    .expect("legacy suffix");
+            }
+            store.save_committed(u17a_id(9)).expect("suffix committed");
+            if native {
+                store.apply_next_native(u17a_id(9)).expect("native suffix apply");
+            } else {
+                store.apply_next_created(u17a_id(9)).expect("legacy suffix apply");
+            }
+            assert_eq!(
+                store
+                    .created_operation_provenance(suffix.operation_id)
+                    .expect("suffix provenance")
+                    .expect("suffix operation")
+                    .first_decision_log_id,
+                u17a_id(9)
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_rejects_incomplete_or_forged_prefix_atomically() {
+        use application::{APPLY_RESULTS, EVENTS, HEADS, OPERATIONS, VERSIONS};
+        for native in [false, true] {
+            for corruption in 0..9 {
+                let (_dir, _backend, mut store, commands) = provenance_history(native);
+                let tx = store.database.begin_write().expect("corruption transaction");
+                match corruption {
+                    0 => {
+                        tx.open_table(LOGS).expect("logs").remove(0).expect("missing prefix");
+                    }
+                    1 => {
+                        tx.open_table(APPLY_RESULTS)
+                            .expect("responses")
+                            .remove(3)
+                            .expect("missing negative response");
+                    }
+                    2 => {
+                        let mut logs = tx.open_table(LOGS).expect("logs");
+                        let raw = logs.get(3).expect("get").expect("row").value().to_vec();
+                        let mut entry = decode_log(&raw).expect("log");
+                        entry.id.term += 1;
+                        logs.insert(3, encode_log(&entry).expect("encode").as_slice())
+                            .expect("wrong full ID");
+                    }
+                    3 => {
+                        let mut operations = tx.open_table(OPERATIONS).expect("operations");
+                        let raw = operations
+                            .get(commands[3].operation_id.as_slice())
+                            .expect("get")
+                            .expect("row")
+                            .value()
+                            .to_vec();
+                        operations.insert([99; 16].as_slice(), raw.as_slice()).expect("orphan");
+                    }
+                    4 => {
+                        tx.open_table(EVENTS)
+                            .expect("events")
+                            .remove([1; 16].as_slice())
+                            .expect("missing event");
+                    }
+                    5 => {
+                        let mut meta = tx.open_table(META).expect("meta");
+                        meta.insert("last_applied", encode_id(u17a_id(7)).as_slice())
+                            .expect("wrong applied ID");
+                    }
+                    6 => {
+                        tx.open_table(HEADS)
+                            .expect("heads")
+                            .remove(crate::created::object_bytes(&commands[0].object).expect("object").as_slice())
+                            .expect("missing head");
+                    }
+                    7 => {
+                        let mut versions = tx.open_table(VERSIONS).expect("versions");
+                        let key = versions
+                            .iter()
+                            .expect("iter")
+                            .next()
+                            .expect("version")
+                            .expect("row")
+                            .0
+                            .value()
+                            .to_vec();
+                        versions.remove(key.as_slice()).expect("missing version");
+                    }
+                    _ => {
+                        let mut logs = tx.open_table(LOGS).expect("logs");
+                        let raw = logs.get(2).expect("get").expect("row").value().to_vec();
+                        let mut entry = decode_log(&raw).expect("log");
+                        entry.payload = if native {
+                            decode_log(logs.get(3).expect("source log").expect("source row").value())
+                                .expect("source entry")
+                                .payload
+                        } else {
+                            commands[3].encode().expect("canonical")
+                        };
+                        logs.insert(2, encode_log(&entry).expect("encode").as_slice())
+                            .expect("forged early conflict");
+                    }
+                }
+                tx.commit().expect("inject corruption");
+                let before = u17b_snapshot(&store);
+                assert_eq!(
+                    store
+                        .promote_created_provenance()
+                        .expect_err("corrupt promotion refused")
+                        .code(),
+                    "corrupt_record"
+                );
+                assert_eq!(u17b_snapshot(&store), before, "rejection must have zero writes");
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_empty_first_commit_never_downgrades() {
+        for native in [false, true] {
+            let (_dir, backend, mut store) = u17a_bound();
+            provenance_promote(&mut store);
+            assert_eq!(committed_schema(&store), 5);
+            if native {
+                store.enable_native_empty().expect("empty5 explicit native6");
+                store.append_native(&[u17a_blank(0)]).expect("blank");
+            } else {
+                store
+                    .append(&[LogEntry {
+                        id: u17a_id(0),
+                        payload: u17a_command().encode().expect("command"),
+                    }])
+                    .expect("legacy");
+            }
+            store.save_committed(u17a_id(0)).expect("first committed");
+            assert_eq!(committed_schema(&store), if native { 6 } else { 5 }, "U26_SCHEMA_NEVER_DOWNGRADES");
+            if native {
+                store.apply_next_native(u17a_id(0)).expect("blank apply");
+            } else {
+                store.apply_next_created(u17a_id(0)).expect("legacy apply");
+                assert_eq!(
+                    store.enable_native_empty().expect_err("populated5 forbidden").code(),
+                    "unsupported_schema"
+                );
+                assert_eq!(
+                    store
+                        .migrate_legacy_created_to_native()
+                        .expect_err("U17B cannot reinterpret5")
+                        .code(),
+                    "unsupported_schema"
+                );
+            }
+            drop(store);
+            let store = Store::open(&backend.path, identity()).expect("reopen schema");
+            assert_eq!(committed_schema(&store), if native { 6 } else { 5 }, "U26_SCHEMA_NEVER_DOWNGRADES");
+            if !native {
+                let writer = NativeLogWriter::new(store);
+                assert!(
+                    u19_runtime().block_on(writer.snapshot_view()).is_err(),
+                    "schema5 cannot expose a native view"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_old_binary_and_unknown_versions_reject() {
+        for native in [false, true] {
+            for corruption in 0..10 {
+                let (_dir, backend, mut store, _) = provenance_history(native);
+                provenance_promote(&mut store);
+                let tx = store.database.begin_write().expect("corruption");
+                if corruption == 0 {
+                    tx.open_table(META)
+                        .expect("meta")
+                        .insert("schema", 7u64.to_be_bytes().as_slice())
+                        .expect("future schema");
+                } else {
+                    let mut operations = tx.open_table(application::OPERATIONS).expect("operations");
+                    let key = [11; 16];
+                    let mut raw = operations
+                        .get(key.as_slice())
+                        .expect("get")
+                        .expect("negative")
+                        .value()
+                        .to_vec();
+                    match corruption {
+                        1 => raw[4] = 2,
+                        2 => {
+                            raw.pop();
+                        }
+                        3 => raw.push(0),
+                        4 => raw[5..29].fill(0),
+                        5 => raw[5..29].copy_from_slice(&encode_id(u17a_id(6))),
+                        6 => {
+                            let mut id = u17a_id(3);
+                            id.leader_node += 1;
+                            raw[5..29].copy_from_slice(&encode_id(id));
+                        }
+                        7 => {
+                            let mut id = u17a_id(3);
+                            id.term += 1;
+                            raw[5..29].copy_from_slice(&encode_id(id));
+                        }
+                        8 => raw[29..37].copy_from_slice(&u64::MAX.to_be_bytes()),
+                        _ => raw = raw[29..].to_vec(),
+                    }
+                    operations.insert(key.as_slice(), raw.as_slice()).expect("bad envelope");
+                }
+                tx.commit().expect("persist corruption");
+                drop(store);
+                assert_eq!(
+                    Store::open(&backend.path, identity())
+                        .err()
+                        .expect("strict open rejects")
+                        .code(),
+                    if corruption == 0 {
+                        "unsupported_schema"
+                    } else {
+                        "corrupt_record"
+                    }
+                );
+            }
+        }
+        // The independent accepted old-binary probe is run by the root task.
+    }
+
+    #[test]
+    fn provenance_promotion_and_apply_powercut_atomic() {
+        for native in [false, true] {
+            for promotion in [false, true] {
+                let fixture = || {
+                    let (dir, backend, mut store, _) = provenance_history(native);
+                    if !promotion {
+                        provenance_promote(&mut store);
+                        let mut c = u17a_command();
+                        c.operation_id = [30; 16];
+                        c.binding_revision = 99;
+                        if native {
+                            store.append_native(&[u17a_created(9, c)]).expect("pending native");
+                        } else {
+                            store
+                                .append(&[LogEntry {
+                                    id: u17a_id(9),
+                                    payload: c.encode().expect("pending canonical"),
+                                }])
+                                .expect("pending legacy");
+                        }
+                        store.save_committed(u17a_id(9)).expect("pending commit");
+                    }
+                    (dir, backend, store)
+                };
+                let action = |store: &mut Store| -> Result<(), StoreError> {
+                    if promotion {
+                        store.promote_created_provenance()
+                    } else if native {
+                        store.apply_next_native(u17a_id(9)).map(|_| ())
+                    } else {
+                        store.apply_next_created(u17a_id(9)).map(|_| ())
+                    }
+                };
+                let (_dir, backend, mut store) = fixture();
+                let old = u17b_snapshot(&store);
+                backend.media.lock().expect("reset syncs").syncs = 0;
+                let result = action(&mut store);
+                assert_eq!(result.as_ref().map(|_| ()).map_err(StoreError::code), Ok(()), "U26_PROVENANCE_ENABLED");
+                let reached = backend.media.lock().expect("syncs").syncs;
+                assert_eq!(reached > 0, true, "U26_DURABLE_ACK");
+                let new = u17b_snapshot(&store);
+                backend.cut();
+                drop(store);
+                let database = Database::open(&backend.path).expect("ACK database recovery");
+                assert_eq!(u17b_snapshot_database(&database), new, "U26_DURABLE_ACK");
+                drop(database);
+                let (_dir, backend, mut store) = fixture();
+                backend.arm(1, false, false);
+                assert_eq!(
+                    action(&mut store).expect_err("uncertain provenance commit").code(),
+                    "commit_indeterminate"
+                );
+                let fenced = u17b_snapshot(&store);
+                let mutations: [fn(&mut Store) -> Result<(), StoreError>; 11] = [
+                    Store::promote_created_provenance,
+                    |store| store.append(&[]),
+                    |store| store.append_native(&[]),
+                    |store| store.save_vote(vote()),
+                    |store| store.save_committed(u17a_id(8)),
+                    |store| store.apply_next_created(u17a_id(0)).map(|_| ()),
+                    |store| store.apply_next_native(u17a_id(0)).map(|_| ()),
+                    |store| store.pin_capture_binding(u17a_binding()),
+                    Store::enable_native_empty,
+                    Store::migrate_legacy_created_to_native,
+                    |store| store.truncate_suffix(9),
+                ];
+                for mutation in mutations {
+                    assert_eq!(
+                        mutation(&mut store)
+                            .expect_err("uncertain handle must fence every mutation")
+                            .code(),
+                        "write_disabled",
+                        "U26_WRITE_FENCE"
+                    );
+                    assert_eq!(u17b_snapshot(&store), fenced, "fenced mutation must not change any table");
+                }
+                let writer = NativeLogWriter::new(store);
+                let result = u19_runtime().block_on(writer.apply_committed(vec![]));
+                assert!(
+                    matches!(result, Err(NativeWriteError::Store(StoreError::WriteDisabled))),
+                    "U26_WRITE_FENCE async apply"
+                );
+                assert_eq!(u17b_snapshot(&writer.store.lock().expect("fenced writer")), fenced);
+                drop(writer);
+                for sync in 1..=reached {
+                    for after in [false, true] {
+                        let (_dir, backend, mut store) = fixture();
+                        assert_eq!(u17b_snapshot(&store), old);
+                        backend.arm(sync, after, true);
+                        let result = action(&mut store);
+                        let actual_syncs = backend.media.lock().expect("reached cut").syncs;
+                        assert!(actual_syncs >= sync, "cut must actually reach target sync");
+                        backend.cut();
+                        drop(store);
+                        match Database::open(&backend.path) {
+                            Ok(database) => {
+                                let actual = u17b_snapshot_database(&database);
+                                assert!(actual == old || actual == new, "physical all-table atomicity");
+                                if result.is_ok() {
+                                    assert_eq!(actual, new, "U26_DURABLE_ACK");
+                                }
+                                let recovered = Store::from_database(database, identity())
+                                    .expect("logical corruption cannot hide mixed state");
+                                assert_eq!(u17b_snapshot(&recovered), actual);
+                            }
+                            Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))) => {
+                                assert!(result.is_err(), "U26_DURABLE_ACK");
+                            }
+                            Err(error) => panic!("unexpected physical recovery error: {error:?}"),
+                        }
+                    }
+                }
+            }
+            let (_dir, _backend, mut expected_store, _) = provenance_history(native);
+            provenance_promote(&mut expected_store);
+            let expected = u17b_snapshot(&expected_store);
+            let dir = tempfile::tempdir().expect("child provenance directory");
+            let path = dir.path().join("db");
+            let mut store = Store::initialize(&path, identity()).expect("child database");
+            store.pin_capture_binding(u17a_binding()).expect("child binding");
+            drop(store);
+            // Process termination after ACK is separate from the physical media cuts above.
+            let mut process = child(&path, if native { "provenance-native" } else { "provenance-legacy" });
+            ack(&mut process);
+            process.kill().expect("SIGKILL acknowledged child");
+            assert!(!process.wait().expect("reap killed child").success());
+            let reopened = Store::open(&path, identity()).expect("independent child ACK reopen");
+            assert_eq!(committed_schema(&reopened), if native { 6 } else { 5 });
+            assert_eq!(u17b_snapshot(&reopened), expected, "U26_DURABLE_ACK complete child state");
+        }
+    }
+
     fn u17b_snapshot(store: &Store) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         u17b_snapshot_database(&store.database)
     }
@@ -1278,6 +1899,17 @@ mod tests {
                     .collect(),
             );
         }
+        snapshot.push(
+            tx.open_table(VOTE)
+                .expect("snapshot vote table")
+                .iter()
+                .expect("vote iterator")
+                .map(|row| {
+                    let (key, value) = row.expect("vote row");
+                    (key.value().to_be_bytes().to_vec(), value.value().to_vec())
+                })
+                .collect(),
+        );
         snapshot
     }
     fn u17b_history() -> (tempfile::TempDir, CrashBackend, Store, Vec<DecideCreated>) {
@@ -3440,7 +4072,48 @@ mod tests {
                 assert!(Store::open(path, identity()).is_err(), "U08_INVARIANT exclusive lock absent");
             } else {
                 let mut store = Store::open(path, identity()).expect("child open");
-                if std::env::var("U08_CHILD_MODE").expect("mode") == "committed" {
+                let mode = std::env::var("U08_CHILD_MODE").expect("mode");
+                if matches!(mode.as_str(), "provenance-native" | "provenance-legacy") {
+                    store.save_vote(vote()).expect("child provenance vote ACK");
+                    let native = mode == "provenance-native";
+                    if native {
+                        store.enable_native_empty().expect("child native enable");
+                    }
+                    provenance_promote(&mut store);
+                    let commands = provenance_commands();
+                    if native {
+                        store
+                            .append_native(
+                                &commands
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, command)| u17a_created(u64::try_from(i).expect("child index"), command.clone()))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .expect("child native append");
+                    } else {
+                        store
+                            .append(
+                                &commands
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, command)| LogEntry {
+                                        id: u17a_id(u64::try_from(i).expect("child index")),
+                                        payload: command.encode().expect("child canonical"),
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            .expect("child legacy append");
+                    }
+                    store.save_committed(u17a_id(8)).expect("child committed ACK");
+                    for index in 0..9 {
+                        if native {
+                            store.apply_next_native(u17a_id(index)).expect("child native apply ACK");
+                        } else {
+                            store.apply_next_created(u17a_id(index)).expect("child legacy apply ACK");
+                        }
+                    }
+                } else if mode == "committed" {
                     store.save_committed(truncate_batch()[2].id).expect("child committed ACK");
                 } else if std::env::var("U08_CHILD_MODE").expect("mode") == "truncate" {
                     store.truncate_suffix(2).expect("truncate ACK");

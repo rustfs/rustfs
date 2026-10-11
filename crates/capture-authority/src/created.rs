@@ -60,6 +60,11 @@ pub struct CreatedOperation {
     pub result: CreatedResult,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedOperationProvenance {
+    pub operation: CreatedOperation,
+    pub first_decision_log_id: LogId,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedApplyResult {
     pub log_id: LogId,
     pub result: CreatedResult,
