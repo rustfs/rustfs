@@ -69,9 +69,10 @@ impl NativeLogWriter {
         }
     }
 
-    async fn write<F>(&self, write: F) -> Result<(), NativeWriteError>
+    async fn write<T, F>(&self, write: F) -> Result<T, NativeWriteError>
     where
-        F: FnOnce(&mut Store) -> Result<(), StoreError> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
     {
         // Lock order is ordering then Store. The worker owns the ordering guard
         // until commit completes, even when its awaiting caller is cancelled.
@@ -109,6 +110,58 @@ impl NativeLogWriter {
 
     pub async fn truncate_suffix(&self, from: u64) -> Result<(), NativeWriteError> {
         self.write(move |store| store.truncate_suffix(from)).await
+    }
+
+    /// Apply entries already committed by Raft consensus. Only the trusted Raft
+    /// apply path may call this; local persistence does not prove quorum.
+    pub async fn apply_committed(&self, entries: Vec<CaptureRaftEntry>) -> Result<Vec<CaptureResponse>, NativeWriteError> {
+        self.write(move |store| {
+            if !store.writable {
+                return Err(StoreError::WriteDisabled);
+            }
+            let (last_applied, _) = store.native_application_state()?;
+            if entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            for entry in &entries {
+                if store.read_native_entry(entry.log_id.index)?.as_ref() != Some(entry) {
+                    return Err(StoreError::InvalidCommittedLog);
+                }
+            }
+            for pair in entries.windows(2) {
+                if pair[0].log_id.index.checked_add(1) != Some(pair[1].log_id.index) {
+                    return Err(StoreError::InvalidApplySequence);
+                }
+            }
+            let first = entries[0].log_id.index;
+            match last_applied {
+                None if first != 0 => return Err(StoreError::InvalidApplySequence),
+                Some(last) if first > last.index && last.index.checked_add(1) != Some(first) => {
+                    return Err(StoreError::InvalidApplySequence);
+                }
+                _ => {}
+            }
+            // Validate the entire request before either durable marker advances.
+            let end = entries[entries.len() - 1].log_id;
+            if store.read_committed()?.is_none_or(|committed| committed.index < end.index) {
+                store.save_committed(end.into())?;
+            }
+            entries
+                .into_iter()
+                .map(|entry| store.apply_next_native(entry.log_id.into()))
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn applied_state(&self) -> Result<(Option<LogId>, CaptureMembership), NativeWriteError> {
+        self.write(|store| {
+            if !store.writable {
+                return Err(StoreError::WriteDisabled);
+            }
+            store.native_application_state()
+        })
+        .await
     }
 }
 
@@ -605,6 +658,302 @@ mod tests {
         }
     }
 
+    fn u21_fixture() -> (tempfile::TempDir, CrashBackend, NativeLogWriter, Vec<CaptureRaftEntry>, CaptureMembership) {
+        let (dir, backend, mut store) = u17a_store();
+        let (entry, membership) = u17a_membership(1);
+        let entries = vec![u17a_blank(0), entry, u17a_created(2, u17a_command())];
+        store.append_native(&entries).expect("persist native batch");
+        (dir, backend, NativeLogWriter::new(store), entries, membership)
+    }
+
+    #[test]
+    fn u21_apply_native_batch() {
+        let (_dir, backend, writer, entries, membership) = u21_fixture();
+        let result = u19_runtime().block_on(writer.apply_committed(entries));
+        assert!(result.is_ok(), "U21_APPLY_SUCCESS: {result:?}");
+        let responses = result.expect("batch responses");
+        let expected = {
+            let store = writer.store.lock().expect("store");
+            (0..3)
+                .map(|i| {
+                    store
+                        .native_apply_response(i)
+                        .expect("receipt")
+                        .expect("U21_APPLY_DURABLE persisted receipt")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(responses, expected, "U21_APPLY_DURABLE");
+        assert_eq!(responses[0], CaptureResponse::blank(u17a_id(0)).expect("Blank"));
+        assert_eq!(responses[1], CaptureResponse::membership(u17a_id(1)).expect("Membership"));
+        {
+            let store = writer.store.lock().expect("store");
+            assert_eq!(
+                responses[2],
+                CaptureResponse::created(store.created_apply_result(2).expect("Created").expect("durable Created"))
+                    .expect("Created response")
+            );
+            assert!(
+                store
+                    .created_operation(u17a_command().operation_id)
+                    .expect("operation")
+                    .is_some(),
+                "U21_APPLY_DURABLE"
+            );
+        }
+        assert_eq!(
+            u19_runtime().block_on(writer.applied_state()).expect("checkpoint"),
+            (Some(u17a_id(2)), membership.clone())
+        );
+        backend.cut();
+        drop(writer);
+        let store = Store::open(&backend.path, identity()).expect("cut reopen");
+        assert_eq!(store.native_application_state().expect("reopened pair"), (Some(u17a_id(2)), membership));
+        for (i, response) in expected.iter().enumerate() {
+            assert_eq!(
+                store
+                    .native_apply_response(u64::try_from(i).expect("index"))
+                    .expect("reopened receipt")
+                    .as_ref(),
+                Some(response)
+            );
+        }
+    }
+
+    #[test]
+    fn u21_apply_batch_rejects_mismatch() {
+        let (_dir, backend, writer, entries, _) = u21_fixture();
+        let old = u19_runtime().block_on(writer.applied_state()).expect("old pair");
+        let mut payload = entries.clone();
+        payload[1].payload = openraft::EntryPayload::Blank;
+        let mut id = entries.clone();
+        id[1].log_id = LogId { term: 12, ..u17a_id(1) }.into();
+        let mut command = u17a_command();
+        command.prepared.content_length += 1;
+        let mut changed = entries.clone();
+        changed[2] = u17a_created(2, command);
+        let syncs = backend.media.lock().expect("media").syncs;
+        for invalid in [
+            payload,
+            id,
+            changed,
+            vec![entries[0].clone(), entries[2].clone()],
+            vec![entries[1].clone(), entries[0].clone()],
+            vec![entries[0].clone(), entries[0].clone()],
+            vec![entries[2].clone()],
+        ] {
+            assert!(u19_runtime().block_on(writer.apply_committed(invalid)).is_err(), "U21_ENTRY_MATCH");
+            assert_eq!(
+                u19_runtime().block_on(writer.applied_state()).expect("unchanged pair"),
+                old,
+                "U21_ENTRY_MATCH"
+            );
+            let store = writer.store.lock().expect("store");
+            assert_eq!(store.read_committed().expect("commit unchanged"), None, "U21_ENTRY_MATCH");
+            assert_eq!(
+                store
+                    .created_operation(u17a_command().operation_id)
+                    .expect("business unchanged"),
+                None,
+                "U21_ENTRY_MATCH"
+            );
+        }
+        assert_eq!(backend.media.lock().expect("media").syncs, syncs);
+    }
+
+    #[test]
+    fn u21_apply_replay_prefix() {
+        let (_dir, backend, writer, entries, membership) = u21_fixture();
+        let runtime = u19_runtime();
+        let prefix = runtime
+            .block_on(writer.apply_committed(entries[..2].to_vec()))
+            .expect("prefix");
+        let responses = runtime
+            .block_on(writer.apply_committed(entries.clone()))
+            .expect("prefix replay and suffix");
+        assert_eq!(responses[..2], prefix);
+        let before = {
+            let store = writer.store.lock().expect("store");
+            (
+                store.created_operation(u17a_command().operation_id).expect("operation"),
+                store.created_event(u17a_command().operation_id).expect("event"),
+                store
+                    .created_version(&u17a_command().object, u17a_command().prepared.version_id)
+                    .expect("version"),
+            )
+        };
+        let syncs = backend.media.lock().expect("media").syncs;
+        assert_eq!(
+            runtime
+                .block_on(writer.apply_committed(entries.clone()))
+                .expect("full replay"),
+            responses
+        );
+        assert_eq!(
+            runtime
+                .block_on(writer.apply_committed(entries[..2].to_vec()))
+                .expect("short replay"),
+            prefix
+        );
+        let store = writer.store.lock().expect("store");
+        assert_eq!(store.read_committed().expect("no regression"), Some(u17a_id(2)));
+        assert_eq!(store.native_application_state().expect("pair"), (Some(u17a_id(2)), membership));
+        assert_eq!(
+            (
+                store.created_operation(u17a_command().operation_id).expect("operation"),
+                store.created_event(u17a_command().operation_id).expect("event"),
+                store
+                    .created_version(&u17a_command().object, u17a_command().prepared.version_id)
+                    .expect("version")
+            ),
+            before
+        );
+        assert_eq!(backend.media.lock().expect("media").syncs, syncs);
+    }
+
+    #[test]
+    fn u21_apply_empty_failure_fence() {
+        let (_dir, backend, writer, _, _) = u21_fixture();
+        let syncs = backend.media.lock().expect("media").syncs;
+        assert_eq!(u19_runtime().block_on(writer.apply_committed(vec![])).expect("empty"), vec![]);
+        assert_eq!(backend.media.lock().expect("media").syncs, syncs);
+        let (_dir, _backend, store) = media_store();
+        let legacy = NativeLogWriter::new(store);
+        assert!(matches!(
+            u19_runtime().block_on(legacy.apply_committed(vec![])),
+            Err(NativeWriteError::Store(StoreError::UnsupportedSchema))
+        ));
+        legacy.store.lock().expect("store").writable = false;
+        assert!(matches!(
+            u19_runtime().block_on(legacy.apply_committed(vec![])),
+            Err(NativeWriteError::Store(StoreError::WriteDisabled))
+        ));
+    }
+
+    #[test]
+    fn u21_apply_cut_and_retry() {
+        let runtime = u19_runtime();
+        let (_dir, backend, writer, entries, _) = u21_fixture();
+        backend.media.lock().expect("media").syncs = 0;
+        let expected = runtime
+            .block_on(writer.apply_committed(entries))
+            .expect("measure real successful apply");
+        let syncs = backend.media.lock().expect("media").syncs;
+        assert!(syncs > 0, "real apply syncs");
+        for sync in 1..=syncs {
+            for after in [false, true] {
+                let (_dir, backend, writer, entries, membership) = u21_fixture();
+                backend.arm(sync, after, false);
+                assert!(
+                    matches!(
+                        runtime.block_on(writer.apply_committed(entries.clone())),
+                        Err(NativeWriteError::Store(StoreError::CommitIndeterminate(_)))
+                    ),
+                    "cut must not ACK {sync}/{after}"
+                );
+                assert_eq!(backend.media.lock().expect("media").syncs, sync, "actual boundary reached");
+                assert!(
+                    matches!(
+                        runtime.block_on(writer.applied_state()),
+                        Err(NativeWriteError::Store(StoreError::WriteDisabled))
+                    ),
+                    "U21_CHECKPOINT_FENCE"
+                );
+                backend.cut();
+                drop(writer);
+                let store = Store::open(&backend.path, identity()).expect("reopen interrupted apply");
+                let pair = store.native_application_state().expect("recovered pair");
+                if let Some(last) = pair.0 {
+                    assert!(last.index <= 2);
+                    assert_eq!(
+                        pair.1,
+                        if last.index >= 1 {
+                            membership.clone()
+                        } else {
+                            CaptureMembership::new(None, Vec::new(), std::collections::BTreeMap::new()).expect("empty membership")
+                        }
+                    );
+                    for i in 0..=last.index {
+                        assert_eq!(
+                            store.native_apply_response(i).expect("recovered receipt"),
+                            Some(expected[usize::try_from(i).expect("index")].clone())
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        pair.1,
+                        CaptureMembership::new(None, Vec::new(), std::collections::BTreeMap::new()).expect("empty membership")
+                    );
+                }
+                let retry = NativeLogWriter::new(store);
+                assert_eq!(
+                    runtime
+                        .block_on(retry.apply_committed(entries))
+                        .expect("retry complete batch"),
+                    expected
+                );
+                assert_eq!(
+                    runtime.block_on(retry.applied_state()).expect("retry checkpoint"),
+                    (Some(u17a_id(2)), membership)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn u21_apply_worker_and_order() {
+        let (_dir, backend, writer, entries, _) = u21_fixture();
+        backend.media.lock().expect("media").sync_threads.clear();
+        let executor = std::thread::current().id();
+        let (entered, resume) = backend.pause_sync(1, false);
+        u19_runtime().block_on(async {
+            let first_writer = writer.clone();
+            let first = tokio::spawn(async move { first_writer.apply_committed(entries).await });
+            tokio::task::spawn_blocking(move || entered.wait())
+                .await
+                .expect("apply entered sync");
+            first.abort();
+            assert!(first.await.expect_err("cancelled await").is_cancelled());
+            assert!(writer.ordering.try_lock().is_err(), "cancel retains ordering guard");
+            let second_writer = writer.clone();
+            let second = tokio::spawn(async move { second_writer.save_vote(vote().into()).await });
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished(), "later write waits");
+            tokio::task::spawn_blocking(move || resume.wait())
+                .await
+                .expect("release sync");
+            second.await.expect("later task").expect("later durable write");
+            assert_eq!(writer.applied_state().await.expect("completed apply").0, Some(u17a_id(2)));
+        });
+        let media = backend.media.lock().expect("media");
+        assert!(!media.sync_threads.is_empty());
+        assert!(media.sync_threads.iter().all(|thread| *thread != executor));
+    }
+
+    #[test]
+    fn u21_checkpoint_read_coherent() {
+        let (_dir, backend, writer, entries, membership) = u21_fixture();
+        let old = u19_runtime().block_on(writer.applied_state()).expect("old pair");
+        let (entered, resume) = backend.pause_sync(1, false);
+        u19_runtime().block_on(async {
+            let apply_writer = writer.clone();
+            let apply = tokio::spawn(async move { apply_writer.apply_committed(entries).await });
+            tokio::task::spawn_blocking(move || entered.wait())
+                .await
+                .expect("apply entered");
+            let read_writer = writer.clone();
+            let read = tokio::spawn(async move { read_writer.applied_state().await });
+            tokio::task::yield_now().await;
+            assert!(!read.is_finished(), "checkpoint waits for store transaction");
+            tokio::task::spawn_blocking(move || resume.wait())
+                .await
+                .expect("release apply");
+            apply.await.expect("apply task").expect("apply");
+            let pair = read.await.expect("read task").expect("read pair");
+            assert!(pair == old || pair == (Some(u17a_id(2)), membership), "full coherent pair");
+        });
+    }
+
     #[test]
     fn u20_vote_durable_roundtrip() {
         let (_dir, backend, store) = u17a_store();
@@ -736,7 +1085,7 @@ mod tests {
         let writer = NativeLogWriter::new(store);
         u19_runtime().block_on(async {
             assert!(matches!(
-                writer.write(|_| panic!("injected worker panic")).await,
+                writer.write::<(), _>(|_| panic!("injected worker panic")).await,
                 Err(NativeWriteError::Worker(_))
             ));
             assert!(matches!(writer.save_vote(vote().into()).await, Err(NativeWriteError::Poisoned)));
