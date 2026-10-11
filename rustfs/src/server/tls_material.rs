@@ -740,6 +740,7 @@ struct ReloadState {
 }
 
 struct ReloadGroup {
+    required_startup_files: BTreeSet<String>,
     state: Mutex<ReloadState>,
     changed: tokio::sync::Notify,
     next_id: std::sync::atomic::AtomicU64,
@@ -835,13 +836,21 @@ pub(crate) fn certificate_names(leaf: &CertificateDer<'_>) -> Result<BTreeSet<St
     Ok(names)
 }
 
+pub(crate) fn validate_required_material_files(
+    required: &BTreeSet<String>,
+    candidate: &rustfs_tls_runtime::TlsMaterialSnapshot,
+) -> Result<(), TlsMaterialError> {
+    if !required.is_subset(&candidate.material_files) {
+        return Err(TlsMaterialError::Parse("required TLS source components disappeared".into()));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_candidate_replacement(
     accepted: &rustfs_tls_runtime::TlsMaterialSnapshot,
     candidate: &rustfs_tls_runtime::TlsMaterialSnapshot,
 ) -> Result<(), TlsMaterialError> {
-    if !accepted.material_files.is_subset(&candidate.material_files) {
-        return Err(TlsMaterialError::Parse("required TLS source components disappeared".into()));
-    }
+    validate_required_material_files(&accepted.material_files, candidate)?;
     let old_names = server_names(&accepted.server)?;
     let new_names = server_names(&candidate.server)?;
     for (selector, names) in old_names {
@@ -866,6 +875,7 @@ pub(crate) fn spawn_reload_loop(
     if !get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE) {
         return Ok(None);
     }
+    let required_startup_files = crate::startup_tls_material::required_startup_material_files(&tls_path);
     let initial = Arc::new(initial);
     let mut registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     registry.retain(|_, group| group.strong_count() != 0);
@@ -873,6 +883,7 @@ pub(crate) fn spawn_reload_loop(
     let first = existing.is_none();
     let group = existing.unwrap_or_else(|| {
         Arc::new(ReloadGroup {
+            required_startup_files,
             state: Mutex::new(ReloadState {
                 targets: HashMap::new(),
                 accepted: initial.clone(),
@@ -947,6 +958,7 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
         let result = async {
             let candidate = load_tls_material(&tls_path).await?;
             validate_candidate_replacement(&accepted, &candidate)?;
+            validate_required_material_files(&group.required_startup_files, &candidate)?;
             // Listener initialization can load a newer bundle than startup published.
             let published = startup_runtime_sources::current_outbound_tls_state().await;
             let required_roots =
@@ -1306,6 +1318,7 @@ mod tests {
         IdentityOnly,
         ServerOnly,
         MissingRoots,
+        PartialRoots,
         MissingIdentity,
     }
 
@@ -1324,6 +1337,7 @@ mod tests {
             ],
             async {
                 let previous = startup_runtime_sources::current_outbound_tls_state().await;
+                let previous_files = crate::startup_tls_material::replace_startup_material_files(None);
                 let dir = TempDir::new().expect("TLS directory");
                 write_test_cert_pair(dir.path(), "server.example");
                 let identity_a = rcgen::generate_simple_self_signed(vec!["client-a.example".into()]).expect("identity A");
@@ -1331,6 +1345,12 @@ mod tests {
                 fs::write(dir.path().join(RUSTFS_CLIENT_CERT_FILENAME), identity_a.cert.pem()).expect("client certificate A");
                 fs::write(dir.path().join(RUSTFS_CLIENT_KEY_FILENAME), identity_a.signing_key.serialize_pem())
                     .expect("client key A");
+                if matches!(rotation, StartupRotation::PartialRoots) {
+                    let public_ca =
+                        rcgen::generate_simple_self_signed(vec!["public-ca.example".into()]).expect("distinct public CA");
+                    fs::write(dir.path().join(rustfs_config::RUSTFS_PUBLIC_CERT), public_ca.cert.pem())
+                        .expect("additional public trust");
+                }
                 let path = dir.path().to_str().expect("UTF8 path").to_string();
                 let mut config = crate::config::Config::new("127.0.0.1:0", Vec::new());
                 config.tls_path = Some(path.clone());
@@ -1354,7 +1374,7 @@ mod tests {
                         }
                     }
                     StartupRotation::ServerOnly => {}
-                    StartupRotation::MissingRoots => {
+                    StartupRotation::MissingRoots | StartupRotation::PartialRoots => {
                         fs::remove_file(dir.path().join(RUSTFS_CA_CERT)).expect("remove startup roots");
                     }
                     StartupRotation::MissingIdentity => {
@@ -1363,7 +1383,10 @@ mod tests {
                     }
                 }
                 let initial = load_tls_material(&path).await.expect("HTTP initialization snapshot");
-                let incomplete = matches!(rotation, StartupRotation::MissingRoots | StartupRotation::MissingIdentity);
+                let incomplete = matches!(
+                    rotation,
+                    StartupRotation::MissingRoots | StartupRotation::PartialRoots | StartupRotation::MissingIdentity
+                );
                 let expected_roots = if incomplete {
                     startup.root_ca_pem.clone().expect("startup trust")
                 } else {
@@ -1421,6 +1444,7 @@ mod tests {
                     },
                 )
                 .await;
+                crate::startup_tls_material::replace_startup_material_files(previous_files);
 
                 assert_eq!(first.root_ca_pem.as_deref(), Some(expected_roots.as_slice()));
                 assert!(
@@ -1465,6 +1489,12 @@ mod tests {
     #[serial_test::serial]
     async fn tls_reload_initial_missing_roots_retains_startup_material() {
         assert_initial_outbound_reconciliation(StartupRotation::MissingRoots).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_reload_initial_partial_missing_roots_retains_startup_material() {
+        assert_initial_outbound_reconciliation(StartupRotation::PartialRoots).await;
     }
 
     #[tokio::test]

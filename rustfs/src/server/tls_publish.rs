@@ -604,6 +604,11 @@ fn publish_at_inner(
             return Err(PublishError::Invalid);
         }
         tls_material::validate_candidate_replacement(&accepted, &candidate).map_err(|_| PublishError::Invalid)?;
+        tls_material::validate_required_material_files(
+            &crate::startup_tls_material::required_startup_material_files(tls_path),
+            &candidate,
+        )
+        .map_err(|_| PublishError::Invalid)?;
         let prepared = tls_material::PreparedServerTls::from_snapshot(&candidate)
             .map_err(|_| PublishError::Invalid)?
             .ok_or(PublishError::Invalid)?;
@@ -711,6 +716,88 @@ mod tests {
         OPERATION_READS.with(|counts| counts.set(OperationReads::default()));
         let result = operation();
         (result, OPERATION_READS.with(std::cell::Cell::get))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tls_publication_rejects_missing_startup_ca_source() {
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (rustfs_config::ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (rustfs_config::ENV_TRUST_LEAF_CERT_AS_CA, Some("0")),
+                (rustfs_config::ENV_TRUST_SYSTEM_CA, Some("0")),
+                (rustfs_config::ENV_MTLS_CLIENT_CERT, None),
+                (rustfs_config::ENV_MTLS_CLIENT_KEY, None),
+                (rustfs_config::ENV_RUSTFS_EXTRA_CA_CERT, None),
+                (ENV_TLS_PUBLISH_DIR, None),
+            ],
+            async {
+                let previous = crate::startup_runtime_sources::current_outbound_tls_state().await;
+                let previous_files = crate::startup_tls_material::replace_startup_material_files(None);
+                let base = tempfile::TempDir::new().expect("base");
+                let root = tempfile::TempDir::new().expect("publication root");
+                fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("permissions");
+                let original = pair("server.example");
+                fs::write(base.path().join(RUSTFS_TLS_CERT), original.cert.pem()).expect("certificate");
+                fs::write(base.path().join(RUSTFS_TLS_KEY), original.signing_key.serialize_pem()).expect("key");
+                fs::write(base.path().join(rustfs_config::RUSTFS_PUBLIC_CERT), pair("public-ca.example").cert.pem())
+                    .expect("public trust");
+                fs::write(base.path().join(rustfs_config::RUSTFS_CA_CERT), pair("fallback-ca.example").cert.pem())
+                    .expect("fallback trust");
+                let path = base.path().to_str().expect("path");
+                let mut config = crate::config::Config::new("127.0.0.1:0", Vec::new());
+                config.tls_path = Some(path.into());
+                crate::startup_tls_material::init_outbound_tls_material(&config)
+                    .await
+                    .expect("real startup publication");
+                fs::remove_file(base.path().join(rustfs_config::RUSTFS_CA_CERT)).expect("remove startup CA before listener");
+                let initial = tls_material::load_tls_material(path).await.expect("HTTP initial snapshot");
+                let prepared = tls_material::PreparedServerTls::from_snapshot(&initial)
+                    .expect("prepared TLS")
+                    .expect("server");
+                let holder = prepared.tcp_acceptor().expect("acceptor");
+                let task = tls_material::spawn_reload_loop(
+                    path.into(),
+                    holder,
+                    initial,
+                    prepared,
+                    #[cfg(feature = "http3")]
+                    None,
+                )
+                .expect("registration")
+                .expect("reload enabled");
+                let state = state_at(root.path(), path).expect("valid bootstrap CAS state");
+                let result = publish_at(root.path(), path, build_request(&state.target_revision, &pair("server.example")));
+                let installed = current_directory(root.path()).expect("read durable pointer");
+                task.abort();
+                let _ = task.await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while tls_material::observed_server_snapshot(path).is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("reload group exits before restoring startup state");
+                crate::startup_runtime_sources::publish_outbound_tls_state(
+                    rustfs_tls_runtime::TlsGeneration(
+                        crate::startup_runtime_sources::current_outbound_tls_generation().saturating_add(1),
+                    ),
+                    &rustfs_tls_runtime::OutboundTlsMaterial {
+                        root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                        mtls_identity: previous.mtls_identity,
+                    },
+                )
+                .await;
+                crate::startup_tls_material::replace_startup_material_files(previous_files);
+                assert!(
+                    matches!(result, Err(PublishError::Invalid)),
+                    "source loss must reject an otherwise valid renewal"
+                );
+                assert!(installed.is_none(), "rejected trust must not acquire a durable publication pointer");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
