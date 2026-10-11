@@ -343,6 +343,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         disks_quorum: 0,
         updates: None,
         checkpoint_tx: None,
+        checkpoint_ancestors: Vec::new(),
+        checkpoint_depth: 0,
         last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
         last_checkpoint_objects: 0,
@@ -409,14 +411,21 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
         .seal_scan_frontier(Some("bucket/a"))
         .expect("fixture frontier");
     assert_eq!(scanner.new_cache.validated_scan_frontier(), Some("bucket/a"));
+    let checkpoint_folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let checkpoint_hash = hash_path("bucket");
+    let checkpoint_entry = scanner.new_cache.root().expect("fixture root");
 
-    scanner.maybe_send_checkpoint();
+    scanner.maybe_send_checkpoint(&checkpoint_folder, &checkpoint_hash, &checkpoint_entry);
 
     scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL * 2;
     scanner.last_checkpoint_at = Instant::now()
         .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
         .expect("test instant subtraction");
-    scanner.maybe_send_checkpoint();
+    scanner.maybe_send_checkpoint(&checkpoint_folder, &checkpoint_hash, &checkpoint_entry);
     assert_eq!(
         scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL,
         "a full checkpoint queue must reject before cloning or advancing progress"
@@ -427,9 +436,71 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
     assert!(!checkpoint.info.snapshot_complete);
     assert_eq!(scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL);
     assert!(checkpoint_rx.try_recv().is_err(), "checkpoint queue remains bounded");
+    scanner
+        .new_cache
+        .cache
+        .insert("bucket/orphan".to_string(), DataUsageEntry::default());
+    scanner.maybe_send_checkpoint(&checkpoint_folder, &checkpoint_hash, &checkpoint_entry);
+    assert!(
+        checkpoint_rx.try_recv().is_err(),
+        "unreachable observations must not become resumable snapshots"
+    );
+    assert_eq!(
+        scanner.last_checkpoint_objects,
+        SCANNER_CHECKPOINT_OBJECT_INTERVAL * 2,
+        "an invalid attempt must still consume the producer interval"
+    );
+    scanner.new_cache.cache.remove("bucket/orphan");
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL * 3;
+    scanner.maybe_send_checkpoint(&checkpoint_folder, &checkpoint_hash, &checkpoint_entry);
+    assert!(checkpoint_rx.try_recv().is_err(), "a repaired graph still waits for the minimum interval");
+
     tokio::fs::remove_dir_all(temp_dir)
         .await
         .expect("remove test scanner directory");
+}
+
+#[tokio::test]
+async fn checkpoint_ancestor_depth_limit_preserves_suspended_accounting() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    let (tx, _rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(tx);
+    scanner.old_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+        requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+    });
+    scanner.checkpoint_depth = MAX_DATA_USAGE_CACHE_DEPTH;
+    scanner.checkpoint_ancestors = (0..MAX_DATA_USAGE_CACHE_DEPTH)
+        .map(|_| ScannerCheckpointAncestor::default())
+        .collect();
+    let mut hash = hash_path("bucket/parent");
+    let mut parent = DataUsageEntry {
+        objects: 3,
+        size: 7,
+        ..Default::default()
+    };
+    let mut child = DataUsageEntry::default();
+    let error = scanner
+        .scan_child_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket/parent/child".to_string(),
+                parent: Some(hash.clone()),
+                object_heal_prob_div: 1,
+            },
+            &mut hash,
+            &mut parent,
+            &mut child,
+        )
+        .await
+        .expect_err("unsupported depth must stop before recursion");
+    assert!(matches!(error, ScannerError::Other(message) if message.contains("depth limit")));
+    assert_eq!(hash, hash_path("bucket/parent"));
+    assert_eq!((parent.objects, parent.size), (3, 7));
+    assert_eq!(scanner.checkpoint_depth, MAX_DATA_USAGE_CACHE_DEPTH);
 }
 
 struct TestGuard {
@@ -1656,6 +1727,51 @@ fn metadata_for_object_version(bucket: &str, object: &str, version_id: Option<Uu
     let mut meta = FileMeta::new();
     meta.add_version(file_info).expect("test metadata version should be accepted");
     meta.marshal_msg().expect("test metadata should marshal")
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scan_folder_keeps_old_cache_bounded_by_loaded_entries() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.is_erasure_mode = true;
+    for directory in 0..16 {
+        for object in 0..32 {
+            write_test_object_metadata(&temp_dir, "bucket", &format!("dir-{directory:03}/obj-{object:03}")).await;
+        }
+    }
+    let initial_capacity = scanner.old_cache.cache.capacity();
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan object directory tree");
+    assert_eq!(
+        scanner
+            .new_cache
+            .size_recursive(&hash_path("bucket").0)
+            .expect("scanned root totals")
+            .objects,
+        512,
+        "all object directories must still be counted",
+    );
+    assert!(scanner.old_cache.cache.is_empty(), "lookups must not retain visited object placeholders");
+    assert_eq!(
+        scanner.old_cache.cache.capacity(),
+        initial_capacity,
+        "old cache must not allocate a growing table"
+    );
 }
 
 async fn write_test_object_metadata(root: &std::path::Path, bucket: &str, object: &str) {
@@ -3275,6 +3391,62 @@ async fn scan_data_folder_missing_scan_root_returns_partial() {
         .expect("missing scan root partial should retain a non-publishable root");
     assert_eq!(root.objects, 0);
     assert_eq!(root.size, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn scan_data_folder_missing_scan_root_preserves_disconnected_durable_cache() {
+    let (scanner, temp_dir) = build_test_scanner().await;
+    tokio::fs::remove_dir_all(&temp_dir).await.expect("remove scanner root");
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "missing-bucket".to_string(),
+            next_cycle: 9,
+            snapshot_complete: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let orphan = hash_path("missing-bucket/orphan");
+    cache.cache.insert(
+        orphan.0.clone(),
+        DataUsageEntry {
+            objects: 7,
+            size: 70,
+            ..Default::default()
+        },
+    );
+    let retained_key_ptr = cache.cache.keys().next().expect("durable orphan key").as_ptr();
+    let result = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![scanner.local_disk.clone()],
+        scanner.local_disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+    let partial = match result {
+        Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
+        other => panic!("missing namespace must remain incomplete, got {other:?}"),
+    };
+    assert!(!partial.info.snapshot_complete);
+    assert_eq!(partial.info.next_cycle, 9);
+    assert_eq!(partial.cache.len(), 1);
+    assert_eq!(partial.cache.keys().next().expect("retained orphan key").as_ptr(), retained_key_ptr);
+    assert!(
+        partial.root().is_none(),
+        "a disconnected durable cache must not gain an invented zero root"
+    );
+    assert!(partial.checked_flatten_complete_scope("missing-bucket").is_none());
+    assert_eq!((partial.cache[&orphan.0].objects, partial.cache[&orphan.0].size), (7, 70));
 }
 
 #[tokio::test]
