@@ -971,6 +971,7 @@ def ordinary_missing_with_offline_peer():
         cluster.ready()
         assert client.get(bucket, 'live') == payload
         client.delete(bucket, 'live')
+        wait_inventory(cluster, bucket, 'live', lambda inventory: all(not drive['exists'] for node in inventory for drive in node), timeout=90)
         client.delete_bucket(bucket)
         return {'case': 'ordinary-missing-delete-offline-single-and-batch', 'status': 'passed', 'cleanup_claim': 'no residue recovery was requested'}
     finally:
