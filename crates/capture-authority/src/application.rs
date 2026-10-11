@@ -133,14 +133,145 @@ pub(crate) fn decode_native_entry(entry: crate::LogEntry) -> Result<crate::Captu
     })
 }
 
+fn apply_created(
+    tx: &redb::WriteTransaction,
+    id: LogId,
+    command: &DecideCreated,
+    canonical: &[u8],
+    binding: &CaptureBinding,
+) -> Result<CreatedResult, StoreError> {
+    let mut operations = tx.open_table(OPERATIONS)?;
+    let existing = operations
+        .get(command.operation_id.as_slice())?
+        .map(|v| decode_operation(v.value()))
+        .transpose()?;
+    let result = if let Some(existing) = existing {
+        if existing.canonical_command == canonical {
+            existing.result
+        } else {
+            CreatedResult::OperationConflict
+        }
+    } else {
+        let mut heads = tx.open_table(HEADS)?;
+        let mut versions = tx.open_table(VERSIONS)?;
+        let object = object_bytes(&command.object)?;
+        let key = version_key(&command.object, command.prepared.version_id)?;
+        let actual = heads
+            .get(object.as_slice())?
+            .map(|v| {
+                let mut d = Decoder::new(v.value());
+                let id = d.uuid()?;
+                d.finish()?;
+                Ok::<_, StoreError>(id)
+            })
+            .transpose()?;
+        let outcome = if command.binding_revision != binding.revision {
+            CreatedResult::BindingMismatch
+        } else if actual != command.expected_head {
+            CreatedResult::HeadMismatch { actual_head: actual }
+        } else if versions.get(key.as_slice())?.is_some() {
+            CreatedResult::VersionConflict
+        } else {
+            let mut version = Vec::new();
+            put_prepared(&mut version, &command.prepared);
+            version.extend(encode_id(id));
+            version.extend(binding.revision.to_be_bytes());
+            versions.insert(key.as_slice(), version.as_slice())?;
+            let mut event = object;
+            put_prepared(&mut event, &command.prepared);
+            event.extend(encode_id(id));
+            event.extend(binding_bytes(&binding)?);
+            tx.open_table(EVENTS)?
+                .insert(command.operation_id.as_slice(), event.as_slice())?;
+            heads.insert(object_bytes(&command.object)?.as_slice(), command.prepared.version_id.as_slice())?;
+            CreatedResult::Created {
+                version_id: command.prepared.version_id,
+                event_id: command.operation_id,
+                decision_log_id: id,
+            }
+        };
+        let mut op = u64::try_from(canonical.len())
+            .map_err(|_| StoreError::CorruptRecord)?
+            .to_be_bytes()
+            .to_vec();
+        op.extend(canonical);
+        op.extend(result_bytes(&outcome));
+        operations.insert(command.operation_id.as_slice(), op.as_slice())?;
+        outcome
+    };
+    Ok(result)
+}
+
+fn validate_response_kind(entry: &crate::CaptureRaftEntry, response: &crate::CaptureResponse) -> Result<(), StoreError> {
+    let kind = match entry.payload {
+        openraft::EntryPayload::Blank => crate::CaptureResponseKind::Blank,
+        openraft::EntryPayload::Normal(_) => crate::CaptureResponseKind::Created,
+        openraft::EntryPayload::Membership(_) => crate::CaptureResponseKind::Membership,
+    };
+    if response.kind() != kind || *response.log_id() != LogId::from(entry.log_id) {
+        return Err(StoreError::CorruptRecord);
+    }
+    Ok(())
+}
+fn encode_response(response: &crate::CaptureResponse) -> Result<Vec<u8>, StoreError> {
+    let (kind, body) = match response.kind() {
+        crate::CaptureResponseKind::Blank => (0, vec![]),
+        crate::CaptureResponseKind::Created => (1, result_bytes(response.created_result().ok_or(StoreError::CorruptRecord)?)),
+        crate::CaptureResponseKind::Membership => (2, vec![]),
+    };
+    let mut bytes = b"CRSP\x01".to_vec();
+    bytes.push(kind);
+    bytes.extend(encode_id(*response.log_id()));
+    bytes.extend(
+        u64::try_from(body.len())
+            .map_err(|_| StoreError::CorruptRecord)?
+            .to_be_bytes(),
+    );
+    bytes.extend(body);
+    Ok(bytes)
+}
+fn decode_response(bytes: &[u8]) -> Result<crate::CaptureResponse, StoreError> {
+    if bytes.len() < 38
+        || &bytes[..5] != b"CRSP\x01"
+        || number(&bytes[30..38])? != u64::try_from(bytes.len() - 38).map_err(|_| StoreError::CorruptRecord)?
+    {
+        return Err(StoreError::CorruptRecord);
+    }
+    let id = crate::decode_id(&bytes[6..30])?;
+    match bytes[5] {
+        0 if bytes.len() == 38 => crate::CaptureResponse::blank(id),
+        1 => {
+            let mut body = encode_id(id);
+            body.extend(&bytes[38..]);
+            crate::CaptureResponse::created(decode_apply(&body)?)
+        }
+        2 if bytes.len() == 38 => crate::CaptureResponse::membership(id),
+        _ => Err(StoreError::CorruptRecord),
+    }
+}
+fn entry_command(entry: &crate::LogEntry, native: bool) -> Result<DecideCreated, StoreError> {
+    if native {
+        match decode_native_entry(entry.clone())?.payload {
+            openraft::EntryPayload::Normal(command) => Ok(command.created().clone()),
+            _ => Err(StoreError::CorruptRecord),
+        }
+    } else {
+        DecideCreated::decode(&entry.payload)
+    }
+}
+
 pub(crate) fn native_application_state(tx: &ReadTransaction) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
     let meta = tx.open_table(META)?;
     if number(required(meta.get("schema")?)?.value())? != 4 {
         return Err(StoreError::UnsupportedSchema);
     }
     let last = read_applied(&meta)?;
-    let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())?;
-    if last.is_some() || membership.log_id().is_some() || !membership.configs().is_empty() || !membership.nodes().is_empty() {
+    let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())
+        .map_err(|_| StoreError::CorruptRecord)?;
+    if membership
+        .log_id()
+        .is_some_and(|id| last.is_none_or(|last| id.index > last.index))
+    {
         return Err(StoreError::CorruptRecord);
     }
     Ok((last, membership))
@@ -158,11 +289,13 @@ impl Store {
             }
             read_binding(&meta)?;
             if schema == 4 {
-                let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())?;
-                if read_applied(&meta)?.is_some()
-                    || membership.log_id().is_some()
-                    || !membership.configs().is_empty()
-                    || !membership.nodes().is_empty()
+                let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())
+                    .map_err(|_| StoreError::CorruptRecord)?;
+                let last = read_applied(&meta)?;
+                if membership
+                    .log_id()
+                    .is_some_and(|id| last.is_none_or(|last| id.index > last.index))
+                    || (last.is_none() && (!membership.configs().is_empty() || !membership.nodes().is_empty()))
                 {
                     return Err(StoreError::CorruptRecord);
                 }
@@ -255,12 +388,64 @@ impl Store {
         }
         Ok(entries)
     }
-    pub fn apply_next_native(&mut self, _id: LogId) -> Result<crate::CaptureResponse, StoreError> {
-        let _tx = self.write_transaction()?;
-        Err(StoreError::UnsupportedSchema)
+    pub fn apply_next_native(&mut self, id: LogId) -> Result<crate::CaptureResponse, StoreError> {
+        let tx = self.write_transaction()?;
+        let response;
+        {
+            let mut meta = tx.open_table(META)?;
+            if number(required(meta.get("schema")?)?.value())? != 4 {
+                return Err(StoreError::UnsupportedSchema);
+            }
+            let binding = read_binding(&meta)?;
+            let logs = tx.open_table(LOGS)?;
+            let committed = validate_committed(&meta, &logs)?.ok_or(StoreError::InvalidCommittedLog)?;
+            let entry = decode_log(required(logs.get(id.index)?)?.value())?;
+            if entry.id != id || id.index > committed.index {
+                return Err(StoreError::InvalidCommittedLog);
+            }
+            let native = decode_native_entry(entry)?;
+            let last = read_applied(&meta)?;
+            let mut results = tx.open_table(APPLY_RESULTS)?;
+            if last.is_some_and(|last| id.index <= last.index) {
+                let saved = decode_response(required(results.get(id.index)?)?.value())?;
+                if *saved.log_id() != id {
+                    return Err(StoreError::InvalidApplySequence);
+                }
+                validate_response_kind(&native, &saved)?;
+                return Ok(saved);
+            }
+            if id.index != next_index(last.map(|last| last.index))? {
+                return Err(StoreError::InvalidApplySequence);
+            }
+            response = match native.payload {
+                openraft::EntryPayload::Blank => crate::CaptureResponse::blank(id)?,
+                openraft::EntryPayload::Normal(command) => {
+                    let canonical = command.created().encode()?;
+                    let result = apply_created(&tx, id, command.created(), &canonical, &binding)?;
+                    crate::CaptureResponse::created(CreatedApplyResult { log_id: id, result })?
+                }
+                openraft::EntryPayload::Membership(membership) => {
+                    let stored = openraft::StoredMembership::new(Some(id.into()), membership);
+                    let checked = crate::CaptureMembership::try_from(&stored)?;
+                    meta.insert("native_membership", checked.encode()?.as_slice())?;
+                    crate::CaptureResponse::membership(id)?
+                }
+            };
+            results.insert(id.index, encode_response(&response)?.as_slice())?;
+            let mut last = vec![1];
+            last.extend(encode_id(id));
+            meta.insert("last_applied", last.as_slice())?;
+        }
+        self.commit(tx)?;
+        Ok(response)
     }
-    pub fn native_apply_response(&self, _index: u64) -> Result<Option<crate::CaptureResponse>, StoreError> {
-        Err(StoreError::UnsupportedSchema)
+    pub fn native_apply_response(&self, index: u64) -> Result<Option<crate::CaptureResponse>, StoreError> {
+        let tx = self.database.begin_read()?;
+        if number(required(tx.open_table(META)?.get("schema")?)?.value())? != 4 {
+            return Err(StoreError::UnsupportedSchema);
+        }
+        let results = tx.open_table(APPLY_RESULTS)?;
+        results.get(index)?.map(|v| decode_response(v.value())).transpose()
     }
     pub fn native_application_state(&self) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
         native_application_state(&self.database.begin_read()?)
@@ -326,65 +511,7 @@ impl Store {
                 return Err(StoreError::InvalidApplySequence);
             }
             let command = DecideCreated::decode(&entry.payload)?;
-            let mut operations = tx.open_table(OPERATIONS)?;
-            let existing = operations
-                .get(command.operation_id.as_slice())?
-                .map(|v| decode_operation(v.value()))
-                .transpose()?;
-            result = if let Some(existing) = existing {
-                if existing.canonical_command == entry.payload {
-                    existing.result
-                } else {
-                    CreatedResult::OperationConflict
-                }
-            } else {
-                let mut heads = tx.open_table(HEADS)?;
-                let mut versions = tx.open_table(VERSIONS)?;
-                let object = object_bytes(&command.object)?;
-                let key = version_key(&command.object, command.prepared.version_id)?;
-                let actual = heads
-                    .get(object.as_slice())?
-                    .map(|v| {
-                        let mut d = Decoder::new(v.value());
-                        let id = d.uuid()?;
-                        d.finish()?;
-                        Ok::<_, StoreError>(id)
-                    })
-                    .transpose()?;
-                let outcome = if command.binding_revision != binding.revision {
-                    CreatedResult::BindingMismatch
-                } else if actual != command.expected_head {
-                    CreatedResult::HeadMismatch { actual_head: actual }
-                } else if versions.get(key.as_slice())?.is_some() {
-                    CreatedResult::VersionConflict
-                } else {
-                    let mut version = Vec::new();
-                    put_prepared(&mut version, &command.prepared);
-                    version.extend(encode_id(id));
-                    version.extend(binding.revision.to_be_bytes());
-                    versions.insert(key.as_slice(), version.as_slice())?;
-                    let mut event = object;
-                    put_prepared(&mut event, &command.prepared);
-                    event.extend(encode_id(id));
-                    event.extend(binding_bytes(&binding)?);
-                    tx.open_table(EVENTS)?
-                        .insert(command.operation_id.as_slice(), event.as_slice())?;
-                    heads.insert(object_bytes(&command.object)?.as_slice(), command.prepared.version_id.as_slice())?;
-                    CreatedResult::Created {
-                        version_id: command.prepared.version_id,
-                        event_id: command.operation_id,
-                        decision_log_id: id,
-                    }
-                };
-                let mut op = u64::try_from(entry.payload.len())
-                    .map_err(|_| StoreError::CorruptRecord)?
-                    .to_be_bytes()
-                    .to_vec();
-                op.extend(&entry.payload);
-                op.extend(result_bytes(&outcome));
-                operations.insert(command.operation_id.as_slice(), op.as_slice())?;
-                outcome
-            };
+            result = apply_created(&tx, id, &command, &entry.payload, &binding)?;
             let mut applied = encode_id(id);
             applied.extend(result_bytes(&result));
             results.insert(id.index, applied.as_slice())?;
@@ -443,27 +570,29 @@ impl Store {
     pub fn created_apply_result(&self, index: u64) -> Result<Option<CreatedApplyResult>, StoreError> {
         let tx = self.database.begin_read()?;
         let t = tx.open_table(APPLY_RESULTS)?;
-        t.get(index)?.map(|v| decode_apply(v.value())).transpose()
+        if number(required(tx.open_table(META)?.get("schema")?)?.value())? == 4 {
+            t.get(index)?
+                .map(|v| {
+                    decode_response(v.value()).map(|r| {
+                        r.created_result().cloned().map(|result| CreatedApplyResult {
+                            log_id: *r.log_id(),
+                            result,
+                        })
+                    })
+                })
+                .transpose()
+                .map(Option::flatten)
+        } else {
+            t.get(index)?.map(|v| decode_apply(v.value())).transpose()
+        }
     }
 }
 
 pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreError> {
     let meta = tx.open_table(META)?;
     let schema = number(required(meta.get("schema")?)?.value())?;
-    if schema == 4 {
-        read_binding(&meta)?;
-        native_application_state(tx)?;
-        for table in [HEADS, VERSIONS, EVENTS, OPERATIONS] {
-            if !tx.open_table(table)?.is_empty()? {
-                return Err(StoreError::CorruptRecord);
-            }
-        }
-        if !tx.open_table(APPLY_RESULTS)?.is_empty()? {
-            return Err(StoreError::CorruptRecord);
-        }
-        return Ok(());
-    }
-    if schema != 3 {
+    let native = schema == 4;
+    if !matches!(schema, 3 | 4) {
         return Ok(());
     }
     let binding = read_binding(&meta).map_err(|error| match error {
@@ -484,24 +613,85 @@ pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreErro
     let mut next = Some(0);
     let mut observed = None;
     let mut first_operations = BTreeMap::new();
+    let mut expected_membership = crate::CaptureMembership::new(None, vec![], BTreeMap::new())?;
+    let mut replay_operations = BTreeMap::<[u8; 16], (Vec<u8>, CreatedResult)>::new();
+    let mut replay_heads = BTreeMap::<Vec<u8>, [u8; 16]>::new();
+    let mut replay_versions = std::collections::BTreeSet::new();
     for row in results.iter()? {
         let (k, v) = row?;
-        let r = decode_apply(v.value())?;
-        if next != Some(k.value()) || r.log_id.index != k.value() {
+        let entry = decode_log(required(logs.get(k.value())?)?.value())?;
+        let r = if native {
+            let response = decode_response(v.value())?;
+            let native_entry = decode_native_entry(entry.clone())?;
+            validate_response_kind(&native_entry, &response)?;
+            if next != Some(k.value()) || response.log_id().index != k.value() {
+                return Err(StoreError::CorruptRecord);
+            }
+            observed = Some(*response.log_id());
+            next = k.value().checked_add(1);
+            match native_entry.payload {
+                openraft::EntryPayload::Membership(membership) => {
+                    expected_membership =
+                        crate::CaptureMembership::try_from(&openraft::StoredMembership::new(Some(entry.id.into()), membership))?;
+                    continue;
+                }
+                openraft::EntryPayload::Blank => continue,
+                openraft::EntryPayload::Normal(_) => CreatedApplyResult {
+                    log_id: *response.log_id(),
+                    result: response.created_result().cloned().ok_or(StoreError::CorruptRecord)?,
+                },
+            }
+        } else {
+            decode_apply(v.value())?
+        };
+        if !native && (next != Some(k.value()) || r.log_id.index != k.value()) {
             return Err(StoreError::CorruptRecord);
         }
-        let entry = decode_log(required(logs.get(k.value())?)?.value())?;
         if entry.id != r.log_id {
             return Err(StoreError::CorruptRecord);
         }
-        let c = DecideCreated::decode(&entry.payload)?;
+        let c = entry_command(&entry, native)?;
+        let canonical = c.encode()?;
         let op = decode_operation(required(operations.get(c.operation_id.as_slice())?)?.value())?;
-        let canonical_matches = op.canonical_command == entry.payload;
+        let canonical_matches = op.canonical_command == canonical;
         let expected = if canonical_matches {
             op.result
         } else {
             CreatedResult::OperationConflict
         };
+        if native {
+            let replay = if let Some((previous, result)) = replay_operations.get(&c.operation_id) {
+                if *previous == canonical {
+                    result.clone()
+                } else {
+                    CreatedResult::OperationConflict
+                }
+            } else {
+                let object = object_bytes(&c.object)?;
+                let key = version_key(&c.object, c.prepared.version_id)?;
+                let actual = replay_heads.get(&object).copied();
+                let result = if c.binding_revision != binding.revision {
+                    CreatedResult::BindingMismatch
+                } else if actual != c.expected_head {
+                    CreatedResult::HeadMismatch { actual_head: actual }
+                } else if replay_versions.contains(&key) {
+                    CreatedResult::VersionConflict
+                } else {
+                    replay_heads.insert(object, c.prepared.version_id);
+                    replay_versions.insert(key);
+                    CreatedResult::Created {
+                        version_id: c.prepared.version_id,
+                        event_id: c.operation_id,
+                        decision_log_id: r.log_id,
+                    }
+                };
+                replay_operations.insert(c.operation_id, (canonical.clone(), result.clone()));
+                result
+            };
+            if replay != r.result {
+                return Err(StoreError::CorruptRecord);
+            }
+        }
         if expected != r.result {
             return Err(StoreError::CorruptRecord);
         }
@@ -513,6 +703,19 @@ pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreErro
     }
     if observed != last {
         return Err(StoreError::CorruptRecord);
+    }
+    if native {
+        if native_application_state(tx)?.1 != expected_membership
+            || heads.len()? != u64::try_from(replay_heads.len()).map_err(|_| StoreError::CorruptRecord)?
+            || versions.len()? != u64::try_from(replay_versions.len()).map_err(|_| StoreError::CorruptRecord)?
+        {
+            return Err(StoreError::CorruptRecord);
+        }
+        for (object, id) in replay_heads {
+            if required(heads.get(object.as_slice())?)?.value() != id {
+                return Err(StoreError::CorruptRecord);
+            }
+        }
     }
     for row in operations.iter()? {
         let (k, v) = row?;
@@ -592,7 +795,7 @@ pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreErro
             return Err(StoreError::CorruptRecord);
         }
         let entry = decode_log(required(logs.get(version.decision_log_id.index)?)?.value())?;
-        let c = DecideCreated::decode(&entry.payload)?;
+        let c = entry_command(&entry, native)?;
         if entry.id != version.decision_log_id
             || c.object != object
             || c.prepared != version.prepared

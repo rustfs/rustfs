@@ -211,7 +211,11 @@ impl Store {
             let (key, value) = row?;
             let entry = decode_log(value.value())?;
             if next != Some(key.value()) || entry.id.index != key.value() {
-                return Err(StoreError::InvalidLogSequence);
+                return Err(if number(schema.value())? == 4 {
+                    StoreError::CorruptRecord
+                } else {
+                    StoreError::InvalidLogSequence
+                });
             }
             if number(schema.value())? == 4 {
                 application::decode_native_entry(entry.clone())?;
@@ -223,7 +227,11 @@ impl Store {
         application::validate_application(&tx)?;
         let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         if tail != last {
-            return Err(StoreError::InvalidLogSequence);
+            return Err(if number(schema.value())? == 4 {
+                StoreError::CorruptRecord
+            } else {
+                StoreError::InvalidLogSequence
+            });
         }
         drop(schema);
         drop(identity);
@@ -621,6 +629,7 @@ mod tests {
             let response = store.apply_next_native(u17a_id(index)).expect("exact replay");
             assert_eq!(store.native_apply_response(index).expect("receipt"), Some(response));
         }
+        store.enable_native_empty().expect("U17A_ENABLE_VALID_NATIVE_REPLAY");
         assert_eq!(backend.media.lock().expect("sync count").syncs, syncs);
         drop(store);
         let reopened = Store::open(&backend.path, identity()).expect("heterogeneous reopen");
@@ -897,6 +906,56 @@ mod tests {
                 .last_applied()
                 .expect("history frontier"),
             Some(u17a_id(3))
+        );
+        let (_dir, backend, mut store) = u17a_store();
+        let first = u17a_command();
+        let mut rejected = first.clone();
+        rejected.prepared.version_id = [19; 16];
+        rejected.expected_head = Some(first.prepared.version_id);
+        let mut latest = rejected.clone();
+        latest.operation_id = [20; 16];
+        latest.prepared.version_id = [21; 16];
+        latest.prepared.preparation_id = [22; 16];
+        store
+            .append_native(&[
+                u17a_created(0, first),
+                u17a_created(1, rejected.clone()),
+                u17a_created(2, latest),
+            ])
+            .expect("rejected history batch");
+        store.save_committed(u17a_id(2)).expect("commit rejected history");
+        for index in 0..=2 {
+            store.apply_next_native(u17a_id(index)).expect("rejected history apply");
+        }
+        assert_eq!(
+            store
+                .native_apply_response(1)
+                .expect("rejected receipt")
+                .expect("receipt exists")
+                .created_result(),
+            Some(&CreatedResult::OperationConflict)
+        );
+        drop(store);
+        let mut store = Store::open(&backend.path, identity()).expect("valid rejected history reopen");
+        let tx = store.write_transaction().expect("orphan version transaction");
+        let mut key = crate::created::object_bytes(&rejected.object).expect("orphan key");
+        key.extend(rejected.prepared.version_id);
+        let mut value = Vec::new();
+        crate::created::put_prepared(&mut value, &rejected.prepared);
+        value.extend(encode_id(u17a_id(1)));
+        value.extend(u17a_binding().revision.to_be_bytes());
+        tx.open_table(application::VERSIONS)
+            .expect("version table")
+            .insert(key.as_slice(), value.as_slice())
+            .expect("inject syntactically valid rejected version");
+        store.commit(tx).expect("persist rejected version");
+        drop(store);
+        assert_eq!(
+            Store::open(&backend.path, identity())
+                .err()
+                .expect("U17A_REJECTED_VERSION_NOT_MATERIALIZED")
+                .code(),
+            "corrupt_record"
         );
     }
     #[test]
