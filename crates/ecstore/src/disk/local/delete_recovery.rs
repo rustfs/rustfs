@@ -29,6 +29,12 @@ struct CommitReceipt {
     finished: bool,
 }
 
+pub(super) struct DeletePreparationContext {
+    pub transaction: Uuid,
+    pub bucket_incarnation: Option<Uuid>,
+    pub namespace_owner: Option<Arc<dyn Send + Sync>>,
+}
+
 pub(super) fn digest(bytes: &[u8]) -> DeleteRecoveryDigest {
     Sha256::digest(bytes).into()
 }
@@ -415,19 +421,18 @@ fn explicit_delete_plan(
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
             if delete_recovery_part_file(&name) {
                 has_parts = true;
-            } else if marker_names.contains(&name) {
-            } else if dir == rollback
-                && [
-                    STORAGE_FORMAT_FILE_BACKUP,
-                    DELETE_MARKER_ROLLBACK_FILE,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    PREPARED,
-                    TARGET,
-                    FINISHED,
-                ]
-                .contains(&name.as_str())
+            } else if !(marker_names.contains(&name)
+                || (dir == rollback
+                    && [
+                        STORAGE_FORMAT_FILE_BACKUP,
+                        DELETE_MARKER_ROLLBACK_FILE,
+                        DELETE_QUORUM_COMMITTED_FILE,
+                        PREPARED,
+                        TARGET,
+                        FINISHED,
+                    ]
+                    .contains(&name.as_str())))
             {
-            } else {
                 return Ok(None);
             }
         }
@@ -1039,14 +1044,15 @@ impl LocalDisk {
 
     async fn activate_delete_preparation(
         &self,
-        volume: &str,
-        object: &str,
-        transaction: Uuid,
+        journal: &DeleteRecoveryJournal,
         original: Option<&[u8]>,
         target: Option<Vec<u8>>,
-        journal: Vec<u8>,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Option<Vec<u8>>> {
+        let volume = journal.volume.as_str();
+        let object = journal.object.as_str();
+        let transaction = journal.transaction;
+        let journal = journal_bytes(journal)?;
         self.wait_for_startup_cleanup().await;
         let temporary = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
         let root = self.io_get_object_path(volume, object)?;
@@ -1129,13 +1135,16 @@ impl LocalDisk {
         &self,
         volume: &str,
         object: &str,
-        transaction: Uuid,
-        incarnation: Option<Uuid>,
         original: Option<&[u8]>,
         target: Option<&[u8]>,
         data_dirs: Vec<Uuid>,
-        owner: Option<Arc<dyn Send + Sync>>,
+        context: DeletePreparationContext,
     ) -> Result<()> {
+        let DeletePreparationContext {
+            transaction,
+            bucket_incarnation: incarnation,
+            namespace_owner: owner,
+        } = context;
         let old = original.map(FileMeta::load).transpose()?;
         let new = target.map(FileMeta::load).transpose()?;
         let surviving: HashSet<_> = new
@@ -1170,17 +1179,8 @@ impl LocalDisk {
                 .delete_recovery_predecessors(volume, object, transaction, incarnation, owner.clone())
                 .await?,
         };
-        let serialized_journal = journal_bytes(&journal)?;
         let _ = self
-            .activate_delete_preparation(
-                volume,
-                object,
-                transaction,
-                original,
-                target.map(<[u8]>::to_vec),
-                serialized_journal,
-                owner,
-            )
+            .activate_delete_preparation(&journal, original, target.map(<[u8]>::to_vec), owner)
             .await?;
         Ok(())
     }
@@ -1189,15 +1189,18 @@ impl LocalDisk {
         &self,
         volume: &str,
         object: &str,
-        transaction: Uuid,
-        incarnation: Option<Uuid>,
         original: Option<&[u8]>,
         requests: &[FileInfo],
         authority: Option<&DeleteRecoveryJournal>,
-        owner: Option<Arc<dyn Send + Sync>>,
+        context: DeletePreparationContext,
     ) -> Result<Option<Vec<u8>>> {
+        let DeletePreparationContext {
+            transaction,
+            bucket_incarnation: incarnation,
+            namespace_owner: owner,
+        } = context;
         let mut plan = original.map(FileMeta::load).transpose()?.unwrap_or_else(FileMeta::new);
-        let original_headers: Vec<_> = plan
+        let mut deleted_headers: Vec<_> = plan
             .versions
             .iter()
             .map(|version| (version.header.version_id, std::mem::discriminant(&version.header.version_type)))
@@ -1246,11 +1249,8 @@ impl LocalDisk {
             .iter()
             .map(|version| (version.header.version_id, std::mem::discriminant(&version.header.version_type)))
             .collect();
-        let deleted_versions = original_headers
-            .into_iter()
-            .filter(|header| !surviving.contains(header))
-            .map(|(id, _)| id.unwrap_or_default())
-            .collect();
+        deleted_headers.retain(|header| !surviving.contains(header));
+        let deleted_versions = deleted_headers.into_iter().map(|(id, _)| id.unwrap_or_default()).collect();
         let requests = requests
             .iter()
             .map(|request| {
@@ -1284,10 +1284,8 @@ impl LocalDisk {
             journal.original_versions.clone_from(&authority.original_versions);
             journal.deleted_versions.clone_from(&authority.deleted_versions);
         }
-        let serialized_journal = journal_bytes(&journal)?;
         drop(plan);
-        self.activate_delete_preparation(volume, object, transaction, original, target, serialized_journal, owner)
-            .await
+        self.activate_delete_preparation(&journal, original, target, owner).await
     }
 
     pub(crate) async fn delete_recovery_settle(
@@ -1388,11 +1386,8 @@ impl LocalDisk {
                 witness.original_digest = None;
                 witness.target_digest = None;
                 witness.data_dirs.clear();
-                let prepared = journal_bytes(&witness)?;
                 let root = self.io_get_object_path(volume, object)?;
-                let _ = self
-                    .activate_delete_preparation(volume, object, transaction, None, None, prepared, owner.clone())
-                    .await?;
+                let _ = self.activate_delete_preparation(&witness, None, None, owner.clone()).await?;
                 let receipt = CommitReceipt {
                     journal: witness,
                     finished: false,
@@ -1441,12 +1436,14 @@ impl LocalDisk {
                 .prepare_delete_recovery(
                     volume,
                     object,
-                    transaction,
-                    authority.bucket_incarnation,
                     Some(&bytes),
                     &authority.requests,
                     Some(authority.as_ref()),
-                    owner.clone(),
+                    DeletePreparationContext {
+                        transaction,
+                        bucket_incarnation: authority.bucket_incarnation,
+                        namespace_owner: owner.clone(),
+                    },
                 )
                 .await?;
             let adopted = self
@@ -1475,8 +1472,19 @@ impl LocalDisk {
                 if observed.current_digest.is_some() {
                     return Err(DiskError::OutdatedXLMeta);
                 }
-                self.write_delete_recovery_journal(volume, object, transaction, None, None, None, Vec::new(), owner.clone())
-                    .await?;
+                self.write_delete_recovery_journal(
+                    volume,
+                    object,
+                    None,
+                    None,
+                    Vec::new(),
+                    DeletePreparationContext {
+                        transaction,
+                        bucket_incarnation: None,
+                        namespace_owner: owner.clone(),
+                    },
+                )
+                .await?;
             } else {
                 return Ok(observed);
             }
@@ -3566,7 +3574,18 @@ mod tests {
             .unwrap();
         let transaction = Uuid::new_v4();
         let _ = disk
-            .prepare_delete_recovery("recovery", "object", transaction, None, Some(&original), &[request()], None, None)
+            .prepare_delete_recovery(
+                "recovery",
+                "object",
+                Some(&original),
+                &[request()],
+                None,
+                DeletePreparationContext {
+                    transaction,
+                    bucket_incarnation: None,
+                    namespace_owner: None,
+                },
+            )
             .await
             .expect("prepared intent");
         fs::rename(

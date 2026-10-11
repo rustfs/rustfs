@@ -1818,24 +1818,6 @@ fn parse_delete_recovery_timeout(value: Option<&str>) -> Result<std::time::Durat
     Ok(std::time::Duration::from_secs(seconds))
 }
 
-#[cfg(test)]
-mod delete_recovery_timeout_tests {
-    use super::*;
-    #[test]
-    fn recovery_timeout_defaults_and_validates_range() {
-        assert_eq!(
-            parse_delete_recovery_timeout(None).expect("default timeout"),
-            std::time::Duration::from_secs(900)
-        );
-        for seconds in ["30", "900", "86400"] {
-            assert!(parse_delete_recovery_timeout(Some(seconds)).is_ok());
-        }
-        for value in ["", "invalid", "0", "2", "29", "86401", "-1", "18446744073709551616"] {
-            assert!(parse_delete_recovery_timeout(Some(value)).is_err());
-        }
-    }
-}
-
 pub(crate) fn validate_delete_recovery_options(opts: &DeleteOptions) -> Result<()> {
     if opts.old_data_dir.is_none_or(|id| id.is_nil())
         || opts.undo_write
@@ -2003,7 +1985,7 @@ pub enum DeleteRecoveryRpcOperation {
     },
     ApplyVersion {
         object: String,
-        file_info: FileInfo,
+        file_info: Box<FileInfo>,
         force_del_marker: bool,
         opts: DeleteOptions,
     },
@@ -2025,71 +2007,6 @@ impl DeleteRecoveryRpcOperation {
             } => rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES,
             _ => rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES,
         }
-    }
-}
-
-#[cfg(test)]
-mod delete_recovery_wire_limit_tests {
-    use super::*;
-    #[test]
-    fn adoption_and_inspection_reply_support_large_version_journals() {
-        let transaction = Uuid::new_v4();
-        let request = FileInfo {
-            metadata: std::collections::HashMap::from([("metadata".into(), "x".repeat(2048))]),
-            ..Default::default()
-        };
-        let journal = DeleteRecoveryJournal {
-            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
-            volume: "bucket".into(),
-            object: "object".into(),
-            transaction,
-            bucket_incarnation: None,
-            original_digest: None,
-            target_digest: None,
-            data_dirs: Vec::new(),
-            deleted_versions: Vec::new(),
-            requests: vec![request; 1000],
-            original_versions: Vec::new(),
-            predecessors: Vec::new(),
-        };
-        let operation = DeleteRecoveryRpcOperation::Settle {
-            object: "object".into(),
-            transaction,
-            expected_fingerprint: [0; 32],
-            action: DeleteRecoveryAction::AdoptCommit {
-                authority: Box::new(journal.clone()),
-            },
-        };
-        let encoded = rmp_serde::to_vec_named(&operation).expect("encode large adoption");
-        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
-        assert!(encoded.len() < operation.max_wire_payload_bytes());
-        let decoded: DeleteRecoveryRpcOperation =
-            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("large adoption can decode");
-        assert_eq!(decoded.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES);
-        let reply = DeleteRecoveryRpcReply::Inspected(DeleteRecoveryInspection {
-            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
-            id: DeleteTransactionId {
-                object: "object".into(),
-                transaction,
-            },
-            state: DeleteRecoveryState::QuorumCommitted,
-            journal: Some(journal),
-            current_digest: None,
-            current_versions: Vec::new(),
-            backup_digest: None,
-            rollback_data_complete: false,
-            commit_data_safe: true,
-            explicit_delete_safe: false,
-            fingerprint: [0; 32],
-        });
-        let encoded = rmp_serde::to_vec_named(&reply).expect("encode large inspection");
-        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
-        assert!(rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).is_ok());
-        let inspect = DeleteRecoveryRpcOperation::Inspect {
-            object: "object".into(),
-            transaction,
-        };
-        assert_eq!(inspect.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
     }
 }
 
@@ -2815,5 +2732,134 @@ mod tests {
 
             assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_timeout_tests {
+    use super::*;
+    #[test]
+    fn recovery_timeout_defaults_and_validates_range() {
+        assert_eq!(
+            parse_delete_recovery_timeout(None).expect("default timeout"),
+            std::time::Duration::from_secs(900)
+        );
+        for seconds in ["30", "900", "86400"] {
+            assert!(parse_delete_recovery_timeout(Some(seconds)).is_ok());
+        }
+        for value in ["", "invalid", "0", "2", "29", "86401", "-1", "18446744073709551616"] {
+            assert!(parse_delete_recovery_timeout(Some(value)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_wire_limit_tests {
+    use super::*;
+
+    #[test]
+    fn boxed_apply_version_preserves_existing_wire_payload() {
+        #[derive(Serialize)]
+        enum PriorOperation<'a> {
+            ApplyVersion {
+                object: &'a str,
+                file_info: &'a FileInfo,
+                force_del_marker: bool,
+                opts: &'a DeleteOptions,
+            },
+        }
+        let file_info = FileInfo {
+            name: "object".into(),
+            version_id: Some(Uuid::new_v4()),
+            metadata: std::collections::HashMap::from([("metadata".into(), "value".into())]),
+            ..Default::default()
+        };
+        let opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            recoverable_delete: true,
+            delete_recovery_bucket_incarnation: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let prior = PriorOperation::ApplyVersion {
+            object: "object",
+            file_info: &file_info,
+            force_del_marker: true,
+            opts: &opts,
+        };
+        let encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed request shape");
+        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
+            object: "object".into(),
+            file_info: Box::new(file_info.clone()),
+            force_del_marker: true,
+            opts: opts.clone(),
+        };
+        assert_eq!(rmp_serde::to_vec_named(&operation).expect("encode boxed request"), encoded);
+        assert_eq!(
+            serde_json::to_value(&operation).expect("boxed request JSON"),
+            serde_json::to_value(prior).expect("previous request JSON")
+        );
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode the previous payload");
+        assert_eq!(rmp_serde::to_vec_named(&decoded).expect("re-encode decoded prior request"), encoded);
+    }
+    #[test]
+    fn adoption_and_inspection_reply_support_large_version_journals() {
+        let transaction = Uuid::new_v4();
+        let request = FileInfo {
+            metadata: std::collections::HashMap::from([("metadata".into(), "x".repeat(2048))]),
+            ..Default::default()
+        };
+        let journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction,
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: Vec::new(),
+            requests: vec![request; 1000],
+            original_versions: Vec::new(),
+            predecessors: Vec::new(),
+        };
+        let operation = DeleteRecoveryRpcOperation::Settle {
+            object: "object".into(),
+            transaction,
+            expected_fingerprint: [0; 32],
+            action: DeleteRecoveryAction::AdoptCommit {
+                authority: Box::new(journal.clone()),
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode large adoption");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(encoded.len() < operation.max_wire_payload_bytes());
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("large adoption can decode");
+        assert_eq!(decoded.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES);
+        let reply = DeleteRecoveryRpcReply::Inspected(DeleteRecoveryInspection {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            id: DeleteTransactionId {
+                object: "object".into(),
+                transaction,
+            },
+            state: DeleteRecoveryState::QuorumCommitted,
+            journal: Some(journal),
+            current_digest: None,
+            current_versions: Vec::new(),
+            backup_digest: None,
+            rollback_data_complete: false,
+            commit_data_safe: true,
+            explicit_delete_safe: false,
+            fingerprint: [0; 32],
+        });
+        let encoded = rmp_serde::to_vec_named(&reply).expect("encode large inspection");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).is_ok());
+        let inspect = DeleteRecoveryRpcOperation::Inspect {
+            object: "object".into(),
+            transaction,
+        };
+        assert_eq!(inspect.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
     }
 }

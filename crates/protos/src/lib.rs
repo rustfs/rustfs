@@ -2947,10 +2947,10 @@ pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> R
     let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
     let generation = runtime_sources::outbound_tls_state().await.generation.0;
     let current_generation = TLS_GENERATION_CACHE.lock().await.get(&cache_key).copied();
-    if current_generation == Some(generation) {
-        if let Some(channel) = cached_connection(&cache_key).await {
-            return Ok(channel);
-        }
+    if current_generation == Some(generation)
+        && let Some(channel) = cached_connection(&cache_key).await
+    {
+        return Ok(channel);
     }
     build_channel_with_timeout(addr, &cache_key, rpc_timeout)
         .await

@@ -6581,16 +6581,7 @@ impl LocalDisk {
 
                 if fi.deleted && force_del_marker {
                     return self
-                        .write_missing_delete_marker(
-                            volume,
-                            path,
-                            fi,
-                            file_path.as_path(),
-                            rollback_dir,
-                            opts.delete_recovery_bucket_incarnation,
-                            opts.recoverable_delete,
-                            namespace_owner.clone(),
-                        )
+                        .write_missing_delete_marker(volume, path, fi, file_path.as_path(), &opts, namespace_owner.clone())
                         .await;
                 }
 
@@ -6629,12 +6620,14 @@ impl LocalDisk {
                     .prepare_delete_recovery(
                         volume,
                         path,
-                        rollback_dir,
-                        opts.delete_recovery_bucket_incarnation,
                         Some(&buf),
                         std::slice::from_ref(&fi),
                         None,
-                        namespace_owner.clone(),
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: opts.delete_recovery_bucket_incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                        },
                     )
                     .await?;
             } else {
@@ -7695,25 +7688,27 @@ impl LocalDisk {
         path: &str,
         fi: FileInfo,
         object_dir: &Path,
-        rollback_dir: Option<Uuid>,
-        incarnation: Option<Uuid>,
-        recoverable: bool,
+        opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        let rollback_dir = opts.old_data_dir;
+        let incarnation = opts.delete_recovery_bucket_incarnation;
         let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
         let mut recovery_target = None;
         if let Some(rollback_dir) = rollback_dir {
-            if recoverable {
+            if opts.recoverable_delete {
                 recovery_target = self
                     .prepare_delete_recovery(
                         volume,
                         path,
-                        rollback_dir,
-                        incarnation,
                         None,
                         std::slice::from_ref(&fi),
                         None,
-                        namespace_owner.clone(),
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                        },
                     )
                     .await?;
             } else {
@@ -7844,16 +7839,7 @@ impl LocalDisk {
                     return Err(DiskError::FileNotFound);
                 };
                 return self
-                    .write_missing_delete_marker(
-                        volume,
-                        path,
-                        delete_marker,
-                        object_dir,
-                        opts.old_data_dir,
-                        opts.delete_recovery_bucket_incarnation,
-                        opts.recoverable_delete,
-                        namespace_owner.clone(),
-                    )
+                    .write_missing_delete_marker(volume, path, delete_marker, object_dir, opts, namespace_owner.clone())
                     .await;
             }
             Err(err) => return Err(err),
@@ -7875,12 +7861,14 @@ impl LocalDisk {
                     .prepare_delete_recovery(
                         volume,
                         path,
-                        rollback_dir,
-                        opts.delete_recovery_bucket_incarnation,
                         Some(&data),
                         fis,
                         None,
-                        namespace_owner.clone(),
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: opts.delete_recovery_bucket_incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                        },
                     )
                     .await?;
             } else {

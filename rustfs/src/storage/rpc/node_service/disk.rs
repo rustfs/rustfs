@@ -1678,7 +1678,7 @@ impl NodeService {
                     force_del_marker,
                     opts,
                 } => disk
-                    .delete_version_recoverable(&request.volume, &object, file_info, force_del_marker, opts)
+                    .delete_version_recoverable(&request.volume, &object, *file_info, force_del_marker, opts)
                     .await
                     .map(|()| DeleteRecoveryRpcReply::AppliedVersion),
                 DeleteRecoveryRpcOperation::ApplyVersions { versions, opts } => {

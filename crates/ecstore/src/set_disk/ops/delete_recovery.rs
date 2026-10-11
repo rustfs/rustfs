@@ -587,7 +587,7 @@ impl SetDisks {
                     .iter()
                     .filter(|copy| copy.current_versions == journal.original_versions)
                     .count()
-                    >= self.set_drive_count / 2 + 1
+                    > self.set_drive_count / 2
             });
             let all_decisions_precede = !authorities.is_empty()
                 && authorities.iter().all(|authority| {
@@ -699,10 +699,7 @@ impl SetDisks {
                     .collect::<Vec<_>>();
                 if copies.iter().any(|state| {
                     state.state == DeleteRecoveryState::Absent
-                        && state
-                            .current_versions
-                            .iter()
-                            .any(|version| !originals.iter().any(|original| *original == version))
+                        && state.current_versions.iter().any(|version| !originals.contains(&version))
                 }) {
                     summary.blocked += 1;
                     unresolved = true;

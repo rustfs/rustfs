@@ -172,14 +172,13 @@ fn validate_delete_recovery_inspection(
     {
         return Err(Error::other("delete recovery inspection does not match request"));
     }
-    if let Some(journal) = &inspection.journal {
-        if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+    if let Some(journal) = &inspection.journal
+        && (journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
             || journal.volume != volume
             || journal.object != object
-            || journal.transaction != transaction
-        {
-            return Err(Error::other("delete recovery journal does not match request"));
-        }
+            || journal.transaction != transaction)
+    {
+        return Err(Error::other("delete recovery journal does not match request"));
     }
     Ok(())
 }
@@ -905,8 +904,7 @@ impl RemoteDisk {
         volume: &str,
         operation: DeleteRecoveryRpcOperation,
     ) -> Result<DeleteRecoveryRpcReply> {
-        let payload = rmp_serde::to_vec_named(&operation)
-            .map_err(|err| Error::other(format!("encode delete recovery operation: {err}")))?;
+        let payload = rmp_serde::to_vec_named(&operation)?;
         if payload.len() > operation.max_wire_payload_bytes() {
             return Err(Error::other("delete recovery operation exceeds payload limit"));
         }
@@ -3747,7 +3745,7 @@ impl DiskAPI for RemoteDisk {
                 volume,
                 DeleteRecoveryRpcOperation::ApplyVersion {
                     object: object.to_owned(),
-                    file_info,
+                    file_info: Box::new(file_info),
                     force_del_marker,
                     opts,
                 },

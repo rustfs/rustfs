@@ -7710,7 +7710,7 @@ impl SetDisks {
                 &delete_request,
                 false,
                 None,
-                DeleteCommitContext::request(&opts, None),
+                DeleteCommitContext::request(opts, None),
             )
             .await?;
             if let Some((_, deleted_object)) = replication_delete {
@@ -10385,7 +10385,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
         if let Err(err) = self
-            .delete_object_version_with_purge(bucket, object, &fi, false, None, DeleteCommitContext::request(&opts, None))
+            .delete_object_version_with_purge(bucket, object, &fi, false, None, DeleteCommitContext::request(opts, None))
             .await
         {
             warn!(
