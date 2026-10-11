@@ -23,6 +23,61 @@ pub use raft_types::{
 mod application_tests;
 mod truncate;
 
+/// OpenRaft log reader backed by exclusive local authority storage.
+#[derive(Clone)]
+pub struct NativeLogReader {
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+}
+
+impl NativeLogReader {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store: std::sync::Arc::new(std::sync::Mutex::new(store)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum NativeReaderError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("native log reader lock poisoned")]
+    Poisoned,
+    #[error("native log reader worker failed")]
+    Worker,
+}
+
+fn native_read_error(error: NativeReaderError) -> openraft::StorageError<u64> {
+    openraft::StorageError::IO {
+        source: openraft::StorageIOError::read_logs(openraft::AnyError::new(&error)),
+    }
+}
+
+async fn native_read_worker<F>(
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+    read: F,
+) -> Result<Vec<CaptureRaftEntry>, openraft::StorageError<u64>>
+where
+    F: FnOnce(&Store) -> Result<Vec<CaptureRaftEntry>, StoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().map_err(|_| native_read_error(NativeReaderError::Poisoned))?;
+        read(&store).map_err(|error| native_read_error(NativeReaderError::Store(error)))
+    })
+    .await
+    .map_err(|_| native_read_error(NativeReaderError::Worker))?
+}
+
+impl openraft::RaftLogReader<CaptureTypeConfig> for NativeLogReader {
+    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<CaptureRaftEntry>, openraft::StorageError<u64>> {
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+        native_read_worker(self.store.clone(), move |store| store.read_native_range(bounds)).await
+    }
+}
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const VOTE: TableDefinition<u8, &[u8]> = TableDefinition::new("vote");
 const LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
@@ -459,6 +514,153 @@ mod tests {
             node_id: 0,
         }
     }
+    fn u19_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reader runtime")
+    }
+
+    fn u19_assert_io(error: openraft::StorageError<u64>) {
+        match error {
+            openraft::StorageError::IO { source } => {
+                assert!(source.to_string().starts_with("when Read Logs:"), "U19_READER_ERROR: {source}");
+            }
+            other => panic!("U19_READER_ERROR: unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u19_reader_roundtrip() {
+        use openraft::RaftLogReader;
+        let (_dir, _backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())];
+        store.append_native(&entries).expect("append reader fixture");
+        let mut reader = NativeLogReader::new(store);
+        let read = u19_runtime().block_on(reader.try_get_log_entries(..)).expect("trait read");
+        assert_eq!(read, entries, "U19_TRAIT_READ_SUCCESS");
+    }
+
+    #[test]
+    fn u19_reader_bounds_reopen() {
+        use openraft::RaftLogReader;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let (dir, backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())];
+        store.append_native(&entries).expect("append range fixture");
+        drop(store);
+        drop(backend);
+        let store = Store::open(dir.path().join("db"), identity()).expect("reopen reader file");
+        let mut reader = NativeLogReader::new(store);
+        u19_runtime().block_on(async {
+            assert_eq!(
+                reader.try_get_log_entries(1..2).await.expect("bounded"),
+                entries[1..2],
+                "U19_READER_RANGE"
+            );
+            assert_eq!(reader.try_get_log_entries(..=1).await.expect("inclusive"), entries[..2]);
+            assert_eq!(
+                reader
+                    .try_get_log_entries((Excluded(0), Included(2)))
+                    .await
+                    .expect("excluded"),
+                entries[1..]
+            );
+            assert_eq!(reader.try_get_log_entries(2..).await.expect("unbounded end"), entries[2..]);
+            assert_eq!(
+                reader
+                    .try_get_log_entries((Unbounded, Included(u64::MAX)))
+                    .await
+                    .expect("max"),
+                entries
+            );
+            for range in [
+                (Included(2), Excluded(2)),
+                (Included(2), Included(1)),
+                (Excluded(u64::MAX), Unbounded),
+            ] {
+                assert!(reader.try_get_log_entries(range).await.expect("empty bounds").is_empty());
+            }
+            let start = 1;
+            let end = 2;
+            assert_eq!(
+                reader
+                    .try_get_log_entries((Included(&start), Excluded(&end)))
+                    .await
+                    .expect("borrowed bounds"),
+                entries[1..2]
+            );
+        });
+    }
+
+    #[test]
+    fn u19_reader_legacy_corrupt() {
+        use openraft::RaftLogReader;
+        let (_legacy_dir, _legacy_backend, legacy) = u17a_bound();
+        let mut legacy = NativeLogReader::new(legacy);
+        let runtime = u19_runtime();
+        u19_assert_io(
+            runtime
+                .block_on(legacy.try_get_log_entries(0..0))
+                .expect_err("U19_READER_ERROR: legacy empty range"),
+        );
+        let (_dir, _backend, mut store) = u17a_store();
+        store.append_native(&[u17a_blank(0)]).expect("append corruption fixture");
+        let tx = store.database.begin_write().expect("corruption transaction");
+        {
+            let mut logs = tx.open_table(LOGS).expect("logs");
+            logs.insert(0, b"corrupt".as_slice()).expect("corrupt row");
+        }
+        tx.commit().expect("persist corruption");
+        let mut reader = NativeLogReader::new(store);
+        u19_assert_io(
+            runtime
+                .block_on(reader.try_get_log_entries(..))
+                .expect_err("U19_READER_ERROR: corrupt row"),
+        );
+    }
+
+    #[test]
+    fn u19_reader_worker_thread() {
+        use openraft::RaftLogReader;
+        let (_dir, _backend, mut store) = u17a_store();
+        let entries = vec![u17a_blank(0)];
+        store.append_native(&entries).expect("append worker fixture");
+        let mut reader = NativeLogReader::new(store);
+        let runtime = u19_runtime();
+        let async_thread = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+        runtime.block_on(async {
+            let read = native_read_worker(reader.store.clone(), move |store| {
+                sender.send(std::thread::current().id()).expect("send worker thread");
+                store.read_native_range(..)
+            })
+            .await
+            .expect("worker read");
+            assert_eq!(read, entries);
+            assert_ne!(receiver.recv().expect("worker thread"), async_thread, "U19_BLOCKING_THREAD");
+            assert_eq!(reader.try_get_log_entries(..).await.expect("trait read"), entries);
+        });
+    }
+
+    #[test]
+    fn u19_reader_worker_errors() {
+        use openraft::RaftLogReader;
+        let (_dir, _backend, store) = u17a_store();
+        let mut reader = NativeLogReader::new(store);
+        let runtime = u19_runtime();
+        let error = runtime
+            .block_on(native_read_worker(reader.store.clone(), |_| panic!("test worker panic")))
+            .expect_err("worker panic must fail");
+        assert!(error.to_string().contains("native log reader worker failed"));
+        u19_assert_io(error);
+        let error = runtime
+            .block_on(reader.try_get_log_entries(..))
+            .expect_err("poison must fail");
+        assert!(error.to_string().contains("native log reader lock poisoned"));
+        u19_assert_io(error);
+    }
+
     fn u17a_id(index: u64) -> LogId {
         LogId {
             term: 11,
