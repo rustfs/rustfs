@@ -238,8 +238,10 @@ impl OtelConfig {
     /// that know their display/build version should use
     /// [`OtelConfig::extract_otel_config_from_env_with_version`].
     ///
-    /// When no endpoint is configured at all, `use_stdout` is forced to `true`
-    /// so that logs are still visible during development.
+    /// When no endpoint is configured at all (neither the root endpoint nor any
+    /// per-signal one), `use_stdout` is forced to `true` so that logs are still
+    /// visible during development. With any endpoint set, `RUSTFS_OBS_USE_STDOUT`
+    /// is honoured.
     ///
     /// # Example
     /// ```no_run
@@ -268,9 +270,15 @@ impl OtelConfig {
             _ => env::var(ENV_OBS_ENDPOINT).unwrap_or_default(),
         };
 
-        // Force stdout when there is no remote endpoint so that operators
-        // always have *some* log output in the default configuration.
-        let use_stdout = if endpoint.is_empty() {
+        // Force stdout only when no OTLP endpoint is configured at all, so that operators
+        // always have *some* log output in the default configuration. A per-signal endpoint
+        // (e.g. `RUSTFS_OBS_TRACE_ENDPOINT`) counts as configured: otherwise setting only that
+        // one forces the stdout exporters on and silently ignores `RUSTFS_OBS_USE_STDOUT=false`,
+        // printing every exported span to stdout.
+        let has_signal_endpoint = [ENV_OBS_TRACE_ENDPOINT, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_LOG_ENDPOINT]
+            .into_iter()
+            .any(|key| get_env_opt_str(key).is_some_and(|value| !value.is_empty()));
+        let use_stdout = if endpoint.is_empty() && !has_signal_endpoint {
             true
         } else {
             get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT)
@@ -535,6 +543,45 @@ mod tests {
                 let config = OtelConfig::extract_otel_config_from_env(None);
                 assert_eq!(config.log_filename.as_deref(), Some(DEFAULT_OBS_LOG_FILENAME));
             });
+        });
+    }
+
+    #[test]
+    fn use_stdout_is_forced_only_when_no_endpoint_is_configured() {
+        with_profiling_env_lock(|| {
+            temp_env::with_vars_unset(
+                [
+                    ENV_OBS_ENDPOINT,
+                    ENV_OBS_TRACE_ENDPOINT,
+                    ENV_OBS_METRIC_ENDPOINT,
+                    ENV_OBS_LOG_ENDPOINT,
+                ],
+                || {
+                    temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                        // No endpoint at all: forced on, the explicit false is ignored.
+                        assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true));
+                    });
+                    for key in [ENV_OBS_TRACE_ENDPOINT, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_LOG_ENDPOINT] {
+                        temp_env::with_var(key, Some("http://localhost:4318/v1/signal"), || {
+                            temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(false), "{key}");
+                            });
+                            temp_env::with_var(ENV_OBS_USE_STDOUT, Some("true"), || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true), "{key}");
+                            });
+                            temp_env::with_var_unset(ENV_OBS_USE_STDOUT, || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(USE_STDOUT), "{key}");
+                            });
+                        });
+                    }
+                    temp_env::with_var(ENV_OBS_TRACE_ENDPOINT, Some(""), || {
+                        temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                            // An empty per-signal endpoint is not a configured endpoint.
+                            assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true));
+                        });
+                    });
+                },
+            );
         });
     }
 
