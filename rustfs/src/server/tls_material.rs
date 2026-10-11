@@ -35,10 +35,11 @@ use rustfs_tls_runtime::{
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
@@ -79,7 +80,7 @@ pub async fn load_tls_material(tls_path: &str) -> Result<rustfs_tls_runtime::Tls
         .await
         .map_err(map_runtime_tls_error)?;
 
-    enrich_outbound(&mut snapshot.outbound, &PathBuf::from(tls_path)).await?;
+    enrich_outbound(&mut snapshot).await?;
 
     Ok(snapshot)
 }
@@ -100,6 +101,42 @@ pub(crate) async fn build_acceptor_from_loaded(
     )
     .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
+    build_acceptor_with_verifier(server, mtls_verifier)
+}
+
+pub(crate) fn build_acceptor_from_snapshot(
+    snapshot: &rustfs_tls_runtime::TlsMaterialSnapshot,
+) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
+    build_acceptor_with_verifier(snapshot.server.clone(), snapshot_client_verifier(snapshot)?)
+}
+
+fn snapshot_client_verifier(
+    snapshot: &rustfs_tls_runtime::TlsMaterialSnapshot,
+) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>, TlsMaterialError> {
+    if !get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE) {
+        return Ok(None);
+    }
+    let pem = snapshot
+        .server_client_ca_pem
+        .as_deref()
+        .ok_or_else(|| TlsMaterialError::Parse("mTLS client trust is missing".into()))?;
+    let mut reader = Cursor::new(pem);
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(&mut reader) {
+        roots
+            .add(cert.map_err(|e| TlsMaterialError::Parse(e.to_string()))?)
+            .map_err(|e| TlsMaterialError::Parse(e.to_string()))?;
+    }
+    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map(Some)
+        .map_err(|e| TlsMaterialError::Parse(e.to_string()))
+}
+
+fn build_acceptor_with_verifier(
+    server: Option<RuntimeServerTlsMaterial>,
+    mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
     match server {
         Some(RuntimeServerTlsMaterial::SingleCert { certs, key }) => {
             let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier, ServerProtocol::Tcp)?;
@@ -114,9 +151,14 @@ pub(crate) async fn build_acceptor_from_loaded(
             Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
         }
         Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => {
+            let validity = certificate_validities(cert_key_pairs.values().map(|(certs, _)| certs.as_slice()))?;
             let resolver = create_multi_cert_resolver(cert_key_pairs)
                 .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
-            let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier, ServerProtocol::Tcp)?;
+            let config = build_server_config(
+                ServerCertSource::Resolver(Arc::new(resolver), validity),
+                mtls_verifier,
+                ServerProtocol::Tcp,
+            )?;
             info!(
                 component = LOG_COMPONENT_TLS,
                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -147,12 +189,32 @@ pub(crate) async fn build_http3_server_config_from_loaded(
     )
     .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
+    build_http3_with_verifier(Some(server), mtls_verifier)
+}
+
+#[cfg(feature = "http3")]
+pub(crate) fn build_http3_server_config_from_snapshot(
+    snapshot: &rustfs_tls_runtime::TlsMaterialSnapshot,
+) -> Result<Option<quinn::ServerConfig>, TlsMaterialError> {
+    build_http3_with_verifier(snapshot.server.as_ref(), snapshot_client_verifier(snapshot)?)
+}
+
+#[cfg(feature = "http3")]
+fn build_http3_with_verifier(
+    server: Option<&RuntimeServerTlsMaterial>,
+    mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Option<quinn::ServerConfig>, TlsMaterialError> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+
     let source = match server {
         RuntimeServerTlsMaterial::SingleCert { certs, key } => ServerCertSource::SingleCert {
             certs: certs.clone(),
             key: key.clone_key(),
         },
         RuntimeServerTlsMaterial::MultiCert { cert_key_pairs } => {
+            let validity = certificate_validities(cert_key_pairs.values().map(|(certs, _)| certs.as_slice()))?;
             let pairs = cert_key_pairs
                 .iter()
                 .map(|(domain, (certs, key))| (domain.clone(), (certs.clone(), key.clone_key())))
@@ -161,7 +223,7 @@ pub(crate) async fn build_http3_server_config_from_loaded(
             let resolver = create_multi_cert_resolver(pairs)
                 .map_err(|e| TlsMaterialError::Parse(format!("build HTTP/3 SNI resolver: {e}")))?;
 
-            ServerCertSource::Resolver(Arc::new(resolver))
+            ServerCertSource::Resolver(Arc::new(resolver), validity)
         }
     };
 
@@ -179,18 +241,30 @@ pub(crate) async fn build_http3_server_config_from_loaded(
 /// 1. Optional: server leaf cert as root CA (`RUSTFS_TRUST_LEAF_CERT_AS_CA`)
 /// 2. Optional: system root CAs from platform paths (`RUSTFS_TRUST_SYSTEM_CA`)
 /// 3. Optional: mTLS identity from env-var-overridden paths
-async fn enrich_outbound(outbound: &mut rustfs_tls_runtime::OutboundTlsMaterial, tls_dir: &Path) -> Result<(), TlsMaterialError> {
-    // 1. Optional: load leaf certs as root CAs
-    if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA)
-        && load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut outbound.root_ca_pem).await
-    {
-        info!(
-            component = LOG_COMPONENT_TLS,
-            subsystem = LOG_SUBSYSTEM_TLS,
-            event = "tls_root_ca_enriched",
-            source = "leaf_certificate",
-            "TLS root CA set enriched"
-        );
+async fn enrich_outbound(snapshot: &mut rustfs_tls_runtime::TlsMaterialSnapshot) -> Result<(), TlsMaterialError> {
+    let tls_dir = &snapshot.source.base_dir;
+    let outbound = &mut snapshot.outbound;
+    if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
+        let chains: Vec<_> = match &snapshot.server {
+            Some(RuntimeServerTlsMaterial::SingleCert { certs, .. }) => vec![certs],
+            Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => {
+                cert_key_pairs.values().map(|(certs, _)| certs).collect()
+            }
+            None => Vec::new(),
+        };
+        let mut certificates = BTreeSet::new();
+        for chain in chains {
+            certificates.extend(chain.iter().map(|cert| cert.as_ref().to_vec()));
+        }
+        for certificate in certificates {
+            outbound.root_ca_pem.extend_from_slice(
+                format!(
+                    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                    base64_simd::STANDARD.encode_to_string(&certificate),
+                )
+                .as_bytes(),
+            );
+        }
     }
 
     // 2. Optional: load system root CAs
@@ -260,19 +334,6 @@ async fn load_mtls_identity_from_overridden_paths(
         None => tls_dir.join(RUSTFS_CLIENT_KEY_FILENAME),
     };
 
-    if !client_cert_path.exists() || !client_key_path.exists() {
-        info!(
-            component = LOG_COMPONENT_TLS,
-            subsystem = LOG_SUBSYSTEM_TLS,
-            event = "mtls_identity_state",
-            state = "not_configured",
-            cert_path = ?client_cert_path,
-            key_path = ?client_key_path,
-            "mTLS client identity not configured"
-        );
-        return Ok(None);
-    }
-
     let cert_pem = tokio::fs::read(&client_cert_path)
         .await
         .map_err(|e| TlsMaterialError::Io(format!("read client cert {client_cert_path:?}: {e}")))?;
@@ -281,11 +342,13 @@ async fn load_mtls_identity_from_overridden_paths(
         .map_err(|e| TlsMaterialError::Io(format!("read client key {client_key_path:?}: {e}")))?;
 
     let mut reader = std::io::Cursor::new(&cert_pem);
-    if CertificateDer::pem_reader_iter(&mut reader).next().is_none() {
-        return Err(TlsMaterialError::Parse("no valid certificate in client cert PEM".into()));
-    }
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsMaterialError::Parse(format!("invalid client certificate: {e}")))?;
     let mut reader = std::io::Cursor::new(&key_pem);
-    PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| TlsMaterialError::Parse(format!("invalid client key PEM: {e}")))?;
+    let key =
+        PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| TlsMaterialError::Parse(format!("invalid client key: {e}")))?;
+    rustfs_tls_runtime::validate_certified_key(&certs, &key, "client identity override", false).map_err(map_runtime_tls_error)?;
 
     info!(
         component = LOG_COMPONENT_TLS,
@@ -413,50 +476,51 @@ async fn load_cert_file(path: &Path, pem_data: &mut Vec<u8>, desc: &str) -> bool
 /// Search for and load certificate files matching `cert_name` in the directory
 /// and one level of subdirectories.
 /// Returns `true` if at least one matching file was loaded.
-async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<u8>) -> bool {
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-        debug!(
-            component = LOG_COMPONENT_TLS,
-            subsystem = LOG_SUBSYSTEM_TLS,
-            event = "tls_material_directory_state",
-            path = %dir.display(),
-            state = "missing",
-            "TLS material directory state changed"
+
+type CertificateValidities = HashMap<Vec<u8>, (i64, i64)>;
+
+fn certificate_validities<'a>(
+    chains: impl Iterator<Item = &'a [CertificateDer<'static>]>,
+) -> Result<CertificateValidities, TlsMaterialError> {
+    let mut validity = HashMap::new();
+    for chain in chains {
+        let leaf = chain
+            .first()
+            .ok_or_else(|| TlsMaterialError::Parse("empty certificate chain".into()))?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+            .map_err(|e| TlsMaterialError::Parse(format!("invalid certificate: {e}")))?;
+        validity.insert(
+            leaf.as_ref().to_vec(),
+            (parsed.validity().not_before.timestamp(), parsed.validity().not_after.timestamp()),
         );
-        return false;
-    };
-
-    let mut loaded = false;
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let Ok(ft) = entry.file_type().await else { continue };
-
-        if ft.is_file() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname == cert_name && load_cert_file(&entry.path(), pem_data, "certificate").await {
-                loaded = true;
-            }
-        } else if ft.is_dir()
-            && let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await
-        {
-            while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                if let Ok(sub_ft) = sub_entry.file_type().await
-                    && sub_ft.is_file()
-                {
-                    let fname = sub_entry.file_name().to_string_lossy().to_string();
-                    if fname == cert_name && load_cert_file(&sub_entry.path(), pem_data, "certificate").await {
-                        loaded = true;
-                    }
-                }
-            }
-        }
     }
-    loaded
+    Ok(validity)
 }
 
-// ── Server Config Construction ──
+#[derive(Debug)]
+struct ValidityCheckedResolver {
+    inner: Arc<dyn rustls::server::ResolvesServerCert>,
+    validity: CertificateValidities,
+}
+
+impl rustls::server::ResolvesServerCert for ValidityCheckedResolver {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let certificate = self.inner.resolve(hello)?;
+        let leaf = certificate.cert.first()?;
+        let (not_before, not_after) = self.validity.get(leaf.as_ref())?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs(),
+        )
+        .ok()?;
+        (*not_before <= now && now < *not_after).then_some(certificate)
+    }
+}
 
 enum ServerCertSource {
-    Resolver(Arc<dyn rustls::server::ResolvesServerCert + Send + Sync>),
+    Resolver(Arc<dyn rustls::server::ResolvesServerCert + Send + Sync>, CertificateValidities),
     SingleCert {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
@@ -474,6 +538,10 @@ fn build_server_config(
     mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     protocol: ServerProtocol,
 ) -> Result<rustls::ServerConfig, TlsMaterialError> {
+    let validity = match &cert_source {
+        ServerCertSource::SingleCert { certs, .. } => certificate_validities(std::iter::once(certs.as_slice()))?,
+        ServerCertSource::Resolver(_, validity) => validity.clone(),
+    };
     let builder = match protocol {
         ServerProtocol::Tcp => rustls::ServerConfig::builder(),
         #[cfg(feature = "http3")]
@@ -481,7 +549,7 @@ fn build_server_config(
     };
 
     let mut config = match cert_source {
-        ServerCertSource::Resolver(resolver) => {
+        ServerCertSource::Resolver(resolver, _) => {
             if let Some(verifier) = mtls_verifier {
                 builder.with_client_cert_verifier(verifier).with_cert_resolver(resolver)
             } else {
@@ -503,6 +571,10 @@ fn build_server_config(
         }
     };
 
+    config.cert_resolver = Arc::new(ValidityCheckedResolver {
+        inner: config.cert_resolver,
+        validity,
+    });
     config.alpn_protocols = match protocol {
         ServerProtocol::Tcp => {
             vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()]
@@ -680,140 +752,263 @@ async fn reload_acceptors(
 /// Spawn a background task that periodically checks for TLS certificate changes.
 /// Single load per tick: loads once via tls-runtime, enriches, publishes outbound,
 /// and builds acceptor — no double reads.
-pub(crate) fn spawn_reload_loop(
-    tls_path: String,
+#[derive(Clone)]
+struct ReloadTarget {
     holder: Arc<TlsAcceptorHolder>,
-    #[cfg(feature = "http3")] http3_endpoint: Option<quinn::Endpoint>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let enabled = get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
-    if !enabled {
-        debug!(
-            component = LOG_COMPONENT_TLS,
-            subsystem = LOG_SUBSYSTEM_TLS,
-            event = "tls_reload_state",
-            state = "disabled",
-            env_var = ENV_TLS_RELOAD_ENABLE,
-            "TLS reload state changed"
-        );
-        return None;
+    #[cfg(feature = "http3")]
+    http3_endpoint: Option<quinn::Endpoint>,
+}
+
+struct ReloadState {
+    targets: HashMap<u64, ReloadTarget>,
+    accepted: Arc<rustfs_tls_runtime::TlsMaterialSnapshot>,
+    tcp: Arc<TlsAcceptor>,
+    #[cfg(feature = "http3")]
+    quic: Option<quinn::ServerConfig>,
+}
+
+struct ReloadGroup {
+    state: Mutex<ReloadState>,
+    changed: tokio::sync::Notify,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+// Lock order is registry, then group state, then acceptor. Neither guard crosses an await.
+static RELOAD_GROUPS: LazyLock<Mutex<HashMap<String, Weak<ReloadGroup>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct ReloadRegistration {
+    group: Arc<ReloadGroup>,
+    id: u64,
+}
+
+impl Drop for ReloadRegistration {
+    fn drop(&mut self) {
+        self.group
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .targets
+            .remove(&self.id);
+        self.group.changed.notify_one();
     }
+}
 
-    let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
-    let tls_source = TlsSource::from_directory(&tls_path);
-
-    info!(
-        component = LOG_COMPONENT_TLS,
-        subsystem = LOG_SUBSYSTEM_TLS,
-        event = "tls_reload_state",
-        state = "enabled",
-        interval_secs,
-        "TLS reload state changed"
-    );
-
-    Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        let tls_dir = PathBuf::from(&tls_path);
-        loop {
-            interval.tick().await;
-
-            match rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source).await {
-                Ok(mut snapshot) => {
-                    if let Err(e) = enrich_outbound(&mut snapshot.outbound, &tls_dir).await {
-                        startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "enrich_err", None, None);
-                        warn!(
-                            component = LOG_COMPONENT_TLS,
-                            subsystem = LOG_SUBSYSTEM_TLS,
-                            event = "tls_reload_failed",
-                            stage = "enrich_outbound",
-                            error = %e,
-                            "TLS reload failed"
-                        );
-                        continue;
+fn server_names(server: &Option<RuntimeServerTlsMaterial>) -> Result<BTreeMap<String, BTreeSet<String>>, TlsMaterialError> {
+    let chains: Vec<_> = match server {
+        Some(RuntimeServerTlsMaterial::SingleCert { certs, .. }) => vec![("default", certs)],
+        Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => cert_key_pairs
+            .iter()
+            .map(|(selector, (certs, _))| (selector.as_str(), certs))
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut selectors = BTreeMap::new();
+    for (selector, chain) in chains {
+        let mut names = BTreeSet::new();
+        let leaf = chain
+            .first()
+            .ok_or_else(|| TlsMaterialError::Parse("empty certificate chain".into()))?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+            .map_err(|e| TlsMaterialError::Parse(format!("invalid certificate: {e}")))?;
+        if let Some(san) = parsed
+            .subject_alternative_name()
+            .map_err(|e| TlsMaterialError::Parse(format!("invalid SAN: {e}")))?
+        {
+            for name in &san.value.general_names {
+                match name {
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        names.insert(format!("dns:{}", name.to_ascii_lowercase()));
                     }
-
-                    let generation = startup_runtime_sources::current_outbound_tls_generation().saturating_add(1);
-                    startup_runtime_sources::publish_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
-                    startup_runtime_sources::record_tls_generation("rustfs_server_reload_loop", generation);
-                    if !snapshot.outbound.root_ca_pem.is_empty() {
-                        info!(
-                            component = LOG_COMPONENT_TLS,
-                            subsystem = LOG_SUBSYSTEM_TLS,
-                            event = "tls_root_ca_enriched",
-                            source = "reload_snapshot",
-                            generation,
-                            "TLS root CA set updated"
-                        );
+                    x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                        names.insert(format!("ip:{bytes:?}"));
                     }
-
-                    match reload_acceptors(
-                        snapshot.server,
-                        &tls_dir,
-                        &holder,
-                        #[cfg(feature = "http3")]
-                        http3_endpoint.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            info!(
-                                component = LOG_COMPONENT_TLS,
-                                subsystem = LOG_SUBSYSTEM_TLS,
-                                event = "tls_reload_state",
-                                state = "reloaded",
-                                generation,
-                                "TLS reload state changed"
-                            );
-                            startup_runtime_sources::record_tls_reload_result(
-                                "rustfs_server_reload_loop",
-                                "ok",
-                                None,
-                                Some(generation),
-                            );
-                        }
-                        Ok(false) => {
-                            startup_runtime_sources::record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
-                            warn!(
-                                component = LOG_COMPONENT_TLS,
-                                subsystem = LOG_SUBSYSTEM_TLS,
-                                event = "tls_reload_failed",
-                                stage = "build_acceptor",
-                                reason = "no_acceptor",
-                                "TLS reload returned no acceptor"
-                            )
-                        }
-                        Err(e) => {
-                            startup_runtime_sources::record_tls_reload_result(
-                                "rustfs_server_reload_loop",
-                                "acceptor_err",
-                                None,
-                                Some(generation),
-                            );
-                            warn!(
-                                component = LOG_COMPONENT_TLS,
-                                subsystem = LOG_SUBSYSTEM_TLS,
-                                event = "tls_reload_failed",
-                                stage = "build_acceptor",
-                                error = %e,
-                                generation,
-                                "TLS reload failed"
-                            )
-                        }
-                    }
-                }
-                Err(e) => {
-                    startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "load_err", None, None);
-                    warn!(
-                        component = LOG_COMPONENT_TLS,
-                        subsystem = LOG_SUBSYSTEM_TLS,
-                        event = "tls_reload_failed",
-                        stage = "load_snapshot",
-                        error = %e,
-                        "TLS reload failed"
-                    );
+                    _ => {}
                 }
             }
         }
-    }))
+        selectors.insert(selector.to_string(), names);
+    }
+    Ok(selectors)
+}
+
+fn validate_candidate_replacement(
+    accepted: &rustfs_tls_runtime::TlsMaterialSnapshot,
+    candidate: &rustfs_tls_runtime::TlsMaterialSnapshot,
+) -> Result<(), TlsMaterialError> {
+    if !accepted.material_files.is_subset(&candidate.material_files) {
+        return Err(TlsMaterialError::Parse("required TLS source components disappeared".into()));
+    }
+    let old_names = server_names(&accepted.server)?;
+    let new_names = server_names(&candidate.server)?;
+    for (selector, names) in old_names {
+        if !new_names.get(&selector).is_some_and(|new| names.is_subset(new)) {
+            return Err(TlsMaterialError::Parse("required server certificate names disappeared".into()));
+        }
+    }
+    Ok(())
+}
+
+fn outbound_material_matches(a: &rustfs_tls_runtime::OutboundTlsMaterial, b: &rustfs_tls_runtime::OutboundTlsMaterial) -> bool {
+    a.root_ca_pem == b.root_ca_pem && a.mtls_identity == b.mtls_identity
+}
+
+pub(crate) fn spawn_reload_loop(
+    tls_path: String,
+    holder: Arc<TlsAcceptorHolder>,
+    initial: rustfs_tls_runtime::TlsMaterialSnapshot,
+    #[cfg(feature = "http3")] http3_endpoint: Option<quinn::Endpoint>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, TlsMaterialError> {
+    if !get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE) {
+        return Ok(None);
+    }
+    let initial = Arc::new(initial);
+    let mut registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    registry.retain(|_, group| group.strong_count() != 0);
+    let existing = registry.get(&tls_path).and_then(Weak::upgrade);
+    let first = existing.is_none();
+    let group = existing.unwrap_or_else(|| {
+        Arc::new(ReloadGroup {
+            state: Mutex::new(ReloadState {
+                targets: HashMap::new(),
+                accepted: initial.clone(),
+                tcp: holder.get(),
+                #[cfg(feature = "http3")]
+                quic: None,
+            }),
+            changed: tokio::sync::Notify::new(),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        })
+    });
+    let id = group.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "http3")]
+        if let Some(endpoint) = &http3_endpoint {
+            if state.quic.is_none() {
+                let mut config = build_http3_server_config_from_snapshot(&state.accepted)?
+                    .ok_or_else(|| TlsMaterialError::Parse("HTTP/3 certificate is missing".into()))?;
+                config.migration(false);
+                state.quic = Some(config);
+            }
+            endpoint.set_server_config(state.quic.clone());
+        }
+        holder.swap(&TlsAcceptorHolder::new(state.tcp.clone()));
+        state.targets.insert(
+            id,
+            ReloadTarget {
+                holder,
+                #[cfg(feature = "http3")]
+                http3_endpoint,
+            },
+        );
+    }
+    registry.insert(tls_path.clone(), Arc::downgrade(&group));
+    drop(registry);
+    if first {
+        tokio::spawn(run_reload_group(tls_path, group.clone()));
+    }
+    group.changed.notify_one();
+    let registration = ReloadRegistration { group, id };
+    Ok(Some(tokio::spawn(async move {
+        let _registration = registration;
+        std::future::pending::<()>().await;
+    })))
+}
+
+async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
+    let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut generation = 1_u64;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {},
+            _ = group.changed.notified() => {},
+        }
+        let (accepted, empty) = {
+            let state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.accepted.clone(), state.targets.is_empty())
+        };
+        if empty {
+            let mut registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+            if group.state.lock().unwrap_or_else(|e| e.into_inner()).targets.is_empty() {
+                registry.remove(&tls_path);
+                return;
+            }
+            continue;
+        }
+        let result = async {
+            let candidate = load_tls_material(&tls_path).await?;
+            validate_candidate_replacement(&accepted, &candidate)?;
+            if (!accepted.outbound.root_ca_pem.is_empty() && candidate.outbound.root_ca_pem.is_empty())
+                || (accepted.outbound.mtls_identity.is_some() && candidate.outbound.mtls_identity.is_none())
+            {
+                return Err(TlsMaterialError::Parse("required outbound TLS material disappeared".into()));
+            }
+            let outbound_changed = !outbound_material_matches(&accepted.outbound, &candidate.outbound);
+            if accepted.fingerprint == candidate.fingerprint && !outbound_changed {
+                startup_runtime_sources::record_tls_reload_skipped("rustfs_server_reload_loop", "unchanged");
+                return Ok(None);
+            }
+            let verifier = snapshot_client_verifier(&candidate)?;
+            let tcp = build_acceptor_with_verifier(candidate.server.clone(), verifier.clone())?
+                .ok_or_else(|| TlsMaterialError::Parse("server certificate is missing".into()))?;
+            #[cfg(feature = "http3")]
+            let quic = {
+                let mut config = build_http3_with_verifier(candidate.server.as_ref(), verifier)?
+                    .ok_or_else(|| TlsMaterialError::Parse("HTTP/3 certificate is missing".into()))?;
+                config.migration(false);
+                config
+            };
+            let candidate = Arc::new(candidate);
+            let listeners = {
+                let mut state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+                // Newly registered listeners join the same prepared generation under this lock.
+                for target in state.targets.values() {
+                    #[cfg(feature = "http3")]
+                    if let Some(endpoint) = &target.http3_endpoint {
+                        endpoint.set_server_config(Some(quic.clone()));
+                    }
+                    target.holder.swap(&tcp);
+                }
+                state.tcp = tcp.get();
+                state.accepted = candidate.clone();
+                #[cfg(feature = "http3")]
+                {
+                    state.quic = Some(quic);
+                }
+                state.targets.len()
+            };
+            if outbound_changed {
+                let next = startup_runtime_sources::current_outbound_tls_generation().saturating_add(1);
+                startup_runtime_sources::publish_outbound_tls_state(TlsGeneration(next), &candidate.outbound).await;
+            }
+            Ok(Some(listeners))
+        }
+        .await;
+        match result {
+            Ok(Some(listeners)) => {
+                generation = generation.saturating_add(1);
+                startup_runtime_sources::record_tls_generation("rustfs_server_reload_loop", generation);
+                startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "ok", None, Some(generation));
+                info!(
+                    event = "tls_reload_state",
+                    component = LOG_COMPONENT_TLS,
+                    subsystem = LOG_SUBSYSTEM_TLS,
+                    state = "reloaded",
+                    generation,
+                    listeners,
+                    "TLS material updated"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "rejected", None, None);
+                warn!(event = "tls_reload_failed", component = LOG_COMPONENT_TLS, subsystem = LOG_SUBSYSTEM_TLS,
+                    result = "rejected", error = %error, "TLS material update rejected");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -837,6 +1032,195 @@ mod tests {
         let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![subject.to_string()]).unwrap();
         fs::write(dir.join(RUSTFS_TLS_CERT), cert.pem()).unwrap();
         fs::write(dir.join(rustfs_config::RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_replacement_preserves_ca_components_and_default_names() {
+        let dir = TempDir::new().expect("TLS directory");
+        write_test_cert_pair(dir.path(), "s3.example.com");
+        let ca_a = rcgen::generate_simple_self_signed(vec!["ca-a.example".into()]).expect("CA A");
+        let ca_b = rcgen::generate_simple_self_signed(vec!["ca-b.example".into()]).expect("CA B");
+        fs::write(dir.path().join(RUSTFS_CLIENT_CA_CERT_FILENAME), ca_a.cert.pem()).expect("primary client CA");
+        fs::write(dir.path().join(RUSTFS_CA_CERT), ca_b.cert.pem()).expect("fallback CA");
+        let source = TlsSource::from_directory(dir.path());
+        let accepted = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("accepted generation");
+        fs::remove_file(dir.path().join(RUSTFS_CLIENT_CA_CERT_FILENAME)).expect("remove primary client CA");
+        let candidate = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("fallback generation parses");
+        assert!(
+            validate_candidate_replacement(&accepted, &candidate).is_err(),
+            "a fallback must not replace accepted client trust"
+        );
+
+        fs::write(dir.path().join(RUSTFS_CLIENT_CA_CERT_FILENAME), ca_a.cert.pem()).expect("restore primary CA");
+        write_test_cert_pair(dir.path(), "wrong.example.com");
+        let candidate = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("valid but wrong SAN");
+        assert!(
+            validate_candidate_replacement(&accepted, &candidate).is_err(),
+            "default SAN coverage must survive renewal"
+        );
+
+        write_test_cert_pair(dir.path(), "s3.example.com");
+        let renewed = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("valid renewal");
+        validate_candidate_replacement(&accepted, &renewed).expect("renewal preserving names and trust sources");
+    }
+
+    #[tokio::test]
+    async fn candidate_default_names_cannot_move_into_another_sni_certificate() {
+        let dir = TempDir::new().expect("TLS directory");
+        let sni = dir.path().join("example.com");
+        fs::create_dir(&sni).expect("SNI directory");
+        write_test_cert_pair(dir.path(), "default.local");
+        write_test_cert_pair(&sni, "example.com");
+        let source = TlsSource::from_directory(dir.path());
+        let accepted = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("accepted selectors");
+        write_test_cert_pair(dir.path(), "wrong.local");
+        let relocated = rcgen::generate_simple_self_signed(vec!["example.com".into(), "default.local".into()])
+            .expect("certificate with relocated SAN");
+        fs::write(sni.join(RUSTFS_TLS_CERT), relocated.cert.pem()).expect("SNI certificate");
+        fs::write(sni.join(rustfs_config::RUSTFS_TLS_KEY), relocated.signing_key.serialize_pem()).expect("SNI key");
+        let candidate = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+            .await
+            .expect("individually valid candidate");
+        assert!(
+            validate_candidate_replacement(&accepted, &candidate).is_err(),
+            "another selector's SAN does not cover the default resolver's hostname"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_leaf_trust_is_encoded_in_canonical_der_order() {
+        let dir = TempDir::new().expect("TLS directory");
+        let a = rcgen::generate_simple_self_signed(vec!["a.example".into()]).expect("certificate A");
+        let b = rcgen::generate_simple_self_signed(vec!["b.example".into()]).expect("certificate B");
+        let (first, second) = if a.cert.der().as_ref() > b.cert.der().as_ref() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        fs::write(dir.path().join(RUSTFS_TLS_CERT), format!("{}{}", first.cert.pem(), second.cert.pem()))
+            .expect("descending DER chain");
+        fs::write(dir.path().join(rustfs_config::RUSTFS_TLS_KEY), first.signing_key.serialize_pem()).expect("leaf key");
+        let mut snapshot = rustfs_tls_runtime::TlsMaterialSnapshot::load(&TlsSource::from_directory(dir.path()))
+            .await
+            .expect("validated material");
+        temp_env::async_with_vars(
+            [
+                (ENV_TRUST_LEAF_CERT_AS_CA, Some("1")),
+                (ENV_TRUST_SYSTEM_CA, Some("0")),
+                (ENV_MTLS_CLIENT_CERT, None),
+                (ENV_MTLS_CLIENT_KEY, None),
+            ],
+            async {
+                enrich_outbound(&mut snapshot).await.expect("derive leaf trust");
+                let mut reader = Cursor::new(&snapshot.outbound.root_ca_pem);
+                let certificates = CertificateDer::pem_reader_iter(&mut reader)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("derived certificate PEM");
+                assert_eq!(
+                    certificates,
+                    vec![second.cert.der().clone(), first.cert.der().clone()],
+                    "leaf trust must not depend on source enumeration order"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_identity_override_rejects_mismatch_and_missing_files() {
+        let dir = TempDir::new().expect("identity directory");
+        let a = rcgen::generate_simple_self_signed(vec!["client-a.example".into()]).expect("identity A");
+        let b = rcgen::generate_simple_self_signed(vec!["client-b.example".into()]).expect("identity B");
+        let cert = dir.path().join(RUSTFS_CLIENT_CERT_FILENAME);
+        let key = dir.path().join(RUSTFS_CLIENT_KEY_FILENAME);
+        fs::write(&cert, a.cert.pem()).expect("client cert");
+        fs::write(&key, b.signing_key.serialize_pem()).expect("mismatched key");
+        assert!(
+            load_mtls_identity_from_overridden_paths(cert.to_str(), key.to_str(), dir.path())
+                .await
+                .is_err()
+        );
+        fs::remove_file(&key).expect("remove override key");
+        assert!(
+            load_mtls_identity_from_overridden_paths(cert.to_str(), key.to_str(), dir.path())
+                .await
+                .is_err()
+        );
+        fs::write(&key, a.signing_key.serialize_pem()).expect("matching key");
+        assert!(
+            load_mtls_identity_from_overridden_paths(cert.to_str(), key.to_str(), dir.path())
+                .await
+                .expect("valid override")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn late_listener_joins_accepted_generation_when_source_is_invalid() {
+        ensure_rustls_crypto_provider();
+        temp_env::async_with_vars([(ENV_TLS_RELOAD_ENABLE, Some("1")), (ENV_SERVER_MTLS_ENABLE, Some("0"))], async {
+            let dir = TempDir::new().expect("TLS directory");
+            write_test_cert_pair(dir.path(), "server.example");
+            let source = TlsSource::from_directory(dir.path());
+            let a = rustfs_tls_runtime::TlsMaterialSnapshot::load(&source)
+                .await
+                .expect("generation A");
+            let first = build_acceptor_from_snapshot(&a).expect("config A").expect("TLS A");
+            let path = dir.path().to_str().expect("UTF8 path").to_string();
+            let task_a = spawn_reload_loop(
+                path.clone(),
+                first.clone(),
+                a,
+                #[cfg(feature = "http3")]
+                None,
+            )
+            .expect("register A")
+            .expect("reload enabled");
+            // No async yield between producing B and registration: the actor cannot accept B.
+            write_test_cert_pair(dir.path(), "server.example");
+            let b = rustfs_tls_runtime::TlsMaterialSnapshot::load_from_snapshot(&source.snapshot().expect("pin B"))
+                .expect("generation B");
+            let second = build_acceptor_from_snapshot(&b).expect("config B").expect("TLS B");
+            assert!(!Arc::ptr_eq(&first.get(), &second.get()));
+            fs::write(dir.path().join(RUSTFS_TLS_CERT), "invalid certificate").expect("break source");
+            let task_b = spawn_reload_loop(
+                path.clone(),
+                second.clone(),
+                b,
+                #[cfg(feature = "http3")]
+                None,
+            )
+            .expect("register B")
+            .expect("reload enabled");
+            assert!(
+                Arc::ptr_eq(&first.get(), &second.get()),
+                "late listener must use the group's accepted config"
+            );
+            task_a.abort();
+            task_b.abort();
+            let _ = task_a.await;
+            let _ = task_b.await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&path) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("group exits when all registrations are dropped");
+        })
+        .await;
     }
 
     #[tokio::test]

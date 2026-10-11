@@ -34,6 +34,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
+arc-swap.workspace = true
 hotpath.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
