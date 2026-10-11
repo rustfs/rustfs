@@ -35,6 +35,7 @@ pub fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
             HashMap::new(),
         ),
         state_store: OidcStateStore::new(),
+        pending_discovery: Default::default(),
     }
 }
 

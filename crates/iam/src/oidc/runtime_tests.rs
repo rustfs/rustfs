@@ -175,6 +175,7 @@ async fn web_identity_verification_refreshes_rotated_jwks() {
         configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
         provider_runtime: ProviderRuntime::new(http_client, HashMap::from([(config.id.clone(), state)])),
         state_store: OidcStateStore::new(),
+        pending_discovery: Default::default(),
     };
 
     let now = std::time::SystemTime::now()
@@ -208,6 +209,15 @@ async fn web_identity_verification_refreshes_rotated_jwks() {
 }
 #[tokio::test]
 async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
+    assert_complete_console_login(false).await;
+}
+
+#[tokio::test]
+async fn console_login_recovers_startup_discovery_with_authorization_rules() {
+    assert_complete_console_login(true).await;
+}
+
+async fn assert_complete_console_login(initially_unavailable: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     for hidden in [false, true] {
@@ -221,6 +231,8 @@ async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
             };
             let mut config = build_mocked_oidc_provider_config("console", &format!("{base}/.well-known/openid-configuration"));
             config.hide_from_ui = hidden;
+            config.claim_name = "groups".into();
+            config.claim_prefix = "team/".into();
             config.issuer = explicit.then(|| issuer.clone());
             config.client_secret = Some(Nonce::new_random().secret().clone());
             let server_config = config.clone();
@@ -230,6 +242,23 @@ async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
             let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<HashMap<String, String>>();
             let server = tokio::spawn(async move {
                 let mut auth_rx = Some(auth_rx);
+                let failures = if initially_unavailable {
+                    if explicit { 1 } else { 2 }
+                } else {
+                    0
+                };
+                for _ in 0..failures {
+                    let (mut stream, _) = listener.accept().await.expect("startup discovery request");
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.expect("discovery request headers"));
+                        assert!(request.len() < 8192);
+                    }
+                    stream
+                        .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .expect("startup discovery failure response");
+                }
                 for expected_path in ["/.well-known/openid-configuration", "/jwks", "/token"] {
                     let (mut stream, _) = tokio::time::timeout(StdDuration::from_secs(10), listener.accept())
                         .await
@@ -309,12 +338,21 @@ async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
                 }
             });
             let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
-            let discovered = discover_provider(&config, &http_client).await.unwrap();
-            let sys = OidcSys {
-                configs: HashMap::from([(config.id.clone(), test_sourced_config(config))]),
-                provider_runtime: ProviderRuntime::new(http_client, HashMap::from([("console".into(), discovered)])),
-                state_store: OidcStateStore::new(),
-            };
+            let sys = Arc::new(
+                OidcSys::new_with_config_snapshot(http_client, OidcConfigSnapshot::new(vec![test_sourced_config(config)]))
+                    .await
+                    .expect("OIDC initialization remains available during an IdP outage"),
+            );
+            let adapter = StandardOidcAdapter::new(sys.clone());
+            let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+            assert_eq!(sys.list_visible_providers().len(), usize::from(!hidden));
+            if initially_unavailable {
+                assert!(sys.provider_runtime.get_provider_state("console").is_err());
+                assert!(sys.authorize_url("console", redirect, None).await.is_err());
+                tokio::time::timeout(StdDuration::from_secs(10), sys.recover_failed_providers())
+                    .await
+                    .expect("discovery should recover after the IdP becomes available");
+            }
             let auth_url = sys.authorize_url("console", redirect, Some("/buckets".into())).await.unwrap();
             let auth_url = Url::parse(&auth_url).unwrap();
             assert_eq!(auth_url.as_str().split('?').next(), Some(format!("{base}/authorize").as_str()));
@@ -328,15 +366,18 @@ async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
             assert!(auth["scope"].split_whitespace().any(|scope| scope == "openid"));
             let state = auth["state"].clone();
             auth_tx.send(auth).unwrap();
-            let (claims, provider, session, _) = sys
-                .exchange_code(&state, "test-authorization-code", redirect)
+            let exchange = adapter
+                .exchange_identity(&state, "test-authorization-code", redirect)
                 .await
                 .unwrap_or_else(|err| panic!("hidden={hidden}, explicit={explicit}: {err}"));
-            assert_eq!(provider, "console");
-            assert_eq!(claims.sub, "existing-user");
-            assert_eq!(claims.email, "user@example.com");
-            assert_eq!(claims.groups, vec!["readwrite"]);
-            assert_eq!(session.redirect_after.as_deref(), Some("/buckets"));
+            let (identity, redirect_after, _) = exchange.into_parts();
+            let authorization = mapper.map(identity);
+            assert_eq!(authorization.provider_id, "console");
+            assert_eq!(authorization.claims.sub, "existing-user");
+            assert_eq!(authorization.claims.email, "user@example.com");
+            assert_eq!(authorization.claims.groups, vec!["readwrite"]);
+            assert_eq!(authorization.policies, vec!["team/readwrite"]);
+            assert_eq!(redirect_after.as_deref(), Some("/buckets"));
             assert!(matches!(sys.exchange_code(&state, "test-authorization-code", redirect).await,
                 Err(error) if error == "invalid or expired OIDC state"));
             server.await.unwrap();
@@ -470,6 +511,7 @@ async fn oidc_token_exchange_reports_forbidden_token_endpoint() {
             )]),
         ),
         state_store,
+        pending_discovery: Default::default(),
     };
 
     let error = match sys
