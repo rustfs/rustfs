@@ -99,6 +99,7 @@ static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = st
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadRepairPausePhase {
     Data,
+    PartStaging(usize),
     Commit,
 }
 
@@ -1596,47 +1597,38 @@ impl SetDisks {
                         let dst_data_dir = data_dir;
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
-                            let erasure_info = latest_meta.erasure.clone();
-                            let mut writer_failures = HealWriterFailures::new(disks_to_heal_count);
+                            let stage_result: disk::error::Result<Option<DiskError>> = async {
+                                let erasure_info = latest_meta.erasure.clone();
+                                let mut writer_failures = HealWriterFailures::new(disks_to_heal_count);
 
-                            for (part_index, part) in latest_meta.parts.iter().enumerate() {
-                                use crate::io_support::shard_integrity::{PartProofReader, PreparedIntegrity, ShardVerifier};
-                                let source_layout = (|| -> disk::error::Result<_> {
+                                for (part_index, part) in latest_meta.parts.iter().enumerate() {
+                                    use crate::io_support::shard_integrity::{PartProofReader, PreparedIntegrity, ShardVerifier};
                                     let proof = part
                                         .integrity
                                         .as_ref()
                                         .map(|part| {
                                             PartProofReader::new(part.clone(), &parts_metadata, &latest_disks, bucket, object)
                                         })
-                                        .transpose()
-                                        .map_err(DiskError::from)?;
+                                        .transpose()?;
                                     // Cover the complete encoded shard, including a logical
                                     // part's partial final data block, when checking truncation.
                                     let till_offset = usize::try_from(erasure.shard_file_size(part.size as i64))
                                         .map_err(|_| DiskError::FileCorrupt)?;
-                                    Ok((proof, till_offset))
-                                })();
-                                let (proof, till_offset) = match source_layout {
-                                    Ok(layout) => layout,
-                                    Err(error) => {
-                                        let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                        return Err(error);
-                                    }
-                                };
-                                let use_mmap_read = object_mmap_read_enabled();
+                                    let use_mmap_read = object_mmap_read_enabled();
 
-                                let mut writers = Vec::with_capacity(out_dated_disks.len());
+                                    let mut writers = Vec::with_capacity(out_dated_disks.len());
 
-                                // Preserve the committed layout: recomputing inline-ness here
-                                // (with a hardcoded unversioned threshold) makes healed replicas
-                                // diverge from healthy ones in quorum identity, so heal would
-                                // flag them forever.
-                                let is_inline_buffer = latest_meta.inline_data();
-                                // create writers for all disk positions, but only for outdated disks
-                                for (index, disk_op) in out_dated_disks.iter().enumerate() {
-                                    if let Some(outdated_disk) = disk_op {
-                                        let writer_result =
-                                            if let Some(error) = injected_heal_writer_error(bucket, object, part.number, index) {
+                                    // Preserve the committed layout: recomputing inline-ness here
+                                    // (with a hardcoded unversioned threshold) makes healed replicas
+                                    // diverge from healthy ones in quorum identity, so heal would
+                                    // flag them forever.
+                                    let is_inline_buffer = latest_meta.inline_data();
+                                    // create writers for all disk positions, but only for outdated disks
+                                    for (index, disk_op) in out_dated_disks.iter().enumerate() {
+                                        if let Some(outdated_disk) = disk_op {
+                                            let writer_result = if let Some(error) =
+                                                injected_heal_writer_error(bucket, object, part.number, index)
+                                            {
                                                 Err(error)
                                             } else {
                                                 create_bitrot_writer(
@@ -1654,135 +1646,120 @@ impl SetDisks {
                                                 )
                                                 .await
                                             };
-                                        let writer = match writer_result {
-                                            Ok(writer) => writer,
-                                            Err(err) => {
-                                                writer_failures.record(part.number, index, err);
-                                                writers.push(None);
-                                                continue;
-                                            }
-                                        };
-                                        let mut writer = writer;
-                                        if let Some(proof) = &proof {
-                                            let verifier = match ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
-                                            {
-                                                Ok(verifier) => verifier,
-                                                Err(error) => {
-                                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                                    return Err(error.into());
+                                            let writer = match writer_result {
+                                                Ok(writer) => writer,
+                                                Err(err) => {
+                                                    writer_failures.record(part.number, index, err);
+                                                    writers.push(None);
+                                                    continue;
                                                 }
                                             };
-                                            writer.set_integrity(verifier);
-                                        }
-                                        writers.push(Some(writer));
-                                    } else {
-                                        writers.push(None);
-                                    }
-                                }
-
-                                // Heal each part. erasure.Heal() will write the healed
-                                // part to .rustfs/tmp/uuid/ which needs to be renamed
-                                // later to the final location.
-                                if writers.iter().all(Option::is_none) {
-                                    writer_failures.warn(bucket, object, version_id, "all_targets_unavailable");
-                                    // No target can accept this part. Preserve the setup
-                                    // cause and discard earlier staged parts before opening
-                                    // source readers or spending work on reconstruction.
-                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                    return Ok((result, Some(writer_failures.into_error())));
-                                }
-                                let mut readers = Vec::with_capacity(latest_disks.len());
-
-                                let mut prefer = vec![false; latest_disks.len()];
-                                let this_part_errs =
-                                    Self::shuffle_check_parts(&data_errs_by_part[&part_index], &erasure_info.distribution);
-                                for (index, disk) in latest_disks.iter().enumerate() {
-                                    if this_part_errs[index] != CHECK_PART_SUCCESS {
-                                        trace!(
-                                            event = EVENT_SET_DISK_HEAL,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                            part_number = part.number,
-                                            disk_index = index,
-                                            part_status = this_part_errs[index],
-                                            state = "source_shard_skipped",
-                                            "Set disk source shard skipped"
-                                        );
-                                        readers.push(None);
-                                        continue;
-                                    }
-
-                                    if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
-                                        let checksum_info = metadata.erasure.get_checksum_info(part.number);
-                                        let checksum_algo = if metadata.uses_legacy_checksum
-                                            && checksum_info.algorithm == HashAlgorithm::HighwayHash256S
-                                        {
-                                            HashAlgorithm::HighwayHash256SLegacy
+                                            let mut writer = writer;
+                                            if let Some(proof) = &proof {
+                                                let verifier = ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)?;
+                                                writer.set_integrity(verifier);
+                                            }
+                                            writers.push(Some(writer));
                                         } else {
-                                            checksum_info.algorithm
-                                        };
+                                            writers.push(None);
+                                        }
+                                    }
 
-                                        match create_bitrot_reader(
-                                            metadata.data.as_deref(),
-                                            Some(disk),
-                                            bucket,
-                                            &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
-                                            0,
-                                            till_offset,
-                                            erasure.shard_size(),
-                                            checksum_algo.clone(),
-                                            false,
-                                            use_mmap_read,
-                                        )
-                                        .await
-                                        {
-                                            Ok(Some(mut reader)) => {
-                                                if let Some(proof) = &proof
-                                                    && let Err(error) =
-                                                        ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
-                                                            .and_then(|verifier| reader.set_integrity(verifier))
-                                                {
-                                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                                    return Err(error.into());
-                                                }
-                                                readers.push(Some(reader));
-                                            }
-                                            Ok(None) => {
-                                                readers.push(None);
-                                                continue;
-                                            }
-                                            Err(_e) => {
-                                                readers.push(None);
-                                                continue;
-                                            }
+                                    // Heal each part. erasure.Heal() will write the healed
+                                    // part to .rustfs/tmp/uuid/ which needs to be renamed
+                                    // later to the final location.
+                                    if writers.iter().all(Option::is_none) {
+                                        writer_failures.warn(bucket, object, version_id, "all_targets_unavailable");
+                                        // No target can accept this part. Preserve the setup
+                                        // cause before opening source readers or reconstructing.
+                                        return Ok(Some(writer_failures.into_error()));
+                                    }
+                                    #[cfg(test)]
+                                    pause_read_repair(bucket, object, ReadRepairPausePhase::PartStaging(part.number)).await;
+
+                                    let mut readers = Vec::with_capacity(latest_disks.len());
+
+                                    let mut prefer = vec![false; latest_disks.len()];
+                                    let this_part_errs =
+                                        Self::shuffle_check_parts(&data_errs_by_part[&part_index], &erasure_info.distribution);
+                                    for (index, disk) in latest_disks.iter().enumerate() {
+                                        if this_part_errs[index] != CHECK_PART_SUCCESS {
+                                            trace!(
+                                                event = EVENT_SET_DISK_HEAL,
+                                                component = LOG_COMPONENT_ECSTORE,
+                                                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                                part_number = part.number,
+                                                disk_index = index,
+                                                part_status = this_part_errs[index],
+                                                state = "source_shard_skipped",
+                                                "Set disk source shard skipped"
+                                            );
+                                            readers.push(None);
+                                            continue;
                                         }
 
-                                        prefer[index] = disk.host_name().is_empty();
-                                    } else {
-                                        readers.push(None);
-                                        // errors.push(Some(DiskError::DiskNotFound));
-                                    }
-                                }
+                                        if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
+                                            let checksum_info = metadata.erasure.get_checksum_info(part.number);
+                                            let checksum_algo = if metadata.uses_legacy_checksum
+                                                && checksum_info.algorithm == HashAlgorithm::HighwayHash256S
+                                            {
+                                                HashAlgorithm::HighwayHash256SLegacy
+                                            } else {
+                                                checksum_info.algorithm
+                                            };
 
-                                let heal_part = erasure.heal(&mut writers, readers, part.size, &prefer);
-                                let heal_part_result = if read_repair_uses_shared_lock {
-                                    match tokio::time::timeout(READ_REPAIR_DATA_PHASE_TIMEOUT, heal_part).await {
-                                        Ok(result) => result,
-                                        Err(_) => Err(DiskError::Timeout),
+                                            match create_bitrot_reader(
+                                                metadata.data.as_deref(),
+                                                Some(disk),
+                                                bucket,
+                                                &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
+                                                0,
+                                                till_offset,
+                                                erasure.shard_size(),
+                                                checksum_algo.clone(),
+                                                false,
+                                                use_mmap_read,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(mut reader)) => {
+                                                    if let Some(proof) = &proof {
+                                                        let verifier =
+                                                            ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)?;
+                                                        reader.set_integrity(verifier)?;
+                                                    }
+                                                    readers.push(Some(reader));
+                                                }
+                                                Ok(None) => {
+                                                    readers.push(None);
+                                                    continue;
+                                                }
+                                                Err(_e) => {
+                                                    readers.push(None);
+                                                    continue;
+                                                }
+                                            }
+
+                                            prefer[index] = disk.host_name().is_empty();
+                                        } else {
+                                            readers.push(None);
+                                            // errors.push(Some(DiskError::DiskNotFound));
+                                        }
                                     }
-                                } else {
-                                    heal_part.await
-                                };
-                                if let Err(e) = heal_part_result {
-                                    // Don't leak the partially-written healed shards in
-                                    // .rustfs/tmp when heal fails midway (backlog#799 B20).
-                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                    return Err(e);
-                                }
-                                // close_bitrot_writers(&mut writers).await?;
-                                if !is_inline_buffer && let Some(proof) = &proof {
-                                    let before = out_dated_disks.iter().filter(|disk| disk.is_some()).count();
-                                    let proof_result = async {
+
+                                    let heal_part = erasure.heal(&mut writers, readers, part.size, &prefer);
+                                    let heal_part_result = if read_repair_uses_shared_lock {
+                                        match tokio::time::timeout(READ_REPAIR_DATA_PHASE_TIMEOUT, heal_part).await {
+                                            Ok(result) => result,
+                                            Err(_) => Err(DiskError::Timeout),
+                                        }
+                                    } else {
+                                        heal_part.await
+                                    };
+                                    heal_part_result?;
+                                    // close_bitrot_writers(&mut writers).await?;
+                                    if !is_inline_buffer && let Some(proof) = &proof {
+                                        let before = out_dated_disks.iter().filter(|disk| disk.is_some()).count();
                                         PreparedIntegrity::copy_from(proof)
                                             .await?
                                             .write(
@@ -1791,66 +1768,72 @@ impl SetDisks {
                                                 RUSTFS_META_TMP_BUCKET,
                                                 &format!("{tmp_id}/{dst_data_dir}"),
                                             )
-                                            .await
-                                    }
-                                    .await;
-                                    if let Err(error) = proof_result {
-                                        let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                        return Err(error.into());
-                                    }
-                                    disks_to_heal_count -= before - out_dated_disks.iter().filter(|disk| disk.is_some()).count();
-                                }
-
-                                for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
-                                    if disk_op.is_none() {
-                                        continue;
+                                            .await?;
+                                        disks_to_heal_count -=
+                                            before - out_dated_disks.iter().filter(|disk| disk.is_some()).count();
                                     }
 
-                                    if writers[index].is_none() {
-                                        *disk_op = None;
-                                        disks_to_heal_count -= 1;
-                                        continue;
-                                    }
-
-                                    parts_metadata[index].data_dir = Some(dst_data_dir);
-                                    parts_metadata[index].add_object_part(
-                                        part.number,
-                                        part.etag.clone(),
-                                        part.size,
-                                        part.mod_time,
-                                        part.actual_size,
-                                        part.index.clone(),
-                                        part.checksums.clone(),
-                                    );
-                                    if let Some(updated) = parts_metadata[index]
-                                        .parts
-                                        .iter_mut()
-                                        .find(|updated| updated.number == part.number)
-                                    {
-                                        updated.integrity.clone_from(&part.integrity);
-                                    }
-                                    if is_inline_buffer {
-                                        if let Some(writer) = writers[index].take() {
-                                            // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
-                                            //     parts_metadata[index].data = Some(w.inline_data().to_vec());
-                                            // }
-                                            parts_metadata[index].data =
-                                                Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                                    for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
+                                        if disk_op.is_none() {
+                                            continue;
                                         }
-                                        parts_metadata[index].set_inline_data();
-                                    } else {
-                                        parts_metadata[index].data = None;
+
+                                        if writers[index].is_none() {
+                                            *disk_op = None;
+                                            disks_to_heal_count -= 1;
+                                            continue;
+                                        }
+
+                                        parts_metadata[index].data_dir = Some(dst_data_dir);
+                                        parts_metadata[index].add_object_part(
+                                            part.number,
+                                            part.etag.clone(),
+                                            part.size,
+                                            part.mod_time,
+                                            part.actual_size,
+                                            part.index.clone(),
+                                            part.checksums.clone(),
+                                        );
+                                        if let Some(updated) = parts_metadata[index]
+                                            .parts
+                                            .iter_mut()
+                                            .find(|updated| updated.number == part.number)
+                                        {
+                                            updated.integrity.clone_from(&part.integrity);
+                                        }
+                                        if is_inline_buffer {
+                                            if let Some(writer) = writers[index].take() {
+                                                // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
+                                                //     parts_metadata[index].data = Some(w.inline_data().to_vec());
+                                                // }
+                                                parts_metadata[index].data =
+                                                    Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                                            }
+                                            parts_metadata[index].set_inline_data();
+                                        } else {
+                                            parts_metadata[index].data = None;
+                                        }
+                                    }
+
+                                    if disks_to_heal_count == 0 {
+                                        writer_failures.warn(bucket, object, version_id, "all_targets_unavailable");
+                                        return Ok(Some(writer_failures.into_error()));
                                     }
                                 }
 
-                                if disks_to_heal_count == 0 {
-                                    writer_failures.warn(bucket, object, version_id, "all_targets_unavailable");
+                                writer_failures.warn(bucket, object, version_id, "partial_targets_unavailable");
+                                Ok(None)
+                            }
+                            .await;
+                            match stage_result {
+                                Ok(None) => {}
+                                failure => {
+                                    // Release readers and writers before removing all parts
+                                    // staged under this heal's exclusively owned prefix.
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                    return Ok((result, Some(writer_failures.into_error())));
+                                    return failure.map(|error| (result, error));
                                 }
                             }
-
-                            writer_failures.warn(bucket, object, version_id, "partial_targets_unavailable");
                         }
                         let _read_repair_write_lock_guard = if let Some(expected_fingerprint) = read_repair_commit_fingerprint {
                             drop(_read_repair_read_lock_guard.take());
@@ -3944,7 +3927,7 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn heal_second_part_writer_setup_failure_cleans_staged_parts_and_retries() {
+    async fn heal_second_part_failures_clean_staged_parts_and_retry() {
         use crate::set_disk::CompletePart;
         use crate::storage_api_contracts::multipart::MultipartOperations as _;
         use tokio::io::AsyncReadExt as _;
@@ -4016,6 +3999,59 @@ mod heal_result_report_tests {
             tmp_before,
             "first-part staging must be cleaned after the second-part setup failure"
         );
+
+        let source_path = dirs[2].path().join(bucket).join(object).join(&data_dir).join("part.2");
+        let source_bytes = tokio::fs::read(&source_path).await.expect("committed source shard");
+        let mut metadata_before = Vec::new();
+        for dir in &dirs {
+            metadata_before.push(
+                tokio::fs::read(dir.path().join(bucket).join(object).join("xl.meta"))
+                    .await
+                    .expect("committed metadata before reconstruction failure"),
+            );
+        }
+        let (pause_scope, arrived, release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(2));
+        let lose_source = async {
+            arrived.notified().await;
+            assert_ne!(
+                non_trash_tmp_entries(&dirs).await,
+                tmp_before,
+                "the first part must already be staged before the source loss"
+            );
+            tokio::fs::remove_file(&source_path)
+                .await
+                .expect("lose one remaining source shard");
+            release.notify_one();
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(set.heal_object(bucket, object, "", &heal_options), lose_source)
+        })
+        .await
+        .expect("heal must report source loss without waiting indefinitely");
+        drop(pause_scope);
+        assert_eq!(
+            outcome.expect_err("source loss after writer admission must preserve the outer failure"),
+            DiskError::ErasureReadQuorum
+        );
+        assert_eq!(
+            non_trash_tmp_entries(&dirs).await,
+            tmp_before,
+            "reconstruction failure must clean every staged part"
+        );
+        for (dir, expected) in dirs.iter().zip(metadata_before) {
+            assert_eq!(
+                tokio::fs::read(dir.path().join(bucket).join(object).join("xl.meta"))
+                    .await
+                    .expect("metadata after reconstruction failure"),
+                expected,
+                "a failed data stage must not publish replacement metadata"
+            );
+        }
+        tokio::fs::write(&source_path, source_bytes)
+            .await
+            .expect("restore the committed source shard");
+
         let (_, error) = set
             .heal_object(bucket, object, "", &heal_options)
             .await
