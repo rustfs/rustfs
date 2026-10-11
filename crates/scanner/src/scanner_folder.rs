@@ -1657,8 +1657,26 @@ impl FolderScanner {
                 "Scanner folder state updated"
             );
 
+            // A child prefix can be removed after its parent listed it and before
+            // it is opened here (e.g. concurrent object deletes). Treat it like a
+            // directory that vanished during iteration instead of failing the
+            // whole parent subtree. The bucket root (no parent) still propagates
+            // NotFound so namespace removal is detected by the caller.
             let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
-                Ok(dir_reader) => dir_reader,
+                Ok(dir_reader) => Some(dir_reader),
+                Err(e) if e.kind() == ErrorKind::NotFound && folder.parent.is_some() => {
+                    debug!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_FOLDER_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                        dir_path = %dir_path,
+                        state = "dir_missing_before_open",
+                        error = %e,
+                        "Scanner folder state updated"
+                    );
+                    None
+                }
                 Err(e) => return Err(ScannerError::Io(e)),
             };
             let mut pending_entry_progress = 0_u64;
@@ -1667,7 +1685,11 @@ impl FolderScanner {
             let raw_enumeration_committed_entries = self.raw_enumeration_committed_entry_oracle(&folder.name);
 
             loop {
-                let entry = match dir_reader.next_entry().await {
+                let Some(reader) = dir_reader.as_mut() else {
+                    raw_enumeration_complete = true;
+                    break;
+                };
+                let entry = match reader.next_entry().await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => {
                         raw_enumeration_complete = true;
