@@ -42,8 +42,7 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
     INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
-use s3s::Body;
-use s3s::dto::StreamingBlob;
+use rustfs_s3_types::Body;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_bytes;
 use sha2::{Digest, Sha256};
@@ -250,6 +249,9 @@ macro_rules! log_internode_put_file_stage_failure {
     };
 }
 
+/// Answers the internode rpc paths itself and hands every other request to
+/// `inner`. Its own responses are built as [`Body`] and converted into the
+/// wrapped service's response body type, so both leave as one type.
 #[derive(Clone)]
 pub struct InternodeRpcService<S> {
     inner: S,
@@ -385,13 +387,14 @@ fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
     query.put_file_server_epoch.is_some_and(|epoch| !epoch.is_nil())
 }
 
-impl<S> Service<Request<Incoming>> for InternodeRpcService<S>
+impl<S, ResBody> Service<Request<Incoming>> for InternodeRpcService<S>
 where
-    S: Service<Request<Incoming>, Response = Response<Body>> + Clone + Send + 'static,
+    S: Service<Request<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<BoxError> + Send + 'static,
+    ResBody: From<Body> + Send + 'static,
 {
-    type Response = Response<Body>;
+    type Response = Response<ResBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -405,7 +408,7 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        Box::pin(async move { Ok(handle_internode_rpc(req).await) })
+        Box::pin(async move { Ok(handle_internode_rpc(req).await.map(ResBody::from)) })
     }
 }
 
@@ -679,11 +682,21 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    let stream = read_file_body_stream(file, query.length, INTERNODE_OPERATION_READ_FILE_STREAM);
+    read_file_stream_response(file, query.length)
+}
+
+/// The read_file_stream answer: 200 with the file streamed at an unknown
+/// length, so the peer reads it chunked and sees a failed read as a cut
+/// connection rather than a short body.
+fn read_file_stream_response<R>(file: R, length: usize) -> Response<Body>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+{
+    let stream = read_file_body_stream(file, length, INTERNODE_OPERATION_READ_FILE_STREAM);
 
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(stream)))
+        .body(Body::from_stream(stream))
         .expect("failed to build read file stream response")
 }
 
@@ -1239,7 +1252,7 @@ where
     let mut stream = Box::pin(stream);
     if !preflight_missing_path_error {
         let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-        return Ok(Body::from(StreamingBlob::wrap(stream)));
+        return Ok(Body::from_stream(stream));
     }
 
     // Keep the first chunk bounded in memory so a missing-path error can use
@@ -1248,12 +1261,12 @@ where
         Some(Ok(first_bytes)) => {
             let stream = stream::once(async move { Ok(first_bytes) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from(StreamingBlob::wrap(stream)))
+            Ok(Body::from_stream(stream))
         }
         Some(Err(first_error)) => {
             let stream = stream::once(async move { Err(first_error) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from(StreamingBlob::wrap(stream)))
+            Ok(Body::from_stream(stream))
         }
         None => match completion_rx.await {
             Ok(Ok(())) => Ok(Body::empty()),
@@ -1269,7 +1282,7 @@ where
 
 fn walk_dir_error_body(message: &'static str) -> Body {
     let stream = stream::once(async move { Err(io::Error::other(message)) });
-    Body::from(StreamingBlob::wrap(stream))
+    Body::from_stream(stream)
 }
 
 fn append_walk_dir_completion<S>(
@@ -1338,7 +1351,7 @@ where
     })
     .filter_map(std::future::ready);
 
-    Body::from(StreamingBlob::wrap(stream.chain(completion)))
+    Body::from_stream(stream.chain(completion))
 }
 
 fn put_file_target_lock(disk: &DiskStore, query: &PutFileQuery) -> Arc<Mutex<()>> {
@@ -1814,7 +1827,7 @@ mod tests {
         ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
         put_file_capability_response, put_file_server_epoch_accepted, put_file_server_epoch_matches,
         put_file_stage_error_message, put_file_target_lock, read_file_body_stream, read_file_stream_buffer_size,
-        remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
+        read_file_stream_response, remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
         validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
         verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
         write_put_file_body_chunks_to_writer,
@@ -1910,7 +1923,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener address should be available");
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("test server should accept a connection");
-            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(super::Body::empty())) });
             server_http1::Builder::new()
                 .serve_connection(TokioIo::new(socket), TowerToHyperService::new(InternodeRpcService::new(fallback)))
                 .await
@@ -3064,7 +3077,7 @@ mod tests {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         drop(completion_tx);
         let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"partial walk data"))]);
-        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, true)));
+        let body = super::Body::from_stream(append_walk_dir_completion(stream, completion_rx, true));
 
         let err = BodyExt::collect(body)
             .await
@@ -3116,7 +3129,7 @@ mod tests {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         drop(completion_tx);
         let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"legacy partial data"))]);
-        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, false)));
+        let body = super::Body::from_stream(append_walk_dir_completion(stream, completion_rx, false));
 
         let bytes = BodyExt::collect(body)
             .await
@@ -3265,5 +3278,253 @@ mod tests {
             reader.read_to_end(&mut data).await.expect("read metadata");
             assert_eq!(data, expected);
         }
+    }
+
+    // ---- the wire: the exact bytes a peer reads for each rpc response body ----
+    //
+    // The expected strings were captured from these tests run against the s3s
+    // bodies the rpc paths served before rustfs/backlog#2747 batch 4. A body
+    // change that moves a byte (a length or chunking header, a chunk boundary,
+    // the terminating chunk, a cut connection) fails here.
+
+    /// Serves `response` to one HTTP/1.1 request through hyper's server encoder
+    /// and returns the raw bytes the peer read until the connection closed. The
+    /// date header is off, so the bytes depend on the response alone.
+    async fn wire_bytes<B>(response: Response<B>, method: Method) -> Vec<u8>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let response = std::sync::Mutex::new(Some(response));
+        let service = hyper::service::service_fn(move |_request| {
+            let response = response.lock().ok().and_then(|mut slot| slot.take());
+            async move { response.ok_or("one request per connection") }
+        });
+        let server = tokio::spawn(async move {
+            // A body error cuts the connection; what the peer read before the
+            // cut is the observation, not the server's own error.
+            let _ = server_http1::Builder::new()
+                .auto_date_header(false)
+                .serve_connection(TokioIo::new(server), service)
+                .await;
+        });
+        let request = format!("{method} /rustfs/rpc/wire HTTP/1.1\r\nhost: peer\r\nconnection: close\r\n\r\n");
+        client.write_all(request.as_bytes()).await.expect("the request is written");
+        let mut raw = Vec::new();
+        client
+            .read_to_end(&mut raw)
+            .await
+            .expect("the response is read until the close");
+        server.await.expect("the server task ends");
+        raw
+    }
+
+    /// `wire_bytes` for the responses whose bytes are all ASCII.
+    async fn wire_text<B>(response: Response<B>, method: Method) -> String
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        String::from_utf8(wire_bytes(response, method).await).expect("the scripted responses are ASCII")
+    }
+
+    fn ok<B>(body: B) -> Response<B> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .expect("a valid test response")
+    }
+
+    /// A reader that yields `data`, pauses once so the server flushes it, then
+    /// fails, the way a disk read that breaks mid-file does.
+    struct FailAfterData {
+        data: Option<&'static [u8]>,
+        paused: bool,
+    }
+
+    impl io::AsyncRead for FailAfterData {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut io::ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if let Some(data) = self.data.take() {
+                buf.put_slice(data);
+                return Poll::Ready(Ok(()));
+            }
+            if !self.paused {
+                self.paused = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(io::Error::other("disk read failed")))
+        }
+    }
+
+    const WIRE_STATUS_404_GET: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain; charset=utf-8\r\nconnection: close\r\ncontent-length: 29\r\n\r\ninternode rpc route not found";
+    const WIRE_STATUS_404_HEAD: &str =
+        "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain; charset=utf-8\r\nconnection: close\r\ncontent-length: 29\r\n\r\n";
+    const WIRE_DISK_ERROR_GET: &str = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain; charset=utf-8\r\nx-rustfs-disk-error: file-not-found\r\nconnection: close\r\ncontent-length: 13\r\n\r\nread file err";
+    const WIRE_STATUS_EMPTY_MESSAGE_GET: &str =
+        "HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain; charset=utf-8\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const WIRE_EMPTY_OK_GET: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const WIRE_EMPTY_OK_HEAD: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
+    const WIRE_READ_FILE_WHOLE: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\nB\r\nhello world\r\n0\r\n\r\n";
+    const WIRE_READ_FILE_RANGED: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    const WIRE_READ_FILE_EMPTY: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
+    const WIRE_READ_FILE_BROKEN: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n7\r\npartial\r\n";
+    const WIRE_WALK_DIR_STREAMED: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n12\r\ncomplete walk data\r\n0\r\n\r\n";
+    const WIRE_WALK_DIR_EMPTY: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const WIRE_WALK_DIR_LEGACY_CLEAN_END: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n13\r\nlegacy partial data\r\n0\r\n\r\n";
+    const WIRE_WALK_DIR_FAILED_FIRST: &str = "";
+    const WIRE_WALK_DIR_FAILED_AFTER_DATA: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n11\r\npartial walk data\r\n";
+    const WIRE_NS_SCANNER_COMPLETE: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\nD\r\nscanner frame\r\n0\r\n\r\n";
+    const WIRE_NS_SCANNER_FAILED_AFTER_DATA: &str =
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n15\r\npartial scanner frame\r\n";
+
+    #[tokio::test]
+    async fn rpc_status_responses_keep_their_wire_bytes() {
+        let not_found = || super::response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found");
+        assert_eq!(wire_text(not_found(), Method::GET).await, WIRE_STATUS_404_GET);
+        assert_eq!(wire_text(not_found(), Method::HEAD).await, WIRE_STATUS_404_HEAD);
+        assert_eq!(
+            wire_text(response_with_disk_error(&DiskError::FileNotFound, "read file err"), Method::GET).await,
+            WIRE_DISK_ERROR_GET
+        );
+        assert_eq!(
+            wire_text(super::response_with_status(StatusCode::FORBIDDEN, ""), Method::GET).await,
+            WIRE_STATUS_EMPTY_MESSAGE_GET
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_empty_ok_keeps_its_wire_bytes() {
+        assert_eq!(wire_text(super::empty_ok(), Method::GET).await, WIRE_EMPTY_OK_GET);
+        assert_eq!(wire_text(super::empty_ok(), Method::HEAD).await, WIRE_EMPTY_OK_HEAD);
+    }
+
+    #[tokio::test]
+    async fn rpc_capability_responses_keep_their_wire_bytes() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-capability-server-test-secret".to_string());
+        let challenge = uuid::Uuid::new_v4();
+        type ResponseBuilder = Box<dyn Fn() -> Response<super::Body>>;
+        let builders: [(&str, ResponseBuilder); 3] = [
+            ("put_file", Box::new(move || put_file_capability_response(challenge))),
+            ("ns_scanner", Box::new(move || super::ns_scanner_capability_response(challenge, false))),
+            (
+                "ns_scanner with tier generation",
+                Box::new(move || super::ns_scanner_capability_response(challenge, true)),
+            ),
+        ];
+        for (name, build) in builders {
+            let response = build();
+            assert_eq!(response.status(), StatusCode::OK, "{name}: the proof is signed");
+            // Signing is deterministic for one challenge within one process, so
+            // a second response carries the same payload.
+            let payload = BodyExt::collect(response.into_body())
+                .await
+                .expect("an in-memory body")
+                .to_bytes();
+            assert!(!payload.is_empty(), "{name}");
+            let raw = wire_bytes(build(), Method::GET).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/msgpack\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                payload.len()
+            );
+            assert_eq!(
+                raw.get(..head.len()),
+                Some(head.as_bytes()),
+                "{name}: {:?}",
+                String::from_utf8_lossy(&raw)
+            );
+            assert_eq!(&raw[head.len()..], &payload[..], "{name}: payload");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_stream_responses_keep_their_wire_bytes() {
+        let whole = read_file_stream_response(std::io::Cursor::new(b"hello world".to_vec()), 0);
+        assert_eq!(wire_text(whole, Method::GET).await, WIRE_READ_FILE_WHOLE);
+        let ranged = read_file_stream_response(std::io::Cursor::new(b"hello world".to_vec()), 5);
+        assert_eq!(wire_text(ranged, Method::GET).await, WIRE_READ_FILE_RANGED);
+        let empty = read_file_stream_response(std::io::Cursor::new(Vec::new()), 0);
+        assert_eq!(wire_text(empty, Method::GET).await, WIRE_READ_FILE_EMPTY);
+        let broken = read_file_stream_response(
+            FailAfterData {
+                data: Some(b"partial"),
+                paused: false,
+            },
+            0,
+        );
+        assert_eq!(wire_text(broken, Method::GET).await, WIRE_READ_FILE_BROKEN);
+    }
+
+    #[tokio::test]
+    async fn walk_dir_bodies_keep_their_wire_bytes() {
+        let streamed = walk_dir_response_body(true, false, |mut writer| async move {
+            writer.write_all(b"complete walk data").await?;
+            Ok(())
+        })
+        .await
+        .expect("an ordinary stream starts at once");
+        assert_eq!(wire_text(ok(streamed), Method::GET).await, WIRE_WALK_DIR_STREAMED);
+
+        let preflighted = walk_dir_response_body(true, true, |mut writer| async move {
+            writer.write_all(b"complete walk data").await?;
+            Ok(())
+        })
+        .await
+        .expect("a preflighted stream keeps its first chunk");
+        assert_eq!(wire_text(ok(preflighted), Method::GET).await, WIRE_WALK_DIR_STREAMED);
+
+        let empty = walk_dir_response_body(true, true, |_writer| async { Ok(()) })
+            .await
+            .expect("an empty successful walk completes during preflight");
+        assert_eq!(wire_text(ok(empty), Method::GET).await, WIRE_WALK_DIR_EMPTY);
+
+        let legacy = walk_dir_response_body(false, false, |mut writer| async move {
+            writer.write_all(b"legacy partial data").await?;
+            Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+        })
+        .await
+        .expect("legacy peers keep a clean end");
+        assert_eq!(wire_text(ok(legacy), Method::GET).await, WIRE_WALK_DIR_LEGACY_CLEAN_END);
+
+        let failed_first = walk_dir_response_body(true, true, |_writer| async {
+            Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+        })
+        .await
+        .expect("a failure before any data is an error body for capable peers");
+        assert_eq!(wire_text(ok(failed_first), Method::GET).await, WIRE_WALK_DIR_FAILED_FIRST);
+
+        // The pause lets the server flush the data before the failure arrives.
+        let failed_after_data = walk_dir_response_body(true, false, |mut writer| async move {
+            writer.write_all(b"partial walk data").await?;
+            tokio::task::yield_now().await;
+            Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+        })
+        .await
+        .expect("an ordinary stream starts at once");
+        assert_eq!(wire_text(ok(failed_after_data), Method::GET).await, WIRE_WALK_DIR_FAILED_AFTER_DATA);
+    }
+
+    #[tokio::test]
+    async fn namespace_scanner_bodies_keep_their_wire_bytes() {
+        let complete = ns_scanner_response_body(|mut writer, _disconnect| async move {
+            writer.write_all(b"scanner frame").await?;
+            Ok(())
+        });
+        assert_eq!(wire_text(ok(complete), Method::POST).await, WIRE_NS_SCANNER_COMPLETE);
+
+        let failed = ns_scanner_response_body(|mut writer, _disconnect| async move {
+            writer.write_all(b"partial scanner frame").await?;
+            tokio::task::yield_now().await;
+            Err(io::Error::other("remote namespace scanner failed"))
+        });
+        assert_eq!(wire_text(ok(failed), Method::POST).await, WIRE_NS_SCANNER_FAILED_AFTER_DATA);
     }
 }
