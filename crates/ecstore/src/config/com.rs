@@ -465,6 +465,48 @@ where
     .await
 }
 
+pub(crate) async fn read_config_observation_no_lock<S>(
+    api: Arc<S>,
+    file: &str,
+    max_bytes: usize,
+    guard: &crate::object_api::WriteCommitGuard,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    if !guard.matches(RUSTFS_META_BUCKET, file) {
+        return Err(Error::InvalidArgument(
+            RUSTFS_META_BUCKET.to_owned(),
+            file.to_owned(),
+            "locked observation requires a matching write owner".to_owned(),
+        ));
+    }
+    let lock_lost_error = || Error::NamespaceLockQuorumUnavailable {
+        mode: "locked_config_observation",
+        bucket: RUSTFS_META_BUCKET.to_owned(),
+        object: file.to_owned(),
+        required: 1,
+        achieved: 0,
+    };
+    if guard.is_lock_lost() {
+        return Err(lock_lost_error());
+    }
+    let opts = ObjectOptions {
+        suppress_read_repair: true,
+        no_lock: true,
+        skip_verify_bitrot: false,
+        ..Default::default()
+    };
+    let result = crate::object_api::without_get_object_body_cache_hook(read_config_limited_preserve_empty_with_metadata_opts(
+        api, file, &opts, max_bytes,
+    ))
+    .await;
+    if guard.is_lock_lost() {
+        return Err(lock_lost_error());
+    }
+    result
+}
+
 pub(crate) async fn read_config_limited_preserve_empty<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: EcstoreObjectIO,
@@ -5445,12 +5487,25 @@ mod tests {
         inner: Cursor<Vec<u8>>,
         consumed: Arc<AtomicUsize>,
         fail: bool,
+        eof_gate: Option<(Option<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Receiver<()>)>,
     }
 
     impl AsyncRead for ObservationStream {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             if self.fail {
                 return Poll::Ready(Err(std::io::Error::other("observation stream failed")));
+            }
+            if self.inner.position() == u64::try_from(self.inner.get_ref().len()).expect("fixture length")
+                && let Some((ready, release)) = self.eof_gate.as_mut()
+            {
+                if let Some(ready) = ready.take() {
+                    ready.send(()).expect("EOF observer remains active");
+                }
+                match std::future::Future::poll(Pin::new(release), cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.expect("EOF gate released"),
+                }
+                self.eof_gate = None;
             }
             let before = buf.filled().len();
             let result = Pin::new(&mut self.inner).poll_read(cx, buf);
@@ -5464,6 +5519,8 @@ mod tests {
         declared_size: i64,
         error: Option<Error>,
         stream_error: bool,
+        gets: AtomicUsize,
+        eof_gate: std::sync::Mutex<Option<(Option<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Receiver<()>)>>,
         consumed: Arc<AtomicUsize>,
         options: std::sync::Mutex<Option<(bool, bool, bool)>>,
         writes: AtomicUsize,
@@ -5482,6 +5539,8 @@ mod tests {
                 declared_size,
                 error: None,
                 stream_error: false,
+                gets: AtomicUsize::new(0),
+                eof_gate: std::sync::Mutex::new(None),
                 consumed: Arc::new(AtomicUsize::new(0)),
                 options: std::sync::Mutex::new(None),
                 writes: AtomicUsize::new(0),
@@ -5509,6 +5568,7 @@ mod tests {
         ) -> Result<GetObjectReader> {
             assert_eq!(bucket, RUSTFS_META_BUCKET);
             assert_eq!(object, "config/observation.bin");
+            self.gets.fetch_add(1, Ordering::SeqCst);
             assert!(range.is_none());
             *self.options.lock().expect("observation options") =
                 Some((opts.suppress_read_repair, opts.no_lock, opts.skip_verify_bitrot));
@@ -5520,6 +5580,7 @@ mod tests {
                     inner: Cursor::new(self.body.clone()),
                     consumed: self.consumed.clone(),
                     fail: self.stream_error,
+                    eof_gate: self.eof_gate.lock().expect("EOF gate").take(),
                 }),
                 object_info: ObjectInfo {
                     size: self.declared_size,
@@ -5540,6 +5601,150 @@ mod tests {
         ) -> Result<ObjectInfo> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Err(Error::other("observation must not write"))
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_observation_preserves_options_and_typed_errors() {
+        let object = "config/observation.bin";
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let wrapper = rustfs_lock::NamespaceLockWrapper::new(
+            rustfs_lock::NamespaceLock::with_local_manager("locked-observation-options".to_owned(), manager.clone()),
+            rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, object),
+            "locked-observation-options".to_owned(),
+        );
+        let guard = crate::object_api::WriteCommitGuard::acquire(&wrapper, std::time::Duration::from_secs(5))
+            .await
+            .expect("matching real owner");
+        let store = Arc::new(ObservationStore::new(b"raw".to_vec(), 3));
+        let result = super::read_config_observation_no_lock(store.clone(), object, 3, &guard).await;
+        assert_eq!(result.is_ok(), true, "I06L_READ_FLAGS: {result:?}");
+        assert_eq!(
+            *store.options.lock().expect("options") == Some((true, true, false)),
+            true,
+            "I06L_READ_FLAGS"
+        );
+        assert_eq!(result.expect("raw observation").0, b"raw");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        for (bucket, key) in [(RUSTFS_META_BUCKET, "config/other.bin"), ("wrong-bucket", object)] {
+            let wrapper = rustfs_lock::NamespaceLockWrapper::new(
+                rustfs_lock::NamespaceLock::with_local_manager("locked-observation-target".to_owned(), manager.clone()),
+                rustfs_lock::ObjectKey::new(bucket, key),
+                "locked-observation-target".to_owned(),
+            );
+            let wrong = crate::object_api::WriteCommitGuard::acquire(&wrapper, std::time::Duration::from_secs(5))
+                .await
+                .expect("wrong-target real owner");
+            let store = Arc::new(ObservationStore::new(Vec::new(), 0));
+            let result = super::read_config_observation_no_lock(store.clone(), object, 8, &wrong).await;
+            assert_eq!(matches!(result, Err(Error::InvalidArgument(..))), true, "I06L_TARGET_REJECTED");
+            assert_eq!(store.gets.load(Ordering::SeqCst) == 0, true, "I06L_TARGET_REJECTED");
+        }
+        for error in [
+            Error::FileNotFound,
+            Error::ObjectNotFound(RUSTFS_META_BUCKET.to_owned(), object.to_owned()),
+            Error::ErasureReadQuorum,
+        ] {
+            let expected = if error == Error::FileNotFound || matches!(error, Error::ObjectNotFound(..)) {
+                Error::ConfigNotFound
+            } else {
+                error.clone()
+            };
+            let mut fixture = ObservationStore::new(Vec::new(), 0);
+            fixture.error = Some(error);
+            let store = Arc::new(fixture);
+            assert_eq!(
+                super::read_config_observation_no_lock(store.clone(), object, 8, &guard)
+                    .await
+                    .expect_err("typed error"),
+                expected
+            );
+            assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        }
+        let mut fixture = ObservationStore::new(Vec::new(), 0);
+        fixture.stream_error = true;
+        let store = Arc::new(fixture);
+        let err = super::read_config_observation_no_lock(store.clone(), object, 8, &guard)
+            .await
+            .expect_err("stream failure");
+        assert_eq!(err.to_string().contains("observation stream failed"), true, "I06L_TYPED_STREAM_ERROR");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        let store = Arc::new(ObservationStore::new(vec![7; 64], 0));
+        let result = super::read_config_observation_no_lock(store.clone(), object, 8, &guard).await;
+        assert_eq!(matches!(result, Err(Error::CorruptedFormat)), true, "I06L_STREAM_BOUND");
+        assert_eq!(store.consumed.load(Ordering::SeqCst) == 9, true, "I06L_STREAM_BOUND");
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn locked_observation_rejects_actual_owner_loss_before_and_after_read() {
+        let object = "config/observation.bin";
+        for after_read in [false, true] {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let client = Arc::new(RefreshControlledClient::new(manager));
+            let wrapper = rustfs_lock::NamespaceLockWrapper::new(
+                rustfs_lock::NamespaceLock::new("locked-observation-loss".to_owned(), client.clone()),
+                rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, object),
+                "locked-observation-loss".to_owned(),
+            );
+            let guard = crate::object_api::WriteCommitGuard::acquire(&wrapper, std::time::Duration::from_secs(5))
+                .await
+                .expect("real distributed owner");
+            let signal = guard.lock_lost_signal().expect("acquired distributed owner signal");
+            let store = Arc::new(ObservationStore::new(b"raw".to_vec(), 3));
+            if after_read {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                *store.eof_gate.lock().expect("EOF gate") = Some((Some(ready_tx), release_rx));
+                let mut read = Box::pin(super::read_config_observation_no_lock(store.clone(), object, 3, &guard));
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    tokio::select! {
+                        ready = ready_rx => ready.expect("read reached EOF"),
+                        result = &mut read => assert_eq!(false, true, "I06L_LOSS_AFTER_READ: returned before EOF gate: {result:?}"),
+                    }
+                }).await.expect("EOF watchdog");
+                client.reject_refreshes();
+                tokio::time::timeout(std::time::Duration::from_secs(60), signal.notified())
+                    .await
+                    .expect("actual owner loss watchdog");
+                assert_eq!(guard.is_lock_lost(), true, "I06L_LOSS_AFTER_READ");
+                release_tx.send(()).expect("release EOF");
+                let result = tokio::time::timeout(std::time::Duration::from_secs(60), read)
+                    .await
+                    .expect("read watchdog");
+                assert_eq!(
+                    matches!(
+                        result,
+                        Err(Error::NamespaceLockQuorumUnavailable {
+                            mode: "locked_config_observation",
+                            ..
+                        })
+                    ),
+                    true,
+                    "I06L_LOSS_AFTER_READ"
+                );
+                assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+            } else {
+                client.reject_refreshes();
+                tokio::time::timeout(std::time::Duration::from_secs(60), signal.notified())
+                    .await
+                    .expect("actual owner loss watchdog");
+                assert_eq!(guard.is_lock_lost(), true, "I06L_LOSS_BEFORE_GET");
+                let result = super::read_config_observation_no_lock(store.clone(), object, 3, &guard).await;
+                assert_eq!(
+                    matches!(
+                        result,
+                        Err(Error::NamespaceLockQuorumUnavailable {
+                            mode: "locked_config_observation",
+                            ..
+                        })
+                    ),
+                    true,
+                    "I06L_LOSS_BEFORE_GET"
+                );
+                assert_eq!(store.gets.load(Ordering::SeqCst) == 0, true, "I06L_LOSS_BEFORE_GET");
+            }
+            assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         }
     }
 
