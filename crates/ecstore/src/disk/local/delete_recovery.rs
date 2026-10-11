@@ -642,16 +642,20 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
         }
         commit_data_safe = current_digest == journal.original_digest || current_digest == journal.target_digest;
         if current_digest != journal.original_digest && current_digest != journal.target_digest {
-            commit_data_safe = current_meta.as_ref().is_some_and(|meta| {
-                meta.get_data_dirs()
-                    .is_ok_and(|dirs| !dirs.into_iter().flatten().any(|dir| journal.data_dirs.contains(&dir)))
-                    && !meta.versions.iter().any(|version| {
-                        version
-                            .header
-                            .version_id
-                            .is_some_and(|id| !id.is_nil() && journal.deleted_versions.contains(&id))
-                    })
-            });
+            // A later certified delete can remove the remaining metadata of
+            // this committed version delete. Absence has no live references,
+            // but cannot itself authorize an undecided transaction.
+            commit_data_safe = (committed && current.is_none())
+                || current_meta.as_ref().is_some_and(|meta| {
+                    meta.get_data_dirs()
+                        .is_ok_and(|dirs| !dirs.into_iter().flatten().any(|dir| journal.data_dirs.contains(&dir)))
+                        && !meta.versions.iter().any(|version| {
+                            version
+                                .header
+                                .version_id
+                                .is_some_and(|id| !id.is_nil() && journal.deleted_versions.contains(&id))
+                        })
+                });
         }
     }
     let state = if journal.is_some() {
@@ -1341,12 +1345,40 @@ impl LocalDisk {
             return Err(DiskError::OutdatedXLMeta);
         }
         if let DeleteRecoveryAction::AdoptCommit { authority } = &action {
-            if observed.state != DeleteRecoveryState::Absent
-                || authority.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            if authority.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
                 || authority.volume != volume
                 || authority.object != object
                 || authority.transaction != transaction
             {
+                return Err(DiskError::OutdatedXLMeta);
+            }
+            if observed.state == DeleteRecoveryState::NewPrepared {
+                let local = observed.journal.as_ref().ok_or(DiskError::FileCorrupt)?;
+                if observed.current_digest.is_some() || !local.matches_prepared_authority(authority) {
+                    return Err(DiskError::OutdatedXLMeta);
+                }
+                // The coordinator supplies an inspected same-transaction
+                // receipt. Retain this drive's immutable hashes, data dirs and
+                // causal history when completing its partial publication.
+                let root = self.io_get_object_path(volume, object)?;
+                let receipt = CommitReceipt {
+                    journal: local.clone(),
+                    finished: false,
+                };
+                write_delete_rollback_file(
+                    self.io_root(),
+                    volume,
+                    &root,
+                    transaction,
+                    DELETE_QUORUM_COMMITTED_FILE,
+                    &serde_json::to_vec(&receipt)?,
+                    owner.clone(),
+                )
+                .await?;
+                self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
+                return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
+            }
+            if observed.state != DeleteRecoveryState::Absent {
                 return Err(DiskError::OutdatedXLMeta);
             }
             if observed.current_digest.is_none() {
@@ -3238,6 +3270,205 @@ mod tests {
             .expect("finish cleanup of an exactly restored versioned generation");
         assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.unwrap(), original);
         assert!(!rollback.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_absent_remaining_metadata_requires_existing_commit_receipt() {
+        let (_temp, disk, info, original) = fixture().await;
+        let mut remaining = info;
+        remaining.version_id = Some(Uuid::new_v4());
+        remaining.mod_time = remaining.mod_time.map(|time| time + time::Duration::seconds(1));
+        let mut metadata = FileMeta::load(&original).unwrap();
+        metadata.add_version(remaining).unwrap();
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        fs::write(root.join(STORAGE_FORMAT_FILE), metadata.marshal_msg().unwrap())
+            .await
+            .unwrap();
+        let transaction = Uuid::new_v4();
+        let applied = apply(&disk, transaction).await;
+        assert!(applied.journal.as_ref().unwrap().target_digest.is_some());
+        let rollback = root.join(transaction.to_string());
+        fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+        let undecided = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .unwrap();
+        assert_eq!(undecided.state, DeleteRecoveryState::NewPrepared);
+        assert!(
+            !undecided.commit_data_safe,
+            "absence cannot authorize a target-Some undecided transaction"
+        );
+        assert!(matches!(
+            disk.settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                undecided.fingerprint,
+                DeleteRecoveryAction::PublishCommit
+            )
+            .await,
+            Err(DiskError::OutdatedXLMeta)
+        ));
+        assert!(rollback.join(PREPARED).is_file());
+        assert!(rollback.join(STORAGE_FORMAT_FILE_BACKUP).is_file());
+        assert!(!rollback.join(DELETE_QUORUM_COMMITTED_FILE).exists());
+        fs::copy(rollback.join(TARGET), root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+        let applied = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .unwrap();
+        disk.settle_delete_transaction(
+            "recovery",
+            "object",
+            transaction,
+            applied.fingerprint,
+            DeleteRecoveryAction::PublishCommit,
+        )
+        .await
+        .unwrap();
+        fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+        let certified = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .unwrap();
+        assert_eq!(certified.state, DeleteRecoveryState::QuorumCommitted);
+        assert!(certified.commit_data_safe);
+        let finished = disk
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                certified.fingerprint,
+                DeleteRecoveryAction::FinishCommit,
+            )
+            .await
+            .expect("certified obsolete version cleanup has no live metadata references");
+        assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+        assert!(
+            !root.join(STORAGE_FORMAT_FILE).exists(),
+            "cleanup must never republish the old remaining version"
+        );
+        assert!(
+            rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file(),
+            "set-wide GC still owns the final witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_partial_publication_adopts_same_intent_without_replacing_local_journal() {
+        let (_temp, disk, mut original, _) = fixture().await;
+        let (_peer_temp, peer, _, _) = fixture().await;
+        let mut remaining = original.clone();
+        remaining.version_id = Some(Uuid::new_v4());
+        remaining.mod_time = remaining.mod_time.map(|time| time + time::Duration::seconds(1));
+        for (index, target) in [(1, &disk), (2, &peer)] {
+            original.erasure.index = index;
+            remaining.erasure.index = index;
+            let mut metadata = FileMeta::load(&test_meta(original.clone())).unwrap();
+            metadata.add_version(remaining.clone()).unwrap();
+            fs::write(
+                target.io_get_object_path("recovery", "object/xl.meta").unwrap(),
+                metadata.marshal_msg().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let transaction = Uuid::new_v4();
+        let local = apply(&disk, transaction).await;
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        let rollback = root.join(transaction.to_string());
+        let prepared = fs::read(rollback.join(PREPARED)).await.unwrap();
+        let target = fs::read(rollback.join(TARGET)).await.unwrap();
+        fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+        let applied = apply(&peer, transaction).await;
+        let committed = peer
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                applied.fingerprint,
+                DeleteRecoveryAction::PublishCommit,
+            )
+            .await
+            .unwrap();
+        let authority = committed.journal.unwrap();
+        assert_ne!(
+            local.journal.as_ref().unwrap().original_digest,
+            authority.original_digest,
+            "each drive owns distinct raw metadata"
+        );
+        let mut invalid = Vec::new();
+        let mut changed = authority.clone();
+        changed.bucket_incarnation = Some(Uuid::new_v4());
+        invalid.push(changed);
+        let mut changed = authority.clone();
+        changed.deleted_versions.push(Uuid::new_v4());
+        invalid.push(changed);
+        let mut changed = authority.clone();
+        changed.requests[0].version_id = Some(Uuid::new_v4());
+        invalid.push(changed);
+        let mut changed = authority.clone();
+        changed
+            .original_versions
+            .iter_mut()
+            .find(|version| version.version_id.unwrap_or_default().is_nil())
+            .unwrap()
+            .metadata_digest[0] ^= 1;
+        invalid.push(changed);
+        for authority in invalid {
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .unwrap();
+            assert!(matches!(
+                disk.settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    observed.fingerprint,
+                    DeleteRecoveryAction::AdoptCommit {
+                        authority: Box::new(authority)
+                    }
+                )
+                .await,
+                Err(DiskError::OutdatedXLMeta)
+            ));
+            assert!(!rollback.join(DELETE_QUORUM_COMMITTED_FILE).exists());
+        }
+        let observed = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .unwrap();
+        assert!(!observed.commit_data_safe);
+        let adopted = disk
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                observed.fingerprint,
+                DeleteRecoveryAction::AdoptCommit {
+                    authority: Box::new(authority),
+                },
+            )
+            .await
+            .expect("same-T certified intent completes partial publication");
+        assert_eq!(
+            adopted.journal, local.journal,
+            "receipt preserves local hashes and data-directory ownership"
+        );
+        assert_eq!(fs::read(rollback.join(PREPARED)).await.unwrap(), prepared);
+        assert_eq!(fs::read(rollback.join(TARGET)).await.unwrap(), target);
+        disk.settle_delete_transaction(
+            "recovery",
+            "object",
+            transaction,
+            adopted.fingerprint,
+            DeleteRecoveryAction::FinishCommit,
+        )
+        .await
+        .unwrap();
+        assert!(!root.join(STORAGE_FORMAT_FILE).exists());
+        assert!(rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file());
     }
 
     #[cfg(unix)]

@@ -597,12 +597,21 @@ impl SetDisks {
                         .any(|journal| journal.predecessors.contains(&authority.transaction))
                 });
             if authority.is_some() || covered || fresh_absence_decision {
+                let certified_same_transaction = authority.is_some();
                 let reference = authority
                     .or_else(|| copies.iter().find_map(|state| state.journal.clone()))
                     .ok_or(DiskError::FileCorrupt)?;
                 if dry_run {
                     if copies.iter().any(|copy| {
-                        if copy.state == DeleteRecoveryState::Absent {
+                        if certified_same_transaction
+                            && copy.state == DeleteRecoveryState::NewPrepared
+                            && copy.current_digest.is_none()
+                            && !copy.commit_data_safe
+                        {
+                            copy.journal
+                                .as_ref()
+                                .is_none_or(|local| !local.matches_prepared_authority(&reference))
+                        } else if copy.state == DeleteRecoveryState::Absent {
                             copy.current_digest.is_some()
                                 && !reference.requests.iter().all(|request| {
                                     if request.deleted && request.mark_deleted {
@@ -635,13 +644,20 @@ impl SetDisks {
                     bucket,
                     copies,
                     |copy| {
-                        Some(if copy.state == DeleteRecoveryState::Absent {
-                            DeleteRecoveryAction::AdoptCommit {
-                                authority: Box::new(reference.clone()),
-                            }
-                        } else {
-                            DeleteRecoveryAction::PublishCommit
-                        })
+                        Some(
+                            if copy.state == DeleteRecoveryState::Absent
+                                || (certified_same_transaction
+                                    && copy.state == DeleteRecoveryState::NewPrepared
+                                    && copy.current_digest.is_none()
+                                    && !copy.commit_data_safe)
+                            {
+                                DeleteRecoveryAction::AdoptCommit {
+                                    authority: Box::new(reference.clone()),
+                                }
+                            } else {
+                                DeleteRecoveryAction::PublishCommit
+                            },
+                        )
                     },
                     can_commit,
                     namespace_owner.as_ref(),
@@ -1400,6 +1416,138 @@ mod tests {
         assert!(!unavailable(&DiskError::other("invalid journal containing connection refused")));
         assert!(!unavailable(&DiskError::from(tonic::Status::internal("connection refused"))));
         assert!(!unavailable(&DiskError::other("bucket unavailable-logs has corrupt metadata")));
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_chained_committed_versions_finish_after_current_metadata_disappears() {
+        let bucket = "recover-chained-versions";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        let first = put(&store, bucket, &vec![61; 1024 * 1024], true)
+            .await
+            .expect("first version");
+        let second = put(&store, bucket, &vec![62; 4096], true).await.expect("second version");
+        let set = &store.pools[0].disk_set[0];
+        set.disks.write().await[3] = None;
+        for version in [first, second] {
+            store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("commit each explicit version at quorum while peer is absent");
+        }
+        assert!(
+            store
+                .get_object_info(bucket, "object", &ObjectOptions::default())
+                .await
+                .is_err()
+        );
+        set.disks.write().await[3] = Some(disks[3].clone());
+        let report = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("older certified target may be superseded by a later certified absence");
+        assert!(
+            report.detail.contains("committed=2"),
+            "both retained decisions must converge: {}",
+            report.detail
+        );
+        for version in [first, second] {
+            assert!(
+                store
+                    .get_object_info(
+                        bucket,
+                        "object",
+                        &ObjectOptions {
+                            version_id: Some(version.to_string()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "certified cleanup must not resurrect either deleted version"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("no retained version decision may keep the empty bucket nonempty");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_partial_receipt_converges_after_later_version_absence() {
+        let bucket = "recover-partial-chained-versions";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let first = put(&store, bucket, &vec![63; 1024 * 1024], true)
+            .await
+            .expect("first version");
+        let second = put(&store, bucket, &vec![64; 4096], true).await.expect("second version");
+        let transaction = applied(&store, &disks, bucket, Some(first), 4).await;
+        // A crash after the first durable decision leaves other copies prepared.
+        publish(&disks[0], bucket, transaction).await;
+        let later = applied(&store, &disks, bucket, Some(second), 4).await;
+        publish(&disks[0], bucket, later).await;
+        let dry = store
+            .recover_delete_transactions(
+                bucket,
+                &HealOpts {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dry-run uses the same certified prepared-copy authority");
+        assert!(
+            dry.detail.contains("committed=2") && dry.detail.contains("blocked=0"),
+            "accurate dry-run: {}",
+            dry.detail
+        );
+        for dir in &dirs {
+            for id in [transaction, later] {
+                assert!(
+                    dir.path()
+                        .join(bucket)
+                        .join("object")
+                        .join(id.to_string())
+                        .join("delete-prepared")
+                        .exists(),
+                    "dry-run must retain every preparation record"
+                );
+            }
+        }
+        store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("same-transaction receipt certifies each prepared absent copy");
+        for dir in &dirs {
+            assert!(!dir.path().join(bucket).join("object").exists(), "all related proof must converge");
+        }
+        for version in [first, second] {
+            assert!(
+                store
+                    .get_object_info(
+                        bucket,
+                        "object",
+                        &ObjectOptions {
+                            version_id: Some(version.to_string()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "no erased version may be recreated by receipt adoption"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("non-force bucket removal");
     }
 
     #[tokio::test]

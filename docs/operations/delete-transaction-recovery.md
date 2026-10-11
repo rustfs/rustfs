@@ -33,7 +33,10 @@ blocked with its backup intact.
 A disk-local `delete-data.<T>` marker does not prove an erasure-set decision.
 Returning drives cannot restore stale data after a certified deletion. Commit
 receipts remain until every participant and related transaction for the key
-has converged. Cross-transaction null-version supersession also requires causal
+has converged. For consecutive certified version deletions, an older decision
+can finish its own data cleanup after later deletion removes current metadata.
+A prepared copy needs a matching same-transaction decision before promotion;
+absence alone cannot certify it. Cross-transaction null-version supersession also requires causal
 predecessor evidence; timestamps alone cannot authorize it. Cleanup respects active snapshots and removes only validated
 transaction files, with directory removal performed nonrecursively.
 

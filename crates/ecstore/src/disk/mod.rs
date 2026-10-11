@@ -1889,6 +1889,55 @@ pub struct DeleteRecoveryJournal {
     pub predecessors: Vec<Uuid>,
 }
 
+impl DeleteRecoveryJournal {
+    /// Matches immutable local preparation intent against an independently
+    /// inspected same-transaction commit receipt. This match is not authority
+    /// by itself; the coordinator must supply the certified receipt.
+    pub(crate) fn matches_prepared_authority(&self, authority: &Self) -> bool {
+        if self.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || authority.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || self.transaction.is_nil()
+            || self.transaction != authority.transaction
+            || self.volume != authority.volume
+            || self.object != authority.object
+            || self.bucket_incarnation != authority.bucket_incarnation
+            || self.bucket_incarnation.is_some_and(|id| id.is_nil())
+            || self.requests.is_empty()
+            || self.requests != authority.requests
+            || self.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+                != authority.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+        {
+            return false;
+        }
+        let sources: std::collections::HashMap<_, _> = self
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        let certified: std::collections::HashMap<_, _> = authority
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        if sources.len() != self.original_versions.len() || certified.len() != authority.original_versions.len() {
+            return false;
+        }
+        self.requests.iter().all(|request| {
+            let (local, remote) = if request.deleted && request.mark_deleted {
+                (self.original_versions.first(), authority.original_versions.first())
+            } else {
+                let id = request.version_id.unwrap_or_default();
+                (sources.get(&id).copied(), certified.get(&id).copied())
+            };
+            match (local, remote) {
+                (Some(local), Some(remote)) => local == remote,
+                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                _ => false,
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRecoveryVersionIdentity {
