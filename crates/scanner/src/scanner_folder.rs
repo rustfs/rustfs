@@ -3066,6 +3066,13 @@ pub(crate) async fn scan_data_folder_scoped(
             }
             if matches!(&e, ScannerError::Io(io) if io.kind() == ErrorKind::NotFound) {
                 let mut partial_cache = scanner.old_cache;
+                // An empty input still needs a root for the non-publishable
+                // partial result; retain nonempty durable caches unchanged.
+                if partial_cache.cache.is_empty() {
+                    partial_cache
+                        .cache
+                        .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
+                }
                 partial_cache.info.last_update = Some(SystemTime::now());
                 partial_cache.info.next_cycle = next_cycle;
                 partial_cache.info.snapshot_complete = false;

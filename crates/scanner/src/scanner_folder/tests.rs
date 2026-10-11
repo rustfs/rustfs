@@ -3395,6 +3395,62 @@ async fn scan_data_folder_missing_scan_root_returns_partial() {
 
 #[tokio::test]
 #[serial]
+async fn scan_data_folder_missing_scan_root_preserves_disconnected_durable_cache() {
+    let (scanner, temp_dir) = build_test_scanner().await;
+    tokio::fs::remove_dir_all(&temp_dir).await.expect("remove scanner root");
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "missing-bucket".to_string(),
+            next_cycle: 9,
+            snapshot_complete: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let orphan = hash_path("missing-bucket/orphan");
+    cache.cache.insert(
+        orphan.0.clone(),
+        DataUsageEntry {
+            objects: 7,
+            size: 70,
+            ..Default::default()
+        },
+    );
+    let retained_key_ptr = cache.cache.keys().next().expect("durable orphan key").as_ptr();
+    let result = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![scanner.local_disk.clone()],
+        scanner.local_disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+    let partial = match result {
+        Err(ScannerError::NamespaceNotFoundCache(partial)) => partial,
+        other => panic!("missing namespace must remain incomplete, got {other:?}"),
+    };
+    assert!(!partial.info.snapshot_complete);
+    assert_eq!(partial.info.next_cycle, 9);
+    assert_eq!(partial.cache.len(), 1);
+    assert_eq!(partial.cache.keys().next().expect("retained orphan key").as_ptr(), retained_key_ptr);
+    assert!(
+        partial.root().is_none(),
+        "a disconnected durable cache must not gain an invented zero root"
+    );
+    assert!(partial.checked_flatten_complete_scope("missing-bucket").is_none());
+    assert_eq!((partial.cache[&orphan.0].objects, partial.cache[&orphan.0].size), (7, 70));
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folders() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
