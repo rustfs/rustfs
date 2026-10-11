@@ -1120,6 +1120,12 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        // Metadata persistence re-enters native PUT/GET. Keep its full state
+        // out of the tracing wrapper's poll frame on bounded runtime stacks.
+        Box::pin(self.handle_make_bucket_inner(bucket, opts)).await
+    }
+
+    async fn handle_make_bucket_inner(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if !is_meta_bucketname(bucket)
             && let Err(err) = check_valid_bucket_name_strict(bucket)
         {
