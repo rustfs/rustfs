@@ -1649,15 +1649,39 @@ impl BucketMetadataSys {
     }
 
     pub(crate) async fn pending_bucket_creation(&self, bucket: &str) -> Option<PendingBucketCreationProof> {
-        self.pending_bucket_creations.read().await.get(bucket).cloned()
+        let observed = self.pending_bucket_creations.read().await.get(bucket).cloned();
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-") {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=pending-read present={} map={:p}",
+                observed.is_some(),
+                Arc::as_ptr(&self.pending_bucket_creations)
+            );
+        }
+        observed
     }
 
     pub(crate) async fn grant_pending_bucket_creation(&self, bucket: &str, proof: PendingBucketCreationProof) {
         self.pending_bucket_creations.write().await.insert(bucket.to_owned(), proof);
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-") {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=pending-inserted map={:p}",
+                Arc::as_ptr(&self.pending_bucket_creations)
+            );
+        }
     }
 
     pub(crate) async fn revoke_pending_bucket_creation(&self, bucket: &str) {
-        self.pending_bucket_creations.write().await.remove(bucket);
+        self.pending_bucket_creations.write().await.remove(bucket).inspect(|_| {
+            #[cfg(test)]
+            if bucket.starts_with("real-guard-loss-") {
+                eprintln!(
+                    "[creation-proof-diag] bucket={bucket} stage=pending-removed-by-revoke map={:p}",
+                    Arc::as_ptr(&self.pending_bucket_creations)
+                );
+            }
+        });
     }
 
     pub(crate) async fn consume_pending_bucket_creation(

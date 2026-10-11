@@ -1544,6 +1544,10 @@ impl NativePublicationRegistration {
             || !matches!(Path::new(bucket).components().next(), Some(Component::Normal(_)))
             || Path::new(bucket).components().count() != 1
         {
+            #[cfg(test)]
+            if bucket.starts_with("real-guard-loss-") {
+                eprintln!("[creation-proof-diag] bucket={bucket} stage=native-input-rejected");
+            }
             return None;
         }
         let witness = NativeBucketCreationWitness {
@@ -1567,6 +1571,15 @@ impl NativeBucketCreationWitness {
     fn physical_root_is_current(&self) -> bool {
         let root = native_root_identity(&self.registration.root);
         let io_root = native_root_identity(&self.registration.io_root);
+        #[cfg(test)]
+        if self.bucket.starts_with("real-guard-loss-") {
+            eprintln!(
+                "[creation-proof-diag] bucket={} stage=native-physical-root expected={:?} observed_root={root:?} observed_io_root={io_root:?} backend={:p}",
+                self.bucket,
+                self.registration.identity,
+                Arc::as_ptr(&self.backend)
+            );
+        }
         if root == Some(self.registration.identity) && io_root == Some(self.registration.identity) {
             return true;
         }
@@ -1579,10 +1592,29 @@ impl NativeBucketCreationWitness {
     }
 
     fn valid_in(&self, history: &NativePublicationHistory) -> bool {
-        history
-            .roots
-            .get(&self.registration.identity)
-            .is_some_and(|root| !root.unknown && !root.started.contains(&self.bucket))
+        let Some(root) = history.roots.get(&self.registration.identity) else {
+            #[cfg(test)]
+            if self.bucket.starts_with("real-guard-loss-") {
+                eprintln!("[creation-proof-diag] bucket={} stage=native-history-missing", self.bucket);
+            }
+            return false;
+        };
+        let known = !root.unknown;
+        #[cfg(test)]
+        if self.bucket.starts_with("real-guard-loss-") {
+            eprintln!("[creation-proof-diag] bucket={} stage=native-history-known known={known}", self.bucket);
+        }
+        known && {
+            let unstarted = !root.started.contains(&self.bucket);
+            #[cfg(test)]
+            if self.bucket.starts_with("real-guard-loss-") {
+                eprintln!(
+                    "[creation-proof-diag] bucket={} stage=native-history-unstarted unstarted={unstarted}",
+                    self.bucket
+                );
+            }
+            unstarted
+        }
     }
 }
 

@@ -10830,9 +10830,27 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
         let Some(history) = self.publication_history.as_ref() else {
+            #[cfg(test)]
+            if volume.starts_with("real-guard-loss-") {
+                eprintln!("[creation-proof-diag] bucket={volume} stage=local-history-unavailable");
+            }
             return Ok(None);
         };
-        let Some(disk_id) = self.get_disk_id().await? else {
+        let observed = self.get_disk_id().await;
+        #[cfg(test)]
+        if volume.starts_with("real-guard-loss-")
+            && let Err(error) = &observed
+        {
+            eprintln!(
+                "[creation-proof-diag] bucket={volume} stage=local-disk-id-error discriminant={:?}",
+                std::mem::discriminant(error)
+            );
+        }
+        let Some(disk_id) = observed? else {
+            #[cfg(test)]
+            if volume.starts_with("real-guard-loss-") {
+                eprintln!("[creation-proof-diag] bucket={volume} stage=local-disk-id-unavailable");
+            }
             return Ok(None);
         };
         Ok(history.witness(volume, disk_id, Arc::clone(&self.io_backend)))

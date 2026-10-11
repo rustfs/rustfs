@@ -468,14 +468,51 @@ impl ECStore {
         for (_, _, set) in self.bucket_sets() {
             let disks = set.disks.read().await.clone();
             if disks.is_empty() {
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-") {
+                    eprintln!("[creation-proof-diag] bucket={bucket} stage=native-empty-set");
+                }
                 return None;
             }
             for disk in disks {
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-") && disk.is_none() {
+                    eprintln!("[creation-proof-diag] bucket={bucket} stage=native-missing-disk");
+                }
                 let disk = disk?;
-                if !matches!(disk.stat_volume(bucket).await, Err(DiskError::VolumeNotFound)) {
+                let volume_absent = {
+                    let observed = disk.stat_volume(bucket).await;
+                    #[cfg(test)]
+                    if bucket.starts_with("real-guard-loss-") {
+                        match &observed {
+                            Ok(_) => eprintln!("[creation-proof-diag] bucket={bucket} stage=native-volume-present"),
+                            Err(error) if !matches!(error, DiskError::VolumeNotFound) => eprintln!(
+                                "[creation-proof-diag] bucket={bucket} stage=native-stat-error faulty_disk={} discriminant={:?}",
+                                matches!(error, DiskError::FaultyDisk),
+                                std::mem::discriminant(error)
+                            ),
+                            Err(_) => {}
+                        }
+                    }
+                    matches!(observed, Err(DiskError::VolumeNotFound))
+                };
+                if !volume_absent {
                     return None;
                 }
-                witnesses.push(disk.bucket_creation_witness(bucket).await.ok()??);
+                let observed = disk.bucket_creation_witness(bucket).await;
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-") {
+                    match &observed {
+                        Err(error) => eprintln!(
+                            "[creation-proof-diag] bucket={bucket} stage=native-witness-error faulty_disk={} discriminant={:?}",
+                            matches!(error, DiskError::FaultyDisk),
+                            std::mem::discriminant(error)
+                        ),
+                        Ok(None) => eprintln!("[creation-proof-diag] bucket={bucket} stage=native-witness-none"),
+                        Ok(Some(_)) => {}
+                    }
+                }
+                witnesses.push(observed.ok()??);
             }
         }
         crate::disk::os::validate_native_creation_witnesses(&witnesses).then_some(witnesses)
@@ -492,29 +529,95 @@ impl ECStore {
     where
         F: Fn() -> bool + Send,
     {
-        let after = self.native_creation_witnesses(bucket).await?;
+        let after = self.native_creation_witnesses(bucket).await;
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-") {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=after-witness-result available={}",
+                after.is_some()
+            );
+        }
+        let after = after?;
         if before.len() != after.len() || !before.iter().zip(&after).all(|(old, current)| old.matches(current)) {
+            #[cfg(test)]
+            if bucket.starts_with("real-guard-loss-") {
+                eprintln!("[creation-proof-diag] bucket={bucket} stage=witness-pair-rejected");
+            }
             return None;
         }
-        let (persisted, present) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket)
-            .await
-            .ok()?;
+        let loaded = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await;
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-")
+            && let Err(error) = &loaded
+        {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=metadata-load-error discriminant={:?}",
+                std::mem::discriminant(error)
+            );
+        }
+        let (persisted, present) = loaded.ok()?;
         let mut expected = metadata.clone();
         expected.bucket_creation_committed = false;
         expected.bucket_creation_commit_record_present = true;
         expected.bucket_incarnation_sidecar = true;
         expected.default_timestamps();
-        let intent = persisted.marshal_msg().ok()?;
+        let encoded = persisted.marshal_msg();
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-")
+            && let Err(error) = &encoded
+        {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=persisted-encode-error discriminant={:?}",
+                std::mem::discriminant(error)
+            );
+        }
+        let intent = encoded.ok()?;
         if !present
             || persisted.bucket_creation_committed
             || !persisted.bucket_incarnation_sidecar
-            || intent != expected.marshal_msg().ok()?
+            || intent != {
+                let encoded = expected.marshal_msg();
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-")
+                    && let Err(error) = &encoded
+                {
+                    eprintln!(
+                        "[creation-proof-diag] bucket={bucket} stage=expected-encode-error discriminant={:?}",
+                        std::mem::discriminant(error)
+                    );
+                }
+                encoded.ok()?
+            }
         {
+            #[cfg(test)]
+            if bucket.starts_with("real-guard-loss-") {
+                eprintln!(
+                    "[creation-proof-diag] bucket={bucket} stage=metadata-shape-or-intent-rejected present={present} committed={} sidecar={}",
+                    persisted.bucket_creation_committed, persisted.bucket_incarnation_sidecar
+                );
+            }
             return None;
         }
-        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx).ok()?;
+        let system = metadata_sys::require_bucket_metadata_sys_in(&self.ctx);
+        #[cfg(test)]
+        if bucket.starts_with("real-guard-loss-")
+            && let Err(error) = &system
+        {
+            eprintln!(
+                "[creation-proof-diag] bucket={bucket} stage=metadata-system-error discriminant={:?}",
+                std::mem::discriminant(error)
+            );
+        }
+        let sys = system.ok()?;
         let sys = sys.read().await.clone();
-        if !fences_valid() || !crate::disk::os::validate_native_creation_witnesses(&after) {
+        let current_fences_valid = fences_valid();
+        if !current_fences_valid || !crate::disk::os::validate_native_creation_witnesses(&after) {
+            #[cfg(test)]
+            if bucket.starts_with("real-guard-loss-") {
+                eprintln!(
+                    "[creation-proof-diag] bucket={bucket} stage=final-fence-or-history-rejected fences_valid={current_fences_valid}"
+                );
+            }
             return None;
         }
         sys.grant_pending_bucket_creation(
@@ -1336,11 +1439,24 @@ impl ECStore {
                 } else {
                     false
                 };
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-") {
+                    eprintln!(
+                        "[creation-proof-diag] bucket={bucket} stage=prior-intent-observation absent={prior_intent_absent}"
+                    );
+                }
                 let before = if prior_intent_absent {
                     self.native_creation_witnesses(bucket).await
                 } else {
                     None
                 };
+                #[cfg(test)]
+                if bucket.starts_with("real-guard-loss-") {
+                    eprintln!(
+                        "[creation-proof-diag] bucket={bucket} stage=before-witness-result available={}",
+                        before.is_some()
+                    );
+                }
                 await_bucket_lifecycle_operation(
                     bucket_lifecycle_guard.as_ref(),
                     ns_guard.as_ref(),
