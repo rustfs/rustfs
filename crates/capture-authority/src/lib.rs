@@ -37,6 +37,80 @@ impl NativeLogReader {
     }
 }
 
+/// Async native writes and readers sharing one durable Store.
+#[derive(Clone)]
+pub struct NativeLogWriter {
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+    ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeWriteError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("native log writer lock poisoned")]
+    Poisoned,
+    #[error("native log writer worker failed")]
+    Worker(#[source] tokio::task::JoinError),
+}
+
+impl NativeLogWriter {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store: std::sync::Arc::new(std::sync::Mutex::new(store)),
+            ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    pub fn reader(&self) -> NativeLogReader {
+        NativeLogReader {
+            store: self.store.clone(),
+        }
+    }
+
+    async fn write<F>(&self, write: F) -> Result<(), NativeWriteError>
+    where
+        F: FnOnce(&mut Store) -> Result<(), StoreError> + Send + 'static,
+    {
+        // Lock order is ordering then Store. The worker owns the ordering guard
+        // until commit completes, even when its awaiting caller is cancelled.
+        let ordering = self.ordering.clone().lock_owned().await;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ordering = ordering;
+            let mut store = store.lock().map_err(|_| NativeWriteError::Poisoned)?;
+            write(&mut store).map_err(NativeWriteError::Store)
+        })
+        .await
+        .map_err(NativeWriteError::Worker)?
+    }
+
+    pub async fn save_vote(&self, vote: openraft::Vote<u64>) -> Result<(), NativeWriteError> {
+        self.write(move |store| store.save_vote(vote.into())).await
+    }
+
+    pub async fn read_vote(&self) -> Result<Option<openraft::Vote<u64>>, NativeWriteError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| NativeWriteError::Poisoned)?;
+            store
+                .read_vote()
+                .map(|vote| vote.map(Into::into))
+                .map_err(NativeWriteError::Store)
+        })
+        .await
+        .map_err(NativeWriteError::Worker)?
+    }
+
+    pub async fn append_native(&self, entries: Vec<CaptureRaftEntry>) -> Result<(), NativeWriteError> {
+        self.write(move |store| store.append_native(&entries)).await
+    }
+
+    pub async fn truncate_suffix(&self, from: u64) -> Result<(), NativeWriteError> {
+        self.write(move |store| store.truncate_suffix(from)).await
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum NativeReaderError {
     #[error(transparent)]
@@ -528,6 +602,147 @@ mod tests {
             }
             other => panic!("U19_READER_ERROR: unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn u20_vote_durable_roundtrip() {
+        let (_dir, backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        let expected = openraft::Vote::from(vote());
+        u19_runtime().block_on(async {
+            writer.save_vote(expected).await.expect("U20_VOTE_DURABLE save");
+            assert_eq!(writer.read_vote().await.expect("read vote"), Some(expected), "U20_VOTE_DURABLE");
+        });
+        drop(writer);
+        backend.cut();
+        let reopened = Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen vote");
+        assert_eq!(reopened.read_vote().expect("durable vote"), Some(vote()), "U20_VOTE_DURABLE");
+    }
+
+    #[test]
+    fn u20_native_append_reader_visibility() {
+        use openraft::RaftLogReader;
+        let (_dir, backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        let entries = vec![u17a_blank(0), u17a_membership(1).0, u17a_created(2, u17a_command())];
+        let mut reader = writer.reader();
+        u19_runtime().block_on(async {
+            assert!(writer.append_native(entries.clone()).await.is_ok(), "U20_WRITE_SUCCESS");
+            assert_eq!(reader.try_get_log_entries(..).await.expect("shared reader"), entries);
+        });
+        drop(reader);
+        drop(writer);
+        backend.cut();
+        let reopened = Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen entries");
+        assert_eq!(reopened.read_native_range(..).expect("durable entries"), entries);
+    }
+
+    #[test]
+    fn u20_native_truncate_replacement() {
+        use openraft::RaftLogReader;
+        let (_dir, backend, mut store) = u17a_store();
+        let original = vec![u17a_blank(0), u17a_blank(1), u17a_blank(2)];
+        store.append_native(&original).expect("committed fixture entries");
+        store.save_committed(u17a_id(0)).expect("committed prefix");
+        let writer = NativeLogWriter::new(store);
+        let replacement = u17a_created(1, u17a_command());
+        let expected = vec![original[0].clone(), replacement.clone()];
+        u19_runtime().block_on(async {
+            assert!(matches!(
+                writer.truncate_suffix(0).await,
+                Err(NativeWriteError::Store(StoreError::CommittedLogProtected))
+            ));
+            writer.truncate_suffix(1).await.expect("truncate suffix");
+            writer.append_native(vec![replacement]).await.expect("replace suffix");
+            assert_eq!(writer.reader().try_get_log_entries(..).await.expect("replacement reader"), expected);
+        });
+        drop(writer);
+        backend.cut();
+        let reopened = Store::from_database(CrashBackend::new(&backend.path).database(), identity()).expect("reopen replacement");
+        assert_eq!(reopened.read_native_range(..).expect("durable replacement"), expected);
+    }
+
+    #[test]
+    fn u20_worker_thread() {
+        let (_dir, backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        backend.media.lock().expect("media").sync_threads.clear();
+        let executor = std::thread::current().id();
+        u19_runtime().block_on(writer.save_vote(vote().into())).expect("worker vote");
+        let media = backend.media.lock().expect("media");
+        assert!(!media.sync_threads.is_empty(), "U20_WORKER_THREAD no real sync");
+        assert!(media.sync_threads.iter().all(|thread| *thread != executor), "U20_WORKER_THREAD");
+    }
+
+    #[test]
+    fn u20_cancelled_write_stays_serialized() {
+        let (_dir, backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        let (entered, resume) = backend.pause_sync(1, false);
+        u19_runtime().block_on(async {
+            let first_writer = writer.clone();
+            let first = tokio::spawn(async move { first_writer.save_vote(vote().into()).await });
+            tokio::task::spawn_blocking(move || entered.wait())
+                .await
+                .expect("first sync entered");
+            first.abort();
+            assert!(first.await.expect_err("cancel first await").is_cancelled());
+            let held = writer.ordering.try_lock().is_err();
+            let second_writer = writer.clone();
+            let second = tokio::spawn(async move { second_writer.append_native(vec![u17a_blank(0)]).await });
+            tokio::task::yield_now().await;
+            let waiting = !second.is_finished();
+            tokio::task::spawn_blocking(move || resume.wait())
+                .await
+                .expect("release sync");
+            second.await.expect("second task").expect("second commit");
+            assert!(held && waiting, "U20_WRITE_ORDER cancelled caller released ordering");
+            assert_eq!(writer.read_vote().await.expect("first committed vote"), Some(vote().into()));
+        });
+    }
+
+    #[test]
+    fn u20_failed_commit_disables_mutations() {
+        let (_dir, backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        backend.arm(1, false, false);
+        u19_runtime().block_on(async {
+            assert!(
+                matches!(
+                    writer.save_vote(vote().into()).await,
+                    Err(NativeWriteError::Store(StoreError::CommitIndeterminate(_)))
+                ),
+                "U20_WRITE_FAILURE"
+            );
+            assert!(matches!(
+                writer.save_vote(vote().into()).await,
+                Err(NativeWriteError::Store(StoreError::WriteDisabled))
+            ));
+            assert!(matches!(
+                writer.append_native(vec![u17a_blank(0)]).await,
+                Err(NativeWriteError::Store(StoreError::WriteDisabled))
+            ));
+            assert!(matches!(
+                writer.truncate_suffix(0).await,
+                Err(NativeWriteError::Store(StoreError::WriteDisabled))
+            ));
+        });
+    }
+
+    #[test]
+    fn u20_worker_poison_errors() {
+        let (_dir, _backend, store) = u17a_store();
+        let writer = NativeLogWriter::new(store);
+        u19_runtime().block_on(async {
+            assert!(matches!(
+                writer.write(|_| panic!("injected worker panic")).await,
+                Err(NativeWriteError::Worker(_))
+            ));
+            assert!(matches!(writer.save_vote(vote().into()).await, Err(NativeWriteError::Poisoned)));
+            assert!(matches!(writer.append_native(vec![]).await, Err(NativeWriteError::Poisoned)));
+            assert!(matches!(writer.truncate_suffix(0).await, Err(NativeWriteError::Poisoned)));
+            assert!(matches!(writer.read_vote().await, Err(NativeWriteError::Poisoned)));
+        });
     }
 
     #[test]
@@ -1573,6 +1788,7 @@ mod tests {
     }
     #[derive(Debug)]
     struct Media {
+        sync_threads: Vec<std::thread::ThreadId>,
         volatile: Vec<u8>,
         dead: bool,
         syncs: usize,
@@ -1594,6 +1810,7 @@ mod tests {
             Self {
                 path: path.to_owned(),
                 media: Arc::new(Mutex::new(Media {
+                    sync_threads: Vec::new(),
                     volatile: bytes,
                     dead: false,
                     syncs: 0,
@@ -1671,6 +1888,7 @@ mod tests {
                 return Err(io::Error::other("power lost"));
             }
             m.syncs += 1;
+            m.sync_threads.push(std::thread::current().id());
             let fault = m.fault.filter(|(n, _, _)| *n == m.syncs);
             let pause = if m.pause.as_ref().is_some_and(|(n, _, _, _)| *n == m.syncs) {
                 m.pause.take()
