@@ -15,6 +15,7 @@
 use crate::admin::{
     auth::authorize_admin_request,
     router::{AdminOperation, Operation, S3Router},
+    storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
 };
 use crate::server::{
     ADMIN_PREFIX, NativeTlsTransport,
@@ -24,7 +25,6 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::{action::Action, action::AdminAction};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 pub fn register_tls_certificate_routes(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     router.insert(
