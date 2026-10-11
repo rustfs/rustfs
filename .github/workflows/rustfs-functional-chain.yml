@@ -292,6 +292,28 @@ jobs:
             > "${VALIDATION_ROOT}/native-authority-manifest.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
+      - name: Download pinned manager persistence and incarnation evidence
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || inputs.validation_case == 'heal.outcome-counters-and-error-truth' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-manager-native-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-manager-native-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify exact manager native prerequisites before fleet mutation
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || inputs.validation_case == 'heal.outcome-counters-and-error-truth' }}
+        env:
+          VALIDATION_CASE: ${{ inputs.validation_case }}
+        run: |
+          set -euo pipefail
+          MANAGER_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-manager-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${MANAGER_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/manager_fixture.py \
+            --directory "${MANAGER_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --case-id "${VALIDATION_CASE}" > "${VALIDATION_ROOT}/manager-prerequisite-manifest.json"
+          printf 'VALIDATION_HEAL_MANAGER_DIRECTORY=%s\n' "${MANAGER_DIRECTORY}" >> "${GITHUB_ENV}"
+
       - name: Download pinned C10 shared-reference encoder
         if: ${{ inputs.validation_case == 'heal.dangling-and-orphan-safety' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
