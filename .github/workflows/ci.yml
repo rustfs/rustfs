@@ -390,7 +390,9 @@ jobs:
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    # Alternate feature configurations run on main, merge groups, and scheduled
+    # or manual validation; the default workspace remains the PR gate.
+    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -506,7 +508,7 @@ jobs:
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
