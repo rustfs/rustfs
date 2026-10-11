@@ -1092,6 +1092,17 @@ impl ECStore {
         metadata_guard: Option<&rustfs_lock::NamespaceLockGuard>,
         namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
     ) {
+        // Keep nested rollback state off the bucket-creation caller's stored future.
+        Box::pin(self.rollback_failed_bucket_creation_inner(bucket, lifecycle_guard, metadata_guard, namespace_guard)).await;
+    }
+
+    async fn rollback_failed_bucket_creation_inner(
+        &self,
+        bucket: &str,
+        lifecycle_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+        metadata_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+        namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    ) {
         let rollback_result = await_bucket_lifecycle_operation(
             lifecycle_guard,
             namespace_guard,
