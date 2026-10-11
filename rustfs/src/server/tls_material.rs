@@ -26,13 +26,13 @@ use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
     DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_RUSTFS_EXTRA_CA_CERT,
     ENV_SERVER_MTLS_ENABLE, ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA,
-    ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME,
-    RUSTFS_TLS_CERT,
+    ENV_TRUST_SYSTEM_CA, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME,
 };
-use rustfs_tls_runtime::{
-    ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource, WebPkiClientVerifierOptions,
-    build_webpki_client_verifier, create_multi_cert_resolver,
-};
+#[cfg(test)]
+use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME};
+use rustfs_tls_runtime::{ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource, create_multi_cert_resolver};
+#[cfg(test)]
+use rustfs_tls_runtime::{WebPkiClientVerifierOptions, build_webpki_client_verifier};
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -76,9 +76,17 @@ pub async fn load_tls_material(tls_path: &str) -> Result<rustfs_tls_runtime::Tls
     }
 
     let tls_source = TlsSource::from_directory(tls_path);
-    let mut snapshot = rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source)
-        .await
-        .map_err(map_runtime_tls_error)?;
+    let mut snapshot = tokio::task::spawn_blocking(move || {
+        let overlay = super::tls_publish::configured_server_directory(&tls_source.base_dir.to_string_lossy())
+            .map_err(|_| TlsMaterialError::Io("invalid certificate publication source".into()))?;
+        rustfs_tls_runtime::TlsMaterialSnapshot::load_from_snapshot_with_server_directory(
+            &tls_source.snapshot().map_err(map_runtime_tls_error)?,
+            overlay.as_deref(),
+        )
+        .map_err(map_runtime_tls_error)
+    })
+    .await
+    .map_err(|_| TlsMaterialError::Io("TLS material loader failed".into()))??;
 
     enrich_outbound(&mut snapshot).await?;
 
@@ -90,6 +98,7 @@ pub async fn load_tls_material(tls_path: &str) -> Result<rustfs_tls_runtime::Tls
 /// Takes the server material already loaded by `load_tls_material` and constructs
 /// the `rustls::ServerConfig` without any additional disk reads (except the mTLS
 /// client CA verifier, which reads the client CA cert from disk).
+#[cfg(test)]
 pub(crate) async fn build_acceptor_from_loaded(
     server: Option<RuntimeServerTlsMaterial>,
     tls_dir: &Path,
@@ -173,7 +182,7 @@ fn build_acceptor_with_verifier(
     }
 }
 
-#[cfg(feature = "http3")]
+#[cfg(all(test, feature = "http3"))]
 pub(crate) async fn build_http3_server_config_from_loaded(
     server: Option<&RuntimeServerTlsMaterial>,
     tls_dir: &Path,
@@ -719,6 +728,7 @@ impl TlsAcceptorHolder {
 }
 
 // Build both configurations before publishing either listener's new certificate.
+#[cfg(all(test, feature = "http3"))]
 async fn reload_acceptors(
     server: Option<RuntimeServerTlsMaterial>,
     tls_dir: &Path,
@@ -776,6 +786,32 @@ struct ReloadGroup {
 // Lock order is registry, then group state, then acceptor. Neither guard crosses an await.
 static RELOAD_GROUPS: LazyLock<Mutex<HashMap<String, Weak<ReloadGroup>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub(crate) fn observed_server_snapshot(tls_path: &str) -> Option<Arc<rustfs_tls_runtime::TlsMaterialSnapshot>> {
+    let registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    let group = registry.get(tls_path)?.upgrade()?;
+    let state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+    (!state.targets.is_empty()).then(|| state.accepted.clone())
+}
+
+/// Resolve the source actually registered by listener configuration, including CLI overrides.
+pub(crate) fn active_server_tls_path() -> Option<String> {
+    let registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut paths = registry.iter().filter_map(|(path, group)| {
+        let group = group.upgrade()?;
+        let state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+        (!state.targets.is_empty()).then(|| path.clone())
+    });
+    let path = paths.next()?;
+    paths.next().is_none().then_some(path)
+}
+
+pub(crate) fn notify_server_publication(tls_path: &str) {
+    let registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(group) = registry.get(tls_path).and_then(Weak::upgrade) {
+        group.changed.notify_one();
+    }
+}
+
 struct ReloadRegistration {
     group: Arc<ReloadGroup>,
     id: u64,
@@ -804,34 +840,38 @@ fn server_names(server: &Option<RuntimeServerTlsMaterial>) -> Result<BTreeMap<St
     };
     let mut selectors = BTreeMap::new();
     for (selector, chain) in chains {
-        let mut names = BTreeSet::new();
         let leaf = chain
             .first()
             .ok_or_else(|| TlsMaterialError::Parse("empty certificate chain".into()))?;
-        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
-            .map_err(|e| TlsMaterialError::Parse(format!("invalid certificate: {e}")))?;
-        if let Some(san) = parsed
-            .subject_alternative_name()
-            .map_err(|e| TlsMaterialError::Parse(format!("invalid SAN: {e}")))?
-        {
-            for name in &san.value.general_names {
-                match name {
-                    x509_parser::extensions::GeneralName::DNSName(name) => {
-                        names.insert(format!("dns:{}", name.to_ascii_lowercase()));
-                    }
-                    x509_parser::extensions::GeneralName::IPAddress(bytes) => {
-                        names.insert(format!("ip:{bytes:?}"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        selectors.insert(selector.to_string(), names);
+        selectors.insert(selector.to_string(), certificate_names(leaf)?);
     }
     Ok(selectors)
 }
 
-fn validate_candidate_replacement(
+pub(crate) fn certificate_names(leaf: &CertificateDer<'_>) -> Result<BTreeSet<String>, TlsMaterialError> {
+    let mut names = BTreeSet::new();
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|e| TlsMaterialError::Parse(format!("invalid certificate: {e}")))?;
+    if let Some(san) = parsed
+        .subject_alternative_name()
+        .map_err(|e| TlsMaterialError::Parse(format!("invalid SAN: {e}")))?
+    {
+        for name in &san.value.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(name) => {
+                    names.insert(format!("dns:{}", name.to_ascii_lowercase()));
+                }
+                x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                    names.insert(format!("ip:{bytes:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(names)
+}
+
+pub(crate) fn validate_candidate_replacement(
     accepted: &rustfs_tls_runtime::TlsMaterialSnapshot,
     candidate: &rustfs_tls_runtime::TlsMaterialSnapshot,
 ) -> Result<(), TlsMaterialError> {
@@ -1015,6 +1055,7 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
 mod tests {
     use super::*;
     use rcgen::CertifiedKey;
+    use rustfs_config::RUSTFS_TLS_CERT;
     use std::fs;
     use std::sync::Once;
     use tempfile::TempDir;

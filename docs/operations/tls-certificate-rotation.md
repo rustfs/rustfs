@@ -2,9 +2,11 @@
 
 Use an independent certificate controller to obtain and renew certificates.
 RustFS consumes certificate material; it does not register ACME accounts or
-change DNS records. The certificate-maintenance protocol in `plugin-runner`
-is a separate integration boundary. Its admission, scheduler, CA/DNS runner
-capabilities and deployment broker are tracked in
+change DNS records. The independent
+[rustfs-cert-controller](https://github.com/houseme/rustfs-cert-controller)
+owns issuance, renewal scheduling and publication. `plugin-runner` starts its
+container; it does not own certificate schedules or CA credentials. Progress
+and deployment acceptance are tracked in
 [backlog #2806](https://github.com/rustfs/backlog/issues/2806).
 
 ## Deployment boundaries
@@ -82,6 +84,59 @@ publisher should use a complete immutable bundle for coherent publication.
 one identity. Explicit missing, malformed, mismatched, expired or unsuitable
 override material rejects the update; it does not silently select another
 identity. Keep default identity files valid when they are present as well.
+
+## Controller publication API
+
+For a VM or Docker installation with one default serving certificate, enable
+reload and configure `RUSTFS_TLS_PUBLISH_DIR` to a dedicated persistent directory
+owned by the RustFS process with mode `0700`. Keep `RUSTFS_TLS_PATH` configured
+for the initial serving identity and independent trust/client material. The
+publication directory must be separate from the original TLS source. A valid
+initial certificate and trusted management credentials must be provisioned
+before a controller can connect to the HTTPS API. That bootstrap identity must
+cover the names the configured issuer will continue to renew; publication
+preserves existing SAN coverage.
+
+The controller signs requests using the existing S3 SigV4 authentication:
+
+- `GET /rustfs/admin/v3/tls/certificate-state` requires
+  `admin:TLSCertificateStatus`.
+- `POST /rustfs/admin/v3/tls/certificate` requires
+  `admin:TLSCertificatePublish` and a connection terminated by RustFS TLS.
+
+Grant only these two actions to the controller identity. Read permissions,
+general configuration permissions and forwarded HTTPS headers do not authorize
+private-key publication. Keep API requests and credentials out of access-body
+logs. The API does not add MinIO-compatible aliases.
+
+The `rustfs.tls-publish/v1alpha1` request fixes `resource_id` to `server-default`
+and carries an `issuance_id`, the captured `expected_target_revision`,
+`certificate_pem` and `private_key_pem`. Read the target token before issuance;
+retain it with that immutable candidate. Repeating the same issuance and payload
+recovers a lost receipt. A conflict stops that candidate; fetching a new token
+and replaying the old candidate would defeat this concurrency protection.
+An HTTP 503 or uncertain network result is retryable with the same issuance,
+payload and token; HTTP 409 indicates a revision or payload conflict.
+
+RustFS validates the complete candidate before publishing an immutable leaf
+generation and syncing its atomic pointer. It does not copy or overwrite CA
+trust or client credentials. This mode rejects projected Kubernetes sources,
+multiple SNI identities and configurations that trust the serving leaf as a CA.
+Use the existing external-file/cert-manager integration for those deployments.
+
+The state reports the visible target revision and public leaf fingerprint. A
+successful POST receipt proves the publication was synced; a GET during an
+uncertain write does not replace that receipt. Retry the identical POST to
+confirm acceptance. `observed_certificate_fingerprint` is present only when
+this process's serving reload group has the exact current certificate chain;
+matching the leaf alone is insufficient. A durable receipt can precede that
+observation. Check convergence and a fresh TLS handshake on every relevant
+endpoint. One process's response does not prove another node has converged.
+
+Use a stable local publication volume with one owner. Captured-token CAS and
+local process locking do not implement HA leadership, restore ordering or PITR
+protection. Do not remove active generation directories; automated generation
+cleanup is not part of this interface.
 
 ## Activation and failure handling
 

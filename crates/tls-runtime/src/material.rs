@@ -94,10 +94,18 @@ impl TlsMaterialSnapshot {
 
     /// Load all consumers' material from one previously pinned directory generation.
     pub fn load_from_snapshot(snapshot: &TlsSourceSnapshot) -> Result<Self, TlsRuntimeError> {
+        Self::load_from_snapshot_with_server_directory(snapshot, None)
+    }
+
+    /// Load a server-only publication without replacing the pinned trust or client identity source.
+    pub fn load_from_snapshot_with_server_directory(
+        snapshot: &TlsSourceSnapshot,
+        server_directory: Option<&Path>,
+    ) -> Result<Self, TlsRuntimeError> {
         snapshot.validate_available()?;
         let source = snapshot.resolved_source();
         let base_dir = snapshot.base_dir();
-        let server = load_server_material(source, base_dir)?;
+        let server = load_server_material(source, server_directory.unwrap_or(base_dir))?;
         let public_ca_pem = read_optional_tls_file(&base_dir.join(&source.layout.public_ca_filename))?;
         let fallback_ca_pem = read_optional_tls_file(&base_dir.join(&source.fallback_ca_filename))?;
         let client_ca_pem = read_optional_tls_file(&base_dir.join(&source.layout.client_ca_filename))?;
@@ -255,6 +263,34 @@ mod tests {
         let pair = rcgen::generate_simple_self_signed(vec![domain.to_string()]).expect("generate certificate");
         fs::write(dir.join("rustfs_cert.pem"), pair.cert.pem()).expect("write certificate");
         fs::write(dir.join("rustfs_key.pem"), pair.signing_key.serialize_pem()).expect("write private key");
+    }
+
+    #[tokio::test]
+    async fn server_overlay_survives_expired_bootstrap_without_replacing_trust() {
+        let base = TempDir::new().expect("base source");
+        let overlay = TempDir::new().expect("server overlay");
+        let key = KeyPair::generate().expect("bootstrap key");
+        let mut params = CertificateParams::new(vec!["example.com".into()]).expect("bootstrap params");
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let expired = params.self_signed(&key).expect("expired bootstrap");
+        fs::write(base.path().join("rustfs_cert.pem"), expired.pem()).expect("bootstrap certificate");
+        fs::write(base.path().join("rustfs_key.pem"), key.serialize_pem()).expect("bootstrap key");
+        let ca = rcgen::generate_simple_self_signed(vec!["trust.example".into()]).expect("trust source");
+        fs::write(base.path().join(rustfs_config::RUSTFS_CA_CERT), ca.cert.pem()).expect("trust file");
+        write_pair(overlay.path(), "example.com");
+        let source = TlsSource::from_directory(base.path());
+        assert!(
+            TlsMaterialSnapshot::load(&source).await.is_err(),
+            "the expired base alone must remain invalid"
+        );
+        let loaded = TlsMaterialSnapshot::load_from_snapshot_with_server_directory(
+            &source.snapshot().expect("pinned base"),
+            Some(overlay.path()),
+        )
+        .expect("valid overlay");
+        assert_eq!(loaded.outbound.root_ca_pem, ca.cert.pem().as_bytes());
+        assert!(matches!(loaded.server, Some(ServerTlsMaterial::SingleCert { .. })));
     }
 
     #[tokio::test]
