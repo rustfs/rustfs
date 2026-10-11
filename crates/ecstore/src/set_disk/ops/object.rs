@@ -14944,6 +14944,7 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
+                    capability: crate::set_disk::GetObjectMetadataCacheCapability::Full,
                     fi,
                     parts_metadata,
                     online_disks,

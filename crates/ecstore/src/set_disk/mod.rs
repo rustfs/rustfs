@@ -968,10 +968,11 @@ impl GetObjectFileInfo {
     }
 
     fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        let condition_stopped = entry.capability == GetObjectMetadataCacheCapability::ConditionOnly;
         Self {
             owned: None,
             shared: Some(entry),
-            condition_stopped: false,
+            condition_stopped,
         }
     }
 
@@ -1402,6 +1403,7 @@ mod prepared_get_object_metadata_tests {
         };
         let cached = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
+            capability: GetObjectMetadataCacheCapability::Full,
             parts_metadata: vec![fi.clone()],
             fi,
             online_disks: vec![None],
@@ -4684,6 +4686,13 @@ impl Hash for GetObjectMetadataCacheKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GetObjectMetadataCacheCapability {
+    Full,
+    // Quorum-validated metadata without a complete body or write-target layout.
+    ConditionOnly,
+}
+
 #[derive(Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
@@ -4692,6 +4701,7 @@ struct GetObjectMetadataCacheEntry {
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
+    capability: GetObjectMetadataCacheCapability,
 }
 
 #[derive(Clone, Debug)]
