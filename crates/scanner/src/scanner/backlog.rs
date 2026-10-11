@@ -2192,7 +2192,7 @@ mod tests {
             })
             .expect("native retirement test thread")
             .join()
-            .expect("native retirement test completed");
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 
     async fn native_retirement_store() -> (tempfile::TempDir, Arc<ECStore>) {
@@ -2631,13 +2631,13 @@ mod tests {
         )
         .await;
         eprintln!("native expansion fixture old_pools={old_pool_count} stage=seed_old_authority");
-        let fault = unstable_source
-            .then(|| NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&old.pools[0].disk_set[0]), "publish", 2));
         let now = unix_now();
-        let mut controller = ScannerPauseBacklogController::claim(Arc::clone(&old), now)
-            .await
-            .expect("the native controller commits the actual old cohort");
-        if unstable_source {
+        let original = if unstable_source {
+            let fault =
+                NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&old.pools[0].disk_set[0]), "publish", 2);
+            let controller = ScannerPauseBacklogController::claim(Arc::clone(&old), now)
+                .await
+                .expect("the native controller commits the actual old cohort");
             assert!(controller.loaded.requires_reload);
             let (bytes, _) = native_replica_bytes(&old.pools[0].disk_set[0]).await;
             let ScannerPauseBacklogReplicaState::Valid(record) = decode_scanner_pause_backlog_ledger(&bytes) else {
@@ -2645,23 +2645,14 @@ mod tests {
             };
             assert!(record.stable.is_none());
             assert_eq!(record.committed.unwrap().ledger, controller.loaded.ledger);
+            let original = controller.loaded.ledger.clone();
+            assert!(controller.loaded.durable);
+            drop(controller);
+            drop(fault);
+            original
         } else {
-            controller.observe(observation(now + 1, true, 4)).await;
-            controller.observe(observation(now + 2, false, 4)).await;
-            let decision = controller.begin_attempt(now + 2).await;
-            assert!(
-                matches!(decision, ScannerPauseBacklogAttemptDecision::Tracked(_)),
-                "expected tracked native expansion setup attempt, got {decision:?}; ledger={:?}; persistence_disabled={}; runtime_error={:?}",
-                controller.loaded.ledger,
-                controller.persistence_disabled,
-                runtime_error()
-            );
-            assert!(controller.loaded.ledger.has_unfinished_attempt());
-        }
-        let original = controller.loaded.ledger.clone();
-        assert!(controller.loaded.durable);
-        drop(controller);
-        drop(fault);
+            seed_native_expansion_ledger(&old, now).await
+        };
         old.pool_meta_write_status()
             .await
             .expect("healthy pool metadata keeps the background recovery loop read-only");
@@ -2684,6 +2675,81 @@ mod tests {
             }
         }
         (root, expanded, original)
+    }
+
+    async fn seed_native_expansion_ledger(store: &Arc<ECStore>, now: u64) -> ScannerPauseBacklogLedger {
+        let loaded = load_scanner_pause_backlog(Arc::clone(store))
+            .await
+            .expect("empty native expansion cohort");
+        assert!(
+            loaded
+                .replicas
+                .iter()
+                .all(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
+        );
+        let mut ledger = claim_scanner_pause_backlog_writer(&loaded.ledger, now).expect("fixture writer generation");
+        // The fixture needs the final unfinished attempt, not four separate
+        // durable controller transitions before the fault under test. Retain
+        // their generations and timestamps, then publish the final state once
+        // through the real native commit and stabilization protocol.
+        ledger.apply_observation(observation(now + 1, true, 4));
+        prepare_scanner_pause_backlog_persist(&mut ledger, now + 1).expect("fixture pause generation");
+        ledger.apply_observation(observation(now + 2, false, 4));
+        prepare_scanner_pause_backlog_persist(&mut ledger, now + 2).expect("fixture resume generation");
+        assert!(matches!(ledger.begin_attempt(now + 2), ScannerPauseBacklogAttemptDecision::Tracked(_)));
+        prepare_scanner_pause_backlog_persist(&mut ledger, now + 2).expect("fixture unfinished attempt generation");
+        let published = persist_scanner_pause_backlog(Arc::clone(store), &loaded, ledger.clone())
+            .await
+            .expect("publish the complete native expansion fixture");
+        assert!(published.durable && published.stable_matches_ledger && !published.requires_reload);
+        assert!(ledger.has_unfinished_attempt());
+        assert_current_native_writer_ledger(store, &ledger).await;
+        set_runtime_error(None);
+        ledger
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_expansion_fixture_retains_controller_state_and_complete_disk_proof() {
+        run_native_retirement_test(async || {
+            use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
+
+            let (_reference_root, reference) = native_pause_backlog_store(1, 2).await;
+            let now = unix_now();
+            let mut controller = ScannerPauseBacklogController::claim(Arc::clone(&reference), now)
+                .await
+                .expect("reference native writer claim");
+            controller.observe(observation(now + 1, true, 4)).await;
+            controller.observe(observation(now + 2, false, 4)).await;
+            assert!(matches!(
+                controller.begin_attempt(now + 2).await,
+                ScannerPauseBacklogAttemptDecision::Tracked(_)
+            ));
+            let expected = controller.loaded.ledger.clone();
+            assert_current_native_writer_ledger(&reference, &expected).await;
+
+            let (_fixture_root, fixture) = native_pause_backlog_store(1, 2).await;
+            // A third preparation write would fail: the complete native commit
+            // and stabilization must suffice, without replaying the unrelated
+            // pause/resume transitions to disk in every recovery matrix cell.
+            let fault =
+                NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&fixture.pools[0].disk_set[0]), "publish", 3);
+            let actual = seed_native_expansion_ledger(&fixture, now).await;
+            assert_eq!(actual, expected, "all generations, timestamps and unfinished work must be retained");
+            assert_current_native_writer_ledger(&fixture, &expected).await;
+            drop(fault);
+            drop(controller);
+            shutdown_native_retirement_store(reference).await;
+            shutdown_native_retirement_store(fixture).await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "original native scenario failure")]
+    fn native_retirement_runner_preserves_scenario_failure_payload() {
+        run_native_retirement_test_with_budget(Duration::from_secs(1), async || {
+            panic!("original native scenario failure");
+        });
     }
 
     async fn native_expanded_retirement_store(
