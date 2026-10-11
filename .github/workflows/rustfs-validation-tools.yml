@@ -14,6 +14,10 @@ on:
         type: boolean
         required: false
         default: false
+      build_shared_heal:
+        type: boolean
+        required: false
+        default: false
     secrets:
       PF_TESTING_GH_TOKEN:
         required: true
@@ -29,6 +33,11 @@ on:
         required: true
       build_native_heal:
         description: Also compile and run separate exact-source native Heal regressions
+        type: boolean
+        required: false
+        default: false
+      build_shared_heal:
+        description: Build the controlled C10 shared-reference fixture encoder
         type: boolean
         required: false
         default: false
@@ -165,6 +174,50 @@ jobs:
           Path("validation-tools/heal-meta-inspect.json").write_text(json.dumps(source, indent=2) + "\n")
           PY
           git -C candidate diff --exit-code
+
+      - name: Build and test the controlled C10 metadata encoder
+        if: ${{ inputs.build_shared_heal }}
+        run: |
+          set -euo pipefail
+          python3 -B auto-testing/scripts/validation_heal/prepare_heal_shared_fixture.py \
+            --source candidate --commit "${CANDIDATE_SHA}" --out shared-build
+          cp candidate/Cargo.lock shared-build/Cargo.lock
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/inspector-build/target"
+          cargo build --release --manifest-path shared-build/Cargo.toml
+          mkdir shared-tools
+          if ! cargo test --release --manifest-path shared-build/Cargo.toml -- --test-threads=1 \
+            > shared-tools/shared-fixture-tests.log 2>&1; then
+            cat shared-tools/shared-fixture-tests.log
+            exit 1
+          fi
+          cp "${CARGO_TARGET_DIR}/release/heal-shared-fixture" shared-tools/
+          cp shared-build/Cargo.lock shared-tools/shared-Cargo.lock
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          source = json.loads(Path("shared-build/source.json").read_text())
+          source.update(schemaVersion=1, built=True, sourceUnmodified=True,
+              candidateSourceTree=subprocess.check_output(["git", "-C", "candidate", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              testingCommit=os.environ["AUTO_TESTING_SHA"],
+              binarySha256=hashlib.sha256(Path("shared-tools/heal-shared-fixture").read_bytes()).hexdigest(),
+              sharedLockSha256=hashlib.sha256(Path("shared-tools/shared-Cargo.lock").read_bytes()).hexdigest(),
+              toolchain=subprocess.check_output(["rustc", "-vV"], text=True), target="x86_64-unknown-linux-gnu",
+              runId=os.environ["GITHUB_RUN_ID"], runAttempt=os.environ["GITHUB_RUN_ATTEMPT"])
+          Path("shared-tools/heal-shared-fixture.json").write_text(json.dumps(source, indent=2) + "\n")
+          PY
+          git -C candidate diff --exit-code
+
+      - name: Upload controlled C10 fixture encoder evidence
+        if: ${{ always() && inputs.build_shared_heal }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-shared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: shared-tools/
+          if-no-files-found: warn
 
       - name: Upload immutable validation tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
