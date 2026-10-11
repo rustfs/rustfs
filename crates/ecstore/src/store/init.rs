@@ -18893,6 +18893,43 @@ mod tests {
     }
 
     macro_rules! creation_guard_loss_test {
+        ($name:ident, $role:ident, BeforeRollbackMetadataCleanup) => {
+            #[tokio::test]
+            #[serial_test::serial(storage_class_env)]
+            async fn $name() {
+                const CHILD: &str = "RUSTFS_TEST_CREATION_GUARD_LOSS_CHILD";
+                let test_name = concat!("store::init::tests::", stringify!($name));
+                if std::env::var(CHILD).as_deref() == Ok(test_name) {
+                    real_creation_guard_loss(
+                        CreationGuardRole::$role,
+                        crate::store::bucket::BucketCreationPausePoint::BeforeRollbackMetadataCleanup,
+                    )
+                    .await;
+                    return;
+                }
+                let output = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, test_name)
+                    .output()
+                    .expect("isolated creation guard-loss child should run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                print!("{stdout}");
+                eprint!("{stderr}");
+                assert!(
+                    output.status.success(),
+                    "isolated guard-loss child failed for {test_name}: {stdout} {stderr}"
+                );
+                assert!(
+                    stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                    "isolated guard-loss child must execute one unignored test for {test_name}: {stdout} {stderr}"
+                );
+                assert!(
+                    stdout.contains(&format!("test {test_name} ...")),
+                    "isolated guard-loss child must run the exact selected test {test_name}: {stdout} {stderr}"
+                );
+            }
+        };
         ($name:ident, $role:ident, $point:ident) => {
             #[tokio::test]
             #[serial_test::serial(storage_class_env)]
