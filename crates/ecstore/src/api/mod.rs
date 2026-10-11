@@ -372,6 +372,15 @@ pub mod config {
             with_server_config_write_lock,
         };
 
+        /// Observe persisted config bytes and their reader-associated metadata within a byte limit.
+        pub async fn read_config_observation(
+            api: std::sync::Arc<crate::store::ECStore>,
+            file: &str,
+            max_bytes: usize,
+        ) -> crate::error::Result<(Vec<u8>, crate::object_api::ObjectInfo)> {
+            crate::config::com::read_config_observation(api, file, max_bytes).await
+        }
+
         /// Read config bytes and metadata without treating an empty payload as absent.
         pub async fn read_config_preserve_empty_with_metadata_opts(
             api: std::sync::Arc<crate::store::ECStore>,

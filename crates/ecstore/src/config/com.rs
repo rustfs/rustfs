@@ -449,6 +449,22 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_observation<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    let opts = ObjectOptions {
+        suppress_read_repair: true,
+        no_lock: false,
+        skip_verify_bitrot: false,
+        ..Default::default()
+    };
+    crate::object_api::without_get_object_body_cache_hook(read_config_limited_preserve_empty_with_metadata_opts(
+        api, file, &opts, max_bytes,
+    ))
+    .await
+}
+
 pub(crate) async fn read_config_limited_preserve_empty<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: EcstoreObjectIO,
@@ -5423,6 +5439,166 @@ mod tests {
 
         assert!(err.to_string().contains("transaction lock was lost"));
         assert_eq!(store.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct ObservationStream {
+        inner: Cursor<Vec<u8>>,
+        consumed: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl AsyncRead for ObservationStream {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.fail {
+                return Poll::Ready(Err(std::io::Error::other("observation stream failed")));
+            }
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+            self.consumed.fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+            result
+        }
+    }
+
+    struct ObservationStore {
+        body: Vec<u8>,
+        declared_size: i64,
+        error: Option<Error>,
+        stream_error: bool,
+        consumed: Arc<AtomicUsize>,
+        options: std::sync::Mutex<Option<(bool, bool, bool)>>,
+        writes: AtomicUsize,
+    }
+
+    impl Debug for ObservationStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ObservationStore").finish()
+        }
+    }
+
+    impl ObservationStore {
+        fn new(body: Vec<u8>, declared_size: i64) -> Self {
+            Self {
+                body,
+                declared_size,
+                error: None,
+                stream_error: false,
+                consumed: Arc::new(AtomicUsize::new(0)),
+                options: std::sync::Mutex::new(None),
+                writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for ObservationStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<HTTPRangeSpec>,
+            _headers: HeaderMap,
+            opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            assert_eq!(bucket, RUSTFS_META_BUCKET);
+            assert_eq!(object, "config/observation.bin");
+            assert!(range.is_none());
+            *self.options.lock().expect("observation options") =
+                Some((opts.suppress_read_repair, opts.no_lock, opts.skip_verify_bitrot));
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(GetObjectReader {
+                stream: Box::new(ObservationStream {
+                    inner: Cursor::new(self.body.clone()),
+                    consumed: self.consumed.clone(),
+                    fail: self.stream_error,
+                }),
+                object_info: ObjectInfo {
+                    size: self.declared_size,
+                    etag: Some("observation-etag".to_string()),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(Error::other("observation must not write"))
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_options_and_errors() {
+        for body in [Vec::new(), b"raw config".to_vec()] {
+            let store = Arc::new(ObservationStore::new(body.clone(), i64::try_from(body.len()).expect("fixture size")));
+            let result = super::read_config_observation(store.clone(), "config/observation.bin", 32).await;
+            assert!(result.is_ok(), "observation must preserve empty and nonempty objects: {result:?}");
+            let (observed, info) = result.expect("successful observation");
+            assert_eq!(observed, body);
+            assert_eq!(info.etag.as_deref(), Some("observation-etag"));
+            assert_eq!(
+                *store.options.lock().expect("options"),
+                Some((true, false, false)),
+                "I05_REPAIR_SUPPRESSED"
+            );
+            assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        }
+        for (source, expected) in [
+            (Error::FileNotFound, Error::ConfigNotFound),
+            (
+                Error::ObjectNotFound(RUSTFS_META_BUCKET.to_string(), "config/observation.bin".to_string()),
+                Error::ConfigNotFound,
+            ),
+            (Error::ErasureReadQuorum, Error::ErasureReadQuorum),
+        ] {
+            let mut fixture = ObservationStore::new(Vec::new(), 0);
+            fixture.error = Some(source);
+            let store = Arc::new(fixture);
+            let result = super::read_config_observation(store.clone(), "config/observation.bin", 32).await;
+            assert_eq!(result.expect_err("read error must propagate"), expected);
+            assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        }
+        let mut fixture = ObservationStore::new(Vec::new(), 0);
+        fixture.stream_error = true;
+        let store = Arc::new(fixture);
+        let result = super::read_config_observation(store.clone(), "config/observation.bin", 32).await;
+        let error = result.expect_err("stream error must propagate");
+        assert!(error.to_string().contains("observation stream failed"));
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn observation_enforces_byte_limit() {
+        let store = Arc::new(ObservationStore::new(vec![7; 64], 0));
+        let result = super::read_config_observation(store.clone(), "config/observation.bin", 8).await;
+        assert_eq!(result.is_err(), true, "I05_BOUND_ENFORCED");
+        assert_eq!(
+            result.expect_err("bounded observation error"),
+            Error::CorruptedFormat,
+            "I05_BOUND_ENFORCED"
+        );
+        assert_eq!(store.consumed.load(Ordering::SeqCst), 9, "I05_BOUND_ENFORCED: drain exactly limit + 1");
+        let store = Arc::new(ObservationStore::new(vec![7; 8], 8));
+        let result = super::read_config_observation(store.clone(), "config/observation.bin", 8).await;
+        assert!(result.is_ok(), "exact byte limit must succeed: {result:?}");
+        assert_eq!(result.expect("exact limit").0, vec![7; 8]);
+        assert_eq!(store.consumed.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test]

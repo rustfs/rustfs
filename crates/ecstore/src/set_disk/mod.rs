@@ -1095,6 +1095,217 @@ mod prepared_get_object_metadata_tests {
     use http::HeaderMap;
     use tokio::io::AsyncReadExt;
 
+    const OBSERVATION_HOOK_BODY_LEN: usize = 1024 * 1024 + 1;
+
+    struct ObservationBodyHook {
+        object: &'static str,
+        calls: Arc<AtomicU64>,
+        body: bytes::Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::object_api::GetObjectBodyCacheHook for ObservationBodyHook {
+        async fn lookup(&self, bucket: &str, object: &str, info: &ObjectInfo) -> Option<bytes::Bytes> {
+            if bucket == crate::disk::RUSTFS_META_BUCKET && object == self.object {
+                assert_eq!(info.size, i64::try_from(self.body.len()).expect("hook fixture size"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Some(self.body.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    struct ObservationHookGuard;
+
+    impl Drop for ObservationHookGuard {
+        fn drop(&mut self) {
+            crate::object_api::unregister_get_object_body_cache_hook();
+        }
+    }
+
+    async fn ordinary_observation_get(set: &SetDisks, object: &str) -> Vec<u8> {
+        let mut reader = set
+            .get_object_reader(crate::disk::RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("ordinary GET positive control");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("ordinary GET body");
+        bytes
+    }
+
+    fn observation_register_hook(object: &'static str, body: Vec<u8>) -> (ObservationHookGuard, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        crate::object_api::register_get_object_body_cache_hook(Arc::new(ObservationBodyHook {
+            object,
+            calls: calls.clone(),
+            body: bytes::Bytes::from(body),
+        }));
+        (ObservationHookGuard, calls)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn observation_real_backend_boundaries() {
+        let object = "config/observation-real.bin";
+        let payload = b"persisted config";
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let mut reader = PutObjReader::from_vec(payload.to_vec());
+        let written = set
+            .put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("persist real config fixture");
+        let result = crate::config::com::read_config_observation(set.clone(), object, payload.len()).await;
+        assert_eq!(result.is_ok(), true, "I05_OBSERVATION_SUCCESS: {result:?}");
+        let (bytes, info) = result.expect("real observation success");
+        assert_eq!(bytes, payload);
+        assert_eq!(info.size, written.size);
+        assert_eq!(info.etag, written.etag);
+        assert_eq!(info.data_dir, written.data_dir);
+        assert_eq!(info.name, object);
+        let over = crate::config::com::read_config_observation(set.clone(), object, payload.len() - 1).await;
+        assert_eq!(over.is_err(), true, "I05_BOUND_ENFORCED");
+        assert_eq!(over.expect_err("over limit must fail"), Error::CorruptedFormat, "I05_BOUND_ENFORCED");
+        let absent = crate::config::com::read_config_observation(set.clone(), "config/observation-absent.bin", 32).await;
+        assert_eq!(absent.expect_err("absent config"), Error::ConfigNotFound);
+        let empty_object = "config/observation-empty.bin";
+        let mut empty = PutObjReader::from_vec(Vec::new());
+        set.put_object(crate::disk::RUSTFS_META_BUCKET, empty_object, &mut empty, &ObjectOptions::default())
+            .await
+            .expect("persist empty config");
+        let empty = crate::config::com::read_config_observation(set, empty_object, 0).await;
+        assert!(empty.is_ok(), "existing empty config must succeed: {empty:?}");
+        let (bytes, info) = empty.expect("empty observation");
+        assert!(bytes.is_empty());
+        assert_eq!(info.size, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn observation_bypasses_registered_body_hook() {
+        let object = "config/observation-hook.bin";
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let mut reader = PutObjReader::from_vec(vec![b'p'; OBSERVATION_HOOK_BODY_LEN]);
+        set.put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("persist real config fixture");
+        let (_hook, calls) = observation_register_hook(object, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+        let result = crate::config::com::read_config_observation(set, object, OBSERVATION_HOOK_BODY_LEN).await;
+        assert_eq!(result.is_ok(), true, "I05_HOOK_BYPASS: {result:?}");
+        assert_eq!(
+            result.expect("observed persisted body").0,
+            vec![b'p'; OBSERVATION_HOOK_BODY_LEN],
+            "I05_HOOK_BYPASS"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "I05_HOOK_BYPASS");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn observation_hook_scope_restores_after_error() {
+        let object = "config/observation-hook-error.bin";
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let mut reader = PutObjReader::from_vec(vec![b'p'; OBSERVATION_HOOK_BODY_LEN]);
+        set.put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("persist real config fixture");
+        let (_hook, calls) = observation_register_hook(object, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        let result = crate::config::com::read_config_observation(set.clone(), object, OBSERVATION_HOOK_BODY_LEN - 1).await;
+        assert_eq!(result.expect_err("bounded observation error"), Error::CorruptedFormat);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct PendingObservationStore {
+        set: Arc<SetDisks>,
+        ready: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl std::fmt::Debug for PendingObservationStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PendingObservationStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for PendingObservationStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<HTTPRangeSpec>,
+            headers: HeaderMap,
+            opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            let mut reader = self.set.get_object_reader(bucket, object, range, headers, opts).await?;
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("pending producer real GET");
+            assert_eq!(
+                body,
+                vec![b'p'; OBSERVATION_HOOK_BODY_LEN],
+                "I05_HOOK_BYPASS: producer must enter its own scope"
+            );
+            self.ready
+                .lock()
+                .expect("pending signal")
+                .take()
+                .expect("one GET")
+                .send(())
+                .expect("producer entry signal");
+            std::future::pending::<Result<GetObjectReader>>().await
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            assert!(false, "observation must not PUT");
+            Err(Error::other("unexpected observation PUT"))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn observation_hook_scope_restores_after_cancel() {
+        let object = "config/observation-hook-cancel.bin";
+        let (_dirs, set) = make_local_set_disks(4, 2).await;
+        let mut reader = PutObjReader::from_vec(vec![b'p'; OBSERVATION_HOOK_BODY_LEN]);
+        set.put_object(crate::disk::RUSTFS_META_BUCKET, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("persist real config fixture");
+        let (_hook, calls) = observation_register_hook(object, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(PendingObservationStore {
+            set: set.clone(),
+            ready: std::sync::Mutex::new(Some(ready_tx)),
+        });
+        let mut scope = Box::pin(crate::config::com::read_config_observation(adapter, object, OBSERVATION_HOOK_BODY_LEN));
+        tokio::select! {
+            result = ready_rx => { result.expect("producer reached pending GET"); }
+            result = &mut scope => { assert!(false, "producer must remain pending until cancelled: {result:?}"); }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(scope);
+        assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     const READ_VERSION_BARRIER_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
 
     fn object_with_initial_data_shards(bucket: &str, prefix: &str) -> String {
