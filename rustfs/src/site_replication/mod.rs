@@ -56,11 +56,9 @@ use crate::runtime_sources::{
     current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_region,
 };
 use crate::storage_api::site_replication::s3::{
-    Body, BucketLifecycleConfiguration, BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus,
-    DeleteReplication, DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus,
-    LifecycleRule, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, S3Error, S3ErrorCode, S3Response, S3Result, SourceSelectionCriteria, VersioningConfiguration,
-    s3_error,
+    Body, BucketLifecycleConfiguration, BucketVersioningStatus, LifecycleRule, PersistedOptionalReplicationStatus,
+    PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
+    PersistedSourceSelectionCriteria, S3Error, S3ErrorCode, S3Response, S3Result, Status, VersioningConfiguration, s3_error,
 };
 #[cfg(test)]
 use crate::storage_api::site_replication::save_config as save_admin_config;

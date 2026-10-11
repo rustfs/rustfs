@@ -13,7 +13,10 @@
 // limitations under the License.
 
 //! The legacy s3s edge: conversions from s3s request types into the app
-//! layer's own types (rustfs/backlog#2734). Everything here goes away with the
-//! s3s edge itself (task T4.1).
+//! layer's own types (rustfs/backlog#2734), and between the s3s DTOs and the
+//! `rustfs-gateway-types` shapes the engine crates hold (rustfs/backlog#2745),
+//! one module per configuration family; every such conversion is total and
+//! lossless. Everything here goes away with the s3s edge itself (task T4.1).
 
 mod envelope;
+pub(crate) mod replication;

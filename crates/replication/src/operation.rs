@@ -18,7 +18,7 @@ use crate::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_STATUS, get_consistent_internal_metadata, get_header_metadata,
 };
-use s3s::dto::ReplicationConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -167,7 +167,7 @@ pub struct ReplicationDeleteStateSource {
 }
 
 pub fn delete_replication_state_from_config(
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
     source: &ReplicationDeleteStateSource,
 ) -> Option<ReplicationState> {
     let opts = ObjectOpts {
@@ -359,10 +359,10 @@ mod tests {
     };
     use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
-    use s3s::dto::{
-        DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-        ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationRule, PersistedReplicationStatus, PersistedSourceSelectionCriteria,
     };
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
@@ -546,37 +546,37 @@ mod tests {
         assert_eq!(opts.op_type, ReplicationType::Delete);
     }
 
-    fn delete_replication_rule(arn: &str, replica_modifications: bool) -> ReplicationRule {
-        ReplicationRule {
-            delete_marker_replication: Some(DeleteMarkerReplication {
-                status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+    fn delete_replication_rule(arn: &str, replica_modifications: bool) -> PersistedReplicationRule {
+        PersistedReplicationRule {
+            delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                status: Some(Status::ENABLED.to_string()),
             }),
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
-            existing_object_replication: Some(ExistingObjectReplication {
-                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            existing_object_replication: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
             filter: None,
             id: Some("rule-1".to_string()),
             prefix: Some("test/".to_string()),
             priority: Some(1),
-            source_selection_criteria: replica_modifications.then_some(SourceSelectionCriteria {
-                replica_modifications: Some(ReplicaModifications {
-                    status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+            source_selection_criteria: replica_modifications.then_some(PersistedSourceSelectionCriteria {
+                replica_modifications: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 sse_kms_encrypted_objects: None,
             }),
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
     #[test]
     fn delete_replication_state_tracks_downstream_delete_marker_targets() {
         let arn = "arn:aws:s3:::target-bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.to_string(),
             rules: vec![delete_replication_rule(arn, true)],
         };
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn delete_replication_state_skips_replica_delete_without_replica_modifications() {
         let arn = "arn:aws:s3:::target-bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.to_string(),
             rules: vec![delete_replication_rule(arn, false)],
         };
@@ -619,10 +619,10 @@ mod tests {
     fn delete_replication_state_uses_delete_switch_for_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket";
         let mut rule = delete_replication_rule(arn, false);
-        rule.delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        rule.delete_replication = Some(PersistedReplicationStatus {
+            status: Status::DISABLED.to_string(),
         });
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: arn.to_string(),
             rules: vec![rule],
         };
@@ -639,8 +639,8 @@ mod tests {
             "delete-marker version purge must not use the enabled marker-creation switch"
         );
 
-        config.rules[0].delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        config.rules[0].delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
         let state = delete_replication_state_from_config(&config, &source)
             .expect("delete-marker version purge should honor the enabled permanent-delete switch");

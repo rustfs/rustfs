@@ -188,7 +188,7 @@ impl ScannerIODisk for Disk {
             crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_replication_config(&cache.info.name))
                 .await
                 .unwrap_or((
-                    ReplicationConfiguration {
+                    PersistedReplicationConfiguration {
                         role: "".to_string(),
                         rules: vec![],
                     },

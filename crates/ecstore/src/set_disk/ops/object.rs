@@ -21882,11 +21882,13 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn batch_version_delete_uses_tags_read_under_the_delete_lock() {
-        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
-            ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter,
+            PersistedReplicationRule, PersistedReplicationStatus, PersistedReplicationTag,
         };
+        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-delete-locked-tags";
@@ -21925,20 +21927,20 @@ mod delete_objects_lock_gating_tests {
                 status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
                     existing_object_replication: None,
-                    filter: Some(ReplicationRuleFilter {
-                        tag: Some(Tag {
+                    filter: Some(PersistedReplicationFilter {
+                        tag: Some(PersistedReplicationTag {
                             key: Some("generation".to_string()),
                             value: Some("locked".to_string()),
                         }),
@@ -21948,7 +21950,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -21986,10 +21988,12 @@ mod delete_objects_lock_gating_tests {
     #[tokio::test]
     #[serial]
     async fn lifecycle_delete_all_history_records_exact_replication_purge() {
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
-            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+            PersistedReplicationStatus,
         };
+        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "lifecycle-delete-all-replication";
@@ -22033,14 +22037,14 @@ mod delete_objects_lock_gating_tests {
                 status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
@@ -22050,7 +22054,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -22092,11 +22096,12 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn synthetic_directory_delete_uses_decoded_prefix_and_marker_switch() {
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
-            DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter,
-            ReplicationRuleStatus, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::{
+            PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+            PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus,
         };
+        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-directory-replication";
@@ -22112,21 +22117,21 @@ mod delete_objects_lock_gating_tests {
                 status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
-                    delete_marker_replication: Some(DeleteMarkerReplication {
-                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                rules: vec![PersistedReplicationRule {
+                    delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                        status: Some(Status::ENABLED.to_string()),
                     }),
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::DISABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
                     existing_object_replication: None,
-                    filter: Some(ReplicationRuleFilter {
+                    filter: Some(PersistedReplicationFilter {
                         prefix: Some("photos/".to_string()),
                         ..Default::default()
                     }),
@@ -22134,7 +22139,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: None,
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));

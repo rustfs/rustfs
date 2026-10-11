@@ -338,12 +338,12 @@ pub(crate) mod site_replication {
     /// S3 wire types for the service module, funneled here so the module
     /// itself stays off the direct s3s surface (s3s footprint ratchet).
     pub(crate) mod s3 {
-        pub(crate) use s3s::dto::{
-            BucketLifecycleConfiguration, BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus,
-            DeleteReplication, DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus,
-            LifecycleRule, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-            ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
+        pub(crate) use rustfs_gateway_types::dto::Status;
+        pub(crate) use rustfs_gateway_types::persistence::{
+            PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+            PersistedReplicationRule, PersistedReplicationStatus, PersistedSourceSelectionCriteria,
         };
+        pub(crate) use s3s::dto::{BucketLifecycleConfiguration, BucketVersioningStatus, LifecycleRule, VersioningConfiguration};
         #[cfg(test)]
         pub(crate) use s3s::dto::{ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass};
         pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
