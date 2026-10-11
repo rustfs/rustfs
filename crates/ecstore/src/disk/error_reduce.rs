@@ -131,6 +131,15 @@ pub fn build_write_quorum_failure_summary(
 
 fn dominant_error_label(errors: &[Option<Error>], ignored_errs: &[Error], dominant_error: Option<&Error>) -> &'static str {
     let Some(dominant_error) = dominant_error else {
+        // The reducer also returns None when every failure is ignored for
+        // quorum voting. That case contains no successful nil entry.
+        if !errors.is_empty() && errors.iter().all(Option::is_some) {
+            return if errors.iter().all(|error| error.as_ref() == Some(&Error::DiskNotFound)) {
+                "disk_not_found"
+            } else {
+                "all_ignored"
+            };
+        }
         return "nil_dominated";
     };
 
@@ -387,9 +396,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_write_quorum_failure_summary_all_ignored_is_nil_dominated() {
-        // All disks offline (all DiskNotFound). The dominant error must be None and
-        // the label must be "nil_dominated" rather than falling back to "other_error".
+    fn test_build_write_quorum_failure_summary_all_missing_is_disk_not_found() {
+        // Ignoring unavailable disks for quorum reduction must not imply a
+        // successful nil entry in the diagnostic label.
         let errors = vec![
             Some(Error::DiskNotFound),
             Some(Error::DiskNotFound),
@@ -397,7 +406,21 @@ mod tests {
         ];
         let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
         assert_eq!(summary.dominant_error, None);
-        assert_eq!(summary.dominant_error_label, "nil_dominated");
+        assert_eq!(summary.achieved, 0);
+        assert_eq!(summary.dominant_error_label, "disk_not_found");
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_all_ignored_has_no_success() {
+        let errors = [Some(Error::FaultyDisk), Some(Error::DiskNotFound)];
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+        assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.achieved, 0);
+        assert_eq!(summary.dominant_error_label, "all_ignored");
+        assert_eq!(
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            Some(Error::ErasureWriteQuorum)
+        );
     }
 
     #[test]

@@ -96,38 +96,8 @@ jobs:
           overwrite: true
 
   upgrade:
-    name: ${{ matrix.name }}
+    name: Upgrade compatibility
     needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The two `_from_rc2_` tests keep their names: they assert
-          # release-independent object contracts and pass unchanged against the
-          # newer pinned source, so renaming them would only churn history and
-          # the CI required-check names. UPGRADE_SOURCE_VERSION above is the
-          # single source of truth for which release they actually run against.
-          - name: Direct upgrade from the previous release
-            test: direct_upgrade_from_rc2_preserves_object_contracts
-            artifact: direct-upgrade
-          - name: Mixed-version rolling upgrade from the previous release
-            test: rolling_upgrade_from_rc2_preserves_mixed_version_contracts
-            artifact: mixed-version-upgrade
-          - name: Bucket configuration survives the upgrade
-            test: direct_upgrade_from_previous_release_preserves_bucket_configuration
-            artifact: bucket-config-upgrade
-          - name: Rollback reads current bucket metadata
-            test: rollback_to_previous_release_reads_current_bucket_metadata
-            artifact: bucket-config-rollback
-          - name: ODM configuration recovery after rc.5 rollback
-            test: rc5_rollback_requires_restoring_odm_configuration
-            artifact: odm-config-rollback
-          - name: Multipart layouts survive the rc.5 upgrade
-            test: direct_upgrade_from_rc5_preserves_multipart_layouts
-            artifact: multipart-layout-upgrade
-          - name: rc.5 multipart replication baseline
-            test: rc5_baseline_replicates_multipart_layouts
-            artifact: multipart-layout-baseline
     runs-on: sm-standard-2
     timeout-minutes: 60
     env:
@@ -142,8 +112,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           cache-shared-key: e2e-upgrade-tests
-          # One main-branch consumer warms the shared test-harness dependencies.
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.artifact == 'direct-upgrade' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: "false"
           install-test-tools: "false"
 
@@ -170,22 +139,49 @@ jobs:
           echo "RUSTFS_UPGRADE_SOURCE_BINARY=$SOURCE_DIR/rustfs" >> "$GITHUB_ENV"
           echo "RUSTFS_E2E_LOG_DIR=$RUNNER_TEMP/rustfs-upgrade-logs" >> "$GITHUB_ENV"
 
-      - name: Run upgrade compatibility test
+      # Reuse one compiled harness, while keeping each case in its own process.
+      # Continue after a failure to retain the former matrix's complete verdict.
+      - name: Run upgrade compatibility tests
+        shell: bash
         env:
-          RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
           NO_PROXY: 127.0.0.1,localhost,::1
         run: |
           export no_proxy="$NO_PROXY"
-          python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test \
-            "upgrade_compatibility_test::${{ matrix.test }}" \
-            -- --ignored --exact --nocapture
+          cases=(
+            direct-upgrade:direct_upgrade_from_rc2_preserves_object_contracts
+            mixed-version-upgrade:rolling_upgrade_from_rc2_preserves_mixed_version_contracts
+            bucket-config-upgrade:direct_upgrade_from_previous_release_preserves_bucket_configuration
+            bucket-config-rollback:rollback_to_previous_release_reads_current_bucket_metadata
+            odm-config-rollback:rc5_rollback_requires_restoring_odm_configuration
+            multipart-layout-upgrade:direct_upgrade_from_rc5_preserves_multipart_layouts
+            multipart-layout-baseline:rc5_baseline_replicates_multipart_layouts
+          )
+          status=0
+          for entry in "${cases[@]}"; do
+            artifact="${entry%%:*}"
+            test="${entry#*:}"
+            export RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR="$RUNNER_TEMP/rustfs-upgrade-g09-evidence/$artifact"
+            export RUSTFS_E2E_LOG_DIR="$RUNNER_TEMP/rustfs-upgrade-logs/$artifact"
+            mkdir -p "$RUSTFS_E2E_LOG_DIR"
+            echo "::group::$test"
+            if python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test \
+              "upgrade_compatibility_test::$test" -- --ignored --exact --nocapture \
+              2>&1 | tee "$RUSTFS_E2E_LOG_DIR/test.log"; then
+              echo "PASS: $test"
+            else
+              echo "::error::Upgrade compatibility failed: $test"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
 
       - name: Upload scanner/heal G09 evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.artifact }}-g09-evidence-${{ github.run_number }}
-          path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
+          name: upgrade-g09-evidence-${{ github.run_number }}
+          path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence
           if-no-files-found: ignore
           retention-days: 14
 
@@ -193,7 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.artifact }}-server-logs-${{ github.run_number }}
+          name: upgrade-server-logs-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-logs
           if-no-files-found: warn
           retention-days: 14

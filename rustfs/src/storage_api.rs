@@ -79,6 +79,12 @@ pub(crate) mod config_test {
 }
 
 pub(crate) mod error {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error::Error as DiskError;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error_reduce::{
+        OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    };
     pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
 

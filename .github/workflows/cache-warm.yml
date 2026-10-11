@@ -99,7 +99,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Readers: test-and-lint, test-ilm-integration-serial, build-rustfs-debug-binary,
+  # Readers: test-and-lint (workspace and ILM), build-rustfs-debug-binary,
   # e2e-tests, e2e-full.
   warm-ci-dev:
     name: Warm ci-dev
