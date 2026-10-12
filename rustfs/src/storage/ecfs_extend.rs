@@ -340,6 +340,10 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
         ));
     }
 
+    if key.is_empty() || !crate::storage::storage_api::ecstore_bucket::utils::is_valid_object_prefix(key) {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"));
+    }
+
     // Log debug info for keys with special characters to help diagnose encoding issues
     if key.contains([' ', '+', '%']) {
         debug!(

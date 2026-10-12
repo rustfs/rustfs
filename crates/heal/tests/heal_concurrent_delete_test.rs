@@ -563,9 +563,31 @@ fn admin_root_completes_after_unversioned_delete() {
     run_delete_case(DeleteCase::Unversioned);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[serial]
-async fn admin_root_rejects_recreated_bucket_before_successor_repair() {
+fn admin_root_rejects_recreated_bucket_before_successor_repair() {
+    // Incarnation-bound repairs use a spawned owner; retain the server's stack
+    // budget for the whole scenario. block_on alone would poll that future on
+    // libtest's smaller calling-thread stack.
+    let stack_size = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("heal-concurrent-delete".to_owned())
+        .stack_size(stack_size)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(stack_size)
+                .enable_all()
+                .build()
+                .expect("concurrent delete runtime");
+            runtime.block_on(recreated_bucket_repair());
+        })
+        .expect("concurrent delete scenario thread starts")
+        .join()
+        .expect("concurrent delete scenario must not panic");
+}
+
+async fn recreated_bucket_repair() {
     let directory = tempfile::tempdir().expect("recreated bucket fixture");
     let env = TestECStoreEnv::builder().base_dir(directory.path()).build().await;
     env.make_bucket(BUCKET, false).await;

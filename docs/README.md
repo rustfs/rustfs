@@ -21,6 +21,9 @@ For bounded local read-backend startup and cancellation, see
 
 For legacy protection assessment and bounded protected copies, see [Object integrity inventory, audit, and migration](operations/shard-integrity-audit.md).
 
+For encrypted listing compatibility and older stored fingerprints, see
+[Encrypted object ETags](operations/encrypted-etags.md).
+
 Operational runbooks live under [`operations/`](operations/). Replication
 operators should start with:
 

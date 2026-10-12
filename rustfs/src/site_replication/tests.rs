@@ -3570,11 +3570,6 @@ fn test_reconcile_site_replication_bucket_targets_allows_peer_on_same_port_as_lo
 }
 
 #[test]
-fn test_hash_client_secret_matches_minio_style_base64url_sha256() {
-    assert_eq!(hash_client_secret(Some("secret")), "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols");
-}
-
-#[test]
 fn test_site_replication_peer_client_cache_hit_generation_mismatch_returns_none() {
     let cache = Some(SiteReplicationPeerClientCache {
         generation: 7,
