@@ -48,12 +48,12 @@ pub(crate) const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("e
 pub(crate) const OPERATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("operations");
 pub(crate) const APPLY_RESULTS: TableDefinition<u64, &[u8]> = TableDefinition::new("apply_results");
 
-fn version_key(object: &ObjectIdentity, version: [u8; 16]) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn version_key(object: &ObjectIdentity, version: [u8; 16]) -> Result<Vec<u8>, StoreError> {
     let mut b = object_bytes(object)?;
     b.extend(version);
     Ok(b)
 }
-fn decode_version(b: &[u8]) -> Result<CreatedVersion, StoreError> {
+pub(crate) fn decode_version(b: &[u8]) -> Result<CreatedVersion, StoreError> {
     let mut d = Decoder::new(b);
     let v = CreatedVersion {
         prepared: d.prepared()?,
@@ -63,7 +63,7 @@ fn decode_version(b: &[u8]) -> Result<CreatedVersion, StoreError> {
     d.finish()?;
     Ok(v)
 }
-fn decode_event(b: &[u8]) -> Result<CreatedEvent, StoreError> {
+pub(crate) fn decode_event(b: &[u8]) -> Result<CreatedEvent, StoreError> {
     let mut d = Decoder::new(b);
     let e = CreatedEvent {
         object: d.object()?,
@@ -89,7 +89,7 @@ fn decode_operation(b: &[u8]) -> Result<CreatedOperation, StoreError> {
         result,
     })
 }
-fn decode_provenance(b: &[u8]) -> Result<CreatedOperationProvenance, StoreError> {
+pub(crate) fn decode_provenance(b: &[u8]) -> Result<CreatedOperationProvenance, StoreError> {
     if b.len() > MAX_OBJECT_KEY_LENGTH + 512 || b.get(..5) != Some(b"COPR\x01") {
         return Err(StoreError::CorruptRecord);
     }
@@ -107,7 +107,7 @@ pub(crate) fn validate_provenance_encoding(bytes: &[u8]) -> Result<(), StoreErro
     decode_provenance(bytes).map(|_| ())
 }
 
-fn decode_stored_operation(b: &[u8], schema: u64) -> Result<CreatedOperation, StoreError> {
+pub(crate) fn decode_stored_operation(b: &[u8], schema: u64) -> Result<CreatedOperation, StoreError> {
     if matches!(schema, 5 | 6) {
         Ok(decode_provenance(b)?.operation)
     } else {
@@ -139,7 +139,7 @@ pub(crate) fn read_binding(meta: &impl ReadableTable<&'static str, &'static [u8]
     d.finish()?;
     Ok(binding)
 }
-fn read_applied(meta: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<Option<LogId>, StoreError> {
+pub(crate) fn read_applied(meta: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<Option<LogId>, StoreError> {
     let b = meta.get("last_applied")?.ok_or(StoreError::CorruptRecord)?;
     let mut d = Decoder::new(b.value());
     let id = match d.take::<1>()?[0] {
@@ -255,6 +255,7 @@ fn apply_created(
             event.extend(binding_bytes(&binding)?);
             tx.open_table(EVENTS)?
                 .insert(command.operation_id.as_slice(), event.as_slice())?;
+            crate::source_page::insert_event_index(tx, id, command.operation_id)?;
             heads.insert(object_bytes(&command.object)?.as_slice(), command.prepared.version_id.as_slice())?;
             CreatedResult::Created {
                 version_id: command.prepared.version_id,
@@ -613,6 +614,7 @@ impl Store {
             if !tx.open_table(APPLY_RESULTS)?.is_empty()? {
                 return Err(StoreError::CorruptRecord);
             }
+            tx.open_table(crate::source_page::EVENT_SEQUENCE)?.retain(|_, _| false)?;
             meta.insert("capture_binding", encoded.as_slice())?;
             meta.insert("last_applied", &[0][..])?;
             meta.insert("schema", 3u64.to_be_bytes().as_slice())?;

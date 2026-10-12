@@ -9,6 +9,8 @@ use std::{
 mod application;
 mod committed;
 mod created;
+mod source_page;
+pub use source_page::{EventCursor, EventPage, MAX_EVENT_PAGE, SourceEvent};
 mod native_snapshot;
 mod node;
 pub use native_snapshot::{NativeSnapshotError, NativeSnapshotView};
@@ -256,6 +258,8 @@ pub enum StoreError {
     UnsupportedSchema,
     #[error("corrupt record")]
     CorruptRecord,
+    #[error("invalid event page limit")]
+    InvalidEventPage,
     #[error("invalid membership")]
     InvalidMembership(#[from] MembershipError),
     #[error("invalid log sequence")]
@@ -299,6 +303,7 @@ impl StoreError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::IdentityMismatch => "identity_mismatch",
+            Self::InvalidEventPage => "invalid_event_page",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::CorruptRecord => "corrupt_record",
             Self::InvalidMembership(_) => "invalid_membership",
@@ -361,6 +366,7 @@ impl Store {
             meta.insert("identity", encode_identity(identity).as_slice())?;
             tx.open_table(VOTE)?;
             tx.open_table(LOGS)?;
+            tx.open_table(source_page::EVENT_SEQUENCE)?;
         }
         store.commit(tx)?;
         Ok(store)
@@ -375,7 +381,7 @@ impl Store {
         Self::from_database(database, expected)
     }
     fn from_database(database: Database, expected: NodeIdentity) -> Result<Self, StoreError> {
-        let store = Self {
+        let mut store = Self {
             database,
             writable: true,
         };
@@ -432,6 +438,7 @@ impl Store {
         drop(vote);
         drop(meta);
         drop(tx);
+        store.ensure_event_index()?;
         Ok(store)
     }
     fn write_transaction(&self) -> Result<WriteTransaction, StoreError> {
