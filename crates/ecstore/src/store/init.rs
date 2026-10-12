@@ -9594,8 +9594,18 @@ mod tests {
     #[cfg(feature = "test-util")]
     async fn decommission_migrates_and_verifies_registered_durable_ilm_records_scenario() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-decommission", &[4, 4])).await;
+        // The explicit recovery below must be the only journal consumer,
+        // including when receipt validation outlasts the background interval.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "durable-ilm-decommission",
+            &[(1, 4), (1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
 
         let tier_name = "DECOMMISSION-ILM";
         let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
@@ -10067,6 +10077,16 @@ mod tests {
         .await
         .expect("manual task receipt should restore after the corruption check");
 
+        assert!(matches!(
+            com::read_config(store.pools[0].clone(), &tier_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &tier_path)
+                .await
+                .expect("manual recovery must still observe the exact migrated tier journal"),
+            tier_bytes
+        );
         let tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
             .expect("tier journal recovery should consume the migrated record before completion");

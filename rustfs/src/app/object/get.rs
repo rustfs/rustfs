@@ -5893,8 +5893,18 @@ mod tests {
                     *metadata.last_mut().expect("inline data bytes") ^= 1;
                     tokio::fs::write(&meta_path, metadata).await.expect("damage inline payload");
                 } else {
-                    let data_path = object_path.join(info.data_dir.expect("sharded object data directory").to_string());
-                    tokio::fs::remove_dir_all(data_path).await.expect("remove object data shards");
+                    // Discover version data dirs by listing the object directory
+                    // (matching delete_object_part_shards) instead of constructing
+                    // the path from info.data_dir, whose UUID string form may not
+                    // match the on-disk directory name.
+                    let mut entries = tokio::fs::read_dir(&object_path).await.expect("read object dir");
+                    while let Some(entry) = entries.next_entry().await.expect("read object dir entry") {
+                        if entry.file_type().await.expect("entry file type").is_dir() {
+                            tokio::fs::remove_dir_all(entry.path())
+                                .await
+                                .expect("remove object data shards");
+                        }
+                    }
                 }
             }
             let resolved = store
