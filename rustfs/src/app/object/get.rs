@@ -3002,7 +3002,7 @@ impl DefaultObjectUsecase {
             // resolver; only the response headers, authorization and audit
             // summary are derived here, without a second KMS unwrap.
             Some(headers) => (
-                Some(headers.server_side_encryption),
+                Some(headers.server_side_encryption).filter(|_| headers.sse_customer_algorithm.is_none()),
                 headers.sse_customer_algorithm,
                 headers.sse_customer_key_md5,
                 headers.ssekms_key_id,
