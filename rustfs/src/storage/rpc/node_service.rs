@@ -6787,7 +6787,7 @@ mod tests {
         };
         let rollback_dir = Uuid::new_v4();
         remote
-            .delete_version(
+            .delete_version_recoverable(
                 bucket,
                 object,
                 marker.clone(),

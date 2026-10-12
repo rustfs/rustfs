@@ -8833,9 +8833,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )) as Arc<dyn Send + Sync>
         });
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        let disks = self.disks.read().await.clone();
 
         if opts
             .namespace_lock_fence
@@ -24354,5 +24352,123 @@ mod crash_delete_retry_tests {
                 "bucket and completed part sidecars must be removed on every disk"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_inventory_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn batch_delete_completes_with_queued_disk_renewal() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = store.pools[0].disk_set[0].clone();
+        let disks = set.disk_inventory().await.into_iter().flatten().collect::<Vec<_>>();
+        let bucket = "batch-delete-renew";
+        let object = "existing-inline-version";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative real bucket");
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x73; 4096]),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed actual version");
+        let endpoint = set.set_endpoints[0].clone();
+        let ctx = crate::runtime::global::current_ctx();
+        let was_dist = ctx.is_dist_erasure().await;
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        }
+        let map = ctx.local_disk_map();
+        let previous = map.read().await.get(&endpoint.to_string()).cloned();
+
+        let barrier = DeleteCleanupBarrier::install(bucket);
+        let delete_store = store.clone();
+        let mut deletion = tokio::spawn(async move {
+            delete_store
+                .delete_objects(
+                    bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_owned(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let extra_gate = set.disks.read().await;
+        let renewal = set.renew_disk(&endpoint);
+        tokio::pin!(renewal);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::poll_fn(|cx| {
+                assert!(
+                    std::pin::pin!(tokio::task::unconstrained(renewal.as_mut()))
+                        .poll(cx)
+                        .is_pending(),
+                    "real renewal must reach inventory write"
+                );
+                if set.disks.try_read().is_err() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("queue real renewal writer");
+        let connected = map
+            .read()
+            .await
+            .get(&endpoint.to_string())
+            .cloned()
+            .flatten()
+            .expect("renewal registered new handle");
+        assert!(!Arc::ptr_eq(&connected, &disks[0]));
+        drop(extra_gate);
+        barrier.release();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(renewal.as_mut(), &mut deletion) }).await;
+        if outcome.is_err() {
+            deletion.abort();
+        }
+        drop(renewal);
+        if outcome.is_err() {
+            let _ = deletion.await;
+        }
+        {
+            let mut map = map.write().await;
+            match previous {
+                Some(old) => {
+                    map.insert(endpoint.to_string(), old);
+                }
+                None => {
+                    map.remove(&endpoint.to_string());
+                }
+            }
+        }
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+        }
+        let (_, result) =
+            outcome.expect("batch DELETE and real queued disk renewal must finish without nested inventory-read deadlock");
+        let (_, errors) = result.expect("delete task must finish");
+        assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }

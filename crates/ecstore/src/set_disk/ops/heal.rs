@@ -31,6 +31,8 @@ use std::sync::Arc;
 struct ExplicitVersionHeal<'a> {
     opts: &'a HealOpts,
     allow_regeneration: bool,
+    preserve_unrepairable: bool,
+    commit_fence: Option<&'a (dyn Fn() -> bool + Sync)>,
     retirement: Option<&'a MarkerRetirementContext<'a>>,
 }
 
@@ -771,6 +773,8 @@ impl SetDisks {
             ExplicitVersionHeal {
                 opts,
                 allow_regeneration: true,
+                preserve_unrepairable: false,
+                commit_fence: None,
                 retirement: None,
             },
             &mut None,
@@ -908,6 +912,8 @@ impl SetDisks {
         let ExplicitVersionHeal {
             opts,
             allow_regeneration: allow_explicit_version_regen,
+            preserve_unrepairable,
+            commit_fence,
             retirement,
         } = run;
         trace!(
@@ -925,6 +931,9 @@ impl SetDisks {
         let bucket_heal_scope = crate::store::bucket_heal_scope_for_object(bucket, object);
         if let Some(scope) = &bucket_heal_scope {
             scope.check()?;
+        }
+        if commit_fence.is_some_and(|check| !check()) {
+            return Err(DiskError::DiskOngoingReq);
         }
 
         let mut result = HealResultItem {
@@ -1249,7 +1258,7 @@ impl SetDisks {
                             // return here and never reach the post-heal reclaim tail
                             // below. Sweep the strays on this path too (issues #3231,
                             // #3191). Skipped on dry-run, like every mutating step.
-                            if !opts.dry_run {
+                            if !opts.dry_run && !preserve_unrepairable {
                                 self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
                             }
                             return Ok((result, None));
@@ -1329,7 +1338,7 @@ impl SetDisks {
                                 );
                             }
 
-                            if read_repair_uses_shared_lock {
+                            if read_repair_uses_shared_lock || preserve_unrepairable {
                                 return Ok((result, Some(cannot_heal_err)));
                             }
 
@@ -1528,6 +1537,9 @@ impl SetDisks {
                             if let Some(scope) = &bucket_heal_scope {
                                 scope.check()?;
                             }
+                            if commit_fence.is_some_and(|check| !check()) {
+                                return Err(DiskError::DiskOngoingReq);
+                            }
                             let disk = outdated_disk.as_ref().expect("checked above").clone();
                             let endpoint = disk.endpoint().to_string();
                             match disk.make_volume(bucket).await {
@@ -1562,6 +1574,9 @@ impl SetDisks {
 
                         if let Some(scope) = &bucket_heal_scope {
                             scope.check()?;
+                        }
+                        if commit_fence.is_some_and(|check| !check()) {
+                            return Err(DiskError::DiskOngoingReq);
                         }
                         if disks_to_heal_count == 0 {
                             return Ok((result, volume_creation_error.or(Some(DiskError::ErasureWriteQuorum))));
@@ -1874,6 +1889,10 @@ impl SetDisks {
                                 if let Some(scope) = &bucket_heal_scope {
                                     scope.check()?;
                                 }
+                                if commit_fence.is_some_and(|check| !check()) {
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Err(DiskError::DiskOngoingReq);
+                                }
                                 rename_attempts += 1;
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;
@@ -2005,7 +2024,9 @@ impl SetDisks {
                         // by pre-#3510 unversioned overwrites, which the dangling paths
                         // above never touch (issues #3231, #3191). Best effort — a
                         // failure must not fail the heal.
-                        self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
+                        if !preserve_unrepairable {
+                            self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
+                        }
 
                         Ok((result, None))
                     }
@@ -2071,7 +2092,7 @@ impl SetDisks {
                     .await;
                 }
 
-                if opts.dry_run {
+                if opts.dry_run || preserve_unrepairable {
                     return Ok((
                         self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                             .await,
@@ -3348,6 +3369,74 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 }
 
 impl SetDisks {
+    /// The recovery coordinator retains the key write lock and lifecycle fence.
+    /// Only current live metadata can supply this exact source; backups and
+    /// dangling cleanup cannot authorize prerequisite repair.
+    pub(in crate::set_disk) async fn heal_delete_recovery_source(
+        &self,
+        bucket: &str,
+        object: &str,
+        source: &crate::disk::DeleteRecoveryVersionIdentity,
+        can_commit: &(dyn Fn() -> bool + Sync),
+    ) -> disk::error::Result<()> {
+        if !can_commit() {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        let version = source.version_id.ok_or(DiskError::OutdatedXLMeta)?.to_string();
+        let disks = self.get_disks_internal().await;
+        let (metadata, errors, _) = Self::read_metadata(&disks, "", bucket, object, &version, true, false, false)
+            .await?
+            .into_legacy();
+        let (read_quorum, write_quorum) = Self::object_quorum_from_meta(&metadata, &errors, self.default_parity_count)?;
+        let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+        let write_quorum = usize::try_from(write_quorum).map_err(|_| DiskError::ErasureWriteQuorum)?;
+        let live_sources = metadata
+            .iter()
+            .zip(&errors)
+            .filter(|(info, error)| {
+                error.is_none()
+                    && !info.deleted
+                    && !info.is_remote()
+                    && crate::disk::DeleteRecoveryVersionIdentity::from_file_info((*info).clone())
+                        .is_ok_and(|identity| identity == *source)
+            })
+            .count();
+        if live_sources < write_quorum || !can_commit() {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let (_, mod_time, etag) = Self::list_online_disks(&disks, &metadata, &errors, read_quorum);
+        let selected = Self::pick_valid_fileinfo(&metadata, mod_time, etag, read_quorum)?;
+        if crate::disk::DeleteRecoveryVersionIdentity::from_file_info(selected)? != *source {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let opts = HealOpts {
+            no_lock: true,
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (_, error) = Box::pin(self.heal_object_with_explicit_version_regen(
+            bucket,
+            object,
+            &version,
+            ExplicitVersionHeal {
+                opts: &opts,
+                allow_regeneration: false,
+                preserve_unrepairable: true,
+                commit_fence: Some(can_commit),
+                retirement: None,
+            },
+            &mut None,
+        ))
+        .await?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if !can_commit() {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn heal_object_with_absence(
         &self,
         bucket: &str,
@@ -3390,11 +3479,24 @@ impl SetDisks {
             return Ok((result, err.map(|e| e.into())));
         }
 
+        let mut recovery_removed_version = false;
         if !opts.read_repair
             && _write_lock_guard.is_some()
             && let Some(scope) = crate::store::bucket_heal_scope_for_object(bucket, object)
             && !crate::bucket::utils::is_meta_bucketname(bucket)
         {
+            let requested = Uuid::parse_str(version_id).ok();
+            if !opts.dry_run && (version_id.is_empty() || requested.is_some()) {
+                let disks = self.get_disks_internal().await;
+                let before = Self::read_metadata(&disks, "", bucket, object, version_id, false, false, false)
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                recovery_removed_version = before
+                    .slots
+                    .iter()
+                    .filter_map(|slot| slot.file_info())
+                    .any(|info| version_id.is_empty() || Some(info.version_id.unwrap_or_default()) == requested);
+            }
             let explicit_delete = opts.remove
                 && version_id.is_empty()
                 && crate::bucket::metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket).await?
@@ -3409,6 +3511,7 @@ impl SetDisks {
                     crate::set_disk::DeleteRecoveryContext {
                         dry_run: opts.dry_run,
                         explicit_delete,
+                        repair_marker_source: true,
                         namespace_owner: (!opts.dry_run).then(|| {
                             Arc::new((scope.clone(), self.ctx.begin_namespace_commit(), _write_lock_guard.clone()))
                                 as Arc<dyn Send + Sync>
@@ -3501,7 +3604,7 @@ impl SetDisks {
                 *absence = Some(HealedObjectAbsence {
                     pool_index: self.pool_index,
                     set_index: self.set_index,
-                    removed: false,
+                    removed: recovery_removed_version,
                 });
             }
             return Ok((result, Some(err)));
@@ -3519,6 +3622,8 @@ impl SetDisks {
                 ExplicitVersionHeal {
                     opts: &inner_opts,
                     allow_regeneration: true,
+                    preserve_unrepairable: false,
+                    commit_fence: None,
                     retirement: proof.retirement,
                 },
                 absence,
@@ -3539,6 +3644,8 @@ impl SetDisks {
                             ExplicitVersionHeal {
                                 opts: &inner_opts,
                                 allow_regeneration: true,
+                                preserve_unrepairable: false,
+                                commit_fence: None,
                                 retirement: proof.retirement,
                             },
                             absence,

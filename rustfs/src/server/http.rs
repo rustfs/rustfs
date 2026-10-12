@@ -4169,6 +4169,51 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn cold_delete_recovery_discovery_uses_production_body_auth() {
+        use storage::DiskAPI;
+        temp_env::async_with_vars([("RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT", Some("false"))], async {
+            let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind recovery RPC peer");
+            let addr = listener.local_addr().expect("recovery RPC address");
+            let previous_node_name = rustfs_common::get_global_local_node_name().await;
+            rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+            let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+            let service = RpcRequestPathService::new(Routes::new(node).prepare());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("accept recovery RPC connection");
+                ConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                    .await
+                    .expect("serve recovery RPC connection");
+            });
+            let mut endpoint =
+                Endpoint::try_from(format!("http://{addr}/cold-recovery-disk").as_str()).expect("remote recovery endpoint");
+            endpoint.is_local = false;
+            let disk = storage::new_disk(
+                &endpoint,
+                &storage::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("production remote disk client");
+            // Recovery may race a heal-control peer-state refresh, before another
+            // authenticated response has repopulated the shared peer state.
+            let result = disk.discover_delete_transactions("cold-recovery-bucket", None, None, 1).await;
+            server.abort();
+            let _ = server.await;
+            rustfs_common::set_global_local_node_name(&previous_node_name).await;
+            assert!(
+                matches!(result, Err(crate::storage_api::error::DiskError::DiskNotFound)),
+                "the cold request must pass production authentication and reach the missing-disk handler: {result:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn peer_rest_heal_control_uses_production_auth_and_keeps_validation_errors_online() {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let listener = match TcpListener::bind("127.0.0.1:0").await {

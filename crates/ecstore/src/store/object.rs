@@ -4932,12 +4932,22 @@ impl ECStore {
             let mut opts = opts;
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
             let result = self
-                .handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)
+                .handle_delete_object_with_journal_inner_boxed(bucket, object, opts, tier_journal_api)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             result
         })
         .await
+    }
+
+    fn handle_delete_object_with_journal_inner_boxed<'a>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> impl std::future::Future<Output = Result<ObjectInfo>> + Send + 'a {
+        Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api))
     }
 
     async fn handle_delete_object_with_journal_inner(
@@ -5531,10 +5541,11 @@ impl ECStore {
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
-        let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
+        let _object_lock_guards = Arc::new(match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
-        };
+        });
+        opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), _object_lock_guards.clone())));
         #[cfg(any(test, feature = "test-util"))]
         if !_object_lock_guards.is_empty() {
             notify_delete_namespace_acquired(bucket);
@@ -9279,8 +9290,31 @@ mod tests {
                 .expect("read original marker");
             assert_eq!(info.delete_marker_incarnation(), Some(old_incarnation));
         }
-        // Taking four actual members offline preserves their existing xl.meta.
-        // All deletion/recreation work below goes through the normal store API.
+        // Save each stale member's inline versions before converging the old
+        // bucket's delete receipts, then reintroduce them after recreation.
+        let mut stale_metadata = Vec::new();
+        for disk in before.iter().skip(12).flatten() {
+            for version in &historical {
+                let info = disk
+                    .read_version(
+                        "",
+                        bucket,
+                        "history.bin",
+                        &version.to_string(),
+                        &crate::disk::ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read stale inline data version");
+                assert!(info.inline_data() && info.data.is_some(), "fixture payload must be preserved in xl.meta");
+            }
+            stale_metadata.push((
+                disk.read_all(bucket, "history.bin/xl.meta").await.unwrap(),
+                disk.read_all(bucket, &format!("{object}/xl.meta")).await.unwrap(),
+            ));
+        }
         for slot in 12..16 {
             set.disks.write().await[slot] = None;
         }
@@ -9310,6 +9344,29 @@ mod tests {
             )
             .await
             .expect("delete exact old marker with four drives offline");
+        let pending = store
+            .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect_err("offline participants require retained delete receipts");
+        assert!(matches!(
+            pending,
+            StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. }
+        ));
+        assert!(
+            !crate::bucket::retirement::is_retired(store.clone(), bucket, old_incarnation)
+                .await
+                .unwrap()
+        );
+        *set.disks.write().await = before.clone();
+        store
+            .recover_delete_transactions_at_incarnation(
+                bucket,
+                None,
+                Some(old_incarnation),
+                &rustfs_heal_contracts::heal_channel::HealOpts::default(),
+            )
+            .await
+            .expect("converge old bucket deletes on all participants");
         store
             .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
             .await
@@ -9319,6 +9376,9 @@ mod tests {
                 .await
                 .expect("durable retirement")
         );
+        for slot in 12..16 {
+            set.disks.write().await[slot] = None;
+        }
         store
             .handle_make_bucket(bucket, &create)
             .await
@@ -9343,6 +9403,13 @@ mod tests {
                 .await
                 .expect("write new generation");
             new_versions.push((key, info.version_id.unwrap(), payload));
+        }
+        for (slot, (history, marker)) in (12..16).zip(stale_metadata) {
+            for (key, bytes) in [("history.bin", history), (object, marker)] {
+                let root = dirs[slot].path().join(bucket).join(key);
+                tokio::fs::create_dir_all(&root).await.unwrap();
+                tokio::fs::write(root.join("xl.meta"), bytes).await.unwrap();
+            }
         }
         *set.disks.write().await = before.clone();
         let heal = rustfs_heal_contracts::heal_channel::HealOpts {
@@ -11575,5 +11642,100 @@ mod missing_key_delete_quorum_tests {
             errors.iter().all(Option::is_none),
             "batch missing-key delete must preserve its idempotent success at quorum: {errors:?}"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn batch_delete_timeout_retains_physical_key_guard() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use crate::disk::{DiskAPI, ReadOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+        temp_env::async_with_vars([("RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS", Some("30"))], async {
+            let (_dirs, store) = isolated_store_over_temp_disks().await;
+            init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = "review-batch-late-owner";
+            let key = "object";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("fixture bucket");
+            let mut reader = PutObjReader::from_vec(vec![0x51; 1024 * 1024]);
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed real external object");
+            let disks = store.pools[0].disk_set[0].disk_inventory().await;
+            let disk = disks[0].as_ref().expect("online drive");
+            let info = disk
+                .read_version("", bucket, key, "", &ReadOptions::default())
+                .await
+                .expect("seed metadata");
+            assert!(!info.inline_data());
+            let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                panic!("local disk");
+            };
+            let part = local
+                .get_disk()
+                .get_object_path_for_io(bucket, key)
+                .expect("leased key")
+                .join(info.data_dir.expect("external data directory").to_string())
+                .join("part.1");
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let hook = hooks::install_at(hooks::Stage::Remove, &part, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let deleting = store.clone();
+            let delete = tokio::spawn(async move {
+                deleting
+                    .delete_objects_with_tier_delete_journal_and_accounting(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: key.to_owned(),
+                            ..Default::default()
+                        }],
+                        ObjectOptions::default(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .expect("physical cleanup entry")
+                .expect("entry hook");
+            assert!(part.exists(), "payload unlink has not run");
+            let (_, errors, _) = tokio::time::timeout(Duration::from_secs(40), delete)
+                .await
+                .expect("real settlement timeout must return")
+                .expect("delete task");
+            assert!(errors.iter().all(Option::is_none), "certified batch response: {errors:?}");
+            assert!(
+                store.ctx.namespace_commits_pending(),
+                "background physical operation must retain its owner"
+            );
+            let ns = store.handle_new_ns_lock(bucket, key).await.expect("same production key lock");
+            let probe = ns.get_write_lock(Duration::from_millis(300)).await;
+            let acquired_while_pending = probe.is_ok();
+            drop(probe);
+            drop(release);
+            drop(hook);
+            assert!(
+                !acquired_while_pending,
+                "batch released the exact-key guard while physical cleanup was still paused after its real recovery timeout"
+            );
+            let _released = ns
+                .get_write_lock(Duration::from_secs(10))
+                .await
+                .expect("physical cleanup must eventually release the exact-key guard");
+        })
+        .await;
     }
 }

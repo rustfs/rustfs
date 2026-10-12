@@ -39,7 +39,7 @@ pub(super) fn digest(bytes: &[u8]) -> DeleteRecoveryDigest {
     Sha256::digest(bytes).into()
 }
 
-fn generation(mut canonical: FileInfo) -> Result<crate::disk::DeleteRecoveryVersionIdentity> {
+pub(in crate::disk) fn generation(mut canonical: FileInfo) -> Result<crate::disk::DeleteRecoveryVersionIdentity> {
     canonical.data = None;
     canonical.erasure.index = 0;
     canonical.erasure.checksums.clear();
@@ -665,7 +665,26 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                 });
         }
     }
-    let state = if journal.is_some() {
+    // In-place shard repair leaves a backup in the live data directory.
+    // Preserve it without interpreting it as an unfinished delete.
+    let live_write_backup = journal.is_none()
+        && !any_marker
+        && !regular_marker(&rollback.join(DELETE_MARKER_ROLLBACK_FILE))?
+        && prepared.is_none()
+        && target.is_none()
+        && receipt_bytes.is_none()
+        && !finished
+        && current_meta.as_ref().is_some_and(|meta| {
+            meta.get_data_dirs()
+                .is_ok_and(|dirs| dirs.into_iter().flatten().any(|dir| dir == transaction))
+        })
+        && before_meta.as_ref().is_some_and(|meta| {
+            meta.get_data_dirs()
+                .is_ok_and(|dirs| dirs.into_iter().flatten().any(|dir| dir == transaction))
+        });
+    let state = if live_write_backup {
+        DeleteRecoveryState::Absent
+    } else if journal.is_some() {
         if committed {
             if finished {
                 DeleteRecoveryState::CommitFinished
@@ -869,7 +888,7 @@ impl LocalDisk {
             if session.frames.is_empty() {
                 match std::fs::read_dir(&session.root) {
                     Ok(entries) => session.frames.push((String::new(), entries)),
-                    Err(err) if err.kind() == ErrorKind::NotFound && session.object.is_some() => {
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
                         return Ok(DeleteRecoveryPage {
                             transactions: Vec::new(),
                             next: None,
@@ -2504,6 +2523,47 @@ mod tests {
             .await
             .unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_live_repair_backup_preserves_legacy_delete_guards() {
+        for shape in ["live", "rollback-marker", "missing-current", "foreign-backup"] {
+            let (_temp, disk, mut info, _) = fixture().await;
+            let transaction = Uuid::new_v4();
+            info.data_dir = Some(transaction);
+            let root = disk.io_get_object_path("recovery", "object").unwrap();
+            let current = test_meta(info.clone());
+            fs::write(root.join(STORAGE_FORMAT_FILE), &current).await.unwrap();
+            let rollback = root.join(transaction.to_string());
+            fs::create_dir(&rollback).await.unwrap();
+            if shape == "foreign-backup" {
+                info.data_dir = Some(Uuid::new_v4());
+            }
+            let backup = test_meta(info);
+            fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), &backup).await.unwrap();
+            if shape == "rollback-marker" {
+                fs::write(rollback.join(DELETE_MARKER_ROLLBACK_FILE), []).await.unwrap();
+            } else if shape == "missing-current" {
+                fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+            }
+            let inspection = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .unwrap();
+            assert_eq!(
+                inspection.state,
+                if shape == "live" {
+                    DeleteRecoveryState::Absent
+                } else {
+                    DeleteRecoveryState::LegacyAmbiguous
+                },
+                "{shape}"
+            );
+            assert_eq!(fs::read(rollback.join(STORAGE_FORMAT_FILE_BACKUP)).await.unwrap(), backup);
+            if shape != "missing-current" {
+                assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.unwrap(), current);
+            }
+        }
     }
 
     #[tokio::test]

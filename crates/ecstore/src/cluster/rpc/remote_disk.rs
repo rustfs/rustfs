@@ -934,8 +934,9 @@ impl RemoteDisk {
                     protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
                     operation: payload.into(),
                 });
-                let canonical_body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "recover_delete_transaction")?;
+                let canonical_body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                    .map_err(|_| Error::other("recover_delete_transaction request length cannot be represented"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
                 // UNIMPLEMENTED is deliberately propagated: older peers cannot settle transactions.
                 let response = client
                     .recover_delete_transaction(request)

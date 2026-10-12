@@ -47,6 +47,8 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub incarnation: Option<Uuid>,
     pub dry_run: bool,
     pub explicit_delete: bool,
+    /// Only the locked heal path may repair a live marker-creation source.
+    pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
@@ -57,6 +59,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             incarnation,
             dry_run: false,
             explicit_delete: false,
+            repair_marker_source: false,
             namespace_owner: None,
             can_commit,
         }
@@ -404,6 +407,7 @@ impl SetDisks {
             incarnation,
             dry_run,
             explicit_delete,
+            repair_marker_source,
             namespace_owner,
             can_commit,
         } = context;
@@ -465,6 +469,39 @@ impl SetDisks {
             }
             all_states.insert(transaction, complete);
         }
+        let prerequisite = if repair_marker_source && !dry_run {
+            let mut active = all_states
+                .iter()
+                .filter(|(_, copies)| copies.iter().any(|copy| copy.state != DeleteRecoveryState::Absent));
+            let first = active.next();
+            if active.next().is_none() {
+                first.and_then(|(&transaction, copies)| {
+                    marker_source_to_repair(copies, incarnation).map(|source| (transaction, source))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((transaction, source)) = prerequisite {
+            Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit)).await?;
+            let refreshed = inspect(&disks, bucket, object, transaction)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            if !can_commit() {
+                return Err(DiskError::DiskOngoingReq);
+            }
+            if refreshed.iter().any(|copy| {
+                copy.journal
+                    .as_ref()
+                    .is_some_and(|journal| journal.bucket_incarnation != incarnation)
+            }) {
+                return Err(DiskError::OutdatedXLMeta);
+            }
+            all_states.insert(transaction, refreshed);
+        }
         let transaction_order = causal_transaction_order(&all_states)?;
         // Legacy snapshots contain no set decision. A fresh authorized removal
         // applies only after the entire key is absent and every raw shape is safe.
@@ -488,12 +525,25 @@ impl SetDisks {
                         DeleteRecoveryState::LegacyAmbiguous => false,
                     }
             });
+        // Receipt cleanup alone does not mutate xl.meta. Returning peers and
+        // undecided preparations still need fences before and after recovery.
+        let metadata_may_change = all_states.values().any(|copies| {
+            !copies.iter().all(|copy| copy.state == DeleteRecoveryState::Absent)
+                && copies.iter().any(|copy| {
+                    copy.state == DeleteRecoveryState::NewPrepared
+                        || (copy.state == DeleteRecoveryState::Absent && copy.current_digest.is_some())
+                        || copy
+                            .journal
+                            .as_ref()
+                            .is_some_and(|journal| copy.current_digest != journal.target_digest)
+                })
+        });
         let namespace_owner = if dry_run {
             None
         } else {
             Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit()))
         };
-        if !dry_run {
+        if !dry_run && metadata_may_change {
             self.invalidate_get_object_metadata_cache(bucket, object).await;
         }
         let authorities = all_states
@@ -753,11 +803,69 @@ impl SetDisks {
             }
         }
 
-        if !dry_run {
+        if !dry_run && metadata_may_change {
             self.invalidate_get_object_metadata_cache(bucket, object).await;
         }
         Ok(summary)
     }
+}
+
+// A lagging member may have the complete older suffix of a marker creation's
+// live source. Repair that source before applying the original strict matcher.
+fn marker_source_to_repair(
+    copies: &[DeleteRecoveryInspection],
+    incarnation: Option<Uuid>,
+) -> Option<crate::disk::DeleteRecoveryVersionIdentity> {
+    let expected = incarnation.filter(|id| !id.is_nil())?;
+    let authority = copies
+        .iter()
+        .filter(|copy| receipt(copy.state))
+        .find_map(|copy| copy.journal.as_ref())?;
+    let source = authority.original_versions.first()?;
+    let request = authority.requests.first()?;
+    if authority.bucket_incarnation != Some(expected)
+        || authority.requests.len() != 1
+        || !request.deleted
+        || !request.mark_deleted
+        || request.version_id.is_none_or(|id| id.is_nil())
+        || authority
+            .original_versions
+            .iter()
+            .any(|version| version.version_id == request.version_id)
+        || !authority.deleted_versions.is_empty()
+        || !authority.data_dirs.is_empty()
+        || authority.target_digest.is_none()
+        || source.version_id.is_none_or(|id| id.is_nil())
+        || source.deleted
+    {
+        return None;
+    }
+    let mut missing_source = false;
+    for copy in copies {
+        match copy.state {
+            DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished => {
+                let journal = copy.journal.as_ref()?;
+                if journal.bucket_incarnation != Some(expected)
+                    || journal.original_versions != authority.original_versions
+                    || !journal.matches_prepared_authority(authority)
+                    || copy.current_digest != journal.target_digest
+                {
+                    return None;
+                }
+            }
+            DeleteRecoveryState::Absent => {
+                if copy.journal.is_some()
+                    || copy.current_versions.is_empty()
+                    || !authority.original_versions.ends_with(&copy.current_versions)
+                {
+                    return None;
+                }
+                missing_source |= copy.current_versions.first() != Some(source);
+            }
+            _ => return None,
+        }
+    }
+    missing_source.then(|| source.clone())
 }
 
 fn unavailable(error: &DiskError) -> bool {
@@ -793,7 +901,7 @@ fn unavailable(error: &DiskError) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
-    use crate::disk::{DeleteOptions, STORAGE_FORMAT_FILE};
+    use crate::disk::{DeleteOptions, ReadOptions, STORAGE_FORMAT_FILE};
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO, ObjectOperations};
@@ -920,6 +1028,142 @@ mod tests {
             report.detail
         );
         assert_eq!(body(&store, bucket, None).await, original);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_marker_source_heal_preserves_foreign_history_and_damaged_data() {
+        fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            let mut files = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap());
+                    }
+                }
+            }
+            files
+        }
+
+        for shape in ["live-backup", "foreign", "partial-history", "damaged-data"] {
+            let bucket = "recover-marker-source-guards";
+            let (dirs, store) = isolated_store_over_temp_disks().await;
+            init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            store
+                .make_bucket(
+                    bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.unwrap();
+            let set = &store.pools[0].disk_set[0];
+            let disks: Vec<_> = set.disk_inventory().await.into_iter().map(Option::unwrap).collect();
+            let original = vec![71; 1024 * 1024];
+            let oldest = put(&store, bucket, &original, true).await.unwrap();
+            let first = put(&store, bucket, &original, true).await.unwrap();
+            set.disks.write().await[3] = None;
+            let payload = vec![72; 1024 * 1024];
+            let source = put(&store, bucket, &payload, true).await.unwrap();
+            store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("publish marker while one member lacks the source version");
+            set.disks.write().await[3] = Some(disks[3].clone());
+            let mut first_info = disks[3]
+                .read_version("", bucket, "object", &first.to_string(), &ReadOptions::default())
+                .await
+                .unwrap();
+            match shape {
+                "live-backup" => {
+                    let root = dirs[3].path().join(bucket).join("object");
+                    let backup = root.join(first_info.data_dir.unwrap().to_string()).join("xl.meta.bkp");
+                    tokio::fs::write(backup, tokio::fs::read(root.join("xl.meta")).await.unwrap())
+                        .await
+                        .unwrap();
+                }
+                "foreign" => {
+                    first_info.version_id = Some(Uuid::new_v4());
+                    first_info.mod_time = Some(time::OffsetDateTime::now_utc());
+                    disks[3].write_metadata("", bucket, "object", first_info).await.unwrap();
+                }
+                "partial-history" => {
+                    disks[3]
+                        .delete_version(
+                            bucket,
+                            "object",
+                            FileInfo {
+                                name: "object".into(),
+                                version_id: Some(oldest),
+                                ..Default::default()
+                            },
+                            false,
+                            DeleteOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                "damaged-data" => {
+                    // Three metadata sources meet write quorum, but corrupting
+                    // two shards leaves fewer than EC2+2's two required readers.
+                    for (index, disk) in disks.iter().take(2).enumerate() {
+                        let info = disk
+                            .read_version("", bucket, "object", &source.to_string(), &ReadOptions::default())
+                            .await
+                            .unwrap();
+                        let part = dirs[index]
+                            .path()
+                            .join(bucket)
+                            .join("object")
+                            .join(info.data_dir.unwrap().to_string())
+                            .join("part.1");
+                        let mut bytes = tokio::fs::read(&part).await.unwrap();
+                        *bytes.last_mut().unwrap() ^= 1;
+                        tokio::fs::write(part, bytes).await.unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let before: Vec<_> = dirs
+                .iter()
+                .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+                .collect();
+            let result = store
+                .heal_object_at_incarnation(
+                    bucket,
+                    "object",
+                    &source.to_string(),
+                    incarnation,
+                    &HealOpts {
+                        scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if shape == "live-backup" {
+                assert!(result.unwrap().error.is_none(), "plain live backups cannot block source repair");
+                assert_eq!(body(&store, bucket, Some(source)).await, payload);
+                assert_eq!(body(&store, bucket, Some(first)).await, original);
+            } else {
+                assert!(result.is_err() || result.unwrap().error.is_some(), "{shape} must fail safely");
+                for (dir, expected) in dirs.iter().zip(before) {
+                    assert_eq!(snapshot(&dir.path().join(bucket).join("object")), expected, "{shape}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

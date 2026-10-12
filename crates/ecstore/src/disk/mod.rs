@@ -1959,6 +1959,12 @@ pub struct DeleteRecoveryVersionIdentity {
     pub metadata_digest: DeleteRecoveryDigest,
 }
 
+impl DeleteRecoveryVersionIdentity {
+    pub(crate) fn from_file_info(info: FileInfo) -> error::Result<Self> {
+        local::delete_recovery::generation(info)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeleteRecoveryState {
     Absent,

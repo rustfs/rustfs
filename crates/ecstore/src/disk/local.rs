@@ -17,7 +17,7 @@ pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
-mod delete_recovery;
+pub(super) mod delete_recovery;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;

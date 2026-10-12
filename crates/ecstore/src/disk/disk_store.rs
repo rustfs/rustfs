@@ -466,12 +466,11 @@ impl LocalDiskWrapper {
         self.track_disk_health_mutation(
             "delete_version",
             DiskMetricMutation::Delete,
-            || async {
+            || {
                 Box::pin(
                     self.disk
                         .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner),
                 )
-                .await
             },
             get_max_timeout_duration(),
         )
@@ -2071,10 +2070,12 @@ impl LocalDiskWrapper {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
             DiskMetricMutation::Delete,
-            || async {
-                self.disk
-                    .delete_recovery_settle(volume, object, transaction, expected_fingerprint, action, namespace_owner)
-                    .await
+            || {
+                Box::pin(async {
+                    self.disk
+                        .delete_recovery_settle(volume, object, transaction, expected_fingerprint, action, namespace_owner)
+                        .await
+                })
             },
             crate::disk::get_delete_recovery_timeout()?,
         )
