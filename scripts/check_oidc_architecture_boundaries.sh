@@ -130,7 +130,10 @@ def is_struct_pattern(source, opening_brace):
     if depth:
         return False
     suffix = source[index:].lstrip()
-    return suffix.startswith("=>") or (suffix.startswith("=") and not suffix.startswith("=="))
+    typed_let_pattern = suffix.startswith(":") and re.search(
+        r"\blet\s+(?:\w+\s*::\s*)*FederatedAuthorization\s*$", source[:opening_brace]
+    )
+    return bool(typed_let_pattern) or suffix.startswith("=>") or (suffix.startswith("=") and not suffix.startswith("=="))
 
 
 def function_body(source, name):
