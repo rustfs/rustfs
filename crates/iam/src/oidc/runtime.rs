@@ -16,7 +16,7 @@ use super::{
         OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderSummary, OidcSiteReplicationSnapshot,
         SourcedOidcProviderConfig, load_oidc_config_snapshot,
     },
-    provider::{ProviderRuntime, discover_provider},
+    provider::{ProviderRuntime, discover_provider_for_recovery},
     state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
     transport::{OidcExtraRootCaProvider, ReqwestHttpClient, inspect_token_response_body, oidc_http_error_diagnostics},
 };
@@ -37,11 +37,19 @@ use openidconnect::{
     PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_utils::logging::LogThrottle;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use std::time::Duration;
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, error, info, warn};
+
+const OIDC_DISCOVERY_RECOVERY_CONCURRENCY: usize = 4;
+const OIDC_DISCOVERY_RECOVERY_MAX_DELAY_MS: u64 = 30_000;
+// A round can try two issuer variants three times, each fetching discovery and JWKS.
+const OIDC_DISCOVERY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(125);
 
 /// Claims extracted from an OIDC ID token.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,6 +68,7 @@ pub struct OidcSys {
     pub(super) configs: HashMap<String, SourcedOidcProviderConfig>,
     pub(super) provider_runtime: ProviderRuntime,
     pub(super) state_store: OidcStateStore,
+    pub(super) pending_discovery: Mutex<Vec<String>>,
 }
 
 pub(super) fn trusted_aud(other_audiences: &[String], audience: &Audience) -> bool {
@@ -81,8 +90,16 @@ impl OidcSys {
     async fn new_with_http_client(http_client: ReqwestHttpClient) -> Result<Self, String> {
         let server_config = crate::server_config::current_server_config();
         let parsed_configs = load_oidc_config_snapshot(server_config.as_ref());
+        Self::new_with_config_snapshot(http_client, parsed_configs).await
+    }
+
+    async fn new_with_config_snapshot(
+        http_client: ReqwestHttpClient,
+        parsed_configs: OidcConfigSnapshot,
+    ) -> Result<Self, String> {
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
+        let mut pending_discovery = Vec::new();
 
         for sourced_config in parsed_configs.into_providers() {
             let config = &sourced_config.config;
@@ -91,13 +108,15 @@ impl OidcSys {
                 continue;
             }
 
-            match discover_provider(config, &http_client).await {
+            match discover_provider_for_recovery(config, &http_client).await {
                 Ok(state) => {
                     debug!(provider = %config.id, "OIDC provider discovered");
                     provider_states.insert(config.id.clone(), state);
-                    configs.insert(config.id.clone(), sourced_config);
                 }
                 Err(e) => {
+                    if e.retryable {
+                        pending_discovery.push(config.id.clone());
+                    }
                     error!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
@@ -114,13 +133,86 @@ impl OidcSys {
                     );
                 }
             }
+            // Configuration also supplies redirect and authorization rules before recovery.
+            configs.insert(config.id.clone(), sourced_config);
         }
 
         Ok(Self {
             configs,
             provider_runtime: ProviderRuntime::new(http_client, provider_states),
             state_store: OidcStateStore::new(),
+            pending_discovery: Mutex::new(pending_discovery),
         })
+    }
+
+    /// Recover providers that failed startup discovery due to a transient error.
+    /// The server owns and cancels this future; dropping it cancels all outstanding requests.
+    /// Pending providers are claimed once so concurrent callers cannot duplicate recovery.
+    pub async fn recover_failed_providers(&self) {
+        let pending = std::mem::take(&mut *self.pending_discovery.lock().await);
+        let permits = Semaphore::new(OIDC_DISCOVERY_RECOVERY_CONCURRENCY);
+        futures::future::join_all(pending.iter().filter_map(|id| self.get_provider_config(id)).map(|config| {
+            let permits = &permits;
+            async move {
+                let mut delay_ms = 1_000_u64;
+                let failure_log = LogThrottle::new(60_000);
+                loop {
+                    let sleep_ms = rand::random_range(delay_ms * 3 / 4..=delay_ms);
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    let Ok(permit) = permits.acquire().await else {
+                        return;
+                    };
+                    let result = tokio::time::timeout(
+                        OIDC_DISCOVERY_RECOVERY_TIMEOUT,
+                        self.provider_runtime.recover_provider_state(&config.id, config),
+                    )
+                    .await;
+                    drop(permit);
+                    let (error_kind, error_detail) = match result {
+                        Ok(Ok(_)) => {
+                            info!(
+                                event = EVENT_OIDC_DIAGNOSTICS,
+                                component = LOG_COMPONENT_IAM,
+                                subsystem = LOG_SUBSYSTEM_OIDC,
+                                result = "provider_discovery_recovered",
+                                provider_id = %config.id,
+                                "oidc provider discovery recovered"
+                            );
+                            return;
+                        }
+                        Ok(Err(error)) if !error.retryable => {
+                            error!(
+                                event = EVENT_OIDC_DIAGNOSTICS,
+                                component = LOG_COMPONENT_IAM,
+                                subsystem = LOG_SUBSYSTEM_OIDC,
+                                result = "provider_discovery_recovery_stopped",
+                                provider_id = %config.id,
+                                error = %error,
+                                "oidc provider discovery requires configuration correction"
+                            );
+                            return;
+                        }
+                        Ok(Err(error)) => error.diagnostics,
+                        Err(_) => ("attempt_timeout", OIDC_DISCOVERY_RECOVERY_TIMEOUT.as_secs().to_string()),
+                    };
+                    if let Some(suppressed) = failure_log.claim() {
+                        warn!(
+                            event = EVENT_OIDC_DIAGNOSTICS,
+                            component = LOG_COMPONENT_IAM,
+                            subsystem = LOG_SUBSYSTEM_OIDC,
+                            result = "provider_discovery_recovery_pending",
+                            provider_id = %config.id,
+                            error_kind,
+                            error_detail = %error_detail,
+                            suppressed,
+                            "oidc provider discovery remains unavailable"
+                        );
+                    }
+                    delay_ms = delay_ms.saturating_mul(2).min(OIDC_DISCOVERY_RECOVERY_MAX_DELAY_MS);
+                }
+            }
+        }))
+        .await;
     }
 
     /// Create an OidcSys with no providers (useful for when OIDC is not configured).
@@ -129,6 +221,7 @@ impl OidcSys {
             configs: HashMap::new(),
             provider_runtime: ProviderRuntime::new(ReqwestHttpClient::new()?, HashMap::new()),
             state_store: OidcStateStore::new(),
+            pending_discovery: Mutex::default(),
         })
     }
 
@@ -895,3 +988,7 @@ impl FederatedProviderQuery for StandardOidcAdapter {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
