@@ -24,6 +24,7 @@ pub(crate) mod heal_walk;
 pub(crate) mod list;
 pub(crate) mod locking;
 pub(crate) mod multipart;
+pub(crate) mod native_prepare;
 pub(crate) mod object;
 
 #[cfg(test)]

@@ -88,7 +88,94 @@ impl NativePreparationReceipt {
         &self.shard_digest
     }
 }
+/// A routing observation, never a durability or publication receipt.
+pub(crate) enum NativePreparationProbe {
+    Absent,
+    Existing {
+        version: Uuid,
+        prepared: bool,
+        object_digest: [u8; 32],
+        object_length: u64,
+        set_digest: [u8; 32],
+        distribution_digest: [u8; 32],
+        metadata: Option<bytes::Bytes>,
+    },
+}
+#[cfg(all(test, unix))]
+pub(crate) use tests::{clear_native_preparation_probe, pause_native_preparation};
 impl LocalDisk {
+    #[cfg(unix)]
+    pub(crate) async fn probe_native(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+        fence: Arc<ObjectLockConfigSnapshot>,
+    ) -> Result<NativePreparationProbe> {
+        if preparation.is_nil() || !fence.is_valid_for_destructive_put(store_id, bucket, incarnation) {
+            return Err(DiskError::InvalidPath);
+        }
+        let object_path = self.get_object_path(bucket, key)?;
+        // Match the writer's metadata -> object -> preparation lock order.
+        let metadata_owner = crate::disk::os::acquire_metadata_mutation_lease(&object_path, Some(fence.clone())).await;
+        let object_owner = crate::disk::os::acquire_rename_data_mutation_lease_with_owner(
+            &self.root,
+            bucket,
+            &object_path,
+            Some(metadata_owner),
+        )
+        .await;
+        let prep_path = self
+            .root
+            .join(".rustfs.sys/native-preparations")
+            .join(preparation.to_string());
+        let owner = crate::disk::os::acquire_namespace_mutation_lease_with_owner(&prep_path, Some(object_owner)).await;
+        let disk = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        let root = self.io_root().to_path_buf();
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        crate::disk::os::run_blocking_namespace_operation(owner, move || {
+            if !fence.is_valid_for_destructive_put(store_id, &bucket, incarnation) {
+                return Err(std::io::Error::other("native preparation fence changed"));
+            }
+            let result = durable::probe(&root, preparation, disk, store_id, &bucket, &key, incarnation)?;
+            if !fence.is_valid_for_destructive_put(store_id, &bucket, incarnation) {
+                return Err(std::io::Error::other("native preparation fence changed"));
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(Into::into)
+    }
+    #[cfg(not(unix))]
+    pub(crate) async fn probe_native(
+        &self,
+        _preparation: Uuid,
+        _store_id: Uuid,
+        _bucket: &str,
+        _key: &str,
+        _incarnation: Uuid,
+        _fence: Arc<ObjectLockConfigSnapshot>,
+    ) -> Result<NativePreparationProbe> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    #[cfg(not(unix))]
+    pub(crate) async fn recover_native_with_metadata(
+        &self,
+        _preparation: Uuid,
+        _store_id: Uuid,
+        _bucket: &str,
+        _incarnation: Uuid,
+        _fence: Arc<ObjectLockConfigSnapshot>,
+    ) -> Result<(NativePreparationReceipt, bytes::Bytes)> {
+        Err(DiskError::UnsupportedDisk)
+    }
     /// Inspect a persisted preparation under fresh lifecycle and namespace owners.
     /// Recovery re-establishes barriers after an earlier unknown I/O outcome.
     #[cfg(unix)]
@@ -100,6 +187,20 @@ impl LocalDisk {
         incarnation: Uuid,
         fence: Arc<ObjectLockConfigSnapshot>,
     ) -> Result<NativePreparationReceipt> {
+        self.recover_native_with_metadata(preparation, store_id, bucket, incarnation, fence)
+            .await
+            .map(|(receipt, _)| receipt)
+    }
+    /// Return the exact metadata verified under the same recovery owners.
+    #[cfg(unix)]
+    pub(crate) async fn recover_native_with_metadata(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        fence: Arc<ObjectLockConfigSnapshot>,
+    ) -> Result<(NativePreparationReceipt, bytes::Bytes)> {
         if preparation.is_nil() || !fence.is_valid_for_destructive_put(store_id, bucket, incarnation) {
             return Err(DiskError::InvalidPath);
         }
@@ -142,6 +243,20 @@ impl LocalDisk {
     }
     /// Retain the real bucket and object owners through every blocking write.
     pub async fn prepare_native(&self, input: NativePrepareInput) -> Result<NativePreparationReceipt> {
+        self.prepare_native_inner(input, None).await
+    }
+    pub(crate) async fn prepare_native_with_owner(
+        &self,
+        input: NativePrepareInput,
+        owner: Arc<rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<NativePreparationReceipt> {
+        self.prepare_native_inner(input, Some(owner)).await
+    }
+    async fn prepare_native_inner(
+        &self,
+        input: NativePrepareInput,
+        operation_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    ) -> Result<NativePreparationReceipt> {
         if input.preparation.is_nil()
             || input.bucket_incarnation.is_nil()
             || !input
@@ -172,7 +287,7 @@ impl LocalDisk {
             return Err(DiskError::InvalidPath);
         }
         let version = input.version;
-        let layout = metadata
+        metadata
             .validate(rustfs_filemeta::ValidationMode::RequireErasure)
             .map_err(|_| DiskError::InvalidPath)?
             .ok_or(DiskError::InvalidPath)?;
@@ -188,14 +303,26 @@ impl LocalDisk {
         if part.number != 1 || part.size != usize::try_from(metadata.size).map_err(|_| DiskError::InvalidPath)? {
             return Err(DiskError::InvalidPath);
         }
-        let shard_length = usize::try_from(layout.shard_file_size(part.size).ok_or(DiskError::InvalidPath)?)
+        let codec = crate::erasure::coding::Erasure::try_new_with_options(
+            metadata.erasure.data_blocks,
+            metadata.erasure.parity_blocks,
+            metadata.erasure.block_size,
+            metadata.uses_legacy_checksum,
+        )?;
+        let checksum = metadata.erasure.get_checksum_info(1).algorithm;
+        let checksum = if metadata.uses_legacy_checksum && checksum == rustfs_utils::HashAlgorithm::HighwayHash256S {
+            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum
+        };
+        let shard_length = usize::try_from(codec.shard_file_size(i64::try_from(part.size).map_err(|_| DiskError::InvalidPath)?))
             .map_err(|_| DiskError::InvalidPath)?;
         crate::erasure::coding::bitrot_verify(
             std::io::Cursor::new(shard),
             shard.len(),
             shard_length,
-            metadata.erasure.get_checksum_info(1).algorithm,
-            metadata.erasure.shard_size(),
+            checksum,
+            codec.shard_size(),
         )
         .await?;
         let disk = self
@@ -224,13 +351,14 @@ impl LocalDisk {
         #[cfg(unix)]
         return crate::disk::os::run_blocking_namespace_operation(owner, move || {
             let _admission = admission;
+            let _operation_owner = operation_owner;
             durable::prepare(&root, disk, version, input, metadata)
         })
         .await
         .map_err(Into::into);
         #[cfg(not(unix))]
         {
-            let _ = (owner, admission, root, disk, version, input, metadata);
+            let _ = (owner, admission, root, disk, version, input, metadata, operation_owner);
             Err(DiskError::UnsupportedDisk)
         }
     }
@@ -247,7 +375,7 @@ mod durable {
         path::Path,
     };
     const METADATA_LIMIT: usize = 1024 * 1024;
-    const RECORD_LIMIT: usize = 8192;
+    const RECORD_LIMIT: usize = 2 * METADATA_LIMIT;
     #[derive(Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Record {
@@ -271,6 +399,8 @@ mod durable {
         metadata_length: u64,
         shard_digest: [u8; 32],
         shard_length: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_metadata: Option<String>,
     }
     impl Record {
         pub(super) fn new(
@@ -285,7 +415,7 @@ mod durable {
             set: &[Uuid],
         ) -> io::Result<Self> {
             Ok(Self {
-                format: 1,
+                format: 2,
                 deployment,
                 disk_format_digest,
                 set_digest: Sha256::digest(serde_json::to_vec(set).map_err(invalid)?).into(),
@@ -305,6 +435,7 @@ mod durable {
                 metadata_length: u64::try_from(metadata.len()).map_err(invalid)?,
                 shard_digest: Sha256::digest(shard).into(),
                 shard_length: u64::try_from(shard.len()).map_err(invalid)?,
+                recovery_metadata: Some(base64_simd::STANDARD.encode_to_string(metadata)),
             })
         }
         fn receipt(&self) -> NativePreparationReceipt {
@@ -542,6 +673,118 @@ mod durable {
             );
         }
     }
+    pub(super) fn probe(
+        root: &Path,
+        preparation: Uuid,
+        disk: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+    ) -> io::Result<NativePreparationProbe> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let root_fd = File::from(fs::open(root, flags, Mode::empty())?);
+        let sys_fd = File::from(fs::openat(&root_fd, ".rustfs.sys", flags, Mode::empty())?);
+        let root_identity = fs::fstat(&root_fd)?;
+        let sys_identity = fs::fstat(&sys_fd)?;
+        let format_bytes = read_file(&sys_fd, "format.json", METADATA_LIMIT)?.ok_or_else(|| invalid("missing disk format"))?;
+        let format: crate::layout::format::FormatV3 = serde_json::from_slice(&format_bytes).map_err(invalid)?;
+        let set = format
+            .erasure
+            .sets
+            .iter()
+            .find(|set| set.contains(&disk))
+            .ok_or_else(|| invalid("disk absent from native format"))?;
+        if format.id != store_id
+            || store_id.is_nil()
+            || format.erasure.this != disk
+            || format.version != crate::layout::format::FormatMetaVersion::V1
+            || format.erasure.version != crate::layout::format::FormatErasureVersion::V3
+            || !matches!(
+                format.format,
+                crate::layout::format::FormatBackend::Erasure | crate::layout::format::FormatBackend::ErasureSingle
+            )
+            || format.erasure.sets.iter().filter(|set| set.contains(&disk)).count() != 1
+            || set.iter().any(Uuid::is_nil)
+            || set.iter().enumerate().any(|(i, id)| set[i + 1..].contains(id))
+        {
+            return Err(invalid("invalid native probe disk format"));
+        }
+        let result = match Directory::open(root, preparation, false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => NativePreparationProbe::Absent,
+            Err(error) => return Err(error),
+            Ok(dir) => {
+                let record = inspect(root, preparation)?;
+                if record.disk != disk
+                    || record.deployment != store_id
+                    || record.bucket != bucket
+                    || record.key != key
+                    || record.incarnation != incarnation
+                    || record.disk_format_digest.as_slice() != Sha256::digest(&format_bytes).as_slice()
+                    || record.set_digest.as_slice() != Sha256::digest(serde_json::to_vec(set).map_err(invalid)?).as_slice()
+                    || record.data_blocks == 0
+                    || record.data_blocks.checked_add(record.parity_blocks) != Some(set.len())
+                    || record.shard_index == 0
+                    || record.shard_index > set.len()
+                {
+                    return Err(invalid("native probe identity mismatch"));
+                }
+                let metadata = match dir.read("xl.meta", METADATA_LIMIT)? {
+                    Some(metadata) => Some(metadata),
+                    None => record
+                        .recovery_metadata
+                        .as_ref()
+                        .map(|encoded| base64_simd::STANDARD.decode_to_vec(encoded).map_err(invalid))
+                        .transpose()?,
+                };
+                if let Some(metadata) = &metadata {
+                    if metadata.len() > METADATA_LIMIT
+                        || u64::try_from(metadata.len()).map_err(invalid)? != record.metadata_length
+                        || Sha256::digest(metadata).as_slice() != record.metadata_digest
+                    {
+                        return Err(invalid("native probe metadata mismatch"));
+                    }
+                }
+                let prepared = match dir.read("PREPARED", 32)? {
+                    None => false,
+                    Some(marker)
+                        if dir.read("xl.meta", METADATA_LIMIT)?.is_some()
+                            && marker.as_slice() == Sha256::digest(serde_json::to_vec(&record).map_err(invalid)?).as_slice() =>
+                    {
+                        true
+                    }
+                    Some(_) => return Err(invalid("native probe marker mismatch")),
+                };
+                dir.check()?;
+                if dir.read("intent.json", RECORD_LIMIT)?.as_deref()
+                    != Some(serde_json::to_vec(&record).map_err(invalid)?.as_slice())
+                {
+                    return Err(invalid("native probe intent changed"));
+                }
+                NativePreparationProbe::Existing {
+                    version: record.version,
+                    prepared,
+                    object_digest: record.object_digest,
+                    object_length: record.object_length,
+                    set_digest: record.set_digest,
+                    distribution_digest: record.distribution_digest,
+                    metadata: metadata.map(Into::into),
+                }
+            }
+        };
+        // ENOENT is absence only while the actual disk and format remain present.
+        let root_now = fs::fstat(File::from(fs::open(root, flags, Mode::empty())?))?;
+        let sys_now = fs::statat(&root_fd, ".rustfs.sys", AtFlags::SYMLINK_NOFOLLOW)?;
+        if root_now.st_dev != root_identity.st_dev
+            || root_now.st_ino != root_identity.st_ino
+            || sys_now.st_dev != sys_identity.st_dev
+            || sys_now.st_ino != sys_identity.st_ino
+            || read_file(&sys_fd, "format.json", METADATA_LIMIT)?.as_deref() != Some(format_bytes.as_slice())
+        {
+            return Err(invalid("native probe disk changed"));
+        }
+        Ok(result)
+    }
     pub(super) fn inspect(root: &Path, preparation: Uuid) -> io::Result<Record> {
         let dir = Directory::open(root, preparation, false)?;
         let record: Record = serde_json::from_slice(
@@ -549,7 +792,7 @@ mod durable {
                 .ok_or_else(|| invalid("missing native intent"))?,
         )
         .map_err(invalid)?;
-        if record.format != 1
+        if !matches!((record.format, record.recovery_metadata.is_some()), (1, false) | (2, true))
             || record.preparation != preparation
             || record.version.is_nil()
             || record.disk.is_nil()
@@ -567,7 +810,7 @@ mod durable {
         store_id: Uuid,
         fence: Arc<ObjectLockConfigSnapshot>,
         runtime: tokio::runtime::Handle,
-    ) -> io::Result<NativePreparationReceipt> {
+    ) -> io::Result<(NativePreparationReceipt, bytes::Bytes)> {
         let record = inspect(root, expected.preparation)?;
         if record != expected || disk != record.disk {
             return Err(invalid("native preparation identity changed"));
@@ -596,7 +839,7 @@ mod durable {
                 include_part_checksums: true,
             },
         )?;
-        let layout = decoded
+        decoded
             .validate(rustfs_filemeta::ValidationMode::RequireErasure)?
             .ok_or_else(|| invalid("missing native layout"))?;
         if decoded.erasure.get_checksum_info(1).algorithm.size() == 0
@@ -633,18 +876,26 @@ mod durable {
             return Err(invalid("corrupt native shard"));
         }
         let part = &decoded.parts[0];
-        let shard_size = usize::try_from(
-            layout
-                .shard_file_size(part.size)
-                .ok_or_else(|| invalid("invalid native shard length"))?,
+        let codec = crate::erasure::coding::Erasure::try_new_with_options(
+            decoded.erasure.data_blocks,
+            decoded.erasure.parity_blocks,
+            decoded.erasure.block_size,
+            decoded.uses_legacy_checksum,
         )
-        .map_err(invalid)?;
+        .map_err(|error| error.into_io_error())?;
+        let checksum = decoded.erasure.get_checksum_info(1).algorithm;
+        let checksum = if decoded.uses_legacy_checksum && checksum == rustfs_utils::HashAlgorithm::HighwayHash256S {
+            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum
+        };
+        let shard_size = usize::try_from(codec.shard_file_size(i64::try_from(part.size).map_err(invalid)?)).map_err(invalid)?;
         runtime.block_on(crate::erasure::coding::bitrot_verify(
             std::io::Cursor::new(shard),
             shard.len(),
             shard_size,
-            decoded.erasure.get_checksum_info(1).algorithm,
-            decoded.erasure.shard_size(),
+            checksum,
+            codec.shard_size(),
         ))?;
         let marker = dir
             .read("PREPARED", 32)?
@@ -672,7 +923,7 @@ mod durable {
         {
             return Err(invalid("native preparation files changed before receipt"));
         }
-        Ok(record.receipt())
+        Ok((record.receipt(), metadata.into()))
     }
     fn verify_disk_layout(
         dir: &Directory,
@@ -736,12 +987,21 @@ mod durable {
         }
         let dir = Directory::open(root, input.preparation, true)?;
         let (deployment, format_digest, set) = verify_disk_layout(&dir, disk, input.store_id, &info)?;
-        let record = Record::new(&input, disk, &info, metadata, shard, version, deployment, format_digest, &set)?;
+        let mut record = Record::new(&input, disk, &info, metadata, shard, version, deployment, format_digest, &set)?;
+        let existing = dir.read("intent.json", RECORD_LIMIT)?;
+        if let Some(bytes) = &existing {
+            let saved: Record = serde_json::from_slice(bytes).map_err(invalid)?;
+            // Preserve the canonical bytes and marker of an existing v1 intent.
+            if saved.format == 1 && saved.recovery_metadata.is_none() {
+                record.format = 1;
+                record.recovery_metadata = None;
+            }
+        }
         let encoded = serde_json::to_vec(&record).map_err(invalid)?;
         if encoded.len() > RECORD_LIMIT {
             return Err(invalid("native preparation identity too large"));
         }
-        match dir.read("intent.json", RECORD_LIMIT)? {
+        match existing {
             Some(bytes) => {
                 let saved: Record = serde_json::from_slice(&bytes).map_err(invalid)?;
                 if saved != record {
@@ -827,6 +1087,24 @@ mod tests {
     }
     static SYNC_PROBES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, SyncProbe>>> =
         std::sync::LazyLock::new(Default::default);
+    pub(crate) fn pause_native_preparation(
+        preparation: Uuid,
+        stage: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::SyncSender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        SYNC_PROBES.lock().expect("probe mutex").insert(
+            preparation,
+            SyncProbe {
+                pause: Some((stage.to_owned(), entered_tx, release_rx)),
+                ..Default::default()
+            },
+        );
+        (entered_rx, release_tx)
+    }
+    pub(crate) fn clear_native_preparation_probe(preparation: Uuid) {
+        SYNC_PROBES.lock().expect("probe mutex").remove(&preparation);
+    }
     pub(super) fn sync_before(id: Uuid, stage: &str) -> std::io::Result<()> {
         let pause = {
             let mut probes = SYNC_PROBES.lock().expect("probe mutex");
@@ -943,6 +1221,121 @@ mod tests {
         .await
         .expect("child native preparation");
         panic!("child must stop at requested real I/O boundary");
+    }
+    #[tokio::test]
+    #[serial]
+    async fn native_preparation_probe_preserves_partial_and_unknown_states() {
+        async fn probe(disk: &LocalDisk, input: &NativePrepareInput) -> Result<NativePreparationProbe> {
+            disk.probe_native(
+                input.preparation,
+                input.store_id,
+                &input.bucket,
+                &input.key,
+                input.bucket_incarnation,
+                input.bucket_fence.clone(),
+            )
+            .await
+        }
+        let (dirs, _store, disk, input) = fixture().await;
+        assert!(
+            matches!(probe(&disk, &input).await, Ok(NativePreparationProbe::Absent)),
+            "NP02_PROBE_ABSENCE_BOUND: only a healthy disk can establish absence"
+        );
+        disk.prepare_native(input.clone()).await.expect("persist real preparation");
+        let (_, metadata) = disk
+            .recover_native_with_metadata(
+                input.preparation,
+                input.store_id,
+                &input.bucket,
+                input.bucket_incarnation,
+                input.bucket_fence.clone(),
+            )
+            .await
+            .expect("recover exact checked bytes");
+        assert_eq!(metadata, input.metadata, "NP02_RAW_METADATA_BOUND");
+        assert!(
+            matches!(
+                probe(&disk, &input).await,
+                Ok(NativePreparationProbe::Existing {
+                    prepared: true,
+                    metadata: Some(_),
+                    ..
+                })
+            ),
+            "NP02_PROBE_PREPARED_BOUND"
+        );
+        let dir = dirs[0]
+            .path()
+            .join(".rustfs.sys/native-preparations")
+            .join(input.preparation.to_string());
+        std::fs::write(dir.join("PREPARED"), b"corrupt").expect("corrupt own marker");
+        assert!(probe(&disk, &input).await.is_err(), "NP02_PROBE_UNKNOWN_BOUND: corruption is not absence");
+        std::fs::remove_file(dir.join("PREPARED")).expect("retain incomplete intent");
+        assert!(
+            matches!(
+                probe(&disk, &input).await,
+                Ok(NativePreparationProbe::Existing {
+                    prepared: false,
+                    metadata: Some(_),
+                    ..
+                })
+            ),
+            "NP02_PROBE_PARTIAL_BOUND: uncommitted metadata pins routing"
+        );
+        std::fs::remove_file(dir.join("xl.meta")).expect("retain intent before metadata");
+        assert!(
+            matches!(
+                probe(&disk, &input).await,
+                Ok(NativePreparationProbe::Existing {
+                    prepared: false,
+                    metadata: Some(_),
+                    ..
+                })
+            ),
+            "NP02_PROBE_PARTIAL_BOUND: intent alone is not absence"
+        );
+        let recovered_metadata = match probe(&disk, &input).await.expect("inspect incomplete intent") {
+            NativePreparationProbe::Existing {
+                metadata: Some(bytes), ..
+            } => bytes,
+            _ => panic!("NP02_RAW_METADATA_BOUND: intent must retain original metadata"),
+        };
+        assert_eq!(recovered_metadata, input.metadata, "NP02_RAW_METADATA_BOUND");
+        let mut retry = input.clone();
+        retry.metadata = recovered_metadata;
+        disk.prepare_native(retry).await.expect("repair intent-only preparation");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("intent.json")).expect("read complete intent"))
+                .expect("decode intent");
+        legacy["format"] = serde_json::json!(1);
+        legacy.as_object_mut().expect("intent object").remove("recovery_metadata");
+        let legacy: durable::Record = serde_json::from_value(legacy).expect("decode old intent format");
+        let encoded = serde_json::to_vec(&legacy).expect("canonical old intent");
+        std::fs::write(dir.join("intent.json"), &encoded).expect("install old intent");
+        std::fs::write(dir.join("PREPARED"), Sha256::digest(&encoded)).expect("install old marker");
+        disk.prepare_native(input.clone())
+            .await
+            .expect("retry existing v1 preparation");
+        assert_eq!(
+            std::fs::read(dir.join("intent.json")).expect("retained old intent"),
+            encoded,
+            "NP02_INTENT_COMPAT_BOUND: retry must preserve existing canonical bytes"
+        );
+        disk.recover_native(
+            input.preparation,
+            input.store_id,
+            &input.bucket,
+            input.bucket_incarnation,
+            input.bucket_fence.clone(),
+        )
+        .await
+        .expect("recover old intent");
+        let format = dirs[0].path().join(".rustfs.sys/format.json");
+        let saved = std::fs::read(&format).expect("save actual format");
+        std::fs::remove_file(&format).expect("make actual disk identity unavailable");
+        let result = probe(&disk, &input).await;
+        std::fs::write(&format, saved).expect("restore fixture format");
+        assert!(result.is_err(), "NP02_PROBE_UNKNOWN_BOUND: missing format is not absence");
     }
     async fn fixture() -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>, LocalDisk, NativePrepareInput) {
         let (dirs, store) = isolated_store_over_temp_disks().await;

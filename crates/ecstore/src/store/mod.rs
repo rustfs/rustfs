@@ -437,6 +437,11 @@ mod init;
 pub(crate) mod init_format;
 pub(crate) mod list_objects;
 mod multipart;
+pub mod native_prepare;
+#[cfg(all(test, unix))]
+mod native_prepare_multi_pool_tests;
+#[cfg(all(test, unix))]
+mod native_prepare_tests;
 mod object;
 #[cfg(feature = "test-util")]
 pub use object::DeleteAfterObjectLockSnapshotBarrier;

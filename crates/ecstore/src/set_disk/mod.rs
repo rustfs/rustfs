@@ -878,6 +878,7 @@ pub(crate) use ops::heal::AbsenceProofRequest;
 #[cfg(test)]
 pub(crate) use ops::heal::DanglingDeleteFailure;
 pub(crate) use ops::heal::HealedObjectAbsence;
+pub(crate) use ops::native_prepare::same_identity;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;
