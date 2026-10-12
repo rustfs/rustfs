@@ -1191,11 +1191,59 @@ mod tests {
         .into())
     }
 
+    fn scanner_cycle_completion_budget(
+        cycle_end: u64,
+        interval: Option<u64>,
+        now: u64,
+        active: bool,
+    ) -> Result<Duration, &'static str> {
+        if cycle_end > now {
+            return Err("scanner cycle timestamp is in the future");
+        }
+        if active {
+            return Ok(Duration::from_secs(60));
+        }
+        let interval = interval
+            .filter(|interval| *interval != 0)
+            .ok_or("scanner schedule has no positive interval")?;
+        let next_cycle = cycle_end
+            .checked_add(interval)
+            .ok_or("scanner schedule timestamp overflows")?;
+        let budget = next_cycle
+            .saturating_sub(now)
+            .checked_add(60)
+            .ok_or("scanner completion budget overflows")?;
+        Ok(Duration::from_secs(budget))
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_accounts_for_captured_retry_schedule() {
+        assert_eq!(
+            scanner_cycle_completion_budget(1_791_815_390, Some(256), 1_791_815_447, false),
+            Ok(Duration::from_secs(259)),
+        );
+        assert_eq!(scanner_cycle_completion_budget(100, Some(1), 110, false), Ok(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_does_not_grant_planned_sleep_to_active_cycle() {
+        assert_eq!(scanner_cycle_completion_budget(100, Some(256), 110, true), Ok(Duration::from_secs(60)));
+        assert_eq!(scanner_cycle_completion_budget(0, None, 110, true), Ok(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_rejects_invalid_schedule() {
+        for (end, interval, now) in [(101, 1, 100), (100, 0, 100), (u64::MAX, 1, u64::MAX), (1, u64::MAX - 1, 1)] {
+            assert!(scanner_cycle_completion_budget(end, Some(interval), now, false).is_err());
+        }
+    }
+
     async fn wait_for_scanner_cycle_after(
         cluster: &RustFSTestClusterEnvironment,
         previous_cycle_end: u64,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut deadline = Instant::now() + Duration::from_secs(60);
+        let mut schedule_accounted = false;
         loop {
             let mut latest_cycle_end = 0;
             let mut versions_observed = false;
@@ -1237,14 +1285,36 @@ mod tests {
                 let versions_scanned = metrics["versions_scanned"]
                     .as_u64()
                     .ok_or("scanner status is missing its version-coverage counter")?;
-                latest_cycle_end = latest_cycle_end.max(cycle_end);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                if cycle_end > now {
+                    return Err("scanner cycle timestamp is in the future".into());
+                }
+                let schedule = &status["cycle_schedule"];
+                if !schedule_accounted && schedule["execution_role"].as_str() == Some("leader") {
+                    let active = metrics["current_cycle_active"]
+                        .as_bool()
+                        .ok_or("scanner status is missing its active-cycle flag")?;
+                    if active || (cycle_end != 0 && schedule["effective_interval_available"].as_bool() == Some(true)) {
+                        let interval = schedule["effective_interval_seconds"].as_u64();
+                        let budget = scanner_cycle_completion_budget(cycle_end, interval, now, active)?;
+                        deadline = Instant::now().checked_add(budget).ok_or("scanner deadline overflows")?;
+                        schedule_accounted = true;
+                    }
+                }
+                // Superseded walks complete all sets while withholding quota authority.
+                // Deferred and partial attempts do not certify completed scanning.
+                if matches!(metrics["last_cycle_result"].as_str(), Some("success" | "superseded")) {
+                    latest_cycle_end = latest_cycle_end.max(cycle_end);
+                }
                 versions_observed |= versions_scanned > 0;
                 observations.push(format!(
-                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}",
+                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, partial_reason={}, schedule={}",
                     metrics["current_cycle"],
                     metrics["current_cycle_active"],
                     metrics["leader_lock_state"],
                     metrics["last_cycle_result"],
+                    metrics["last_cycle_partial_reason"],
+                    schedule,
                 ));
             }
             // The coordinator records cycle completion, but remote workers
@@ -1555,7 +1625,8 @@ mod tests {
         }
 
         if background_enabled {
-            wait_for_scanner_cycle_after(&cluster, 0).await?;
+            let baseline_cycle_floor = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            wait_for_scanner_cycle_after(&cluster, baseline_cycle_floor).await?;
         }
 
         cluster.stop_node(1)?;
