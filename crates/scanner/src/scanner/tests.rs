@@ -714,7 +714,7 @@ async fn checkpoint_runtime_handoff(store: Arc<MemoryConfigStore>, expected_cycl
     assert_eq!((cycle.next, saved_epoch), (expected_cycle, epoch));
     cycle.current = cycle.next;
     let ctx = CancellationToken::new();
-    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone()).await;
+    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone(), Arc::new(RemoteScanProgress::default())).await;
     tokio::time::pause();
     let budget = ScannerCycleBudget::new(
         &ctx,
@@ -1289,7 +1289,8 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
     };
 
     global_metrics().set_current_scan_mode(HealScanMode::Deep);
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     mark_scan_cycle_idle(&mut cycle_info, &mut cycle_metrics_guard).await;
 
@@ -1309,6 +1310,33 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
 
 #[tokio::test]
 #[serial]
+async fn scanner_cycle_metrics_guard_installs_budget_remote_progress() {
+    let parent = CancellationToken::new();
+    let old_budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), old_budget.remote_scan_progress()).await;
+    old_budget.record_remote_progress(3, 2);
+    guard.finish(CurrentCycle::default()).await;
+    let previous = global_metrics().report().await;
+    assert_eq!(previous.last_cycle_objects_scanned, 3);
+    assert_eq!(previous.last_cycle_directories_scanned, 2);
+
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), budget.remote_scan_progress()).await;
+    budget.record_remote_progress(2, 1);
+    old_budget.record_remote_progress(9, 7);
+    let active = global_metrics().report().await;
+    assert_eq!(active.current_cycle_objects_scanned, 2);
+    assert_eq!(active.current_cycle_directories_scanned, 1);
+    guard.finish(CurrentCycle::default()).await;
+    old_budget.record_remote_progress(11, 5);
+    let finished = global_metrics().report().await;
+    assert_eq!(finished.last_cycle_objects_scanned, 2);
+    assert_eq!(finished.last_cycle_directories_scanned, 1);
+    global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
     let cycle_started = Utc::now() - chrono::Duration::seconds(5);
     let mut cycle_info = CurrentCycle {
@@ -1317,7 +1345,7 @@ async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
         started: cycle_started,
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
     let setup_report = global_metrics().report().await;
     assert!(setup_report.current_cycle_active);
     assert_eq!(setup_report.current_cycle, 0);
@@ -1343,7 +1371,7 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
         started: Utc::now(),
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     cycle_info.current = 0;
     tokio::task::yield_now().await;
@@ -1362,12 +1390,15 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
 #[tokio::test]
 #[serial]
 async fn scanner_cycle_metrics_guard_drop_clears_activity() {
-    let guard = ScannerCycleMetricsGuard::new(CurrentCycle {
-        current: 12,
-        next: 13,
-        started: Utc::now(),
-        ..Default::default()
-    })
+    let guard = ScannerCycleMetricsGuard::new(
+        CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        },
+        Arc::new(RemoteScanProgress::default()),
+    )
     .await;
     assert!(global_metrics().report().await.current_cycle_active);
 
@@ -1639,7 +1670,8 @@ async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
 
@@ -1675,7 +1707,8 @@ async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         persist_required_scanner_cycle_floor(
@@ -1715,7 +1748,8 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         !persist_required_scanner_cycle_floor(
@@ -1736,7 +1770,8 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         next: 12,
         ..Default::default()
     };
-    let mut max_cycle_metrics_guard = ScannerCycleMetricsGuard::new(max_cycle_info.clone()).await;
+    let mut max_cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(max_cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
     assert!(
         !persist_required_scanner_cycle_floor(
             &ctx,
@@ -4600,7 +4635,8 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
 
     assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
     assert_eq!(cycle_info.next, 13);

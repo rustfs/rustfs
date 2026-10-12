@@ -270,6 +270,134 @@ impl ECStore {
         .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
     }
 
+    /// Recover hidden delete journals through the lifecycle-owned heal boundary.
+    pub async fn recover_delete_transactions(self: &Arc<Self>, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        Ok(self
+            .recover_delete_transactions_at_incarnation(bucket, None, None, opts)
+            .await?
+            .unwrap_or_else(|| HealResultItem {
+                heal_item_type: HealItemType::Bucket.to_string(),
+                bucket: bucket.to_owned(),
+                detail: "delete recovery: discovered=0".to_owned(),
+                ..Default::default()
+            }))
+    }
+
+    pub async fn recover_delete_transactions_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.recover_delete_transactions_in_scope(bucket, object, None, expected, opts)
+            .await
+    }
+
+    pub async fn recover_delete_prefix_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.recover_delete_transactions_in_scope(bucket, None, Some(prefix), expected, opts)
+            .await
+    }
+
+    async fn recover_delete_transactions_in_scope(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: Option<&str>,
+        prefix: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        if opts.no_lock && !opts.dry_run {
+            return Err(StorageError::InvalidArgument(
+                "heal".to_string(),
+                "no_lock".to_string(),
+                "delete recovery requires namespace locking".to_string(),
+            ));
+        }
+        let expected = match expected {
+            Some(expected) => expected,
+            None => self.bucket_incarnation_id_from_disk(bucket).await?,
+        };
+        let object = object.map(str::to_owned);
+        let prefix = prefix.map(str::to_owned);
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
+            let explicit_delete = opts.remove
+                && metadata_sys::has_authoritative_never_versioned_state_in(&store.ctx, &bucket).await?
+                && matches!(
+                    metadata_sys::get_object_lock_config_state_in(&store.ctx, &bucket).await?,
+                    metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+                );
+            let movement_gate = store.ctx.data_movement_operation_gate();
+            let _movement_guard = movement_gate.read().await;
+            let can_commit = || scope.check().is_ok();
+            let recovery_context = crate::set_disk::DeleteRecoveryContext {
+                dry_run: opts.dry_run,
+                explicit_delete,
+                namespace_owner: (!opts.dry_run)
+                    .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit())) as Arc<dyn Send + Sync>),
+                ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &can_commit)
+            };
+            let mut summary = crate::set_disk::DeleteRecoverySummary::default();
+            for pool in store.get_pools_for_heal_object(&opts)? {
+                if store.is_suspended(pool.pool_idx).await || store.is_pool_rebalancing(pool.pool_idx).await {
+                    return Err(StorageError::SlowDown);
+                }
+                for (set_index, set) in pool.disk_set.iter().enumerate() {
+                    if opts.set.is_some_and(|requested| requested != set_index) {
+                        continue;
+                    }
+                    if let Some(object) = &object {
+                        if !Arc::ptr_eq(set, &pool.get_disks_by_key(object)) {
+                            continue;
+                        }
+                        summary.add(set.recover_delete_object(&bucket, object, recovery_context.clone()).await?);
+                    } else if let Some(prefix) = &prefix {
+                        summary.add(set.recover_delete_prefix(&bucket, prefix, recovery_context.clone()).await?);
+                    } else {
+                        summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
+                    }
+                }
+            }
+            if summary.pending > 0 {
+                return Err(StorageError::ErasureReadQuorum);
+            }
+            if object.is_some() && !opts.dry_run && summary.blocked > 0 {
+                return Err(StorageError::SlowDown);
+            }
+            if summary.discovered == 0 {
+                return Ok(None);
+            }
+            Ok(Some(HealResultItem {
+                heal_item_type: if object.is_some() {
+                    HealItemType::Object
+                } else {
+                    HealItemType::Bucket
+                }
+                .to_string(),
+                object: object.or(prefix).unwrap_or_default(),
+                bucket,
+                detail: format!(
+                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}",
+                    if opts.dry_run { " (dry run)" } else { "" },
+                    summary.discovered,
+                    summary.committed,
+                    summary.rolled_back,
+                    summary.reclaimed,
+                    summary.blocked
+                ),
+                ..Default::default()
+            }))
+        })
+        .await
+    }
+
     pub async fn heal_bucket_at_incarnation(
         self: &Arc<Self>,
         bucket: &str,

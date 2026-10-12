@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_scanner_metrics::metrics::RemoteScanProgress;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -73,6 +74,7 @@ pub struct ScannerCycleBudget {
     entries_visited: AtomicU64,
     last_progress_millis: AtomicU64,
     cycle_state_persisted: AtomicBool,
+    remote_scan_progress: Arc<RemoteScanProgress>,
 }
 
 impl ScannerCycleBudget {
@@ -137,6 +139,7 @@ impl ScannerCycleBudget {
             entries_visited: AtomicU64::new(0),
             last_progress_millis: AtomicU64::new(0),
             cycle_state_persisted: AtomicBool::new(false),
+            remote_scan_progress: Arc::new(RemoteScanProgress::default()),
         })
     }
 
@@ -237,7 +240,12 @@ impl ScannerCycleBudget {
         }
     }
 
+    pub(crate) fn remote_scan_progress(&self) -> Arc<RemoteScanProgress> {
+        Arc::clone(&self.remote_scan_progress)
+    }
+
     pub(crate) fn record_remote_progress(&self, objects_scanned: u64, directories_started: u64) {
+        self.remote_scan_progress.record(objects_scanned, directories_started);
         if self.track_progress || self.max_objects.is_some() {
             let objects = saturating_fetch_add(&self.objects_scanned, objects_scanned);
             if self.track_progress {

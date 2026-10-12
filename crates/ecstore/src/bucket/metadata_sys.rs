@@ -314,6 +314,33 @@ pub async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
     Ok(lock.remove(bucket).await)
 }
 
+/// Remove a peer's cached metadata only when the bucket is absent under the
+/// namespace read fence. A delayed delete notification must not withdraw the
+/// metadata of a same-name bucket that has already been recreated.
+pub async fn remove_bucket_metadata_if_absent(api: Arc<ECStore>, bucket: &str) -> Result<bool> {
+    if is_meta_bucketname(bucket) {
+        return Ok(false);
+    }
+    // Lock order: bucket namespace read -> metadata system read (released)
+    // -> metadata publish, matching peer reloads.
+    let namespace_lock = api.new_ns_lock(bucket, bucket).await?;
+    let namespace_guard = namespace_lock
+        .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let sys = bucket_metadata_sys_of(&api.ctx)?;
+    let sys = sys.read().await.clone();
+    if sys
+        .bucket_exists(bucket, &namespace_guard, "peer bucket metadata removal existence check")
+        .await?
+    {
+        return Ok(false);
+    }
+    await_bucket_namespace_operation(Some(&namespace_guard), bucket, "peer bucket metadata removal", async {
+        Ok(sys.remove(bucket).await)
+    })
+    .await
+}
+
 fn start_refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>) {
     let Some(cancel_token) = runtime_sources::background_services_cancel_token() else {
         warn!("bucket metadata refresh loop skipped because background cancellation token is not initialized");
@@ -4853,6 +4880,117 @@ mod tests {
             node_a_sys.get(bucket).await.unwrap().bucket_incarnation_id,
             replacement_incarnation,
             "peer reload must converge the complete cached metadata snapshot"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn peer_reload_clears_negative_cache_after_remote_bucket_creation() {
+        let (dirs, node_a, node_b) = two_nodes_over_one_store().await;
+        let bucket = "cross-node-negative-cache-refresh";
+        let node_b_sys = node_b.read().await.clone();
+
+        assert_eq!(
+            node_b_sys.get_bucket_incarnation_id(bucket).await.unwrap_err(),
+            Error::BucketNotFound(bucket.to_string()),
+            "the probe must populate node B's missing-bucket cache"
+        );
+
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("physical bucket should exist before creation metadata");
+        }
+        let created = BucketMetadata::new(bucket);
+        let created_incarnation = created.bucket_incarnation_id;
+        node_a
+            .read()
+            .await
+            .persist_new_and_set(created)
+            .await
+            .expect("node A should publish the created bucket metadata");
+
+        node_b_sys
+            .reload_from_store(bucket)
+            .await
+            .expect("peer reload should clear the stale negative cache");
+        assert_eq!(
+            node_b_sys.get_bucket_incarnation_id(bucket).await.unwrap(),
+            created_incarnation,
+            "node B should resolve the newly created bucket immediately"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn peer_delete_clears_metadata_for_absent_bucket() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "peer-delete-absent-bucket";
+
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("initial bucket creation");
+        let cached = sys.read().await.get(bucket).await.expect("initial cached metadata");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket deletion");
+
+        // Model a peer that still caches the metadata after the physical delete.
+        sys.read().await.set(bucket.to_string(), cached).await;
+        assert!(
+            remove_bucket_metadata_if_absent(store.clone(), bucket)
+                .await
+                .expect("conditional peer delete"),
+            "the peer must evict the deleted bucket's cached metadata"
+        );
+        let sys = sys.read().await;
+        assert!(matches!(sys.get(bucket).await, Err(Error::ConfigNotFound)));
+        assert_eq!(
+            sys.get_bucket_incarnation_id(bucket)
+                .await
+                .expect_err("deleted bucket lookup"),
+            Error::BucketNotFound(bucket.to_string()),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn delayed_peer_delete_preserves_recreated_bucket_metadata() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "delayed-peer-delete-recreated-bucket";
+
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("initial bucket creation");
+        let old_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("old incarnation");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket deletion");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket recreation");
+        let new_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("new incarnation");
+        assert_ne!(old_incarnation, new_incarnation);
+
+        let removed = remove_bucket_metadata_if_absent(store.clone(), bucket)
+            .await
+            .expect("conditional peer delete");
+        assert!(!removed, "a delayed delete must not remove metadata for a live recreated bucket");
+        assert_eq!(
+            sys.read()
+                .await
+                .get(bucket)
+                .await
+                .expect("recreated metadata should remain cached")
+                .bucket_incarnation_id,
+            new_incarnation,
         );
     }
 

@@ -2491,12 +2491,32 @@ fn checked_flatten_accepts_depth_limit_and_rejects_deeper_tree() {
 }
 
 #[test]
-fn test_find_children_copy_preserves_missing_entry_behavior() {
-    let mut cache = DataUsageCache::default();
+fn test_find_children_copy_does_not_insert_missing_entries() {
+    let cache = DataUsageCache::default();
     let missing_hash = hash_path("missing");
 
-    assert!(cache.find_children_copy(missing_hash.clone()).is_empty());
-    assert!(cache.cache.contains_key(&missing_hash.key()));
+    assert!(cache.find_children_copy(&missing_hash).is_empty());
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.cache.capacity(), 0);
+}
+
+#[test]
+fn test_find_children_copy_preserves_existing_children() {
+    let hash = hash_path("bucket");
+    let children = HashSet::from(["bucket/child".to_string()]);
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        hash.key(),
+        DataUsageEntry {
+            children: children.clone(),
+            ..Default::default()
+        },
+    );
+    let mut copied = cache.find_children_copy(&hash);
+    assert_eq!(copied, children);
+    copied.clear();
+    assert_eq!(cache.cache[&hash.0].children, children);
+    assert_eq!(cache.cache.len(), 1);
 }
 
 #[test]

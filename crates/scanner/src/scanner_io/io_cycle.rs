@@ -506,22 +506,23 @@ where
         return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
     }
 
-    let set_scan_limit = scanner_budgeted_concurrency_limit(
-        scanner_max_concurrent_set_scans(total_results),
-        budget.requires_serial_progress_accounting(),
-    );
+    let dispatch_limit = scanner_max_concurrent_set_scans(total_results);
+    let serial_progress_accounting = budget.requires_serial_progress_accounting();
+    let set_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
     let bucket_failures = ScannerBucketFailureState::default();
     let pending_maintenance_work = Arc::new(AtomicBool::new(false));
     let cold_zero_walk_reuse_observed = Arc::new(AtomicBool::new(false));
     record_set_scan_concurrency_limit(set_scan_limit);
-    debug!(
+    tracing::info!(
         target: "rustfs::scanner::io",
         event = EVENT_SCANNER_SET_STATE,
         component = LOG_COMPONENT_SCANNER,
         subsystem = LOG_SUBSYSTEM_IO,
-        total_sets = total_results,
-        concurrency_limit = set_scan_limit,
         state = "concurrency_budget",
+        reason = if serial_progress_accounting { "count_budget" } else { "configured_or_available_work" },
+        total_sets = total_results,
+        dispatch_limit,
+        concurrency_limit = set_scan_limit,
         "Scanner set concurrency budget resolved"
     );
     let set_scan_semaphore = Arc::new(Semaphore::new(set_scan_limit));

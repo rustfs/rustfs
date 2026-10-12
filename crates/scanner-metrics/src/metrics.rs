@@ -18,7 +18,7 @@ use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -880,6 +880,24 @@ pub struct TierRequestCount {
 
 const TIER_REQUEST_COUNTER_SLOTS: usize = TierRequestOperation::ALL.len() * TierRequestOutcome::ALL.len();
 
+/// Remote work belongs to one cycle; retained worker handles cannot update a later cycle.
+#[derive(Default)]
+pub struct RemoteScanProgress {
+    objects: AtomicU64,
+    directories: AtomicU64,
+}
+
+impl RemoteScanProgress {
+    /// Record authenticated per-walk deltas without changing process-local operation counters.
+    pub fn record(&self, objects: u64, directories: u64) {
+        for (counter, delta) in [(&self.objects, objects), (&self.directories, directories)] {
+            if delta != 0 {
+                let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(delta)));
+            }
+        }
+    }
+}
+
 pub struct Metrics {
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
@@ -889,6 +907,10 @@ pub struct Metrics {
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
     current_scan_mode: AtomicU8,
     current_scan_cycle_work_active: AtomicBool,
+    // Cycle transitions and reports lock cycle_info before remote_scan_progress.
+    // Cycle transitions take cycle_info before this lock; never hold it across awaits
+    // or while acquiring another metrics lock. Workers update their own handle directly.
+    remote_scan_progress: Mutex<Arc<RemoteScanProgress>>,
     current_scan_cycle_objects_start: AtomicU64,
     current_scan_cycle_directories_start: AtomicU64,
     current_scan_cycle_bucket_drive_scans_start: AtomicU64,
@@ -994,6 +1016,8 @@ pub struct Metrics {
     scanner_bitrot_cycle_enabled: AtomicBool,
     scanner_bitrot_cycle_millis: AtomicU64,
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
+    scanner_checkpoints_persisted: Mutex<BTreeMap<(usize, usize), ScannerPersistedCheckpointReport>>,
+    scanner_checkpoint_save_failures: AtomicU64,
     scanner_checkpoint_used: AtomicU64,
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
@@ -1135,6 +1159,15 @@ pub struct ScannerCheckpointReport {
     pub resume_after: String,
     pub reason: String,
     pub last_event: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerPersistedCheckpointReport {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub bucket: String,
+    pub saved_unix_secs: u64,
+    pub checkpoint: Option<ScannerCheckpointReport>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1498,6 +1531,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_checkpoint: Option<ScannerCheckpointReport>,
+    #[serde(default)]
+    pub scan_checkpoints_persisted: Vec<ScannerPersistedCheckpointReport>,
+    #[serde(default)]
+    pub scan_checkpoint_save_failures: u64,
     #[serde(default)]
     pub scan_checkpoint_used: u64,
     #[serde(default)]
@@ -1948,6 +1985,7 @@ impl Metrics {
             cycle_info: Arc::new(RwLock::new(None)),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
+            remote_scan_progress: Mutex::new(Arc::new(RemoteScanProgress::default())),
             current_scan_cycle_objects_start: AtomicU64::new(0),
             current_scan_cycle_directories_start: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_scans_start: AtomicU64::new(0),
@@ -2046,6 +2084,8 @@ impl Metrics {
             scanner_bitrot_cycle_enabled: AtomicBool::new(false),
             scanner_bitrot_cycle_millis: AtomicU64::new(0),
             scanner_checkpoint: Mutex::new(None),
+            scanner_checkpoints_persisted: Mutex::new(BTreeMap::new()),
+            scanner_checkpoint_save_failures: AtomicU64::new(0),
             scanner_checkpoint_used: AtomicU64::new(0),
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
@@ -2351,6 +2391,34 @@ impl Metrics {
             Ok(mut current) => *current = Some(checkpoint),
             Err(poisoned) => *poisoned.into_inner() = Some(checkpoint),
         }
+    }
+
+    /// Keep only the latest confirmed periodic save per set on this process.
+    pub fn record_scanner_checkpoint_saved(
+        &self,
+        pool_index: usize,
+        set_index: usize,
+        bucket: &str,
+        checkpoint: Option<ScannerCheckpointReport>,
+    ) {
+        let mut saved = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        saved.insert(
+            (pool_index, set_index),
+            ScannerPersistedCheckpointReport {
+                pool_index,
+                set_index,
+                bucket: bucket.to_string(),
+                saved_unix_secs: unix_now_secs(),
+                checkpoint,
+            },
+        );
+    }
+
+    pub fn record_scanner_checkpoint_save_failed(&self) {
+        self.scanner_checkpoint_save_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_scanner_checkpoint_used(&self) {
@@ -2749,8 +2817,18 @@ impl Metrics {
 
     /// Publish a scanner cycle and its work-accounting baseline as one state transition.
     pub async fn start_scan_cycle_work_with_cycle(&self, cycle: CurrentCycle) -> ScanCycleWorkSnapshot {
+        self.start_scan_cycle_work_with_cycle_and_remote_progress(cycle, Arc::new(RemoteScanProgress::default()))
+            .await
+    }
+
+    /// Install the cycle's remote work handle together with its cycle identity.
+    pub async fn start_scan_cycle_work_with_cycle_and_remote_progress(
+        &self,
+        cycle: CurrentCycle,
+        remote_progress: Arc<RemoteScanProgress>,
+    ) -> ScanCycleWorkSnapshot {
         let mut current_cycle = self.cycle_info.write().await;
-        let snapshot = self.start_scan_cycle_work();
+        let snapshot = self.begin_scan_cycle_work(remote_progress);
         *current_cycle = Some(cycle);
         snapshot
     }
@@ -2865,6 +2943,15 @@ impl Metrics {
     }
 
     pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
+        self.begin_scan_cycle_work(Arc::new(RemoteScanProgress::default()))
+    }
+
+    fn begin_scan_cycle_work(&self, remote_progress: Arc<RemoteScanProgress>) -> ScanCycleWorkSnapshot {
+        // The cycle transition serializes replacement; workers keep their own Arc.
+        *self
+            .remote_scan_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = remote_progress;
         let snapshot = self.scan_cycle_work_snapshot();
         let source_snapshot = self.scanner_source_work_values();
         let replication_repair_snapshot = self.scanner_replication_repair_work_values();
@@ -2982,9 +3069,22 @@ impl Metrics {
 
     fn scan_cycle_work_since(&self, start: ScanCycleWorkSnapshot) -> ScanCycleWorkSnapshot {
         let current = self.scan_cycle_work_snapshot();
+        let (remote_objects, remote_directories) = {
+            let remote = self
+                .remote_scan_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (remote.objects.load(Ordering::Relaxed), remote.directories.load(Ordering::Relaxed))
+        };
         ScanCycleWorkSnapshot {
-            objects_scanned: current.objects_scanned.saturating_sub(start.objects_scanned),
-            directories_scanned: current.directories_scanned.saturating_sub(start.directories_scanned),
+            objects_scanned: current
+                .objects_scanned
+                .saturating_sub(start.objects_scanned)
+                .saturating_add(remote_objects),
+            directories_scanned: current
+                .directories_scanned
+                .saturating_sub(start.directories_scanned)
+                .saturating_add(remote_directories),
             bucket_drive_scans: current.bucket_drive_scans.saturating_sub(start.bucket_drive_scans),
             bucket_drive_failures: current.bucket_drive_failures.saturating_sub(start.bucket_drive_failures),
             yield_events: current.yield_events.saturating_sub(start.yield_events),
@@ -3512,6 +3612,14 @@ impl Metrics {
             Ok(checkpoint) => checkpoint.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
+        m.scan_checkpoints_persisted = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        m.scan_checkpoint_save_failures = self.scanner_checkpoint_save_failures.load(Ordering::Relaxed);
         m.scan_checkpoint_used = self.scanner_checkpoint_used.load(Ordering::Relaxed);
         m.scan_checkpoint_cleared = self.scanner_checkpoint_cleared.load(Ordering::Relaxed);
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
@@ -3597,14 +3705,18 @@ pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// Register a new disk in the global path tracker and return two callbacks:
 /// one to update the current path and one to deregister the disk when done.
 pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+    register_current_path(&global_metrics().current_paths, disk, initial).await
+}
+
+async fn register_current_path(
+    current_paths: &Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
+    disk: &str,
+    initial: &str,
+) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
 
-    global_metrics()
-        .current_paths
-        .write()
-        .await
-        .insert(disk_name.clone(), Arc::clone(&tracker));
+    current_paths.write().await.insert(disk_name.clone(), Arc::clone(&tracker));
 
     let update_fn: UpdateCurrentPathFn = {
         let tracker = Arc::clone(&tracker);
@@ -3617,10 +3729,17 @@ pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPa
 
     let done_fn: CloseDiskFn = {
         let disk = disk_name;
+        let current_paths = Arc::clone(current_paths);
+        let tracker = Arc::clone(&tracker);
         Arc::new(move || {
             let disk = disk.clone();
+            let current_paths = Arc::clone(&current_paths);
+            let tracker = Arc::clone(&tracker);
             Box::pin(async move {
-                global_metrics().current_paths.write().await.remove(&disk);
+                let mut paths = current_paths.write().await;
+                if paths.get(&disk).is_some_and(|current| Arc::ptr_eq(current, &tracker)) {
+                    paths.remove(&disk);
+                }
             })
         })
     };
@@ -3805,6 +3924,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_path_cleanup_preserves_a_replacement_scan() {
+        let metrics = Metrics::new();
+        let (_, close_first) = register_current_path(&metrics.current_paths, "remote-node/disk", "first-bucket").await;
+        let (_, close_second) = register_current_path(&metrics.current_paths, "remote-node/disk", "second-bucket").await;
+        close_first().await;
+        assert_eq!(metrics.get_current_paths().await, vec!["remote-node/disk/second-bucket"]);
+        close_second().await;
+        assert!(metrics.get_current_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_path_guard_cleans_up_its_remote_scan() {
+        let metrics = Metrics::new();
+        let (_, close_path) = register_current_path(&metrics.current_paths, "remote-node/disk", "bucket").await;
+        let guard = CloseDiskGuard::new(close_path);
+        assert_eq!(metrics.report().await.active_paths, vec!["remote-node/disk/bucket"]);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !metrics.get_current_paths().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled remote path guard must remove its registration");
+    }
+
+    #[tokio::test]
     async fn report_counts_active_scan_paths() {
         let metrics = Metrics::new();
         let updated_at = Timestamp::now() - jiff::SignedDuration::from_secs(12);
@@ -3973,6 +4119,37 @@ mod tests {
         assert_eq!(report.scan_checkpoint_used, 1);
         assert_eq!(report.scan_checkpoint_stale, 1);
         assert_eq!(report.scan_checkpoint_cleared, 1);
+    }
+
+    #[tokio::test]
+    async fn report_distinguishes_persisted_checkpoints_from_memory_and_failures() {
+        let metrics = Metrics::new();
+        let saved = ScannerCheckpointReport {
+            version: 1,
+            resume_after: "bucket/first".to_string(),
+            reason: "objects".to_string(),
+            last_event: "saved".to_string(),
+        };
+        metrics.record_scanner_checkpoint_saved(0, 1, "bucket", Some(saved.clone()));
+        metrics.record_scanner_checkpoint_set(1, "bucket/second", "objects");
+        metrics.record_scanner_checkpoint_save_failed();
+        let report = metrics.report().await;
+        assert_eq!(report.scan_checkpoint_save_failures, 1);
+        assert_eq!(report.scan_checkpoint.expect("in-memory cursor").resume_after, "bucket/second");
+        assert_eq!(report.scan_checkpoints_persisted.len(), 1);
+        assert_eq!(report.scan_checkpoints_persisted[0].checkpoint, Some(saved));
+        assert_eq!(report.scan_checkpoints_persisted[0].set_index, 1);
+        assert!(report.scan_checkpoints_persisted[0].saved_unix_secs > 0);
+        metrics.record_scanner_checkpoint_saved(0, 1, "other-bucket", None);
+        metrics.record_scanner_checkpoint_saved(0, 2, "bucket", None);
+        let report = metrics.report().await;
+        assert_eq!(
+            report.scan_checkpoints_persisted.len(),
+            2,
+            "retain at most one save per set, not per bucket"
+        );
+        assert_eq!(report.scan_checkpoints_persisted[0].bucket, "other-bucket");
+        assert!(report.scan_checkpoints_persisted[0].checkpoint.is_none());
     }
 
     #[tokio::test]
@@ -4975,6 +5152,86 @@ mod tests {
 
         assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
         assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 0);
+    }
+
+    #[test]
+    fn remote_scan_progress_saturates_instead_of_wrapping() {
+        let remote = RemoteScanProgress::default();
+        remote.record(u64::MAX - 1, u64::MAX - 2);
+        remote.record(3, 4);
+        remote.record(0, 0);
+        assert_eq!(remote.objects.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(remote.directories.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn saturated_remote_cycle_does_not_hide_later_remote_and_local_work() {
+        let metrics = Metrics::new();
+        let old_remote = Arc::new(RemoteScanProgress::default());
+        let previous = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), old_remote.clone())
+            .await;
+        old_remote.record(u64::MAX, u64::MAX);
+        metrics.finish_scan_cycle_work(previous);
+
+        let remote = Arc::new(RemoteScanProgress::default());
+        let next = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), remote.clone())
+            .await;
+        old_remote.record(9, 7);
+        let empty = metrics.report().await;
+        assert_eq!(empty.current_cycle_objects_scanned, 0);
+        assert_eq!(empty.current_cycle_directories_scanned, 0);
+        remote.record(2, 1);
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 5);
+        assert_eq!(active.current_cycle_directories_scanned, 3);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 5);
+        assert_eq!(finished.last_cycle_directories_scanned, 3);
+    }
+
+    #[tokio::test]
+    async fn cycle_work_combines_local_and_remote_progress_without_changing_local_operations() {
+        let metrics = Metrics::new();
+        metrics.operations[Metric::ScanObject as usize].store(10, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].store(5, Ordering::Relaxed);
+        let remote = Arc::new(RemoteScanProgress::default());
+        let start = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), remote.clone())
+            .await;
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        remote.record(7, 4);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 10);
+        assert_eq!(active.current_cycle_directories_scanned, 6);
+        assert_eq!(metrics.lifetime(Metric::ScanObject), 13);
+        assert_eq!(metrics.lifetime(Metric::ScanFolder), 7);
+        metrics.finish_scan_cycle_work(start);
+        let finished = metrics.report().await;
+        assert_eq!(finished.current_cycle_objects_scanned, 0);
+        assert_eq!(finished.current_cycle_directories_scanned, 0);
+        assert_eq!(finished.last_cycle_objects_scanned, 10);
+        assert_eq!(finished.last_cycle_directories_scanned, 6);
+
+        remote.record(9, 3);
+        let next_remote = Arc::new(RemoteScanProgress::default());
+        let next = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), next_remote.clone())
+            .await;
+        let empty = metrics.report().await;
+        assert_eq!(empty.current_cycle_objects_scanned, 0);
+        assert_eq!(empty.current_cycle_directories_scanned, 0);
+        remote.record(11, 5);
+        next_remote.record(2, 1);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 2);
+        assert_eq!(finished.last_cycle_directories_scanned, 1);
     }
 
     #[tokio::test]

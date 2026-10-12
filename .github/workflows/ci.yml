@@ -168,13 +168,10 @@ jobs:
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/test-and-lint/run-metadata.txt
 
-      # Clippy runs before the test pass: lint failures are the most common
-      # CI-only breakage and should surface in minutes, not after 20+ minutes
-      # of tests.
-      # Sampled too: clippy is the natural control arm for any CARGO_BUILD_JOBS
-      # experiment, since --all-targets is check-only for workspace members and
-      # never links the ~100 test binaries the limit exists to throttle.
+      # Keep full Clippy validation on main, merge groups, and scheduled/manual
+      # runs. PRs retain the complete default test suite and compile-free checks.
       - name: Run clippy lints
+        if: github.event_name != 'pull_request'
         run: |
           ./scripts/ci/resource_sampler.sh start clippy
           trap './scripts/ci/resource_sampler.sh stop' EXIT
@@ -283,6 +280,49 @@ jobs:
       - name: Verify rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
 
+      # The workspace already compiled these ignored tests. Keep the same Cargo
+      # package selection to reuse their binaries, then run them serially in
+      # separate processes because they share fixed ports and global state.
+      # test_transition_and_restore_flows was re-enabled by rustfs/backlog#1303:
+      # its "missing xl.meta on disk2" was a test-util bug (open_disk hardcoded
+      # disk_index 0), not an EC metadata-distribution issue.
+      # restore_object_usecase_reports_ongoing_conflict_and_completion was
+      # re-enabled by backlog#1304 (restore accepts serialize on a short CAS
+      # guard; the copy-back no longer holds the #4877 whole-copy-back lock,
+      # so the mid-restore ongoing read and fast 409 rejection it asserts are
+      # the implemented contract).
+      - name: Run ignored ILM integration tests serially
+        if: needs.classify-changes.outputs.mode == 'full'
+        env:
+          # Match the preceding workspace build and reuse its feature graph.
+          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+        run: |
+          mkdir -p artifacts/ilm-integration
+          set +e
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
+            cargo nextest run --profile default -j1 --run-ignored ignored-only \
+            --all --exclude e2e_test \
+            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))' \
+            --status-level all --final-status-level all \
+            2>&1 | tee artifacts/ilm-integration/nextest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|nextest|target/.*/deps/' || true
+          } > artifacts/ilm-integration/diagnostics.txt
+          exit "${status}"
+
+      - name: Upload ILM test diagnostics
+        if: always() && needs.classify-changes.outputs.mode == 'full'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ilm-integration-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/ilm-integration
+          retention-days: 3
+
   # This gate builds into a fresh target directory to isolate the E2E root.
   # Give its cold build a separate budget from workspace tests and migration proofs.
   offline-enrollment-e2e:
@@ -314,83 +354,11 @@ jobs:
       - name: Check offline enrollment E2E root boundary
         run: ./scripts/check_offline_enrollment_e2e.sh
 
-  # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
-  # drive the object layer through process-global singletons (the GLOBAL_ENV
-  # ECStore, the global tier-config manager, background-expiry workers) and bind
-  # fixed ports (9002 for the scanner suite, 9003 for the app suite), so they are
-  # marked #[ignore] to keep them out of the default parallel `cargo nextest run
-  # --all` pass. Run them here explicitly with `--run-ignored ignored-only` and
-  # `-j1` so no two of them share global state or race for a port at once.
-  # serial_test's #[serial] does NOT serialize across nextest's process-per-test
-  # boundary (see .config/nextest.toml); `-j1` is what actually serializes them.
-  # See rustfs/backlog#1148 (ilm-1) and #1155.
-  test-ilm-integration-serial:
-    name: ILM Integration (serial)
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 90
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-
-      # test_transition_and_restore_flows was re-enabled by rustfs/backlog#1303:
-      # its "missing xl.meta on disk2" was a test-util bug (open_disk hardcoded
-      # disk_index 0), not an EC metadata-distribution issue.
-      # restore_object_usecase_reports_ongoing_conflict_and_completion was
-      # re-enabled by backlog#1304 (restore accepts serialize on a short CAS
-      # guard; the copy-back no longer holds the #4877 whole-copy-back lock,
-      # so the mid-restore ongoing read and fast 409 rejection it asserts are
-      # the implemented contract).
-      - name: Run ignored ILM integration tests serially
-        env:
-          # Match the measured Test and Lint link budget. The default exposed
-          # all 14 pod CPUs and a cold cache spent the full 80m compiling
-          # without starting one ILM test (main run 32982910990).
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
-        run: |
-          mkdir -p artifacts/ilm-integration
-          set +e
-          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
-            cargo nextest run -j1 --run-ignored ignored-only \
-            -p rustfs-scanner -p rustfs \
-            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))' \
-            --status-level all --final-status-level all \
-            2>&1 | tee artifacts/ilm-integration/nextest.log
-          status=${PIPESTATUS[0]}
-          {
-            echo "exit_status=${status}"
-            echo "finished_at=$(date --utc --iso-8601=seconds)"
-            echo
-            echo "Remaining test-related processes:"
-            pgrep -af 'cargo|nextest|target/.*/deps/' || true
-          } > artifacts/ilm-integration/diagnostics.txt
-          exit "${status}"
-
-      - name: Upload ILM test diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ilm-integration-${{ github.run_number }}-${{ github.run_attempt }}
-          path: |
-            artifacts/ilm-integration
-            target/nextest/ci/junit.xml
-
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    # Alternate feature configurations run on main, merge groups, and scheduled
+    # or manual validation; the default workspace remains the PR gate.
+    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -506,7 +474,7 @@ jobs:
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -1264,7 +1232,6 @@ jobs:
       - quick-checks
       - test-and-lint
       - offline-enrollment-e2e
-      - test-ilm-integration-serial
       - test-and-lint-rio-v2
       - connect-short-credential-boundary
       - test-and-lint-protocols
@@ -1298,7 +1265,6 @@ jobs:
       - quick-checks
       - test-and-lint
       - offline-enrollment-e2e
-      - test-ilm-integration-serial
       - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary

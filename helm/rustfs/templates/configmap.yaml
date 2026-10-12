@@ -1,3 +1,8 @@
+{{- $tls := .Values.tls | default dict -}}
+{{- $tlsEnabled := $tls.enabled | default false -}}
+{{- if and $tlsEnabled .Values.mtls.enabled -}}
+{{- fail "tls.enabled and mtls.enabled are mutually exclusive; use ingress TLS for public access to an mTLS backend" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -41,8 +46,12 @@ data:
   {{- end }}
   {{- if .Values.mtls.enabled }}
   RUSTFS_SERVER_MTLS_ENABLE: "1"
-  RUSTFS_TLS_KEYLOG: "1"
+  {{- end }}
+  {{- if or .Values.mtls.enabled $tlsEnabled }}
+  RUSTFS_TLS_KEYLOG: "0"
   RUSTFS_TLS_PATH: "/opt/tls"
+  RUSTFS_TLS_RELOAD_ENABLE: "1"
+  RUSTFS_TLS_RELOAD_INTERVAL: {{ $tls.reloadInterval | default 30 | quote }}
   {{- end }}
   {{- if .Values.config.rustfs.obs_endpoint.enabled }}
   RUSTFS_OBS_ENDPOINT: {{ .Values.config.rustfs.obs_endpoint.base_endpoint | quote }}

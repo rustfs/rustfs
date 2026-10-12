@@ -59,7 +59,7 @@
 7|crates/ecstore/src/set_disk/core/io_primitives.rs
 1|crates/ecstore/src/set_disk/mod.rs
 3|crates/ecstore/src/set_disk/ops/bitrot_self_verify.rs
-2|crates/ecstore/src/set_disk/ops/heal.rs
+1|crates/ecstore/src/set_disk/ops/heal.rs
 8|crates/ecstore/src/set_disk/ops/multipart.rs
 2|crates/ecstore/src/set_disk/ops/object.rs
 3|crates/ecstore/src/set_disk/read.rs

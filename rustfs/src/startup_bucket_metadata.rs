@@ -15,7 +15,6 @@
 use crate::app::object::OnDemandMigrationWriteBack;
 use crate::module_switches::{on_demand_migration_enabled_from_env, set_on_demand_migration_module_enabled};
 use crate::on_demand_migration::OnDemandMigrationSys;
-use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
     ECStore, Error as StorageError, Result as StorageResult, get_global_replication_pool, init_bucket_metadata_sys,
     reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
@@ -58,19 +57,13 @@ const STARTUP_BACKGROUND_STATUS_CANCELED: f64 = 3.0;
 
 pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, ctx: &CancellationToken) -> IoResult<Vec<String>> {
     let buckets_list = retry_metadata_startup(ctx, "list_buckets", || async {
-        store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(IoError::other)
+        store.list_buckets_for_metadata_startup().await.map_err(IoError::other)
     })
     .await?;
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    retry_metadata_startup(ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone())).await?;
+    retry_metadata_startup(ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone(), &buckets)).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     retry_metadata_startup(ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
@@ -81,19 +74,13 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, c
 
 pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> IoResult<Vec<String>> {
     let buckets_list = retry_metadata_startup(&ctx, "list_buckets", || async {
-        store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(IoError::other)
+        store.list_buckets_for_metadata_startup().await.map_err(IoError::other)
     })
     .await?;
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    retry_metadata_startup(&ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone())).await?;
+    retry_metadata_startup(&ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone(), &buckets)).await?;
 
     retry_metadata_startup(&ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     init_on_demand_migration_runtime();

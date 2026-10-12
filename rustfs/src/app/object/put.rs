@@ -18,8 +18,29 @@ use super::*;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::UploadLimitExceeded;
+use crate::error::{UploadLimitExceeded, normalize_put_read_quorum_error};
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum PutReadQuorumTestStage {
+    DefaultSse,
+    Prelookup,
+    Commit,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PUT_READ_QUORUM_TEST_STAGE: PutReadQuorumTestStage;
+}
+
+#[cfg(test)]
+fn injected_put_read_quorum_failure(stage: PutReadQuorumTestStage) -> Option<StorageError> {
+    PUT_READ_QUORUM_TEST_STAGE
+        .try_with(|configured| *configured == stage)
+        .unwrap_or(false)
+        .then(|| StorageError::InsufficientReadQuorum("bucket".into(), "object".into()))
+}
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 
@@ -1098,6 +1119,11 @@ impl PutObjectCompletion {
 
 /// Record the failed completion and hand the error back to the caller.
 fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
+    let err = if matches!(&completion, PutObjectCompletion::S3(_)) {
+        normalize_put_read_quorum_error(err)
+    } else {
+        err
+    };
     let result: S3Result<S3Response<()>> = Err(err);
     let _ = completion.complete(&result);
     match result {
@@ -1185,7 +1211,9 @@ impl DefaultObjectUsecase {
     #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        self.execute_put_object_boxed(_fs, req).await
+        self.execute_put_object_boxed(_fs, req)
+            .await
+            .map_err(normalize_put_read_quorum_error)
     }
 
     fn execute_put_object_boxed<'a>(
@@ -1552,6 +1580,9 @@ impl DefaultObjectUsecase {
 
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await;
+        #[cfg(test)]
+        let bucket_sse_config = injected_put_read_quorum_failure(PutReadQuorumTestStage::DefaultSse)
+            .map_or(bucket_sse_config, |err| Err(ApiError::from(err).into()));
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
         let bucket_sse_config = bucket_sse_config?;
         debug!(
@@ -1702,6 +1733,9 @@ impl DefaultObjectUsecase {
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
         let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
+        #[cfg(test)]
+        let prelookup_required =
+            prelookup_required || injected_put_read_quorum_failure(PutReadQuorumTestStage::Prelookup).is_some();
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
@@ -1716,6 +1750,9 @@ impl DefaultObjectUsecase {
                 crate::hp_guard!("S3::put_object_prelookup");
                 store.get_object_info(&bucket, &key, &current_opts).await
             };
+            #[cfg(test)]
+            let previous_current_info =
+                injected_put_read_quorum_failure(PutReadQuorumTestStage::Prelookup).map_or(previous_current_info, Err);
             Some(match previous_current_info {
                 Ok(existing_obj_info) => {
                     validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?;
@@ -1990,6 +2027,8 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        #[cfg(test)]
+        let injected_commit_error = injected_put_read_quorum_failure(PutReadQuorumTestStage::Commit);
         let put_commit = spawn_traced_join({
             let store = Arc::clone(&store);
             let bucket = bucket.clone();
@@ -2010,6 +2049,11 @@ impl DefaultObjectUsecase {
                     .and_then(ObjectTrafficHealth::track_write_storage);
                 let mut reader = reader;
                 let store_put_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                #[cfg(test)]
+                if let Some(err) = injected_commit_error {
+                    store_put_watchdog.cancel();
+                    return Err(ApiError::from(err).into());
+                }
                 let (obj_info, backfilled_old_current_size) = match store
                     .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
                     .await
@@ -2206,6 +2250,79 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn put_read_quorum_failures_are_normalized_at_each_stage() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-quorum-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("read-quorum PUT bucket must be created");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+
+        for (index, stage) in [
+            PutReadQuorumTestStage::DefaultSse,
+            PutReadQuorumTestStage::Prelookup,
+            PutReadQuorumTestStage::Commit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for method in [Method::PUT, Method::POST] {
+                let key = format!("refused-{index}-{method}");
+                let input = PutObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(key.clone())
+                    .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"quorum probe"))))
+                    .content_length(Some(12))
+                    .build()
+                    .expect("quorum probe input must build");
+                let mut req = build_request(input, method.clone());
+                if method == Method::POST {
+                    req.extensions.insert(PostObjectRequestMarker);
+                }
+                let err = PUT_READ_QUORUM_TEST_STAGE
+                    .scope(stage, usecase.execute_put_object(&FS::new(), req))
+                    .await
+                    .expect_err("read quorum failure must refuse the upload");
+                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "stage {index}, method {method}");
+                assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+                assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
+                assert!(matches!(
+                    err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+                    Some(StorageError::InsufficientReadQuorum(_, _))
+                ));
+                let response = err.to_http_response().expect("PUT error must serialize");
+                assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+                let xml = http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .expect("PUT error XML must be readable")
+                    .to_bytes();
+                let xml = std::str::from_utf8(&xml).expect("PUT error XML must be UTF-8");
+                assert!(xml.contains("<Code>ServiceUnavailable</Code>"), "{xml}");
+                assert!(!xml.contains("SlowDownRead"), "{xml}");
+                let lookup = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await;
+                assert!(
+                    lookup.as_ref().is_err_and(is_err_object_not_found),
+                    "failed PUT must leave no object: {lookup:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_put_completion_normalizes_only_s3_errors() {
+        let error = || S3Error::from(ApiError::from(StorageError::ErasureReadQuorum));
+        let err = fail_put_object(PutObjectCompletion::S3(OperationHelper::Disabled), error());
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
+        let internal = fail_put_object(PutObjectCompletion::Internal(None), error());
+        assert_eq!(internal.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+    }
     use s3s::dto::{
         DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ServerSideEncryptionByDefault,
         ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
