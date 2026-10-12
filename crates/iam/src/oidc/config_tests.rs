@@ -380,13 +380,15 @@ fn config_input_rejects_invalid_fields() {
     let err = serde_json::from_str::<OidcProviderConfigInput>(
         r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
     )
-    .expect_err("unknown upsert field should fail");
+    .err()
+    .expect("unknown upsert field should fail");
     assert!(err.to_string().contains("unknown field"));
 
     let err = serde_json::from_str::<OidcProviderValidationInput>(
         r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
     )
-    .expect_err("unknown validate field should fail");
+    .err()
+    .expect("unknown validate field should fail");
     assert!(err.to_string().contains("unknown field"));
 
     assert!(matches!(
