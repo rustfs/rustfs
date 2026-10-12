@@ -32,6 +32,7 @@ members = [
     "crates/keystone", # OpenStack Keystone integration
     "crates/license", # License and entitlement provider contracts
     "crates/lifecycle", # Lifecycle rule evaluation contracts
+    "crates/media-processing", # Image/video variant derivation via ffmpeg
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/log-analyzer", # Offline log fault-analysis core (rustfs diagnose)

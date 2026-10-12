@@ -272,6 +272,7 @@ pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
 pub const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = "on-demand-migration.json";
+pub const BUCKET_MEDIA_PROCESSING_CONFIG: &str = "media-processing.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
 pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
@@ -460,6 +461,7 @@ pub struct BucketMetadata {
     pub table_bucket_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
     pub on_demand_migration_config_json: Vec<u8>,
+    pub media_processing_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -482,6 +484,7 @@ pub struct BucketMetadata {
     pub table_bucket_config_updated_at: OffsetDateTime,
     pub durability_config_updated_at: OffsetDateTime,
     pub on_demand_migration_config_updated_at: OffsetDateTime,
+    pub media_processing_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -535,6 +538,7 @@ impl Default for BucketMetadata {
             table_bucket_config_json: Default::default(),
             durability_config_json: Default::default(),
             on_demand_migration_config_json: Default::default(),
+            media_processing_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -556,6 +560,7 @@ impl Default for BucketMetadata {
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             on_demand_migration_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            media_processing_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -659,6 +664,13 @@ impl BucketMetadata {
         ))
     }
 
+    /// Opaque per-bucket media processing profile with its persisted update
+    /// time. Empty bytes mean absent or cleared; decoding belongs to the consumer.
+    pub fn media_processing_config(&self) -> Option<(&[u8], OffsetDateTime)> {
+        (!self.media_processing_config_json.is_empty())
+            .then_some((self.media_processing_config_json.as_slice(), self.media_processing_config_updated_at))
+    }
+
     /// Parsed per-bucket durability override, if a valid one is stored.
     /// Invalid payloads follow the global mode after logging a parse failure.
     pub fn durability_config(&self) -> Option<super::durability::BucketDurabilityConfig> {
@@ -742,6 +754,9 @@ impl BucketMetadata {
                 "OnDemandMigrationConfigJSON" | "OnDemandMigrationConfigJson" => {
                     self.on_demand_migration_config_json = read_msgp_bin(rd)?
                 }
+                "MediaProcessingConfigJSON" | "MediaProcessingConfigJson" => {
+                    self.media_processing_config_json = read_msgp_bin(rd)?
+                }
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -752,6 +767,7 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
+                "MediaProcessingConfigUpdatedAt" => self.media_processing_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketCreationCommitted" => self.bucket_creation_committed = read_msgp_bool(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
@@ -827,6 +843,7 @@ impl BucketMetadata {
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
         write_bin_field(wr, "OnDemandMigrationConfigJSON", &self.on_demand_migration_config_json)?;
+        write_bin_field(wr, "MediaProcessingConfigJSON", &self.media_processing_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -847,6 +864,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
+        rmp::encode::write_str(wr, "MediaProcessingConfigUpdatedAt")?;
+        write_msgp_time(wr, self.media_processing_config_updated_at)?;
         rmp::encode::write_str(wr, "BucketCreationCommitted")?;
         rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
 
@@ -952,6 +971,9 @@ impl BucketMetadata {
         }
         if self.on_demand_migration_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.on_demand_migration_config_updated_at = self.created
+        }
+        if self.media_processing_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.media_processing_config_updated_at = self.created
         }
     }
 
@@ -1089,6 +1111,10 @@ impl BucketMetadata {
             BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
                 self.on_demand_migration_config_json = data;
                 self.on_demand_migration_config_updated_at = updated;
+            }
+            BUCKET_MEDIA_PROCESSING_CONFIG => {
+                self.media_processing_config_json = data;
+                self.media_processing_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }

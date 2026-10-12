@@ -45,6 +45,7 @@ pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod kms_rekey;
+pub mod media_processing;
 pub mod mfa;
 pub mod module_switch;
 mod notify_runtime_access;

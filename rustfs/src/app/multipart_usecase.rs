@@ -806,6 +806,9 @@ impl DefaultMultipartUsecase {
                     }
 
                     enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+                    // A multipart upload is the usual path for large video, so
+                    // it must derive renditions exactly like a single PUT.
+                    crate::app::media_processing::enqueue_media_processing(&bucket, &key, obj_info.size);
 
                     if let Some(decision) = completion_replication_decision
                         && decision.replicate_any()

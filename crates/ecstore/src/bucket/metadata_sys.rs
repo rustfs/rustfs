@@ -1214,6 +1214,22 @@ pub async fn get_on_demand_migration_config_in(api: &ECStore, bucket: &str) -> R
     lock.get_on_demand_migration_config(bucket).await
 }
 
+/// The bucket's media processing profile with its update time, or `Ok(None)`
+/// when the bucket has none.
+pub async fn get_media_processing_config(bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_media_processing_config(bucket).await
+}
+
+/// Resolve opaque configuration from the store's own metadata system.
+pub async fn get_media_processing_config_in(api: &ECStore, bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
+    let sys = bucket_metadata_sys_of(&api.ctx)?;
+    let lock = sys.read().await;
+    lock.get_media_processing_config(bucket).await
+}
+
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -2982,6 +2998,16 @@ impl BucketMetadataSys {
 
         Ok(bm
             .on_demand_migration_config()
+            .map(|(bytes, updated_at)| (bytes.to_vec(), updated_at)))
+    }
+
+    /// The bucket's media processing profile, or `None` when it has none.
+    /// Bytes are opaque to the metadata owner; the consumer decodes them.
+    pub async fn get_media_processing_config(&self, bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        Ok(bm
+            .media_processing_config()
             .map(|(bytes, updated_at)| (bytes.to_vec(), updated_at)))
     }
 }

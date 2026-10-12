@@ -223,6 +223,7 @@ hotpath-cpu = [
 workspace = true
 
 [dependencies]
+rustfs-media-processing = { path = "../crates/media-processing" }
 hotpath.workspace = true
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }

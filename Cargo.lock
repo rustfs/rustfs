@@ -9580,6 +9580,7 @@ dependencies = [
  "rustfs-lock",
  "rustfs-log-analyzer",
  "rustfs-madmin",
+ "rustfs-media-processing",
  "rustfs-mimalloc",
  "rustfs-notify",
  "rustfs-object-capacity",
@@ -10294,6 +10295,17 @@ dependencies = [
  "sysinfo",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "rustfs-media-processing"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

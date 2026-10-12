@@ -380,7 +380,7 @@ fn custom_error(code: &'static str, status: StatusCode, message: String) -> S3Er
     err
 }
 
-fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+pub(crate) fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let bucket = params.get("bucket").unwrap_or("").to_string();
     if bucket.is_empty() {
         return Err(admin_s3_error(S3ErrorCode::InvalidRequest, "bucket name is required"));
@@ -389,7 +389,7 @@ fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 }
 
 /// Authorize with `action` and confirm the bucket exists (404 otherwise).
-async fn authorize_for_bucket(req: &S3Request<Body>, action: AdminAction, bucket: &str) -> S3Result<Credentials> {
+pub(crate) async fn authorize_for_bucket(req: &S3Request<Body>, action: AdminAction, bucket: &str) -> S3Result<Credentials> {
     let cred = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
 
     let Some(store) = object_store_from_req(req) else {
@@ -680,7 +680,7 @@ async fn probe_source(bucket: &str, config: &OnDemandMigrationConfig) -> S3Resul
     }
 }
 
-fn format_updated_at(updated_at: OffsetDateTime) -> S3Result<String> {
+pub(crate) fn format_updated_at(updated_at: OffsetDateTime) -> S3Result<String> {
     updated_at
         .format(&Rfc3339)
         .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to format timestamp: {err}")))
@@ -699,7 +699,7 @@ pub(crate) async fn reload_peers(context: Option<&AppContext>, bucket: &str) -> 
         .map_err(|err| err.to_string())
 }
 
-fn notify_peers_reload(context: Option<Arc<AppContext>>, bucket: String, operation: &'static str) {
+pub(crate) fn notify_peers_reload(context: Option<Arc<AppContext>>, bucket: String, operation: &'static str) {
     tokio::spawn(async move {
         if let Err(error) = reload_peers(context.as_deref(), &bucket).await {
             warn!(

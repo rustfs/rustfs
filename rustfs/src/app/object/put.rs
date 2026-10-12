@@ -2115,6 +2115,9 @@ impl DefaultObjectUsecase {
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
                 let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+                // Derive image/video renditions off the request path; a bucket
+                // without a media profile makes this a no-op.
+                crate::app::media_processing::enqueue_media_processing(&bucket, &key, obj_info.size);
 
                 let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
                 // Fast in-memory update for immediate quota and admin usage consistency.

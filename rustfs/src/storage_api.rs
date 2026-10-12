@@ -299,6 +299,15 @@ pub(crate) mod connect {
 /// (`crate::site_replication`, backlog#1840): bucket metadata, bucket
 /// targets, replication-config primitives, and the config-object lock
 /// helpers its state transaction runs on.
+/// Storage surface of the media processing subsystem
+/// (`crate::app::media_processing`): the per-bucket profile blob and its reader.
+pub(crate) mod media_processing {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_MEDIA_PROCESSING_CONFIG;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+        get_media_processing_config, get_media_processing_config_in,
+    };
+}
+
 pub(crate) mod site_replication {
     pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;

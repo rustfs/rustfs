@@ -338,6 +338,12 @@ impl DefaultObjectUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
+    /// Store handle for subsystems outside the object module, such as the media
+    /// processing workers, which write derived objects outside a request.
+    pub(crate) fn object_store_pub(&self) -> Option<Arc<ECStore>> {
+        self.object_store()
+    }
+
     fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
         current_object_data_cache_for_context(self.context.as_deref())
     }

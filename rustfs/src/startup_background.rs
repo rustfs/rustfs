@@ -94,6 +94,9 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     );
 
     init_on_demand_migration_backfill_runtime(store).await;
+    // Starts only when an ffmpeg with libx264 is reachable; otherwise it logs
+    // and leaves every other service untouched.
+    crate::app::media_processing::init_media_processing().await;
 
     Ok(plan.scanner_enabled)
 }

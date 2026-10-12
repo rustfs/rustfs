@@ -41,6 +41,7 @@ const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
 const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
 const GET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("GetBucketOnDemandMigrationAction");
+const GET_BUCKET_MEDIA_PROCESSING: AdminActionRef = AdminActionRef::new("GetBucketMediaProcessingAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
 const GET_USER: AdminActionRef = AdminActionRef::new("GetUserAdminAction");
 const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
@@ -93,6 +94,7 @@ const SERVER_UPDATE: AdminActionRef = AdminActionRef::new("ServerUpdateAdminActi
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
 const SET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("SetBucketOnDemandMigrationAction");
+const SET_BUCKET_MEDIA_PROCESSING: AdminActionRef = AdminActionRef::new("SetBucketMediaProcessingAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
 const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketAction");
 const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
@@ -430,6 +432,30 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/on-demand-migration/{bucket}",
         SET_BUCKET_ON_DEMAND_MIGRATION,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/media-processing/{bucket}",
+        SET_BUCKET_MEDIA_PROCESSING,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/media-processing/{bucket}",
+        GET_BUCKET_MEDIA_PROCESSING,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/media-processing/{bucket}",
+        SET_BUCKET_MEDIA_PROCESSING,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/media-processing/{bucket}/capabilities",
+        GET_BUCKET_MEDIA_PROCESSING,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,

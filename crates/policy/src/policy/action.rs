@@ -521,6 +521,13 @@ pub enum AdminAction {
     /// Read a bucket's on-demand migration configuration and status.
     #[strum(serialize = "admin:GetBucketOnDemandMigration")]
     GetBucketOnDemandMigrationAction,
+    /// Write a bucket's media processing profile; it decides which objects get
+    /// image and video renditions, and may delete the source afterwards.
+    #[strum(serialize = "admin:SetBucketMediaProcessing")]
+    SetBucketMediaProcessingAction,
+    /// Read a bucket's media processing profile and the local encoder set.
+    #[strum(serialize = "admin:GetBucketMediaProcessing")]
+    GetBucketMediaProcessingAction,
     #[strum(serialize = "admin:GetMetrics")]
     GetMetricsAction,
     #[strum(serialize = "admin:ReplicationDiff")]
@@ -686,6 +693,8 @@ impl AdminAction {
                 | AdminAction::GetBucketTargetAction
                 | AdminAction::SetBucketOnDemandMigrationAction
                 | AdminAction::GetBucketOnDemandMigrationAction
+                | AdminAction::SetBucketMediaProcessingAction
+                | AdminAction::GetBucketMediaProcessingAction
                 | AdminAction::GetMetricsAction
                 | AdminAction::ReplicationDiff
                 | AdminAction::GetReplicationMetricsAction
