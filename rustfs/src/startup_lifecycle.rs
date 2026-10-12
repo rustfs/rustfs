@@ -130,6 +130,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         readiness,
     } = lifecycle;
     let StartupServiceRuntime {
+        oidc_recovery,
         optional_runtimes,
         heartbeat,
         inventory,
@@ -166,6 +167,18 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         shutdown_token,
     )
     .await;
+    if let Some(recovery) = oidc_recovery
+        && let Err(error) = recovery.await
+    {
+        tracing::warn!(
+            event = EVENT_SERVER_SHUTDOWN_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            result = "oidc_discovery_recovery_join_failed",
+            error = %error,
+            "OIDC discovery recovery task failed to join"
+        );
+    }
     shutdown_connect_runtimes(heartbeat, inventory).await;
     if let Some(runtime) = local_trace_capture {
         runtime.shutdown().await;

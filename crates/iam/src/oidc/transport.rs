@@ -312,6 +312,10 @@ struct CachedOidcExtraRootCerts {
     certs: Vec<Certificate>,
 }
 
+/// Discovery callers report failures with provider context and recovery throttling.
+#[derive(Clone)]
+pub(super) struct DiscoveryRequest;
+
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
 ///
 /// A fresh client is built for every request so the destination is re-validated and the
@@ -555,6 +559,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
         Box::pin(async move {
             let started_at = Instant::now();
             let (parts, body) = request.into_parts();
+            let discovery_request = parts.extensions.get::<DiscoveryRequest>().is_some();
             let method = parts.method.clone();
             let uri = parts.uri.to_string();
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -593,17 +598,19 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
             let response = response.map_err(|err| {
                 let error = oidc_http_error_from_reqwest(&url, err);
-                error!(
-                    event = EVENT_OIDC_HTTP,
-                    component = LOG_COMPONENT_IAM,
-                    subsystem = LOG_SUBSYSTEM_OIDC,
-                    result = "request_failed",
-                    method = %method,
-                    uri = %uri,
-                    elapsed_ms,
-                    error = %error,
-                    "oidc outbound http"
-                );
+                if !discovery_request {
+                    error!(
+                        event = EVENT_OIDC_HTTP,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "request_failed",
+                        method = %method,
+                        uri = %uri,
+                        elapsed_ms,
+                        error = %error,
+                        "oidc outbound http"
+                    );
+                }
                 error
             })?;
 
@@ -612,18 +619,20 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let body_bytes = read_bounded_response_body(response, MAX_OIDC_RESPONSE_SIZE)
                 .await
                 .map_err(|err| {
-                    error!(
-                        event = EVENT_OIDC_HTTP,
-                        component = LOG_COMPONENT_IAM,
-                        subsystem = LOG_SUBSYSTEM_OIDC,
-                        result = "response_body_failed",
-                        method = %method,
-                        uri = %uri,
-                        status = status.as_u16(),
-                        elapsed_ms,
-                        error = %err,
-                        "oidc outbound http"
-                    );
+                    if !discovery_request {
+                        error!(
+                            event = EVENT_OIDC_HTTP,
+                            component = LOG_COMPONENT_IAM,
+                            subsystem = LOG_SUBSYSTEM_OIDC,
+                            result = "response_body_failed",
+                            method = %method,
+                            uri = %uri,
+                            status = status.as_u16(),
+                            elapsed_ms,
+                            error = %err,
+                            "oidc outbound http"
+                        );
+                    }
                     err
                 })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
