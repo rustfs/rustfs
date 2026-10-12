@@ -19,10 +19,12 @@ use rustfs_iam::{
 };
 use std::{
     collections::hash_map::DefaultHasher,
+    future::Future,
     hash::{Hash, Hasher},
     io::{Error, Result},
     sync::Arc,
 };
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -31,7 +33,7 @@ const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
 
-pub(crate) async fn init_auth_integrations() -> Result<()> {
+pub(crate) async fn init_auth_integrations(shutdown: CancellationToken) -> Result<Option<AbortOnDropHandle<()>>> {
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
         match crate::auth_keystone::init_keystone_auth(keystone_config).await {
@@ -55,8 +57,13 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
 
     match build_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
         Ok(oidc) => {
-            let (service, oidc_config_query) = standard_oidc_runtime(oidc);
-            crate::runtime_sources::publish_federated_identity_runtime(service, oidc_config_query);
+            let (service, oidc_config_query) = standard_oidc_runtime(oidc.clone());
+            if crate::runtime_sources::publish_federated_identity_runtime(service, oidc_config_query) {
+                return Ok(Some(spawn_oidc_discovery_recovery(
+                    async move { oidc.recover_failed_providers().await },
+                    shutdown,
+                )));
+            }
         }
         Err(e) => {
             warn!(
@@ -69,7 +76,20 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(None)
+}
+
+fn spawn_oidc_discovery_recovery(
+    recovery: impl Future<Output = ()> + Send + 'static,
+    shutdown: CancellationToken,
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {}
+            () = recovery => {}
+        }
+    }))
 }
 
 fn standard_oidc_runtime(oidc: Arc<OidcSys>) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
@@ -132,5 +152,49 @@ mod tests {
         assert_eq!(Arc::strong_count(&retained), 2, "the query should retain the shared adapter");
         drop(oidc_config_query);
         assert_eq!(Arc::strong_count(&retained), 1, "dropping the runtime should release its OIDC Arc");
+    }
+
+    #[tokio::test]
+    async fn oidc_recovery_shutdown_releases_pending_work() {
+        let shutdown = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel::<()>();
+        let recovery = spawn_oidc_discovery_recovery(
+            async move {
+                let _release = released_tx;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            },
+            shutdown.child_token(),
+        );
+        started_rx.await.expect("recovery started");
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .expect("recovery observes shutdown")
+            .expect("recovery joins cleanly");
+        assert!(released_rx.await.is_err(), "shutdown drops in-flight recovery work");
+    }
+
+    #[tokio::test]
+    async fn oidc_recovery_owner_drop_releases_pending_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel::<()>();
+        let recovery = spawn_oidc_discovery_recovery(
+            async move {
+                let _release = released_tx;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            },
+            CancellationToken::new(),
+        );
+        started_rx.await.expect("recovery started");
+        drop(recovery);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), released_rx)
+                .await
+                .expect("owner drop aborts recovery")
+                .is_err()
+        );
     }
 }

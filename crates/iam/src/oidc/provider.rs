@@ -13,7 +13,7 @@
 // limitations under the License.
 use super::{
     config::{OidcProviderConfig, OidcProviderValidationResult, SourcedOidcProviderConfig},
-    transport::{OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs},
+    transport::{DiscoveryRequest, OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs, oidc_http_error_diagnostics},
 };
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use openidconnect::core::{CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 pub(super) const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -33,6 +33,55 @@ pub(super) const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 pub(super) const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 pub(super) const OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY: &str = "JWKS request blocked by outbound policy";
 pub(super) const OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY: &str = "OIDC provider discovery blocked by outbound policy";
+
+/// Preserve recovery eligibility before discovery errors become public diagnostic strings.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(super) struct DiscoveryFailure {
+    message: String,
+    pub(super) retryable: bool,
+    pub(super) diagnostics: (&'static str, String),
+}
+
+impl From<String> for DiscoveryFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+            diagnostics: ("validation", String::new()),
+        }
+    }
+}
+
+fn retryable_discovery_status(status: http::StatusCode) -> bool {
+    status.is_server_error() || matches!(status, http::StatusCode::REQUEST_TIMEOUT | http::StatusCode::TOO_MANY_REQUESTS)
+}
+
+fn retryable_discovery_transport(error: &OidcHttpError) -> bool {
+    matches!(error, OidcHttpError::Reqwest(error) if !error.is_builder())
+}
+
+fn discovery_failure(error: DiscoveryError<OidcHttpError>, context: &str, blocked_context: &str) -> DiscoveryFailure {
+    let retryable = match &error {
+        DiscoveryError::Request(error) => retryable_discovery_transport(error),
+        DiscoveryError::Response(status, _, _) => retryable_discovery_status(*status),
+        _ => false,
+    };
+    let diagnostics = match &error {
+        DiscoveryError::Request(error) => oidc_http_error_diagnostics(error),
+        DiscoveryError::Response(status, _, _) => ("http_status", status.as_u16().to_string()),
+        _ => ("validation", String::new()),
+    };
+    let message = match error {
+        DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason)) => format!("{blocked_context}: {reason}"),
+        error => format!("{context}: {error}"),
+    };
+    DiscoveryFailure {
+        message,
+        retryable,
+        diagnostics,
+    }
+}
 
 // ---- Internal provider state ----
 
@@ -180,6 +229,7 @@ impl<'c> AsyncHttpClient<'c> for JwksAcceptClient<'_> {
                 http::HeaderValue::from_static("application/json, application/jwk-set+json"),
             );
         }
+        request.extensions_mut().insert(DiscoveryRequest);
         self.inner.call(request)
     }
 }
@@ -246,7 +296,17 @@ impl ProviderRuntime {
         provider_id: &str,
         config: &OidcProviderConfig,
     ) -> Result<ProviderState, String> {
-        let state = discover_provider(config, &self.http_client).await?;
+        self.recover_provider_state(provider_id, config)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    pub(super) async fn recover_provider_state(
+        &self,
+        provider_id: &str,
+        config: &OidcProviderConfig,
+    ) -> Result<ProviderState, DiscoveryFailure> {
+        let state = discover_provider_for_recovery(config, &self.http_client).await?;
         let mut map = self.states.write().map_err(|e| {
             let msg = e.to_string();
             format!("provider state lock poisoned: {msg}")
@@ -301,6 +361,15 @@ pub(super) async fn discover_provider(
     config: &OidcProviderConfig,
     http_client: &ReqwestHttpClient,
 ) -> Result<ProviderState, String> {
+    discover_provider_for_recovery(config, http_client)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+pub(super) async fn discover_provider_for_recovery(
+    config: &OidcProviderConfig,
+    http_client: &ReqwestHttpClient,
+) -> Result<ProviderState, DiscoveryFailure> {
     if let Some(issuer) = config.issuer.as_deref().filter(|issuer| !issuer.trim().is_empty()) {
         return discover_provider_from_config_url(config, issuer, http_client).await;
     }
@@ -310,6 +379,8 @@ pub(super) async fn discover_provider(
     let base_issuer = normalize_config_url(&config.config_url)?;
     let candidates = issuer_candidates(&base_issuer);
     let mut last_errors = Vec::new();
+    let mut retryable = false;
+    let mut diagnostics = ("validation", String::new());
 
     for candidate_issuer in candidates.iter() {
         let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
@@ -332,26 +403,21 @@ pub(super) async fn discover_provider(
                         metadata: DiscoveredProviderMetadata::Console(Box::new(metadata)),
                         discovered_at: Instant::now(),
                     })
-                    .map_err(|err| match err {
-                        DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason)) => {
-                            format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}")
-                        }
-                        err => format!("discovery failed: {err}"),
-                    })
+                    .map_err(|err| discovery_failure(err, "discovery failed", OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY))
             };
             match discovered {
                 Ok(state) => return Ok(state),
                 Err(error)
-                    if error.starts_with(OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY)
-                        || error.starts_with(OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY) =>
+                    if error.message.starts_with(OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY)
+                        || error.message.starts_with(OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY) =>
                 {
                     return Err(error);
                 }
                 Err(error) => {
-                    let is_transient_transport = error.contains("Request failed");
+                    let is_transient_transport = error.message.contains("Request failed");
                     let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
                     if should_retry {
-                        warn!(
+                        debug!(
                             event = EVENT_OIDC_DIAGNOSTICS,
                             component = LOG_COMPONENT_IAM,
                             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -368,8 +434,12 @@ pub(super) async fn discover_provider(
                         continue;
                     }
 
+                    if error.retryable || !retryable {
+                        diagnostics = error.diagnostics.clone();
+                    }
+                    retryable |= error.retryable;
                     last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
-                    warn!(
+                    debug!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
                         subsystem = LOG_SUBSYSTEM_OIDC,
@@ -388,11 +458,11 @@ pub(super) async fn discover_provider(
         }
     }
 
-    Err(format!(
-        "discovery failed for all issuer variants {:?}: {}",
-        candidates,
-        last_errors.join("; ")
-    ))
+    Err(DiscoveryFailure {
+        message: format!("discovery failed for all issuer variants {:?}: {}", candidates, last_errors.join("; ")),
+        retryable,
+        diagnostics,
+    })
 }
 
 pub(super) async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
@@ -429,7 +499,7 @@ async fn discover_provider_from_config_url(
     config: &OidcProviderConfig,
     issuer: &str,
     http_client: &ReqwestHttpClient,
-) -> Result<ProviderState, String> {
+) -> Result<ProviderState, DiscoveryFailure> {
     let issuer_url = IssuerUrl::new(issuer.trim().to_string()).map_err(|e| format!("invalid issuer URL: {e}"))?;
     let explicit_issuer = config.issuer.as_deref().is_some_and(|issuer| !issuer.trim().is_empty());
     let discovery_url = if explicit_issuer {
@@ -440,6 +510,7 @@ async fn discover_provider_from_config_url(
             .map_err(|err| err.to_string())?
     };
     let request = http::Request::builder()
+        .extension(DiscoveryRequest)
         .uri(discovery_url.to_string())
         .method(http::Method::GET)
         .header(http::header::ACCEPT, "application/json")
@@ -449,12 +520,22 @@ async fn discover_provider_from_config_url(
     let response = match http_client.call(request).await {
         Ok(response) => response,
         Err(OidcHttpError::ForbiddenOutbound(reason)) => {
-            return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
+            return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}").into());
         }
-        Err(err) => return Err(format!("discovery request failed: Request failed: {err}")),
+        Err(err) => {
+            return Err(DiscoveryFailure {
+                retryable: retryable_discovery_transport(&err),
+                diagnostics: oidc_http_error_diagnostics(&err),
+                message: format!("discovery request failed: Request failed: {err}"),
+            });
+        }
     };
     if response.status() != http::StatusCode::OK {
-        return Err(format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url));
+        return Err(DiscoveryFailure {
+            retryable: retryable_discovery_status(response.status()),
+            diagnostics: ("http_status", response.status().as_u16().to_string()),
+            message: format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url),
+        });
     }
 
     if !explicit_issuer
@@ -466,7 +547,9 @@ async fn discover_provider_from_config_url(
                 .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
         })
     {
-        return Err("Unexpected response Content-Type: expected application/json".into());
+        return Err("Unexpected response Content-Type: expected application/json"
+            .to_string()
+            .into());
     }
 
     let provider_metadata = DiscoveredProviderMetadata::parse(response.body(), config.hide_from_ui)
@@ -476,7 +559,8 @@ async fn discover_provider_from_config_url(
             "unexpected issuer URI `{}` (expected `{}`)",
             provider_metadata.issuer().as_str(),
             issuer_url.as_str()
-        ));
+        )
+        .into());
     }
 
     let jwks_url = if explicit_issuer {
@@ -494,10 +578,7 @@ async fn discover_provider_from_config_url(
     .await
     {
         Ok(jwks) => jwks,
-        Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
-            return Err(format!("{OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
-        }
-        Err(err) => return Err(format!("failed to fetch JWKS: {err}")),
+        Err(err) => return Err(discovery_failure(err, "failed to fetch JWKS", OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY)),
     };
 
     Ok(ProviderState {
