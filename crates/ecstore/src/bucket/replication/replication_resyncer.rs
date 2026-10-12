@@ -3567,7 +3567,16 @@ async fn replicate_delete_to_target(
         }
     }
 
-    if !is_version_purge && dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+    // A target that mints its own version ids never holds the source marker
+    // id, so a version-addressed pre-check cannot succeed there; the marker
+    // is created by the versionless DELETE below.
+    let version_addressable =
+        !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable();
+    if version_addressable
+        && !is_version_purge
+        && dobj.delete_object.delete_marker
+        && dobj.delete_object.delete_marker_version_id.is_some()
+    {
         match head_object_for_worker(
             tgt_client.as_ref(),
             &tgt_client.bucket,
@@ -3576,6 +3585,11 @@ async fn replicate_delete_to_target(
         )
         .await
         {
+            // The verdict is not known yet (e.g. no PUT since restart) and the
+            // target rejected the source id: learn it as the PUT path does.
+            Err(e) if is_version_id_format_mismatch(e.as_ref()) => {
+                ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+            }
             Ok(head) if head.delete_marker == Some(true) => {
                 // Some targets expose an existing marker as a successful HEAD
                 // with the marker bit instead of the usual 405. Treat that as
@@ -6673,6 +6687,63 @@ mod tests {
         let seen = server.join().expect("test HTTP server should finish");
         assert_eq!(seen.len(), 1, "an ambiguous HEAD must not trigger DELETE: {seen:?}");
         assert!(seen[0].starts_with("HEAD "), "{seen:?}");
+    }
+
+    /// AWS S3 answers a HEAD for a version id it did not mint with a bodiless
+    /// 400. On a target with no verdict yet, that teaches `MintsOwn` and the
+    /// marker is still created with one versionless DELETE.
+    #[tokio::test]
+    async fn live_delete_marker_worker_learns_mints_own_from_bodiless_400() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("HEAD ") {
+                empty_response("400 Bad Request")
+            } else if line.starts_with("DELETE ") {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = marker_creation_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
+
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Completed, "{rinfo:?}");
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::MintsOwn
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("HEAD "), "{seen:?}");
+        assert!(seen[1].starts_with("DELETE "), "{seen:?}");
+        assert!(!seen[1].contains("versionId="), "marker creation must remain versionless: {seen:?}");
+    }
+
+    /// A target already known to mint its own version ids is never asked for
+    /// the source marker id: the marker is created by the versionless DELETE.
+    #[tokio::test]
+    async fn live_delete_marker_worker_skips_version_head_on_mints_own_target() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("DELETE ") {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = marker_creation_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
+
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Completed, "{rinfo:?}");
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "no version-addressed HEAD on a MintsOwn target: {seen:?}");
+        assert!(seen[0].starts_with("DELETE "), "{seen:?}");
+        assert!(!seen[0].contains("versionId="), "marker creation must remain versionless: {seen:?}");
     }
 
     /// A target answers `HEAD ?versionId=<delete marker>` with a bodiless
