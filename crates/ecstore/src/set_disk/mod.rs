@@ -4734,7 +4734,9 @@ impl Hash for GetObjectMetadataCacheKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GetObjectMetadataCacheCapability {
     Full,
-    // Quorum-validated metadata without a complete body or write-target layout.
+    // A quorum-selected layout can serve body reads, but is not a mutation layout.
+    QuorumSelected,
+    // Quorum-validated metadata used only to evaluate a terminal read condition.
     ConditionOnly,
 }
 

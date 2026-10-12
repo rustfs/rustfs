@@ -472,14 +472,14 @@ impl SetDisks {
         entry: Arc<GetObjectMetadataCacheEntry>,
         after_insert: impl FnOnce(),
     ) {
-        // Every publisher shares Moka's per-key compute lock. A conditional
-        // snapshot cannot downgrade a full layout or extend its original TTL.
+        // Every publisher shares Moka's per-key compute lock. A partial snapshot
+        // cannot downgrade a full layout or extend its original TTL.
         self.get_object_metadata_cache
             .entry(key.clone())
             .and_compute_with(|current| {
                 std::future::ready(
                     if !self.is_get_object_metadata_cache_generation_current(generation)
-                        || (entry.capability == GetObjectMetadataCacheCapability::ConditionOnly
+                        || (entry.capability != GetObjectMetadataCacheCapability::Full
                             && current
                                 .as_ref()
                                 .is_some_and(|existing| existing.value().capability == GetObjectMetadataCacheCapability::Full))
@@ -632,7 +632,11 @@ impl SetDisks {
             match self.lookup_cached_get_object_fileinfo(bucket, object).await {
                 MetadataCacheLookup::Hit(cached)
                     if cached.capability == GetObjectMetadataCacheCapability::Full
+                        || (cached.capability == GetObjectMetadataCacheCapability::QuorumSelected
+                            && read_data
+                            && allow_early_stop)
                         || (purpose == MetadataReadPurpose::GetObjectReader
+                            && cached.capability == GetObjectMetadataCacheCapability::ConditionOnly
                             && allow_early_stop
                             && crate::object_api::get_object_read_condition_is_terminal(
                                 crate::object_api::GetObjectReadMetadata::from_file_info(bucket, object, &cached.fi),
@@ -828,8 +832,10 @@ impl SetDisks {
                     &fi,
                     if metadata_fanout_complete {
                         GetObjectMetadataCacheCapability::Full
-                    } else {
+                    } else if condition_stopped {
                         GetObjectMetadataCacheCapability::ConditionOnly
+                    } else {
+                        GetObjectMetadataCacheCapability::QuorumSelected
                     },
                 ),
                 &parts_metadata,
@@ -4130,6 +4136,7 @@ mod metadata_cache_tests {
         .await
         .expect("test object should be written before enabling the slow-tail fault");
 
+        let calls = disk_call_counters::observe(object);
         temp_env::async_with_vars(
             [
                 ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
@@ -4142,7 +4149,6 @@ mod metadata_cache_tests {
                 ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
             ],
             async {
-                let calls = disk_call_counters::observe(object);
                 let first = tokio::time::timeout(
                     Duration::from_millis(400),
                     set.get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true),
@@ -4167,6 +4173,19 @@ mod metadata_cache_tests {
             },
         )
         .await;
+
+        let full_layout = set
+            .get_object_fileinfo_gated(bucket, object, &ObjectOptions::default(), false, false)
+            .await
+            .expect("read-before-write consumers must fetch a complete layout");
+        assert!(
+            full_layout.shared_entry().is_none(),
+            "a quorum-selected partial layout cannot satisfy mutation consumers"
+        );
+        assert!(
+            calls.total(disk_call_counters::KIND_READ_VERSION) > 4,
+            "mutation consumers must independently fan out after a quorum-only cache hit"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
