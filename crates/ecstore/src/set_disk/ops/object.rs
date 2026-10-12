@@ -22999,22 +22999,43 @@ mod delete_objects_lock_gating_tests {
             ..Default::default()
         }];
 
-        let (deleted, errs) = tokio::time::timeout(
-            Duration::from_secs(1),
-            set_disks.delete_objects(
-                bucket,
-                objects,
-                ObjectOptions {
-                    no_lock: true,
-                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
-                        ObjectLockConfigState::ConfirmedAbsent,
-                    ))),
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("no_lock batch delete path must not wait for the outer lock");
+        let lock_manager = set_disks
+            .local_lock_manager
+            .as_fast_lock_manager()
+            .expect("isolated fixture should use the local lock manager");
+        let lock_metrics = lock_manager.get_metrics().shard_metrics;
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        let mut delete = Box::pin(set_disks.delete_objects(
+            bucket,
+            objects,
+            ObjectOptions {
+                no_lock: true,
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            },
+        ));
+        // Observe lock attempts on every poll: durable disk work can take more
+        // than a second on CI without waiting for the namespace lock at all.
+        let deletion = futures::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(delete.as_mut(), cx);
+            assert_eq!(
+                lock_manager.current_lock_counts(),
+                (1, 0),
+                "no_lock batch delete must preserve the outer holder without adding lock waiters"
+            );
+            let current = lock_manager.get_metrics().shard_metrics;
+            assert_eq!(
+                (current.total_acquisitions(), current.timeouts),
+                (lock_metrics.total_acquisitions(), lock_metrics.timeouts),
+                "no_lock batch delete must not acquire or time out on another namespace lock"
+            );
+            result
+        });
+        let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), deletion)
+            .await
+            .expect("no_lock batch delete disk work should complete");
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
