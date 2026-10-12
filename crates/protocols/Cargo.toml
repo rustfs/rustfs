@@ -93,6 +93,7 @@ swift = [
     "dep:futures",
     "dep:http-body-util",
     "dep:tokio-util",
+    "dep:sync_wrapper",
     "dep:serde",
     "dep:urlencoding",
     "dep:md-5",
@@ -137,6 +138,7 @@ time = { workspace = true, features = ["parsing", "formatting", "macros", "serde
 bytes = { workspace = true, features = ["serde"] }
 
 # S3 API dependencies
+rustfs-s3-types = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 
 # FTPS specific dependencies (optional)
@@ -157,6 +159,9 @@ uuid = { workspace = true, optional = true, features = ["v4", "fast-rng", "macro
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
+# Lends `Sync` to the Send-only streams that `Body::from_stream` and the
+# storage writer take; the stream is only ever polled through `&mut`.
+sync_wrapper = { workspace = true, optional = true, features = ["futures"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }

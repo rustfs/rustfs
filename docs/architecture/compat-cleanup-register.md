@@ -11,6 +11,8 @@
 
 ## Open Items
 
+- `authz-secret-header-conditions` legacy policy input: credential and SSE-C customer-key headers still reach the condition map consumed by OPA, while AuthzFacts excludes them. Preserve that input during the authorization-facts refactor. Remove the forwarding after a reviewed policy-input change stops sending those headers and defines migration for existing OPA policies.
+
 - `backlog-2253-metadata-observation-adapter` metadata observations: preserve aligned metadata/error slices for existing layout, shard and exact-version PUT, MPU and delete consumers while read/heal scheduling uses typed disk observations. Pending slots acquire empty placeholders only in this adapter. Remove after those remaining consumers use typed observations; delete the adapter and old facade in a separate cleanup.
 
 - `connect-894` pending Connect heartbeats: replay the exact preceding producer-capability list, with or without jobs, when upgrading to the memory-service capability. Preserve request ID, sequence, and persisted body rather than inserting the new capability into a retry. Remove after upgrades from the pre-service-memory capability set are unsupported.

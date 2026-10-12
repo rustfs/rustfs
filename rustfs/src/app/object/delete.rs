@@ -976,6 +976,8 @@ impl DefaultObjectUsecase {
         // Lock order is bucket lifecycle, then object/commit locks in storage.
         // Keep this guard alive through the physical delete: a preflight without
         // writer exclusion could authorize one subtree and delete a newer one.
+        // The delete takes ownership of it and releases it only when it has
+        // finished, even if this request is dropped first.
         let recursive_delete_guard = if force_header {
             Some(
                 store
@@ -1076,7 +1078,7 @@ impl DefaultObjectUsecase {
 
         let obj_info = {
             match store
-                .delete_object_with_tier_delete_journal(&bucket, &key, opts.clone())
+                .delete_object_with_tier_delete_journal_and_guards(&bucket, &key, opts.clone(), recursive_delete_guard)
                 .await
             {
                 Ok(obj) => obj,
@@ -1118,7 +1120,6 @@ impl DefaultObjectUsecase {
                 }
             }
         };
-        drop(recursive_delete_guard);
 
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;

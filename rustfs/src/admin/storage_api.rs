@@ -537,6 +537,7 @@ pub(crate) mod quota {
     pub(crate) type BucketQuota = super::ecstore_bucket::quota::BucketQuota;
     pub(crate) type QuotaError = super::ecstore_bucket::quota::QuotaError;
     pub(crate) type QuotaOperation = super::ecstore_bucket::quota::QuotaOperation;
+    pub(crate) use super::ecstore_bucket::quota::{QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2};
 }
 
 pub(crate) mod replication {

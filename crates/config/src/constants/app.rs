@@ -18,10 +18,8 @@ use const_str::concat;
 /// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
 pub const APP_NAME: &str = "RustFS";
-/// Application version
-/// Default value: 1.0.0
-/// Environment variable: RUSTFS_VERSION
-pub const VERSION: &str = "1.0.0";
+/// Cargo package version for this workspace member.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default configuration logger level
 /// Default value: error
@@ -38,12 +36,6 @@ pub const SAMPLE_RATIO: f64 = 1.0;
 /// Default configuration meter interval
 /// Default value: 30
 pub const METER_INTERVAL: u64 = 30;
-
-/// Default configuration service version
-/// Default value: 1.0.0
-/// Environment variable: RUSTFS_OBS_SERVICE_VERSION
-/// Uses the same value as VERSION constant
-pub const SERVICE_VERSION: &str = "1.0.0";
 
 /// Default configuration environment
 /// Default value: production
@@ -410,7 +402,6 @@ mod tests {
             APP_NAME,
             VERSION,
             DEFAULT_LOG_LEVEL,
-            SERVICE_VERSION,
             ENVIRONMENT,
             RUSTFS_TLS_KEY,
             RUSTFS_TLS_CERT,
@@ -446,8 +437,7 @@ mod tests {
     fn test_configuration_consistency() {
         // Test configuration consistency
 
-        // Version consistency
-        assert_eq!(VERSION, SERVICE_VERSION, "Application version should match service version");
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
 
         // Port conflict check
         let ports = [DEFAULT_PORT, DEFAULT_CONSOLE_PORT];

@@ -18,7 +18,7 @@
 //! [`AuthzFacts`] holds every request fact a condition key reads, already
 //! resolved: the client address, whether the transport was secure, how the
 //! request was authenticated, its headers and its listing query. Each edge
-//! builds one — the legacy s3s edge from a [`RequestEnvelope`], the gateway
+//! builds one — the legacy s3s edge from borrowed request parts, the gateway
 //! authorizer from its own request context — and both hand it to
 //! [`build_conditions`], so a policy cannot be judged differently depending on
 //! which edge accepted the request.
@@ -32,7 +32,6 @@
 //! material are dropped when the facts are built, no query parameter other than
 //! the listing keys is copied, and `Debug` prints names and counts only.
 
-use crate::app::RequestEnvelope;
 use crate::auth::{AuthType, constant_time_eq, extract_string_list_claim, get_request_auth_type_with_query};
 use http::{HeaderMap, HeaderName};
 use rustfs_credentials::Credentials;
@@ -181,18 +180,6 @@ pub(crate) struct AuthzFacts {
 }
 
 impl AuthzFacts {
-    /// The facts of a request the legacy edge decoded into an envelope.
-    pub(crate) fn from_envelope(envelope: &RequestEnvelope, target: AuthzTarget<'_>, now: OffsetDateTime) -> Self {
-        Self::from_request_parts(
-            envelope.headers(),
-            envelope.uri().query(),
-            envelope.remote_addr(),
-            envelope.client_info(),
-            target,
-            now,
-        )
-    }
-
     /// The facts of a request the legacy edge received, resolved by its rules.
     ///
     /// The client address is the one a trusted proxy attested, else the socket
@@ -537,5 +524,6 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
         || OBJECT_LOCK_HEADERS
             .iter()
             .any(|header| key.eq_ignore_ascii_case(header.trim_start_matches("x-amz-")))
+        || key.eq_ignore_ascii_case(super::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION)
         || is_server_derived_condition_key(key)
 }

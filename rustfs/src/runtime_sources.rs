@@ -14,7 +14,7 @@
 
 use crate::app::context;
 use rustfs_config::ENV_RUSTFS_BROWSER_REDIRECT_URL;
-use rustfs_iam::federation::FederatedIdentityService;
+use rustfs_iam::federation::{FederatedIdentityService, oidc::OidcConfigQuery};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -35,6 +35,7 @@ pub(crate) use context::{
     resolve_bucket_monitor_handle as current_bucket_monitor_handle, resolve_buffer_config as current_buffer_config,
     resolve_daily_tier_stats as current_daily_tier_stats, resolve_deployment_id as current_deployment_id,
     resolve_encryption_service as current_encryption_service, resolve_endpoints_handle as current_endpoints_handle,
+    resolve_federated_identity_runtime as current_federated_identity_runtime,
     resolve_federated_identity_service as current_federated_identity_service, resolve_iam_handle as current_iam_handle,
     resolve_iam_ready as current_iam_ready, resolve_internode_metrics as current_internode_metrics,
     resolve_kms_runtime_service_manager as current_kms_runtime_service_manager,
@@ -58,7 +59,15 @@ pub(crate) use context::{
     resolve_tier_config_handle as current_tier_config_handle, resolve_token_signing_key as current_token_signing_key,
 };
 
-pub(crate) fn publish_federated_identity_service(service: Arc<FederatedIdentityService>) -> bool {
+pub(crate) fn publish_federated_identity_runtime(
+    service: Arc<FederatedIdentityService>,
+    oidc_config_query: Arc<dyn OidcConfigQuery>,
+) -> bool {
+    warn_on_browser_redirect_fallback(&service);
+    context::publish_federated_identity_runtime(service, oidc_config_query)
+}
+
+fn warn_on_browser_redirect_fallback(service: &FederatedIdentityService) {
     let browser_redirect_url = rustfs_utils::get_env_opt_str(ENV_RUSTFS_BROWSER_REDIRECT_URL);
     if service.has_providers() && browser_redirect_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
         warn!(
@@ -72,8 +81,6 @@ pub(crate) fn publish_federated_identity_service(service: Arc<FederatedIdentityS
             "OIDC browser redirect fallback enabled"
         );
     }
-
-    context::publish_federated_identity_service(service)
 }
 
 #[cfg(test)]
@@ -96,13 +103,12 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_iam::{
-        federation::{
-            FederatedAuthorization, FederatedCodeExchange, FederatedIdentityProvider, FederatedIdentityRegistry,
-            Result as FederationResult,
-        },
-        oidc::{OidcProviderConfig, OidcProviderSummary},
+    use rustfs_iam::federation::oidc::OidcConfigQuery;
+    use rustfs_iam::federation::{
+        FederatedAuthorization, FederatedCodeExchange, FederatedIdentityProvider, FederatedIdentityRegistry,
+        FederatedProviderView, FederatedRedirectPolicy, Result as FederationResult,
     };
+    use rustfs_iam::oidc::OidcConfigSnapshot;
     use std::{
         io::{self, Write},
         sync::Mutex,
@@ -119,15 +125,15 @@ mod tests {
             self.has_providers
         }
 
-        fn list_providers(&self) -> Vec<OidcProviderSummary> {
+        fn list_providers(&self) -> Vec<FederatedProviderView> {
             Vec::new()
         }
 
-        fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
+        fn list_visible_providers(&self) -> Vec<FederatedProviderView> {
             Vec::new()
         }
 
-        fn provider_config(&self, _id: &str) -> Option<&OidcProviderConfig> {
+        fn redirect_policy(&self, _provider_id: &str) -> Option<FederatedRedirectPolicy> {
             None
         }
 
@@ -161,6 +167,12 @@ mod tests {
         }
     }
 
+    impl OidcConfigQuery for TestProvider {
+        fn config_snapshot(&self) -> OidcConfigSnapshot {
+            OidcConfigSnapshot::new(Vec::new())
+        }
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -185,9 +197,10 @@ mod tests {
         }
     }
 
-    fn test_service(has_providers: bool) -> Arc<FederatedIdentityService> {
+    fn test_runtime(has_providers: bool) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
         let provider = Arc::new(TestProvider { has_providers });
-        Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(provider)))
+        let service = Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(provider.clone())));
+        (service, provider)
     }
 
     fn capture_startup_publication(has_providers: bool, browser_redirect_url: Option<&str>) -> String {
@@ -204,7 +217,8 @@ mod tests {
             );
 
             tracing::subscriber::with_default(subscriber, || {
-                assert!(publish_federated_identity_service(test_service(has_providers)));
+                let (service, oidc_config_query) = test_runtime(has_providers);
+                assert!(publish_federated_identity_runtime(service, oidc_config_query));
             });
 
             String::from_utf8(captured.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8")

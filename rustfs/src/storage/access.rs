@@ -15,14 +15,14 @@
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
-use crate::app::RequestEnvelope;
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
 use crate::auth::{
-    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest,
-    VerifiedSigV4Request, check_key_valid_with_context, get_condition_values_with_client_info, get_request_auth_type_with_query,
-    get_session_token, parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
+    AuthType, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, RUSTFS_MAX_CONTENT_LENGTH_QUERY,
+    RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request, check_key_valid_with_context,
+    get_condition_values_with_client_info, get_request_auth_type_with_query, get_session_token,
+    parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
     reject_unsigned_amz_headers_on_sigv4_request,
 };
 use crate::error::ApiError;
@@ -137,6 +137,11 @@ pub(crate) struct PostObjectRequestMarker;
 
 #[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
+
+/// Retain-until date the request asks to set. `authorization_conditions` turns it
+/// into `object-lock-remaining-retention-days`.
+#[derive(Clone, Debug)]
+struct RequestedObjectLockRetainUntil(OffsetDateTime);
 
 #[derive(Clone, Debug)]
 struct StagedMultipartPartAuthorization;
@@ -895,7 +900,16 @@ fn merge_request_object_tag_conditions(
 
 /// The request facts of `req` for an authorization decision about `target`, read now.
 fn request_authz_facts<T>(req: &S3Request<T>, target: AuthzTarget<'_>) -> AuthzFacts {
-    AuthzFacts::from_envelope(&RequestEnvelope::from_s3s(req), target, OffsetDateTime::now_utc())
+    AuthzFacts::from_request_parts(
+        &req.headers,
+        req.uri.query(),
+        req.extensions
+            .get::<Option<RemoteAddr>>()
+            .and_then(|addr| addr.as_ref().map(|addr| addr.0)),
+        req.extensions.get::<rustfs_trusted_proxies::ClientInfo>(),
+        target,
+        OffsetDateTime::now_utc(),
+    )
 }
 
 /// The root access key a principal is compared against to be the `Account`.
@@ -919,7 +933,56 @@ fn authorization_conditions<T>(
     let mut conditions = build_conditions(principal, facts);
     forward_secret_headers(&req.headers, &mut conditions);
     merge_request_object_tag_conditions(facts.action(), &req.headers, &mut conditions)?;
+    merge_object_lock_remaining_retention_days_condition(
+        req.extensions.get::<RequestedObjectLockRetainUntil>(),
+        OffsetDateTime::now_utc(),
+        &mut conditions,
+    );
     Ok(conditions)
+}
+
+/// Records the retain-until date a request asks to set, or clears it when the
+/// request sets none. Call it before `authorize_request` with the parsed date from
+/// headers, form fields, the PutObjectRetention XML body, or an archive member.
+pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, retain_until: Option<&Timestamp>) {
+    match retain_until {
+        Some(retain_until) => {
+            req.extensions
+                .insert(RequestedObjectLockRetainUntil(OffsetDateTime::from(retain_until.clone())));
+        }
+        None => {
+            req.extensions.remove::<RequestedObjectLockRetainUntil>();
+        }
+    }
+}
+
+fn merge_object_lock_remaining_retention_days_condition(
+    requested: Option<&RequestedObjectLockRetainUntil>,
+    now: OffsetDateTime,
+    conditions: &mut HashMap<String, Vec<String>>,
+) {
+    if let Some(RequestedObjectLockRetainUntil(retain_until)) = requested {
+        conditions.insert(
+            OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION.to_string(),
+            vec![remaining_retention_days(*retain_until, now).to_string()],
+        );
+    }
+}
+
+/// Whole days from `now` to `retain_until`, rounded up as MinIO does, so a policy
+/// limit of N days rejects a date even one second past day N. A date that is not
+/// in the future yields 0.
+fn remaining_retention_days(retain_until: OffsetDateTime, now: OffsetDateTime) -> i64 {
+    let remaining = retain_until - now;
+    if remaining <= time::Duration::ZERO {
+        return 0;
+    }
+    let days = remaining.whole_days();
+    if remaining > time::Duration::days(days) {
+        days + 1
+    } else {
+        days
+    }
 }
 
 fn retain_internal_object_authorization_conditions(
@@ -2296,6 +2359,8 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
+        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -2320,6 +2385,8 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
+        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -3250,6 +3317,8 @@ impl S3Access for FS {
         // Snapshot before authorization, but preserve AccessDenied precedence
         // by exposing any bucket-state error only after authorization succeeds.
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
         req.extensions.insert(bucket_generation?);
 
@@ -3315,6 +3384,12 @@ impl S3Access for FS {
 
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let requested_retain_until = req
+            .input
+            .retention
+            .as_ref()
+            .and_then(|retention| retention.retain_until_date.clone());
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -3456,6 +3531,8 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action,
     };
+    use super::{remaining_retention_days, set_requested_object_lock_retain_until};
+    use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::auth::facts::{AuthzPrincipal, AuthzTarget, list_query_pairs, merge_list_query_conditions};
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -4255,6 +4332,207 @@ mod tests {
             destination_conditions.get("RequestObjectTagKeys"),
             Some(&vec!["classification".to_string(), "label".to_string()])
         );
+    }
+
+    #[test]
+    fn access_facts_preserve_verified_client_context() {
+        use crate::shared_types::RemoteAddr;
+        use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+
+        let trusted = ClientInfo::from_trusted_proxy(
+            "203.0.113.9".parse().expect("client IP"),
+            None,
+            Some("https".to_owned()),
+            "10.0.0.2".parse().expect("proxy IP"),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        );
+        for (client_info, expected_ip, expected_secure) in [(None, "192.0.2.10", "false"), (Some(trusted), "203.0.113.9", "true")]
+        {
+            let mut req = build_request((), Method::GET);
+            req.headers
+                .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
+            req.headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            req.extensions
+                .insert(Some(RemoteAddr("192.0.2.10:443".parse().expect("peer address"))));
+            if let Some(client_info) = client_info {
+                req.extensions.insert(client_info);
+            }
+            let conditions = remaining_retention_days_conditions(&req, Action::S3Action(S3Action::GetObjectAction));
+            assert_eq!(conditions.get("SourceIp"), Some(&vec![expected_ip.to_owned()]));
+            assert_eq!(conditions.get("SecureTransport"), Some(&vec![expected_secure.to_owned()]));
+            assert!(req.extensions.get::<Option<RemoteAddr>>().is_some(), "facts must only borrow extensions");
+        }
+    }
+
+    fn remaining_retention_days_conditions(req: &S3Request<()>, action: Action) -> HashMap<String, Vec<String>> {
+        let credentials = rustfs_credentials::Credentials::default();
+        let principal = AuthzPrincipal::new(&credentials, "");
+        let facts = request_authz_facts(
+            req,
+            AuthzTarget {
+                action,
+                bucket: "",
+                object: "",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        authorization_conditions(req, &principal, &facts).expect("conditions should build")
+    }
+
+    fn request_retaining_for(retain_for: time::Duration) -> S3Request<()> {
+        let mut req = build_request((), Method::PUT);
+        let retain_until = OffsetDateTime::now_utc() + retain_for;
+        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        req
+    }
+
+    /// AWS does not document how it rounds partial days. MinIO computes
+    /// `ceil(hours / 24)` in `enforceRetentionBypassForPut`
+    /// (cmd/bucket-object-lock.go), and RustFS keeps that rounding so a policy
+    /// moved from MinIO evaluates the same way.
+    #[test]
+    fn remaining_retention_days_matches_s3_ceil_rounding() {
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            (time::Duration::NANOSECOND, 1),
+            (time::Duration::HOUR, 1),
+            (time::Duration::DAY - time::Duration::SECOND, 1),
+            (time::Duration::DAY, 1),
+            (time::Duration::DAY + time::Duration::SECOND, 2),
+            (time::Duration::days(29) + time::Duration::hours(12), 30),
+            (time::Duration::days(30), 30),
+            (time::Duration::days(30) + time::Duration::SECOND, 31),
+        ];
+
+        for (retain_for, expected) in cases {
+            let minio_days = (retain_for.as_seconds_f64() / 3600.0 / 24.0).ceil() as i64;
+            assert_eq!(minio_days, expected, "MinIO reference for {retain_for}");
+            assert_eq!(remaining_retention_days(now + retain_for, now), expected, "retain for {retain_for}");
+        }
+    }
+
+    #[test]
+    fn remaining_retention_days_is_zero_for_dates_not_in_future() {
+        let now = OffsetDateTime::now_utc();
+
+        assert_eq!(remaining_retention_days(now, now), 0);
+        assert_eq!(remaining_retention_days(now - time::Duration::NANOSECOND, now), 0);
+        assert_eq!(remaining_retention_days(now - time::Duration::days(3), now), 0);
+    }
+
+    #[test]
+    fn requested_retain_until_sets_remaining_retention_days_condition() {
+        let req = request_retaining_for(time::Duration::days(10) - time::Duration::HOUR);
+
+        let conditions = remaining_retention_days_conditions(&req, Action::S3Action(S3Action::PutObjectAction));
+
+        assert_eq!(
+            conditions.get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            Some(&vec!["10".to_string()])
+        );
+    }
+
+    #[test]
+    fn request_without_retention_has_no_remaining_retention_days_condition() {
+        let action = Action::S3Action(S3Action::PutObjectAction);
+        let req = build_request((), Method::PUT);
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+
+        let mut req = request_retaining_for(time::Duration::days(5));
+        set_requested_object_lock_retain_until(&mut req, None);
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+    }
+
+    #[test]
+    fn remaining_retention_days_condition_ignores_client_header() {
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let mut req = build_request((), Method::PUT);
+        req.headers
+            .insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(400);
+        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            Some(&vec!["400".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_policy_limits_retention_to_thirty_days() {
+        let policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:PutObjectRetention"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Deny",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:PutObjectRetention"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"NumericGreaterThan":{"s3:object-lock-remaining-retention-days":"30"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+        let no_groups: Option<Vec<String>> = None;
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let spoofed_header = |mut req: S3Request<()>| {
+            req.headers
+                .insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+            req
+        };
+
+        let cases = [
+            ("29 days", request_retaining_for(time::Duration::days(29)), true),
+            ("30 days", request_retaining_for(time::Duration::days(30)), true),
+            ("31 days", request_retaining_for(time::Duration::days(31)), false),
+            (
+                "30 days and a minute",
+                request_retaining_for(time::Duration::days(30) + time::Duration::MINUTE),
+                false,
+            ),
+            ("no retention", build_request((), Method::PUT), true),
+            (
+                "31 days with spoofed header",
+                spoofed_header(request_retaining_for(time::Duration::days(31))),
+                false,
+            ),
+        ];
+
+        for (name, req, allowed) in cases {
+            let conditions = remaining_retention_days_conditions(&req, action);
+            let args = BucketPolicyArgs {
+                bucket: "bucket",
+                action,
+                is_owner: false,
+                account: "",
+                groups: &no_groups,
+                conditions: &conditions,
+                object: "obj",
+            };
+
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{name}");
+        }
     }
 
     #[test]

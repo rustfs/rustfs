@@ -32,7 +32,10 @@ pub enum QuotaType {
     Hard,
 }
 
-pub(crate) const QUOTA_RESERVATION_PROTOCOL_V1: u32 = 1;
+pub const QUOTA_RESERVATION_PROTOCOL_V1: u32 = 1;
+/// Sharded durable reservations. Older nodes reject this protocol instead of
+/// silently falling back to the single-ledger protocol.
+pub const QUOTA_RESERVATION_PROTOCOL_V2: u32 = 2;
 
 /// Bucket quota configuration. quota_type defaults to Hard when omitted.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -89,7 +92,10 @@ impl<'de> Deserialize<'de> for BucketQuota {
         D: Deserializer<'de>,
     {
         let wire = BucketQuotaWire::deserialize(deserializer)?;
-        let quota = if wire.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1) {
+        let quota = if matches!(
+            wire.reservation_protocol,
+            Some(QUOTA_RESERVATION_PROTOCOL_V1) | Some(QUOTA_RESERVATION_PROTOCOL_V2)
+        ) {
             Some(
                 wire.reservation_quota
                     .ok_or_else(|| D::Error::custom("reservation_quota is required for reservation protocol v1"))?,
@@ -129,17 +135,33 @@ impl BucketQuota {
         }
     }
 
+    /// Creates a quota using the sharded durable reservation protocol.
+    /// Deployment must complete the mixed-version rollout before enabling it;
+    /// older nodes fail closed when they see protocol v2.
+    pub fn new_sharded(quota: u64) -> Self {
+        let mut config = Self::new(Some(quota));
+        config.reservation_protocol = Some(QUOTA_RESERVATION_PROTOCOL_V2);
+        config
+    }
+
     pub fn get_quota_limit(&self) -> Option<u64> {
         self.quota
     }
 
     pub fn uses_durable_reservations(&self) -> bool {
-        self.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1)
+        matches!(
+            self.reservation_protocol,
+            Some(QUOTA_RESERVATION_PROTOCOL_V1) | Some(QUOTA_RESERVATION_PROTOCOL_V2)
+        )
+    }
+
+    pub fn uses_sharded_reservations(&self) -> bool {
+        self.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V2)
     }
 
     pub fn has_unsupported_reservation_protocol(&self) -> bool {
         self.reservation_protocol
-            .is_some_and(|version| version != QUOTA_RESERVATION_PROTOCOL_V1)
+            .is_some_and(|version| !matches!(version, QUOTA_RESERVATION_PROTOCOL_V1 | QUOTA_RESERVATION_PROTOCOL_V2))
     }
 
     pub fn check_operation_allowed(&self, current_usage: u64, operation_size: u64) -> bool {
@@ -322,9 +344,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_reservation_protocol_does_not_activate_v1() {
+    fn sharded_quota_roundtrips_with_authoritative_reservation_quota() {
+        let quota = BucketQuota::new_sharded(4096);
+        let json = serde_json::to_value(&quota).expect("sharded quota should serialize");
+        assert_eq!(json["quota"], 0);
+        assert_eq!(json["reservation_protocol"], QUOTA_RESERVATION_PROTOCOL_V2);
+        assert_eq!(json["reservation_quota"], 4096);
+        let restored: BucketQuota = serde_json::from_value(json).expect("sharded quota should parse");
+        assert_eq!(restored.quota, Some(4096));
+        assert!(restored.uses_sharded_reservations());
+    }
+
+    #[test]
+    fn unknown_reservation_protocol_does_not_activate_any_known_protocol() {
         let quota: BucketQuota =
-            serde_json::from_str(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":2,"reservation_quota":2048}"#)
+            serde_json::from_str(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":3,"reservation_quota":2048}"#)
                 .expect("future protocol should remain parseable");
 
         assert!(!quota.uses_durable_reservations());

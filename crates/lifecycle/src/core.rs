@@ -1479,7 +1479,7 @@ mod tests {
         // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and
         // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
         // InvalidArgument. The PutBucketLifecycleConfiguration path maps this io::Error
-        // to s3_error!(InvalidArgument) (see execute_put_bucket_lifecycle_configuration).
+        // to an InvalidArgument S3 error (see execute_put_bucket_lifecycle_configuration).
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {

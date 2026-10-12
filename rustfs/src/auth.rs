@@ -660,6 +660,10 @@ fn condition_values(
     conditions
 }
 
+/// Condition name for `s3:object-lock-remaining-retention-days`. Storage access
+/// derives it from the requested retain-until date, so no header may set it.
+pub(crate) const OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION: &str = "object-lock-remaining-retention-days";
+
 /// Get request authentication type
 ///
 /// # Arguments
@@ -1809,6 +1813,17 @@ mod tests {
         assert_eq!(conditions.get("object-lock-mode"), None);
         assert_eq!(conditions.get("object-lock-legal-hold"), None);
         assert_eq!(conditions.get("object-lock-retain-until-date"), None);
+    }
+
+    #[test]
+    fn object_lock_remaining_retention_days_header_is_ignored() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION), None);
     }
 
     #[test]

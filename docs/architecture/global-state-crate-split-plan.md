@@ -33,7 +33,7 @@ The guard pins the production files allowed to reference `rustfs_ecstore::api::g
 
 - `rustfs/src/storage/storage_api.rs`
 
-That boundary keeps only bootstrap writes and lifecycle controls (`set_global_endpoints`, `set_global_region`, `set_global_rustfs_port`, `set_object_store_resolver`, `shutdown_background_services`, `update_erasure_type`). Read-only runtime getters are exported through `rustfs_ecstore::api::runtime` and consumed through the local storage facade. A new direct use either moves behind an existing owner-local boundary or updates this plan and the guard in the same reviewed change.
+That boundary keeps only bootstrap writes and lifecycle controls (`set_global_endpoints`, `set_global_region`, `set_global_rustfs_port`, `set_object_store_resolver`, `shutdown_background_services`, `update_erasure_type`, `wait_for_detached_mutations`). Read-only runtime getters are exported through `rustfs_ecstore::api::runtime` and consumed through the local storage facade. A new direct use either moves behind an existing owner-local boundary or updates this plan and the guard in the same reviewed change.
 
 ## Fallback Removal Plan
 

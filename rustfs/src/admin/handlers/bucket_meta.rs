@@ -1369,7 +1369,7 @@ mod import_persist_tests {
 
         let unknown_protocol = vec![(
             format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
-            br#"{"quota":0,"reservation_protocol":2,"reservation_quota":1024}"#.to_vec(),
+            br#"{"quota":0,"reservation_protocol":3,"reservation_quota":1024}"#.to_vec(),
         )];
         assert!(imported_quota_requires_fleet_proof(&unknown_protocol).is_err());
     }

@@ -36,7 +36,7 @@ use rustfs_obs::init_obs;
 #[tokio::main]
 async fn main() {
     // Build config from environment variables, then initialise all backends.
-    let _guard = init_obs(None).await.expect("failed to initialise observability");
+    let _guard = init_obs(None, None).await.expect("failed to initialise observability");
 
     tracing::info!("RustFS started");
 
@@ -56,7 +56,7 @@ async fn main() {
 ```rust
 use rustfs_obs::init_obs;
 
-let _guard = init_obs(Some("http://otel-collector:4318".to_string()))
+let _guard = init_obs(Some("http://otel-collector:4318".to_string()), None)
 .await
 .expect("observability init failed");
 ```
@@ -136,7 +136,7 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 | Variable                     | Default           | Description                                             |
 |------------------------------|-------------------|---------------------------------------------------------|
 | `RUSTFS_OBS_SERVICE_NAME`    | `rustfs`          | OTel `service.name`                                     |
-| `RUSTFS_OBS_SERVICE_VERSION` | _(crate version)_ | OTel `service.version`                                  |
+| `RUSTFS_OBS_SERVICE_VERSION` | RustFS build version | OTel `service.version`; the explicit environment value overrides the version passed by the RustFS binary |
 | `RUSTFS_OBS_ENVIRONMENT`     | `development`     | Deployment environment (`production`, `development`, …) |
 
 ### Local logging

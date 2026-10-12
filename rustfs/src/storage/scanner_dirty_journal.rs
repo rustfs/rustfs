@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{ECStore, Error, ecstore_config};
+use super::{ECStore, Error, ObjectOptions, ecstore_config};
 use rustfs_scanner::{
     ScannerDirtyUsageBucket, ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayRecord,
     ScannerDurableDirtyUsageReplayScope, SegmentInvalidationProducerIdentity,
@@ -467,7 +467,16 @@ async fn flush_durable_dirty_usage_journal(store: Arc<ECStore>, owner: &str, sta
                 return false;
             }
         };
-        ecstore_config::com::save_config(store, &path, bytes).await
+        ecstore_config::com::save_config_with_opts_quiet(
+            store,
+            &path,
+            bytes,
+            &ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            },
+        )
+        .await
     };
     match result {
         Ok(()) | Err(Error::ConfigNotFound) => true,

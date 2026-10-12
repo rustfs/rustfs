@@ -87,6 +87,7 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
     is_restored_object_on_disk,
 };
+use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
@@ -190,6 +191,8 @@ const TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL: StdDuration = StdDuration::from_
 // before another full sweep can discover work persisted by another node.
 const TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
 const TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT: u64 = 10;
+const TIER_FREE_VERSION_RECOVERY_LEADER_LOCK: &str = "tier-free-version-recovery/leader.lock";
+const TIER_FREE_VERSION_RECOVERY_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 const DEFAULT_MANUAL_TRANSITION_JOB_RECOVERY_LIMIT: usize = 100;
@@ -1441,13 +1444,24 @@ pub(crate) async fn enqueue_committed_free_versions(api: &ECStore, free_versions
     queued
 }
 
-async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryState>>, oi: ObjectInfo) -> bool {
+async fn enqueue_recovered_free_version_with_state(
+    state: &Arc<RwLock<ExpiryState>>,
+    oi: ObjectInfo,
+    cancel: &CancellationToken,
+) -> bool {
     let task = FreeVersionTask(oi);
     let hash = task.op_hash();
     let (wrkr, stats) = {
-        let state = state.read().await;
+        let state = select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            state = state.read() => state,
+        };
         (state.get_worker_ch(hash), Arc::clone(&state.stats))
     };
+    if cancel.is_cancelled() {
+        return false;
+    }
     let Some(wrkr) = wrkr else {
         stats.increment_missed_freevers_tasks();
         stats.record_scanner_expiry_state();
@@ -1497,9 +1511,13 @@ fn set_recovered_free_version_enqueue_observer(
     RecoveredFreeVersionEnqueueObserverGuard
 }
 
-pub async fn enqueue_recovered_free_version(api: &ECStore, oi: ObjectInfo) -> bool {
+pub(super) async fn enqueue_recovered_free_version_with_cancel(
+    api: &ECStore,
+    oi: ObjectInfo,
+    cancel: &CancellationToken,
+) -> bool {
     let expiry_state = api.ctx.expiry_state();
-    let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi).await;
+    let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi, cancel).await;
 
     #[cfg(test)]
     if let Some(observer) = RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER
@@ -2937,20 +2955,43 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
 
     Some(tokio::spawn(async move {
         let cancel_token = api.ctx.background_cancel_token().unwrap_or_default();
-        let expiry_state = api.ctx.expiry_state();
-        run_tier_free_version_recovery_loop(
+        let acquire_api = Arc::clone(&api);
+        run_tier_free_version_recovery_coordinator(
             cancel_token,
-            expiry_state,
-            jitter_tier_free_version_recovery_delay,
-            move |bucket_marker, object_marker, recovery_cancel| {
+            tier_free_version_recovery_leader_retry_delay,
+            move || {
+                let api = Arc::clone(&acquire_api);
+                async move {
+                    let lock = api
+                        .new_ns_lock(RUSTFS_META_BUCKET, TIER_FREE_VERSION_RECOVERY_LEADER_LOCK)
+                        .await?;
+                    match lock.get_write_lock_quiet(TIER_FREE_VERSION_RECOVERY_LOCK_TIMEOUT).await {
+                        Ok(guard) => Ok(Some(guard)),
+                        Err(LockError::Timeout { .. }) => Ok(None),
+                        Err(err) => Err(err.into()),
+                    }
+                }
+            },
+            move |leader_cancel| {
                 let api = Arc::clone(&api);
                 async move {
-                    recover_tier_free_versions_with_cancel(
-                        api,
-                        DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
-                        bucket_marker,
-                        object_marker,
-                        recovery_cancel,
+                    run_tier_free_version_recovery_loop(
+                        leader_cancel,
+                        api.ctx.expiry_state(),
+                        jitter_tier_free_version_recovery_delay,
+                        move |bucket_marker, object_marker, recovery_cancel| {
+                            let api = Arc::clone(&api);
+                            async move {
+                                recover_tier_free_versions_with_cancel(
+                                    api,
+                                    DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
+                                    bucket_marker,
+                                    object_marker,
+                                    recovery_cancel,
+                                )
+                                .await
+                            }
+                        },
                     )
                     .await
                 }
@@ -2958,6 +2999,86 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
         )
         .await;
     }))
+}
+
+fn tier_free_version_recovery_leader_retry_delay() -> StdDuration {
+    StdDuration::from_secs(rand::rng().random_range(15..=30))
+}
+
+async fn run_tier_free_version_recovery_coordinator<A, AF, R, RF>(
+    cancel: CancellationToken,
+    retry_delay: fn() -> StdDuration,
+    mut acquire: A,
+    mut recover: R,
+) where
+    A: FnMut() -> AF,
+    AF: Future<Output = crate::error::Result<Option<NamespaceLockGuard>>>,
+    R: FnMut(CancellationToken) -> RF,
+    RF: Future<Output = ()>,
+{
+    loop {
+        let acquired = select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = acquire() => result,
+        };
+        match acquired {
+            Ok(Some(mut guard)) => {
+                let leader_cancel = cancel.child_token();
+                // Hold ownership across every page, cooldown and idle wait. A
+                // follower taking over starts a fresh sweep of persisted markers.
+                let recovery = recover(leader_cancel.clone());
+                tokio::pin!(recovery);
+                debug!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "free_version_recovery_leader_acquired",
+                    lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                    "Tier free-version recovery leader acquired"
+                );
+                select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        leader_cancel.cancel();
+                        recovery.await;
+                    }
+                    _ = guard.lock_lost_notified() => {
+                        debug!(
+                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            state = "free_version_recovery_leader_lost",
+                            lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                            "Tier free-version recovery leader lost"
+                        );
+                        // Dropping the recovery future would detach its active
+                        // walk. Cancel it and poll the same future through cleanup.
+                        leader_cancel.cancel();
+                        recovery.await;
+                    }
+                    _ = &mut recovery => {}
+                }
+                leader_cancel.cancel();
+                guard.release();
+            }
+            Ok(None) => {}
+            Err(err) => warn!(
+                event = EVENT_LIFECYCLE_WORKER_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                state = "free_version_recovery_leader_acquire_failed",
+                lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                error = %err,
+                "Tier free-version recovery leader acquisition failed"
+            ),
+        }
+        select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(retry_delay()) => {}
+        }
+    }
 }
 
 async fn run_tier_free_version_recovery_loop<F, Fut>(
@@ -2969,7 +3090,11 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
     F: FnMut(Option<String>, Option<String>, CancellationToken) -> Fut,
     Fut: Future<Output = crate::error::Result<FreeVersionRecoveryStats>>,
 {
-    let recovery_notify = Arc::clone(&expiry_state.read().await.recovery_notify);
+    let recovery_notify = select! {
+        biased;
+        _ = cancel_token.cancelled() => return,
+        state = expiry_state.read() => Arc::clone(&state.recovery_notify),
+    };
     let mut schedule = TierFreeVersionRecoverySchedule::default();
 
     loop {
@@ -2992,7 +3117,11 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
                 schedule.record_success(&stats);
                 rustfs_io_metrics::record_stage_duration("lifecycle_free_version_recovery", elapsed.as_secs_f64() * 1000.0);
                 let (pending_tasks, active_tasks) = {
-                    let state = expiry_state.read().await;
+                    let state = select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return,
+                        state = expiry_state.read() => state,
+                    };
                     (state.pending_tasks(), state.stats.active_tasks())
                 };
                 debug!(
@@ -5652,8 +5781,10 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     } else {
         None
     };
+    // The delete owns the publication guard from here on, so a cancelled
+    // expiry worker cannot let table-bucket publication overtake it.
     let mut dobj = match api
-        .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
+        .delete_object_with_tier_delete_journal_and_guards(&oi.bucket, &encode_dir_object(&oi.name), opts, [publication_guard])
         .await
     {
         Ok(dobj) => dobj,
@@ -5904,10 +6035,10 @@ mod tests {
         merge_stale_multipart_candidate, persist_manual_transition_job_progress_if_owned,
         persist_manual_transition_page_checkpoint, recover_manual_transition_job, recover_manual_transition_jobs,
         resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
-        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
-        should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
-        wait_for_tier_free_version_recovery,
+        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_coordinator,
+        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
+        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -6000,6 +6131,231 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn recovery_test_lock() -> (Arc<rustfs_lock::NamespaceLock>, Vec<Arc<dyn rustfs_lock::LockClient>>) {
+        let clients: Vec<Arc<dyn rustfs_lock::LockClient>> = (0..3)
+            .map(|_| {
+                Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())))
+                    as Arc<dyn rustfs_lock::LockClient>
+            })
+            .collect();
+        let lock =
+            rustfs_lock::NamespaceLock::with_clients_and_quorum(format!("recovery-test-{}", Uuid::new_v4()), clients.clone(), 2);
+        (Arc::new(lock), clients)
+    }
+
+    async fn acquire_recovery_test_lock(
+        lock: Arc<rustfs_lock::NamespaceLock>,
+        owner: String,
+    ) -> crate::error::Result<Option<rustfs_lock::NamespaceLockGuard>> {
+        // Keep this lease longer than the virtual-time cooldown/idle advances;
+        // production uses the namespace wrapper's renewable 30-second lease.
+        lock.lock_guard(
+            rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, super::TIER_FREE_VERSION_RECOVERY_LEADER_LOCK),
+            &owner,
+            StdDuration::from_millis(5),
+            StdDuration::from_secs(3600),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    fn recovery_test_retry_delay() -> StdDuration {
+        StdDuration::from_secs(15)
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_eight_coordinators_hold_one_leader_and_take_over() {
+        let (lock, _clients) = recovery_test_lock();
+        let (pages_tx, mut pages_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        let mut cancels = Vec::new();
+        for node in 0..8 {
+            let cancel = CancellationToken::new();
+            cancels.push(cancel.clone());
+            let lock = Arc::clone(&lock);
+            let pages_tx = pages_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                run_tier_free_version_recovery_coordinator(
+                    cancel,
+                    recovery_test_retry_delay,
+                    move || acquire_recovery_test_lock(Arc::clone(&lock), format!("node-{node}")),
+                    move |leader_cancel| {
+                        let pages_tx = pages_tx.clone();
+                        async move {
+                            let mut pages = 0;
+                            run_tier_free_version_recovery_loop(
+                                leader_cancel,
+                                ExpiryState::new(),
+                                std::convert::identity,
+                                move |bucket, object, _| {
+                                    pages += 1;
+                                    pages_tx.send((node, bucket, object)).expect("page observer should be open");
+                                    std::future::ready(Ok(free_version_recovery_stats(0, 0, pages == 1)))
+                                },
+                            )
+                            .await;
+                        }
+                    },
+                )
+                .await;
+            }));
+        }
+        let (leader, bucket, object) = pages_rx.recv().await.expect("one coordinator should start recovery");
+        assert!(bucket.is_none() && object.is_none());
+        // The same leader must survive both a truncated page's cooldown and
+        // complete idle sweeps. All other coordinators keep probing the lock.
+        let mut observed_pages = 1;
+        for _ in 0..27 {
+            tokio::time::advance(StdDuration::from_secs(60)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            while let Ok((node, bucket, object)) = pages_rx.try_recv() {
+                assert_eq!(node, leader, "followers must not repeat a namespace sweep");
+                if observed_pages == 1 {
+                    assert_eq!(bucket.as_deref(), Some("bucket"));
+                    assert_eq!(object.as_deref(), Some("object"));
+                } else {
+                    assert!(bucket.is_none() && object.is_none(), "complete sweeps should reset their cursors");
+                }
+                observed_pages += 1;
+            }
+        }
+        assert!(observed_pages >= 7, "the leader should finish a full ten-minute idle wait");
+        cancels[leader].cancel();
+        let (successor, bucket, object) = tokio::time::timeout(StdDuration::from_secs(60), pages_rx.recv())
+            .await
+            .expect("a follower should take over after leader shutdown")
+            .expect("page observer should remain open");
+        assert_ne!(successor, leader);
+        assert!(bucket.is_none() && object.is_none(), "a new leader must restart discovery safely");
+        for cancel in cancels {
+            cancel.cancel();
+        }
+        for task in tasks {
+            task.await.expect("all coordinators should shut down cleanly");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_lock_loss_waits_for_active_page_cleanup() {
+        let (lock, _clients) = recovery_test_lock();
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let (page_tx, mut page_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let finish_cleanup = Arc::new(tokio::sync::Notify::new());
+        let observed_cleanup = Arc::clone(&cleanup_started);
+        let release_cleanup = Arc::clone(&finish_cleanup);
+        let task = tokio::spawn(async move {
+            run_tier_free_version_recovery_coordinator(
+                loop_cancel,
+                recovery_test_retry_delay,
+                move || acquire_recovery_test_lock(Arc::clone(&lock), "old-leader".to_string()),
+                move |leader_cancel| {
+                    let page_tx = page_tx.clone();
+                    let cleanup_started = Arc::clone(&cleanup_started);
+                    let finish_cleanup = Arc::clone(&finish_cleanup);
+                    async move {
+                        run_tier_free_version_recovery_loop(
+                            leader_cancel,
+                            ExpiryState::new(),
+                            std::convert::identity,
+                            move |_, _, page_cancel| {
+                                let cleanup_started = Arc::clone(&cleanup_started);
+                                let finish_cleanup = Arc::clone(&finish_cleanup);
+                                page_tx.send(()).expect("page observer should remain open");
+                                async move {
+                                    page_cancel.cancelled().await;
+                                    cleanup_started.notify_one();
+                                    finish_cleanup.notified().await;
+                                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled page").into())
+                                }
+                            },
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
+        });
+        page_rx.recv().await.expect("leader should start an active page");
+        // Let authoritative backend leases expire before the next heartbeat
+        // can renew them. A failed refresh must cancel the active page.
+        tokio::time::advance(StdDuration::from_secs(3600)).await;
+        tokio::time::timeout(StdDuration::from_secs(1), observed_cleanup.notified())
+            .await
+            .expect("expired backend leases must trigger recovery cancellation");
+        assert!(!task.is_finished(), "lock loss must wait for the active page's cleanup");
+        assert!(page_rx.try_recv().is_err(), "the old leader must not start another page");
+        cancel.cancel();
+        release_cleanup.notify_one();
+        task.await.expect("coordinator should finish cleanup before exiting");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_coordinator_retries_without_scanning_after_lock_error() {
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            run_tier_free_version_recovery_coordinator(
+                loop_cancel,
+                recovery_test_retry_delay,
+                move || {
+                    observed_attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(rustfs_lock::LockError::InsufficientNodes {
+                        required: 2,
+                        available: 1,
+                    }
+                    .into()))
+                },
+                |_| async { panic!("a node without ownership must never start discovery") },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(StdDuration::from_secs(14)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "lock errors must not cause a tight retry loop");
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        task.await.expect("a follower should respond to shutdown during retry wait");
+    }
+
+    #[tokio::test]
+    async fn tier_free_version_recovery_enqueue_cancels_while_waiting_for_state_lock() {
+        let state = ExpiryState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut held = state.write().await;
+        held.tasks_tx.push(tx);
+        let cancel = CancellationToken::new();
+        let enqueue_cancel = cancel.clone();
+        let enqueue_state = Arc::clone(&state);
+        let enqueue = tokio::spawn(async move {
+            enqueue_recovered_free_version_with_state(&enqueue_state, ObjectInfo::default(), &enqueue_cancel).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!enqueue.is_finished(), "enqueue should be blocked on the state lock");
+        cancel.cancel();
+        let queued = tokio::time::timeout(StdDuration::from_secs(1), enqueue)
+            .await
+            .expect("cancellation must not wait for the state write guard")
+            .expect("enqueue should return cleanly");
+        assert!(!queued);
+        assert_eq!(held.pending_tasks(), 0);
+        assert_eq!(held.stats.missed_free_vers_tasks(), 0);
+        assert!(rx.try_recv().is_err(), "a cancelled recovery must not enqueue a task");
+        drop(held);
+        assert!(!enqueue_recovered_free_version_with_state(&state, ObjectInfo::default(), &cancel).await);
+        assert!(rx.try_recv().is_err(), "cancellation must win even when the lock is available");
+    }
 
     fn free_version_recovery_stats(enqueued: usize, failed: usize, truncated: bool) -> FreeVersionRecoveryStats {
         FreeVersionRecoveryStats {
@@ -7680,7 +8036,7 @@ mod tests {
         assert_eq!(state.read().await.stats.pending_tasks(), 1);
 
         // The single-slot queue is full for both enqueue paths.
-        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone(), &CancellationToken::new()).await);
         assert_eq!(state.read().await.stats.pending_tasks(), 1);
         assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
 
@@ -7712,7 +8068,7 @@ mod tests {
             ..Default::default()
         };
 
-        let queued = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let queued = enqueue_recovered_free_version_with_state(&state, oi, &CancellationToken::new()).await;
         let state = state.read().await;
 
         assert!(!queued);
@@ -7841,8 +8197,8 @@ mod tests {
             ..Default::default()
         };
 
-        let first = enqueue_recovered_free_version_with_state(&state, oi.clone()).await;
-        let second = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let first = enqueue_recovered_free_version_with_state(&state, oi.clone(), &CancellationToken::new()).await;
+        let second = enqueue_recovered_free_version_with_state(&state, oi, &CancellationToken::new()).await;
         let state = state.read().await;
 
         assert!(first);
@@ -7943,7 +8299,7 @@ mod tests {
         };
 
         assert!(
-            super::enqueue_recovered_free_version(&ecstore, oi).await,
+            super::enqueue_recovered_free_version_with_cancel(&ecstore, oi, &CancellationToken::new()).await,
             "the resized production worker queue should accept the task"
         );
         stop_tx.send(None).await.expect("worker stop signal should be delivered");
@@ -13840,7 +14196,11 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
-        let (disk_paths, ecstore) = setup_test_env().await;
+        let (disk_paths, ecstore) =
+            temp_env::async_with_vars([(super::ENV_TIER_FREE_VERSION_RECOVERY_ENABLED, Some("false"))], async {
+                setup_test_env().await
+            })
+            .await;
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
         let recovery_rx = {
             let state = runtime_state.read().await;
@@ -13896,13 +14256,14 @@ mod tests {
         };
         let mut recovery_rx = recovery_rx.lock().await;
         assert!(
-            super::enqueue_recovered_free_version(
+            super::enqueue_recovered_free_version_with_cancel(
                 &ecstore,
                 ObjectInfo {
                     bucket: "prefill".to_string(),
                     name: "prefill".to_string(),
                     ..Default::default()
                 },
+                &CancellationToken::new(),
             )
             .await,
             "the production recovery queue should accept its first task"
