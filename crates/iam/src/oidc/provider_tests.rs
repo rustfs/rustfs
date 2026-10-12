@@ -299,6 +299,7 @@ async fn workload_discovery_verification_and_rotation() {
             configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
             provider_runtime: ProviderRuntime::new(http_client, HashMap::from([(config.id.clone(), state)])),
             state_store: OidcStateStore::new(),
+            pending_discovery: Default::default(),
         };
         assert!(sys.has_providers());
         assert!(sys.provider_configs().all(|provider| provider.hide_from_ui));
