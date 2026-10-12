@@ -28,7 +28,8 @@ pub(crate) fn scanner_cache_lock_timeout() -> Duration {
 pub(crate) enum ScannerCheckpointPersistResult {
     Saved,
     FenceChanged,
-    Failed(StorageError),
+    Skipped,
+    RetryBucket(StorageError),
 }
 
 pub(crate) struct ScannerCheckpointPersistContext<'a> {
@@ -80,7 +81,12 @@ where
     )
     .await;
     if let Err(error) = checkpoint_save {
-        return ScannerCheckpointPersistResult::Failed(error);
+        record_checkpoint_save_failure(cache_name, checkpoint, &error);
+        return if matches!(error, StorageError::PreconditionFailed) {
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        } else {
+            ScannerCheckpointPersistResult::Skipped
+        };
     }
 
     if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
@@ -101,10 +107,46 @@ where
     {
         Ok(next_revisions) => {
             *revisions = next_revisions;
+            if let Some(source) = checkpoint.info.source {
+                let saved = checkpoint.info.scan_checkpoint.as_ref().map(|cursor| {
+                    rustfs_scanner_metrics::metrics::ScannerCheckpointReport {
+                        version: cursor.version,
+                        resume_after: cursor.resume_after.clone(),
+                        reason: cursor.reason.as_str().to_string(),
+                        last_event: "saved".to_string(),
+                    }
+                });
+                global_metrics().record_scanner_checkpoint_saved(
+                    source.pool_index,
+                    source.set_index,
+                    &checkpoint.info.name,
+                    saved,
+                );
+            }
             ScannerCheckpointPersistResult::Saved
         }
-        Err(error) => ScannerCheckpointPersistResult::Failed(error),
+        Err(error) => {
+            // A successful PUT consumed the old CAS revision. Reload the bucket
+            // before another write instead of rebasing this scan over a newer writer.
+            record_checkpoint_save_failure(cache_name, checkpoint, &error);
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        }
     }
+}
+
+fn record_checkpoint_save_failure(cache_name: &str, checkpoint: &DataUsageCache, error: &StorageError) {
+    global_metrics().record_scanner_checkpoint_save_failed();
+    error!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "periodic_checkpoint_save_failed",
+        bucket = %checkpoint.info.name,
+        cache_name = %cache_name,
+        error = %error,
+        "Scanner periodic checkpoint save failed"
+    );
 }
 
 #[derive(Debug)]

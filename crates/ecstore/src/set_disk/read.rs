@@ -14,10 +14,10 @@
 
 use super::{
     Arc, Bytes, DiskError, DiskOption, DiskStore, Endpoint, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason,
-    GetObjectFileInfo, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey,
-    GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK,
-    OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks, StorageError,
-    adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
+    GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
+    GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
+    LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
     collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
     get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
     is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, reduce_read_quorum_errs, to_object_err,
@@ -26,7 +26,8 @@ use super::{
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
-    GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED, GET_METADATA_CACHE_REASON_DATA_MOVEMENT,
+    GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
@@ -257,6 +258,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataReadPurpose {
+    FullLayout,
+    GetObjectReader,
+}
+
 impl SetDisks {
     /// A startup quorum can leave remote slots unregistered even after their
     /// peers become ready. Refresh those slots before taking the GET metadata
@@ -424,11 +431,12 @@ impl SetDisks {
         &self,
         identity: (&str, &str),
         generation: Option<GetObjectMetadataCacheGeneration>,
-        fi: &FileInfo,
+        selected: (&FileInfo, GetObjectMetadataCacheCapability),
         parts_metadata: &[FileInfo],
         online_disks: &[Option<DiskStore>],
         read_quorum: usize,
     ) {
+        let (fi, capability) = selected;
         if fi.deleted || !fi.has_valid_erasure_geometry() {
             return;
         }
@@ -451,6 +459,7 @@ impl SetDisks {
             parts_metadata: parts_metadata.to_vec(),
             online_disks: online_disks.to_vec(),
             read_quorum,
+            capability,
         });
         self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
             .await;
@@ -463,7 +472,25 @@ impl SetDisks {
         entry: Arc<GetObjectMetadataCacheEntry>,
         after_insert: impl FnOnce(),
     ) {
-        self.get_object_metadata_cache.insert(key.clone(), entry).await;
+        // Every publisher shares Moka's per-key compute lock. A conditional
+        // snapshot cannot downgrade a full layout or extend its original TTL.
+        self.get_object_metadata_cache
+            .entry(key.clone())
+            .and_compute_with(|current| {
+                std::future::ready(
+                    if !self.is_get_object_metadata_cache_generation_current(generation)
+                        || (entry.capability == GetObjectMetadataCacheCapability::ConditionOnly
+                            && current
+                                .as_ref()
+                                .is_some_and(|existing| existing.value().capability == GetObjectMetadataCacheCapability::Full))
+                    {
+                        moka::ops::compute::Op::Nop
+                    } else {
+                        moka::ops::compute::Op::Put(entry)
+                    },
+                )
+            })
+            .await;
         after_insert();
         if self.is_get_object_metadata_cache_generation_current(generation) {
             return;
@@ -525,8 +552,15 @@ impl SetDisks {
         read_data: bool,
         caller_allows_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, caller_allows_early_stop, false)
-            .await
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            read_data,
+            caller_allows_early_stop,
+            MetadataReadPurpose::FullLayout,
+        )
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -539,15 +573,13 @@ impl SetDisks {
         read_data: bool,
         caller_allows_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        let allow_read_version_coalescing = !crate::bucket::utils::is_meta_bucketname(bucket)
-            && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
         self.get_object_fileinfo_gated_inner(
             bucket,
             object,
             opts,
             read_data,
             caller_allows_early_stop,
-            allow_read_version_coalescing,
+            MetadataReadPurpose::GetObjectReader,
         )
         .await
     }
@@ -565,7 +597,7 @@ impl SetDisks {
         read_data: bool,
         allow_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, allow_early_stop, false)
+        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, allow_early_stop, MetadataReadPurpose::FullLayout)
             .await
     }
 
@@ -577,7 +609,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         allow_early_stop: bool,
-        allow_read_version_coalescing: bool,
+        purpose: MetadataReadPurpose,
     ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
@@ -598,7 +630,14 @@ impl SetDisks {
             );
         } else if vid.is_empty() {
             match self.lookup_cached_get_object_fileinfo(bucket, object).await {
-                MetadataCacheLookup::Hit(cached) => {
+                MetadataCacheLookup::Hit(cached)
+                    if cached.capability == GetObjectMetadataCacheCapability::Full
+                        || (purpose == MetadataReadPurpose::GetObjectReader
+                            && allow_early_stop
+                            && crate::object_api::get_object_read_condition_is_terminal(
+                                crate::object_api::GetObjectReadMetadata::from_file_info(bucket, object, &cached.fi),
+                            )) =>
+                {
                     rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "reached");
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
@@ -611,6 +650,15 @@ impl SetDisks {
                         metadata_cache_lookup_start,
                     );
                     return Ok(GetObjectFileInfo::shared(cached));
+                }
+                MetadataCacheLookup::Hit(_) => {
+                    // Keep the conditional entry for other requests; this read
+                    // needs a body or a complete mutation target set.
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_REJECT,
+                        GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED,
+                    );
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -648,6 +696,9 @@ impl SetDisks {
         // read_metadata_observed (see read_all_fileinfo_early_stop in
         // core/metadata_read.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
+        let allow_read_version_coalescing = purpose == MetadataReadPurpose::GetObjectReader
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
         let metadata_read_result = if allow_read_version_coalescing {
             Self::read_metadata_for_get_object(
                 &disks,
@@ -685,6 +736,7 @@ impl SetDisks {
             }
         };
         let metadata_fanout_complete = metadata_read.is_complete();
+        let condition_stopped = metadata_read.condition_stopped;
         let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
         metadata_fanout_diagnostics.record(metadata_metrics_path);
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
@@ -759,6 +811,7 @@ impl SetDisks {
             .await;
         } else if use_metadata_cache
             && (metadata_fanout_complete
+                || condition_stopped
                 || (read_data
                     && allow_early_stop
                     && metadata_fanout_diagnostics.valid_responses() >= read_quorum
@@ -771,7 +824,14 @@ impl SetDisks {
             self.cache_get_object_fileinfo(
                 (bucket, object),
                 metadata_cache_generation,
-                &fi,
+                (
+                    &fi,
+                    if metadata_fanout_complete {
+                        GetObjectMetadataCacheCapability::Full
+                    } else {
+                        GetObjectMetadataCacheCapability::ConditionOnly
+                    },
+                ),
                 &parts_metadata,
                 &op_online_disks,
                 read_quorum,
@@ -783,20 +843,17 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        if !metadata_fanout_complete
+        let mut snapshot = if !metadata_fanout_complete
             && allow_early_stop
             && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
             && late_materialization_candidate_is_safe(&fi)
         {
-            Ok(GetObjectFileInfo::owned_with_late_metadata_fanout(
-                fi,
-                parts_metadata,
-                op_online_disks,
-                disks,
-            ))
+            GetObjectFileInfo::owned_with_late_metadata_fanout(fi, parts_metadata, op_online_disks, disks)
         } else {
-            Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
-        }
+            GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
+        };
+        snapshot.condition_stopped = condition_stopped;
+        Ok(snapshot)
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -926,6 +983,8 @@ impl SetDisks {
             );
 
             let decode_stage_start = Instant::now();
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
             let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
@@ -983,6 +1042,8 @@ impl SetDisks {
         }
 
         let decode_stage_start = Instant::now();
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let body =
             try_read_inline_data_shards_direct(&mut reader_setup.readers, erasure.data_shards, read_length, object_size).await;
         let decode_elapsed = decode_stage_start.elapsed();
@@ -1401,6 +1462,8 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
             let coding::decode::DecodeOutcome {
                 written,
                 error: err,
@@ -1956,6 +2019,8 @@ impl SetDisks {
         .with_deferred_parity_handles(deferred_stripe_handles)
         .with_deferred_parity_reopeners(deferred_reopeners)
         .with_repair_evidence(Arc::clone(&repair));
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = if single_inflight {
             coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
@@ -2575,6 +2640,10 @@ impl Drop for LegacyPerPartDecodeReader {
 }
 
 fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {
+    #[cfg(feature = "test-util")]
+    if super::conditional_read_bench::cache_bypass_applies(bucket) {
+        return Some("benchmark");
+    }
     if !read_data {
         return Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA);
     }
@@ -3560,8 +3629,15 @@ mod metadata_cache_tests {
         let online_disks = Vec::new();
 
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            &parts_metadata,
+            &online_disks,
+            0,
+        )
+        .await;
 
         let cached = set
             .cached_get_object_fileinfo("bucket", "object")
@@ -3580,8 +3656,15 @@ mod metadata_cache_tests {
         let parts_metadata = vec![fi.clone()];
         let online_disks = Vec::new();
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            &parts_metadata,
+            &online_disks,
+            0,
+        )
+        .await;
         let cached = set
             .cached_get_object_fileinfo("bucket", "object")
             .await
@@ -3844,8 +3927,15 @@ mod metadata_cache_tests {
         let mut deleted = valid_test_fileinfo("deleted-object");
         deleted.deleted = true;
         let generation = set.get_object_metadata_cache_generation("bucket", "deleted-object");
-        set.cache_get_object_fileinfo(("bucket", "deleted-object"), generation, &deleted, &[deleted.clone()], &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "deleted-object"),
+            generation,
+            (&deleted, GetObjectMetadataCacheCapability::Full),
+            &[deleted.clone()],
+            &[],
+            0,
+        )
+        .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "deleted-object").await.is_none(),
             "deleted metadata must not be cached"
@@ -3853,8 +3943,15 @@ mod metadata_cache_tests {
 
         let invalid = FileInfo::default();
         let generation = set.get_object_metadata_cache_generation("bucket", "invalid-object");
-        set.cache_get_object_fileinfo(("bucket", "invalid-object"), generation, &invalid, std::slice::from_ref(&invalid), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "invalid-object"),
+            generation,
+            (&invalid, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&invalid),
+            &[],
+            0,
+        )
+        .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "invalid-object").await.is_none(),
             "invalid metadata must not be cached"
@@ -3876,6 +3973,7 @@ mod metadata_cache_tests {
                 ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
+                    capability: GetObjectMetadataCacheCapability::Full,
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
@@ -3896,8 +3994,15 @@ mod metadata_cache_tests {
         let fi = valid_test_fileinfo("object");
 
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
 
         assert!(
             set.cached_get_object_fileinfo("bucket", "object").await.is_some(),
@@ -3922,8 +4027,15 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket", "object")
             .expect("metadata cache generation should be active");
         let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(generation),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
         assert_eq!(set.get_object_metadata_cache.entry_count(), 1);
@@ -4130,13 +4242,879 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn conditional_inline_hedge_caches_only_terminal_metadata() {
+        use crate::object_api::{GetObjectReadCondition, GetObjectReadMetadata, WriteCompletion, with_get_object_read_condition};
+        use crate::set_disk::core::io_primitives::{disk_call_counters, rename_fanout_barrier};
+        use crate::set_disk::core::metadata_read::bounded_metadata_fanout_order;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        struct MatchingEtag {
+            bucket: &'static str,
+            object: &'static str,
+            etag: String,
+            reached: Notify,
+        }
+        impl GetObjectReadCondition for MatchingEtag {
+            fn is_terminal(&self, metadata: GetObjectReadMetadata<'_>) -> bool {
+                let matched = metadata.bucket == self.bucket
+                    && metadata.object == self.object
+                    && !metadata.delete_marker
+                    && metadata.etag == Some(self.etag.as_str());
+                if matched {
+                    // Observe the real metadata decision without changing its result.
+                    self.reached.notify_one();
+                }
+                matched
+            }
+        }
+
+        temp_env::async_with_vars(
+            [
+                (super::super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (super::super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+            ],
+            async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                let bucket = "conditional-inline-cache-hedge";
+                let object = "conditional-inline-cache-hedge.bin";
+                let payload: Vec<_> = (0..4096)
+                    .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+                    .collect();
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("real bucket");
+                let info = set
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(payload.clone()),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit all four real inline shards");
+                let etag = info.etag.expect("committed ETag");
+                let opts = ObjectOptions::default();
+                // This metadata-only inspection bypasses publication and discovers the actual layout.
+                let snapshot = set
+                    .get_object_fileinfo(bucket, object, &opts, false, false)
+                    .await
+                    .expect("actual metadata");
+                let distribution = snapshot.fi().erasure.distribution.clone();
+                assert_eq!(snapshot.fi().erasure.data_blocks, 2);
+                assert_eq!(snapshot.fi().erasure.parity_blocks, 2);
+                assert!(snapshot.fi().inline_data());
+                let d1 = distribution.iter().position(|block| *block == 1).expect("D1");
+                let d2 = distribution.iter().position(|block| *block == 2).expect("D2");
+                let order = bounded_metadata_fanout_order(bucket, object, 4, 2);
+                // Parity slots retain disk order, not their erasure block-number order.
+                let p1 = order[2];
+                let p2 = order[3];
+                assert_eq!(&order[..2], &[d1, d2]);
+                assert!(distribution[p1] > 2 && distribution[p2] > 2);
+                drop(snapshot);
+                assert!(set.cached_get_object_fileinfo(bucket, object).await.is_none(), "cold real object");
+                assert!(
+                    set.get_object_metadata_cache_bypass_reason(bucket, &opts, true)
+                        .await
+                        .is_none()
+                );
+
+                let calls = disk_call_counters::observe(object);
+                let data = rename_fanout_barrier::arm(object, d2, rename_fanout_barrier::PHASE_READ_VERSION);
+                let parity = rename_fanout_barrier::arm(object, p2, rename_fanout_barrier::PHASE_READ_VERSION);
+                let condition = Arc::new(MatchingEtag {
+                    bucket,
+                    object,
+                    etag: etag.clone(),
+                    reached: Notify::new(),
+                });
+                let reader_set = Arc::clone(&set);
+                let reader_condition = Arc::clone(&condition);
+                let mut read = tokio::spawn(async move {
+                    with_get_object_read_condition(
+                        reader_condition,
+                        reader_set.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+                    )
+                    .await
+                });
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let completed = tokio::select! {
+                    _ = data.wait_until_paused_before(deadline) => {
+                        parity.wait_until_paused_before(deadline).await;
+                        assert!(data.is_paused(), "D2 is still unavailable when the spare P2 is scheduled");
+                        assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, d1), 1);
+                        assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, p1), 1);
+                        parity.release();
+                        tokio::time::timeout_at(deadline, condition.reached.notified()).await
+                            .expect("actual matching decision on the first three completed responses");
+                        // The 304 must finish while D2 remains blocked; waiting
+                        // for all four disks would hide the cache starvation.
+                        let result = tokio::time::timeout_at(deadline, &mut read).await.expect("conditional reader deadline");
+                        data.release();
+                        result
+                    }
+                    _ = &mut read => panic!("cold read must cross the real hedge barriers"),
+                };
+                let mut reader = completed.expect("reader task").expect("conditional metadata reader");
+                assert_eq!(reader.object_info.etag.as_deref(), Some(etag.as_str()));
+                let mut forbidden_body = Vec::new();
+                assert!(
+                    reader.stream.read_to_end(&mut forbidden_body).await.is_err(),
+                    "terminal read is not a successful body"
+                );
+                assert!(forbidden_body.is_empty());
+                drop(reader);
+                assert_eq!(calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN), 0);
+                assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 0);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_BODY_DECODE),
+                    0,
+                    "304 metadata setup never verifies or decodes a body"
+                );
+                drop(data);
+                drop(parity);
+                let cached = set
+                    .cached_get_object_fileinfo(bucket, object)
+                    .await
+                    .expect("a terminal quorum must remain reusable for another condition");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::ConditionOnly);
+                assert_eq!(cached.online_disks.iter().flatten().count(), 3);
+                assert_eq!(
+                    cached
+                        .parts_metadata
+                        .iter()
+                        .filter(|metadata| !metadata.name.is_empty())
+                        .count(),
+                    3
+                );
+
+                let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                let mut hit = with_get_object_read_condition(
+                    Arc::new(MatchingEtag {
+                        bucket,
+                        object,
+                        etag: etag.clone(),
+                        reached: Notify::new(),
+                    }),
+                    set.get_object_reader(bucket, object, None, HeaderMap::new(), &opts),
+                )
+                .await
+                .expect("warm conditional metadata");
+                assert!(hit.stream.read_to_end(&mut Vec::new()).await.is_err());
+                drop(hit);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    before,
+                    "warm conditions reuse metadata without fanout"
+                );
+                let mut ordinary = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("ordinary warm GET");
+                let mut actual = Vec::new();
+                ordinary.stream.read_to_end(&mut actual).await.expect("ordinary body");
+                assert_eq!(actual, payload);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) > before,
+                    "conditional cached layout cannot supply an ordinary body"
+                );
+                assert!(
+                    calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN) > 0,
+                    "same source counter sees the ordinary positive control"
+                );
+                assert!(
+                    calls.total(disk_call_counters::KIND_BODY_DECODE) > 0,
+                    "same decoder counter sees the ordinary positive control"
+                );
+
+                // Restore the proven conditional quorum for each nonterminal
+                // consumer, so an earlier ordinary read cannot mask a leak.
+                for range in [
+                    None,
+                    Some(HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: 1,
+                        end: 16,
+                    }),
+                ] {
+                    set.invalidate_get_object_metadata_cache(bucket, object).await;
+                    set.cache_get_object_fileinfo(
+                        (bucket, object),
+                        set.get_object_metadata_cache_generation(bucket, object),
+                        (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                        &cached.parts_metadata,
+                        &cached.online_disks,
+                        cached.read_quorum,
+                    )
+                    .await;
+                    let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                    let mut reader = with_get_object_read_condition(
+                        Arc::new(MatchingEtag {
+                            bucket,
+                            object,
+                            etag: "different-etag".to_owned(),
+                            reached: Notify::new(),
+                        }),
+                        set.get_object_reader(bucket, object, range.clone(), HeaderMap::new(), &opts),
+                    )
+                    .await
+                    .expect("nonterminal condition must read its own body layout");
+                    let mut actual = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("complete nonterminal body");
+                    assert_eq!(
+                        actual.as_slice(),
+                        if range.is_some() {
+                            &payload[1..17]
+                        } else {
+                            payload.as_slice()
+                        }
+                    );
+                    assert!(calls.total(disk_call_counters::KIND_READ_VERSION) > before);
+                }
+
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+                set.cache_get_object_fileinfo(
+                    (bucket, object),
+                    set.get_object_metadata_cache_generation(bucket, object),
+                    (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                    &cached.parts_metadata,
+                    &cached.online_disks,
+                    cached.read_quorum,
+                )
+                .await;
+                let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                let full = with_get_object_read_condition(
+                    Arc::new(MatchingEtag {
+                        bucket,
+                        object,
+                        etag,
+                        reached: Notify::new(),
+                    }),
+                    set.get_object_fileinfo_gated(bucket, object, &opts, true, false),
+                )
+                .await
+                .expect("full-layout caller under a matching condition");
+                assert!(calls.total(disk_call_counters::KIND_READ_VERSION) > before);
+                assert_eq!(full.online_disks().iter().flatten().count(), 4);
+                assert_eq!(
+                    set.cached_get_object_fileinfo(bucket, object)
+                        .await
+                        .expect("complete publication")
+                        .capability,
+                    GetObjectMetadataCacheCapability::Full
+                );
+            },
+        )
+        .await;
+    }
+
+    fn cache_capability_race_entry(
+        object: &str,
+        capability: GetObjectMetadataCacheCapability,
+        etag: &str,
+    ) -> Arc<GetObjectMetadataCacheEntry> {
+        let mut fi = valid_test_fileinfo(object);
+        fi.metadata.insert("etag".to_string(), etag.to_string());
+        Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            parts_metadata: vec![fi.clone()],
+            fi,
+            online_disks: Vec::new(),
+            read_quorum: 0,
+            capability,
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_capability_publication_preserves_full_in_both_orders() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        for capabilities in [[Full, ConditionOnly], [ConditionOnly, Full]] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let full = cache_capability_race_entry("object", Full, "full-layout");
+            let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+            for capability in capabilities {
+                let incoming = if capability == Full { &full } else { &partial };
+                set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, Arc::clone(incoming), || {})
+                    .await;
+            }
+            let cached = set.get_object_metadata_cache.get(&key).await.expect("published cache entry");
+            assert_eq!(cached.capability, Full);
+            assert!(Arc::ptr_eq(&cached, &full), "the complete layout must survive either publication order");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_capability_publisher_waits_for_real_compute_in_both_orders() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+        use moka::ops::compute::Op;
+
+        for held_capability in [Full, ConditionOnly] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let full = cache_capability_race_entry("object", Full, "full-layout");
+            let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+            let (held_entry, incoming) = if held_capability == Full {
+                (Arc::clone(&full), Arc::clone(&partial))
+            } else {
+                (Arc::clone(&partial), Arc::clone(&full))
+            };
+            let release = Arc::new(Notify::new());
+            let holder_release = Arc::clone(&release);
+            // Hold the actual Moka compute waiter across an await. Polling the
+            // production publisher below proves it queues before any cache write.
+            let mut holder = Box::pin(
+                set.get_object_metadata_cache
+                    .entry(key.clone())
+                    .and_compute_with(|current| async move {
+                        assert!(current.is_none(), "the holder must see an empty key");
+                        holder_release.notified().await;
+                        Op::Put(held_entry)
+                    }),
+            );
+            assert!(futures::poll!(holder.as_mut()).is_pending());
+            let hook_calls = AtomicUsize::new(0);
+            let mut publisher =
+                Box::pin(
+                    set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, incoming, || {
+                        hook_calls.fetch_add(1, Ordering::AcqRel);
+                    }),
+                );
+            assert!(
+                futures::poll!(publisher.as_mut()).is_pending(),
+                "all production publishers must share Moka's compute waiter"
+            );
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "a plain insert must not bypass the holder and expose an entry"
+            );
+            assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+            release.notify_one();
+            holder.await;
+            publisher.await;
+            assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+            let cached = set.get_object_metadata_cache.get(&key).await.expect("published cache entry");
+            assert_eq!(cached.capability, Full);
+            assert!(Arc::ptr_eq(&cached, &full), "a queued conditional publisher must not downgrade Full");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_waiting_stale_compute_cannot_touch_new_generation() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+        use moka::ops::compute::Op;
+
+        let set = new_metadata_cache_test_set().await;
+        let old_generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active old generation");
+        let old_key = GetObjectMetadataCacheKey::new("bucket", "object", old_generation);
+        let release = Arc::new(Notify::new());
+        let holder_release = Arc::clone(&release);
+        let mut holder = Box::pin(
+            set.get_object_metadata_cache
+                .entry(old_key.clone())
+                .and_compute_with(|current| async move {
+                    assert!(current.is_none());
+                    holder_release.notified().await;
+                    Op::Nop
+                }),
+        );
+        assert!(futures::poll!(holder.as_mut()).is_pending());
+        let hook_calls = AtomicUsize::new(0);
+        let old_partial = cache_capability_race_entry("object", ConditionOnly, "retired-layout");
+        let mut old_publisher = Box::pin(set.insert_get_object_metadata_cache_entry_after_insert(
+            old_key.clone(),
+            old_generation,
+            old_partial,
+            || {
+                hook_calls.fetch_add(1, Ordering::AcqRel);
+            },
+        ));
+        assert!(futures::poll!(old_publisher.as_mut()).is_pending());
+        assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        let new_generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active new generation");
+        assert_eq!(new_generation.value, old_generation.value + 1);
+        let new_key = GetObjectMetadataCacheKey::new("bucket", "object", new_generation);
+        assert_ne!(old_key, new_key);
+        let new_full = cache_capability_race_entry("object", Full, "current-layout");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set.insert_get_object_metadata_cache_entry_after_insert(
+                new_key.clone(),
+                new_generation,
+                Arc::clone(&new_full),
+                || {},
+            ),
+        )
+        .await
+        .expect("a retired-generation waiter must not block the new key");
+        release.notify_one();
+        holder.await;
+        old_publisher.await;
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1, "a stale Nop still runs the post-compute hook");
+        assert!(set.get_object_metadata_cache.get(&old_key).await.is_none());
+        let cached = set
+            .get_object_metadata_cache
+            .get(&new_key)
+            .await
+            .expect("new generation must survive");
+        assert!(
+            Arc::ptr_eq(&cached, &new_full),
+            "old publication and its cleanup must not replace or remove the new key"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_put_and_nop_hooks_recheck_generation_exactly_once() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        for incoming_capability in [Full, ConditionOnly] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let existing = cache_capability_race_entry("object", Full, "existing-full");
+            set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, existing, || {})
+                .await;
+            let incoming = cache_capability_race_entry("object", incoming_capability, "incoming");
+            let hook_calls = AtomicUsize::new(0);
+            set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, incoming, || {
+                assert_eq!(hook_calls.fetch_add(1, Ordering::AcqRel), 0, "hook must run once");
+                // The existing production seam invalidates after either a Put or
+                // Full-preserving Nop; both must still perform the final fence read.
+                set.get_object_metadata_cache_generations[generation.index].fetch_add(1, Ordering::AcqRel);
+            })
+            .await;
+            assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "post-compute generation change must withdraw the retired key for both Put and Nop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_conditional_nop_preserves_actual_moka_expiration() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        let set = new_metadata_cache_test_set().await;
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active cache generation");
+        let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        let full = cache_capability_race_entry("object", Full, "original-full");
+        set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, Arc::clone(&full), || {})
+            .await;
+        let original_insert_finished = Instant::now();
+
+        // Moka uses its own real clock, so Tokio paused-time advancement would not
+        // establish this property. Use the actual configured TTL and expiry reads.
+        tokio::time::sleep(GET_OBJECT_METADATA_CACHE_TTL * 3 / 4).await;
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_some(),
+            "the retained entry must be live immediately before the Nop"
+        );
+        let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+        set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, partial, || {})
+            .await;
+        let retained = set.get_object_metadata_cache.get(&key).await.expect("Full must remain live");
+        assert!(Arc::ptr_eq(&retained, &full));
+
+        // A distinct fresh Put is the positive control for the renewed deadline.
+        let fresh_generation = set
+            .get_object_metadata_cache_generation("bucket", "fresh-object")
+            .expect("active positive-control generation");
+        let fresh_key = GetObjectMetadataCacheKey::new("bucket", "fresh-object", fresh_generation);
+        let fresh = cache_capability_race_entry("fresh-object", Full, "fresh-full");
+        set.insert_get_object_metadata_cache_entry_after_insert(fresh_key.clone(), fresh_generation, fresh, || {})
+            .await;
+        let renewed_insert_finished = Instant::now();
+        let original_expired_by = original_insert_finished + GET_OBJECT_METADATA_CACHE_TTL + Duration::from_millis(200);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(original_expired_by)).await;
+        assert!(
+            renewed_insert_finished.elapsed() < GET_OBJECT_METADATA_CACHE_TTL,
+            "the measurement must end before a renewed TTL could expire"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&fresh_key).await.is_some(),
+            "a genuinely fresh Put must still be live at the same observation time"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_none(),
+            "Nop must preserve Moka's original expiration, not merely the entry's created_at"
+        );
+    }
+
+    struct CacheBoundaryCondition {
+        bucket: &'static str,
+        object: &'static str,
+        etag: String,
+        calls: AtomicUsize,
+        terminal_calls: usize,
+    }
+
+    impl crate::object_api::GetObjectReadCondition for CacheBoundaryCondition {
+        fn is_terminal(&self, metadata: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+            if metadata.bucket != self.bucket
+                || metadata.object != self.object
+                || metadata.delete_marker
+                || metadata.etag != Some(self.etag.as_str())
+            {
+                return false;
+            }
+            self.calls.fetch_add(1, Ordering::AcqRel) < self.terminal_calls
+        }
+    }
+
+    async fn condition_only_cache_boundary_fixture(
+        bucket: &'static str,
+        object: &'static str,
+    ) -> (Vec<tempfile::TempDir>, Arc<SetDisks>, Arc<GetObjectMetadataCacheEntry>) {
+        use crate::object_api::WriteCompletion;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real bucket");
+        let committed = set
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![17; 4096]),
+                &ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit all four shards");
+        let full = set
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("complete real metadata");
+        assert_eq!(full.online_disks().iter().flatten().count(), 4);
+        let mut metadata = full.parts_metadata().to_vec();
+        let mut disks = full.online_disks().to_vec();
+        let omitted = metadata
+            .iter()
+            .position(|fi| fi.erasure.index == 2)
+            .expect("actual second data disk");
+        metadata[omitted] = FileInfo::default();
+        disks[omitted] = None;
+        // This seam prepares a real, independently validated D1/P1/P2 quorum.
+        // The hedge test separately exercises its production publication timing.
+        let errs: Vec<Option<DiskError>> = (0..4).map(|_| None).collect();
+        let (online_disks, fi, _) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errs, "", 2, 3)
+            .expect("three real members satisfy latest-generation selection");
+        assert_eq!(online_disks.iter().flatten().count(), 3);
+        assert_eq!(fi.metadata.get("etag"), committed.etag.as_ref());
+        set.invalidate_get_object_metadata_cache(bucket, object).await;
+        set.cache_get_object_fileinfo(
+            (bucket, object),
+            set.get_object_metadata_cache_generation(bucket, object),
+            (&fi, GetObjectMetadataCacheCapability::ConditionOnly),
+            &metadata,
+            &online_disks,
+            2,
+        )
+        .await;
+        let cached = set
+            .cached_get_object_fileinfo(bucket, object)
+            .await
+            .expect("prepared conditional quorum");
+        assert_eq!(cached.capability, GetObjectMetadataCacheCapability::ConditionOnly);
+        (dirs, set, cached)
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_final_predicate_flip_fails_before_body() {
+        use crate::object_api::with_get_object_read_condition;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+
+        let bucket = "conditional-cache-final-flip";
+        let object = "conditional-cache-final-flip.bin";
+        let (_dirs, set, cached) = condition_only_cache_boundary_fixture(bucket, object).await;
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket,
+            object,
+            etag: cached.fi.metadata["etag"].clone(),
+            calls: AtomicUsize::new(0),
+            // Deliberately violate purity to attack the final fail-closed guard.
+            terminal_calls: 1,
+        });
+        let calls = disk_call_counters::observe(object);
+        let result = with_get_object_read_condition(
+            condition.clone(),
+            set.get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await;
+        let err = result
+            .err()
+            .expect("a partial snapshot cannot become a body reader after predicate flip");
+        assert!(
+            err.to_string()
+                .contains("conditional metadata snapshot no longer satisfies the read condition")
+        );
+        assert_eq!(condition.calls.load(Ordering::Acquire), 2, "lookup and final selected-FI check both ran");
+        for kind in [
+            disk_call_counters::KIND_READ_VERSION,
+            disk_call_counters::KIND_INLINE_SHARD_OPEN,
+            disk_call_counters::KIND_DISK_SHARD_OPEN,
+            disk_call_counters::KIND_BODY_DECODE,
+        ] {
+            assert_eq!(calls.total(kind), 0, "rejected cached snapshot cannot materialize any body");
+        }
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_scope_and_full_layout_boundaries() {
+        use crate::object_api::with_get_object_read_condition;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+
+        let bucket = "conditional-cache-scope-boundary";
+        let object = "conditional-cache-scope-boundary.bin";
+        let (_dirs, set, cached) = condition_only_cache_boundary_fixture(bucket, object).await;
+        for mode in 0..3 {
+            set.invalidate_get_object_metadata_cache(bucket, object).await;
+            set.cache_get_object_fileinfo(
+                (bucket, object),
+                set.get_object_metadata_cache_generation(bucket, object),
+                (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                &cached.parts_metadata,
+                &cached.online_disks,
+                cached.read_quorum,
+            )
+            .await;
+            let condition = Arc::new(CacheBoundaryCondition {
+                bucket,
+                object,
+                etag: cached.fi.metadata["etag"].clone(),
+                calls: AtomicUsize::new(0),
+                terminal_calls: usize::MAX,
+            });
+            let calls = disk_call_counters::observe(object);
+            let snapshot = with_get_object_read_condition(condition.clone(), async {
+                assert!(crate::object_api::get_object_read_condition_is_active());
+                match mode {
+                    0 => {
+                        let producer_set = set.clone();
+                        tokio::spawn(Box::pin(async move {
+                            assert!(
+                                !crate::object_api::get_object_read_condition_is_active(),
+                                "spawned producers inherit no caller condition"
+                            );
+                            producer_set
+                                .get_object_fileinfo_for_get_object_reader(bucket, object, &ObjectOptions::default(), true, true)
+                                .await
+                        }))
+                        .await
+                        .expect("producer task")
+                        .expect("producer reads its own layout")
+                    }
+                    1 => set
+                        .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                        .await
+                        .expect("generic complete-layout consumer"),
+                    _ => set
+                        .get_object_fileinfo_for_get_object_reader(
+                            bucket,
+                            object,
+                            &ObjectOptions {
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                ..Default::default()
+                            },
+                            true,
+                            true,
+                        )
+                        .await
+                        .expect("unprotected NoLock reads bypass even a terminal cached condition"),
+                }
+            })
+            .await;
+            assert!(snapshot.shared.is_none(), "mode {mode} cannot consume a conditional cached layout");
+            assert!(
+                calls.total(disk_call_counters::KIND_READ_VERSION) > 0,
+                "mode {mode} must independently read metadata"
+            );
+            if mode < 2 {
+                assert!(!snapshot.condition_stopped);
+                assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn condition_only_cache_rejects_invalid_deleted_and_insufficient_quorum() {
+        let set = new_metadata_cache_test_set().await;
+        let mut deleted = valid_test_fileinfo("conditional-deleted");
+        deleted.deleted = true;
+        let invalid = FileInfo::default();
+        for (object, fi) in [("conditional-deleted", deleted), ("conditional-invalid", invalid)] {
+            set.cache_get_object_fileinfo(
+                ("bucket", object),
+                set.get_object_metadata_cache_generation("bucket", object),
+                (&fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
+            .await;
+            assert!(matches!(
+                set.lookup_cached_get_object_fileinfo("bucket", object).await,
+                MetadataCacheLookup::Miss
+            ));
+        }
+        for object in ["conditional-deleted", "conditional-invalid"] {
+            let condition = Arc::new(CacheBoundaryCondition {
+                bucket: "bucket",
+                object,
+                etag: "etag-1".to_owned(),
+                calls: AtomicUsize::new(0),
+                terminal_calls: usize::MAX,
+            });
+            let result = crate::object_api::with_get_object_read_condition(
+                condition.clone(),
+                set.get_object_fileinfo_for_get_object_reader("bucket", object, &ObjectOptions::default(), true, true),
+            )
+            .await;
+            assert!(result.is_err(), "invalid or deleted cache metadata cannot terminate the read");
+            assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+        }
+        let object = "conditional-insufficient";
+        let fi = valid_test_fileinfo(object);
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", object)
+            .expect("generation");
+        set.get_object_metadata_cache
+            .insert(
+                GetObjectMetadataCacheKey::new("bucket", object, generation),
+                Arc::new(GetObjectMetadataCacheEntry {
+                    created_at: Instant::now(),
+                    capability: GetObjectMetadataCacheCapability::ConditionOnly,
+                    fi: fi.clone(),
+                    parts_metadata: vec![fi],
+                    online_disks: vec![None],
+                    read_quorum: 1,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo("bucket", object).await,
+            MetadataCacheLookup::RejectedInsufficientQuorum
+        ));
+        // With no disks, a rejected entry must produce an actual metadata error,
+        // even when a caller's predicate would accept the poisoned cached ETag.
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket: "bucket",
+            object,
+            etag: "etag-1".to_owned(),
+            calls: AtomicUsize::new(0),
+            terminal_calls: usize::MAX,
+        });
+        let result = crate::object_api::with_get_object_read_condition(
+            condition.clone(),
+            set.get_object_fileinfo_for_get_object_reader("bucket", object, &ObjectOptions::default(), true, true),
+        )
+        .await;
+        assert!(result.is_err(), "insufficient cached quorum cannot yield terminal metadata");
+        assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_generation_rechecked_after_lookup() {
+        let bucket = "conditional-cache-generation-boundary";
+        let object = "conditional-cache-generation-boundary.bin";
+        let (_dirs, set, _) = condition_only_cache_boundary_fixture(bucket, object).await;
+        let generation = set
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("current generation");
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket,
+            object,
+            etag: set
+                .cached_get_object_fileinfo(bucket, object)
+                .await
+                .expect("cached quorum")
+                .fi
+                .metadata["etag"]
+                .clone(),
+            calls: AtomicUsize::new(0),
+            terminal_calls: usize::MAX,
+        });
+        let lookup = crate::object_api::with_get_object_read_condition(condition.clone(), async {
+            set.lookup_cached_get_object_fileinfo_after_get(bucket, object, || {
+                set.get_object_metadata_cache_generations[generation.index].fetch_add(1, Ordering::AcqRel);
+            })
+            .await
+        })
+        .await;
+        assert!(
+            matches!(lookup, MetadataCacheLookup::Miss),
+            "a concurrent invalidation rejects old conditional metadata"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_none(),
+            "retired partial entry is withdrawn"
+        );
+        assert_eq!(
+            condition.calls.load(Ordering::Acquire),
+            0,
+            "generation validation precedes conditional use"
+        );
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo(bucket, object).await,
+            MetadataCacheLookup::Miss
+        ));
+    }
+
+    #[tokio::test]
     async fn metadata_cache_lookup_rechecks_generation_after_get() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
         let generation_index = generation.expect("metadata cache generation should be active").index;
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
 
         let lookup = set
             .lookup_cached_get_object_fileinfo_after_get("bucket", "object", || {
@@ -4161,6 +5139,7 @@ mod metadata_cache_tests {
         let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
+            capability: GetObjectMetadataCacheCapability::Full,
             fi: fi.clone(),
             parts_metadata: vec![fi],
             online_disks: Vec::new(),
@@ -4200,8 +5179,15 @@ mod metadata_cache_tests {
 
         assert_eq!(first.value, initial.value + 1);
         assert_eq!(second.value, first.value + 1);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(first), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(first),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
     }
 
@@ -4240,10 +5226,24 @@ mod metadata_cache_tests {
         let first_generation = first.get_object_metadata_cache_generation("bucket", "object");
         let second_generation = second.get_object_metadata_cache_generation("bucket", "object");
         first
-            .cache_get_object_fileinfo(("bucket", "object"), first_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .cache_get_object_fileinfo(
+                ("bucket", "object"),
+                first_generation,
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
             .await;
         second
-            .cache_get_object_fileinfo(("bucket", "object"), second_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .cache_get_object_fileinfo(
+                ("bucket", "object"),
+                second_generation,
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
             .await;
 
         first.invalidate_get_object_metadata_cache("bucket", "object").await;
@@ -4274,6 +5274,7 @@ mod metadata_cache_tests {
         let entry = |fi: FileInfo| {
             Arc::new(GetObjectMetadataCacheEntry {
                 created_at: Instant::now(),
+                capability: GetObjectMetadataCacheCapability::Full,
                 parts_metadata: vec![fi.clone()],
                 fi,
                 online_disks: Vec::new(),
@@ -4322,8 +5323,15 @@ mod metadata_cache_tests {
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
 
         assert_eq!(set.get_object_metadata_cache_generation("bucket", "object"), None);
-        set.cache_get_object_fileinfo(("bucket", "object"), last_generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            last_generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
         assert_eq!(
@@ -4341,8 +5349,15 @@ mod metadata_cache_tests {
 
         set.invalidate_all_get_object_metadata_cache();
 
-        set.cache_get_object_fileinfo(("bucket", "object"), stale_generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            stale_generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
     }
 
@@ -4356,8 +5371,15 @@ mod metadata_cache_tests {
                 .get_object_metadata_cache_generation("bucket", object)
                 .expect("metadata cache generation should be active");
             retired_keys.push(GetObjectMetadataCacheKey::new("bucket", object, generation));
-            set.cache_get_object_fileinfo(("bucket", object), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-                .await;
+            set.cache_get_object_fileinfo(
+                ("bucket", object),
+                Some(generation),
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
+            .await;
         }
         set.get_object_metadata_cache.run_pending_tasks().await;
         assert_eq!(set.get_object_metadata_cache.entry_count(), 3);
@@ -4382,8 +5404,15 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket", "object")
             .expect("metadata cache generation should be active");
         let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(generation),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         for fence in set.get_object_metadata_cache_generations.iter() {
             fence.store(u64::MAX, Ordering::Release);
         }
@@ -4410,8 +5439,15 @@ mod metadata_cache_tests {
         let fresh_fi = valid_test_fileinfo("fresh-object");
 
         let generation = set.get_object_metadata_cache_generation("bucket", "fresh-object");
-        set.cache_get_object_fileinfo(("bucket", "fresh-object"), generation, &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "fresh-object"),
+            generation,
+            (&fresh_fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fresh_fi),
+            &[],
+            0,
+        )
+        .await;
 
         assert!(
             set.cached_get_object_fileinfo("bucket", "fresh-object").await.is_some(),

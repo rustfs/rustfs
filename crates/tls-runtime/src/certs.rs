@@ -429,6 +429,209 @@ pub fn load_all_certs_from_directory(
     Ok(cert_key_pairs)
 }
 
+/// Strict runtime loader: a discovered identity must never disappear through
+/// best-effort filtering. The diagnostic inspection API remains independent.
+pub fn load_all_certs_from_directory_strict(
+    options: CertDirectoryLoadOptions,
+) -> Result<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>, crate::error::TlsRuntimeError> {
+    use crate::error::TlsRuntimeError;
+    options.validate()?;
+    let dir = &options.dir_path;
+    let mut pairs = HashMap::new();
+    if let Some(pair) = read_cert_key_pair_strict(dir, &options.cert_filename, &options.key_filename, "default", true)? {
+        pairs.insert("default".to_string(), pair);
+    }
+    for entry in fs::read_dir(dir).map_err(|source| TlsRuntimeError::SourceIo {
+        path: dir.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| TlsRuntimeError::SourceIo {
+            path: dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| TlsRuntimeError::InvalidCertificate {
+            name: "SNI directory".to_string(),
+            reason: "directory name is not UTF-8".to_string(),
+        })?;
+        if !is_discoverable_cert_domain_dir(name) {
+            continue;
+        }
+        let metadata = fs::metadata(&path).map_err(|source| TlsRuntimeError::SourceIo {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        if let Some(pair) = read_cert_key_pair_strict(&path, &options.cert_filename, &options.key_filename, name, true)? {
+            pairs.insert(name.to_string(), pair);
+        }
+    }
+    Ok(pairs)
+}
+
+pub(crate) fn read_optional_tls_file(path: &Path) -> Result<Option<Vec<u8>>, crate::error::TlsRuntimeError> {
+    use crate::error::TlsRuntimeError;
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::read(path).map(Some).map_err(|source| TlsRuntimeError::SourceIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A disappearing pinned generation is an error, not optional absence.
+            if let Some(parent) = path.parent() {
+                fs::read_dir(parent).map_err(|source| TlsRuntimeError::SourceIo {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            Ok(None)
+        }
+        Err(source) => Err(TlsRuntimeError::SourceIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+pub(crate) fn parse_certificate_pem(
+    pem: &[u8],
+    name: &str,
+) -> Result<Vec<CertificateDer<'static>>, crate::error::TlsRuntimeError> {
+    use crate::error::TlsRuntimeError;
+    let certs = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| TlsRuntimeError::InvalidCertificate {
+            name: name.to_string(),
+            reason: error.to_string(),
+        })?;
+    if certs.is_empty() {
+        return Err(TlsRuntimeError::InvalidCertificate {
+            name: name.to_string(),
+            reason: "empty certificate PEM".to_string(),
+        });
+    }
+    for cert in &certs {
+        let (remaining, _) =
+            x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|error| TlsRuntimeError::InvalidCertificate {
+                name: name.to_string(),
+                reason: error.to_string(),
+            })?;
+        if !remaining.is_empty() {
+            return Err(TlsRuntimeError::InvalidCertificate {
+                name: name.to_string(),
+                reason: "trailing certificate DER".to_string(),
+            });
+        }
+    }
+    Ok(certs)
+}
+
+pub(crate) fn parse_private_key_pem(pem: &[u8], name: &str) -> Result<PrivateKeyDer<'static>, crate::error::TlsRuntimeError> {
+    PrivateKeyDer::from_pem_slice(pem).map_err(|error| crate::error::TlsRuntimeError::InvalidPrivateKey {
+        name: name.to_string(),
+        reason: error.to_string(),
+    })
+}
+
+pub(crate) fn read_cert_key_pair_strict(
+    dir: &Path,
+    cert_filename: &str,
+    key_filename: &str,
+    name: &str,
+    server: bool,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>, crate::error::TlsRuntimeError> {
+    let cert = read_optional_tls_file(&dir.join(cert_filename))?;
+    let key = read_optional_tls_file(&dir.join(key_filename))?;
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let certs = parse_certificate_pem(&cert, name)?;
+            let key = parse_private_key_pem(&key, name)?;
+            validate_certified_key(&certs, &key, name, server)?;
+            Ok(Some((certs, key)))
+        }
+        _ => Err(crate::error::TlsRuntimeError::IncompleteIdentity { name: name.to_string() }),
+    }
+}
+
+/// Validate before publication, including the default certificate that bypasses
+/// rustls' SNI name checks.
+pub fn validate_certified_key(
+    certs: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    name: &str,
+    server: bool,
+) -> Result<CertifiedKey, crate::error::TlsRuntimeError> {
+    use crate::error::TlsRuntimeError;
+    if certs.is_empty() {
+        return Err(TlsRuntimeError::InvalidCertificate {
+            name: name.to_string(),
+            reason: "empty certificate chain".to_string(),
+        });
+    }
+    for (index, cert) in certs.iter().enumerate() {
+        let (remaining, parsed) =
+            x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|error| TlsRuntimeError::InvalidCertificate {
+                name: name.to_string(),
+                reason: error.to_string(),
+            })?;
+        if !remaining.is_empty() {
+            return Err(TlsRuntimeError::InvalidCertificate {
+                name: name.to_string(),
+                reason: "trailing certificate DER".to_string(),
+            });
+        }
+        if index == 0 {
+            if !parsed.validity().is_valid() {
+                return Err(TlsRuntimeError::CertificateValidity { name: name.to_string() });
+            }
+            if parsed
+                .extended_key_usage()
+                .map_err(|error| TlsRuntimeError::InvalidCertificate {
+                    name: name.to_string(),
+                    reason: error.to_string(),
+                })?
+                .is_some_and(|eku| {
+                    if server {
+                        !eku.value.server_auth
+                    } else {
+                        !eku.value.client_auth
+                    }
+                })
+            {
+                return Err(if server {
+                    TlsRuntimeError::InvalidServerEku { name: name.to_string() }
+                } else {
+                    TlsRuntimeError::InvalidClientEku { name: name.to_string() }
+                });
+            }
+        }
+    }
+    let certified = CertifiedKey::from_der(certs.to_vec(), key.clone_key(), &rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|source| TlsRuntimeError::InvalidCertifiedKey {
+            name: name.to_string(),
+            source,
+        })?;
+    certified
+        .keys_match()
+        .map_err(|source| TlsRuntimeError::InvalidCertifiedKey {
+            name: name.to_string(),
+            source,
+        })?;
+    if server && name != "default" {
+        let mut sni = ResolvesServerCertUsingSni::new();
+        sni.add(name, certified.clone())
+            .map_err(|source| TlsRuntimeError::InvalidCertifiedKey {
+                name: name.to_string(),
+                source,
+            })?;
+    }
+    Ok(certified)
+}
+
 fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
@@ -494,10 +697,7 @@ pub fn create_multi_cert_resolver(
     let mut default_cert = None;
 
     for (domain, (certs, key)) in cert_key_pairs {
-        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-            .map_err(|e| certs_error(format!("unsupported private key types:{domain}, err:{e:?}")))?;
-
-        let certified_key = CertifiedKey::new(certs, signing_key);
+        let certified_key = validate_certified_key(&certs, &key, &domain, true).map_err(io::Error::other)?;
         if domain == "default" {
             default_cert = Some(Arc::new(certified_key.clone()));
         } else {

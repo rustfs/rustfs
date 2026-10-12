@@ -391,6 +391,21 @@ message DeletePathsResponse {
   optional Error error = 2;
 }
 
+// Protocol 1 is additive and has no fallback to generic file mutation RPCs.
+message RecoverDeleteTransactionRequest {
+  string disk = 1;
+  string volume = 2;
+  uint32 protocol_version = 3;
+  bytes operation = 4;
+}
+
+message RecoverDeleteTransactionResponse {
+  bool success = 1;
+  uint32 protocol_version = 2;
+  bytes result = 3;
+  optional Error error = 4;
+}
+
 message SnapshotLeaseRequest {
   string disk = 1;
   string volume = 2;
@@ -1218,6 +1233,7 @@ service NodeService {
   rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
+  rpc RecoverDeleteTransaction(RecoverDeleteTransactionRequest) returns (RecoverDeleteTransactionResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound

@@ -14,7 +14,9 @@
 
 use crate::config::Config;
 use crate::startup_runtime_sources;
+use std::collections::BTreeSet;
 use std::io::{Error, Result};
+use std::sync::Mutex;
 use tracing::{error, info};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -22,6 +24,25 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_TLS_OUTBOUND_INITIALIZED: &str = "tls_outbound_initialized";
 const EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED: &str = "tls_outbound_initialization_failed";
 const TLS_STARTUP_GENERATION_CONSUMER: &str = "rustfs_server_startup";
+
+// Startup completes before listeners register; retain source names independently
+// of the later listener snapshot, without pinning renewable certificate bytes.
+static STARTUP_MATERIAL_FILES: Mutex<Option<(String, BTreeSet<String>)>> = Mutex::new(None);
+
+pub(crate) fn required_startup_material_files(tls_path: &str) -> BTreeSet<String> {
+    STARTUP_MATERIAL_FILES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|(path, _)| path == tls_path.trim())
+        .map(|(_, files)| files.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn replace_startup_material_files(files: Option<(String, BTreeSet<String>)>) -> Option<(String, BTreeSet<String>)> {
+    std::mem::replace(&mut *STARTUP_MATERIAL_FILES.lock().unwrap_or_else(|error| error.into_inner()), files)
+}
 
 pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
     crate::server::tls_material::validate_configured_oidc_extra_ca_cert()
@@ -32,6 +53,8 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
         match crate::server::tls_material::load_tls_material(tls_path).await {
             Ok(snapshot) => {
                 publish_outbound_tls_material(&snapshot.outbound, Some(tls_path)).await;
+                *STARTUP_MATERIAL_FILES.lock().unwrap_or_else(|error| error.into_inner()) =
+                    Some((tls_path.to_string(), snapshot.material_files));
             }
             Err(err) => {
                 error!(
@@ -49,6 +72,11 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
         if startup_runtime_sources::observability_metric_enabled() {
             startup_runtime_sources::init_tls_metrics();
         }
+    } else {
+        STARTUP_MATERIAL_FILES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 
     Ok(())

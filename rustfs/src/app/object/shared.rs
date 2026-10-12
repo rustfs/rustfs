@@ -1092,30 +1092,18 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
         return Err(odm_source_unavailable_error("missing_source_validator"));
     }
+    let mut metadata = HashMap::new();
+    for (name, value) in [("cache-control", &head.cache_control), ("expires", &head.expires)] {
+        if let Some(value) = value {
+            metadata.insert(name.to_owned(), value.clone());
+        }
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
+        user_defined: metadata.into(),
         ..Default::default()
     };
-    // A successful source read establishes wildcard existence, but the
-    // remaining conditions must still run in their ordinary precedence.
-    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
-        let mut remaining = headers.clone();
-        if if_match == Some("*") {
-            remaining.remove(http::header::IF_MATCH);
-            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
-        }
-        if if_none_match == Some("*") {
-            remaining.remove(http::header::IF_NONE_MATCH);
-            remaining.remove(http::header::IF_MODIFIED_SINCE);
-        }
-        check_preconditions(&remaining, &info)?;
-        return if if_none_match == Some("*") {
-            Err(S3Error::new(S3ErrorCode::NotModified))
-        } else {
-            Ok(())
-        };
-    }
     check_preconditions(headers, &info)
 }
 
@@ -1513,7 +1501,7 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
         let err = build_put_like_object_lock_metadata(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,

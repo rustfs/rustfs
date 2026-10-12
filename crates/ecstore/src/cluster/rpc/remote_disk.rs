@@ -14,7 +14,8 @@
 
 use crate::cluster::rpc::client::{
     AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
-    node_service_time_out_client, node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
+    node_service_delete_recovery_client, node_service_time_out_client, node_service_time_out_client_for_class,
+    node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
@@ -22,10 +23,11 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions, DiskAPI, DiskInfo,
-    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    batch_read_version_one_by_one,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION,
+    DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection,
+    DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -59,10 +61,10 @@ use rustfs_protos::proto_gen::node_service::{
     CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
     DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
     MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
-    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
+    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+    WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -140,6 +142,45 @@ fn decode_delete_versions_errors(response: DeleteVersionsResponse, expected_len:
         .into_iter()
         .map(|error| (!error.is_empty()).then(|| Error::other(error)))
         .collect()
+}
+
+fn decode_delete_recovery_batch_errors(codes: Vec<Option<u32>>, expected_len: usize) -> Result<Vec<Option<DiskError>>> {
+    if codes.len() != expected_len {
+        return Err(Error::other("malformed recoverable batch delete response length"));
+    }
+    codes
+        .into_iter()
+        .map(|code| match code {
+            None => Ok(None),
+            Some(code) => DiskError::from_u32(code)
+                .map(Some)
+                .ok_or_else(|| Error::other("invalid recoverable batch delete error code")),
+        })
+        .collect()
+}
+
+fn validate_delete_recovery_inspection(
+    volume: &str,
+    object: &str,
+    transaction: Uuid,
+    inspection: &DeleteRecoveryInspection,
+) -> Result<()> {
+    if inspection.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+        || inspection.id.object != object
+        || inspection.id.transaction != transaction
+        || transaction.is_nil()
+    {
+        return Err(Error::other("delete recovery inspection does not match request"));
+    }
+    if let Some(journal) = &inspection.journal
+        && (journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || journal.volume != volume
+            || journal.object != object
+            || journal.transaction != transaction)
+    {
+        return Err(Error::other("delete recovery journal does not match request"));
+    }
+    Ok(())
 }
 
 fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result<SnapshotLeaseToken> {
@@ -858,6 +899,75 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn recover_delete_transaction(
+        &self,
+        volume: &str,
+        operation: DeleteRecoveryRpcOperation,
+    ) -> Result<DeleteRecoveryRpcReply> {
+        let payload = rmp_serde::to_vec_named(&operation)?;
+        if payload.len() > operation.max_wire_payload_bytes() {
+            return Err(Error::other("delete recovery operation exceeds payload limit"));
+        }
+        let settle_timeout = if matches!(&operation, DeleteRecoveryRpcOperation::Settle { .. }) {
+            Some(crate::disk::get_delete_recovery_timeout()?)
+        } else {
+            None
+        };
+        self.execute_with_timeout(
+            || async {
+                let mut client = if let Some(timeout) = settle_timeout {
+                    if let Some(error) = self.offline_bypass_error() {
+                        return Err(error);
+                    }
+                    node_service_delete_recovery_client(
+                        &self.addr,
+                        TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                        timeout,
+                    )
+                    .await?
+                } else {
+                    self.get_client().await?
+                };
+                let mut request = Request::new(RecoverDeleteTransactionRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_owned(),
+                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    operation: payload.into(),
+                });
+                let canonical_body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                    .map_err(|_| Error::other("recover_delete_transaction request length cannot be represented"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                // UNIMPLEMENTED is deliberately propagated: older peers cannot settle transactions.
+                let response = client
+                    .recover_delete_transaction(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if response.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+                    return Err(DiskError::UnsupportedDisk);
+                }
+                if !response.success {
+                    return Err(response
+                        .error
+                        .ok_or_else(|| Error::other("missing delete recovery error"))?
+                        .into());
+                }
+                if response.error.is_some() {
+                    return Err(Error::other("malformed delete recovery success"));
+                }
+                rustfs_protos::decode_delete_recovery_payload(&response.result).map_err(Into::into)
+            },
+            settle_timeout.unwrap_or_else(get_max_timeout_duration),
+        )
+        .await
+    }
+
     async fn rename_file_with_durability(
         &self,
         src_volume: &str,
@@ -1920,6 +2030,12 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     encode_msgpack_with_capacity(value, MSGPACK_ENCODE_CAPACITY_HINT)
 }
 
+// Optional fields are omitted by serde; named maps keep rollback flags and
+// transaction UUIDs independent of field order across peer versions.
+fn encode_delete_options_msgpack(value: &DeleteOptions) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(value)?)
+}
+
 fn encode_file_info_msgpack(value: &FileInfo) -> Result<Vec<u8>> {
     encode_msgpack_with_capacity(value, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
 }
@@ -2610,7 +2726,7 @@ impl DiskAPI for RemoteDisk {
                 // `_bin` support for DeleteVersion is new (grpc-optimization P2); always dual-write
                 // JSON + msgpack until its fallback counter has read zero across a release window.
                 let file_info_bin = encode_file_info_msgpack(&fi)?;
-                let opts_bin = encode_msgpack(&opts)?;
+                let opts_bin = encode_delete_options_msgpack(&opts)?;
                 let conditional_marker = opts.expected_delete_marker.is_some();
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
@@ -2682,7 +2798,7 @@ impl DiskAPI for RemoteDisk {
 
         // `_bin` support for DeleteVersions is new (grpc-optimization P2); always dual-write JSON +
         // msgpack until its fallback counter has read zero across a release window.
-        let opts_bin = match encode_msgpack(&opts) {
+        let opts_bin = match encode_delete_options_msgpack(&opts) {
             Ok(opts_bin) => opts_bin,
             Err(err) => {
                 let mut errors = Vec::with_capacity(versions.len());
@@ -3661,6 +3777,138 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<()> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::ApplyVersion {
+                    object: object.to_owned(),
+                    file_info: Box::new(file_info),
+                    force_del_marker,
+                    opts,
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::AppliedVersion => Ok(()),
+            _ => Err(Error::other("unexpected recoverable delete reply")),
+        }
+    }
+
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        let expected_len = versions.len();
+        let result = match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::ApplyVersions { versions, opts })
+            .await
+        {
+            Ok(DeleteRecoveryRpcReply::AppliedVersions(codes)) => decode_delete_recovery_batch_errors(codes, expected_len),
+            Ok(_) => Err(Error::other("unexpected recoverable batch delete reply")),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(errors) => errors,
+            Err(error) => vec![Some(error); expected_len],
+        }
+    }
+
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Discover {
+                    object: object.map(str::to_owned),
+                    cursor,
+                    limit,
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Discovered(page) => {
+                if object.is_some_and(|object| page.transactions.iter().any(|id| id.object != object)) {
+                    return Err(Error::other("delete recovery discovery escaped requested object"));
+                }
+                if page.transactions.len() > usize::try_from(limit).map_err(|_| Error::other("invalid discovery limit"))?
+                    || page
+                        .transactions
+                        .iter()
+                        .any(|id| id.transaction.is_nil() || id.object.is_empty())
+                {
+                    return Err(Error::other("malformed delete discovery page"));
+                }
+                Ok(page)
+            }
+            _ => Err(Error::other("unexpected delete discovery reply")),
+        }
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Inspect {
+                    object: object.to_owned(),
+                    transaction,
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Inspected(inspection) => {
+                validate_delete_recovery_inspection(volume, object, transaction, &inspection)?;
+                Ok(inspection)
+            }
+            _ => Err(Error::other("unexpected delete inspection reply")),
+        }
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Settle {
+                    object: object.to_owned(),
+                    transaction,
+                    expected_fingerprint,
+                    action,
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Settled(inspection) => {
+                validate_delete_recovery_inspection(volume, object, transaction, &inspection)?;
+                Ok(inspection)
+            }
+            _ => Err(Error::other("unexpected delete settlement reply")),
+        }
+    }
+
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
         self.execute_with_timeout(
             || async {
@@ -4075,6 +4323,45 @@ mod tests {
     static INIT: Once = Once::new();
 
     #[test]
+    fn recoverable_batch_delete_rejects_invalid_error_codes_and_length() {
+        let errors = decode_delete_recovery_batch_errors(vec![None, Some(DiskError::FileNotFound.to_u32())], 2)
+            .expect("valid per-item errors");
+        assert!(errors[0].is_none());
+        assert_eq!(errors[1], Some(DiskError::FileNotFound));
+        assert!(decode_delete_recovery_batch_errors(vec![None], 2).is_err());
+        assert!(decode_delete_recovery_batch_errors(vec![Some(0)], 1).is_err());
+        assert!(decode_delete_recovery_batch_errors(vec![Some(u32::MAX)], 1).is_err());
+    }
+
+    #[test]
+    fn delete_recovery_inspection_rejects_wrong_transaction_object_and_protocol() {
+        let transaction = Uuid::new_v4();
+        let inspection = DeleteRecoveryInspection {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            id: crate::disk::DeleteTransactionId {
+                object: "object".into(),
+                transaction,
+            },
+            state: crate::disk::DeleteRecoveryState::Absent,
+            journal: None,
+            current_digest: None,
+            current_versions: Vec::new(),
+            backup_digest: None,
+            rollback_data_complete: false,
+            commit_data_safe: false,
+            explicit_delete_safe: false,
+            fingerprint: [0; 32],
+        };
+        validate_delete_recovery_inspection("bucket", "object", transaction, &inspection).expect("matching inspection");
+        assert!(validate_delete_recovery_inspection("bucket", "other", transaction, &inspection).is_err());
+        assert!(validate_delete_recovery_inspection("bucket", "object", Uuid::new_v4(), &inspection).is_err());
+        assert!(validate_delete_recovery_inspection("bucket", "object", Uuid::nil(), &inspection).is_err());
+        let mut incompatible = inspection;
+        incompatible.protocol_version += 1;
+        assert!(validate_delete_recovery_inspection("bucket", "object", transaction, &incompatible).is_err());
+    }
+
+    #[test]
     fn compare_and_update_wire_outcome_fails_closed() {
         assert_eq!(
             conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32)
@@ -4107,32 +4394,19 @@ mod tests {
     }
 
     #[test]
-    fn retired_marker_options_preserve_legacy_positional_wire_shape() {
+    fn delete_options_named_wire_preserves_rollback_and_legacy_marker_fields() {
         #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
         struct LegacyDeleteOptions {
             recursive: bool,
             immediate: bool,
             undo_write: bool,
+            #[serde(default)]
             undo_delete: bool,
             old_data_dir: Option<Uuid>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
         }
-        let legacy = LegacyDeleteOptions {
-            recursive: false,
-            immediate: false,
-            undo_write: false,
-            undo_delete: false,
-            old_data_dir: None,
-        };
-        let original = encode_msgpack(&legacy).unwrap();
-        let current = encode_msgpack(&DeleteOptions::default()).unwrap();
-        assert_eq!(current, original, "ordinary deletes must retain the older peer's positional payload");
-        assert_eq!(rmp_serde::from_slice::<LegacyDeleteOptions>(&current).unwrap(), legacy);
-        assert!(
-            rmp_serde::from_slice::<DeleteOptions>(&original)
-                .unwrap()
-                .expected_delete_marker
-                .is_none()
-        );
+        let transaction = Uuid::new_v4();
         let mut marker = FileInfo {
             deleted: true,
             version_id: Some(Uuid::new_v4()),
@@ -4141,12 +4415,69 @@ mod tests {
         };
         marker.set_delete_marker_incarnation(Uuid::new_v4());
         let marker = rustfs_filemeta::MetaDeleteMarker::from(marker);
+        for expected_delete_marker in [None, Some(marker)] {
+            for (undo_write, undo_delete) in [(true, false), (false, true)] {
+                let legacy = LegacyDeleteOptions {
+                    recursive: false,
+                    immediate: false,
+                    undo_write,
+                    undo_delete,
+                    old_data_dir: Some(transaction),
+                    expected_delete_marker: expected_delete_marker.clone(),
+                };
+                // Older senders use positional arrays. Their unchanged field prefix and
+                // missing optional fields must also decode on the named-map sender's peer.
+                for (encoding, payload) in [
+                    ("positional", rmp_serde::to_vec(&legacy).expect("encode legacy positional options")),
+                    ("named", rmp_serde::to_vec_named(&legacy).expect("encode legacy named options")),
+                ] {
+                    let decoded: DeleteOptions = rmp_serde::from_slice(&payload).expect("decode legacy options on current peer");
+                    assert_eq!(decoded.undo_write, undo_write, "{encoding} undo-write flag");
+                    assert_eq!(decoded.undo_delete, undo_delete, "{encoding} undo-delete flag");
+                    assert_eq!(decoded.old_data_dir, Some(transaction), "{encoding} transaction UUID");
+                    assert_eq!(decoded.expected_delete_marker, expected_delete_marker, "{encoding} marker precondition");
+                    assert!(decoded.delete_recovery_bucket_incarnation.is_none(), "{encoding} omitted incarnation");
+                    assert!(!decoded.recoverable_delete, "{encoding} omitted recovery flag");
+                }
+                for incarnation in [None, Some(Uuid::new_v4())] {
+                    let current = DeleteOptions {
+                        undo_write,
+                        undo_delete,
+                        old_data_dir: Some(transaction),
+                        expected_delete_marker: expected_delete_marker.clone(),
+                        delete_recovery_bucket_incarnation: incarnation,
+                        recoverable_delete: true,
+                        ..Default::default()
+                    };
+                    let payload = encode_delete_options_msgpack(&current).expect("encode current named options");
+                    let decoded: DeleteOptions = rmp_serde::from_slice(&payload).expect("decode current options on current peer");
+                    assert_eq!(decoded.undo_write, undo_write);
+                    assert_eq!(decoded.undo_delete, undo_delete);
+                    assert_eq!(decoded.old_data_dir, Some(transaction));
+                    assert_eq!(decoded.expected_delete_marker, expected_delete_marker);
+                    assert_eq!(decoded.delete_recovery_bucket_incarnation, incarnation);
+                    assert!(decoded.recoverable_delete);
+                    let decoded: LegacyDeleteOptions =
+                        rmp_serde::from_slice(&payload).expect("decode current options on legacy peer");
+                    assert_eq!(decoded, legacy, "unknown recovery fields cannot shift rollback or marker values");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_nonempty_delete_options_do_not_fall_back_to_json() {
         let options = DeleteOptions {
-            expected_delete_marker: Some(marker.clone()),
+            undo_write: true,
+            old_data_dir: Some(Uuid::new_v4()),
             ..Default::default()
         };
-        let decoded: DeleteOptions = rmp_serde::from_slice(&encode_msgpack(&options).unwrap()).unwrap();
-        assert_eq!(decoded.expected_delete_marker, Some(marker));
+        let json = serde_json::to_string(&options).expect("valid compatibility JSON");
+        assert!(decode_msgpack_or_json::<DeleteOptions>(&[0xc1], &json, "DeleteOptions").is_err());
+        let decoded: DeleteOptions =
+            decode_msgpack_or_json(&[], &json, "DeleteOptions").expect("absent MessagePack permits JSON compatibility");
+        assert!(decoded.undo_write);
+        assert_eq!(decoded.old_data_dir, options.old_data_dir);
     }
 
     #[test]

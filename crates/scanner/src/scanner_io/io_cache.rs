@@ -469,21 +469,22 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
             );
         }
-        let disk_scan_limit = scanner_budgeted_concurrency_limit(
-            scanner_max_concurrent_disk_scans(workers.len()),
-            budget.requires_serial_progress_accounting(),
-        );
+        let dispatch_limit = scanner_max_concurrent_disk_scans(workers.len());
+        let serial_progress_accounting = budget.requires_serial_progress_accounting();
+        let disk_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
         record_disk_scan_concurrency_limit(&pool_label, &set_label, disk_scan_limit);
-        debug!(
+        tracing::info!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "disk_concurrency_budget",
+            reason = if serial_progress_accounting { "count_budget" } else { "configured_or_available_work" },
             pool = self.pool_index,
             set = self.set_index,
             online_disks = workers.len(),
+            dispatch_limit,
             concurrency_limit = disk_scan_limit,
-            state = "disk_concurrency_budget",
             "Scanner disk concurrency budget resolved"
         );
         let disk_scan_semaphore = Arc::new(Semaphore::new(disk_scan_limit));
@@ -1209,7 +1210,7 @@ impl ScannerIOCache for SetDisks {
                                 )
                                 .await
                                 {
-                                    ScannerCheckpointPersistResult::Saved => {
+                                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
                                         if cache_guard.is_lock_lost() || ctx_clone.is_cancelled() {
                                             scan_ctx.cancel();
                                             await_scanner_disk_shutdown(scan.as_mut()).await;
@@ -1221,19 +1222,10 @@ impl ScannerIOCache for SetDisks {
                                         await_scanner_disk_shutdown(scan.as_mut()).await;
                                         break Err(Error::other("scanner bucket cache fence changed during checkpoint save"));
                                     }
-                                    ScannerCheckpointPersistResult::Failed(error) => {
-                                        error!(
-                                            target: "rustfs::scanner::io",
-                                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_IO,
-                                            bucket = %bucket.name,
-                                            cache_name = %cache_name,
-                                            state = "periodic_checkpoint_save_failed",
-                                            error = %error,
-                                            "Scanner periodic checkpoint save failed"
-                                        );
-                                        checkpoint_channel_closed = true;
+                                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                                        scan_ctx.cancel();
+                                        await_scanner_disk_shutdown(scan.as_mut()).await;
+                                        break Err(error);
                                     }
                                 }
                             }

@@ -9221,7 +9221,7 @@ mod test {
         };
         let snapshot = PersistentListMetadataObject::from_object_info(&object);
         assert!(snapshot.to_object_info("bucket").etag.is_none());
-        let mut old_snapshot = snapshot.clone();
+        let mut old_snapshot = snapshot;
         old_snapshot.etag = object.etag.clone();
         let old_contents = format!(
             "# rustfs-listobjects-key-only-v2\n{}\n",

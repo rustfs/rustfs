@@ -231,6 +231,105 @@ pub enum Disk {
 }
 
 impl Disk {
+    pub(crate) async fn delete_versions_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions(volume, versions, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_versions_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        mut opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        if let Err(error) = validate_delete_recovery_options(&opts) {
+            return vec![Some(error); versions.len()];
+        }
+        if versions.iter().any(|version| version.name.starts_with('/')) {
+            return vec![Some(DiskError::InvalidPath); versions.len()];
+        }
+        opts.recoverable_delete = true;
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions_recoverable(volume, versions, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn settle_delete_transaction_with_namespace_owner(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.settle_delete_transaction_with_namespace_owner(
+                    volume,
+                    object,
+                    transaction,
+                    expected_fingerprint,
+                    action,
+                    namespace_owner,
+                )
+                .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_version_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        mut opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        validate_delete_recovery_options(&opts)?;
+        if path.starts_with('/') {
+            return Err(DiskError::InvalidPath);
+        }
+        opts.recoverable_delete = true;
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.delete_version_recoverable(volume, path, fi, force_del_marker, opts)
+                    .await
+            }
+        }
+    }
     pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => {
@@ -258,6 +357,70 @@ impl Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<()> {
+        self.delete_version_recoverable_with_namespace_owner(volume, object, file_info, force_del_marker, opts, None)
+            .await
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        match self {
+            Self::Local(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
+            Self::Remote(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
+        }
+    }
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        match self {
+            Self::Local(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+            Self::Remote(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+        }
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => disk.inspect_delete_transaction(volume, object, transaction).await,
+            Self::Remote(disk) => disk.inspect_delete_transaction(volume, object, transaction).await,
+        }
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+        }
+    }
     fn to_string(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.to_string(),
@@ -1247,6 +1410,51 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         Err(DiskError::MethodNotAllowed)
     }
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
+    async fn discover_delete_transactions(
+        &self,
+        _volume: &str,
+        _object: Option<&str>,
+        _cursor: Option<DeleteRecoveryCursor>,
+        _limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn delete_version_recoverable(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _file_info: FileInfo,
+        _force_del_marker: bool,
+        _opts: DeleteOptions,
+    ) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        _volume: &str,
+        versions: Vec<FileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        vec![Some(DiskError::MethodNotAllowed); versions.len()]
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+    ) -> Result<DeleteRecoveryInspection> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn settle_delete_transaction(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+        _expected_fingerprint: DeleteRecoveryDigest,
+        _action: DeleteRecoveryAction,
+    ) -> Result<DeleteRecoveryInspection> {
+        Err(DiskError::MethodNotAllowed)
+    }
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // CheckParts
@@ -1591,6 +1799,269 @@ pub struct DeleteOptions {
     /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_recovery_bucket_incarnation: Option<Uuid>,
+    #[serde(default)]
+    pub recoverable_delete: bool,
+}
+
+pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
+pub(crate) fn get_delete_recovery_timeout() -> Result<std::time::Duration> {
+    let value = std::env::var("RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS");
+    match value {
+        Ok(value) => parse_delete_recovery_timeout(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_delete_recovery_timeout(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(DiskError::other("invalid delete recovery timeout configuration")),
+    }
+}
+
+fn parse_delete_recovery_timeout(value: Option<&str>) -> Result<std::time::Duration> {
+    let seconds = match value {
+        None => 900,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (30..=86400).contains(seconds))
+            .ok_or_else(|| DiskError::other("delete recovery timeout must be an integer between 30 and 86400 seconds"))?,
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+pub(crate) fn validate_delete_recovery_options(opts: &DeleteOptions) -> Result<()> {
+    if opts.old_data_dir.is_none_or(|id| id.is_nil())
+        || opts.undo_write
+        || opts.undo_delete
+        || opts.recursive
+        || opts.immediate
+        || opts.expected_delete_marker.is_some()
+        || opts.delete_recovery_bucket_incarnation.is_some_and(|id| id.is_nil())
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(())
+}
+pub type DeleteRecoveryDigest = [u8; 32];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTransactionId {
+    pub object: String,
+    pub transaction: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryCursor {
+    pub token: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryPage {
+    pub transactions: Vec<DeleteTransactionId>,
+    pub next: Option<DeleteRecoveryCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryJournal {
+    pub protocol_version: u32,
+    pub volume: String,
+    pub object: String,
+    pub transaction: Uuid,
+    pub bucket_incarnation: Option<Uuid>,
+    pub original_digest: Option<DeleteRecoveryDigest>,
+    pub target_digest: Option<DeleteRecoveryDigest>,
+    pub data_dirs: Vec<Uuid>,
+    pub deleted_versions: Vec<Uuid>,
+    pub requests: Vec<FileInfo>,
+    pub original_versions: Vec<DeleteRecoveryVersionIdentity>,
+    #[serde(default)]
+    pub predecessors: Vec<Uuid>,
+}
+
+impl DeleteRecoveryJournal {
+    /// Checks source generations only; the coordinator must supply a certified
+    /// decision and the receiver must retain its namespace/incarnation fences.
+    pub(crate) fn matches_adoption_source(&self, current: &[DeleteRecoveryVersionIdentity]) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        let mut originals = std::collections::HashMap::with_capacity(self.original_versions.len());
+        for version in &self.original_versions {
+            originals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        let mut locals = std::collections::HashMap::with_capacity(current.len());
+        for version in current {
+            locals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        self.requests.iter().all(|request| {
+            if request.deleted && request.mark_deleted {
+                return current.first() == self.original_versions.first();
+            }
+            let id = request.version_id.unwrap_or_default();
+            let Some(original) = originals.get(&id) else {
+                return false;
+            };
+            match locals.get(&id) {
+                Some(local) => local == original,
+                None => !id.is_nil(),
+            }
+        })
+    }
+
+    /// Matches immutable local preparation intent against an independently
+    /// inspected same-transaction commit receipt. This match is not authority
+    /// by itself; the coordinator must supply the certified receipt.
+    pub(crate) fn matches_prepared_authority(&self, authority: &Self) -> bool {
+        if self.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || authority.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || self.transaction.is_nil()
+            || self.transaction != authority.transaction
+            || self.volume != authority.volume
+            || self.object != authority.object
+            || self.bucket_incarnation != authority.bucket_incarnation
+            || self.bucket_incarnation.is_some_and(|id| id.is_nil())
+            || self.requests.is_empty()
+            || self.requests != authority.requests
+            || self.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+                != authority.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+        {
+            return false;
+        }
+        let sources: std::collections::HashMap<_, _> = self
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        let certified: std::collections::HashMap<_, _> = authority
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        if sources.len() != self.original_versions.len() || certified.len() != authority.original_versions.len() {
+            return false;
+        }
+        self.requests.iter().all(|request| {
+            let (local, remote) = if request.deleted && request.mark_deleted {
+                (self.original_versions.first(), authority.original_versions.first())
+            } else {
+                let id = request.version_id.unwrap_or_default();
+                (sources.get(&id).copied(), certified.get(&id).copied())
+            };
+            match (local, remote) {
+                (Some(local), Some(remote)) => local == remote,
+                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                _ => false,
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryVersionIdentity {
+    pub version_id: Option<Uuid>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub data_dir: Option<Uuid>,
+    pub deleted: bool,
+    pub metadata_digest: DeleteRecoveryDigest,
+}
+
+impl DeleteRecoveryVersionIdentity {
+    pub(crate) fn from_file_info(info: FileInfo) -> error::Result<Self> {
+        local::delete_recovery::generation(info)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeleteRecoveryState {
+    Absent,
+    NewPrepared,
+    QuorumCommitted,
+    CommitFinished,
+    LegacyAmbiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryInspection {
+    pub protocol_version: u32,
+    pub id: DeleteTransactionId,
+    pub state: DeleteRecoveryState,
+    pub journal: Option<DeleteRecoveryJournal>,
+    pub current_digest: Option<DeleteRecoveryDigest>,
+    pub current_versions: Vec<DeleteRecoveryVersionIdentity>,
+    pub backup_digest: Option<DeleteRecoveryDigest>,
+    pub rollback_data_complete: bool,
+    pub commit_data_safe: bool,
+    pub explicit_delete_safe: bool,
+    pub fingerprint: DeleteRecoveryDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DeleteRecoveryAction {
+    PublishCommit,
+    FinishCommit,
+    FinalizeCommit,
+    Rollback,
+    DiscardLegacy,
+    AdoptCommit { authority: Box<DeleteRecoveryJournal> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoveryRpcOperation {
+    Discover {
+        object: Option<String>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    },
+    Inspect {
+        object: String,
+        transaction: Uuid,
+    },
+    Settle {
+        object: String,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    },
+    ApplyVersion {
+        object: String,
+        file_info: Box<FileInfo>,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    },
+    ApplyVersions {
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    },
+}
+
+impl DeleteRecoveryRpcOperation {
+    /// Full metadata application and adoption share the existing mutation envelope.
+    pub fn max_wire_payload_bytes(&self) -> usize {
+        match self {
+            Self::ApplyVersion { .. }
+            | Self::ApplyVersions { .. }
+            | Self::Settle {
+                action: DeleteRecoveryAction::AdoptCommit { .. },
+                ..
+            } => rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES,
+            _ => rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoveryRpcReply {
+    Discovered(DeleteRecoveryPage),
+    Inspected(DeleteRecoveryInspection),
+    Settled(DeleteRecoveryInspection),
+    AppliedVersion,
+    AppliedVersions(Vec<Option<u32>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1881,6 +2352,8 @@ mod tests {
             undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
             expected_delete_marker: None,
+            delete_recovery_bucket_incarnation: None,
+            recoverable_delete: false,
         };
 
         assert!(opts.recursive);
@@ -2309,5 +2782,185 @@ mod tests {
 
             assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_timeout_tests {
+    use super::*;
+    #[test]
+    fn recovery_timeout_defaults_and_validates_range() {
+        assert_eq!(
+            parse_delete_recovery_timeout(None).expect("default timeout"),
+            std::time::Duration::from_secs(900)
+        );
+        for seconds in ["30", "900", "86400"] {
+            assert!(parse_delete_recovery_timeout(Some(seconds)).is_ok());
+        }
+        for value in ["", "invalid", "0", "2", "29", "86401", "-1", "18446744073709551616"] {
+            assert!(parse_delete_recovery_timeout(Some(value)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_wire_limit_tests {
+    use super::*;
+
+    #[test]
+    fn boxed_apply_version_preserves_existing_wire_payload() {
+        #[derive(Serialize)]
+        enum PriorOperation<'a> {
+            ApplyVersion {
+                object: &'a str,
+                file_info: &'a FileInfo,
+                force_del_marker: bool,
+                opts: &'a DeleteOptions,
+            },
+        }
+        let file_info = FileInfo {
+            name: "object".into(),
+            version_id: Some(Uuid::new_v4()),
+            metadata: std::collections::HashMap::from([("metadata".into(), "value".into())]),
+            ..Default::default()
+        };
+        let opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            recoverable_delete: true,
+            delete_recovery_bucket_incarnation: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let prior = PriorOperation::ApplyVersion {
+            object: "object",
+            file_info: &file_info,
+            force_del_marker: true,
+            opts: &opts,
+        };
+        let encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed request shape");
+        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
+            object: "object".into(),
+            file_info: Box::new(file_info.clone()),
+            force_del_marker: true,
+            opts: opts.clone(),
+        };
+        assert_eq!(rmp_serde::to_vec_named(&operation).expect("encode boxed request"), encoded);
+        assert_eq!(
+            serde_json::to_value(&operation).expect("boxed request JSON"),
+            serde_json::to_value(prior).expect("previous request JSON")
+        );
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode the previous payload");
+        assert_eq!(rmp_serde::to_vec_named(&decoded).expect("re-encode decoded prior request"), encoded);
+    }
+    #[test]
+    fn adoption_and_inspection_reply_support_large_version_journals() {
+        let transaction = Uuid::new_v4();
+        let request = FileInfo {
+            metadata: std::collections::HashMap::from([("metadata".into(), "x".repeat(2048))]),
+            ..Default::default()
+        };
+        let journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction,
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: Vec::new(),
+            requests: vec![request; 1000],
+            original_versions: Vec::new(),
+            predecessors: Vec::new(),
+        };
+        let operation = DeleteRecoveryRpcOperation::Settle {
+            object: "object".into(),
+            transaction,
+            expected_fingerprint: [0; 32],
+            action: DeleteRecoveryAction::AdoptCommit {
+                authority: Box::new(journal.clone()),
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode large adoption");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(encoded.len() < operation.max_wire_payload_bytes());
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("large adoption can decode");
+        assert_eq!(decoded.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES);
+        let reply = DeleteRecoveryRpcReply::Inspected(DeleteRecoveryInspection {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            id: DeleteTransactionId {
+                object: "object".into(),
+                transaction,
+            },
+            state: DeleteRecoveryState::QuorumCommitted,
+            journal: Some(journal),
+            current_digest: None,
+            current_versions: Vec::new(),
+            backup_digest: None,
+            rollback_data_complete: false,
+            commit_data_safe: true,
+            explicit_delete_safe: false,
+            fingerprint: [0; 32],
+        });
+        let encoded = rmp_serde::to_vec_named(&reply).expect("encode large inspection");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).is_ok());
+        let inspect = DeleteRecoveryRpcOperation::Inspect {
+            object: "object".into(),
+            transaction,
+        };
+        assert_eq!(inspect.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_adoption_tests {
+    use super::*;
+
+    #[test]
+    fn source_matching_preserves_non_null_absence_and_rejects_foreign_or_missing_null() {
+        let id = Uuid::new_v4();
+        let source = DeleteRecoveryVersionIdentity {
+            version_id: Some(id),
+            mod_time: None,
+            data_dir: None,
+            deleted: false,
+            metadata_digest: [1; 32],
+        };
+        let mut journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction: Uuid::new_v4(),
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: vec![id],
+            requests: vec![FileInfo {
+                version_id: Some(id),
+                ..Default::default()
+            }],
+            original_versions: vec![source.clone()],
+            predecessors: Vec::new(),
+        };
+        assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let mut foreign = source.clone();
+        foreign.metadata_digest = [2; 32];
+        assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
+        journal.original_versions.push(foreign.clone());
+        assert!(
+            journal.matches_adoption_source(&[source.clone(), foreign.clone()]),
+            "retain original first-match semantics"
+        );
+        assert!(!journal.matches_adoption_source(&[foreign, source]));
+        journal.requests[0].version_id = None;
+        journal.original_versions[0].version_id = None;
+        assert!(!journal.matches_adoption_source(&[]), "null absence does not establish its generation");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
+        journal.requests.clear();
+        assert!(!journal.matches_adoption_source(&journal.original_versions));
     }
 }

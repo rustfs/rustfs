@@ -19,7 +19,10 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
+use crate::storage::storage_api::{
+    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, PartTransactionAction, RenameDataResp,
+    SnapshotLeaseToken, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -117,6 +120,16 @@ impl LocalMutationTarget {
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
+
+fn rejects_legacy_delete_transaction(volume: &str, opts: &DeleteOptions) -> bool {
+    !(volume == ".rustfs.sys"
+        || volume.starts_with(".rustfs.sys/")
+        || volume == ".minio.sys"
+        || volume.starts_with(".minio.sys/"))
+        && opts.old_data_dir.is_some()
+        && !opts.recoverable_delete
+        && !opts.undo_write
+}
 
 fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Response<SnapshotLeaseResponse> {
     match result {
@@ -715,6 +728,14 @@ impl NodeService {
                 }
             };
 
+            if rejects_legacy_delete_transaction(&request.volume, &opts) {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(DiskError::UnsupportedDisk.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
             let (errors, item_errors) =
                 encode_delete_versions_errors(disk.delete_versions(&request.volume, versions, opts).await);
 
@@ -782,6 +803,13 @@ impl NodeService {
                 }));
             }
         };
+        if rejects_legacy_delete_transaction(&request.volume, &opts) {
+            return Ok(Response::new(DeleteVersionResponse {
+                success: false,
+                raw_file_info: String::new(),
+                error: Some(DiskError::UnsupportedDisk.into()),
+            }));
+        }
         if require_marker_condition && opts.expected_delete_marker.is_none() {
             return Err(Status::invalid_argument("retired marker deletion requires a marker precondition"));
         }
@@ -1662,6 +1690,131 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_recover_delete_transaction(
+        &self,
+        request: Request<RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<RecoverDeleteTransactionResponse>, Status> {
+        if request.get_ref().operation.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(Status::resource_exhausted("delete recovery operation exceeds payload limit"));
+        }
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("delete recovery request length cannot be represented"))?;
+        // This additive protocol has no digestless rolling-upgrade exception.
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("delete recovery requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        if request.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+            return Err(Status::unimplemented("incompatible delete recovery protocol"));
+        }
+        let operation: DeleteRecoveryRpcOperation = rustfs_protos::decode_delete_recovery_payload(&request.operation)
+            .map_err(|_| Status::invalid_argument("invalid delete recovery operation"))?;
+        if request.operation.len() > operation.max_wire_payload_bytes() {
+            return Err(Status::resource_exhausted("delete recovery operation exceeds payload limit"));
+        }
+        match &operation {
+            DeleteRecoveryRpcOperation::ApplyVersions { versions, .. }
+                if versions.len() > 1000
+                    || versions
+                        .iter()
+                        .try_fold(0_usize, |count, versions| count.checked_add(versions.versions.len()))
+                        .is_none_or(|count| count > 1000) =>
+            {
+                return Err(Status::invalid_argument("recoverable batch delete exceeds 1000 object/version requests"));
+            }
+            DeleteRecoveryRpcOperation::Discover { limit, .. } if *limit == 0 || *limit > 256 => {
+                return Err(Status::invalid_argument("delete recovery page limit must be between 1 and 256"));
+            }
+            DeleteRecoveryRpcOperation::Inspect { transaction, .. } | DeleteRecoveryRpcOperation::Settle { transaction, .. }
+                if transaction.is_nil() =>
+            {
+                return Err(Status::invalid_argument("delete transaction must be a non-nil UUID"));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersion { opts, .. } | DeleteRecoveryRpcOperation::ApplyVersions { opts, .. }
+                if opts.old_data_dir.is_none_or(|transaction| transaction.is_nil())
+                    || opts.undo_delete
+                    || opts.undo_write
+                    || opts.recursive
+                    || opts.immediate
+                    || opts.expected_delete_marker.is_some()
+                    || opts
+                        .delete_recovery_bucket_incarnation
+                        .is_some_and(|incarnation| incarnation.is_nil()) =>
+            {
+                return Err(Status::invalid_argument(
+                    "recoverable delete requires a non-nil transaction and valid apply options",
+                ));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersion { object, .. } if object.starts_with('/') => {
+                return Err(Status::invalid_argument("recoverable delete requires a relative object key"));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersions { versions, .. }
+                if versions.iter().any(|version| version.name.starts_with('/')) =>
+            {
+                return Err(Status::invalid_argument("recoverable delete requires relative object keys"));
+            }
+            _ => {}
+        }
+        let result = if let Some(disk) = self.find_disk(&request.disk).await {
+            match operation {
+                DeleteRecoveryRpcOperation::ApplyVersion {
+                    object,
+                    file_info,
+                    force_del_marker,
+                    opts,
+                } => disk
+                    .delete_version_recoverable(&request.volume, &object, *file_info, force_del_marker, opts)
+                    .await
+                    .map(|()| DeleteRecoveryRpcReply::AppliedVersion),
+                DeleteRecoveryRpcOperation::ApplyVersions { versions, opts } => {
+                    let errors = disk.delete_versions_recoverable(&request.volume, versions, opts).await;
+                    Ok(DeleteRecoveryRpcReply::AppliedVersions(
+                        errors.into_iter().map(|error| error.map(|error| error.to_u32())).collect(),
+                    ))
+                }
+                DeleteRecoveryRpcOperation::Discover { object, cursor, limit } => disk
+                    .discover_delete_transactions(&request.volume, object.as_deref(), cursor, limit)
+                    .await
+                    .map(DeleteRecoveryRpcReply::Discovered),
+                DeleteRecoveryRpcOperation::Inspect { object, transaction } => disk
+                    .inspect_delete_transaction(&request.volume, &object, transaction)
+                    .await
+                    .map(DeleteRecoveryRpcReply::Inspected),
+                DeleteRecoveryRpcOperation::Settle {
+                    object,
+                    transaction,
+                    expected_fingerprint,
+                    action,
+                } => disk
+                    .settle_delete_transaction(&request.volume, &object, transaction, expected_fingerprint, action)
+                    .await
+                    .map(DeleteRecoveryRpcReply::Settled),
+            }
+        } else {
+            Err(DiskError::DiskNotFound)
+        };
+        match result {
+            Ok(reply) => {
+                let result = encode_msgpack_named(&reply, "delete recovery reply")
+                    .map_err(|_| Status::internal("cannot encode delete recovery reply"))?;
+                if result.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+                    return Err(Status::resource_exhausted("delete recovery reply exceeds payload limit"));
+                }
+                Ok(Response::new(RecoverDeleteTransactionResponse {
+                    success: true,
+                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    result: result.into(),
+                    error: None,
+                }))
+            }
+            Err(error) => Ok(Response::new(RecoverDeleteTransactionResponse {
+                success: false,
+                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                result: Bytes::new(),
+                error: Some(error.into()),
+            })),
+        }
+    }
+
     pub(super) async fn handle_settle_part_transaction(
         &self,
         request: Request<SettlePartTransactionRequest>,
@@ -2091,9 +2244,10 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
+        DeleteOptions, compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
         encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
         encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
@@ -2106,11 +2260,32 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serial_test::serial;
     use tonic::Request;
+    use uuid::Uuid;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn legacy_delete_transaction_policy_preserves_rollback_and_internal_maintenance() {
+        let mut opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(rejects_legacy_delete_transaction("bucket", &opts));
+        assert!(!rejects_legacy_delete_transaction(".rustfs.sys", &opts));
+        assert!(!rejects_legacy_delete_transaction(".rustfs.sys/tmp", &opts));
+        assert!(!rejects_legacy_delete_transaction(".minio.sys", &opts));
+        opts.undo_write = true;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
+        opts.undo_write = false;
+        opts.recoverable_delete = true;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
+        opts.recoverable_delete = false;
+        opts.old_data_dir = None;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
     }
 
     #[test]

@@ -467,12 +467,11 @@ impl LocalDiskWrapper {
         self.track_disk_health_mutation(
             "delete_version",
             DiskMetricMutation::Delete,
-            || async {
+            || {
                 Box::pin(
                     self.disk
                         .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner),
                 )
-                .await
             },
             get_max_timeout_duration(),
         )
@@ -1840,6 +1839,8 @@ impl LocalDiskWrapper {
                     undo_delete: false,
                     old_data_dir: None,
                     expected_delete_marker: None,
+                    recoverable_delete: false,
+                    delete_recovery_bucket_incarnation: None,
                 },
             )
             .await?;
@@ -2025,8 +2026,84 @@ impl LocalDiskWrapper {
     }
 
     /// Get the current disk ID
+    pub(crate) async fn delete_versions_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let version_count = versions.len();
+        self.metrics.record_operation_call("delete_versions");
+        // Check if disk is faulty before proceeding
+        if self.health.is_faulty() {
+            self.metrics.record_availability_error();
+            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        }
+
+        // Check if disk is stale
+        if let Err(e) = self.check_disk_stale().await {
+            self.metrics.record_availability_error();
+            return vec![Some(e); versions.len()];
+        }
+
+        let _io_permit = match self.acquire_disk_io_permit().await {
+            Ok(permit) => permit,
+            Err(error) => return vec![Some(error); version_count],
+        };
+
+        // Record operation start
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
+        let waiting_guard = self.health.waiting_guard();
+        let metric_waiting_guard = self.metrics.waiting_guard();
+        let started = Instant::now();
+
+        // Execute the operation
+        let result = self
+            .disk
+            .delete_versions_with_namespace_owner(volume, versions, opts, namespace_owner)
+            .await;
+        self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
+
+        drop(waiting_guard);
+        drop(metric_waiting_guard);
+        let has_err = result.iter().any(|e| e.is_some());
+        if !has_err {
+            // Log success and decrement waiting counter
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
+            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
+        }
+
+        result
+    }
+
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
+    }
+
+    pub(crate) async fn settle_delete_transaction_with_namespace_owner(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        expected_fingerprint: crate::disk::DeleteRecoveryDigest,
+        action: crate::disk::DeleteRecoveryAction,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<crate::disk::DeleteRecoveryInspection> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || {
+                Box::pin(async {
+                    self.disk
+                        .delete_recovery_settle(volume, object, transaction, expected_fingerprint, action, namespace_owner)
+                        .await
+                })
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
     }
 
     /// Track disk health for an operation.
@@ -2244,6 +2321,87 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: FileInfo,
+        force_del_marker: bool,
+        mut opts: DeleteOptions,
+    ) -> Result<()> {
+        crate::disk::validate_delete_recovery_options(&opts)?;
+        if object.starts_with('/') {
+            return Err(DiskError::InvalidPath);
+        }
+        opts.recoverable_delete = true;
+        self.delete_version(volume, object, file_info, force_del_marker, opts).await
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        mut opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        if let Err(err) = crate::disk::validate_delete_recovery_options(&opts) {
+            return vec![Some(err); versions.len()];
+        }
+        if versions.iter().any(|version| version.name.starts_with('/')) {
+            return vec![Some(DiskError::InvalidPath); versions.len()];
+        }
+        opts.recoverable_delete = true;
+        self.delete_versions(volume, versions, opts).await
+    }
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<crate::disk::DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<crate::disk::DeleteRecoveryPage> {
+        self.track_disk_health_with_op(
+            "discover_delete_transactions",
+            || async {
+                self.disk
+                    .discover_delete_transactions(volume, object, cursor.clone(), limit)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+    ) -> Result<crate::disk::DeleteRecoveryInspection> {
+        self.track_disk_health_with_op(
+            "inspect_delete_transaction",
+            || async { self.disk.inspect_delete_transaction(volume, object, transaction).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        expected_fingerprint: crate::disk::DeleteRecoveryDigest,
+        action: crate::disk::DeleteRecoveryAction,
+    ) -> Result<crate::disk::DeleteRecoveryInspection> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || async {
+                self.disk
+                    .settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
+    }
     fn has_replacement_mount_lease(&self) -> bool {
         self.disk.has_replacement_mount_lease()
     }
@@ -2457,46 +2615,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
-        let version_count = versions.len();
-        self.metrics.record_operation_call("delete_versions");
-        // Check if disk is faulty before proceeding
-        if self.health.is_faulty() {
-            self.metrics.record_availability_error();
-            return vec![Some(DiskError::FaultyDisk); versions.len()];
-        }
-
-        // Check if disk is stale
-        if let Err(e) = self.check_disk_stale().await {
-            self.metrics.record_availability_error();
-            return vec![Some(e); versions.len()];
-        }
-
-        let _io_permit = match self.acquire_disk_io_permit().await {
-            Ok(permit) => permit,
-            Err(error) => return vec![Some(error); version_count],
-        };
-
-        // Record operation start
-        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
-        let waiting_guard = self.health.waiting_guard();
-        let metric_waiting_guard = self.metrics.waiting_guard();
-        let started = Instant::now();
-
-        // Execute the operation
-        let result = self.disk.delete_versions(volume, versions, opts).await;
-        self.metrics.record_operation_latency("delete_versions", started.elapsed());
-        self.record_batch_delete_error_metrics(&result);
-
-        drop(waiting_guard);
-        drop(metric_waiting_guard);
-        let has_err = result.iter().any(|e| e.is_some());
-        if !has_err {
-            // Log success and decrement waiting counter
-            self.health.record_operation_success(&self.endpoint(), "operation_success");
-            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
-        }
-
-        result
+        self.delete_versions_with_namespace_owner(volume, versions, opts, None).await
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {

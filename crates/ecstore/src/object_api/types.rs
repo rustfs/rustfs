@@ -938,6 +938,10 @@ pub struct ObjectOptions {
     /// A genuine target write guard; loss fences alone do not authorize a borrowed write.
     #[doc(hidden)]
     pub write_lock_context: Option<WriteLockContext>,
+    /// In-process delete ownership for late filesystem completion. Never
+    /// serialized or copied into object metadata.
+    #[doc(hidden)]
+    pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
@@ -1158,6 +1162,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("http_preconditions", &self.http_preconditions.is_some())
             .field("delete_replication", &self.delete_replication.is_some())
             .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
+            .field("delete_mutation_owner", &self.delete_mutation_owner.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
             .field("replication_request", &self.replication_request)
