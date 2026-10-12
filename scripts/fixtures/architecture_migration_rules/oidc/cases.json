@@ -42,6 +42,48 @@
     "expected": ["federation-authorization-owner"]
   },
   {
+    "id": "oidc_adapter_imports_credentials",
+    "path": "crates/iam/src/oidc/runtime.rs",
+    "source": "use rustfs_credentials::Credentials;\n",
+    "expected": ["oidc-iam-session-boundary"]
+  },
+  {
+    "id": "oidc_adapter_constructs_qualified_credentials",
+    "path": "crates/iam/src/oidc/runtime.rs",
+    "source": "let credentials = rustfs_credentials::Credentials { access_key };\n",
+    "expected": ["oidc-iam-session-boundary"]
+  },
+  {
+    "id": "oidc_adapter_imports_binding_transaction",
+    "path": "crates/iam/src/oidc/runtime.rs",
+    "source": "use crate::federation::FederatedSessionTransaction as BindingRequest;\n",
+    "expected": ["oidc-iam-session-boundary"]
+  },
+  {
+    "id": "oidc_adapter_constructs_binding_transaction",
+    "path": "crates/iam/src/oidc/runtime.rs",
+    "source": "let transaction = FederatedSessionTransaction { authorization, duration_seconds, session_policy };\n",
+    "expected": ["oidc-iam-session-boundary"]
+  },
+  {
+    "id": "oidc_adapter_test_module_uses_credentials",
+    "path": "crates/iam/src/oidc/runtime.rs",
+    "source": "#[cfg(test)]\nmod tests { use rustfs_credentials::Credentials; }\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_federation_transaction_owner",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "let transaction = FederatedSessionTransaction { authorization, duration_seconds, session_policy };\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_binding_credentials_owner",
+    "path": "rustfs/src/admin/service/federated_identity.rs",
+    "source": "let credentials = Credentials { access_key };\n",
+    "expected": []
+  },
+  {
     "id": "config_imports_provider_runtime",
     "path": "crates/iam/src/oidc/config.rs",
     "source": "pub struct OidcSiteReplicationProvider { pub provider_id: String, pub claim_name: String, pub role_policy: String, pub client_id: String, pub hashed_client_secret: String }\npub struct OidcSiteReplicationSnapshot { providers: Vec<OidcSiteReplicationProvider> }\npub trait OidcConfigQuery: Send + Sync { fn site_replication_snapshot(&self) -> OidcSiteReplicationSnapshot; }\nuse super::provider::ProviderRuntime;\n",

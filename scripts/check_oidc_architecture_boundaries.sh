@@ -180,6 +180,12 @@ def source_findings(path, source):
             r"\b(?:crate|super)::oidc\b|\buse\b[^;]*\boidc\b[^;]*;|\boidc::|\b(?:OidcSys|OidcClaims|OidcStateStore|OidcProviderConfig|OidcConfigSnapshot|OidcExtraRootCaProvider|ProviderRuntime|ReqwestHttpClient|openidconnect|reqwest)\b",
         )
 
+    if path.startswith("crates/iam/src/oidc/"):
+        findings += find_matches(
+            "oidc-iam-session-boundary", path, code,
+            r"\b(?:Credentials|FederatedSessionTransaction)\b",
+        )
+
     if path.startswith("crates/iam/src/") and path != "crates/iam/src/lib.rs" and not path.startswith(
         ("crates/iam/src/oidc/", "crates/iam/src/federation/")
     ):
