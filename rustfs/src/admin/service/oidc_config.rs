@@ -125,7 +125,7 @@ pub(crate) async fn validate_config(input: OidcProviderValidationInput) -> Resul
     let provider = build_validation_provider_config(input)?;
     let extra_root_ca = crate::startup_auth::current_oidc_extra_root_ca_material()
         .await
-        .map_err(|error| OidcAdminConfigError::Validation(error.to_string()))?;
+        .map_err(OidcAdminConfigError::Validation)?;
     validate_oidc_provider_config_with_extra_root_ca(&provider, extra_root_ca.root_ca_pem.as_deref())
         .await
         .map_err(OidcAdminConfigError::Validation)
