@@ -931,16 +931,21 @@ pub(in crate::set_disk) struct GetObjectFileInfo {
     owned: Option<OwnedGetObjectFileInfo>,
     shared: Option<Arc<GetObjectMetadataCacheEntry>>,
     condition_stopped: bool,
+    late_metadata_fanout: Option<LateMetadataFanout>,
 }
 
 struct OwnedGetObjectFileInfo {
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
-    late_metadata_fanout_disks: Option<Vec<Option<DiskStore>>>,
 }
 
-type OwnedGetObjectFileInfoParts = (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>, Option<Vec<Option<DiskStore>>>);
+enum LateMetadataFanout {
+    CapturedDisks(Vec<Option<DiskStore>>),
+    RefreshCurrentSet,
+}
+
+type OwnedGetObjectFileInfoParts = (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>, Option<LateMetadataFanout>);
 
 impl GetObjectFileInfo {
     fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
@@ -949,10 +954,10 @@ impl GetObjectFileInfo {
                 fi,
                 parts_metadata,
                 online_disks,
-                late_metadata_fanout_disks: None,
             }),
             shared: None,
             condition_stopped: false,
+            late_metadata_fanout: None,
         }
     }
 
@@ -962,16 +967,9 @@ impl GetObjectFileInfo {
         online_disks: Vec<Option<DiskStore>>,
         late_metadata_fanout_disks: Vec<Option<DiskStore>>,
     ) -> Self {
-        Self {
-            owned: Some(OwnedGetObjectFileInfo {
-                fi,
-                parts_metadata,
-                online_disks,
-                late_metadata_fanout_disks: Some(late_metadata_fanout_disks),
-            }),
-            shared: None,
-            condition_stopped: false,
-        }
+        let mut snapshot = Self::owned(fi, parts_metadata, online_disks);
+        snapshot.late_metadata_fanout = Some(LateMetadataFanout::CapturedDisks(late_metadata_fanout_disks));
+        snapshot
     }
 
     fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
@@ -980,7 +978,14 @@ impl GetObjectFileInfo {
             owned: None,
             shared: Some(entry),
             condition_stopped,
+            late_metadata_fanout: None,
         }
+    }
+
+    fn shared_with_late_metadata_refresh(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        let mut snapshot = Self::shared(entry);
+        snapshot.late_metadata_fanout = Some(LateMetadataFanout::RefreshCurrentSet);
+        snapshot
     }
 
     fn fi(&self) -> &FileInfo {
@@ -1008,9 +1013,7 @@ impl GetObjectFileInfo {
     }
 
     fn has_late_metadata_fanout(&self) -> bool {
-        self.owned
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.late_metadata_fanout_disks.is_some())
+        self.late_metadata_fanout.is_some()
     }
 
     fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
@@ -1019,16 +1022,22 @@ impl GetObjectFileInfo {
     }
 
     fn into_owned_with_late_metadata_fanout(self) -> OwnedGetObjectFileInfoParts {
-        match (self.owned, self.shared) {
-            (Some(snapshot), None) => (
-                snapshot.fi,
-                snapshot.parts_metadata,
-                snapshot.online_disks,
-                snapshot.late_metadata_fanout_disks,
-            ),
+        let Self {
+            owned,
+            shared,
+            late_metadata_fanout,
+            ..
+        } = self;
+        match (owned, shared) {
+            (Some(snapshot), None) => (snapshot.fi, snapshot.parts_metadata, snapshot.online_disks, late_metadata_fanout),
             (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks, None),
-                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone(), None),
+                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout),
+                Err(entry) => (
+                    entry.fi.clone(),
+                    entry.parts_metadata.clone(),
+                    entry.online_disks.clone(),
+                    late_metadata_fanout,
+                ),
             },
             _ => unreachable!("GET metadata snapshot representation must be exclusive"),
         }

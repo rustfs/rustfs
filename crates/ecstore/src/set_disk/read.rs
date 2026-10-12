@@ -653,7 +653,15 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok(GetObjectFileInfo::shared(cached));
+                    let snapshot = if cached.capability == GetObjectMetadataCacheCapability::QuorumSelected
+                        && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
+                        && late_materialization_candidate_is_safe(&cached.fi)
+                    {
+                        GetObjectFileInfo::shared_with_late_metadata_refresh(cached)
+                    } else {
+                        GetObjectFileInfo::shared(cached)
+                    };
+                    return Ok(snapshot);
                 }
                 MetadataCacheLookup::Hit(_) => {
                     // Keep the conditional entry for other requests; this read
@@ -4113,11 +4121,13 @@ mod metadata_cache_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(metadata_cache_early_stop)]
     async fn metadata_cache_publishes_quorum_selected_early_stop_result() {
+        use tokio::io::AsyncReadExt;
+
         let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         isolated_ctx
             .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
             .await;
-        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
         let bucket = "metadata-cache-early-stop";
         let object = "objects/repeated-key";
         let disks = set.disks.read().await.clone();
@@ -4169,7 +4179,40 @@ mod metadata_cache_tests {
 
                 let cached = second.shared_entry().expect("second lookup should share cached metadata");
                 assert_eq!(cached.fi.name, object);
-                assert!(cached.online_disks.iter().filter(|disk| disk.is_some()).count() >= cached.read_quorum);
+                let cached_online_count = cached.online_disks.iter().filter(|disk| disk.is_some()).count();
+                assert_eq!(cached_online_count, 3, "the warm cache should contain three of four disks");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::QuorumSelected);
+
+                let data_dir = cached
+                    .fi
+                    .data_dir
+                    .expect("quorum cache retains the object data directory")
+                    .to_string();
+                let selected_disk_indices = cached
+                    .online_disks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, disk)| disk.as_ref().map(|_| index))
+                    .take(2)
+                    .collect::<Vec<_>>();
+                assert_eq!(selected_disk_indices.len(), 2, "the warmed cache should name enough selected shards");
+                for index in selected_disk_indices {
+                    tokio::fs::remove_file(dirs[index].path().join(bucket).join(object).join(&data_dir).join("part.1"))
+                        .await
+                        .expect("simulate loss of two cached selected shards");
+                }
+
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("a cached partial layout must recover through omitted disks");
+                let mut body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut body)
+                    .await
+                    .expect("the GET should decode after refreshing the omitted disks");
+                assert_eq!(body, expected_body, "recovered body must be byte-exact");
             },
         )
         .await;

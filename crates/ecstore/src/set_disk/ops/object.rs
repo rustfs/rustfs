@@ -37,9 +37,9 @@ use super::super::{
     GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION, GET_STAGE_READER_SETUP,
     GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision, GetObjectReader,
     HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
-    ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
-    PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, LateMetadataFanout, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo,
+    ObjectKey, ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime,
+    Ordering, Pin, PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
     SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
@@ -3197,9 +3197,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 let object_size = usize::try_from(object_info.size)
                     .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
                 let mut output = Vec::with_capacity(object_size);
-                let (fi, files, disks, late_metadata_fanout_disks) = snapshot.into_owned_with_late_metadata_fanout();
+                let (fi, files, disks, late_metadata_fanout) = snapshot.into_owned_with_late_metadata_fanout();
                 let expected_identity = super::super::read::LateMetadataIdentity::from_file_info(&fi);
-                let late_metadata_fanout_disks = late_metadata_fanout_disks.ok_or_else(|| {
+                let late_metadata_fanout = late_metadata_fanout.ok_or_else(|| {
                     to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object])
                 })?;
                 let initial_result = Self::get_object_with_fileinfo(
@@ -3224,6 +3224,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await;
                 if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                    let late_metadata_fanout_disks = match late_metadata_fanout {
+                        LateMetadataFanout::CapturedDisks(disks) => disks,
+                        LateMetadataFanout::RefreshCurrentSet => self.get_disks_for_data_read().await,
+                    };
                     #[cfg(test)]
                     super::super::rename_fanout_barrier::checkpoint(
                         object,
