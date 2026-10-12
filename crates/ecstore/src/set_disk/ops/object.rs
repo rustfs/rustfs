@@ -22978,6 +22978,7 @@ mod delete_objects_lock_gating_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn delete_objects_honors_no_lock_when_outer_write_lock_is_held() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-no-lock-bucket";
@@ -22986,38 +22987,64 @@ mod delete_objects_lock_gating_tests {
         }
         put_plain_object(&set_disks, bucket, "obj-a").await;
 
-        let _outer_guard = set_disks
+        let outer_guard = set_disks
             .new_ns_lock(bucket, "obj-a")
             .await
             .expect("namespace lock should be created")
             .get_write_lock(Duration::from_secs(1))
             .await
             .expect("outer write lock should be acquired");
+        let lock_manager = set_disks
+            .local_lock_manager_for_test()
+            .as_fast_lock_manager()
+            .expect("fixture requires enabled namespace locking");
+        let acquisitions = lock_manager.get_metrics().shard_metrics.total_acquisitions();
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
 
-        let objects = vec![ObjectToDelete {
-            object_name: "obj-a".to_string(),
-            ..Default::default()
-        }];
-
-        let (deleted, errs) = tokio::time::timeout(
-            Duration::from_secs(1),
-            set_disks.delete_objects(
-                bucket,
-                objects,
-                ObjectOptions {
-                    no_lock: true,
-                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
-                        ObjectLockConfigState::ConfirmedAbsent,
-                    ))),
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("no_lock batch delete path must not wait for the outer lock");
+        // Prove real delete progress while the caller's lock remains held;
+        // disk preparation and fsync are not a one-second lock-acquire oracle.
+        let barrier = DeleteCleanupBarrier::install(bucket);
+        let deleting_set = Arc::clone(&set_disks);
+        let deletion = tokio::spawn(async move {
+            deleting_set
+                .delete_objects(
+                    bucket,
+                    vec![ObjectToDelete {
+                        object_name: "obj-a".to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions {
+                        no_lock: true,
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0), "only the caller may hold a namespace lock");
+        assert_eq!(lock_manager.get_metrics().shard_metrics.total_acquisitions(), acquisitions);
+        barrier.release();
+        let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), deletion)
+            .await
+            .expect("no_lock batch delete must complete with the caller's lock held")
+            .expect("batch deletion task should not panic");
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        assert_eq!(lock_manager.get_metrics().shard_metrics.total_acquisitions(), acquisitions);
+        for disk in &disk_stores {
+            assert_eq!(
+                disk.read_version("", bucket, "obj-a", "", &crate::disk::ReadOptions::default())
+                    .await
+                    .expect_err("every drive must confirm the deleted version is absent"),
+                DiskError::FileNotFound
+            );
+        }
+        drop(outer_guard);
     }
 }
 
