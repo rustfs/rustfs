@@ -274,9 +274,9 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_stage(3, 3);
                 }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal bucket {bucket}: {e}"),
-                })
+                // Keep storage/quorum identity for the cluster retry classifier.
+                // The structured log above already carries the bucket context.
+                Err(e)
             }
         }
     }

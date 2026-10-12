@@ -728,6 +728,85 @@ mod canonical_outcome {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cluster_bucket_write_quorum_retries_preserve_budget_and_truthful_coverage() {
+        for (failures, succeeds) in [(1, true), (4, false)] {
+            let storage = Arc::new(MockStorage {
+                listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
+                typed_bucket_heal_errors: Mutex::new(HashMap::from([(
+                    "bucket-a".to_string(),
+                    (0..failures)
+                        .map(|_| Error::Storage(EcstoreError::ErasureWriteQuorum))
+                        .collect(),
+                )])),
+                ..Default::default()
+            });
+            let task = HealTask::from_request(
+                HealRequest::new(
+                    HealType::Cluster,
+                    HealOptions {
+                        recursive: true,
+                        timeout: None,
+                        ..Default::default()
+                    },
+                    HealPriority::Normal,
+                ),
+                storage.clone(),
+            );
+            let result = task.execute().await;
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "original cluster task must honor its bounded bucket retry budget"
+            );
+            let outcome = task.get_outcome().await;
+            if succeeds {
+                assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+                assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+            } else {
+                assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+                assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+                let failure = task.take_batch_failure().await.expect("exhausted bucket retains its failure");
+                assert_eq!((failure.failed, failure.retryable, failure.permanent), (1, 1, 0));
+            }
+            let calls = storage.bucket_heal_calls.lock().expect("original bucket calls");
+            assert_eq!(
+                calls.iter().filter(|bucket| bucket.as_str() == "bucket-a").count(),
+                if succeeds { 2 } else { 4 }
+            );
+            assert_eq!(calls.last().map(String::as_str), Some("bucket-b"), "later buckets must still be visited");
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_prepass_preserves_typed_quorum_and_terminal_access_denial() {
+        for error in [
+            Error::Storage(EcstoreError::ErasureWriteQuorum),
+            Error::Disk(DiskError::FileAccessDenied),
+        ] {
+            let retryable = error.is_recoverable_heal();
+            let storage = Arc::new(MockStorage {
+                typed_bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_string(), VecDeque::from([error]))])),
+                ..Default::default()
+            });
+            let task = bucket_task(storage.clone());
+            let observed = task
+                .heal_bucket("bucket-a")
+                .await
+                .expect_err("bucket prepass must retain the storage error");
+            assert!(matches!(
+                observed,
+                Error::Storage(EcstoreError::ErasureWriteQuorum) | Error::Disk(DiskError::FileAccessDenied)
+            ));
+            assert_eq!(observed.is_recoverable_heal(), retryable);
+            assert_eq!(storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(), ["bucket-a"]);
+            assert!(
+                storage.heal_object_calls.lock().expect("object calls").is_empty(),
+                "failed prepass must not heal objects"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancellation_and_deadline_leave_partial_coverage() {
         for cancel in [false, true] {
             let storage = Arc::new(MockStorage {
@@ -1482,6 +1561,7 @@ struct MockStorage {
     include_object_dir_candidate: Mutex<bool>,
     listed_buckets: Mutex<Option<Vec<String>>>,
     bucket_heal_errors: Mutex<HashMap<String, VecDeque<&'static str>>>,
+    typed_bucket_heal_errors: Mutex<HashMap<String, VecDeque<Error>>>,
     bucket_heal_calls: Mutex<Vec<String>>,
     block_heal_object: Mutex<bool>,
     resume_disk: Mutex<Option<DiskStore>>,
@@ -2247,6 +2327,15 @@ impl HealStorageAPI for MockStorage {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         self.bucket_heal_calls.lock().unwrap().push(bucket.to_string());
         self.bucket_heal_opts.lock().unwrap().push(*opts);
+        if let Some(error) = self
+            .typed_bucket_heal_errors
+            .lock()
+            .unwrap()
+            .get_mut(bucket)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
+        }
         if let Some(message) = self
             .bucket_heal_errors
             .lock()
