@@ -225,10 +225,10 @@ fn load_server_material(source: &TlsSource, base_dir: &Path) -> Result<Option<Se
     if cert_key_pairs.is_empty() {
         return Ok(None);
     }
-    if cert_key_pairs.len() == 1 {
-        if let Some((certs, key)) = cert_key_pairs.remove("default") {
-            return Ok(Some(ServerTlsMaterial::SingleCert { certs, key }));
-        }
+    if cert_key_pairs.len() == 1
+        && let Some((certs, key)) = cert_key_pairs.remove("default")
+    {
+        return Ok(Some(ServerTlsMaterial::SingleCert { certs, key }));
     }
     Ok(Some(ServerTlsMaterial::MultiCert { cert_key_pairs }))
 }

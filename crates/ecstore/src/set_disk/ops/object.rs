@@ -8342,18 +8342,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             self.bucket_incarnation_id_from_disk(bucket).await.ok()
         };
-        self.delete_object_version_with_purge(
-            bucket,
-            object,
-            fi,
-            force_del_marker,
-            None,
-            DeleteCommitContext {
-                incarnation: source_bucket_incarnation_id,
-                ..Default::default()
-            },
-        )
-        .await
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let result = self
+            .delete_object_version_with_purge(
+                bucket,
+                object,
+                fi,
+                force_del_marker,
+                None,
+                DeleteCommitContext {
+                    incarnation: source_bucket_incarnation_id,
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        result
     }
 
     #[tracing::instrument(skip(self, objects, opts))]
@@ -14240,6 +14244,25 @@ mod metadata_mutation_generation_tests {
         assert_eq!(delete_probe.count(), 2, "DELETE must invalidate before mutation and after commit");
         assert_retired(&set_disks, &delete_key).await;
         drop(delete_probe);
+
+        let raw_object = "raw-delete-object";
+        let (_, raw_key) = put_and_prime(&set_disks, bucket, raw_object, b"raw DELETE body").await;
+        let raw_probe = MetadataCacheInvalidationProbe::install(bucket, raw_object);
+        set_disks
+            .delete_object_version(
+                bucket,
+                raw_object,
+                &FileInfo {
+                    name: raw_object.to_owned(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .expect("raw DELETE should succeed");
+        assert_eq!(raw_probe.count(), 2, "raw DELETE must fence the cache before and after mutation");
+        assert_retired(&set_disks, &raw_key).await;
+        drop(raw_probe);
 
         let copy_object = "copy-object";
         let (mut copy_info, copy_key) = put_and_prime(&set_disks, bucket, copy_object, b"COPY body").await;
@@ -24413,8 +24436,7 @@ mod delete_recovery_inventory_tests {
         });
         barrier.wait_until_paused().await;
         let extra_gate = set.disks.read().await;
-        let renewal = set.renew_disk(&endpoint);
-        tokio::pin!(renewal);
+        let mut renewal = Box::pin(set.renew_disk(&endpoint));
         tokio::time::timeout(
             Duration::from_secs(5),
             futures::future::poll_fn(|cx| {

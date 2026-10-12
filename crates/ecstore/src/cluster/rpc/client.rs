@@ -54,7 +54,7 @@ use super::context_propagation::{inject_request_id_into_metadata, inject_trace_c
 /// 3. Subsequent calls will attempt fresh connections
 /// 4. If node is still down, connection will fail fast (3s timeout)
 pub async fn node_service_time_out_client(
-    addr: &String,
+    addr: &str,
     interceptor: TonicInterceptor,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     // Default to the latency-sensitive control channel; bulk `bytes` RPCs opt in via the
@@ -110,7 +110,7 @@ pub async fn tier_mutation_control_time_out_client(
 /// from lock/health RPCs; everything else uses [`ChannelClass::Control`]. When isolation is
 /// disabled the two classes resolve to the same cached channel, i.e. legacy behavior.
 pub async fn node_service_time_out_client_for_class(
-    addr: &String,
+    addr: &str,
     interceptor: TonicInterceptor,
     class: ChannelClass,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
@@ -141,7 +141,7 @@ pub(crate) async fn node_service_delete_recovery_client(
 }
 
 pub async fn node_service_time_out_client_no_auth(
-    addr: &String,
+    addr: &str,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     node_service_time_out_client(addr, TonicInterceptor::NoOp(NoOpInterceptor)).await
 }

@@ -512,10 +512,7 @@ async fn load_cert_file(path: &Path, pem_data: &mut Vec<u8>, desc: &str) -> bool
     }
 }
 
-/// Search for and load certificate files matching `cert_name` in the directory
-/// and one level of subdirectories.
-/// Returns `true` if at least one matching file was loaded.
-
+/// Validity windows indexed by leaf certificate DER.
 type CertificateValidities = HashMap<Vec<u8>, (i64, i64)>;
 
 fn certificate_validities<'a>(

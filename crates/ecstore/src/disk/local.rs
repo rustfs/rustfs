@@ -242,6 +242,10 @@ fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<Offse
 
 pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
     let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
+    inline_metadata_rollback_dir_with_used_dirs(version_id, &used_data_dirs)
+}
+
+fn inline_metadata_rollback_dir_with_used_dirs(version_id: Uuid, used_data_dirs: &HashSet<Uuid>) -> Uuid {
     let base = version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR;
     let mut salt = 0u128;
 

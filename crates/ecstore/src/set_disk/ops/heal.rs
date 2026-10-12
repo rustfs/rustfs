@@ -3485,18 +3485,6 @@ impl SetDisks {
             && let Some(scope) = crate::store::bucket_heal_scope_for_object(bucket, object)
             && !crate::bucket::utils::is_meta_bucketname(bucket)
         {
-            let requested = Uuid::parse_str(version_id).ok();
-            if !opts.dry_run && (version_id.is_empty() || requested.is_some()) {
-                let disks = self.get_disks_internal().await;
-                let before = Self::read_metadata(&disks, "", bucket, object, version_id, false, false, false)
-                    .await
-                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-                recovery_removed_version = before
-                    .slots
-                    .iter()
-                    .filter_map(|slot| slot.file_info())
-                    .any(|info| version_id.is_empty() || Some(info.version_id.unwrap_or_default()) == requested);
-            }
             let explicit_delete = opts.remove
                 && version_id.is_empty()
                 && crate::bucket::metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket).await?
@@ -3522,6 +3510,16 @@ impl SetDisks {
                     },
                 )
                 .await?;
+            recovery_removed_version = if version_id.is_empty() {
+                !recovery.removed_versions.is_empty()
+            } else {
+                let target = if version_id == "null" {
+                    Some(Uuid::nil())
+                } else {
+                    Uuid::parse_str(version_id).ok()
+                };
+                target.is_some_and(|id| recovery.removed_versions.contains(&id))
+            };
             if opts.dry_run && recovery.discovered > 0 {
                 return Ok((
                     HealResultItem {
