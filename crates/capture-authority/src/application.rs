@@ -108,14 +108,14 @@ pub(crate) fn validate_provenance_encoding(bytes: &[u8]) -> Result<(), StoreErro
 }
 
 pub(crate) fn decode_stored_operation(b: &[u8], schema: u64) -> Result<CreatedOperation, StoreError> {
-    if matches!(schema, 5 | 6) {
+    if matches!(schema, 5 | 6 | 7) {
         Ok(decode_provenance(b)?.operation)
     } else {
         decode_operation(b)
     }
 }
 
-fn encode_provenance(first: LogId, operation: &[u8]) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn encode_provenance(first: LogId, operation: &[u8]) -> Result<Vec<u8>, StoreError> {
     let mut bytes = b"COPR\x01".to_vec();
     bytes.extend(encode_id(first));
     bytes.extend(operation);
@@ -204,7 +204,7 @@ pub(crate) fn decode_native_entry(entry: crate::LogEntry) -> Result<crate::Captu
     })
 }
 
-fn apply_created(
+pub(crate) fn apply_created(
     tx: &redb::WriteTransaction,
     id: LogId,
     command: &DecideCreated,
@@ -269,7 +269,7 @@ fn apply_created(
             .to_vec();
         op.extend(canonical);
         op.extend(result_bytes(&outcome));
-        if matches!(schema, 5 | 6) {
+        if matches!(schema, 5 | 6 | 7) {
             op = encode_provenance(id, &op)?;
         }
         operations.insert(command.operation_id.as_slice(), op.as_slice())?;
@@ -278,7 +278,10 @@ fn apply_created(
     Ok(result)
 }
 
-fn validate_response_kind(entry: &crate::CaptureRaftEntry, response: &crate::CaptureResponse) -> Result<(), StoreError> {
+pub(crate) fn validate_response_kind(
+    entry: &crate::CaptureRaftEntry,
+    response: &crate::CaptureResponse,
+) -> Result<(), StoreError> {
     let kind = match entry.payload {
         openraft::EntryPayload::Blank => crate::CaptureResponseKind::Blank,
         openraft::EntryPayload::Normal(_) => crate::CaptureResponseKind::Created,
@@ -306,7 +309,7 @@ fn encode_response(response: &crate::CaptureResponse) -> Result<Vec<u8>, StoreEr
     bytes.extend(body);
     Ok(bytes)
 }
-fn decode_response(bytes: &[u8]) -> Result<crate::CaptureResponse, StoreError> {
+pub(crate) fn decode_response(bytes: &[u8]) -> Result<crate::CaptureResponse, StoreError> {
     if bytes.len() < 38
         || &bytes[..5] != b"CRSP\x01"
         || number(&bytes[30..38])? != u64::try_from(bytes.len() - 38).map_err(|_| StoreError::CorruptRecord)?
@@ -343,12 +346,16 @@ pub(crate) fn native_application_state(tx: &ReadTransaction) -> Result<(Option<L
 fn native_application_metadata(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
-    if !matches!(number(required(meta.get("schema")?)?.value())?, 4 | 6) {
+    let schema = number(required(meta.get("schema")?)?.value())?;
+    if !matches!(schema, 4 | 6 | 7) {
         return Err(StoreError::UnsupportedSchema);
     }
     let last = read_applied(meta)?;
-    let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())
-        .map_err(|_| StoreError::CorruptRecord)?;
+    let membership_bytes = required(meta.get("native_membership")?)?;
+    if schema == 7 && membership_bytes.value().len() > 1024 * 1024 {
+        return Err(StoreError::CorruptRecord);
+    }
+    let membership = crate::CaptureMembership::decode(membership_bytes.value()).map_err(|_| StoreError::CorruptRecord)?;
     if membership
         .log_id()
         .is_some_and(|id| last.is_none_or(|last| id.index > last.index))
@@ -422,11 +429,11 @@ impl Store {
         {
             let mut meta = tx.open_table(META)?;
             let schema = number(required(meta.get("schema")?)?.value())?;
-            if !matches!(schema, 3..=6) {
+            if !matches!(schema, 3..=7) {
                 return Err(StoreError::UnsupportedSchema);
             }
             read_binding(&meta)?;
-            if matches!(schema, 4 | 6) {
+            if matches!(schema, 4 | 6 | 7) {
                 let membership = crate::CaptureMembership::decode(required(meta.get("native_membership")?)?.value())
                     .map_err(|_| StoreError::CorruptRecord)?;
                 let last = read_applied(&meta)?;
@@ -463,7 +470,8 @@ impl Store {
         let tx = self.write_transaction()?;
         {
             let mut meta = tx.open_table(META)?;
-            if !matches!(number(required(meta.get("schema")?)?.value())?, 4 | 6) {
+            let schema = number(required(meta.get("schema")?)?.value())?;
+            if !matches!(schema, 4 | 6 | 7) {
                 return Err(StoreError::UnsupportedSchema);
             }
             if entries.is_empty() {
@@ -476,7 +484,36 @@ impl Store {
                 if entry.log_id.index != next {
                     return Err(StoreError::InvalidLogSequence);
                 }
-                encoded.push(encode_native_entry(entry)?);
+                if schema == 7 {
+                    if let openraft::EntryPayload::Membership(membership) = &entry.payload {
+                        // Reuse framing's size preflight before allocating the membership encoding.
+                        let stored = openraft::StoredMembership::new(Some(entry.log_id), membership.clone());
+                        let header = crate::snapshot::Header {
+                            cluster_id: crate::decode_identity(required(meta.get("identity")?)?.value())?.cluster_id,
+                            applied: Some(entry.log_id.into()),
+                            membership: crate::CaptureMembership::try_from(&stored)?,
+                            binding: read_binding(&meta)?,
+                        };
+                        crate::snapshot::Encoder::new(
+                            std::io::sink(),
+                            &header,
+                            [0; 4],
+                            crate::snapshot::Limits {
+                                total_bytes: 1024 * 1024,
+                                membership_bytes: 1024 * 1024 - 256,
+                                key_bytes: 0,
+                                value_bytes: 0,
+                                records: 0,
+                            },
+                        )
+                        .map_err(|_| StoreError::ResourceLimit)?;
+                    }
+                }
+                let bytes = encode_native_entry(entry)?;
+                if schema == 7 && bytes.len() > 1024 * 1024 {
+                    return Err(StoreError::ResourceLimit);
+                }
+                encoded.push(bytes);
                 if position + 1 < entries.len() {
                     next = next_index(Some(next))?;
                 }
@@ -492,7 +529,7 @@ impl Store {
     }
     pub fn read_native_entry(&self, index: u64) -> Result<Option<crate::CaptureRaftEntry>, StoreError> {
         let tx = self.database.begin_read()?;
-        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6) {
+        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6 | 7) {
             return Err(StoreError::UnsupportedSchema);
         }
         tx.open_table(LOGS)?
@@ -509,14 +546,14 @@ impl Store {
     /// Read typed native entries within the requested bounds.
     pub fn read_native_range<R: std::ops::RangeBounds<u64>>(&self, range: R) -> Result<Vec<crate::CaptureRaftEntry>, StoreError> {
         let tx = self.database.begin_read()?;
-        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6) {
+        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6 | 7) {
             return Err(StoreError::UnsupportedSchema);
         }
         read_native_range_in(&tx, range)
     }
     pub fn read_native_entries(&self, start: u64, end: u64) -> Result<Vec<crate::CaptureRaftEntry>, StoreError> {
         let tx = self.database.begin_read()?;
-        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6) {
+        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6 | 7) {
             return Err(StoreError::UnsupportedSchema);
         }
         if start > end {
@@ -531,7 +568,7 @@ impl Store {
         {
             let mut meta = tx.open_table(META)?;
             let schema = number(required(meta.get("schema")?)?.value())?;
-            if !matches!(schema, 4 | 6) {
+            if !matches!(schema, 4 | 6 | 7) {
                 return Err(StoreError::UnsupportedSchema);
             }
             let binding = read_binding(&meta)?;
@@ -579,7 +616,7 @@ impl Store {
     }
     pub fn native_apply_response(&self, index: u64) -> Result<Option<crate::CaptureResponse>, StoreError> {
         let tx = self.database.begin_read()?;
-        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6) {
+        if !matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6 | 7) {
             return Err(StoreError::UnsupportedSchema);
         }
         let results = tx.open_table(APPLY_RESULTS)?;
@@ -597,7 +634,7 @@ impl Store {
         let tx = self.write_transaction()?;
         {
             let mut meta = tx.open_table(META)?;
-            if matches!(number(required(meta.get("schema")?)?.value())?, 3..=6) {
+            if matches!(number(required(meta.get("schema")?)?.value())?, 3..=7) {
                 if read_binding(&meta)? == binding {
                     return Ok(());
                 }
@@ -665,7 +702,7 @@ impl Store {
     pub fn capture_binding(&self) -> Result<Option<CaptureBinding>, StoreError> {
         let tx = self.database.begin_read()?;
         let meta = tx.open_table(META)?;
-        if !matches!(number(required(meta.get("schema")?)?.value())?, 3..=6) {
+        if !matches!(number(required(meta.get("schema")?)?.value())?, 3..=7) {
             return Ok(None);
         }
         Ok(Some(read_binding(&meta)?))
@@ -673,7 +710,7 @@ impl Store {
     pub fn last_applied(&self) -> Result<Option<LogId>, StoreError> {
         let tx = self.database.begin_read()?;
         let meta = tx.open_table(META)?;
-        if !matches!(number(required(meta.get("schema")?)?.value())?, 3..=6) {
+        if !matches!(number(required(meta.get("schema")?)?.value())?, 3..=7) {
             return Ok(None);
         }
         read_applied(&meta)
@@ -706,7 +743,7 @@ impl Store {
     pub fn created_operation_provenance(&self, operation: [u8; 16]) -> Result<Option<CreatedOperationProvenance>, StoreError> {
         let tx = self.database.begin_read()?;
         let schema = number(required(tx.open_table(META)?.get("schema")?)?.value())?;
-        if !matches!(schema, 5 | 6) {
+        if !matches!(schema, 5 | 6 | 7) {
             return Err(StoreError::UnsupportedSchema);
         }
         tx.open_table(OPERATIONS)?
@@ -721,6 +758,9 @@ impl Store {
         {
             let mut meta = tx.open_table(META)?;
             let schema = number(required(meta.get("schema")?)?.value())?;
+            if schema == 7 {
+                return Ok(());
+            }
             if !matches!(schema, 3..=6) {
                 return Err(StoreError::UnsupportedSchema);
             }
@@ -758,7 +798,7 @@ impl Store {
             let mut operations = tx.open_table(OPERATIONS)?;
             let results = tx.open_table(APPLY_RESULTS)?;
             let first = validate_application_tables(&meta, &logs, &heads, &versions, &events, &operations, &results, true)?;
-            if matches!(schema, 5 | 6) {
+            if matches!(schema, 5 | 6 | 7) {
                 return Ok(());
             }
             // Keep one encoded row at a time; the replay map contains only first LogIds.
@@ -782,7 +822,7 @@ impl Store {
     pub fn created_apply_result(&self, index: u64) -> Result<Option<CreatedApplyResult>, StoreError> {
         let tx = self.database.begin_read()?;
         let t = tx.open_table(APPLY_RESULTS)?;
-        if matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6) {
+        if matches!(number(required(tx.open_table(META)?.get("schema")?)?.value())?, 4 | 6 | 7) {
             t.get(index)?
                 .map(|v| {
                     decode_response(v.value()).map(|r| {
@@ -802,6 +842,9 @@ impl Store {
 
 pub(crate) fn validate_application(tx: &ReadTransaction) -> Result<(), StoreError> {
     let meta = tx.open_table(META)?;
+    if number(required(meta.get("schema")?)?.value())? == 7 {
+        return crate::checkpoint_baseline::validate_recovery(tx);
+    }
     if !matches!(number(required(meta.get("schema")?)?.value())?, 3..=6) {
         return Ok(());
     }

@@ -124,14 +124,42 @@ impl NativeSnapshotView {
         writer: W,
         limits: snapshot::Limits,
     ) -> Result<snapshot::CapabilityArtifact<W>, NativeSnapshotError> {
-        if self.schema != 6 {
+        if !matches!(self.schema, 6 | 7) {
             return Err(StoreError::UnsupportedSchema.into());
         }
         let output = snapshot::CapabilityOutput::new(writer, limits.total_bytes);
         Ok(self.stream(output, limits)?.finish())
     }
 
+    pub(crate) fn transaction(&self) -> &ReadTransaction {
+        &self.transaction
+    }
+
+    pub(crate) fn header(&self) -> &snapshot::Header {
+        &self.header
+    }
+
+    pub(crate) fn owner(&self) -> &Arc<Mutex<Store>> {
+        &self._owner
+    }
+
+    pub(crate) fn stream_local_capability<W: Write>(
+        &self,
+        writer: W,
+        limits: snapshot::Limits,
+    ) -> Result<snapshot::CapabilityArtifact<W>, NativeSnapshotError> {
+        if !matches!(self.schema, 6 | 7) {
+            return Err(StoreError::UnsupportedSchema.into());
+        }
+        let output = snapshot::CapabilityOutput::new(writer, limits.total_bytes);
+        Ok(self.stream_borrowed(output, limits)?.finish())
+    }
+
     pub fn stream<W: Write>(self, writer: W, limits: snapshot::Limits) -> Result<W, NativeSnapshotError> {
+        self.stream_borrowed(writer, limits)
+    }
+
+    fn stream_borrowed<W: Write>(&self, writer: W, limits: snapshot::Limits) -> Result<W, NativeSnapshotError> {
         let mut encoder = snapshot::Encoder::new(writer, &self.header, self.counts, limits)?;
         for (definition, section) in [
             (application::HEADS, snapshot::Section::Heads),

@@ -7,7 +7,12 @@ use std::{
 };
 
 mod application;
+mod checkpoint_baseline;
 mod committed;
+mod native_checkpoint;
+#[cfg(test)]
+mod native_checkpoint_tests;
+pub use native_checkpoint::{CheckpointError, CheckpointLimits, CheckpointReceipt};
 mod created;
 mod source_page;
 pub use source_page::{EventCursor, EventPage, MAX_EVENT_PAGE, SourceEvent};
@@ -48,6 +53,7 @@ impl NativeLogReader {
 pub struct NativeLogWriter {
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
+    checkpoint_admission: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +71,7 @@ impl NativeLogWriter {
         Self {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
             ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_admission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -164,6 +171,13 @@ impl NativeLogWriter {
                 .collect()
         })
         .await
+    }
+
+    /// Purge only the exact durable baseline selected by this local checkpoint.
+    pub async fn purge_checkpoint(&self, receipt: &CheckpointReceipt) -> Result<(), NativeWriteError> {
+        let generation = receipt.generation();
+        let cut = receipt.cut();
+        self.write(move |store| store.purge_checkpoint(generation, cut)).await
     }
 
     pub async fn applied_state(&self) -> Result<(Option<LogId>, CaptureMembership), NativeWriteError> {
@@ -270,6 +284,10 @@ pub enum StoreError {
     CommittedRegression,
     #[error("committed log protected")]
     CommittedLogProtected,
+    #[error("checkpoint recovery resource limit exceeded")]
+    ResourceLimit,
+    #[error("checkpoint generation or cut changed")]
+    StaleCheckpoint,
     #[error("capture binding not pinned")]
     BindingNotPinned,
     #[error("capture binding conflict")]
@@ -282,6 +300,8 @@ pub enum StoreError {
     AlreadyInitialized,
     #[error("store missing")]
     MissingStore,
+    #[error("checkpoint staging commit failed")]
+    StagingCommit(#[source] redb::CommitError),
     #[error("commit outcome unknown; close and reopen")]
     CommitIndeterminate(#[source] redb::CommitError),
     #[error("handle requires reopening")]
@@ -311,12 +331,15 @@ impl StoreError {
             Self::InvalidCommittedLog => "invalid_committed_log",
             Self::CommittedRegression => "committed_regression",
             Self::CommittedLogProtected => "committed_log_protected",
+            Self::ResourceLimit => "resource_limit",
+            Self::StaleCheckpoint => "stale_checkpoint",
             Self::BindingNotPinned => "binding_not_pinned",
             Self::BindingConflict => "binding_conflict",
             Self::InvalidApplySequence => "invalid_apply_sequence",
             Self::IndexExhausted => "index_exhausted",
             Self::AlreadyInitialized => "already_initialized",
             Self::MissingStore => "missing_store",
+            Self::StagingCommit(_) => "staging_commit",
             Self::CommitIndeterminate(_) => "commit_indeterminate",
             Self::WriteDisabled => "write_disabled",
             Self::Io(_) => "io",
@@ -380,7 +403,31 @@ impl Store {
         let database = Database::open(path)?;
         Self::from_database(database, expected)
     }
+    /// Reopen with an explicit temporary-space budget when the retained suffix
+    /// has outgrown the budget recorded at the last checkpoint.
+    pub fn open_with_checkpoint_limits(
+        path: impl AsRef<Path>,
+        expected: NodeIdentity,
+        limits: CheckpointLimits,
+    ) -> Result<Self, StoreError> {
+        validate_identity(expected)?;
+        limits.validate()?;
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StoreError::MissingStore);
+        }
+        Self::from_database_with_limits(Database::open(path)?, expected, Some(limits))
+    }
+
     fn from_database(database: Database, expected: NodeIdentity) -> Result<Self, StoreError> {
+        Self::from_database_with_limits(database, expected, None)
+    }
+
+    fn from_database_with_limits(
+        database: Database,
+        expected: NodeIdentity,
+        limits: Option<CheckpointLimits>,
+    ) -> Result<Self, StoreError> {
         let mut store = Self {
             database,
             writable: true,
@@ -388,7 +435,7 @@ impl Store {
         let tx = store.database.begin_read()?;
         let meta = tx.open_table(META)?;
         let schema = meta.get("schema")?.ok_or(StoreError::CorruptRecord)?;
-        if !matches!(number(schema.value())?, 1..=6) {
+        if !matches!(number(schema.value())?, 1..=7) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = meta.get("identity")?.ok_or(StoreError::CorruptRecord)?;
@@ -404,29 +451,37 @@ impl Store {
             decode_vote(value.value())?;
         }
         let logs = tx.open_table(LOGS)?;
-        let mut next = Some(0);
-        let mut last = None;
+        let purged = checkpoint_baseline::read_purged(&meta)?;
+        let mut next = purged.map_or(Some(0), |id| id.index.checked_add(1));
+        let mut last = purged;
         for row in logs.iter()? {
             let (key, value) = row?;
+            if number(schema.value())? == 7 && value.value().len() > 1024 * 1024 {
+                return Err(StoreError::CorruptRecord);
+            }
             let entry = decode_log(value.value())?;
             if next != Some(key.value()) || entry.id.index != key.value() {
-                return Err(if matches!(number(schema.value())?, 4 | 6) {
+                return Err(if matches!(number(schema.value())?, 4 | 6 | 7) {
                     StoreError::CorruptRecord
                 } else {
                     StoreError::InvalidLogSequence
                 });
             }
-            if matches!(number(schema.value())?, 4 | 6) {
+            if matches!(number(schema.value())?, 4 | 6 | 7) {
                 application::decode_native_entry(entry.clone())?;
             }
             next = key.value().checked_add(1);
             last = Some(entry.id);
         }
         committed::validate_committed(&meta, &logs)?;
-        application::validate_application(&tx)?;
+        if number(schema.value())? == 7 {
+            checkpoint_baseline::validate_recovery_with_limits(&tx, limits)?;
+        } else {
+            application::validate_application(&tx)?;
+        }
         let tail = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         if tail != last {
-            return Err(if matches!(number(schema.value())?, 4 | 6) {
+            return Err(if matches!(number(schema.value())?, 4 | 6 | 7) {
                 StoreError::CorruptRecord
             } else {
                 StoreError::InvalidLogSequence
@@ -456,6 +511,34 @@ impl Store {
             StoreError::CommitIndeterminate(e)
         })
     }
+    fn purge_checkpoint(&mut self, generation: u64, cut: LogId) -> Result<(), StoreError> {
+        let read = self.database.begin_read()?;
+        let selected = checkpoint_baseline::read_metadata(&read.open_table(META)?)?.ok_or(StoreError::StaleCheckpoint)?;
+        if selected.generation != generation || selected.header.applied != Some(cut) {
+            return Err(StoreError::StaleCheckpoint);
+        }
+        // Re-read the committed generation and prove baseline + suffix recovery
+        // before removing any historical evidence. The writer owns ordering.
+        checkpoint_baseline::validate_recovery(&read)?;
+        drop(read);
+        let tx = self.write_transaction()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            let selected = checkpoint_baseline::read_metadata(&meta)?.ok_or(StoreError::StaleCheckpoint)?;
+            if selected.generation != generation || selected.header.applied != Some(cut) {
+                return Err(StoreError::StaleCheckpoint);
+            }
+            if checkpoint_baseline::read_purged(&meta)? == Some(cut) {
+                return Ok(());
+            }
+            tx.open_table(LOGS)?.retain(|index, _| index > cut.index)?;
+            tx.open_table(application::APPLY_RESULTS)?
+                .retain(|index, _| index > cut.index)?;
+            meta.insert(checkpoint_baseline::PURGED_KEY, checkpoint_baseline::encode_purged(cut).as_slice())?;
+        }
+        self.commit(tx)
+    }
+
     pub fn read_vote(&self) -> Result<Option<VoteRecord>, StoreError> {
         let tx = self.database.begin_read()?;
         let table = tx.open_table(VOTE)?;
@@ -475,7 +558,7 @@ impl Store {
         let tx = self.database.begin_read()?;
         if matches!(
             number(tx.open_table(META)?.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?,
-            4 | 6
+            4 | 6 | 7
         ) {
             return Err(StoreError::UnsupportedSchema);
         }
@@ -541,7 +624,10 @@ impl Store {
         let meta = tx.open_table(META)?;
         let last = meta.get("tail")?.map(|v| decode_id(v.value())).transpose()?;
         let logs = tx.open_table(LOGS)?;
-        let first = logs.get(0)?.map(|v| decode_log(v.value()).map(|e| e.id)).transpose()?;
+        let first = logs
+            .first()?
+            .map(|(_, value)| decode_log(value.value()).map(|entry| entry.id))
+            .transpose()?;
         Ok(LogState { first, last })
     }
 }
@@ -1680,7 +1766,7 @@ mod tests {
                 if corruption == 0 {
                     tx.open_table(META)
                         .expect("meta")
-                        .insert("schema", 7u64.to_be_bytes().as_slice())
+                        .insert("schema", 8u64.to_be_bytes().as_slice())
                         .expect("future schema");
                 } else {
                     let mut operations = tx.open_table(application::OPERATIONS).expect("operations");

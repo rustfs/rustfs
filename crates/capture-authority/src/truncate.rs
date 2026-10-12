@@ -21,8 +21,12 @@ impl Store {
                 None
             } else {
                 let index = from - 1;
-                let record = logs.get(index)?.ok_or(StoreError::InvalidLogSequence)?;
-                let id = decode_log(record.value())?.id;
+                let id = match logs.get(index)? {
+                    Some(record) => decode_log(record.value())?.id,
+                    None => crate::checkpoint_baseline::read_purged(&meta)?
+                        .filter(|id| id.index == index)
+                        .ok_or(StoreError::InvalidLogSequence)?,
+                };
                 if id.index != index {
                     return Err(StoreError::CorruptRecord);
                 }

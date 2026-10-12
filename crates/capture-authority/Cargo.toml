@@ -15,10 +15,10 @@ serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

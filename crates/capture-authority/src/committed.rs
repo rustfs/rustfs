@@ -8,17 +8,18 @@ pub(crate) fn validate_committed(
     let schema = number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?;
     let marker = meta.get("committed")?;
     match (schema, marker) {
-        (1 | 3 | 4 | 5 | 6, None) => {
-            if matches!(schema, 3..=6) && meta.get("last_applied")?.is_none_or(|v| v.value() != [0]) {
+        (1 | 3 | 4 | 5 | 6 | 7, None) => {
+            if matches!(schema, 3..=7) && meta.get("last_applied")?.is_none_or(|v| v.value() != [0]) {
                 return Err(StoreError::CorruptRecord);
             }
             Ok(None)
         }
-        (2 | 3 | 4 | 5 | 6, Some(marker)) => {
+        (2 | 3 | 4 | 5 | 6 | 7, Some(marker)) => {
             let id = decode_id(marker.value())?;
-            let record = logs.get(id.index)?.ok_or(StoreError::CorruptRecord)?;
-            if decode_log(record.value())?.id != id {
-                return Err(StoreError::CorruptRecord);
+            match logs.get(id.index)? {
+                Some(record) if decode_log(record.value())?.id == id => {}
+                None if schema == 7 && crate::checkpoint_baseline::read_baseline_cut(meta)? == Some(id) => {}
+                _ => return Err(StoreError::CorruptRecord),
             }
             Ok(Some(id))
         }
@@ -41,6 +42,9 @@ impl Store {
             let mut meta = tx.open_table(META)?;
             let logs = tx.open_table(LOGS)?;
             let previous = validate_committed(&meta, &logs)?;
+            if previous == Some(id) {
+                return Ok(());
+            }
             let record = logs.get(id.index)?.ok_or(StoreError::InvalidCommittedLog)?;
             if decode_log(record.value())?.id != id {
                 return Err(StoreError::InvalidCommittedLog);
@@ -49,12 +53,9 @@ impl Store {
                 if id.index < previous.index {
                     return Err(StoreError::CommittedRegression);
                 }
-                if id == previous {
-                    return Ok(());
-                }
             }
             meta.insert("committed", encode_id(id).as_slice())?;
-            if previous.is_none() && !matches!(number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?, 3..=6) {
+            if previous.is_none() && !matches!(number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?, 3..=7) {
                 meta.insert("schema", 2u64.to_be_bytes().as_slice())?;
             }
         }

@@ -34,6 +34,65 @@ caller validation and require isolated staging. Rows remain opaque to the
 framing decoder. A framing digest detects byte corruption; it does not establish
 semantic consistency, historical truth, or authority to install a checkpoint.
 
+## Local checkpoint implementation
+
+`NativeLogWriter::checkpoint_local` in
+`crates/capture-authority/src/native_checkpoint.rs` accepts resource limits and
+captures its own store. It has no artifact, path, or caller-supplied trust input.
+The private staging owner retains the original read transaction and store;
+decoded rows must match that transaction byte for byte before publication.
+This establishes local provenance without treating a valid snapshot digest as
+remote authorization.
+
+One admission guard limits checkpoint work per writer. Capturing and validating
+the snapshot allow later application writes to proceed. Publication takes the
+existing writer ordering guard and retains it in the blocking worker through
+the durable transaction. It replaces four immutable baseline tables and their
+versioned metadata atomically, advancing local storage to schema 7. Live
+application tables, identity, vote, committed state, and later log entries stay
+in the same database. Old schema readers reject this explicit storage upgrade;
+CSNP v1 and COPR v1 retain their encodings.
+
+`checkpoint_baseline::validate_recovery` validates baseline relationships with
+disk-backed indexes, then applies the continuous suffix into a temporary redb
+store using the existing `apply_created` decision logic. It compares recovered
+rows and membership with the live state. Original negative results remain
+canonical across this boundary. Temporary databases use a bounded file backend
+and fixed cache; snapshot records stream through bounded buffers. The recorded
+budget is the default for recovery. If later state requires more temporary
+space, `Store::open_with_checkpoint_limits` supplies a larger explicit budget;
+resource exhaustion is not reported as corrupt history.
+
+`NativeLogWriter::purge_checkpoint` checks the selected generation and complete
+cut, validates recovery from the durable baseline, then checks the selection
+again in the cleanup transaction. That transaction removes covered log entries
+and application responses together with a durable full-ID purge marker. A stale
+receipt cannot authorize cleanup of another generation. Recovery accepts the
+purged boundary when the committed marker equals the exact baseline cut, and
+requires all retained log entries to be contiguous after the purge marker.
+
+```mermaid
+sequenceDiagram
+    participant W as Native writer
+    participant C as Local capture worker
+    participant D as Durable redb store
+    W->>C: Admit one checkpoint
+    C->>D: Acquire owned read transaction at cut
+    D-->>C: Header and four application tables
+    W->>D: Continue append and apply after cut
+    C->>C: Stream, decode, compare, validate on disk
+    C->>W: Acquire writer ordering
+    C->>D: Atomically publish baseline and schema 7
+    D-->>W: Generation and full cut receipt
+    W->>D: Re-read baseline and validate suffix recovery
+    W->>D: Atomically purge covered logs/results and record boundary
+```
+
+These local operations are prerequisites for Raft log compaction. They do not
+provide a remote snapshot installation endpoint, authenticated Raft transport,
+quorum commitment, or S3 publication. Those boundaries must be connected to the
+real authority owner before source events may claim published-object authority.
+
 ## Canonical operation provenance
 
 Checkpoint-capable storage must use an explicitly versioned operation envelope

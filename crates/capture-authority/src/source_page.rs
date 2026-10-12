@@ -90,7 +90,7 @@ fn validated_event(
     let event = application::decode_event(bytes)?;
     let cut = applied.ok_or(StoreError::CorruptRecord)?;
     let operation = operations.get(key)?.ok_or(StoreError::CorruptRecord)?;
-    let first_decision = if matches!(schema, 5 | 6) {
+    let first_decision = if matches!(schema, 5 | 6 | 7) {
         Some(application::decode_provenance(operation.value())?.first_decision_log_id)
     } else {
         None
@@ -154,7 +154,7 @@ impl Store {
         let read = self.database.begin_read()?;
         let meta = read.open_table(crate::META)?;
         let schema = crate::number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?;
-        if !matches!(schema, 3..=6) {
+        if !matches!(schema, 3..=7) {
             return Ok(());
         }
         let binding = application::read_binding(&meta)?;
@@ -204,7 +204,7 @@ impl Store {
         let tx = self.database.begin_read()?;
         let meta = tx.open_table(crate::META)?;
         let schema = crate::number(meta.get("schema")?.ok_or(StoreError::CorruptRecord)?.value())?;
-        if !matches!(schema, 3..=6) {
+        if !matches!(schema, 3..=7) {
             return Err(StoreError::UnsupportedSchema);
         }
         let identity = crate::decode_identity(meta.get("identity")?.ok_or(StoreError::CorruptRecord)?.value())?;
