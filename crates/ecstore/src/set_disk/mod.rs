@@ -1428,11 +1428,11 @@ mod prepared_get_object_metadata_tests {
         let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
 
         assert!(snapshot.has_valid_representation());
-        assert!(std::mem::size_of::<GetObjectFileInfo>() >= std::mem::size_of::<OwnedGetObjectFileInfo>());
-        assert!(
-            std::mem::size_of::<GetObjectFileInfo>()
-                <= std::mem::size_of::<OwnedGetObjectFileInfo>() + 2 * std::mem::size_of::<usize>()
-        );
+        // Keep the original payload budget after moving the captured disks out
+        // of OwnedGetObjectFileInfo.
+        let owned_payload_size = std::mem::size_of::<(OwnedGetObjectFileInfo, Option<Vec<Option<DiskStore>>>)>();
+        assert!(std::mem::size_of::<GetObjectFileInfo>() >= owned_payload_size);
+        assert!(std::mem::size_of::<GetObjectFileInfo>() <= owned_payload_size + 2 * std::mem::size_of::<usize>());
         assert_eq!(Arc::strong_count(&cached), 2, "a cache hit must add one snapshot reference");
         assert_eq!(snapshot.fi().name, "object");
         assert_eq!(snapshot.parts_metadata().len(), 1);
