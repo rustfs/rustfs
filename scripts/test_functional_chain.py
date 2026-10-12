@@ -76,6 +76,31 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(result["artifact_id"], 789)
         self.assertEqual(result["manifest"]["source_sha"], "b" * 40)
 
+    def test_validation_manifest_binds_requested_source_and_private_channel(self):
+        manifest = {**self.manifest, "schema": 3, "channel": "validation",
+                    "package_url": self.manifest["package_url"].replace("/packages/nightly/", "/packages/validation/")}
+        run = {**self.run, "path": ".github/workflows/rustfs-validation-package.yml"}
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("validation-candidate-123-2.json", json.dumps(manifest))
+        raw = payload.getvalue()
+        artifact = {"id": 789, "name": "validation-candidate-123-2", "expired": False,
+                    "size_in_bytes": len(raw), "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                    "workflow_run": {"id": 123, "head_sha": "a" * 40}}
+        result = candidate.read_manifest(raw, artifact, run)
+        self.assertEqual(result["channel"], "validation")
+        self.assertIn("/packages/validation/runs/123/2/", result["package_url"])
+
+    def test_validation_resolver_requires_manual_workflow_dispatch(self):
+        payload, artifact = self.archive()
+        run = {"id": 123, "run_attempt": 2, "head_sha": "a" * 40,
+               "path": ".github/workflows/rustfs-validation-package.yml", "head_branch": "main",
+               "head_repository": {"full_name": "rustfs/rustfs"}, "event": "schedule",
+               "status": "completed", "conclusion": "success", "run_started_at": "2026-10-12T00:00:00Z"}
+        with mock.patch.object(candidate, "api", side_effect=[run]):
+            with self.assertRaisesRegex(ValueError, "manually dispatched"):
+                candidate.resolve(123, 2)
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):

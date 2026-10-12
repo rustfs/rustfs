@@ -39,8 +39,11 @@ def validate_manifest(manifest, run):
     require(isinstance(manifest, dict), "manifest must be an object")
     common = {"schema", "source_sha", "build_run_id", "build_run_attempt", "package_url", "package_sha256"}
     version = manifest.get("schema")
-    require(type(version) is int and version in (1, 2), "unsupported candidate schema")
-    require(set(manifest) == (common if version == 1 else common | {"workflow_sha", "source_ref"}), "unexpected candidate fields")
+    require(type(version) is int and version in (1, 2, 3), "unsupported candidate schema")
+    expected_fields = common if version == 1 else common | {"workflow_sha", "source_ref"}
+    if version == 3:
+        expected_fields |= {"channel"}
+    require(set(manifest) == expected_fields, "unexpected candidate fields")
     require(positive(manifest["build_run_id"]) and positive(manifest["build_run_attempt"]), "invalid build identity")
     require((manifest["build_run_id"], manifest["build_run_attempt"]) == (run["id"], run["run_attempt"]), "candidate belongs to another build attempt")
     require(sha(manifest["source_sha"]) and sha(manifest["package_sha256"], 64), "invalid candidate hash")
@@ -49,7 +52,10 @@ def validate_manifest(manifest, run):
     else:
         require(manifest["workflow_sha"] == run["head_sha"] and sha(manifest["workflow_sha"]), "candidate workflow SHA differs from artifact provenance")
         require(isinstance(manifest["source_ref"], str) and bool(re.fullmatch(r"[A-Za-z0-9_./-]{1,200}", manifest["source_ref"])), "invalid build source ref")
-    expected = (f"https://dl.rustfs.com/artifacts/rustfs/packages/nightly/runs/{run['id']}/"
+        if version == 3:
+            require(manifest["channel"] == "validation", "validation candidate has the wrong publication channel")
+    channel = "validation" if version == 3 else "nightly"
+    expected = (f"https://dl.rustfs.com/artifacts/rustfs/packages/{channel}/runs/{run['id']}/"
                 f"{run['run_attempt']}/{manifest['package_sha256']}/rustfs.deb")
     require(manifest["package_url"] == expected, "package URL does not bind the run, attempt and checksum")
     return manifest
@@ -72,7 +78,8 @@ def read_json_artifact(archive, artifact, run, expected_name, member, max_json=1
 
 
 def read_manifest(archive, artifact, run):
-    name = f"nightly-candidate-{run['id']}-{run['run_attempt']}"
+    prefix = "validation-candidate" if run.get("path") == ".github/workflows/rustfs-validation-package.yml" else "nightly-candidate"
+    name = f"{prefix}-{run['id']}-{run['run_attempt']}"
     return validate_manifest(read_json_artifact(archive, artifact, run, name, name + ".json"), run)
 
 
@@ -81,10 +88,15 @@ def resolve(run_id, attempt):
     endpoint = f"repos/{REPOSITORY}/actions/runs/{run_id}"
     run = api(f"{endpoint}/attempts/{attempt}")
     require(run.get("id") == run_id and run.get("run_attempt") == attempt, "GitHub returned a different build attempt")
-    require(run.get("path") == ".github/workflows/nightly-gnu.yml" and run.get("head_branch") == "main", "candidate must come from nightly-gnu on main")
+    path = run.get("path")
+    validation = path == ".github/workflows/rustfs-validation-package.yml"
+    require(path == ".github/workflows/nightly-gnu.yml" and run.get("head_branch") == "main" or validation,
+            "candidate must come from nightly-gnu on main or the validation package workflow")
     require((run.get("head_repository") or {}).get("full_name") == REPOSITORY, "candidate came from another repository")
-    require(run.get("event") in ("schedule", "workflow_dispatch") and run.get("status") == "completed" and run.get("conclusion") == "success", "nightly attempt has not completed successfully")
-    name = f"nightly-candidate-{run_id}-{attempt}"
+    require(run.get("event") in ("schedule", "workflow_dispatch") and run.get("status") == "completed" and run.get("conclusion") == "success", "candidate attempt has not completed successfully")
+    if validation:
+        require(run.get("event") == "workflow_dispatch", "validation candidate must be manually dispatched")
+    name = f"{'validation' if validation else 'nightly'}-candidate-{run_id}-{attempt}"
     artifacts = []
     for page in range(1, 11):
         batch = api(f"{endpoint}/artifacts?per_page=100&page={page}")["artifacts"]
