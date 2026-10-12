@@ -568,7 +568,7 @@ nondefault_statefulset=$(awk '
 nondefault_local_host=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$nondefault_statefulset")
 nondefault_namespace=$(yq eval '.metadata.namespace' - <<<"$nondefault_statefulset")
 nondefault_endpoint_port=$(yq eval '.spec.template.spec.containers[0].ports[] | select(.name == "endpoint") | .containerPort' - <<<"$nondefault_statefulset")
-mtls_liveness_command=$(yq eval '.spec.template.spec.containers[0].livenessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
+mtls_liveness_port=$(yq eval '.spec.template.spec.containers[0].livenessProbe.tcpSocket.port' - <<<"$nondefault_statefulset")
 mtls_readiness_command=$(yq eval '.spec.template.spec.containers[0].readinessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
 if [[ "$nondefault_local_host" != '$(RUSTFS_CHART_POD_NAME).tenant-rustfs-headless.object-storage.svc.cluster.corp' ]]; then
   echo "Combined generated topology produced an unexpected local endpoint host: $nondefault_local_host" >&2
@@ -578,9 +578,8 @@ if [[ "$nondefault_namespace" != "object-storage" || "$nondefault_endpoint_port"
   echo "Combined generated topology must retain its namespace and custom endpoint port" >&2
   exit 1
 fi
-if ! grep -Fq 'https://127.0.0.1:9443/health' <<<"$mtls_liveness_command" ||
-   grep -Fq '/health/ready' <<<"$mtls_liveness_command"; then
-  echo "mTLS liveness must use the process health endpoint, not readiness" >&2
+if [[ "$mtls_liveness_port" != 9443 ]]; then
+  echo "mTLS liveness must check the listener independently of certificate validity" >&2
   exit 1
 fi
 if ! grep -Fq 'https://127.0.0.1:9443/health/ready' <<<"$mtls_readiness_command"; then

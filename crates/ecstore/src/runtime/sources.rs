@@ -50,6 +50,7 @@ use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -249,10 +250,6 @@ pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
     } else {
         Some(*GLOBAL_ROOT_DISK_THRESHOLD.read().await)
     }
-}
-
-pub(crate) async fn cached_node_channel(addr: &str) -> Option<Channel> {
-    rustfs_common::cached_connection(addr).await
 }
 
 #[cfg(test)]

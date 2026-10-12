@@ -173,6 +173,40 @@ pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
     }
 }
 
+/// Normalize a read-quorum failure that escaped through a PutObject boundary.
+///
+/// Storage-level read quorum failures keep their `SlowDownRead` code for GET
+/// compatibility. A write request that encounters the same failure must expose
+/// the write-side retry contract instead, while retaining the typed source for
+/// diagnostics and audit consumers.
+pub(crate) fn normalize_put_read_quorum_error(mut err: S3Error) -> S3Error {
+    let is_slow_down_read = matches!(
+        err.code(),
+        S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE
+    );
+    if !is_slow_down_read {
+        return err;
+    }
+    let has_read_quorum_source = err.source().is_some_and(|source| {
+        error_chain_find(source, |error| {
+            matches!(
+                error.downcast_ref::<StorageError>(),
+                Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+            )
+            .then_some(())
+        })
+        .is_some()
+    });
+
+    if has_read_quorum_source {
+        err.set_code(S3ErrorCode::ServiceUnavailable);
+        err.set_message(ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable));
+        err.set_status_code(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    err
+}
+
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
 /// This marker must survive the body-reader and storage layers so the client
@@ -1600,6 +1634,73 @@ mod tests {
 
         assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
         assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn put_read_quorum_error_preserves_context_and_is_idempotent() {
+        for source in [
+            StorageError::ErasureReadQuorum,
+            StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
+        ] {
+            for nested in [false, true] {
+                let mut err: S3Error = ApiError::from(source.clone()).into();
+                if nested {
+                    err.set_source(Box::new(IoError::other(source.clone())));
+                }
+                err.set_request_id("put-quorum-request");
+                let mut headers = http::HeaderMap::new();
+                headers.insert("retry-after", http::HeaderValue::from_static("2"));
+                err.set_headers(headers);
+
+                let err = normalize_put_read_quorum_error(normalize_put_read_quorum_error(err));
+                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+                assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
+                assert_eq!(err.request_id(), Some("put-quorum-request"));
+                assert_eq!(err.headers().expect("retry headers must survive")["retry-after"], "2");
+                let retained = error_chain_find(err.source().expect("typed source must survive"), |error| {
+                    error.downcast_ref::<StorageError>().cloned()
+                });
+                assert_eq!(retained, Some(source.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn put_read_quorum_error_preserves_other_error_contracts() {
+        for code in [
+            S3ErrorCode::SlowDown,
+            S3ErrorCode::AccessDenied,
+            S3ErrorCode::InvalidRequest,
+            S3ErrorCode::PreconditionFailed,
+            S3ErrorCode::BadDigest,
+            S3ErrorCode::IncompleteBody,
+            S3ErrorCode::NoSuchKey,
+            S3ErrorCode::NoSuchBucket,
+            S3ErrorCode::InternalError,
+            S3ErrorCode::ServiceUnavailable,
+        ] {
+            let mut err = S3Error::with_message(code.clone(), "original message");
+            err.set_source(Box::new(StorageError::ErasureReadQuorum));
+            let original_status = err.status_code();
+            let err = normalize_put_read_quorum_error(err);
+            assert_eq!(err.code(), &code);
+            assert_eq!(err.message(), Some("original message"));
+            assert_eq!(err.status_code(), original_status);
+        }
+        for source in [
+            None,
+            Some(StorageError::ErasureWriteQuorum),
+            Some(StorageError::PartMissingOrCorrupt),
+        ] {
+            let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "original message");
+            if let Some(source) = source {
+                err.set_source(Box::new(source));
+            }
+            let err = normalize_put_read_quorum_error(err);
+            assert_eq!(err.code(), &S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+            assert_eq!(err.message(), Some("original message"));
+        }
     }
 
     #[test]

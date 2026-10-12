@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [External certificate issuance and TLS rotation](operations/tls-certificate-rotation.md) — publication, native reload, trust separation and failure handling.
+
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
 
