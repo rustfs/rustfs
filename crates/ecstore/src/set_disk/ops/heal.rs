@@ -100,6 +100,7 @@ static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = st
 enum ReadRepairPausePhase {
     Data,
     Commit,
+    IncarnationCommit,
 }
 
 #[cfg(test)]
@@ -115,7 +116,7 @@ struct ReadRepairPause {
 static READ_REPAIR_PAUSES: std::sync::Mutex<Vec<ReadRepairPause>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-struct ReadRepairPauseScope {
+pub(crate) struct ReadRepairPauseScope {
     bucket: String,
     object: String,
     phase: ReadRepairPausePhase,
@@ -125,6 +126,13 @@ struct ReadRepairPauseScope {
 impl ReadRepairPauseScope {
     fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
         Self::install_at(bucket, object, ReadRepairPausePhase::Commit)
+    }
+
+    pub(crate) fn install_incarnation_commit(
+        bucket: &str,
+        object: &str,
+    ) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        Self::install_at(bucket, object, ReadRepairPausePhase::IncarnationCommit)
     }
 
     fn install_at(
@@ -1861,6 +1869,10 @@ impl SetDisks {
                         // MinIO stops on the first RenameData error. RustFS intentionally
                         // continues per target, but reports any residue after all attempts
                         // so successful repairs survive and failed targets remain retryable.
+                        #[cfg(test)]
+                        if bucket_heal_scope.is_some() {
+                            pause_read_repair(bucket, object, ReadRepairPausePhase::IncarnationCommit).await;
+                        }
                         let mut rename_attempts = 0usize;
                         let mut rename_successes = 0usize;
                         let mut healed_disks = vec![None; out_dated_disks.len()];
