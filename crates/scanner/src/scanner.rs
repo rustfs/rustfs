@@ -3181,7 +3181,8 @@ where
         ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
-        let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
+        let superseded_retry_interval =
+            scanner_superseded_retry_interval(superseded_backoff, &runtime_config, maintenance_features);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
         let mut convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
         if let Some(retry_interval) = convergence_retry_interval {
