@@ -528,6 +528,14 @@ pub struct GetObjectReader {
 }
 
 impl GetObjectReader {
+    pub(crate) fn condition_stopped(object_info: ObjectInfo) -> Self {
+        Self {
+            stream: Box::new(ConditionStoppedBody),
+            object_info,
+            buffered_body: None,
+            body_source: GetObjectBodySource::Unprobed,
+        }
+    }
     /// Builds a fully materialized reader from a cache-coordinated body.
     pub fn from_cache_body(mut object_info: ObjectInfo, body: Bytes) -> Result<Self> {
         object_info.size = i64::try_from(body.len()).map_err(|_| Error::other("cached GET body length exceeds i64::MAX"))?;
@@ -549,6 +557,17 @@ impl GetObjectReader {
     /// missed). The app layer must not repeat the lookup in either case.
     pub fn cache_hook_probed(&self) -> bool {
         !matches!(self.body_source, GetObjectBodySource::Unprobed)
+    }
+}
+
+struct ConditionStoppedBody;
+
+impl AsyncRead for ConditionStoppedBody {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Ready(Err(std::io::Error::other("object read condition must be handled before body access")))
     }
 }
 

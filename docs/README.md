@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [External certificate issuance and TLS rotation](operations/tls-certificate-rotation.md) — publication, native reload, trust separation and failure handling.
+
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
 
@@ -44,6 +46,9 @@ For concurrent bucket creation and deletion, see
 
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
+
+For interrupted object deletions and returning drives, see
+[Delete transaction recovery](operations/delete-transaction-recovery.md).
 
 For disk replacement across VM restarts and schema 5/6 maintenance migration,
 see [Replacement generation recovery](operations/replacement-generation-recovery.md).
