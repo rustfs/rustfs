@@ -353,7 +353,7 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "8.6.0"
+zip = "9.0.2"
 zstd = "0.14.0"
 
 # Observability and Metrics
