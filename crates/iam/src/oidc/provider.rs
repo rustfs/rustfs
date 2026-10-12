@@ -13,7 +13,7 @@
 // limitations under the License.
 use super::{
     config::{OidcProviderConfig, OidcProviderValidationResult, SourcedOidcProviderConfig},
-    transport::{OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs},
+    transport::{DiscoveryRequest, OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs, oidc_http_error_diagnostics},
 };
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use openidconnect::core::{CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 pub(super) const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -40,6 +40,7 @@ pub(super) const OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY: &str = "OIDC provide
 pub(super) struct DiscoveryFailure {
     message: String,
     pub(super) retryable: bool,
+    pub(super) diagnostics: (&'static str, String),
 }
 
 impl From<String> for DiscoveryFailure {
@@ -47,6 +48,7 @@ impl From<String> for DiscoveryFailure {
         Self {
             message,
             retryable: false,
+            diagnostics: ("validation", String::new()),
         }
     }
 }
@@ -65,11 +67,20 @@ fn discovery_failure(error: DiscoveryError<OidcHttpError>, context: &str, blocke
         DiscoveryError::Response(status, _, _) => retryable_discovery_status(*status),
         _ => false,
     };
+    let diagnostics = match &error {
+        DiscoveryError::Request(error) => oidc_http_error_diagnostics(error),
+        DiscoveryError::Response(status, _, _) => ("http_status", status.as_u16().to_string()),
+        _ => ("validation", String::new()),
+    };
     let message = match error {
         DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason)) => format!("{blocked_context}: {reason}"),
         error => format!("{context}: {error}"),
     };
-    DiscoveryFailure { message, retryable }
+    DiscoveryFailure {
+        message,
+        retryable,
+        diagnostics,
+    }
 }
 
 // ---- Internal provider state ----
@@ -218,6 +229,7 @@ impl<'c> AsyncHttpClient<'c> for JwksAcceptClient<'_> {
                 http::HeaderValue::from_static("application/json, application/jwk-set+json"),
             );
         }
+        request.extensions_mut().insert(DiscoveryRequest);
         self.inner.call(request)
     }
 }
@@ -368,6 +380,7 @@ pub(super) async fn discover_provider_for_recovery(
     let candidates = issuer_candidates(&base_issuer);
     let mut last_errors = Vec::new();
     let mut retryable = false;
+    let mut diagnostics = ("validation", String::new());
 
     for candidate_issuer in candidates.iter() {
         let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
@@ -404,7 +417,7 @@ pub(super) async fn discover_provider_for_recovery(
                     let is_transient_transport = error.message.contains("Request failed");
                     let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
                     if should_retry {
-                        warn!(
+                        debug!(
                             event = EVENT_OIDC_DIAGNOSTICS,
                             component = LOG_COMPONENT_IAM,
                             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -421,9 +434,12 @@ pub(super) async fn discover_provider_for_recovery(
                         continue;
                     }
 
+                    if error.retryable || !retryable {
+                        diagnostics = error.diagnostics.clone();
+                    }
                     retryable |= error.retryable;
                     last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
-                    warn!(
+                    debug!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
                         subsystem = LOG_SUBSYSTEM_OIDC,
@@ -445,6 +461,7 @@ pub(super) async fn discover_provider_for_recovery(
     Err(DiscoveryFailure {
         message: format!("discovery failed for all issuer variants {:?}: {}", candidates, last_errors.join("; ")),
         retryable,
+        diagnostics,
     })
 }
 
@@ -493,6 +510,7 @@ async fn discover_provider_from_config_url(
             .map_err(|err| err.to_string())?
     };
     let request = http::Request::builder()
+        .extension(DiscoveryRequest)
         .uri(discovery_url.to_string())
         .method(http::Method::GET)
         .header(http::header::ACCEPT, "application/json")
@@ -507,6 +525,7 @@ async fn discover_provider_from_config_url(
         Err(err) => {
             return Err(DiscoveryFailure {
                 retryable: retryable_discovery_transport(&err),
+                diagnostics: oidc_http_error_diagnostics(&err),
                 message: format!("discovery request failed: Request failed: {err}"),
             });
         }
@@ -514,6 +533,7 @@ async fn discover_provider_from_config_url(
     if response.status() != http::StatusCode::OK {
         return Err(DiscoveryFailure {
             retryable: retryable_discovery_status(response.status()),
+            diagnostics: ("http_status", response.status().as_u16().to_string()),
             message: format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url),
         });
     }

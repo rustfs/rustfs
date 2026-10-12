@@ -435,3 +435,55 @@ async fn recovery_stops_on_issuer_validation_failure() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn recovery_logs_failure_reasons_without_repeating_warnings() {
+    use std::io::{Read, Seek};
+
+    for (explicit, status, expected_kind) in [
+        (false, 503, "http_status"),
+        (true, 503, "http_status"),
+        (true, 0, "request"),
+        (true, 1, "timeout"),
+    ] {
+        let idp = RecoveryIdp::start("logging", false, explicit).await;
+        let sys = initialize(&[&idp]).await;
+        let requests = idp.requests.load(Ordering::SeqCst);
+        idp.discovery_status.store(status, Ordering::SeqCst);
+        let mut output = tempfile::tempfile().expect("create captured log file");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(output.try_clone().expect("clone captured log file"))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        tokio::time::timeout(Duration::from_secs(25), async {
+            tokio::join!(sys.recover_failed_providers(), async {
+                // Two failing rounds exercise suppression; a timeout is already bounded by the HTTP client.
+                while if status == 1 {
+                    idp.cancelled_requests.load(Ordering::SeqCst) == 0
+                } else {
+                    idp.requests.load(Ordering::SeqCst) < requests + if explicit { 2 } else { 4 }
+                } {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                idp.discovery_status.store(200, Ordering::SeqCst);
+            });
+        })
+        .await
+        .expect("recover after recording failure diagnostics");
+        output.rewind().expect("rewind captured log file");
+        let mut logs = String::new();
+        output.read_to_string(&mut logs).expect("read captured log file");
+        assert_eq!(logs.lines().count(), 1, "explicit={explicit}, status={status}: {logs}");
+        assert!(logs.contains("provider_discovery_recovery_pending"), "{logs}");
+        assert!(logs.contains(&format!("error_kind=\"{expected_kind}\"")), "{logs}");
+        if status == 503 {
+            assert!(logs.contains("error_detail=503"), "{logs}");
+        }
+        assert!(logs.contains("provider_id=logging"), "{logs}");
+        assert!(logs.contains("suppressed=0"), "{logs}");
+    }
+}

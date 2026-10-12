@@ -37,6 +37,7 @@ use openidconnect::{
     PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_utils::logging::LogThrottle;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -154,6 +155,7 @@ impl OidcSys {
             let permits = &permits;
             async move {
                 let mut delay_ms = 1_000_u64;
+                let failure_log = LogThrottle::new(60_000);
                 loop {
                     let sleep_ms = rand::random_range(delay_ms * 3 / 4..=delay_ms);
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
@@ -166,7 +168,7 @@ impl OidcSys {
                     )
                     .await;
                     drop(permit);
-                    match result {
+                    let (error_kind, error_detail) = match result {
                         Ok(Ok(_)) => {
                             info!(
                                 event = EVENT_OIDC_DIAGNOSTICS,
@@ -190,16 +192,21 @@ impl OidcSys {
                             );
                             return;
                         }
-                        _ => {
-                            debug!(
-                                event = EVENT_OIDC_DIAGNOSTICS,
-                                component = LOG_COMPONENT_IAM,
-                                subsystem = LOG_SUBSYSTEM_OIDC,
-                                result = "provider_discovery_recovery_pending",
-                                provider_id = %config.id,
-                                "oidc provider discovery remains unavailable"
-                            );
-                        }
+                        Ok(Err(error)) => error.diagnostics,
+                        Err(_) => ("attempt_timeout", OIDC_DISCOVERY_RECOVERY_TIMEOUT.as_secs().to_string()),
+                    };
+                    if let Some(suppressed) = failure_log.claim() {
+                        warn!(
+                            event = EVENT_OIDC_DIAGNOSTICS,
+                            component = LOG_COMPONENT_IAM,
+                            subsystem = LOG_SUBSYSTEM_OIDC,
+                            result = "provider_discovery_recovery_pending",
+                            provider_id = %config.id,
+                            error_kind,
+                            error_detail = %error_detail,
+                            suppressed,
+                            "oidc provider discovery remains unavailable"
+                        );
                     }
                     delay_ms = delay_ms.saturating_mul(2).min(OIDC_DISCOVERY_RECOVERY_MAX_DELAY_MS);
                 }
