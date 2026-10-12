@@ -460,6 +460,21 @@ impl HealTask {
             set: self.options.set_index,
         };
 
+        let recovery_opts = HealOpts {
+            remove: self.source == HealRequestSource::Admin && self.options.remove_corrupted,
+            ..bucket_heal_opts
+        };
+        // Include metadata-less transactions for both startup and admin heals.
+        for bucket in &buckets {
+            self.check_control_flags().await?;
+            if let Some(result) = self
+                .await_with_control(self.storage.recover_delete_transactions(bucket, None, None, &recovery_opts))
+                .await?
+            {
+                self.record_result_item(result).await;
+            }
+        }
+
         for bucket in buckets.iter().filter(|_| self.source != HealRequestSource::Admin) {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;

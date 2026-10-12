@@ -1259,6 +1259,37 @@ pub fn canonical_prepare_part_transaction_request_body(
     Ok(body.finish())
 }
 
+/// Recovery messages are bounded and must contain exactly one MessagePack value.
+pub const DELETE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+pub const DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+pub fn decode_delete_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid delete recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid delete recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "trailing delete recovery payload"));
+    }
+    Ok(value)
+}
+
+pub fn canonical_recover_delete_transaction_request_body(
+    request: &proto_gen::node_service::RecoverDeleteTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-delete-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_settle_part_transaction_request_body(
     request: &proto_gen::node_service::SettlePartTransactionRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1312,6 +1343,40 @@ mod disk_mutation_canonical_tests {
         SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
+
+    #[test]
+    fn delete_recovery_canonical_body_binds_all_wire_fields() {
+        let request = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: "disk".into(),
+            volume: "volume".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_recover_delete_transaction_request_body(&request).expect("canonical body")];
+        for mutate in [
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.disk = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.volume = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.protocol_version = 2,
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_recover_delete_transaction_request_body(&changed).expect("changed canonical body"));
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_recovery_payload_rejects_trailing_malformed_and_oversized_values() {
+        let payload = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encode test payload");
+        assert_eq!(decode_delete_recovery_payload::<Vec<u32>>(&payload).expect("one payload"), vec![1, 2]);
+        let mut trailing = payload;
+        trailing.push(0xc0);
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&vec![0xc0; DELETE_RECOVERY_MAX_PAYLOAD_BYTES + 1]).is_err());
+    }
 
     fn assert_all_distinct(bodies: &[Vec<u8>]) {
         for (i, a) in bodies.iter().enumerate() {
@@ -2905,7 +2970,7 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
                 debug!("Using cached control gRPC channel for: {}", addr);
                 return Ok(channel);
             }
-            return build_channel_until(addr, addr, deadline).await;
+            return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
         }
 
         let pool_size = bulk_channel_pool_size();
@@ -2915,7 +2980,7 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
             debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
             return Ok(channel);
         }
-        build_channel_until(addr, &cache_key, deadline).await
+        build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
     })
     .await
     .map_err(channel_acquisition_timeout)?
@@ -2943,13 +3008,45 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// channels to the same peer be cached independently.
 async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
-    build_channel_until(dial_addr, cache_key, deadline).await
+    build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
+}
+
+/// A separate channel deadline for slow authenticated recovery work. The cache
+/// key keeps this deadline from changing foreground lock, read, and write RPCs.
+#[derive(Debug)]
+pub enum DeleteRecoveryChannelError {
+    Connection(Box<dyn Error>),
+}
+
+impl std::fmt::Display for DeleteRecoveryChannelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(error) => write!(formatter, "delete recovery channel connection failed: {error}"),
+        }
+    }
+}
+
+impl Error for DeleteRecoveryChannelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Connection(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
+    let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(addr, &cache_key, deadline, rpc_timeout)
+        .await
+        .map_err(DeleteRecoveryChannelError::Connection)
 }
 
 async fn build_channel_until(
     dial_addr: &str,
     cache_key: &str,
     deadline: tokio::time::Instant,
+    rpc_timeout: Duration,
 ) -> Result<Channel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
@@ -2962,7 +3059,7 @@ async fn build_channel_until(
             if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
                 return Ok(channel);
             }
-            let (channel, generation) = dial_channel(dial_addr, cache_key).await?;
+            let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
             if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
                 && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
             {
@@ -2980,15 +3077,13 @@ async fn build_channel_until(
     .map_err(channel_acquisition_timeout)?
 }
 
-async fn dial_channel(dial_addr: &str, cache_key: &str) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
+async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
     let http2_keepalive_interval = internode_http2_keep_alive_interval();
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
-    let rpc_timeout = internode_rpc_timeout();
-
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
@@ -3292,6 +3387,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls02_delete_recovery_channels_reject_unbound_and_stale_https_cache() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve recovery peer address");
+        let addr = format!("https://{}", listener.local_addr().expect("recovery peer address"));
+        drop(listener);
+        let rpc_timeout = Duration::from_secs(20);
+        let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+        let generation = runtime_sources::outbound_tls_generation();
+        for cached_generation in [None, Some(generation.checked_add(1).unwrap_or(0))] {
+            cache_connection(cache_key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            if let Some(generation) = cached_generation {
+                TLS_GENERATION_CACHE.lock().await.insert(cache_key.clone(), generation);
+            } else {
+                TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+            }
+            assert!(
+                create_channel_with_timeout(&addr, rpc_timeout).await.is_err(),
+                "recovery must dial the unavailable HTTPS peer instead of returning an unbound or stale cached channel"
+            );
+            assert!(!rustfs_common::has_cached_connection(&cache_key).await);
+            assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(&cache_key));
+        }
+    }
+
+    #[tokio::test]
     async fn tls02_current_https_control_and_bulk_cache_entries_are_reused() {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "https://tls02-current-generation.invalid:9000";
@@ -3444,7 +3564,7 @@ mod tests {
         for _ in 0..8 {
             tasks.push(tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-                let result = build_channel_until(addr, addr, deadline).await;
+                let result = build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
                 result.err().is_some_and(|error| {
                     error
                         .downcast_ref::<std::io::Error>()
