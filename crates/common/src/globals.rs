@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
@@ -26,6 +27,42 @@ pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLoc
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+
+#[derive(Clone, Default)]
+pub struct OutboundTlsSnapshot {
+    pub generation: u64,
+    pub root_ca_pem: Option<Vec<u8>>,
+    pub mtls_identity: Option<MtlsIdentityPem>,
+}
+
+static GLOBAL_OUTBOUND_TLS_STATE: LazyLock<ArcSwap<OutboundTlsSnapshot>> =
+    LazyLock::new(|| ArcSwap::from_pointee(OutboundTlsSnapshot::default()));
+
+pub fn get_global_outbound_tls_snapshot() -> Arc<OutboundTlsSnapshot> {
+    GLOBAL_OUTBOUND_TLS_STATE.load_full()
+}
+
+/// Publish identity, trust and generation together; the individual globals are legacy views.
+pub async fn publish_global_outbound_tls_snapshot(snapshot: OutboundTlsSnapshot) -> u64 {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        if current.generation != 0
+            && current.root_ca_pem == snapshot.root_ca_pem
+            && current.mtls_identity == snapshot.mtls_identity
+        {
+            return Arc::clone(current);
+        }
+        Arc::new(OutboundTlsSnapshot {
+            generation: snapshot.generation.max(current.generation.saturating_add(1)),
+            root_ca_pem: snapshot.root_ca_pem.clone(),
+            mtls_identity: snapshot.mtls_identity.clone(),
+        })
+    });
+    let accepted = get_global_outbound_tls_snapshot();
+    *GLOBAL_ROOT_CERT.write().await = accepted.root_ca_pem.clone();
+    *GLOBAL_MTLS_IDENTITY.write().await = accepted.mtls_identity.clone();
+    GLOBAL_OUTBOUND_TLS_GENERATION.store(accepted.generation, Ordering::Relaxed);
+    accepted.generation
+}
 
 /// Log level to use when reporting cached gRPC connection eviction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,17 +122,27 @@ pub async fn get_global_addr() -> String {
 /// # Arguments
 /// * `cert` - A vector of bytes representing the PEM-encoded root CA certificate.
 pub async fn set_global_root_cert(cert: Vec<u8>) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.root_ca_pem = Some(cert.clone());
+        Arc::new(next)
+    });
     *GLOBAL_ROOT_CERT.write().await = Some(cert);
 }
 
 /// Clear the global root CA certificate for outbound gRPC clients.
 pub async fn clear_global_root_cert() {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.root_ca_pem = None;
+        Arc::new(next)
+    });
     *GLOBAL_ROOT_CERT.write().await = None;
 }
 
 /// Get the global root CA certificate for outbound gRPC clients.
 pub async fn get_global_root_cert() -> Option<Vec<u8>> {
-    GLOBAL_ROOT_CERT.read().await.clone()
+    get_global_outbound_tls_snapshot().root_ca_pem.clone()
 }
 
 /// Set the global mTLS identity (cert+key PEM) for outbound gRPC clients.
@@ -105,22 +152,32 @@ pub async fn get_global_root_cert() -> Option<Vec<u8>> {
 /// # Arguments
 /// * `identity` - An optional MtlsIdentityPem struct containing the cert and key PEM.
 pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.mtls_identity = identity.clone();
+        Arc::new(next)
+    });
     *GLOBAL_MTLS_IDENTITY.write().await = identity;
 }
 
 /// Get the global mTLS identity for outbound gRPC clients.
 pub async fn get_global_mtls_identity() -> Option<MtlsIdentityPem> {
-    GLOBAL_MTLS_IDENTITY.read().await.clone()
+    get_global_outbound_tls_snapshot().mtls_identity.clone()
 }
 
 /// Set the global outbound TLS generation.
 pub fn set_global_outbound_tls_generation(generation: u64) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.generation = generation;
+        Arc::new(next)
+    });
     GLOBAL_OUTBOUND_TLS_GENERATION.store(generation, Ordering::Relaxed);
 }
 
 /// Get the global outbound TLS generation.
 pub fn get_global_outbound_tls_generation() -> u64 {
-    GLOBAL_OUTBOUND_TLS_GENERATION.load(Ordering::Relaxed)
+    get_global_outbound_tls_snapshot().generation
 }
 
 /// Evict a stale/dead connection from the global connection cache.
@@ -194,8 +251,77 @@ pub async fn clear_all_connections() {
 ///
 /// When present, gRPC clients will present this identity to servers requesting/requiring mTLS.
 /// When absent, clients proceed with standard server-authenticated TLS.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MtlsIdentityPem {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for MtlsIdentityPem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtlsIdentityPem")
+            .field("cert_bytes", &self.cert_pem.len())
+            .field("key_pem", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tls_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outbound_snapshot_publication_is_coherent_and_skips_unchanged_material() {
+        let start = get_global_outbound_tls_generation().saturating_add(1);
+        let snapshot = OutboundTlsSnapshot {
+            generation: start,
+            root_ca_pem: Some(vec![1]),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: vec![1],
+                key_pem: vec![1],
+            }),
+        };
+        let first = publish_global_outbound_tls_snapshot(snapshot.clone()).await;
+        assert_eq!(
+            publish_global_outbound_tls_snapshot(OutboundTlsSnapshot {
+                generation: first.saturating_add(1),
+                ..snapshot
+            })
+            .await,
+            first
+        );
+        let writer = tokio::spawn(async move {
+            for tag in 2_u8..=255 {
+                publish_global_outbound_tls_snapshot(OutboundTlsSnapshot {
+                    generation: start.saturating_add(u64::from(tag)),
+                    root_ca_pem: Some(vec![tag]),
+                    mtls_identity: Some(MtlsIdentityPem {
+                        cert_pem: vec![tag],
+                        key_pem: vec![tag],
+                    }),
+                })
+                .await;
+                tokio::task::yield_now().await;
+            }
+        });
+        while !writer.is_finished() {
+            let state = get_global_outbound_tls_snapshot();
+            let identity = state.mtls_identity.as_ref().expect("identity in complete snapshot");
+            assert_eq!(state.root_ca_pem.as_ref().expect("roots in complete snapshot"), &identity.cert_pem);
+            assert_eq!(identity.cert_pem, identity.key_pem);
+            tokio::task::yield_now().await;
+        }
+        writer.await.expect("writer completes");
+    }
+
+    #[test]
+    fn mtls_identity_debug_redacts_private_key() {
+        let identity = MtlsIdentityPem {
+            cert_pem: b"public certificate".to_vec(),
+            key_pem: b"PRIVATE-KEY-MARKER".to_vec(),
+        };
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("PRIVATE-KEY-MARKER"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

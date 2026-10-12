@@ -9686,6 +9686,7 @@ dependencies = [
 name = "rustfs-common"
 version = "1.0.1"
 dependencies = [
+ "arc-swap",
  "hotpath",
  "metrics",
  "smallvec",
@@ -10957,6 +10958,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
