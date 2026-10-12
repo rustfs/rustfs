@@ -1157,10 +1157,17 @@ impl ScannerMaintenanceFeatures {
         self.lifecycle || self.replication || self.inspection_failed
     }
 
-    fn requires_full_scan(self, observed_generation: Option<u64>, current_generation: u64, wake: ScannerCycleWakeReason) -> bool {
+    fn requires_full_scan(
+        self,
+        observed_generation: Option<u64>,
+        current_generation: u64,
+        wake: ScannerCycleWakeReason,
+        superseded_retry: bool,
+    ) -> bool {
         self.needs_regular_cycle()
             || observed_generation != Some(current_generation)
-            || !matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+            || !(matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+                || (wake == ScannerCycleWakeReason::Timer && superseded_retry))
     }
 }
 
@@ -1189,16 +1196,6 @@ impl ScannerUsageBootstrapRebuild {
 
     fn clean_idle_backoff_enabled(self, enabled: bool) -> bool {
         enabled && !self.pending
-    }
-
-    fn requires_full_scan(
-        self,
-        maintenance_features: ScannerMaintenanceFeatures,
-        observed_generation: Option<u64>,
-        current_generation: u64,
-        wake: ScannerCycleWakeReason,
-    ) -> bool {
-        self.pending || maintenance_features.requires_full_scan(observed_generation, current_generation, wake)
     }
 
     fn record_cycle(&mut self, outcome: ScannerCycleOutcome) -> bool {
@@ -3362,11 +3359,13 @@ where
                 leader_epoch,
                 cycle_budget.clone(),
                 ScannerCycleScheduling {
-                    requires_full_scan: usage_bootstrap_rebuild.requires_full_scan(
-                        maintenance_features,
+                    // Cache reuse is admitted by the persisted coverage proof in ScannerIO.
+                    // Bootstrap remains pending until authoritative publication succeeds.
+                    requires_full_scan: maintenance_features.requires_full_scan(
                         maintenance_generation_seen,
                         scanner_maintenance_generation(),
                         wake_reason,
+                        superseded_retry_interval.is_some(),
                     ),
                     service_cohort: Some(service_cohort.clone()),
                 },
