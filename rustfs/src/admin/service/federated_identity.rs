@@ -30,6 +30,10 @@ use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_ADMIN_OIDC_POLICY: &str = "admin_oidc_policy";
+
 pub(crate) struct DefaultFederatedSessionBinding;
 
 // Legacy receivers reject an empty parsed mapping; current receivers ignore it when the virtual-parent marker is present.
@@ -339,6 +343,9 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         for policy_name in &selected_policy_names {
             let exists = iam_store.policy_exists(policy_name).await.map_err(|err| {
                 warn!(
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
                     provider_id = %authorization.provider_id,
                     parent_user = %parent_user,
                     policy = %policy_name,
@@ -367,6 +374,9 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         .map_err(|rejection| match rejection {
             OidcPolicyRejection::Unsupported(policy_names) => {
                 warn!(
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
                     provider_id = %authorization.provider_id,
                     parent_user = %parent_user,
                     unsupported_policies = ?policy_names,
@@ -376,6 +386,9 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             }
             OidcPolicyRejection::Unresolved(policy_names) => {
                 debug!(
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
                     provider_id = %authorization.provider_id,
                     parent_user = %parent_user,
                     unresolved_policies = ?policy_names,
@@ -389,6 +402,9 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         })?;
         if !selection.ignored.is_empty() {
             debug!(
+                event = EVENT_ADMIN_OIDC_POLICY,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
                 provider_id = %authorization.provider_id,
                 parent_user = %parent_user,
                 ignored_group_policies = ?selection.ignored,
