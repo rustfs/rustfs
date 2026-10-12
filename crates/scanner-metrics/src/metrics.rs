@@ -889,8 +889,12 @@ pub struct Metrics {
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
     current_scan_mode: AtomicU8,
     current_scan_cycle_work_active: AtomicBool,
+    remote_scan_objects: AtomicU64,
+    remote_scan_directories: AtomicU64,
     current_scan_cycle_objects_start: AtomicU64,
     current_scan_cycle_directories_start: AtomicU64,
+    current_scan_cycle_remote_objects_start: AtomicU64,
+    current_scan_cycle_remote_directories_start: AtomicU64,
     current_scan_cycle_bucket_drive_scans_start: AtomicU64,
     current_scan_cycle_bucket_drive_failures_start: AtomicU64,
     current_scan_cycle_yield_events_start: AtomicU64,
@@ -1110,6 +1114,8 @@ pub struct CurrentCycle {
 pub struct ScanCycleWorkSnapshot {
     objects_scanned: u64,
     directories_scanned: u64,
+    remote_objects_scanned: u64,
+    remote_directories_scanned: u64,
     bucket_drive_scans: u64,
     bucket_drive_failures: u64,
     yield_events: u64,
@@ -1963,8 +1969,12 @@ impl Metrics {
             cycle_info: Arc::new(RwLock::new(None)),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
+            remote_scan_objects: AtomicU64::new(0),
+            remote_scan_directories: AtomicU64::new(0),
             current_scan_cycle_objects_start: AtomicU64::new(0),
             current_scan_cycle_directories_start: AtomicU64::new(0),
+            current_scan_cycle_remote_objects_start: AtomicU64::new(0),
+            current_scan_cycle_remote_directories_start: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_scans_start: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_failures_start: AtomicU64::new(0),
             current_scan_cycle_yield_events_start: AtomicU64::new(0),
@@ -2917,6 +2927,10 @@ impl Metrics {
             .store(snapshot.objects_scanned, Ordering::Relaxed);
         self.current_scan_cycle_directories_start
             .store(snapshot.directories_scanned, Ordering::Relaxed);
+        self.current_scan_cycle_remote_objects_start
+            .store(snapshot.remote_objects_scanned, Ordering::Relaxed);
+        self.current_scan_cycle_remote_directories_start
+            .store(snapshot.remote_directories_scanned, Ordering::Relaxed);
         self.current_scan_cycle_bucket_drive_scans_start
             .store(snapshot.bucket_drive_scans, Ordering::Relaxed);
         self.current_scan_cycle_bucket_drive_failures_start
@@ -2983,10 +2997,23 @@ impl Metrics {
             .any(|work| work.queued > 0 || work.skipped > 0 || work.failed > 0 || work.missed > 0)
     }
 
+    /// Record authenticated remote walk deltas without changing process-local operation counters.
+    pub fn record_remote_scan_progress(&self, objects: u64, directories: u64) {
+        // Peer-supplied cumulative counts must not wrap cycle telemetry.
+        for (counter, delta) in [
+            (&self.remote_scan_objects, objects),
+            (&self.remote_scan_directories, directories),
+        ] {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(delta)));
+        }
+    }
+
     fn scan_cycle_work_snapshot(&self) -> ScanCycleWorkSnapshot {
         ScanCycleWorkSnapshot {
             objects_scanned: self.lifetime(Metric::ScanObject),
             directories_scanned: self.lifetime(Metric::ScanFolder),
+            remote_objects_scanned: self.remote_scan_objects.load(Ordering::Relaxed),
+            remote_directories_scanned: self.remote_scan_directories.load(Ordering::Relaxed),
             bucket_drive_scans: self.lifetime(Metric::ScanBucketDrive),
             bucket_drive_failures: self.lifetime(Metric::ScanBucketDriveFailure),
             yield_events: self.lifetime(Metric::Yield),
@@ -3006,6 +3033,8 @@ impl Metrics {
         ScanCycleWorkSnapshot {
             objects_scanned: self.current_scan_cycle_objects_start.load(Ordering::Relaxed),
             directories_scanned: self.current_scan_cycle_directories_start.load(Ordering::Relaxed),
+            remote_objects_scanned: self.current_scan_cycle_remote_objects_start.load(Ordering::Relaxed),
+            remote_directories_scanned: self.current_scan_cycle_remote_directories_start.load(Ordering::Relaxed),
             bucket_drive_scans: self.current_scan_cycle_bucket_drive_scans_start.load(Ordering::Relaxed),
             bucket_drive_failures: self.current_scan_cycle_bucket_drive_failures_start.load(Ordering::Relaxed),
             yield_events: self.current_scan_cycle_yield_events_start.load(Ordering::Relaxed),
@@ -3028,8 +3057,22 @@ impl Metrics {
     fn scan_cycle_work_since(&self, start: ScanCycleWorkSnapshot) -> ScanCycleWorkSnapshot {
         let current = self.scan_cycle_work_snapshot();
         ScanCycleWorkSnapshot {
-            objects_scanned: current.objects_scanned.saturating_sub(start.objects_scanned),
-            directories_scanned: current.directories_scanned.saturating_sub(start.directories_scanned),
+            // Subtract each source before summing so large remote lifetime counts
+            // cannot hide local progress in a later cycle.
+            objects_scanned: current
+                .objects_scanned
+                .saturating_sub(start.objects_scanned)
+                .saturating_add(current.remote_objects_scanned.saturating_sub(start.remote_objects_scanned)),
+            directories_scanned: current
+                .directories_scanned
+                .saturating_sub(start.directories_scanned)
+                .saturating_add(
+                    current
+                        .remote_directories_scanned
+                        .saturating_sub(start.remote_directories_scanned),
+                ),
+            remote_objects_scanned: 0,
+            remote_directories_scanned: 0,
             bucket_drive_scans: current.bucket_drive_scans.saturating_sub(start.bucket_drive_scans),
             bucket_drive_failures: current.bucket_drive_failures.saturating_sub(start.bucket_drive_failures),
             yield_events: current.yield_events.saturating_sub(start.yield_events),
@@ -3650,14 +3693,18 @@ pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// Register a new disk in the global path tracker and return two callbacks:
 /// one to update the current path and one to deregister the disk when done.
 pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+    register_current_path(&global_metrics().current_paths, disk, initial).await
+}
+
+async fn register_current_path(
+    current_paths: &Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
+    disk: &str,
+    initial: &str,
+) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
 
-    global_metrics()
-        .current_paths
-        .write()
-        .await
-        .insert(disk_name.clone(), Arc::clone(&tracker));
+    current_paths.write().await.insert(disk_name.clone(), Arc::clone(&tracker));
 
     let update_fn: UpdateCurrentPathFn = {
         let tracker = Arc::clone(&tracker);
@@ -3670,10 +3717,17 @@ pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPa
 
     let done_fn: CloseDiskFn = {
         let disk = disk_name;
+        let current_paths = Arc::clone(current_paths);
+        let tracker = Arc::clone(&tracker);
         Arc::new(move || {
             let disk = disk.clone();
+            let current_paths = Arc::clone(&current_paths);
+            let tracker = Arc::clone(&tracker);
             Box::pin(async move {
-                global_metrics().current_paths.write().await.remove(&disk);
+                let mut paths = current_paths.write().await;
+                if paths.get(&disk).is_some_and(|current| Arc::ptr_eq(current, &tracker)) {
+                    paths.remove(&disk);
+                }
             })
         })
     };
@@ -3855,6 +3909,33 @@ mod tests {
 
         close_disk().await;
         assert!(!global_metrics().current_paths.read().await.contains_key(&disk));
+    }
+
+    #[tokio::test]
+    async fn stale_path_cleanup_preserves_a_replacement_scan() {
+        let metrics = Metrics::new();
+        let (_, close_first) = register_current_path(&metrics.current_paths, "remote-node/disk", "first-bucket").await;
+        let (_, close_second) = register_current_path(&metrics.current_paths, "remote-node/disk", "second-bucket").await;
+        close_first().await;
+        assert_eq!(metrics.get_current_paths().await, vec!["remote-node/disk/second-bucket"]);
+        close_second().await;
+        assert!(metrics.get_current_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_path_guard_cleans_up_its_remote_scan() {
+        let metrics = Metrics::new();
+        let (_, close_path) = register_current_path(&metrics.current_paths, "remote-node/disk", "bucket").await;
+        let guard = CloseDiskGuard::new(close_path);
+        assert_eq!(metrics.report().await.active_paths, vec!["remote-node/disk/bucket"]);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !metrics.get_current_paths().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled remote path guard must remove its registration");
     }
 
     #[tokio::test]
@@ -5059,6 +5140,71 @@ mod tests {
 
         assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
         assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 0);
+    }
+
+    #[test]
+    fn remote_scan_progress_saturates_instead_of_wrapping() {
+        let metrics = Metrics::new();
+        metrics.record_remote_scan_progress(u64::MAX - 1, u64::MAX - 2);
+        metrics.record_remote_scan_progress(3, 4);
+        let work = metrics.scan_cycle_work_snapshot();
+        assert_eq!(work.remote_objects_scanned, u64::MAX);
+        assert_eq!(work.remote_directories_scanned, u64::MAX);
+        assert_eq!(metrics.lifetime(Metric::ScanObject), 0);
+        assert_eq!(metrics.lifetime(Metric::ScanFolder), 0);
+    }
+
+    #[tokio::test]
+    async fn saturated_remote_lifetime_counts_do_not_hide_next_cycle_local_work() {
+        let metrics = Metrics::new();
+        let previous = metrics.start_scan_cycle_work();
+        metrics.record_remote_scan_progress(u64::MAX, u64::MAX);
+        metrics.finish_scan_cycle_work(previous);
+        let next = metrics.start_scan_cycle_work();
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 3);
+        assert_eq!(active.current_cycle_directories_scanned, 2);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 3);
+        assert_eq!(finished.last_cycle_directories_scanned, 2);
+    }
+
+    #[tokio::test]
+    async fn cycle_work_combines_local_and_remote_progress_without_changing_local_operations() {
+        let metrics = Metrics::new();
+        metrics.operations[Metric::ScanObject as usize].store(10, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].store(5, Ordering::Relaxed);
+        metrics.record_remote_scan_progress(20, 8);
+        let start = metrics.start_scan_cycle_work();
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        metrics.record_remote_scan_progress(7, 4);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 10);
+        assert_eq!(active.current_cycle_directories_scanned, 6);
+        assert_eq!(metrics.lifetime(Metric::ScanObject), 13);
+        assert_eq!(metrics.lifetime(Metric::ScanFolder), 7);
+
+        metrics.finish_scan_cycle_work(start);
+        let finished = metrics.report().await;
+        assert_eq!(finished.current_cycle_objects_scanned, 0);
+        assert_eq!(finished.current_cycle_directories_scanned, 0);
+        assert_eq!(finished.last_cycle_objects_scanned, 10);
+        assert_eq!(finished.last_cycle_directories_scanned, 6);
+
+        metrics.record_remote_scan_progress(9, 3);
+        let next = metrics.start_scan_cycle_work();
+        let empty = metrics.report().await;
+        assert_eq!(empty.current_cycle_objects_scanned, 0);
+        assert_eq!(empty.current_cycle_directories_scanned, 0);
+        metrics.record_remote_scan_progress(2, 1);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 2);
+        assert_eq!(finished.last_cycle_directories_scanned, 1);
     }
 
     #[tokio::test]

@@ -470,6 +470,7 @@ async fn terminal_frame_without_eof_still_obeys_rpc_deadline() {
         },
         reader_auth,
         Instant::now() + Duration::from_millis(20),
+        &Metrics::new(),
     )
     .await
     .expect_err("terminal frame without EOF must not succeed");
@@ -917,18 +918,20 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
     let (mut writer, reader) = tokio::io::duplex(4096);
     tokio::spawn(async move {
         let mut sequence = 0;
-        write_frame(
-            &mut writer,
-            &writer_auth,
-            &mut sequence,
-            &RemoteScannerFrame::progress(RemoteScannerProgress {
-                objects_scanned: 2,
-                directories_started: 1,
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("progress should write");
+        for _ in 0..2 {
+            write_frame(
+                &mut writer,
+                &writer_auth,
+                &mut sequence,
+                &RemoteScannerFrame::progress(RemoteScannerProgress {
+                    objects_scanned: 2,
+                    directories_started: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("progress should write");
+        }
         write_frame(
             &mut writer,
             &writer_auth,
@@ -961,10 +964,25 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
             ..Default::default()
         },
     );
-    let outcome =
-        consume_remote_scanner_stream(reader, parent, budget.clone(), "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
-            .await
-            .expect("stream should complete");
+    let metrics = Metrics::new();
+    let start = metrics.start_scan_cycle_work();
+    let outcome = consume_remote_scanner_stream_until(
+        reader,
+        parent,
+        budget.clone(),
+        RemoteScannerResponseExpectation {
+            bucket: "bucket",
+            source: TEST_SOURCE,
+            next_cycle: TEST_NEXT_CYCLE,
+            scan_plan_digest: TEST_PLAN_DIGEST,
+            tier_registry_generation: 0,
+        },
+        reader_auth,
+        Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME,
+        &metrics,
+    )
+    .await
+    .expect("stream should complete");
 
     let RemoteScannerOutcome::Complete {
         usage,
@@ -976,6 +994,15 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
     assert_eq!(usage.entry.objects, 3);
     assert!(pending_maintenance_work);
     assert_eq!(budget.progress(), (3, 2));
+    let active = metrics.report().await;
+    assert_eq!(active.current_cycle_objects_scanned, 3);
+    assert_eq!(active.current_cycle_directories_scanned, 2);
+    assert_eq!(metrics.lifetime(Metric::ScanObject), 0);
+    assert_eq!(metrics.lifetime(Metric::ScanFolder), 0);
+    metrics.finish_scan_cycle_work(start);
+    let finished = metrics.report().await;
+    assert_eq!(finished.last_cycle_objects_scanned, 3);
+    assert_eq!(finished.last_cycle_directories_scanned, 2);
 }
 
 #[tokio::test]
@@ -1271,6 +1298,37 @@ fn uncertain_stream_failure_cancels_count_budget() {
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
 }
 
+#[tokio::test]
+async fn remote_progress_rejects_regression_and_counts_new_attempts_once() {
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
+    let metrics = Metrics::new();
+    let _start = metrics.start_scan_cycle_work();
+    let mut last = RemoteScannerProgress::default();
+    let progress = RemoteScannerProgress {
+        objects_scanned: 4,
+        directories_started: 2,
+        entries_visited: 6,
+    };
+    assert!(apply_remote_progress(&budget, &mut last, progress, &metrics).expect("first progress must advance"));
+    assert!(!apply_remote_progress(&budget, &mut last, progress, &metrics).expect("duplicate progress must be accepted"));
+    let regression = RemoteScannerProgress {
+        objects_scanned: 3,
+        ..progress
+    };
+    assert!(apply_remote_progress(&budget, &mut last, regression, &metrics).is_err());
+    assert_eq!(last, progress);
+    assert_eq!(metrics.report().await.current_cycle_objects_scanned, 4);
+    assert_eq!(metrics.report().await.current_cycle_directories_scanned, 2);
+
+    let mut retry = RemoteScannerProgress::default();
+    apply_remote_progress(&budget, &mut retry, progress, &metrics).expect("new attempt counts repeated work");
+    assert_eq!(budget.progress(), (8, 4));
+    let report = metrics.report().await;
+    assert_eq!(report.current_cycle_objects_scanned, 8);
+    assert_eq!(report.current_cycle_directories_scanned, 4);
+}
+
 #[test]
 fn directory_entry_activity_counts_as_semantic_progress() {
     let parent = CancellationToken::new();
@@ -1284,6 +1342,7 @@ fn directory_entry_activity_counts_as_semantic_progress() {
             entries_visited: 32,
             ..Default::default()
         },
+        &Metrics::new(),
     )
     .expect("entry activity should be valid progress");
 
