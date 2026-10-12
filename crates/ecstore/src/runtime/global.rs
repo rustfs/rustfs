@@ -307,6 +307,13 @@ pub fn shutdown_background_services() {
     }
 }
 
+/// Wait up to `timeout` for object mutations that outlived their callers
+/// (see `InstanceContext::wait_for_detached_mutations`). Returns `false` when
+/// some are still running at the deadline.
+pub async fn wait_for_detached_mutations(timeout: std::time::Duration) -> bool {
+    current_ctx().wait_for_detached_mutations(timeout).await
+}
+
 /// Set the global lock client (first LocalClient created)
 ///
 /// # Arguments

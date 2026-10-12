@@ -337,6 +337,12 @@ impl ErasureSetHealer {
             return HealObjectOutcome::Failed;
         };
 
+        if let EcstoreError::Lock(lock_error) = se
+            && !lock_error.is_fatal()
+        {
+            return HealObjectOutcome::Transient;
+        }
+
         // Genuine object/version absence: nothing left to heal, treat as handled.
         if matches!(
             se,
@@ -2139,6 +2145,46 @@ mod tests {
         assert!(matches!(
             classify(EcstoreError::InsufficientReadQuorum(String::new(), String::new())),
             HealObjectOutcome::Transient
+        ));
+    }
+
+    #[test]
+    fn retryable_lock_failures_are_transient_but_fatal_lock_errors_are_not() {
+        use rustfs_lock::LockError;
+
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::timeout(
+                "bucket/object",
+                std::time::Duration::from_secs(5)
+            )))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::QuorumNotReached {
+                required: 3,
+                achieved: 1,
+            }))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::already_locked(
+                "bucket/object",
+                "node-2"
+            )))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::InsufficientNodes {
+                required: 3,
+                available: 1,
+            }))),
+            HealObjectOutcome::Transient
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Storage(EcstoreError::Lock(LockError::permission_denied(
+                "lock policy"
+            )))),
+            HealObjectOutcome::Failed
         ));
     }
 

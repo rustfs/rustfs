@@ -42,7 +42,12 @@ if args[:2] == ["nextest", "run"]:
     if os.environ.get("RUSTFS_E2E_STARTUP_CAS_BINARY"):
         assert pathlib.Path(receipt["binary"]) == pathlib.Path(os.environ["RUSTFS_E2E_STARTUP_CAS_BINARY"]).resolve()
     pathlib.Path("target/nextest-command.json").write_text(json.dumps(args))
-    raise SystemExit(int(os.environ.get("FAKE_TEST_EXIT", "0")))
+    status = int(os.environ.get("FAKE_TEST_EXIT", "0"))
+    if status == 0:
+        junit = pathlib.Path("target/nextest") / args[args.index("--profile") + 1] / "junit.xml"
+        junit.parent.mkdir(parents=True, exist_ok=True)
+        junit.write_text("<testsuites/>")
+    raise SystemExit(status)
 target = pathlib.Path(args[args.index("--target-dir") + 1])
 binary = target / ("release" if "--release" in args else "debug") / "rustfs"
 binary.parent.mkdir(parents=True, exist_ok=True)

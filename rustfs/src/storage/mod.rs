@@ -21,6 +21,7 @@ pub mod options;
 pub mod request_context;
 pub mod rpc;
 pub(crate) mod s3_api;
+pub(crate) mod s3_compat;
 pub(crate) mod sse;
 pub mod timeout_wrapper;
 pub mod tonic_service;

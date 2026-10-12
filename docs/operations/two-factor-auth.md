@@ -45,9 +45,15 @@ RustFS is an S3 server. SigV4 requires the server to know the secret key itself 
 | --- | --- |
 | At rest | `RUSTFS_IAM_MASTER_KEY` + `encrypt_stream_io` (Argon2id -> AES-GCM / ChaCha20-Poly1305) |
 | Length floor | `is_secret_key_valid` (`SECRET_KEY_MIN_LEN`) |
-| Maximum length | None, deliberately; capping password length is an anti-pattern. |
+| Maximum length | No credential-specific maximum; request and import resource limits still apply. |
 | Rotation | `POST /v3/account/password`, requiring the current secret |
 | Session cleanup | Every STS session minted from the identity is revoked on rotation |
+
+Custom IAM user and service-account secret keys require at least eight UTF-8 bytes. The complete value is used for signing; it is not truncated, pre-hashed, or Unicode-normalized. Automatically generated service-account secret keys remain 40 bytes long.
+
+Before using service-account secret keys longer than 40 bytes, upgrade the site-replication receivers that may need to create those accounts. A receiver that still enforces the old creation limit can reject a new account even when the source created it successfully. Loading an existing identity and updating an existing service account use different paths and do not imply that account creation is supported.
+
+Do not import IAM snapshots containing these long service-account secrets into a version that still enforces the 40-byte creation limit. Such versions can delete an existing same-name account before rejecting its replacement. Keep snapshots suitable for the target version when planning a rollback.
 
 ## At-rest protection is mandatory for TOTP secrets
 

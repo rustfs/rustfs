@@ -62,6 +62,25 @@ pub fn record_contention_event() {
     counter!("rustfs_lock_contentions").increment(1);
 }
 
+/// Record a failed object namespace lock acquisition with bounded labels.
+#[inline(always)]
+pub fn record_object_lock_acquire_failure(
+    op: &'static str,
+    mode: &'static str,
+    resource_class: &'static str,
+    reason: &'static str,
+) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_acquire_failures_total",
+        "op" => op,
+        "mode" => mode,
+        "resource_class" => resource_class,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 /// Record a remote lock RPC that exceeded its caller's deadline.
 #[inline(always)]
 pub fn record_remote_lock_rpc_timeout(peer: &str, op: &'static str) {
@@ -244,6 +263,7 @@ mod tests {
             record_remote_lock_rpc_detached("lock", "detached");
             record_remote_lock_rpc_late_completion("lock", "success");
             record_remote_lock_late_release("released");
+            record_object_lock_acquire_failure("put_object_commit", "write", "system_metadata", "timeout");
         });
 
         let emitted: std::collections::HashSet<String> = snapshotter
@@ -267,9 +287,34 @@ mod tests {
             "rustfs_remote_lock_rpc_detached_total",
             "rustfs_remote_lock_rpc_late_completions_total",
             "rustfs_remote_lock_late_releases_total",
+            "rustfs_object_lock_acquire_failures_total",
         ] {
             assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
         }
+    }
+
+    #[test]
+    fn object_lock_acquire_failure_metric_is_recorded_without_resource_labels() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_acquire_failure("put_object_commit", "write", "system_metadata", "timeout");
+        });
+
+        let keys = recorder.counters.lock().expect("counter keys should be lockable");
+        let key = keys
+            .iter()
+            .find(|key| key.name() == "rustfs_object_lock_acquire_failures_total")
+            .expect("object lock failure counter should be emitted");
+        let labels = key.labels().map(|label| (label.key(), label.value())).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                ("op", "put_object_commit"),
+                ("mode", "write"),
+                ("resource_class", "system_metadata"),
+                ("reason", "timeout"),
+            ]
+        );
     }
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use std::sync::{Arc, Mutex};

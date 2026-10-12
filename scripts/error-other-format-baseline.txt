@@ -14,7 +14,6 @@
 22|crates/ecstore/src/bucket/metadata_sys.rs
 3|crates/ecstore/src/bucket/msgp_decode.rs
 1|crates/ecstore/src/bucket/object_lock/objectlock_sys.rs
-3|crates/ecstore/src/bucket/quota/reservation.rs
 1|crates/ecstore/src/bucket/replication/replication_object_config.rs
 2|crates/ecstore/src/bucket/replication/replication_pool.rs
 2|crates/ecstore/src/bucket/replication/replication_target_boundary.rs

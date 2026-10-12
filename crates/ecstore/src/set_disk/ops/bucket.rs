@@ -34,6 +34,41 @@ pub(crate) enum BucketInfoQuorum {
 }
 
 impl SetDisks {
+    /// Require proof from every configured disk before retiring a bucket
+    /// generation whose visible volume was removed outside the storage API.
+    pub(crate) async fn ensure_bucket_volume_absent_on_every_disk(&self, bucket: &str) -> Result<()> {
+        let disks = self.disk_inventory().await;
+        if disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+
+        let futures = disks.into_iter().map(|disk| async move {
+            match disk {
+                Some(disk) => disk.stat_volume(bucket).await.map(|_| ()),
+                None => Err(DiskError::DiskNotFound),
+            }
+        });
+        let results = join_all(futures).await;
+        let mut volume_present = false;
+        let mut first_unknown = None;
+        for result in results {
+            match result {
+                Ok(()) => volume_present = true,
+                Err(DiskError::VolumeNotFound) => {}
+                Err(error) if first_unknown.is_none() => first_unknown = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(error) = first_unknown {
+            return Err(error.into());
+        }
+        if volume_present {
+            return Err(Error::BucketExists(bucket.to_owned()));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn stat_bucket_with_quorum(&self, bucket: &str, quorum: BucketInfoQuorum) -> Result<BucketInfo> {
         let disks = self.disk_inventory().await;
         let disk_count = disks.len();

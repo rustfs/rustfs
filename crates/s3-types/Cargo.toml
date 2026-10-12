@@ -43,10 +43,12 @@ hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
 bytes = { workspace = true }
+futures-core = { workspace = true }
 hotpath.workspace = true
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
+pin-project-lite = { workspace = true }
 # The s3s package under the name the legacy edge knows it by. Only
 # src/compat_s3s.rs may use it; see that file's header for the footprint note.
 legacy-s3s = { workspace = true, optional = true }
@@ -56,6 +58,10 @@ serde_json = { workspace = true, features = ["raw_value"] }
 [dev-dependencies]
 # Oracle for the parity tests in src/compat_s3s.rs; never a normal dependency.
 legacy-s3s = { workspace = true }
+# The HTTP/1.1 server those parity tests compare bodies through, byte for byte.
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lib]
 doctest = false

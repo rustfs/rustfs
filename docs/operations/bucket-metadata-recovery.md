@@ -26,3 +26,17 @@ Alternatively, use `PUT /rustfs/admin/v3/set-remote-target?bucket=<bucket>&repla
 RustFS validates the replacement target, then reads and updates the latest persisted target set under the bucket metadata transaction lock. The flag authorizes discarding that set only if it is still unreadable at this point. A readable set, including a repair already committed by another node, is preserved and merged using the ordinary target-create identity and conflict checks. Success is returned after persistence, and an actual discard is audited after the commit. Without this opt-in, target writes retain the unreadable-configuration refusal.
 
 Do not submit the diagnostic archive itself to the import endpoint. Copy only reviewed replacement entries into an ordinary import archive.
+
+## Recover metadata after out-of-band volume removal
+
+Removing bucket directories directly from storage disks bypasses bucket deletion, including its lifecycle fences and durable incarnation-retirement record. S3 `DeleteBucket` does not repair this state. If an old incarnation sidecar remains while the bucket is absent by quorum, ordinary `CreateBucket` refuses to create a replacement until an administrator reconciles the orphan.
+
+After confirming that the bucket's data was intentionally removed, call the authenticated `POST /rustfs/admin/v3/recover-orphaned-bucket/{bucket}` endpoint with the dedicated `RecoverOrphanedBucketAction` permission and a JSON body:
+
+```json
+{"expectedIncarnationId":"<non-nil bucket incarnation UUID>"}
+```
+
+Supply the exact old incarnation UUID from the bucket incarnation sidecar or a trusted metadata backup. The operation checks every configured disk in every pool. A remaining volume, offline disk, unreadable retirement metadata, missing identity, or identity mismatch stops recovery. Once all disks confirm absence, RustFS publishes durable retirement evidence before cleaning usage state, bucket metadata, table-catalog metadata, and deleted-bucket markers. Repeating the request after an interrupted cleanup is safe when the same identity is supplied.
+
+This endpoint is local to one deployment and is refused while site replication is enabled; reconcile the affected bucket across sites before retrying. It is not a substitute for `DeleteBucket`: use the normal API whenever the bucket still exists, and do not delete volume directories manually as a routine operation.

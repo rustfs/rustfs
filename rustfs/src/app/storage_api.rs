@@ -28,7 +28,7 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
-    pub(crate) use s3s::auth::SimpleAuth;
+    pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
     #[cfg(test)]
@@ -277,6 +277,7 @@ pub(crate) mod access {
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -1271,6 +1272,12 @@ pub(crate) mod context {
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
+    pub(crate) use crate::storage::storage_api::access_consumer::{
+        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
+        OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, TableDataPlaneListAccess,
+        TableDataPlanePublicationGuards,
+    };
+    pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};

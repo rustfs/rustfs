@@ -180,6 +180,16 @@ fn every_allowed_coarse_flag_is_a_fixed_failure_without_raw_source_identity() {
 }
 
 #[test]
+fn unknown_coarse_flag_is_rejected_as_invalid_evidence() {
+    let now = Utc::now();
+    let request = request(now.timestamp());
+    let result = json_result(&request, observation(now.timestamp(), 100, 50, vec!["drive.serial-number"]), now);
+
+    assert_eq!(result["data"]["checks"][1]["outcome"], "UNKNOWN");
+    assert_eq!(result["data"]["checks"][1]["reasonCode"], "INVALID_EVIDENCE");
+}
+
+#[test]
 fn signed_health_export_binds_target_nonce_consent_and_result_digest() {
     let now = Utc::now();
     let request = request(now.timestamp());

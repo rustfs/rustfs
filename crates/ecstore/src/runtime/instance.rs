@@ -59,6 +59,8 @@ use std::sync::{
 use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 const SCANNER_PUBLICATION_STATE_UNKNOWN: u8 = 0;
@@ -243,6 +245,10 @@ pub struct InstanceContext {
     suppress_tier_delete_journal_recovery: bool,
     transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
+    /// Object mutations that run on their own task so that dropping the
+    /// caller (for example, an S3 client disconnect) cannot stop them between
+    /// their on-disk steps. Shutdown waits for them after the HTTP drain.
+    detached_mutations: TaskTracker,
 }
 
 impl InstanceContext {
@@ -293,6 +299,7 @@ impl InstanceContext {
             suppress_tier_delete_journal_recovery: false,
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
+            detached_mutations: TaskTracker::new(),
         }
     }
 
@@ -304,6 +311,31 @@ impl InstanceContext {
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
+    }
+
+    /// Run a multi-step mutation on its own task and wait for its output.
+    ///
+    /// Dropping the returned future leaves the task running to completion, so
+    /// the mutation, together with the locks and guards it owns, never stops
+    /// between two of its on-disk steps because its caller went away.
+    pub(crate) async fn run_detached_mutation<F>(&self, mutation: F) -> Result<F::Output, tokio::task::JoinError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.detached_mutations.spawn(mutation.in_current_span()).await
+    }
+
+    /// Wait up to `timeout` for every detached mutation to finish. Returns
+    /// `false` when some are still running at the deadline.
+    pub async fn wait_for_detached_mutations(&self, timeout: std::time::Duration) -> bool {
+        self.detached_mutations.close();
+        tokio::time::timeout(timeout, self.detached_mutations.wait()).await.is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_mutation_count(&self) -> usize {
+        self.detached_mutations.len()
     }
 
     pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
@@ -918,6 +950,33 @@ mod tests {
             assert_eq!(ctx.is_dist_erasure().await, want_dist, "is_dist_erasure for {input:?}");
             assert_eq!(ctx.is_erasure_sd().await, want_sd, "is_erasure_sd for {input:?}");
         }
+    }
+
+    // A detached mutation keeps running after its caller is dropped, and
+    // shutdown waits for it instead of tearing it down mid-way.
+    #[tokio::test]
+    async fn detached_mutation_outlives_dropped_caller_and_is_awaited() {
+        let ctx = InstanceContext::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut caller = Box::pin(ctx.run_detached_mutation({
+            let finished = Arc::clone(&finished);
+            async move {
+                let _ = release_rx.await;
+                finished.store(true, Ordering::Release);
+            }
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        drop(caller);
+        assert_eq!(ctx.detached_mutation_count(), 1, "dropping the caller must not cancel the mutation");
+
+        assert!(
+            !ctx.wait_for_detached_mutations(std::time::Duration::from_millis(50)).await,
+            "the wait must report a mutation that is still running"
+        );
+        release_tx.send(()).expect("the detached mutation should still be waiting");
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+        assert!(finished.load(Ordering::Acquire));
     }
 
     // A fresh context (before any update) reflects the initial all-false state.

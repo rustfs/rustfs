@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use super::{
-    FederatedIdentityRegistry, FederatedLoginSession, FederatedSession, FederatedSessionBinding, FederatedSessionTransaction,
-    FederationError, Result,
+    CoreFederatedAuthorizationMapper, FederatedAuthorization, FederatedIdentityProvider, FederatedIdentityRegistry,
+    FederatedLoginSession, FederatedProviderView, FederatedRedirectPolicy, FederatedSession, FederatedSessionBinding,
+    FederatedSessionTransaction, FederationError, OpaqueLogoutContinuation, Result, StandardOidcAuthentication,
 };
-use crate::oidc::{OidcProviderConfig, OidcProviderSummary};
+use crate::oidc::OidcProviderConfig;
+use std::sync::Arc;
 
 const DEFAULT_OIDC_PROVIDER_ID: &str = "default";
 
-fn sorted_provider_summaries(mut providers: Vec<OidcProviderSummary>) -> Vec<OidcProviderSummary> {
+fn sorted_provider_views(mut providers: Vec<FederatedProviderView>) -> Vec<FederatedProviderView> {
     providers.sort_by(|left, right| {
         (left.provider_id != DEFAULT_OIDC_PROVIDER_ID)
             .cmp(&(right.provider_id != DEFAULT_OIDC_PROVIDER_ID))
@@ -30,35 +32,108 @@ fn sorted_provider_summaries(mut providers: Vec<OidcProviderSummary>) -> Vec<Oid
 }
 
 pub struct FederatedIdentityService {
-    registry: FederatedIdentityRegistry,
+    provider: Arc<dyn FederatedIdentityProvider>,
+    standard_oidc: Option<StandardOidcRuntime>,
+}
+
+struct StandardOidcRuntime {
+    authentication: Arc<dyn StandardOidcAuthentication>,
+    mapper: CoreFederatedAuthorizationMapper,
+}
+
+struct RuntimeCodeExchange {
+    authorization: FederatedAuthorization,
+    redirect_after: Option<String>,
+    logout_continuation: OpaqueLogoutContinuation,
 }
 
 impl FederatedIdentityService {
+    async fn exchange_code(&self, state: &str, code: &str, redirect_uri: &str) -> Result<RuntimeCodeExchange> {
+        match &self.standard_oidc {
+            Some(runtime) => {
+                let exchange = runtime.authentication.exchange_identity(state, code, redirect_uri).await?;
+                let (identity, redirect_after, logout_continuation) = exchange.into_parts();
+                Ok(RuntimeCodeExchange {
+                    authorization: runtime.mapper.map(identity),
+                    redirect_after,
+                    logout_continuation,
+                })
+            }
+            None => {
+                let exchange = self.provider.exchange_code(state, code, redirect_uri).await?;
+                let (authorization, redirect_after, logout_continuation) = exchange.into_parts();
+                Ok(RuntimeCodeExchange {
+                    authorization,
+                    redirect_after,
+                    logout_continuation,
+                })
+            }
+        }
+    }
+
+    async fn verify_identity(&self, jwt: &str) -> Result<FederatedAuthorization> {
+        match &self.standard_oidc {
+            Some(runtime) => Ok(runtime.mapper.map(runtime.authentication.verify_identity(jwt).await?)),
+            None => self.provider.verify_web_identity_token(jwt).await,
+        }
+    }
+
+    async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String> {
+        match &self.standard_oidc {
+            Some(runtime) => runtime.authentication.create_logout_token(continuation).await,
+            None => {
+                let (provider, id_token) = continuation.into_parts();
+                self.provider.create_logout_token(provider.as_str(), &id_token).await
+            }
+        }
+    }
+
+    /// Build the compatibility service around the published provider interface.
     pub fn new(registry: FederatedIdentityRegistry) -> Self {
-        Self { registry }
+        Self {
+            provider: registry.standard_oidc_arc(),
+            standard_oidc: None,
+        }
+    }
+
+    pub(super) fn from_standard_oidc_parts(
+        provider: Arc<dyn FederatedIdentityProvider>,
+        authentication: Arc<dyn StandardOidcAuthentication>,
+        mapper: CoreFederatedAuthorizationMapper,
+    ) -> Self {
+        Self {
+            provider,
+            standard_oidc: Some(StandardOidcRuntime { authentication, mapper }),
+        }
     }
 
     pub fn has_providers(&self) -> bool {
-        self.registry.standard_oidc().has_providers()
+        self.provider.has_providers()
     }
 
-    pub fn list_providers(&self) -> Vec<OidcProviderSummary> {
-        sorted_provider_summaries(self.registry.standard_oidc().list_providers())
+    pub fn list_providers(&self) -> Vec<FederatedProviderView> {
+        let providers = self.provider.list_providers();
+        sorted_provider_views(providers)
     }
 
-    pub fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
-        sorted_provider_summaries(self.registry.standard_oidc().list_visible_providers())
+    pub fn list_visible_providers(&self) -> Vec<FederatedProviderView> {
+        let providers = self.provider.list_visible_providers();
+        sorted_provider_views(providers)
     }
 
-    pub fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
-        self.registry.standard_oidc().provider_config(id)
+    pub fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy> {
+        self.provider.redirect_policy(provider_id)
+    }
+
+    /// Compatibility accessor for existing federation consumers.
+    /// Login redirects use [`Self::redirect_policy`], while OIDC-specific
+    /// configuration consumers use the OIDC configuration query.
+    pub fn get_provider_config(&self, provider_id: &str) -> Option<&OidcProviderConfig> {
+        self.provider.provider_config(provider_id)
     }
 
     pub async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String> {
-        self.registry
-            .standard_oidc()
-            .authorize_url(provider_id, redirect_uri, redirect_after)
-            .await
+        self.provider.authorize_url(provider_id, redirect_uri, redirect_after).await
     }
 
     pub async fn complete_authorization_code(
@@ -69,20 +144,14 @@ impl FederatedIdentityService {
         duration_seconds: usize,
         binding: &dyn FederatedSessionBinding,
     ) -> Result<FederatedLoginSession> {
-        let exchange = self.registry.standard_oidc().exchange_code(state, code, redirect_uri).await?;
-        let provider_id = exchange.authorization.provider_id.clone();
+        let exchange = self.exchange_code(state, code, redirect_uri).await?;
         let transaction = FederatedSessionTransaction {
             authorization: exchange.authorization,
             duration_seconds,
             session_policy: None,
         };
         let credentials = binding.bind(&transaction).await?;
-        let logout_token = self
-            .registry
-            .standard_oidc()
-            .create_logout_token(&provider_id, &exchange.id_token)
-            .await?;
-
+        let logout_token = self.create_logout_token(exchange.logout_continuation).await?;
         Ok(FederatedLoginSession {
             session: FederatedSession {
                 credentials,
@@ -100,7 +169,7 @@ impl FederatedIdentityService {
         session_policy: Option<String>,
         binding: &dyn FederatedSessionBinding,
     ) -> Result<FederatedSession> {
-        let authorization = self.registry.standard_oidc().verify_web_identity_token(jwt).await?;
+        let authorization = self.verify_identity(jwt).await?;
         if !authorization.has_authorization_context() {
             tracing::warn!(
                 provider_id = %authorization.provider_id,
@@ -136,10 +205,7 @@ impl FederatedIdentityService {
     }
 
     pub async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>> {
-        self.registry
-            .standard_oidc()
-            .build_logout_url(logout_token, post_logout_redirect_uri)
-            .await
+        self.provider.build_logout_url(logout_token, post_logout_redirect_uri).await
     }
 }
 
@@ -147,9 +213,10 @@ impl FederatedIdentityService {
 mod tests {
     use super::*;
     use crate::federation::{
-        FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedIdentityProvider, FederatedSessionBindingError,
+        FederatedAuthorization, FederatedAuthorizationRule, FederatedAuthorizationRules, FederatedClaims, FederatedCodeExchange,
+        FederatedIdentityProvider, FederatedProviderRef, FederatedSessionBindingError, VerifiedFederatedCodeExchange,
+        VerifiedFederatedIdentity,
     };
-    use crate::oidc::{OidcProviderConfig, OidcProviderSummary};
     use rustfs_credentials::Credentials;
     use std::sync::{Arc, Mutex};
 
@@ -217,12 +284,29 @@ mod tests {
                 roles: Vec::new(),
             }
         }
+
+        fn identity(&self, provider_id: &str) -> VerifiedFederatedIdentity {
+            VerifiedFederatedIdentity::from_claims(
+                FederatedProviderRef::new(provider_id.to_string()),
+                FederatedClaims {
+                    sub: "subject".to_string(),
+                    email: String::new(),
+                    username: "user".to_string(),
+                    groups: if self.with_group {
+                        vec!["developers".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    raw: Default::default(),
+                },
+            )
+        }
     }
 
-    fn provider_summaries(provider_ids: &[&str]) -> Vec<OidcProviderSummary> {
+    fn provider_views(provider_ids: &[&str]) -> Vec<FederatedProviderView> {
         provider_ids
             .iter()
-            .map(|provider_id| OidcProviderSummary {
+            .map(|provider_id| FederatedProviderView {
                 provider_id: (*provider_id).to_string(),
                 display_name: (*provider_id).to_string(),
             })
@@ -235,16 +319,19 @@ mod tests {
             true
         }
 
-        fn list_providers(&self) -> Vec<OidcProviderSummary> {
-            provider_summaries(&self.listed_provider_ids)
+        fn list_providers(&self) -> Vec<FederatedProviderView> {
+            provider_views(&self.listed_provider_ids)
         }
 
-        fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
-            provider_summaries(&self.visible_provider_ids)
+        fn list_visible_providers(&self) -> Vec<FederatedProviderView> {
+            provider_views(&self.visible_provider_ids)
         }
 
-        fn provider_config(&self, _id: &str) -> Option<&OidcProviderConfig> {
-            None
+        fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy> {
+            (provider_id == DEFAULT_OIDC_PROVIDER_ID).then_some(FederatedRedirectPolicy {
+                redirect_uri: None,
+                allow_request_origin: true,
+            })
         }
 
         async fn authorize_url(
@@ -290,10 +377,76 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl StandardOidcAuthentication for TestProvider {
+        async fn exchange_identity(
+            &self,
+            _state: &str,
+            _code: &str,
+            _redirect_uri: &str,
+        ) -> Result<VerifiedFederatedCodeExchange> {
+            self.record("exchange");
+            if self.failure == ProviderFailure::Exchange {
+                return Err(FederationError::CodeExchange("exchange failed".to_string()));
+            }
+            let provider = FederatedProviderRef::new(self.browser_provider_id.to_string());
+            Ok(VerifiedFederatedCodeExchange::new(
+                self.identity(self.browser_provider_id),
+                Some("/browser".to_string()),
+                OpaqueLogoutContinuation::new(provider, "id-token".to_string()),
+            ))
+        }
+
+        async fn verify_identity(&self, _jwt: &str) -> Result<VerifiedFederatedIdentity> {
+            self.record("verify");
+            if self.failure == ProviderFailure::Verification {
+                return Err(FederationError::TokenVerification("verification failed".to_string()));
+            }
+            Ok(self.identity(self.web_provider_id))
+        }
+
+        async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String> {
+            self.record("logout");
+            let (provider, id_token) = continuation.into_parts();
+            assert_eq!((provider.as_str(), id_token.as_str()), self.expected_logout);
+            if self.failure == ProviderFailure::Logout {
+                return Err(FederationError::Logout("logout failed".to_string()));
+            }
+            Ok("logout-token".to_string())
+        }
+    }
+
+    fn standard_service(provider: Arc<TestProvider>) -> FederatedIdentityService {
+        let mut provider_ids = vec![provider.browser_provider_id, provider.web_provider_id];
+        provider_ids.sort_unstable();
+        provider_ids.dedup();
+        let role_policy = if provider.with_policy { "readwrite" } else { "" };
+        let rules = FederatedAuthorizationRules::new(provider_ids.into_iter().map(|provider_id| {
+            FederatedAuthorizationRule::new(
+                provider_id.to_string(),
+                "groups".to_string(),
+                String::new(),
+                role_policy.to_string(),
+                "groups".to_string(),
+                String::new(),
+            )
+        }));
+        let authentication: Arc<dyn StandardOidcAuthentication> = provider.clone();
+        let provider: Arc<dyn FederatedIdentityProvider> = provider;
+        FederatedIdentityService {
+            provider,
+            standard_oidc: Some(StandardOidcRuntime {
+                authentication,
+                mapper: CoreFederatedAuthorizationMapper::new(rules),
+            }),
+        }
+    }
+
     struct RecordingBinding {
         fail: bool,
         events: Arc<Mutex<Vec<&'static str>>>,
         transactions: Mutex<Vec<(String, usize, Option<String>)>>,
+        mapped_policies: Mutex<Vec<Vec<String>>>,
     }
 
     impl RecordingBinding {
@@ -302,6 +455,7 @@ mod tests {
                 fail: false,
                 events,
                 transactions: Mutex::new(Vec::new()),
+                mapped_policies: Mutex::new(Vec::new()),
             }
         }
     }
@@ -318,6 +472,10 @@ mod tests {
                 transaction.duration_seconds,
                 transaction.session_policy.clone(),
             ));
+            self.mapped_policies
+                .lock()
+                .expect("mapped policies should not be poisoned")
+                .push(transaction.authorization.policies.clone());
             if self.fail {
                 return Err(FederatedSessionBindingError::Internal("binding failed".to_string()));
             }
@@ -353,7 +511,7 @@ mod tests {
             [DEFAULT_OIDC_PROVIDER_ID, "alpha", "zeta"]
         );
         assert_eq!(
-            sorted_provider_summaries(provider_summaries(&["zeta", "alpha"]))
+            sorted_provider_views(provider_views(&["zeta", "alpha"]))
                 .into_iter()
                 .map(|provider| provider.provider_id)
                 .collect::<Vec<_>>(),
@@ -404,6 +562,107 @@ mod tests {
                 ("partner".to_string(), 7200, Some("session-policy".to_string())),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn standard_runtime_maps_before_common_browser_and_web_identity_flows() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TestProvider::new(events.clone());
+        provider.browser_provider_id = "corp";
+        provider.web_provider_id = "partner";
+        provider.expected_logout = ("corp", "id-token");
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
+        let service = standard_service(Arc::new(provider));
+
+        let login = service
+            .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
+            .await
+            .expect("standard callback flow should complete");
+        assert_eq!(login.session.authorization.provider_id, "corp");
+        assert_eq!(login.session.authorization.policies, ["readwrite"]);
+        assert_eq!(
+            events.lock().expect("event log should not be poisoned").as_slice(),
+            ["exchange", "bind", "logout"]
+        );
+        events.lock().expect("event log should not be poisoned").clear();
+
+        let web_identity = service
+            .assume_role_with_web_identity("jwt", 7200, Some("session-policy".to_string()), binding.as_ref())
+            .await
+            .expect("standard web identity flow should complete");
+        assert_eq!(web_identity.authorization.provider_id, "partner");
+        assert_eq!(web_identity.authorization.policies, ["readwrite"]);
+        assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
+        assert_eq!(
+            binding
+                .mapped_policies
+                .lock()
+                .expect("mapped policies should not be poisoned")
+                .as_slice(),
+            [vec!["readwrite".to_string()], vec!["readwrite".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_runtime_checks_authorization_before_binding() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TestProvider::new(events.clone());
+        provider.with_policy = false;
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
+        let service = standard_service(Arc::new(provider));
+
+        let error = service
+            .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+            .await
+            .expect_err("standard web identity requires mapped authorization");
+
+        assert!(matches!(error, FederationError::NoAuthorizationContext));
+        assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify"]);
+    }
+
+    #[tokio::test]
+    async fn standard_runtime_preserves_browser_failure_order() {
+        for (provider_failure, binding_failure, expected_events) in [
+            (ProviderFailure::Exchange, false, vec!["exchange"]),
+            (ProviderFailure::None, true, vec!["exchange", "bind"]),
+            (ProviderFailure::Logout, false, vec!["exchange", "bind", "logout"]),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut provider = TestProvider::new(events.clone());
+            provider.failure = provider_failure;
+            let mut binding = RecordingBinding::new(events.clone());
+            binding.fail = binding_failure;
+            let service = standard_service(Arc::new(provider));
+
+            service
+                .complete_authorization_code("state", "code", "https://console.example/callback", 3600, &binding)
+                .await
+                .expect_err("the configured standard callback failure should be returned");
+
+            assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), expected_events);
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_runtime_preserves_web_identity_failure_order() {
+        for (provider_failure, binding_failure, expected_events) in [
+            (ProviderFailure::Verification, false, vec!["verify"]),
+            (ProviderFailure::None, true, vec!["verify", "bind"]),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut provider = TestProvider::new(events.clone());
+            provider.failure = provider_failure;
+            let mut binding = RecordingBinding::new(events.clone());
+            binding.fail = binding_failure;
+            let service = standard_service(Arc::new(provider));
+
+            service
+                .assume_role_with_web_identity("jwt", 3600, None, &binding)
+                .await
+                .expect_err("the configured standard web identity failure should be returned");
+
+            assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), expected_events);
+        }
     }
 
     #[tokio::test]
