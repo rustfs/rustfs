@@ -42,6 +42,24 @@
     "expected": ["federation-authorization-owner"]
   },
   {
+    "id": "accepted_federation_destructures_authorization",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "let FederatedAuthorization { policies, groups, .. } = &authorization;\n",
+    "expected": []
+  },
+  {
+    "id": "accepted_federation_matches_authorization",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "match authorization { FederatedAuthorization { policies, .. } => log(policies) }\n",
+    "expected": []
+  },
+  {
+    "id": "federation_constructs_authorization_for_comparison",
+    "path": "crates/iam/src/federation/transaction.rs",
+    "source": "let matches = FederatedAuthorization { policies, groups } == expected;\n",
+    "expected": ["federation-authorization-owner"]
+  },
+  {
     "id": "oidc_adapter_imports_credentials",
     "path": "crates/iam/src/oidc/runtime.rs",
     "source": "use rustfs_credentials::Credentials;\n",

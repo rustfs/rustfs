@@ -118,6 +118,21 @@ def find_matches(rule, path, source, pattern):
     ]
 
 
+def is_struct_pattern(source, opening_brace):
+    depth = 1
+    index = opening_brace + 1
+    while index < len(source) and depth:
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+        index += 1
+    if depth:
+        return False
+    suffix = source[index:].lstrip()
+    return suffix.startswith("=>") or (suffix.startswith("=") and not suffix.startswith("=="))
+
+
 def function_body(source, name):
     signature = re.search(rf"\bfn\s+{name}\s*\([^)]*\)[^{{]*\{{", source)
     if not signature:
@@ -255,6 +270,8 @@ def source_findings(path, source):
     for match in re.finditer(r"\bFederatedAuthorization\s*\{", code):
         preceding_word = re.search(r"\b(\w+)\s*$", code[: match.start()])
         if preceding_word and preceding_word.group(1) in ("struct", "impl"):
+            continue
+        if is_struct_pattern(code, match.end() - 1):
             continue
         if path != "crates/iam/src/federation/mapper.rs":
             findings.append(("federation-authorization-owner", path, code.count("\n", 0, match.start()) + 1))
