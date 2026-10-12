@@ -237,7 +237,10 @@ pub async fn publish_ready_when_runtime_ready(
     wait_for_runtime_readiness_with(
         startup_runtime_readiness_max_wait(),
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
-        collect_node_readiness,
+        // Publish service readiness at the same per-set read and shared-lock
+        // boundary reported by the node probe. Mutation paths independently
+        // require write quorum and a writable pool-metadata state.
+        || async { collect_node_readiness_report().await.readiness },
         |dependency_readiness| {
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             mark_get_metadata_read_version_coalescing_service_ready();
@@ -1060,20 +1063,6 @@ fn cluster_health_timeout_report() -> DependencyReadinessReport {
     }
 }
 
-async fn collect_node_readiness() -> DependencyReadiness {
-    // Startup publication retains its local dependency gate. Runtime probes
-    // additionally report storage quorum without changing S3 admission.
-    let storage = node_pool_meta_write_readiness().await;
-    let readiness = DependencyReadiness {
-        storage_ready: storage.ready,
-        iam_ready: runtime_sources::current_iam_ready(),
-        lock_quorum_ready: collect_lock_quorum_status().await.ready,
-        peer_health_ready: collect_peer_health_readiness(),
-    };
-    record_readiness_report(&dependency_readiness_report_from_write_status(readiness, storage));
-    readiness
-}
-
 pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::current_iam_ready();
     let storage_ready = collect_storage_read_readiness_uncached().await;
@@ -1114,14 +1103,6 @@ async fn collect_lock_quorum_observation() -> LockQuorumObservation {
         update_lock_quorum_status_cache(computed.clone()).await;
         computed
     }
-}
-
-async fn node_pool_meta_write_readiness() -> StorageWriteReadinessStatus {
-    if let Some(store) = runtime_sources::current_object_store_handle() {
-        return pool_metadata_write_readiness(store.pool_meta_write_status().await);
-    }
-
-    StorageWriteReadinessStatus::default()
 }
 
 async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStatus {

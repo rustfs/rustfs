@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{FederatedAuthorization, FederatedCodeExchange, OpaqueLogoutContinuation, Result, VerifiedFederatedIdentity};
-use crate::oidc::OidcProviderConfig;
+use super::{OpaqueLogoutContinuation, Result, VerifiedFederatedIdentity};
 use serde::{Deserialize, Serialize};
 
 /// Provider data exposed to login discovery consumers.
@@ -56,41 +55,21 @@ impl VerifiedFederatedCodeExchange {
 
 #[async_trait::async_trait]
 pub(crate) trait StandardOidcAuthentication: Send + Sync {
+    async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String>;
     async fn exchange_identity(&self, state: &str, code: &str, redirect_uri: &str) -> Result<VerifiedFederatedCodeExchange>;
     async fn verify_identity(&self, jwt: &str) -> Result<VerifiedFederatedIdentity>;
     async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String>;
+    async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>>;
 }
 
-#[async_trait::async_trait]
-pub trait FederatedIdentityProvider: Send + Sync {
+pub(crate) trait FederatedProviderQuery: Send + Sync {
     fn has_providers(&self) -> bool;
 
     fn list_providers(&self) -> Vec<FederatedProviderView>;
 
     fn list_visible_providers(&self) -> Vec<FederatedProviderView>;
 
-    /// Compatibility accessor for existing provider implementations.
-    /// Login redirect consumers should use [`Self::redirect_policy`].
-    fn provider_config(&self, _provider_id: &str) -> Option<&OidcProviderConfig> {
-        None
-    }
-
-    fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy> {
-        self.provider_config(provider_id).map(|config| FederatedRedirectPolicy {
-            redirect_uri: config.redirect_uri.clone(),
-            allow_request_origin: config.redirect_uri_dynamic,
-        })
-    }
-
-    async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String>;
-
-    async fn exchange_code(&self, state: &str, code: &str, redirect_uri: &str) -> Result<FederatedCodeExchange>;
-
-    async fn verify_web_identity_token(&self, jwt: &str) -> Result<FederatedAuthorization>;
-
-    async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String>;
-
-    async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>>;
+    fn redirect_policy(&self, provider_id: &str) -> Option<FederatedRedirectPolicy>;
 }
 
 #[cfg(test)]

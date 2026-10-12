@@ -203,6 +203,58 @@ fn md5_hex(bytes: &[u8]) -> String {
     hex_simd::encode_to_string(Md5::digest(bytes), hex_simd::AsciiCase::Lower)
 }
 
+/// Validate each object's opaque SSE-C identity before comparing independent writes.
+fn normalize_sse_c_etags(observations: &mut [Observation]) -> Result<(), String> {
+    let position = |op| {
+        let mut matches = observations
+            .iter()
+            .enumerate()
+            .filter(|(_, observation)| observation.op == op && observation.case == "sse-c")
+            .map(|(index, _)| index);
+        match (matches.next(), matches.next()) {
+            (Some(index), None) => Ok(index),
+            _ => Err(format!("expected exactly one SSE-C {op} observation")),
+        }
+    };
+    let put = position("PutObject")?;
+    let head = position("HeadObject")?;
+    let plaintext_md5: [u8; 16] = Md5::digest(b"customer key").into();
+    let etag = |index: usize| {
+        let observation = &observations[index];
+        let raw = observation.headers.get("etag").map(String::as_str);
+        if !observation.is_success() || observation.error_code.is_some() {
+            return Err(format!(
+                "SSE-C {} failed: status={}, error={:?}, etag={raw:?}",
+                observation.op, observation.status, observation.error_code
+            ));
+        }
+        let raw = raw.ok_or_else(|| format!("SSE-C {} is missing its ETag", observation.op))?;
+        let inner = raw
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| format!("SSE-C {} has an invalid opaque ETag: {raw:?}", observation.op))?;
+        let decoded = hex_simd::decode_to_vec(inner.as_bytes())
+            .map_err(|_| format!("SSE-C {} has an invalid hex ETag: {raw:?}", observation.op))?;
+        if decoded.as_slice() == &plaintext_md5[..] {
+            return Err(format!("SSE-C {} exposed the plaintext MD5 as its ETag: {raw:?}", observation.op));
+        }
+        Ok(raw)
+    };
+    let put_etag = etag(put)?;
+    let head_etag = etag(head)?;
+    if put_etag != head_etag {
+        return Err(format!("SSE-C PUT/HEAD ETags differ: put={put_etag:?}, head={head_etag:?}"));
+    }
+    // The nonce makes independent writes differ. Keep every other recorded field intact.
+    for index in [put, head] {
+        observations[index]
+            .headers
+            .insert("etag".to_owned(), "<sse-c-etag>".to_owned());
+    }
+    Ok(())
+}
+
 struct Recorder {
     capture: ResponseCapture,
     observations: Vec<Observation>,
@@ -407,6 +459,7 @@ async fn objects(s: &mut Recorder, c: &Client) {
         .sse_customer_key(&key.key)
         .sse_customer_key_md5(&key.key_md5);
     s.step("HeadObject", "sse-c", head.send(), none).await;
+    normalize_sse_c_etags(&mut s.observations).expect("valid, matching SSE-C PUT/HEAD ETags");
 
     if let Some(output) = s
         .step("GetObject", "normal", c.get_object().bucket(BUCKET).key(README).send(), none)
@@ -1091,7 +1144,9 @@ async fn deletes_and_listings(s: &mut Recorder, c: &Client) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::compare::compare;
     use super::OPERATIONS;
+    use super::{Observation, md5_hex, normalize_sse_c_etags};
 
     #[test]
     fn the_operation_list_is_sorted_without_duplicates() {
@@ -1099,5 +1154,212 @@ mod tests {
             OPERATIONS.windows(2).all(|pair| pair[0] < pair[1]),
             "OPERATIONS must be strictly sorted: {OPERATIONS:?}"
         );
+    }
+
+    const ETAG_A: &str = "\"0123456789abcdef0123456789abcdef\"";
+    const ETAG_B: &str = "\"fedcba9876543210fedcba9876543210\"";
+
+    fn sse_c_pair(etag: &str) -> Vec<Observation> {
+        ["PutObject", "HeadObject"]
+            .into_iter()
+            .map(|op| {
+                let mut observation = Observation::new(
+                    op,
+                    "sse-c",
+                    200,
+                    None,
+                    [
+                        ("etag", etag),
+                        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                        ("x-amz-server-side-encryption-customer-key-md5", "key-md5"),
+                        ("content-type", "text/plain"),
+                    ],
+                )
+                .with_field("size", "12");
+                observation.message = Some("original diagnostic".to_owned());
+                observation
+            })
+            .collect()
+    }
+
+    fn assert_same_observations(actual: &[Observation], expected: &[Observation]) {
+        let project = |observations: &[Observation]| {
+            observations
+                .iter()
+                .map(|observation| {
+                    (
+                        observation.op,
+                        observation.case,
+                        observation.status,
+                        observation.error_code.clone(),
+                        observation.headers.clone(),
+                        observation.fields.clone(),
+                        observation.message.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(project(actual), project(expected));
+    }
+
+    #[test]
+    fn sse_c_etags_normalize_only_valid_object_identities() {
+        let mut a = sse_c_pair(ETAG_A);
+        let mut b = sse_c_pair(ETAG_B);
+        for observations in [&mut a, &mut b] {
+            observations.push(Observation::new("HeadObject", "normal", 200, None, [("etag", ETAG_A)]));
+            observations.push(Observation::new("PutObject", "other", 200, None, [("etag", ETAG_A)]));
+            observations.push(Observation::new("GetObject", "sse-c", 200, None, [("etag", ETAG_A)]));
+        }
+        let mut expected_equal = a.clone();
+        for observation in &mut expected_equal[..2] {
+            observation.headers.insert("etag".to_owned(), "<sse-c-etag>".to_owned());
+        }
+        normalize_sse_c_etags(&mut a).expect("valid first server identity");
+        normalize_sse_c_etags(&mut b).expect("valid second server identity");
+        assert!(compare(&a, &b).is_empty());
+        let equal_pair = (a, b);
+
+        let mut a = sse_c_pair(ETAG_A);
+        let mut b = sse_c_pair(ETAG_B);
+        a.push(Observation::new("HeadObject", "normal", 200, None, [("etag", ETAG_A)]));
+        b.push(Observation::new("HeadObject", "normal", 200, None, [("etag", ETAG_B)]));
+        a.push(Observation::new("PutObject", "other", 200, None, [("etag", ETAG_A)]));
+        b.push(Observation::new(
+            "PutObject",
+            "other",
+            200,
+            Some("InvalidRequest".to_owned()),
+            [("etag", ETAG_A)],
+        ));
+        b[0].status = 201;
+        b[0].headers
+            .insert("x-amz-server-side-encryption-customer-algorithm".to_owned(), "changed".to_owned());
+        b[1].headers
+            .insert("x-amz-server-side-encryption-customer-key-md5".to_owned(), "changed".to_owned());
+        b[1].fields.insert("size".to_owned(), "13".to_owned());
+        let mut expected_a = a.clone();
+        let mut expected_b = b.clone();
+        for expected in [&mut expected_a, &mut expected_b] {
+            for observation in &mut expected[..2] {
+                observation.headers.insert("etag".to_owned(), "<sse-c-etag>".to_owned());
+            }
+        }
+        for observations in [&mut a, &mut b] {
+            normalize_sse_c_etags(observations).expect("valid identity with independent response differences");
+        }
+        let differences = compare(&a, &b);
+        for (op, case, field) in [
+            ("PutObject", "sse-c", "status"),
+            ("PutObject", "sse-c", "header.x-amz-server-side-encryption-customer-algorithm"),
+            ("HeadObject", "sse-c", "header.x-amz-server-side-encryption-customer-key-md5"),
+            ("HeadObject", "sse-c", "body.size"),
+            ("HeadObject", "normal", "header.etag"),
+            ("PutObject", "other", "error_code"),
+        ] {
+            assert!(
+                differences
+                    .iter()
+                    .any(|difference| difference.op == op && difference.case == case && difference.field == field)
+            );
+        }
+        assert_same_observations(&equal_pair.0, &expected_equal);
+        assert_same_observations(&equal_pair.1, &expected_equal);
+        assert_same_observations(&a, &expected_a);
+        assert_same_observations(&b, &expected_b);
+    }
+
+    #[test]
+    fn sse_c_etags_reject_invalid_values_on_each_side() {
+        let plaintext = format!("\"{}\"", md5_hex(b"customer key"));
+        let uppercase_plaintext = plaintext.to_ascii_uppercase();
+        for invalid in [
+            None,
+            Some(""),
+            Some("\"\""),
+            Some("\"0123456789abcdef0123456789abcd\""),
+            Some("\"0123456789abcdef0123456789abcdef01\""),
+            Some("\"\"0123456789abcdef0123456789abcdef\"\""),
+            Some(" \"0123456789abcdef0123456789abcdef\""),
+            Some("\"0123456789abcdef0123456789abcdef\" "),
+            Some("\"0123456789abcdef0123456789abcdef-2\""),
+            Some("\"0123456789abcdef0123456789abcdeé\""),
+            Some("<sse-c-etag>"),
+            Some("W/\"0123456789abcdef0123456789abcdef\""),
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("\"0123456789abcdef0123456789abcdef"),
+            Some("0123456789abcdef0123456789abcdef\""),
+            Some("\"0123456789abcdef0123456789abcde\""),
+            Some("\"0123456789abcdef0123456789abcdef0\""),
+            Some("\"g123456789abcdef0123456789abcdef\""),
+            Some(plaintext.as_str()),
+            Some(uppercase_plaintext.as_str()),
+        ] {
+            for positions in [&[0][..], &[1][..], &[0, 1][..]] {
+                for valid in [ETAG_A, ETAG_B] {
+                    let mut observations = sse_c_pair(valid);
+                    for &index in positions {
+                        if let Some(value) = invalid {
+                            observations[index].headers.insert("etag".to_owned(), value.to_owned());
+                        } else {
+                            observations[index].headers.remove("etag");
+                        }
+                    }
+                    let original = observations.clone();
+                    assert!(
+                        normalize_sse_c_etags(&mut observations).is_err(),
+                        "invalid={invalid:?}, positions={positions:?}"
+                    );
+                    assert_same_observations(&observations, &original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sse_c_etags_reject_inconsistent_failed_or_ambiguous_pairs() {
+        for etag in [ETAG_A, ETAG_B] {
+            let pair = sse_c_pair(etag);
+            let mut invalid_pairs = Vec::new();
+            let mut mismatched = pair.clone();
+            mismatched[1]
+                .headers
+                .insert("etag".to_owned(), if etag == ETAG_A { ETAG_B } else { ETAG_A }.to_owned());
+            invalid_pairs.push(mismatched);
+            let mut case_mismatch = pair.clone();
+            case_mismatch[1].headers.insert("etag".to_owned(), etag.to_ascii_uppercase());
+            invalid_pairs.push(case_mismatch);
+            for index in 0..2 {
+                let mut missing = pair.clone();
+                missing.remove(index);
+                invalid_pairs.push(missing);
+                let mut duplicate = pair.clone();
+                duplicate.push(pair[index].clone());
+                invalid_pairs.push(duplicate);
+                for status in [0, 199, 300, 404, 500] {
+                    let mut failed = pair.clone();
+                    failed[index].status = status;
+                    invalid_pairs.push(failed);
+                }
+                let mut failed = pair.clone();
+                failed[index].error_code = Some("InvalidRequest".to_owned());
+                invalid_pairs.push(failed);
+            }
+            for status in [0, 403, 500, 200] {
+                let mut both_failed = pair.clone();
+                for observation in &mut both_failed {
+                    observation.status = status;
+                    observation.error_code = Some("AccessDenied".to_owned());
+                }
+                invalid_pairs.push(both_failed);
+            }
+            invalid_pairs.push(Vec::new());
+            for original in invalid_pairs {
+                for mut observations in [original.clone(), original.clone()] {
+                    assert!(normalize_sse_c_etags(&mut observations).is_err(), "{original:?}");
+                    assert_same_observations(&observations, &original);
+                }
+            }
+        }
     }
 }

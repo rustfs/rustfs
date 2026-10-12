@@ -3004,6 +3004,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // etag
         let etag = resolve_complete_etag(opts, &uploaded_parts);
 
+        // An upload can contain parts from an older writer or a peer. Until
+        // every part's format is attested, keep its ETag out of keyless lists.
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+
         fi.metadata.insert("etag".to_owned(), etag);
 
         let persist_encryption_original_size = should_persist_encryption_original_size(&fi.metadata);
