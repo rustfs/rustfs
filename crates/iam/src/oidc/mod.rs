@@ -23,9 +23,11 @@ mod transport;
 mod test_support;
 
 pub use config::{
-    OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderConfigSource, OidcProviderValidationResult,
-    SourcedOidcProviderConfig, load_oidc_config_snapshot, load_oidc_provider_configs_from_env,
-    load_oidc_provider_configs_from_server_config,
+    OidcConfigError, OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderConfigInput, OidcProviderConfigSource,
+    OidcProviderValidationInput, OidcProviderValidationResult, OidcSiteReplicationProvider, OidcSiteReplicationSnapshot,
+    SourcedOidcProviderConfig, build_upsert_provider_config, build_validation_provider_config, delete_persisted_provider_config,
+    load_oidc_config_snapshot, load_oidc_provider_configs_from_env, load_oidc_provider_configs_from_server_config,
+    persisted_provider_secret, upsert_persisted_provider_config, validate_mutable_provider_id,
 };
 pub use provider::validate_oidc_provider_config_with_extra_root_ca;
 pub use runtime::{OidcSys, StandardOidcAdapter};

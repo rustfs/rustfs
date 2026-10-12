@@ -3959,39 +3959,63 @@ fn scanner_concurrency_limit_handles_no_available_work() {
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_foreground_reads() {
+fn scanner_concurrency_limit_is_stable_across_foreground_read_transitions() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    crate::set_foreground_read_activity(8);
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    for foreground_activity in [0, 1, 8, 0] {
+        crate::set_foreground_read_activity(foreground_activity);
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+        assert_eq!(scanner_concurrency_limit(1, 4), 1);
+        assert_eq!(scanner_concurrency_limit(8, 0), 0);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), true), 1);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), false), 3);
+    }
     crate::reset_foreground_read_activity_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_shared_foreground_pressure() {
+fn scanner_concurrency_limit_is_stable_across_shared_foreground_pressure() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
-        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Open).with_counts(Some(2), None, Some(16)),
-    ]));
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
-
+    for (state, active) in [
+        (AdmissionState::Open, Some(0)),
+        (AdmissionState::Open, Some(2)),
+        (AdmissionState::Saturated, None),
+        (AdmissionState::Open, Some(0)),
+    ] {
+        install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(active, None, Some(16)),
+        ]));
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+    }
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_streaming_reads() {
+fn scanner_dispatch_limits_preserve_configured_caps_during_streaming_reads() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    let _guard = crate::ForegroundReadGuard::new();
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    temp_env::with_vars(
+        [
+            (ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("3")),
+            (ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("2")),
+        ],
+        || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            for streaming in [false, true, false] {
+                let _guard = streaming.then(crate::ForegroundReadGuard::new);
+                assert_eq!(scanner_max_concurrent_set_scans(4), 3);
+                assert_eq!(scanner_max_concurrent_disk_scans(4), 2);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_set_scans(4), true), 1);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_disk_scans(4), true), 1);
+            }
+        },
+    );
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[test]

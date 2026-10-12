@@ -81,6 +81,14 @@ Every temporary compatibility path carries a `RUSTFS_COMPAT_TODO(<id>)` source m
 
 The server-config model (`Config`, `KV`, `KVS`) and the global server-config snapshot accessors are owned by `rustfs_config::server_config`; ECStore keeps persistence, storage-class state, and startup wiring, and its public facades must not re-export those symbols. See [config-model-boundary-adr.md](config-model-boundary-adr.md).
 
+## OIDC Ownership
+
+`crates/iam/src/oidc/` owns provider configuration, discovery, HTTP transport, login state, and the OIDC runtime. `crates/iam/src/federation/` owns verified identity transactions and authorization mapping; its production code does not import concrete OIDC runtime or provider configuration types. Production `FederatedAuthorization` values are constructed by `CoreFederatedAuthorizationMapper` in `crates/iam/src/federation/mapper.rs`.
+
+`rustfs/src/startup_auth.rs` constructs `StandardOidcAdapter` and publishes the federation service with its OIDC query as one runtime pair. `AppContext` stores and publishes that pair through `FederatedIdentityRuntimeSnapshot`; consumers receive interfaces rather than constructing a second OIDC runtime. `scripts/check_oidc_architecture_boundaries.sh` enforces these boundaries through the existing architecture guard, including the Keycloak workflow path for `crates/iam/src/oidc/`.
+
+`crates/iam/src/oidc/config.rs` owns OIDC configuration input, validation, persisted KVS conversion, and `OidcSiteReplicationSnapshot`. `rustfs/src/admin/service/oidc_config.rs` owns stored configuration reads, compare-and-save updates, restart comparison, and provider discovery validation; the OIDC Admin handler translates HTTP requests and errors. `OidcConfigQuery::site_replication_snapshot()` returns only the provider ID, claim name, role policy, client ID, and hashed client secret needed by site replication. `rustfs/src/admin/handlers/site_replication.rs` maps this narrow view to its existing response format without reading raw OIDC credentials. The Keycloak workflow tracks the Admin configuration service path along with IAM OIDC code.
+
 ## Required Architecture Documents
 
 The guard requires the documents and section headings listed in its `require_source_contains` entries (`scripts/check_architecture_migration_rules.sh`); the directory index is [README.md](README.md).

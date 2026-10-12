@@ -374,16 +374,6 @@ pub(crate) fn runtime_tls_enabled() -> bool {
     runtime_tls_enabled_with(endpoints.as_ref())
 }
 
-pub(crate) fn hash_client_secret(secret: Option<&str>) -> String {
-    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
-        return String::new();
-    };
-
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    URL_SAFE_NO_PAD.encode_to_string(hasher.finalize())
-}
-
 pub(crate) fn loopback_replication_targets_allowed() -> bool {
     std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")

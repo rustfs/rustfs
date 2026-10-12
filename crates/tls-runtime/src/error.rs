@@ -23,6 +23,38 @@ pub enum TlsRuntimeError {
     DirectoryNotFound { path: PathBuf },
     #[error("TLS path is not a directory: {path}")]
     NotADirectory { path: PathBuf },
+    #[error("TLS source I/O error at {path}: {source}")]
+    SourceIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("incomplete TLS certificate/private key pair for {name}")]
+    IncompleteIdentity { name: String },
+    #[error("invalid TLS certificate material for {name}: {reason}")]
+    InvalidCertificate { name: String, reason: String },
+    #[error("invalid TLS private key for {name}: {reason}")]
+    InvalidPrivateKey { name: String, reason: String },
+    #[error("TLS certificate/private key validation failed for {name}: {source}")]
+    InvalidCertifiedKey {
+        name: String,
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("invalid TLS trust anchor in {name}: {source}")]
+    InvalidTrustAnchor {
+        name: String,
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("TLS certificate for {name} is outside its validity interval")]
+    CertificateValidity { name: String },
+    #[error("TLS certificate for {name} does not permit server authentication")]
+    InvalidServerEku { name: String },
+    #[error("TLS certificate for {name} does not permit client authentication")]
+    InvalidClientEku { name: String },
+    #[error("TLS source loading task failed: {0}")]
+    SourceTaskJoin(#[from] tokio::task::JoinError),
     #[error("TLS material error: {0}")]
     Material(String),
     #[error("TLS publication error: {0}")]

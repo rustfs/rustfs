@@ -27,11 +27,11 @@ mod tests {
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
         apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, is_etag_equal,
-        matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
-        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
-        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
+        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
+        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
+        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
+        validate_list_object_unordered_with_delimiter,
     };
     use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
@@ -1191,30 +1191,72 @@ mod tests {
     }
 
     #[test]
-    fn test_is_etag_equal() {
-        // [1] Header ETag is "*", should return true (match any object ETag)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "*"));
+    fn test_read_etag_comparison() {
+        for (object_etag, condition, matches) in [
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "*", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "\"d41d8cd98f00b204e9800998ecf8427e\"", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e", true),
+            ("\"12345\"", "\"67890\", \"12345\", \"abcde\"", true),
+            ("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  ", true),
+            ("\"12345\"", "\"67890\"", false),
+            ("\"12345\"", "\"67890\", \"abcde\"", false),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(object_etag.to_owned()),
+                ..Default::default()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(condition).unwrap());
+            let result = check_preconditions(&headers, &info);
+            if matches {
+                assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
 
-        // [2] Exact match (both with double quotes)
-        assert!(is_etag_equal(
-            "\"d41d8cd98f00b204e9800998ecf8427e\"",
-            "\"d41d8cd98f00b204e9800998ecf8427e\""
-        ));
-
-        // [3] Exact match (object ETag with quotes, header ETag without)
-        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e"));
-
-        // [4] Header ETag has multiple values (comma-separated), one matches
-        assert!(is_etag_equal("\"12345\"", "\"67890\", \"12345\", \"abcde\""));
-
-        // [5] Header ETag has multiple values with spaces, one matches after trim
-        assert!(is_etag_equal("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  "));
-
-        // [6] No match (different ETag)
-        assert!(!is_etag_equal("\"12345\"", "\"67890\""));
-
-        // [7] No match in multiple values
-        assert!(!is_etag_equal("\"12345\"", "\"67890\", \"abcde\""));
+    #[test]
+    fn test_read_etag_comparison_requires_complete_field() {
+        for (etag, condition, matches) in [
+            ("abc", "\"other\"\"abc\"", false),
+            ("abc", "\"abc\"garbage\"", false),
+            ("abc", "\"abc\", \"other\"\"different\"", false),
+            ("abc", "\"abc\", W/ \"other\"", false),
+            ("abc", "\"abc\", \"contains space\"", false),
+            ("abc", "\"abc\", *", false),
+            ("abc", "\"other\", , \"abc\"", true),
+            ("abc", ", \"abc\",,", true),
+            ("a,b", "\"other\", \"a,b\"", true),
+            ("", ",,,", false),
+            ("", "\"\"", true),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(etag.to_owned()),
+                ..Default::default()
+            };
+            for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name.clone(), HeaderValue::from_str(condition).unwrap());
+                let result = check_preconditions(&headers, &info);
+                if name == http::header::IF_MATCH {
+                    if matches {
+                        assert!(result.is_ok(), "{condition}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::PreconditionFailed, "{condition}");
+                    }
+                } else if matches {
+                    // The empty ETag case validates matching via If-Match above;
+                    // emitting that invalid stored response validator fails closed.
+                    assert!(result.is_err(), "{condition}");
+                    if !etag.is_empty() {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified, "{condition}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{condition}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1407,6 +1449,77 @@ mod tests {
             ..Default::default()
         };
         assert!(check_preconditions(&headers18, &info18).is_ok());
+    }
+
+    #[test]
+    fn test_check_preconditions_rfc304() {
+        let modified = OffsetDateTime::from_unix_timestamp(1700000000).expect("valid timestamp");
+        let mut info = ObjectInfo {
+            etag: Some("abc".to_owned()),
+            mod_time: Some(modified),
+            expires: Some(modified + time::Duration::days(1)),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        info.user_defined = std::collections::HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into();
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("W/\"abc\""));
+        let error = check_preconditions(&headers, &info).expect_err("weak ETag must validate the cache");
+        assert_eq!(error.code(), &S3ErrorCode::NotModified);
+        let response = error.headers().expect("304 carries cache headers");
+        assert_eq!(response["etag"], "\"abc\"");
+        assert_eq!(response["cache-control"], "max-age=60");
+        assert!(response.contains_key("expires"));
+        assert!(response.contains_key("last-modified"));
+        assert_eq!(response["x-amz-version-id"], "null");
+
+        headers.insert("if-match", HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            check_preconditions(&headers, &info).expect_err("If-Match is first").code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        headers.remove("if-none-match");
+        headers.insert("if-match", HeaderValue::from_static("W/\"abc\""));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("If-Match requires strong comparison")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("\"other\""));
+        let date = modified.format(&crate::storage::RFC1123).expect("format timestamp");
+        headers.insert("if-modified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        assert!(check_preconditions(&headers, &info).is_ok(), "If-None-Match suppresses the date");
+        headers.clear();
+        headers.insert("if-unmodified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        info.mod_time = Some(modified + time::Duration::seconds(1));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("next second was modified")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        info.etag = None;
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("existing object wildcard needs no ETag")
+                .code(),
+            &S3ErrorCode::NotModified
+        );
+        headers.clear();
+        headers.insert("if-match", HeaderValue::from_static("*"));
+        assert!(check_preconditions(&headers, &info).is_ok());
+        headers.insert("if-match", HeaderValue::from_static("\"other\", \"abc,def\""));
+        info.etag = Some("abc,def".to_owned());
+        assert!(
+            check_preconditions(&headers, &info).is_ok(),
+            "commas inside an opaque tag are not list delimiters"
+        );
     }
 
     #[test]

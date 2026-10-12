@@ -180,6 +180,8 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{DiskAPI, DiskOption, new_disk};
         pub(crate) use crate::storage::storage_api::{
             ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
             tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,

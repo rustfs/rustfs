@@ -289,13 +289,9 @@ async fn client(
     >,
     NetworkPeerProbeError,
 > {
-    node_service_time_out_client_for_class(
-        &address.to_owned(),
-        TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
-        class,
-    )
-    .await
-    .map_err(|_| NetworkPeerProbeError::Unreachable)
+    node_service_time_out_client_for_class(address, TonicInterceptor::Signature(gen_tonic_signature_interceptor()), class)
+        .await
+        .map_err(|_| NetworkPeerProbeError::Unreachable)
 }
 
 fn ping_request(payload: &[u8]) -> PingRequest {

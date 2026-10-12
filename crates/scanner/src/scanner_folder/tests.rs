@@ -2174,6 +2174,59 @@ async fn test_scan_folder_skips_unreadable_child_directory() {
 
 #[tokio::test]
 #[serial]
+async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+    // The parent listed `gone/`, then a concurrent delete removed it before the
+    // child scan opened it.
+    std::fs::create_dir_all(temp_dir.join("bucket")).expect("failed to create bucket dir");
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let folder = CachedFolder {
+        name: "bucket/gone".to_string(),
+        parent: Some(hash_path("bucket")),
+        object_heal_prob_div: 1,
+    };
+
+    let mut into = DataUsageEntry::default();
+    let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+    assert!(result.is_ok(), "expected a child removed before open to be skipped, got {result:?}");
+    assert_eq!(into.objects, 0);
+    assert_eq!(into.size, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+
+    let mut into = DataUsageEntry::default();
+    let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+    assert!(
+        matches!(&result, Err(ScannerError::Io(e)) if e.kind() == ErrorKind::NotFound),
+        "expected a missing bucket root to keep reporting NotFound, got {result:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
