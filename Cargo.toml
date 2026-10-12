@@ -156,7 +156,7 @@ futures-lite = "2.6.1"
 futures-util = "0.3.34"
 pollster = "1.0.1"
 pulsar = { default-features = false, version = "6.9.0" }
-lapin = { default-features = false, version = "4.12.0" }
+lapin = { default-features = false, version = "4.12.1" }
 hyper = { version = "1.12.0" }
 hyper-rustls = { default-features = false, version = "0.27.10" }
 hyper-util = { version = "0.1.21" }
@@ -172,7 +172,7 @@ tokio = { version = "1.53.2" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
 tokio-stream = { version = "0.1.19" }
 tokio-test = "0.4.6"
-tokio-util = { version = "0.7.19" }
+tokio-util = { version = "0.7.20" }
 tonic = { version = "0.14.6" }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
@@ -200,7 +200,7 @@ rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.229" }
 serde_ignored = { version = "0.1" }
 serde_with = { version = "3", default-features = false, features = ["macros", "std"] }
-serde_json = { version = "1.0.151" }
+serde_json = { version = "1.0.154" }
 serde_urlencoded = "0.7.1"
 
 # Cryptography and Security
@@ -326,7 +326,7 @@ s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fc
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.4"
-smallvec = { version = "1.16.2" }
+smallvec = { version = "1.16.3" }
 compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
@@ -345,7 +345,7 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.27.0" }
+uuid = { version = "1.28.0" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
@@ -354,25 +354,25 @@ windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
 zip = "9.0.2"
-zstd = "0.14.0"
+zstd = "0.14.2"
 
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
 dial9 = { version = "0.5.3", default-features = false }
-opentelemetry = { version = "0.33.0" }
-opentelemetry-appender-tracing = { version = "0.33.0" }
-opentelemetry-otlp = { version = "0.33.0" }
-opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["metrics", "gen-tonic-messages"] }
-opentelemetry_sdk = { version = "0.33.0" }
-opentelemetry-semantic-conventions = { version = "0.33.0" }
-opentelemetry-stdout = { version = "0.33.0" }
+opentelemetry = { version = "0.33.1" }
+opentelemetry-appender-tracing = { version = "0.33.1" }
+opentelemetry-otlp = { version = "0.33.1" }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["metrics", "gen-tonic-messages"] }
+opentelemetry_sdk = { version = "0.33.1" }
+opentelemetry-semantic-conventions = { version = "0.33.1" }
+opentelemetry-stdout = { version = "0.33.1" }
 pyroscope = { version = "2.1.1" }
 
 # FTP and SFTP
 libunftp = { version = "0.23.1" }
 unftp-core = "0.1.0"
-suppaftp = { version = "12.1.1" }
+suppaftp = { version = "12.2.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 russh = { version = "0.64.1" }
 russh-sftp = "3.0.1"
@@ -383,7 +383,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.6" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.28.5", default-features = false }
+hotpath = { version = "0.28.6", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
