@@ -17,6 +17,7 @@ use crate::runtime_sources::current_outbound_tls_generation as runtime_current_o
 use crate::storage_api::startup::runtime_sources::{InstanceContext, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
+pub(crate) use rustfs_tls_runtime::load_global_outbound_tls_state as current_outbound_tls_state;
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

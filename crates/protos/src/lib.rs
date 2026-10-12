@@ -25,8 +25,8 @@ use rustfs_common::{cache_connection, cached_connection, evict_connection_with_l
 use std::{
     collections::HashMap,
     error::Error,
-    sync::LazyLock,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -59,6 +59,44 @@ const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+// Lock order: generation metadata, then the common connection cache. The dial
+// registry's standard mutex is released before waiting on any async lock.
+static DIAL_LOCK_REGISTRY: LazyLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+struct DialLock {
+    key: String,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl DialLock {
+    fn for_key(key: &str) -> Self {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, lock| lock.strong_count() != 0);
+        let mutex = registry.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let mutex = Arc::new(Mutex::new(()));
+            registry.insert(key.to_string(), Arc::downgrade(&mutex));
+            mutex
+        });
+        Self {
+            key: key.to_string(),
+            mutex,
+        }
+    }
+}
+
+impl Drop for DialLock {
+    fn drop(&mut self) {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.mutex) == 1
+            && registry
+                .get(&self.key)
+                .is_some_and(|slot| Weak::ptr_eq(slot, &Arc::downgrade(&self.mutex)))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
 static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
@@ -2870,6 +2908,53 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
     format!("{addr}\u{0}bulk\u{0}{idx}")
 }
 
+async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<Channel> {
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        return cached_connection(cache_key).await;
+    }
+    let mut generations = TLS_GENERATION_CACHE.lock().await;
+    let Some(channel) = cached_connection(cache_key).await else {
+        generations.remove(cache_key);
+        return None;
+    };
+    if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
+        return Some(channel);
+    }
+    evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+    generations.remove(cache_key);
+    runtime_sources::record_stale_grpc_channel_tls_generation();
+    None
+}
+
+async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channel, generation: Option<u64>) -> bool {
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        cache_connection(cache_key.to_string(), channel.clone()).await;
+        return true;
+    }
+    let mut generations = TLS_GENERATION_CACHE.lock().await;
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    cache_connection(cache_key.to_string(), channel.clone()).await;
+    // Publication can advance while the common cache's async lock is awaited.
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+        generations.remove(cache_key);
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    if let Some(generation) = generation {
+        enforce_tls_generation_cache_bound(&mut generations, generation, cache_key);
+        generations.insert(cache_key.to_string(), generation);
+    }
+    true
+}
+
+fn channel_acquisition_timeout(_: tokio::time::error::Elapsed) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "internode channel acquisition deadline elapsed")
+}
+
 /// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
 ///
 /// For [`ChannelClass::Control`] (or whenever isolation is disabled) this is exactly the legacy
@@ -2878,22 +2963,27 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
 /// per-peer bulk pool and dialed on demand, physically isolating large transfers from
 /// control-plane RPCs.
 pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
-    if class == ChannelClass::Control || !channel_isolation_enabled() {
-        if let Some(channel) = cached_connection(addr).await {
-            debug!("Using cached control gRPC channel for: {}", addr);
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    tokio::time::timeout_at(deadline, async {
+        if class == ChannelClass::Control || !channel_isolation_enabled() {
+            if let Some(channel) = cached_channel_for_tls_generation(addr, addr).await {
+                debug!("Using cached control gRPC channel for: {}", addr);
+                return Ok(channel);
+            }
+            return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+        }
+
+        let pool_size = bulk_channel_pool_size();
+        let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
+        let cache_key = bulk_cache_key(addr, idx);
+        if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
+            debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
             return Ok(channel);
         }
-        return create_new_channel(addr).await;
-    }
-
-    let pool_size = bulk_channel_pool_size();
-    let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
-    let cache_key = bulk_cache_key(addr, idx);
-    if let Some(channel) = cached_connection(&cache_key).await {
-        debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
-        return Ok(channel);
-    }
-    build_channel(addr, &cache_key).await
+        build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
 }
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
@@ -2917,7 +3007,8 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
 /// channels to the same peer be cached independently.
 async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
-    build_channel_with_timeout(dial_addr, cache_key, internode_rpc_timeout()).await
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
 }
 
 /// A separate channel deadline for slow authenticated recovery work. The cache
@@ -2945,19 +3036,48 @@ impl Error for DeleteRecoveryChannelError {
 
 pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
     let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
-    let generation = runtime_sources::outbound_tls_state().await.generation.0;
-    let current_generation = TLS_GENERATION_CACHE.lock().await.get(&cache_key).copied();
-    if current_generation == Some(generation)
-        && let Some(channel) = cached_connection(&cache_key).await
-    {
-        return Ok(channel);
-    }
-    build_channel_with_timeout(addr, &cache_key, rpc_timeout)
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(addr, &cache_key, deadline, rpc_timeout)
         .await
         .map_err(DeleteRecoveryChannelError::Connection)
 }
 
-async fn build_channel_with_timeout(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<Channel, Box<dyn Error>> {
+async fn build_channel_until(
+    dial_addr: &str,
+    cache_key: &str,
+    deadline: tokio::time::Instant,
+    rpc_timeout: Duration,
+) -> Result<Channel, Box<dyn Error>> {
+    tokio::time::timeout_at(deadline, async {
+        if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+            return Ok(channel);
+        }
+        let slot = DialLock::for_key(cache_key);
+        let _guard = slot.mutex.lock().await;
+        loop {
+            // A successful concurrent miss has already populated this exact key.
+            if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                return Ok(channel);
+            }
+            let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
+            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
+                && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
+            {
+                debug!(
+                    "Successfully created and cached gRPC channel to: {} (cache key: {})",
+                    dial_addr, cache_key
+                );
+                return Ok(channel);
+            }
+            // A generation published during dial cannot be returned; rebuilding
+            // shares the original deadline with lock wait and all earlier dials.
+        }
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
+}
+
+async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
@@ -2991,18 +3111,10 @@ async fn build_channel_with_timeout(dial_addr: &str, cache_key: &str, rpc_timeou
         connector = connector.initial_connection_window_size(conn_window);
     }
 
-    let outbound_tls = runtime_sources::outbound_tls_state().await;
-    let generation = outbound_tls.generation.0;
-    let mut stale_generation = false;
-    {
-        let generation_cache = TLS_GENERATION_CACHE.lock().await;
-        if let Some(cached_generation) = generation_cache.get(cache_key)
-            && *cached_generation != generation
-        {
-            stale_generation = true;
-        }
-    }
+    let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        let outbound_tls = runtime_sources::outbound_tls_state().await;
+        generation = Some(outbound_tls.generation.0);
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
@@ -3050,21 +3162,7 @@ async fn build_channel_with_timeout(dial_addr: &str, cache_key: &str, rpc_timeou
         }
     };
 
-    cache_connection(cache_key.to_string(), channel.clone()).await;
-    {
-        let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
-        enforce_tls_generation_cache_bound(&mut generation_cache, generation, cache_key);
-        generation_cache.insert(cache_key.to_string(), generation);
-    }
-    if stale_generation {
-        runtime_sources::record_stale_grpc_channel_tls_generation();
-    }
-
-    debug!(
-        "Successfully created and cached gRPC channel to: {} (cache key: {})",
-        dial_addr, cache_key
-    );
-    Ok(channel)
+    Ok((channel, generation))
 }
 
 /// Evict a connection from the cache after a failure.
@@ -3124,6 +3222,8 @@ mod tests {
     use super::*;
     use prost::Message as _;
     use std::sync::Mutex;
+
+    static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3246,6 +3346,268 @@ mod tests {
             "duplicate response send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
+    }
+
+    #[tokio::test]
+    async fn tls02_stale_https_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-stale-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        let stale_generation = generation.checked_add(1).unwrap_or(0);
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), stale_generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT stale HTTPS cache entry cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT stale entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_missing_https_generation_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-missing-generation.invalid:9000";
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT HTTPS channel without a generation cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT unbound entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_delete_recovery_channels_reject_unbound_and_stale_https_cache() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve recovery peer address");
+        let addr = format!("https://{}", listener.local_addr().expect("recovery peer address"));
+        drop(listener);
+        let rpc_timeout = Duration::from_secs(20);
+        let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+        let generation = runtime_sources::outbound_tls_generation();
+        for cached_generation in [None, Some(generation.checked_add(1).unwrap_or(0))] {
+            cache_connection(cache_key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            if let Some(generation) = cached_generation {
+                TLS_GENERATION_CACHE.lock().await.insert(cache_key.clone(), generation);
+            } else {
+                TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+            }
+            assert!(
+                create_channel_with_timeout(&addr, rpc_timeout).await.is_err(),
+                "recovery must dial the unavailable HTTPS peer instead of returning an unbound or stale cached channel"
+            );
+            assert!(!rustfs_common::has_cached_connection(&cache_key).await);
+            assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(&cache_key));
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_current_https_control_and_bulk_cache_entries_are_reused() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-current-generation.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTPS channel at the canonical generation is reused"
+            );
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_http_control_and_bulk_cache_ignore_tls_generation() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-http-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE
+                .lock()
+                .await
+                .insert(key.clone(), generation.checked_add(1).unwrap_or(0));
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache is independent of TLS generations"
+            );
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache needs no TLS generation metadata"
+            );
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_captured_identity_is_immutable_and_late_dial_keeps_its_actual_generation() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let first_generation = previous.generation.0.checked_add(1).expect("test generation capacity");
+        let first = OutboundTlsMaterial {
+            root_ca_pem: b"root-a".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-a".to_vec(),
+                key_pem: b"test-key-a".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation), &first).await;
+        let captured = runtime_sources::outbound_tls_state().await;
+        let second = OutboundTlsMaterial {
+            root_ca_pem: b"root-b".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-b".to_vec(),
+                key_pem: b"test-key-b".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 1), &second).await;
+        let current = runtime_sources::outbound_tls_state().await;
+        let addr = "https://tls02-late-dial.invalid:9000";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cached = cache_dialed_channel(addr, addr, &channel, Some(captured.generation.0)).await;
+        let original_key = captured.mtls_identity.as_ref().expect("captured identity").key_pem.clone();
+        let current_key = current.mtls_identity.as_ref().expect("current identity").key_pem.clone();
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 2), &restore).await;
+        assert_eq!(
+            original_key, b"test-key-a",
+            "TLS02_INVARIANT captured identity cannot change with publication"
+        );
+        assert_eq!(captured.root_ca_pem.as_deref(), Some(b"root-a".as_slice()));
+        assert_eq!(current_key, b"test-key-b");
+        assert!(!cached, "TLS02_INVARIANT late dial cannot be relabeled with the current generation");
+        assert!(
+            !rustfs_common::has_cached_connection(addr).await,
+            "TLS02_INVARIANT late stale dial is never cached"
+        );
+        assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(addr));
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP/2 test server");
+        let addr = format!("http://{}", listener.local_addr().expect("test server address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+        for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+            let mut tasks = Vec::new();
+            for _ in 0..32 {
+                let dial_addr = addr.clone();
+                let cache_key = key.clone();
+                tasks.push(tokio::spawn(async move {
+                    build_channel(&dial_addr, &cache_key).await.map_err(|error| error.to_string())
+                }));
+            }
+            for task in tasks {
+                let channel = task.await.expect("channel acquisition task").expect("real HTTP/2 dial");
+                drop(channel);
+            }
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT completed miss groups leave no lock entries"
+            );
+        }
+        // Tonic returns its channel before the server task necessarily polls the
+        // already-established sockets out of the listener's accept queue.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let connections = accepted.load(Ordering::SeqCst);
+        evict_connection_with_log_level(&addr, ConnectionEvictionLogLevel::Debug).await;
+        evict_connection_with_log_level(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(connections, 2, "TLS02_INVARIANT 32 misses per control/bulk key dial once each");
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_waiters_share_bounded_total_deadlines_and_release_registry() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-contended-dial.invalid:9000";
+        let owner = DialLock::for_key(addr);
+        let guard = owner.mutex.lock().await;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            tasks.push(tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+                let result = build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+                result.err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                })
+            }));
+        }
+        let completed = tokio::time::timeout(Duration::from_millis(250), async {
+            for task in tasks {
+                assert!(
+                    task.await.expect("deadline waiter"),
+                    "TLS02_INVARIANT wait and rebuild share a typed timeout"
+                );
+            }
+        })
+        .await;
+        drop(guard);
+        drop(owner);
+        assert!(
+            completed.is_ok(),
+            "TLS02_INVARIANT eight waiters cannot accumulate eight connect timeouts"
+        );
+        assert!(
+            !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(addr),
+            "TLS02_INVARIANT cancelled waiters release the lock registry"
+        );
+    }
+
+    #[test]
+    fn tls02_dial_registry_reclaims_unique_keys_and_preserves_live_lock_identity() {
+        for index in 0..1000 {
+            let key = format!("http://tls02-registry-{index}.invalid");
+            let first = DialLock::for_key(&key);
+            let second = DialLock::for_key(&key);
+            assert!(Arc::ptr_eq(&first.mutex, &second.mutex), "TLS02_INVARIANT one live lock per cache key");
+            drop(first);
+            assert!(DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key));
+            drop(second);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT last owner removes its own weak entry"
+            );
+        }
     }
 
     #[test]

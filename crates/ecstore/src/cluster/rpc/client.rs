@@ -24,10 +24,11 @@ use crate::cluster::rpc::{gen_tonic_replay_scope_headers, gen_tonic_signature_he
 #[cfg(test)]
 use crate::cluster::rpc::{tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers};
 use crate::disk::error::{DiskError, Error as DiskErrorType, RpcStatusError};
+#[cfg(test)]
 use crate::runtime::sources as runtime_sources;
 use http::{Request as HttpRequest, Response as HttpResponse, Uri};
 use rustfs_protos::{
-    ChannelClass, create_new_channel, get_channel_for_class,
+    ChannelClass, get_channel_for_class,
     proto_gen::node_service::{
         heal_control_service_client::HealControlServiceClient, node_service_client::NodeServiceClient,
         scanner_control_service_client::ScannerControlServiceClient,
@@ -66,12 +67,9 @@ pub(crate) async fn scanner_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> crate::error::Result<ScannerControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = match runtime_sources::cached_node_channel(addr).await {
-        Some(channel) => channel,
-        None => create_new_channel(addr)
-            .await
-            .map_err(|err| crate::error::Error::other(err.to_string()))?,
-    };
+    let channel = get_channel_for_class(addr, ChannelClass::Control)
+        .await
+        .map_err(|err| crate::error::Error::other(err.to_string()))?;
     let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
     let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
     Ok(ScannerControlServiceClient::with_interceptor(channel, interceptor)
@@ -84,10 +82,7 @@ pub async fn heal_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> Result<HealControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = match runtime_sources::cached_node_channel(addr).await {
-        Some(channel) => channel,
-        None => create_new_channel(addr).await?,
-    };
+    let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
     let max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
     let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
     Ok(HealControlServiceClient::with_interceptor(channel, interceptor)
@@ -100,10 +95,7 @@ pub async fn tier_mutation_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = match runtime_sources::cached_node_channel(addr).await {
-        Some(channel) => channel,
-        None => create_new_channel(addr).await?,
-    };
+    let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
     let max_message_size = rustfs_protos::TIER_MUTATION_RPC_MAX_MESSAGE_SIZE;
     let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
     Ok(TierMutationControlServiceClient::with_interceptor(channel, interceptor)
@@ -123,17 +115,7 @@ pub async fn node_service_time_out_client_for_class(
     class: ChannelClass,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = match class {
-        ChannelClass::Control => match runtime_sources::cached_node_channel(addr).await {
-            Some(channel) => {
-                debug!("Using cached gRPC channel for: {}", addr);
-                channel
-            }
-            // No cached connection, create new one.
-            None => create_new_channel(addr).await?,
-        },
-        ChannelClass::Bulk => get_channel_for_class(addr, ChannelClass::Bulk).await?,
-    };
+    let channel = get_channel_for_class(addr, class).await?;
 
     let max_message_size = rustfs_protos::internode_rpc_max_message_size();
     let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
@@ -646,6 +628,40 @@ mod tests {
         );
         server.abort();
         rustfs_protos::evict_failed_connection(&addr).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_client_factories_do_not_reuse_https_channels_without_tls_generation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve local address");
+        let addr = format!("https://{}", listener.local_addr().expect("local address"));
+        drop(listener);
+        for factory in 0..4 {
+            let placeholder = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+            runtime_sources::cache_test_node_channel(addr.clone(), placeholder).await;
+            let interceptor = TonicInterceptor::NoOp(NoOpInterceptor);
+            let _result = match factory {
+                0 => scanner_control_time_out_client(&addr, interceptor)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                1 => heal_control_time_out_client(&addr, interceptor)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                2 => tier_mutation_control_time_out_client(&addr, interceptor)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                _ => node_service_time_out_client(&addr, interceptor)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            };
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "factory {factory} must evict an unbound HTTPS cache entry before attempting a fresh dial"
+            );
+        }
     }
 
     #[derive(Clone)]

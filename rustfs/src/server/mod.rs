@@ -29,6 +29,7 @@ pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
 pub mod tls_material;
+pub(crate) mod tls_publish;
 
 #[cfg(feature = "http3")]
 mod http3;
@@ -85,6 +86,7 @@ pub(crate) use readiness::collect_node_readiness_report;
 pub use readiness::publish_ready_when_runtime_ready;
 pub(crate) use readiness::snapshot_dependency_readiness_report;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
+pub(crate) use ssec_transport::NativeTlsTransport;
 
 pub use crate::shared_types::RemoteAddr;
 
