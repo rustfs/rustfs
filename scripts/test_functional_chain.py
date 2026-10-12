@@ -101,6 +101,19 @@ class CandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "manually dispatched"):
                 candidate.resolve(123, 2)
 
+    def test_validation_workflow_rejects_legacy_manifest_schema(self):
+        manifest = {**self.manifest}
+        payload_buffer = io.BytesIO()
+        with zipfile.ZipFile(payload_buffer, "w") as archive:
+            archive.writestr("validation-candidate-123-2.json", json.dumps(manifest))
+        payload = payload_buffer.getvalue()
+        artifact = {"id": 789, "name": "validation-candidate-123-2", "expired": False,
+                    "size_in_bytes": len(payload), "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                    "workflow_run": {"id": 123, "head_sha": "a" * 40}}
+        run = {**self.run, "path": ".github/workflows/rustfs-validation-package.yml"}
+        with self.assertRaisesRegex(ValueError, "schema-3"):
+            candidate.read_manifest(payload, artifact, run)
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):

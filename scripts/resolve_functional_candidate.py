@@ -80,7 +80,13 @@ def read_json_artifact(archive, artifact, run, expected_name, member, max_json=1
 def read_manifest(archive, artifact, run):
     prefix = "validation-candidate" if run.get("path") == ".github/workflows/rustfs-validation-package.yml" else "nightly-candidate"
     name = f"{prefix}-{run['id']}-{run['run_attempt']}"
-    return validate_manifest(read_json_artifact(archive, artifact, run, name, name + ".json"), run)
+    manifest = validate_manifest(read_json_artifact(archive, artifact, run, name, name + ".json"), run)
+    if prefix == "validation-candidate":
+        require(manifest["schema"] == 3 and manifest["channel"] == "validation",
+                "validation workflow requires a schema-3 validation candidate")
+    else:
+        require(manifest["schema"] != 3, "nightly workflow cannot publish a validation candidate")
+    return manifest
 
 
 def resolve(run_id, attempt):
