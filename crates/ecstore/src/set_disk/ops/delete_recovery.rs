@@ -29,7 +29,7 @@ use uuid::Uuid;
 const DISCOVERY_PAGE_SIZE: u32 = 128;
 const MAX_DISCOVERED_TRANSACTIONS: usize = 1_000_000;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteRecoverySummary {
     pub discovered: usize,
     pub committed: usize,
@@ -37,6 +37,8 @@ pub(crate) struct DeleteRecoverySummary {
     pub blocked: usize,
     pub pending: usize,
     pub reclaimed: usize,
+    /// Observed removals for this exact key, not aggregated across prefixes.
+    pub removed_versions: HashSet<Uuid>,
     /// Read-only evidence for ordinary missing-key S3 semantics. This never
     /// authorizes settlement while a configured participant is unavailable.
     pub no_transactions_at_quorum: bool,
@@ -191,6 +193,7 @@ async fn settle_group(
     action: impl Fn(&DeleteRecoveryInspection) -> Option<DeleteRecoveryAction> + Sync,
     can_commit: &(impl Fn() -> bool + Sync + ?Sized),
     namespace_owner: Option<&Arc<dyn Send + Sync>>,
+    removed_versions: &mut HashSet<Uuid>,
 ) -> Result<bool> {
     let results = join_all(disks.iter().zip(copies.iter()).map(|(disk, copy)| {
         let action = action(copy);
@@ -214,7 +217,22 @@ async fn settle_group(
     let mut pending = false;
     for (copy, result) in copies.iter_mut().zip(results) {
         match result {
-            Ok(Some(next)) => *copy = next,
+            Ok(Some(next)) => {
+                if copy.current_digest != next.current_digest {
+                    let retained: HashSet<_> = next
+                        .current_versions
+                        .iter()
+                        .map(|v| v.version_id.unwrap_or_default())
+                        .collect();
+                    removed_versions.extend(
+                        copy.current_versions
+                            .iter()
+                            .map(|v| v.version_id.unwrap_or_default())
+                            .filter(|id| !retained.contains(id)),
+                    );
+                }
+                *copy = next;
+            }
             Ok(None) => {}
             Err(DiskError::DiskOngoingReq) => pending = true,
             Err(error) => return Err(error),
@@ -469,6 +487,8 @@ impl SetDisks {
             }
             all_states.insert(transaction, complete);
         }
+        // Validate causal authority before prerequisite repair can publish metadata.
+        let transaction_order = causal_transaction_order(&all_states)?;
         let prerequisite = if repair_marker_source && !dry_run {
             let mut active = all_states
                 .iter()
@@ -502,7 +522,6 @@ impl SetDisks {
             }
             all_states.insert(transaction, refreshed);
         }
-        let transaction_order = causal_transaction_order(&all_states)?;
         // Legacy snapshots contain no set decision. A fresh authorized removal
         // applies only after the entire key is absent and every raw shape is safe.
         let legacy_only = explicit_delete
@@ -590,6 +609,7 @@ impl SetDisks {
                         },
                         can_commit,
                         namespace_owner.as_ref(),
+                        &mut summary.removed_versions,
                     )
                     .await?
                     {
@@ -696,6 +716,7 @@ impl SetDisks {
                     },
                     can_commit,
                     namespace_owner.as_ref(),
+                    &mut summary.removed_versions,
                 )
                 .await?;
                 if !pending {
@@ -706,6 +727,7 @@ impl SetDisks {
                         |_| Some(DeleteRecoveryAction::FinishCommit),
                         can_commit,
                         namespace_owner.as_ref(),
+                        &mut summary.removed_versions,
                     )
                     .await?;
                 }
@@ -752,6 +774,7 @@ impl SetDisks {
                     |copy| (copy.state == DeleteRecoveryState::NewPrepared).then_some(DeleteRecoveryAction::Rollback),
                     can_commit,
                     namespace_owner.as_ref(),
+                    &mut summary.removed_versions,
                 )
                 .await?
                 {
@@ -795,6 +818,7 @@ impl SetDisks {
                     |copy| (copy.state == DeleteRecoveryState::CommitFinished).then_some(DeleteRecoveryAction::FinalizeCommit),
                     can_commit,
                     namespace_owner.as_ref(),
+                    &mut summary.removed_versions,
                 )
                 .await?
                 {
@@ -1030,25 +1054,25 @@ mod tests {
         assert_eq!(body(&store, bucket, None).await, original);
     }
 
-    #[tokio::test]
-    async fn delete_recovery_marker_source_heal_preserves_foreign_history_and_damaged_data() {
-        fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
-            let mut files = BTreeMap::new();
-            let mut pending = vec![root.to_path_buf()];
-            while let Some(directory) = pending.pop() {
-                for entry in std::fs::read_dir(directory).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        pending.push(path);
-                    } else {
-                        files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap());
-                    }
+    fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap());
                 }
             }
-            files
         }
+        files
+    }
 
-        for shape in ["live-backup", "foreign", "partial-history", "damaged-data"] {
+    #[tokio::test]
+    async fn delete_recovery_marker_source_heal_preserves_foreign_history_and_damaged_data() {
+        for shape in ["live-backup", "foreign", "partial-history", "damaged-data", "causal-cycle"] {
             let bucket = "recover-marker-source-guards";
             let (dirs, store) = isolated_store_over_temp_disks().await;
             init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -1133,6 +1157,33 @@ mod tests {
                         let mut bytes = tokio::fs::read(&part).await.unwrap();
                         *bytes.last_mut().unwrap() ^= 1;
                         tokio::fs::write(part, bytes).await.unwrap();
+                    }
+                }
+                "causal-cycle" => {
+                    for dir in dirs.iter().take(3) {
+                        let root = dir.path().join(bucket).join("object");
+                        let mut found = 0;
+                        for entry in std::fs::read_dir(root).unwrap() {
+                            let entry = entry.unwrap();
+                            let prepared = entry.path().join("delete-prepared");
+                            if !prepared.is_file() {
+                                continue;
+                            }
+                            let transaction = entry.file_name().to_str().unwrap().to_owned();
+                            let mut journal: serde_json::Value =
+                                serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+                            journal["predecessors"] = serde_json::json!([transaction]);
+                            std::fs::write(prepared, serde_json::to_vec(&journal).unwrap()).unwrap();
+                            let receipt = entry.path().join(crate::disk::local::DELETE_QUORUM_COMMITTED_FILE);
+                            if receipt.is_file() {
+                                let mut value: serde_json::Value =
+                                    serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+                                value["journal"] = journal;
+                                std::fs::write(receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+                            }
+                            found += 1;
+                        }
+                        assert_eq!(found, 1, "one active marker journal must exercise prerequisite rejection");
                     }
                 }
                 _ => unreachable!(),
@@ -1258,6 +1309,31 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("returning old replica must not leave bucket residue");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_tracks_only_observed_removed_version() {
+        let bucket = "recover-actual-removal";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        let target = put(&store, bucket, &[41; 4096], true).await.unwrap();
+        let retained = put(&store, bucket, &[42; 4096], true).await.unwrap();
+        let transaction = applied(&store, &disks, bucket, Some(target), 3).await;
+        publish(&disks[0], bucket, transaction).await;
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.unwrap();
+        let set = &store.pools[0].disk_set[0];
+        let report = set
+            .recover_delete_object(bucket, "object", DeleteRecoveryContext::new(Some(incarnation), &|| true))
+            .await
+            .unwrap();
+        assert_eq!(report.pending, 0);
+        assert_eq!(report.blocked, 0);
+        assert_eq!(report.removed_versions, HashSet::from([target]));
+        assert_eq!(body(&store, bucket, Some(retained)).await, vec![42; 4096]);
+        let replay = set
+            .recover_delete_object(bucket, "object", DeleteRecoveryContext::new(Some(incarnation), &|| true))
+            .await
+            .unwrap();
+        assert!(replay.removed_versions.is_empty(), "receipt replay cannot claim a second removal");
     }
 
     #[tokio::test]
@@ -1789,13 +1865,22 @@ mod tests {
     #[tokio::test]
     async fn delete_recovery_chained_committed_versions_finish_after_current_metadata_disappears() {
         let bucket = "recover-chained-versions";
-        let (_dirs, store, disks) = fixture(bucket).await;
+        let (dirs, store, disks) = fixture(bucket).await;
         let first = put(&store, bucket, &vec![61; 1024 * 1024], true)
             .await
             .expect("first version");
         let second = put(&store, bucket, &vec![62; 4096], true).await.expect("second version");
         let set = &store.pools[0].disk_set[0];
-        set.disks.write().await[3] = None;
+        let returning_key = dirs[3].path().join(bucket).join("object");
+        let before_outage = snapshot(&returning_key);
+        // A missing slot can be renewed by the endpoint monitor. Keep its
+        // original identity attached while rejecting I/O until explicit return.
+        disks[3].close().await.expect("stop returning drive's health monitor");
+        disks[3].force_offline_for_test();
+        set.connect_disks().await;
+        assert!(Arc::ptr_eq(set.disks.read().await[3].as_ref().unwrap(), &disks[3]));
+        assert_eq!(disks[3].runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        assert!(matches!(discover(&disks[3], bucket, Some("object")).await, Err(DiskError::FaultyDisk)));
         for version in [first, second] {
             store
                 .delete_object(
@@ -1816,7 +1901,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        set.disks.write().await[3] = Some(disks[3].clone());
+        assert_eq!(snapshot(&returning_key), before_outage, "offline peer retains both deleted versions");
+        assert_eq!(disks[3].runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        disks[3].reset_health_for_store_init_retry();
         let report = store
             .recover_delete_transactions(bucket, &HealOpts::default())
             .await

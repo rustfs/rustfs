@@ -141,6 +141,73 @@ fn regular_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     regular_metadata_bytes(path)
 }
 
+/// A write/heal backup is not a delete transaction when the live metadata
+/// still owns its directory and retains every backed-up generation. Any delete
+/// evidence wins; uncertain backups remain discoverable and fail closed.
+fn live_write_backup(root: &Path, transaction: Uuid) -> Result<bool> {
+    let rollback = root.join(transaction.to_string());
+    for name in [
+        PREPARED,
+        TARGET,
+        FINISHED,
+        DELETE_MARKER_ROLLBACK_FILE,
+        DELETE_QUORUM_COMMITTED_FILE,
+    ] {
+        if regular_bytes(&rollback.join(name))?.is_some() {
+            return Ok(false);
+        }
+    }
+    for prefix in [
+        DELETE_DATA_DIR_MARKER_PREFIX,
+        RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+        RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+    ] {
+        let name = format!("{prefix}{transaction}");
+        if regular_bytes(&root.join(&name))?.is_some() || regular_bytes(&rollback.join(name))?.is_some() {
+            return Ok(false);
+        }
+    }
+    let Some(current) = regular_metadata_bytes(&root.join(STORAGE_FORMAT_FILE))? else {
+        return Ok(false);
+    };
+    let Some(backup) = regular_metadata_bytes(&rollback.join(STORAGE_FORMAT_FILE_BACKUP))? else {
+        return Ok(false);
+    };
+    live_write_backup_matches(&FileMeta::load(&current)?, &FileMeta::load(&backup)?, transaction)
+}
+
+fn live_write_backup_matches(current: &FileMeta, backup: &FileMeta, transaction: Uuid) -> Result<bool> {
+    let mut owns_directory = false;
+    let used_data_dirs: HashSet<_> = current.get_data_dirs()?.into_iter().flatten().collect();
+    let mut live = HashMap::with_capacity(current.versions.len());
+    for version in &current.versions {
+        let mut info = version.into_fileinfo("", "", true)?;
+        let id = info.version_id.unwrap_or_default();
+        owns_directory |=
+            info.data_dir == Some(transaction) || inline_metadata_rollback_dir_with_used_dirs(id, &used_data_dirs) == transaction;
+        rustfs_utils::http::metadata_compat::remove_str(&mut info.metadata, rustfs_utils::http::metadata_compat::SUFFIX_HEALING);
+        if live.insert(id, generation(info)?).is_some() {
+            return Err(DiskError::FileCorrupt);
+        }
+    }
+    if !owns_directory || backup.versions.is_empty() {
+        return Ok(false);
+    }
+    let mut seen = HashSet::with_capacity(backup.versions.len());
+    for version in &backup.versions {
+        let mut info = version.into_fileinfo("", "", true)?;
+        let id = info.version_id.unwrap_or_default();
+        if !seen.insert(id) {
+            return Err(DiskError::FileCorrupt);
+        }
+        rustfs_utils::http::metadata_compat::remove_str(&mut info.metadata, rustfs_utils::http::metadata_compat::SUFFIX_HEALING);
+        if live.get(&id) != Some(&generation(info)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn journal_bytes(journal: &DeleteRecoveryJournal) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(journal)?;
     // The same journal is carried by adoption requests and decision receipts.
@@ -674,14 +741,10 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
         && target.is_none()
         && receipt_bytes.is_none()
         && !finished
-        && current_meta.as_ref().is_some_and(|meta| {
-            meta.get_data_dirs()
-                .is_ok_and(|dirs| dirs.into_iter().flatten().any(|dir| dir == transaction))
-        })
-        && before_meta.as_ref().is_some_and(|meta| {
-            meta.get_data_dirs()
-                .is_ok_and(|dirs| dirs.into_iter().flatten().any(|dir| dir == transaction))
-        });
+        && match (current_meta.as_ref(), before_meta.as_ref()) {
+            (Some(current), Some(backup)) => live_write_backup_matches(current, backup, transaction)?,
+            _ => false,
+        };
     let state = if live_write_backup {
         DeleteRecoveryState::Absent
     } else if journal.is_some() {
@@ -961,6 +1024,11 @@ impl LocalDisk {
                                 Some(_) => session.root.clone(),
                                 None => session.root.join(object),
                             };
+                            if name == STORAGE_FORMAT_FILE_BACKUP
+                                && live_write_backup(&physical, transaction).map_err(std::io::Error::from)?
+                            {
+                                continue;
+                            }
                             let proof_root = physical.join(transaction.to_string());
                             let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
                             let receipt =
@@ -2144,6 +2212,105 @@ mod tests {
             .expect("object directory");
         fs::write(path, &bytes).await.expect("original metadata");
         (temp, disk, info, bytes)
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_live_write_backup_preserves_delete_evidence() {
+        let (_temp, disk, info, original) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        let meta = FileMeta::load(&original).unwrap();
+        let transaction = inline_metadata_rollback_dir(Uuid::nil(), &meta);
+        let rollback = root.join(transaction.to_string());
+        fs::create_dir_all(&rollback).await.unwrap();
+        fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), &original).await.unwrap();
+        let mut healing = info.clone();
+        healing.set_healing();
+        fs::write(root.join(STORAGE_FORMAT_FILE), test_meta(healing)).await.unwrap();
+        assert!(live_write_backup(&root, transaction).unwrap());
+        let page = disk
+            .delete_recovery_discover("recovery", Some("object"), None, 128)
+            .await
+            .unwrap();
+        assert!(page.transactions.is_empty());
+        assert_eq!(fs::read(rollback.join(STORAGE_FORMAT_FILE_BACKUP)).await.unwrap(), original);
+        fs::write(rollback.join(DELETE_QUORUM_COMMITTED_FILE), []).await.unwrap();
+        assert!(
+            !live_write_backup(&root, transaction).unwrap(),
+            "even an empty legacy receipt is delete evidence"
+        );
+        fs::remove_file(rollback.join(DELETE_QUORUM_COMMITTED_FILE)).await.unwrap();
+        let mut changed_parts = info.clone();
+        changed_parts.parts[0].actual_size += 1;
+        fs::write(root.join(STORAGE_FORMAT_FILE), test_meta(changed_parts))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(live_write_backup(&root, transaction), Ok(true)),
+            "changed part metadata cannot hide recovery evidence"
+        );
+        let mut changed = info;
+        changed.metadata.insert("x-amz-object-lock-legal-hold".into(), "ON".into());
+        fs::write(root.join(STORAGE_FORMAT_FILE), test_meta(changed)).await.unwrap();
+        assert!(
+            !live_write_backup(&root, transaction).unwrap(),
+            "protected metadata differences remain meaningful"
+        );
+        fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+        assert!(
+            !live_write_backup(&root, transaction).unwrap(),
+            "hidden legacy deletion remains discoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_live_external_backup_rejects_partial_version_delete() {
+        let (_temp, disk, mut info, _) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        let transaction = Uuid::new_v4();
+        info.data = None;
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut info.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_INLINE_DATA,
+        );
+        info.data_dir = Some(transaction);
+        info.version_id = Some(Uuid::new_v4());
+        let mut meta = FileMeta::new();
+        meta.add_version(info.clone()).unwrap();
+        let original = meta.marshal_msg().unwrap();
+        let rollback = root.join(transaction.to_string());
+        fs::create_dir_all(&rollback).await.unwrap();
+        fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), &original).await.unwrap();
+        info.set_healing();
+        fs::write(root.join(STORAGE_FORMAT_FILE), test_meta(info.clone()))
+            .await
+            .unwrap();
+        assert!(live_write_backup(&root, transaction).unwrap());
+        let mut sibling = info.clone();
+        sibling.version_id = Some(Uuid::new_v4());
+        sibling.data_dir = Some(Uuid::new_v4());
+        meta.add_version(sibling).unwrap();
+        fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), meta.marshal_msg().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !live_write_backup(&root, transaction).unwrap(),
+            "a missing backed-up sibling retains delete recovery"
+        );
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .unwrap()
+                .state,
+            DeleteRecoveryState::LegacyAmbiguous
+        );
+        assert!(
+            disk.discover_delete_transactions("recovery", Some("object"), None, 128)
+                .await
+                .unwrap()
+                .transactions
+                .iter()
+                .any(|id| id.transaction == transaction)
+        );
     }
 
     fn request() -> FileInfo {

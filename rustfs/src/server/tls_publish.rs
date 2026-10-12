@@ -1148,7 +1148,7 @@ mod tests {
                 let snapshot = generation
                     .into_snapshot(&TlsSource::from_directory(base.path()).snapshot().expect("source"))
                     .expect("the pinned operation consumes its already verified material without a second file read");
-                assert_eq!(snapshot_leaf(&snapshot), Some(receipt.certificate_fingerprint.clone()));
+                assert_eq!(snapshot_leaf(&snapshot), Some(receipt.certificate_fingerprint));
                 assert!(
                     matches!(state_at(root.path(), path), Err(PublishError::Invalid)),
                     "the next operation must revalidate disk"
