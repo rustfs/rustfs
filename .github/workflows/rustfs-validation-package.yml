@@ -6,6 +6,21 @@
 name: RustFS Validation Package
 
 on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact RustFS commit SHA to build
+        required: true
+        type: string
+    secrets:
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      R2_ENDPOINT:
+        required: true
+      R2_BUCKET:
+        required: true
   workflow_dispatch:
     inputs:
       source_sha:
@@ -37,9 +52,11 @@ jobs:
         run: |
           set -euo pipefail
           [[ "${REQUESTED_SHA}" =~ ^[0-9a-f]{40}$ ]]
-          git init -q validation-source
-          git -C validation-source fetch --no-tags --depth=1 https://github.com/rustfs/rustfs.git "${REQUESTED_SHA}"
-          test "$(git -C validation-source rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"
+          source_directory="$(mktemp -d "${RUNNER_TEMP}/validation-source.XXXXXX")"
+          trap 'rm -rf "${source_directory}"' EXIT
+          git init -q "${source_directory}"
+          git -C "${source_directory}" fetch --no-tags --depth=1 https://github.com/rustfs/rustfs.git "${REQUESTED_SHA}"
+          test "$(git -C "${source_directory}" rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"
           echo "sha=${REQUESTED_SHA}" >> "${GITHUB_OUTPUT}"
           echo "ref=${REQUESTED_SHA}" >> "${GITHUB_OUTPUT}"
 

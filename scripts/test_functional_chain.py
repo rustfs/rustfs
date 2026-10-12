@@ -99,7 +99,7 @@ class CandidateTests(unittest.TestCase):
                "status": "completed", "conclusion": "success", "run_started_at": "2026-10-12T00:00:00Z"}
         with mock.patch.object(candidate, "api", side_effect=[run]):
             with self.assertRaisesRegex(ValueError, "manually dispatched"):
-                candidate.resolve(123, 2)
+                candidate.resolve(123, 2, allow_validation=True)
 
     def test_validation_workflow_rejects_legacy_manifest_schema(self):
         manifest = {**self.manifest}
@@ -113,6 +113,60 @@ class CandidateTests(unittest.TestCase):
         run = {**self.run, "path": ".github/workflows/rustfs-validation-package.yml"}
         with self.assertRaisesRegex(ValueError, "schema-3"):
             candidate.read_manifest(payload, artifact, run)
+
+    def test_private_candidate_resolution_is_explicit_and_attempt_bound(self):
+        self.manifest.update(schema=3, channel="validation", source_ref=self.manifest["source_sha"],
+                             package_url=self.manifest["package_url"].replace("/packages/nightly/", "/packages/validation/"))
+        payload, artifact = self.archive(["validation-candidate-123-2.json"])
+        artifact["name"] = "validation-candidate-123-2"
+        base = {**self.run, "head_branch": "cxymds/validation-runner", "head_repository": {"full_name": "rustfs/rustfs"},
+                "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                "run_started_at": "2026-10-12T00:00:00Z"}
+        for path in candidate.VALIDATION_BUILD_WORKFLOWS:
+            run = {**base, "path": path}
+            with self.subTest(path=path), mock.patch.object(candidate, "api", side_effect=[run, {"artifacts": [artifact]}, payload]):
+                resolved = candidate.resolve(123, 2, allow_validation=True)
+                self.assertEqual(resolved["manifest"]["source_sha"], "b" * 40)
+                self.assertEqual(resolved["workflow_sha"], "a" * 40)
+            with mock.patch.object(candidate, "api", return_value=run), self.assertRaises(ValueError):
+                candidate.resolve(123, 2)
+        for field, value in (("id", 124), ("run_attempt", 1), ("event", "push"), ("status", "in_progress"),
+                             ("conclusion", "failure"), ("path", ".github/workflows/other.yml"),
+                             ("head_repository", {"full_name": "untrusted/rustfs"})):
+            run = {**base, "path": ".github/workflows/rustfs-functional-chain.yml", field: value}
+            with self.subTest(field=field), mock.patch.object(candidate, "api", return_value=run), self.assertRaises(ValueError):
+                candidate.resolve(123, 2, allow_validation=True)
+
+    def test_private_manifest_rejects_alias_channel_source_and_schema_substitution(self):
+        valid = {**self.manifest, "schema": 3, "channel": "validation", "source_ref": self.manifest["source_sha"],
+                 "package_url": self.manifest["package_url"].replace("/packages/nightly/", "/packages/validation/")}
+        for key, value in (("channel", "nightly"), ("source_ref", "main"), ("source_sha", "e" * 40),
+                           ("package_url", self.manifest["package_url"]), ("workflow_sha", "e" * 40),
+                           ("build_run_attempt", 3), ("schema", True)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                candidate.validate_manifest({**valid, key: value}, self.run)
+
+    def test_package_only_mode_rejects_conflicting_fleet_and_tool_requests(self):
+        from check_test_wiring import yaml_block
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/rustfs-functional-chain.yml"
+        job = yaml_block(workflow.read_text().splitlines(), "validation-package-request", 2)
+        begin = job.index("        run: |") + 1
+        script = "\n".join(line[10:] for line in job[begin:] if not line.strip() or line.startswith("          "))
+        import os
+        inputs = {"validation_package_sha": "a" * 40}
+        env = {**os.environ, "PACKAGE_INPUTS": json.dumps(inputs)}
+        result = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for field in ("build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha", "validation_tools_only",
+                      "validation_native_tools", "validation_shared_tools", "validation_manager_tools",
+                      "validation_cleanup_run_id", "validation_tools_run_id"):
+            with self.subTest(field=field):
+                env["PACKAGE_INPUTS"] = json.dumps({**inputs, field: "not-empty"})
+                result = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+        for value in ("main", "a" * 39, "a" * 40 + "\nFORGED=value"):
+            env["PACKAGE_INPUTS"] = json.dumps({"validation_package_sha": value})
+            self.assertNotEqual(subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True).returncode, 0)
 
 
 class EvidenceTests(unittest.TestCase):

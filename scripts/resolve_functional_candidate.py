@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve a nightly manifest from its exact GitHub build attempt and artifact."""
+"""Resolve a candidate manifest from its exact GitHub build attempt and artifact."""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,7 @@ import zipfile
 REPOSITORY = "rustfs/rustfs"
 ROOT = Path(__file__).resolve().parents[1]
 MAX_ARCHIVE = 1024 * 1024
+VALIDATION_BUILD_WORKFLOWS = {".github/workflows/rustfs-validation-package.yml", ".github/workflows/rustfs-functional-chain.yml"}
 
 
 def require(condition, message):
@@ -79,7 +80,7 @@ def read_json_artifact(archive, artifact, run, expected_name, member, max_json=1
 
 
 def read_manifest(archive, artifact, run):
-    prefix = "validation-candidate" if run.get("path") == ".github/workflows/rustfs-validation-package.yml" else "nightly-candidate"
+    prefix = "validation-candidate" if run.get("path") in VALIDATION_BUILD_WORKFLOWS else "nightly-candidate"
     name = f"{prefix}-{run['id']}-{run['run_attempt']}"
     manifest = validate_manifest(read_json_artifact(archive, artifact, run, name, name + ".json"), run)
     if prefix == "validation-candidate":
@@ -90,15 +91,15 @@ def read_manifest(archive, artifact, run):
     return manifest
 
 
-def resolve(run_id, attempt):
+def resolve(run_id, attempt, *, allow_validation=False):
     require(positive(run_id) and positive(attempt), "build run and attempt are required positive integers")
     endpoint = f"repos/{REPOSITORY}/actions/runs/{run_id}"
     run = api(f"{endpoint}/attempts/{attempt}")
     require(run.get("id") == run_id and run.get("run_attempt") == attempt, "GitHub returned a different build attempt")
     path = run.get("path")
-    validation = path == ".github/workflows/rustfs-validation-package.yml"
+    validation = allow_validation and path in VALIDATION_BUILD_WORKFLOWS
     require(path == ".github/workflows/nightly-gnu.yml" and run.get("head_branch") == "main" or validation,
-            "candidate must come from nightly-gnu on main or the validation package workflow")
+            "candidate must come from nightly-gnu on main or an explicitly allowed validation build")
     require((run.get("head_repository") or {}).get("full_name") == REPOSITORY, "candidate came from another repository")
     require(run.get("event") in ("schedule", "workflow_dispatch") and run.get("status") == "completed" and run.get("conclusion") == "success", "candidate attempt has not completed successfully")
     if validation:

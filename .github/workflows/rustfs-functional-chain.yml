@@ -20,13 +20,20 @@ on:
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: Successful nightly build run on main
+        description: Successful nightly or validation package run; empty for package-only build
         type: string
-        required: true
+        required: false
+        default: ''
       build_run_attempt:
         description: Exact successful build attempt
         type: string
-        required: true
+        required: false
+        default: ''
+      validation_package_sha:
+        description: Exact source SHA for an isolated package-only build
+        type: string
+        required: false
+        default: ''
       validation_case:
         description: Canonical case ID, environment.inspect for read-only resources, or empty for functional chain
         type: string
@@ -81,12 +88,47 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only && 'rustfs-functional-validation-tools' || 'rustfs-functional-chain-runs' }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha != '' && format('rustfs-functional-validation-package-{0}', inputs.validation_package_sha) || github.event_name == 'workflow_dispatch' && inputs.validation_tools_only && 'rustfs-functional-validation-tools' || 'rustfs-functional-chain-runs' }}
   cancel-in-progress: false
 
 jobs:
+  validation-package-request:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate exclusive package-only request
+        env:
+          PACKAGE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          value = json.loads(os.environ["PACKAGE_INPUTS"])
+          if re.fullmatch(r"[0-9a-f]{40}", value["validation_package_sha"]) is None:
+              raise ValueError("package build requires an exact source SHA")
+          exclusive = ("build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha",
+                       "validation_tools_only", "validation_native_tools", "validation_shared_tools",
+                       "validation_manager_tools", "validation_cleanup_run_id", "validation_tools_run_id")
+          if any(value.get(name) for name in exclusive):
+              raise ValueError("package-only build cannot select existing candidate, tools, fleet or recovery execution")
+          PY
+
+  validation-package:
+    needs: validation-package-request
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha != '' }}
+    uses: ./.github/workflows/rustfs-validation-package.yml
+    with:
+      source_sha: ${{ inputs.validation_package_sha }}
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
   prepare:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -135,7 +177,7 @@ jobs:
           fi
 
   validation:
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '') }}
     runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
     timeout-minutes: 90
     outputs:
@@ -199,7 +241,7 @@ jobs:
               raise ValueError("cleanup requires one exact failed run and is exclusive with case/tool execution")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise ValueError("validation requires an exact auto-testing commit SHA")
-          candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]))
+          candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]), allow_validation=True)
           manifest = candidate["manifest"]
           root = Path(os.environ["VALIDATION_ROOT"])
           (root / "candidate-source.json").write_text(json.dumps(candidate, sort_keys=True) + "\n")
@@ -400,7 +442,7 @@ jobs:
 
   validation-tools:
     needs: [validation]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_tools_only }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha == '' && inputs.validation_tools_only }}
     uses: ./.github/workflows/rustfs-validation-tools.yml
     with:
       candidate_sha: ${{ needs.validation.outputs.source_sha }}

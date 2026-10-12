@@ -290,7 +290,7 @@ class ValidationPackageTests(unittest.TestCase):
         build = "\n".join(yaml_block(lines, "build", 2))
         source = "\n".join(yaml_block(lines, "resolve-source", 2))
         self.assertIn('[[ "${REQUESTED_SHA}" =~ ^[0-9a-f]{40}$ ]]', source)
-        self.assertIn('test "$(git -C validation-source rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"', source)
+        self.assertIn('test "$(git -C "${source_directory}" rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"', source)
         self.assertIn("ref: ${{ needs.resolve-source.outputs.source_sha }}", build)
         self.assertIn('--arg source_sha "${VALIDATION_SOURCE_SHA}"', build)
         self.assertIn('--arg workflow_sha "${GITHUB_SHA}"', build)

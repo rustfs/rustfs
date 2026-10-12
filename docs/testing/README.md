@@ -29,6 +29,8 @@ The [scanner cache cost profile](scanner-cache-cost.md) separates clone, subtree
 
 The [Pool layout compatibility reference](pool-layout-compatibility.md) defines the topology and EC regression matrix for single-drive, single-node multi-drive, and multi-node expansion pools.
 
+The [immutable validation candidate reference](validation-candidates.md) describes isolated package builds and exact candidate resolution for the current auto-testing fleet.
+
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)
