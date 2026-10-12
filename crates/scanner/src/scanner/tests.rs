@@ -140,7 +140,7 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
     instance_ctx.set_endpoints(endpoint_pools.clone());
     if pool_count == 1 && sets_per_pool == 1 && drives_per_set == 1 {
         instance_ctx
-            .update_erasure_type(rustfs_ecstore::api::layout::SetupType::ErasureSD)
+            .update_erasure_type(crate::storage_api::EcstoreSetupType::ErasureSD)
             .await;
     }
     if preinitialize_disks {

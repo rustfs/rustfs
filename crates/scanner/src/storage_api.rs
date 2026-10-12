@@ -101,6 +101,7 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+    SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
