@@ -29,7 +29,7 @@ use crate::{
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_credentials::try_get_rpc_token;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
-use rustfs_scanner_metrics::metrics::{CloseDiskGuard, Metric, Metrics, current_path_updater, global_metrics};
+use rustfs_scanner_metrics::metrics::{CloseDiskGuard, Metric, Metrics, current_path_updater};
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -1083,7 +1083,6 @@ pub(crate) async fn scan_remote_bucket(
             },
             authenticator,
             rpc_deadline,
-            global_metrics(),
         )
         .await;
         finish_remote_scanner_stream(stream_result, budget.as_ref())
@@ -1186,7 +1185,6 @@ where
         },
         authenticator,
         Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME,
-        &Metrics::new(),
     )
     .await
 }
@@ -1198,7 +1196,6 @@ async fn consume_remote_scanner_stream_until<R>(
     expected: RemoteScannerResponseExpectation<'_>,
     authenticator: FrameAuthenticator,
     rpc_deadline: Instant,
-    metrics: &Metrics,
 ) -> RemoteScannerStreamResult<RemoteScannerOutcome>
 where
     R: AsyncRead + Unpin,
@@ -1245,7 +1242,7 @@ where
             }
         };
 
-        let advanced = apply_remote_progress(&budget, &mut last_progress, frame.progress, metrics)
+        let advanced = apply_remote_progress(&budget, &mut last_progress, frame.progress)
             .map_err(|err| RemoteScannerStreamError::for_phase(err, last_phase))?;
         if last_phase == RemoteScannerPhase::Persisting && frame.phase == RemoteScannerPhase::Scanning {
             return Err(RemoteScannerStreamError::uncertain(StorageError::other(
@@ -1374,7 +1371,6 @@ fn apply_remote_progress(
     budget: &ScannerCycleBudget,
     last: &mut RemoteScannerProgress,
     current: RemoteScannerProgress,
-    metrics: &Metrics,
 ) -> std::result::Result<bool, StorageError> {
     if current.objects_scanned < last.objects_scanned
         || current.directories_started < last.directories_started
@@ -1385,10 +1381,6 @@ fn apply_remote_progress(
 
     let advanced = current != *last;
     budget.record_remote_progress(
-        current.objects_scanned - last.objects_scanned,
-        current.directories_started - last.directories_started,
-    );
-    metrics.record_remote_scan_progress(
         current.objects_scanned - last.objects_scanned,
         current.directories_started - last.directories_started,
     );

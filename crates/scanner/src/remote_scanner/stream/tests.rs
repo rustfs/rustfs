@@ -470,7 +470,6 @@ async fn terminal_frame_without_eof_still_obeys_rpc_deadline() {
         },
         reader_auth,
         Instant::now() + Duration::from_millis(20),
-        &Metrics::new(),
     )
     .await
     .expect_err("terminal frame without EOF must not succeed");
@@ -965,7 +964,9 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
         },
     );
     let metrics = Metrics::new();
-    let start = metrics.start_scan_cycle_work();
+    let start = metrics
+        .start_scan_cycle_work_with_cycle_and_remote_progress(Default::default(), budget.remote_scan_progress())
+        .await;
     let outcome = consume_remote_scanner_stream_until(
         reader,
         parent,
@@ -979,7 +980,6 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
         },
         reader_auth,
         Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME,
-        &metrics,
     )
     .await
     .expect("stream should complete");
@@ -1303,26 +1303,28 @@ async fn remote_progress_rejects_regression_and_counts_new_attempts_once() {
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
     let metrics = Metrics::new();
-    let _start = metrics.start_scan_cycle_work();
+    let _start = metrics
+        .start_scan_cycle_work_with_cycle_and_remote_progress(Default::default(), budget.remote_scan_progress())
+        .await;
     let mut last = RemoteScannerProgress::default();
     let progress = RemoteScannerProgress {
         objects_scanned: 4,
         directories_started: 2,
         entries_visited: 6,
     };
-    assert!(apply_remote_progress(&budget, &mut last, progress, &metrics).expect("first progress must advance"));
-    assert!(!apply_remote_progress(&budget, &mut last, progress, &metrics).expect("duplicate progress must be accepted"));
+    assert!(apply_remote_progress(&budget, &mut last, progress).expect("first progress must advance"));
+    assert!(!apply_remote_progress(&budget, &mut last, progress).expect("duplicate progress must be accepted"));
     let regression = RemoteScannerProgress {
         objects_scanned: 3,
         ..progress
     };
-    assert!(apply_remote_progress(&budget, &mut last, regression, &metrics).is_err());
+    assert!(apply_remote_progress(&budget, &mut last, regression).is_err());
     assert_eq!(last, progress);
     assert_eq!(metrics.report().await.current_cycle_objects_scanned, 4);
     assert_eq!(metrics.report().await.current_cycle_directories_scanned, 2);
 
     let mut retry = RemoteScannerProgress::default();
-    apply_remote_progress(&budget, &mut retry, progress, &metrics).expect("new attempt counts repeated work");
+    apply_remote_progress(&budget, &mut retry, progress).expect("new attempt counts repeated work");
     assert_eq!(budget.progress(), (8, 4));
     let report = metrics.report().await;
     assert_eq!(report.current_cycle_objects_scanned, 8);
@@ -1342,7 +1344,6 @@ fn directory_entry_activity_counts_as_semantic_progress() {
             entries_visited: 32,
             ..Default::default()
         },
-        &Metrics::new(),
     )
     .expect("entry activity should be valid progress");
 
