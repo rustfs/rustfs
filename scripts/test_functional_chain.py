@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,6 +14,43 @@ import zipfile
 
 import functional_chain_evidence as evidence
 import resolve_functional_candidate as candidate
+
+
+class PersistenceToolsWorkflowTests(unittest.TestCase):
+    def test_supplement_preserves_old_pins_and_propagates_actual_collector_failure(self):
+        from check_test_wiring import yaml_block
+        source = (candidate.ROOT / '.github/workflows/rustfs-validation-tools.yml').read_text()
+        job = yaml_block(source.splitlines(), 'native-heal-regressions', 2)
+        start = job.index('      - name: Run existing F07 directory fsync failure regressions')
+        end = job.index('      - name: Upload native executable identities and original diagnostics')
+        step = job[start:end]
+        shell = '\n'.join(line[10:] for line in step[step.index('        run: |') + 1:]
+                          if not line.strip() or line.startswith('          '))
+        for mode in ('old-harness', 'success', 'run-failure', 'verify-failure'):
+            with tempfile.TemporaryDirectory() as temp, self.subTest(mode=mode):
+                root = Path(temp)
+                if mode != 'old-harness':
+                    collector = root / 'auto-testing/scripts/validation_heal/persistence_native.py'
+                    collector.parent.mkdir(parents=True)
+                    collector.write_text('''import json, os, pathlib, sys
+with pathlib.Path('calls.jsonl').open('a') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')
+sys.exit(42 if os.environ['COLLECTOR_MODE'] == sys.argv[1] + '-failure' else 0)
+''')
+                env = dict(os.environ, AUTO_TESTING_SHA='b' * 40, COLLECTOR_MODE=mode)
+                env.pop('BASH_ENV', None)
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', shell],
+                                        cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, mode in ('old-harness', 'success'), result.stderr)
+                if mode == 'old-harness':
+                    report = json.loads((root / 'native-persistence-evidence/not-available.json').read_text())
+                    self.assertIs(report['complete'], False)
+                    self.assertIs(report['requiredNativeCoverageComplete'], False)
+                    self.assertIs(report['canonicalCasePassClaimed'], False)
+                    self.assertFalse((root / 'calls.jsonl').exists())
+                else:
+                    calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
+                    self.assertEqual([call[0] for call in calls], ['run'] if mode == 'run-failure' else ['run', 'verify'])
+                    for call in calls: self.assertEqual(call[-2:], ['--testing-commit', 'b' * 40])
 
 
 class CandidateTests(unittest.TestCase):

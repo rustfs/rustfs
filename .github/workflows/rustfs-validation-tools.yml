@@ -169,6 +169,25 @@ jobs:
           python3 -B auto-testing/scripts/validation_heal/native_regressions.py run \
             --directory native-tools --out native-evidence
 
+      - name: Run existing F07 directory fsync failure regressions
+        if: ${{ inputs.candidate_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac' }}
+        run: |
+          set -euo pipefail
+          # Older immutable harness pins retain their original native suite;
+          # absence of this additive collector must never fabricate its proof.
+          if [[ ! -f auto-testing/scripts/validation_heal/persistence_native.py ]]; then
+            mkdir native-persistence-evidence
+            echo '{"complete":false,"reason":"pinned harness predates F07 directory-fsync collector","requiredNativeCoverageComplete":false,"canonicalCasePassClaimed":false}' \
+              > native-persistence-evidence/not-available.json
+            exit 0
+          fi
+          python3 -B auto-testing/scripts/validation_heal/persistence_native.py run \
+            --directory native-tools --native-evidence native-evidence --out native-persistence-evidence \
+            --testing-commit "${AUTO_TESTING_SHA}"
+          python3 -B auto-testing/scripts/validation_heal/persistence_native.py verify \
+            --directory native-tools --native-evidence native-evidence --out native-persistence-evidence \
+            --testing-commit "${AUTO_TESTING_SHA}"
+
       - name: Upload native executable identities and original diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -181,6 +200,7 @@ jobs:
             native-tools/*.stderr
             native-tools/*.log
             native-evidence/
+            native-persistence-evidence/
           if-no-files-found: warn
 
   heal-metadata-inspector:
