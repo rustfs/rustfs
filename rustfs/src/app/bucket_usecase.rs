@@ -69,7 +69,8 @@ use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
-    current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
+    current_notification_system_for_context, current_notify_interface_for_context, current_object_data_cache_for_context,
+    current_object_store_handle_for_context,
 };
 use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
@@ -616,11 +617,26 @@ async fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
     scanner_maintenance_change: bool,
 ) {
+    notify_bucket_metadata_reload_with_context(bucket, operation, request_context, scanner_maintenance_change, None).await;
+}
+
+async fn notify_bucket_metadata_reload_with_context(
+    bucket: String,
+    operation: &'static str,
+    request_context: Option<request_context::RequestContext>,
+    scanner_maintenance_change: bool,
+    app_context: Option<Arc<AppContext>>,
+) {
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
     // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = current_notification_system() {
+        let notification_sys = if let Some(context) = app_context.as_deref() {
+            current_notification_system_for_context(Some(context))
+        } else {
+            current_notification_system()
+        };
+        if let Some(notification_sys) = notification_sys {
             let result = if scanner_maintenance_change {
                 notification_sys.load_bucket_metadata_for_scanner_maintenance(&bucket).await
             } else {
@@ -1426,6 +1442,7 @@ impl DefaultBucketUsecase {
 
     async fn execute_create_bucket_inner(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let requester_is_owner = match req_info_ref(&req) {
             Ok(r) => r.is_owner,
             Err(_) => {
@@ -1470,7 +1487,21 @@ impl DefaultBucketUsecase {
         .await?;
 
         match make_result {
-            Ok(()) => {}
+            Ok(()) => {
+                // A peer may have cached this bucket as missing before the
+                // create. Refresh peer metadata after the namespace and
+                // metadata commit fences are released so the peer reload can
+                // acquire its bucket namespace read lock without an ABBA
+                // interleaving with creation.
+                notify_bucket_metadata_reload_with_context(
+                    bucket.clone(),
+                    "create bucket",
+                    request_context,
+                    false,
+                    self.context.clone(),
+                )
+                .await;
+            }
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
@@ -3482,10 +3513,20 @@ mod tests {
     }
 
     fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
-        let start_marker = format!("pub async fn {method}");
-        let start = source.find(&start_marker).expect("method should exist");
-        let rest = &source[start + start_marker.len()..];
-        let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+        let public_start_marker = format!("pub async fn {method}");
+        let private_start_marker = format!("async fn {method}");
+        let (start, marker_len) = if let Some(start) = source.find(&public_start_marker) {
+            (start, public_start_marker.len())
+        } else {
+            let start = source.find(&private_start_marker).expect("method should exist");
+            (start, private_start_marker.len())
+        };
+        let rest = &source[start + marker_len..];
+        let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -3506,6 +3547,11 @@ mod tests {
                 "{method} must run its mutation inside the admitted task"
             );
         }
+        let create_body = usecase_method_source(source, "execute_create_bucket_inner");
+        assert!(
+            create_body.contains("notify_bucket_metadata_reload_with_context("),
+            "a successful bucket creation must refresh peer metadata caches"
+        );
     }
 
     #[test]

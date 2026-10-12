@@ -274,7 +274,7 @@ pub(crate) mod rpc_consumer {
             SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
             StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
             find_local_disk_by_ref, get_global_transition_state, get_local_server_property, reload_bucket_metadata,
-            reload_transition_tier_config, remove_bucket_metadata, validate_batch_read_version_item_count,
+            reload_transition_tier_config, remove_bucket_metadata_if_absent, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -1917,8 +1917,8 @@ pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> R
     ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
-pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
-    ecstore_bucket::metadata_sys::remove_bucket_metadata(bucket).await
+pub(crate) async fn remove_bucket_metadata_if_absent(api: Arc<ECStore>, bucket: &str) -> Result<bool> {
+    ecstore_bucket::metadata_sys::remove_bucket_metadata_if_absent(api, bucket).await
 }
 
 pub(crate) async fn update_bucket_metadata_config(
