@@ -4154,16 +4154,46 @@ mod metadata_cache_tests {
                 assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
                 assert_eq!(calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT), 1);
 
-                let second = set
-                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true)
+                let cached = set
+                    .cached_get_object_fileinfo(bucket, object)
                     .await
-                    .expect("second lookup should use the quorum-published metadata cache entry");
-                assert!(second.shared_entry().is_some(), "the repeated GET should hit the published cache entry");
-                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
-
-                let cached = second.shared_entry().expect("second lookup should share cached metadata");
+                    .expect("early-stop quorum must publish a conditional cache entry");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::ConditionOnly);
                 assert_eq!(cached.fi.name, object);
                 assert!(cached.online_disks.iter().filter(|disk| disk.is_some()).count() >= cached.read_quorum);
+
+                let condition = Arc::new(CacheBoundaryCondition {
+                    bucket,
+                    object,
+                    etag: cached.fi.metadata["etag"].clone(),
+                    calls: AtomicUsize::new(0),
+                    terminal_calls: usize::MAX,
+                });
+                let second = crate::object_api::with_get_object_read_condition(
+                    condition,
+                    set.get_object_fileinfo_for_get_object_reader(bucket, object, &ObjectOptions::default(), true, true),
+                )
+                .await
+                .expect("terminal conditional GET should use the quorum-published cache entry");
+                assert!(second.shared_entry().is_some(), "terminal conditional GET should hit the published entry");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+
+                let full = set
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                    .await
+                    .expect("body-layout lookup must complete its own metadata fanout");
+                assert!(full.owned.is_some(), "a conditional snapshot cannot serve a full body layout");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+
+                let repeated = set
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                    .await
+                    .expect("complete metadata should publish a reusable body layout");
+                let cached = repeated
+                    .shared_entry()
+                    .expect("the repeated body GET must use the complete cached layout");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::Full);
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
             },
         )
         .await;

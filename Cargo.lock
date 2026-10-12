@@ -9807,6 +9807,7 @@ dependencies = [
  "futures-util",
  "google-cloud-auth",
  "google-cloud-storage",
+ "h2",
  "hex-simd",
  "hmac 0.13.0",
  "hostname",
