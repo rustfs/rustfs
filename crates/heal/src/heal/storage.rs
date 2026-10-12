@@ -574,6 +574,29 @@ pub trait HealStorageAPI: Send + Sync {
     /// Heal bucket using ecstore
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
 
+    /// Recover transactions omitted by ordinary listings. Alternate providers
+    /// may explicitly expose no transaction-recovery capability.
+    async fn recover_delete_transactions(
+        &self,
+        _bucket: &str,
+        _object: Option<&str>,
+        _expected: Option<Uuid>,
+        _opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        Ok(None)
+    }
+
+    /// Recover hidden transactions only within the requested object prefix.
+    async fn recover_delete_prefix_transactions(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _expected: Option<Uuid>,
+        _opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        Ok(None)
+    }
+
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
 
@@ -1496,6 +1519,32 @@ impl HealStorageAPI for ECStoreHealStorage {
         Ok(self
             .object_result_with_receipt(bucket, object, version_id, opts, result, None)
             .await)
+    }
+
+    async fn recover_delete_transactions(
+        &self,
+        bucket: &str,
+        object: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.ecstore
+            .recover_delete_transactions_at_incarnation(bucket, object, expected, opts)
+            .await
+            .map_err(Error::Storage)
+    }
+
+    async fn recover_delete_prefix_transactions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.ecstore
+            .recover_delete_prefix_at_incarnation(bucket, prefix, expected, opts)
+            .await
+            .map_err(Error::Storage)
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {

@@ -1536,6 +1536,13 @@ impl Node for NodeService {
         self.handle_rename_part(request).await
     }
 
+    async fn recover_delete_transaction(
+        &self,
+        request: Request<RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<RecoverDeleteTransactionResponse>, Status> {
+        self.handle_recover_delete_transaction(request).await
+    }
+
     async fn settle_part_transaction(
         &self,
         request: Request<SettlePartTransactionRequest>,
@@ -3073,13 +3080,14 @@ mod tests {
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
-        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
-        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest, ReloadPoolMetaRequest,
+        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
+        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
+        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3097,7 +3105,7 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 24] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 25] = [
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
@@ -3116,6 +3124,7 @@ mod tests {
         "renamepart",
         "prepareparttransaction",
         "settleparttransaction",
+        "recoverdeletetransaction",
         "deletevolume",
         "makevolume",
         "makevolumes",
@@ -4386,6 +4395,177 @@ mod tests {
         assert!(!signed.into_inner().success, "the unknown test disk cannot resolve");
     }
 
+    #[tokio::test]
+    async fn delete_recovery_apply_rejects_excessive_batch_cardinality_before_lookup() {
+        use crate::storage::storage_api::{DeleteOptions, DeleteRecoveryRpcOperation, FileInfoVersions};
+        let service = make_server();
+        for versions in [
+            vec![FileInfoVersions::default(); 1001],
+            vec![FileInfoVersions {
+                name: "object".into(),
+                versions: vec![Default::default(); 1001],
+                ..Default::default()
+            }],
+        ] {
+            let operation = DeleteRecoveryRpcOperation::ApplyVersions {
+                versions,
+                opts: DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    ..Default::default()
+                },
+            };
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: "unknown".into(),
+                volume: "bucket".into(),
+                protocol_version: 1,
+                operation: rmp_serde::to_vec_named(&operation).expect("encode batch").into(),
+            });
+            let body =
+                rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical batch");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("batch digest");
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("oversized batch must reject before disk lookup");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_apply_rejects_legacy_cleanup_options_and_absolute_keys() {
+        use crate::storage::storage_api::{DeleteOptions, DeleteRecoveryRpcOperation};
+        let service = make_server();
+        let valid = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let mut invalid = vec![DeleteOptions::default()];
+        for mutate in [
+            |opts: &mut DeleteOptions| opts.old_data_dir = Some(Uuid::nil()),
+            |opts: &mut DeleteOptions| opts.undo_delete = true,
+            |opts: &mut DeleteOptions| opts.undo_write = true,
+            |opts: &mut DeleteOptions| opts.recursive = true,
+            |opts: &mut DeleteOptions| opts.immediate = true,
+        ] {
+            let mut opts = valid.clone();
+            mutate(&mut opts);
+            invalid.push(opts);
+        }
+        let mut operations = Vec::new();
+        for opts in invalid {
+            operations.push(DeleteRecoveryRpcOperation::ApplyVersion {
+                object: "object".into(),
+                file_info: Default::default(),
+                force_del_marker: false,
+                opts: opts.clone(),
+            });
+            operations.push(DeleteRecoveryRpcOperation::ApplyVersions {
+                versions: Vec::new(),
+                opts,
+            });
+        }
+        operations.push(DeleteRecoveryRpcOperation::ApplyVersion {
+            object: "/object".into(),
+            file_info: Default::default(),
+            force_del_marker: false,
+            opts: valid.clone(),
+        });
+        operations.push(DeleteRecoveryRpcOperation::ApplyVersions {
+            versions: vec![crate::storage::storage_api::FileInfoVersions {
+                name: "/object".into(),
+                ..Default::default()
+            }],
+            opts: valid,
+        });
+        for operation in operations {
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: "unknown".into(),
+                volume: "bucket".into(),
+                protocol_version: 1,
+                operation: rmp_serde::to_vec_named(&operation).expect("encode apply operation").into(),
+            });
+            let body =
+                rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical apply");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("apply digest");
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("invalid apply must reject before disk lookup");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_requires_digest_and_valid_protocol_payload() {
+        let service = make_server();
+        let operation = crate::storage::storage_api::DeleteRecoveryRpcOperation::Discover {
+            object: None,
+            cursor: None,
+            limit: 1,
+        };
+        let message = RecoverDeleteTransactionRequest {
+            disk: "unknown".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&operation).expect("encode discovery").into(),
+        };
+        let unsigned = service
+            .recover_delete_transaction(Request::new(message.clone()))
+            .await
+            .expect_err("new RPC must reject unsigned requests");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+        for digest in ["", "UNSIGNED-PAYLOAD"] {
+            let mut request = Request::new(message.clone());
+            request
+                .metadata_mut()
+                .insert("x-rustfs-content-sha256", digest.parse().expect("metadata"));
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("missing or unsigned digest");
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        }
+        let mut invalid = message.clone();
+        invalid.protocol_version = 2;
+        let mut malformed = message.clone();
+        malformed.operation = vec![0xc1].into();
+        let mut trailing = message.clone();
+        let mut payload = trailing.operation.to_vec();
+        payload.push(0xc0);
+        trailing.operation = payload.into();
+        for (message, expected) in [
+            (invalid, tonic::Code::Unimplemented),
+            (malformed, tonic::Code::InvalidArgument),
+            (trailing, tonic::Code::InvalidArgument),
+        ] {
+            let mut request = Request::new(message);
+            let body =
+                rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical recovery");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("invalid recovery input");
+            assert_eq!(error.code(), expected);
+        }
+        let mut request = Request::new(message);
+        let body =
+            rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical recovery");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .recover_delete_transaction(request)
+            .await
+            .expect("valid request reaches disk lookup")
+            .into_inner();
+        assert!(!response.success);
+        assert!(response.error.is_some());
+    }
+
     /// Per-handler wiring check for every mutating disk RPC. A mismatched digest must be rejected
     /// (catches a handler that omits its `verify_disk_mutation_digest` gate) and a correctly
     /// body-bound digest must pass the gate (catches a handler wired to the wrong
@@ -4658,6 +4838,16 @@ mod tests {
                 meta: vec![0x04].into(),
             },
             rustfs_protos::canonical_prepare_part_transaction_request_body
+        );
+        assert_gated!(
+            recover_delete_transaction,
+            RecoverDeleteTransactionRequest {
+                disk: disk.clone(),
+                volume: "dst".into(),
+                protocol_version: 1,
+                operation: vec![0x80].into()
+            },
+            rustfs_protos::canonical_recover_delete_transaction_request_body
         );
         assert_gated!(
             settle_part_transaction,
@@ -6597,7 +6787,7 @@ mod tests {
         };
         let rollback_dir = Uuid::new_v4();
         remote
-            .delete_version(
+            .delete_version_recoverable(
                 bucket,
                 object,
                 marker.clone(),

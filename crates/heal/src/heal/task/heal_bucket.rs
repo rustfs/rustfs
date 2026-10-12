@@ -220,6 +220,22 @@ impl HealTask {
             set: self.options.set_index,
         };
 
+        let recovery_opts = HealOpts {
+            remove: self.source == HealRequestSource::Admin && self.options.remove_corrupted,
+            ..heal_opts
+        };
+        if let Some(result) = self
+            .await_with_control(self.storage.recover_delete_transactions(
+                bucket,
+                None,
+                self.bucket_incarnation_id,
+                &recovery_opts,
+            ))
+            .await?
+        {
+            self.record_result_item(result).await;
+        }
+
         let heal_result = match self.bucket_incarnation_id {
             Some(expected) => {
                 self.await_with_control(self.storage.heal_bucket_at_incarnation(bucket, expected, &heal_opts))
@@ -445,6 +461,26 @@ impl HealTask {
             stage = "prefix_recursive",
             "Heal prefix started"
         );
+
+        let opts = HealOpts {
+            dry_run: self.options.dry_run,
+            remove: self.source == HealRequestSource::Admin && self.options.remove_corrupted,
+            no_lock: self.options.no_lock,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+            ..Default::default()
+        };
+        if let Some(result) = self
+            .await_with_control(self.storage.recover_delete_prefix_transactions(
+                bucket,
+                prefix,
+                self.bucket_incarnation_id,
+                &opts,
+            ))
+            .await?
+        {
+            self.record_result_item(result).await;
+        }
 
         self.heal_bucket_objects(bucket, prefix).await
     }
