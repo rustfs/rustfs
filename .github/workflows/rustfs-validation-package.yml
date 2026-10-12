@@ -130,14 +130,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ -n "${R2_ACCESS_KEY_ID}" && -n "${R2_SECRET_ACCESS_KEY}" && -n "${R2_ENDPOINT}" && -n "${R2_BUCKET}" ]]
+          if [[ -z "${R2_ACCESS_KEY_ID}" || -z "${R2_SECRET_ACCESS_KEY}" || -z "${R2_ENDPOINT}" || -z "${R2_BUCKET}" ]]; then
+            echo "Validation package publication requires complete R2 configuration" >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "${VALIDATION_SOURCE_SHA}"
           export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" AWS_DEFAULT_REGION=auto
           package_sha256="$(sha256sum "${PACKAGE_FILE}" | cut -d ' ' -f 1)"
           key="artifacts/rustfs/packages/validation/runs/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${package_sha256}/rustfs.deb"
           url="https://dl.rustfs.com/${key}"
           AWS_CLI=aws
           if ! "${AWS_CLI}" s3api put-object --generate-cli-skeleton input | jq -e 'has("IfNoneMatch")' >/dev/null; then
-            sudo apt-get update -qq
+            sudo apt-get update
             sudo apt-get install -y -qq python3-venv
             AWS_CLI_DIR="$(mktemp -d "${RUNNER_TEMP}/validation-awscli.XXXXXX")"
             trap 'rm -rf "${AWS_CLI_DIR}"' EXIT
@@ -156,11 +160,11 @@ jobs:
             --argjson build_run_id "${GITHUB_RUN_ID}" --argjson build_run_attempt "${GITHUB_RUN_ATTEMPT}" \
             --arg package_url "${url}" --arg package_sha256 "${package_sha256}" \
             '{schema: 3, workflow_sha: $workflow_sha, source_ref: $source_ref, source_sha: $source_sha, channel: $channel, build_run_id: $build_run_id, build_run_attempt: $build_run_attempt, package_url: $package_url, package_sha256: $package_sha256}' > "${manifest}"
-          echo "manifest=${manifest}" >> "${GITHUB_OUTPUT}"
+          echo "candidate_file=${manifest}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload validation candidate manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: validation-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.publish.outputs.manifest }}
+          path: ${{ steps.publish.outputs.candidate_file }}
           if-no-files-found: error

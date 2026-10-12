@@ -221,5 +221,82 @@ SH
         self.assertNotIn("          overwrite: true", upload)
 
 
+class ValidationPackageTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise the real upload shell with the same conditional object-store
+        # fixture used by the nightly publication tests.
+        self.fixture = NightlyCandidateTests("test_success_binds_actual_package_checkout_and_attempt")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.temp.cleanup)
+        self.workflow = ROOT / ".github/workflows/rustfs-validation-package.yml"
+        job = yaml_block(self.workflow.read_text().splitlines(), "build", 2)
+        start = job.index("      - name: Upload validation package to immutable R2 path")
+        end = job.index("      - name: Upload validation candidate manifest")
+        upload = job[start:end]
+        begin = upload.index("        run: |") + 1
+        self.fixture.shell = "\n".join(line[10:] for line in upload[begin:] if not line.strip() or line.startswith("          "))
+        self.fixture.shims.write_text(self.fixture.shims.read_text().replace("/packages/nightly/runs/*", "/packages/validation/runs/*"))
+        self.fixture.env.update(PACKAGE_FILE=self.fixture.package.name, VALIDATION_SOURCE_SHA=self.fixture.sha,
+                                VALIDATION_SOURCE_REF=self.fixture.sha, GITHUB_SHA="f" * 40)
+
+    def test_success_uploads_only_one_immutable_object_and_exact_source(self):
+        result = self.fixture.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.fixture.manifest()
+        self.assertEqual(manifest["schema"], 3)
+        self.assertEqual(manifest["channel"], "validation")
+        self.assertEqual(manifest["source_sha"], self.fixture.sha)
+        self.assertEqual(manifest["source_ref"], self.fixture.sha)
+        self.assertEqual(manifest["workflow_sha"], "f" * 40)
+        validate_manifest(manifest, {"id": 12345, "run_attempt": 1, "head_sha": "f" * 40})
+        objects = [path for path in self.fixture.store.rglob("*") if path.is_file()]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].read_bytes(), self.fixture.package.read_bytes())
+        self.assertEqual(str(objects[0].relative_to(self.fixture.store)),
+                         f"artifacts/rustfs/packages/validation/runs/12345/1/{self.fixture.digest}/rustfs.deb")
+        self.assertNotIn("s3 cp", (self.fixture.root / "aws.log").read_text())
+
+    def test_failure_or_missing_credentials_cannot_certify_a_candidate(self):
+        for index, mode in enumerate(("upload-failure", "missing-public-url", "wrong-public-bytes", "incomplete-download",
+                                      "bootstrap-failure", "install-failure", "broken-install")):
+            with self.subTest(mode=mode):
+                result = self.fixture.run_publish(FAKE_MODE=mode, GITHUB_RUN_ID=str(20000 + index))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.fixture.output.exists())
+                self.assertEqual(list(self.fixture.root.glob("validation-candidate-*.json")), [])
+        for key in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT", "R2_BUCKET"):
+            with self.subTest(key=key):
+                self.assertNotEqual(self.fixture.run_publish(**{key: ""}).returncode, 0)
+                self.assertFalse(self.fixture.output.exists())
+
+    def test_stale_source_and_duplicate_objects_are_rejected(self):
+        result = self.fixture.run_publish(VALIDATION_SOURCE_SHA="e" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.fixture.store.exists())
+        result = self.fixture.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.fixture.manifest()
+        key = manifest["package_url"].removeprefix("https://dl.rustfs.com/")
+        stored = self.fixture.store / key
+        stored.write_bytes(b"preexisting conflicting object")
+        (self.fixture.root / "validation-candidate-12345-1.json").unlink()
+        result = self.fixture.run_publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(stored.read_bytes(), b"preexisting conflicting object")
+        self.assertFalse(self.fixture.output.exists())
+
+    def test_exact_source_and_workflow_identity_are_preserved_separately(self):
+        lines = self.workflow.read_text().splitlines()
+        build = "\n".join(yaml_block(lines, "build", 2))
+        source = "\n".join(yaml_block(lines, "resolve-source", 2))
+        self.assertIn('[[ "${REQUESTED_SHA}" =~ ^[0-9a-f]{40}$ ]]', source)
+        self.assertIn('test "$(git -C validation-source rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"', source)
+        self.assertIn("ref: ${{ needs.resolve-source.outputs.source_sha }}", build)
+        self.assertIn('--arg source_sha "${VALIDATION_SOURCE_SHA}"', build)
+        self.assertIn('--arg workflow_sha "${GITHUB_SHA}"', build)
+        self.assertNotIn("PF_TESTING_GH_TOKEN", build)
+        self.assertNotIn("publish_nightly_assets", build)
+
+
 if __name__ == "__main__":
     unittest.main()

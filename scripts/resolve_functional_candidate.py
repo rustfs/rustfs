@@ -54,6 +54,7 @@ def validate_manifest(manifest, run):
         require(isinstance(manifest["source_ref"], str) and bool(re.fullmatch(r"[A-Za-z0-9_./-]{1,200}", manifest["source_ref"])), "invalid build source ref")
         if version == 3:
             require(manifest["channel"] == "validation", "validation candidate has the wrong publication channel")
+            require(manifest["source_ref"] == manifest["source_sha"], "validation candidate must bind an exact source SHA")
     channel = "validation" if version == 3 else "nightly"
     expected = (f"https://dl.rustfs.com/artifacts/rustfs/packages/{channel}/runs/{run['id']}/"
                 f"{run['run_attempt']}/{manifest['package_sha256']}/rustfs.deb")

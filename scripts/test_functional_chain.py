@@ -77,7 +77,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(result["manifest"]["source_sha"], "b" * 40)
 
     def test_validation_manifest_binds_requested_source_and_private_channel(self):
-        manifest = {**self.manifest, "schema": 3, "channel": "validation",
+        manifest = {**self.manifest, "schema": 3, "channel": "validation", "source_ref": self.manifest["source_sha"],
                     "package_url": self.manifest["package_url"].replace("/packages/nightly/", "/packages/validation/")}
         run = {**self.run, "path": ".github/workflows/rustfs-validation-package.yml"}
         payload = io.BytesIO()
