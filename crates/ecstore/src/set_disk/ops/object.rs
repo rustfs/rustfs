@@ -22986,7 +22986,7 @@ mod delete_objects_lock_gating_tests {
         }
         put_plain_object(&set_disks, bucket, "obj-a").await;
 
-        let _outer_guard = set_disks
+        let outer_guard = set_disks
             .new_ns_lock(bucket, "obj-a")
             .await
             .expect("namespace lock should be created")
@@ -23039,6 +23039,15 @@ mod delete_objects_lock_gating_tests {
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+        for disk in &disk_stores {
+            assert_eq!(
+                disk.read_version("", bucket, "obj-a", "", &crate::disk::ReadOptions::default())
+                    .await
+                    .expect_err("every drive must confirm the deleted version is absent"),
+                DiskError::FileNotFound
+            );
+        }
+        drop(outer_guard);
     }
 }
 

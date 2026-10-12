@@ -2345,7 +2345,7 @@ fn layout_reported_parts(attributes: &aws_sdk_s3::operation::get_object_attribut
     attributes.object_parts().map(|parts| parts.parts().len())
 }
 
-async fn assert_layout_readable(client: &Client, case: &LayoutCase, context: &str) -> TestResult {
+async fn assert_layout_full_body(client: &Client, case: &LayoutCase, context: &str) -> TestResult {
     let label = case.label();
     let head = layout_head(client, case).await?;
     assert_eq!(
@@ -2362,7 +2362,12 @@ async fn assert_layout_readable(client: &Client, case: &LayoutCase, context: &st
     let full = layout_get(client, case, None, None).await?.body.collect().await?.into_bytes();
     assert_eq!(full.len(), case.body.len(), "{context}: {label}: full GET length");
     assert!(full == case.body, "{context}: {label}: full GET body must equal the rc.5 upload");
+    Ok(())
+}
 
+async fn assert_layout_readable(client: &Client, case: &LayoutCase, context: &str) -> TestResult {
+    assert_layout_full_body(client, case, context).await?;
+    let label = case.label();
     if case.is_multipart_layout() {
         let first = case.part_sizes[0];
         let range = format!("bytes={}-{}", first - 32, first + 31);
@@ -2641,10 +2646,11 @@ async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
             "rc.5 wrote a legacy layout"
         );
     }
-    // The rc.5 writer must itself still read what it wrote, so a later
-    // failure is attributable to the upgrade rather than to the fixture.
+    // Prove the rc.5 writer persisted every original byte before upgrading.
+    // Its compressed cross-part range reader has a legacy limitation; the
+    // upgraded reader must still satisfy every range and partNumber assertion.
     for case in &cases {
-        assert_layout_readable(&old_client, case, "rc.5").await?;
+        assert_layout_full_body(&old_client, case, "rc.5").await?;
     }
 
     // Upgrade in place.
