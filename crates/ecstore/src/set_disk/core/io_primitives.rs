@@ -1260,6 +1260,10 @@ async fn try_create_bitrot_readers_via_batch_pread(
     }
 
     let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
+    #[cfg(test)]
+    for (disk_index, _, _, _) in &batch_items {
+        disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, *disk_index);
+    }
     let batch_results = batch_shard_pread(requests).await;
 
     let mut setup = BitrotReaderSetup::new(disks.len());
@@ -6078,6 +6082,10 @@ pub(crate) mod disk_call_counters {
     pub const KIND_READ_VERSION: &str = "read_version";
     pub const KIND_BATCH_READ_VERSION: &str = "batch_read_version";
     pub const KIND_METADATA_SLOWTAIL_FAULT: &str = "metadata_slowtail_fault";
+    pub const KIND_INLINE_SHARD_OPEN: &str = "inline_shard_open";
+    pub const KIND_DISK_SHARD_OPEN: &str = "disk_shard_open";
+    /// Body verification, direct shard assembly, and erasure decoder entry points.
+    pub const KIND_BODY_DECODE: &str = "body_decode";
 
     /// Registry key: (object, kind, disk_index).
     type CountKey = (String, String, usize);
@@ -6106,6 +6114,28 @@ pub(crate) mod disk_call_counters {
         *reg.counts
             .entry((object.to_string(), kind.to_string(), disk_index))
             .or_insert(0) += 1;
+    }
+
+    /// Matches shard paths to the observed object's namespace path. This also
+    /// records deferred opens running in spawned decoder tasks.
+    pub(crate) fn record_shard_open(path: &str, inline: bool) {
+        let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+        let objects: Vec<_> = reg
+            .observed
+            .iter()
+            .filter(|object| {
+                path == object.as_str() || path.strip_prefix(object.as_str()).is_some_and(|rest| rest.starts_with('/'))
+            })
+            .cloned()
+            .collect();
+        let kind = if inline {
+            KIND_INLINE_SHARD_OPEN
+        } else {
+            KIND_DISK_SHARD_OPEN
+        };
+        for object in objects {
+            *reg.counts.entry((object, kind.to_owned(), 0)).or_insert(0) += 1;
+        }
     }
 
     /// RAII scope that observes call counts for a single `object`. Counts recorded

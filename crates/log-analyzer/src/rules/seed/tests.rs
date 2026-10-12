@@ -176,7 +176,15 @@ fn every_rule_has_a_positive_sample() {
             "heal-no-datadir",
             msg("heal: latest metadata for b/o has no data_dir, cannot heal object data"),
         ),
-        ("heal-all-writes-failed", msg("all drives had write errors, unable to heal b/o")),
+        (
+            "heal-all-writes-failed",
+            Sample {
+                message: "Set disk object heal writer failures",
+                level: Some(LogLevel::Warn),
+                fields: &[("state", "writer_unavailable"), ("result", "all_targets_unavailable")],
+                ..Default::default()
+            },
+        ),
         ("heal-rename-failed", msg("heal rename incomplete: 1 of 2 targets committed for b/o")),
         (
             "heal-xlmeta-regen-failed",
@@ -411,4 +419,45 @@ fn smoke_samples_hit_exact_rule_sets() {
         },
         &[],
     );
+}
+
+#[test]
+fn heal_all_writes_failed_matches_current_and_legacy_logs() {
+    let engine = engine();
+    let rule_ids = |sample: &Sample| {
+        engine
+            .matches(&event(sample))
+            .into_iter()
+            .map(|index| engine.rules()[index].id.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rule_ids(&Sample {
+            message: "Set disk object heal writer failures",
+            level: Some(LogLevel::Warn),
+            fields: &[("state", "writer_unavailable"), ("result", "all_targets_unavailable")],
+            ..Default::default()
+        }),
+        vec!["heal-all-writes-failed"]
+    );
+    assert_eq!(
+        rule_ids(&msg("all drives had write errors, unable to heal b/o")),
+        vec!["heal-all-writes-failed"]
+    );
+    for sample in [
+        Sample {
+            message: "Set disk object heal writer failures",
+            fields: &[("state", "writer_unavailable"), ("result", "partial_targets_unavailable")],
+            ..Default::default()
+        },
+        msg("Set disk object heal writer failures"),
+        Sample {
+            message: "unrelated operation failed",
+            fields: &[("result", "all_targets_unavailable")],
+            ..Default::default()
+        },
+    ] {
+        assert!(rule_ids(&sample).is_empty(), "unexpected rule match: {}", sample.message);
+    }
 }
