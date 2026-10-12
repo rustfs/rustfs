@@ -23651,6 +23651,88 @@ mod single_delete_namespace_owner_tests {
         .expect("seed a complete real object version");
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_coordinator_binds_single_and_batch() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        for batch in [false, true] {
+            let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "quorum-cleanup-order";
+            let object = "object";
+            let version = Uuid::new_v4();
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create fixture bucket");
+            }
+            seed_version(&set, bucket, object, version, &vec![0x51; 256 * 1024]).await;
+            let (observed, observations) = std::sync::mpsc::channel();
+            let mut hooks = Vec::new();
+            for disk in &disks {
+                let fi = disk
+                    .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("read seeded version");
+                assert!(!fi.inline_data(), "fixture must reach physical data cleanup");
+                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("local fixture required");
+                };
+                let object_dir = local.get_disk().get_object_path_for_io(bucket, object).expect("object path");
+                let data_dir = object_dir.join(fi.data_dir.expect("seeded data directory").to_string());
+                let observed = observed.clone();
+                hooks.push(hooks::install_at(hooks::Stage::Remove, &data_dir.join("part.1"), move || {
+                    let backup_present = std::fs::read_dir(&object_dir)
+                        .expect("object exists before payload unlink")
+                        .any(|entry| {
+                            entry
+                                .expect("read transaction entry")
+                                .path()
+                                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                                .exists()
+                        });
+                    observed.send(backup_present).expect("record actual cleanup order");
+                }));
+            }
+            if batch {
+                let (_, errors) = set
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_string(),
+                            version_id: Some(version),
+                            ..Default::default()
+                        }],
+                        ObjectOptions {
+                            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                                ObjectLockConfigState::ConfirmedAbsent,
+                            ))),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "batch delete must commit: {errors:?}");
+            } else {
+                set.delete_object_version(
+                    bucket,
+                    object,
+                    &FileInfo {
+                        name: object.to_string(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("single delete must commit");
+            }
+            let observations = observations.try_iter().collect::<Vec<_>>();
+            assert_eq!(observations.len(), 4, "all four disks must reach cleanup: batch={batch}");
+            assert!(
+                observations.iter().all(|backup_present| !backup_present),
+                "the coordinator must bind post-quorum cleanup before any payload unlink: batch={batch}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn internal_metadata_mutations_do_not_reenter_pool_metadata() {

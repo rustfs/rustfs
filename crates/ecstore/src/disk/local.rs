@@ -19043,6 +19043,326 @@ mod test {
         }]
     }
 
+    // This is a real process interruption of LocalDisk, not a server or
+    // power-loss test. The child stops at the rollback-backup unlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_process_crash_preserves_retry_evidence() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD_ROOT: &str = "RUSTFS_TEST_QUORUM_CLEANUP_ROOT";
+        const CHILD_TRANSACTION: &str = "RUSTFS_TEST_QUORUM_CLEANUP_TRANSACTION";
+        const CHILD_READY: &str = "RUSTFS_TEST_QUORUM_CLEANUP_READY";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let endpoint =
+                Endpoint::try_from(Path::new(&root).to_str().expect("UTF-8 child disk path")).expect("parse child endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("open child disk");
+            let transaction =
+                Uuid::parse_str(&std::env::var(CHILD_TRANSACTION).expect("child transaction")).expect("parse child transaction");
+            let ready = std::env::var_os(CHILD_READY).expect("child readiness path");
+            let rollback_path = format!("object/{transaction}");
+            let backup = disk
+                .io_get_object_path("bucket", &rollback_path)
+                .expect("child transaction path")
+                .join(STORAGE_FORMAT_FILE_BACKUP);
+            let _hook = hooks::install_at(hooks::Stage::Remove, &backup, move || {
+                std::fs::write(ready, b"before-backup-unlink").expect("publish reached boundary");
+                loop {
+                    std::thread::park();
+                }
+            });
+            disk.delete(
+                "bucket",
+                &rollback_path,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("child cleanup should reach its boundary");
+            panic!("child unexpectedly returned without being killed");
+        }
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let residue = write_committed_delete_residue(&disk, "bucket", "object").await;
+        let original_backup = fs::read(residue.backup()).await.expect("read original backup");
+        let original_part = fs::read(residue.part()).await.expect("read original part");
+
+        for attempt in 0..2 {
+            let ready = dir.path().join(format!("cleanup-ready-{attempt}"));
+            let mut child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "disk::local::test::quorum_delete_cleanup_process_crash_preserves_retry_evidence",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, dir.path())
+                .env(CHILD_TRANSACTION, residue.transaction.to_string())
+                .env(CHILD_READY, &ready)
+                .spawn()
+                .expect("spawn this test's cleanup process");
+            let reached = tokio::time::timeout(Duration::from_secs(30), async {
+                while !ready.exists() {
+                    if child.try_wait().expect("check child status").is_some() {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                true
+            })
+            .await;
+            // Child is an owned process handle; no process-name matching or
+            // external PID is accepted by this test.
+            if child.try_wait().expect("check owned child").is_none() {
+                child.kill().expect("SIGKILL the owned cleanup child");
+            }
+            let status = child.wait().expect("reap cleanup child");
+            assert!(matches!(reached, Ok(true)), "child must reach the exact cleanup boundary");
+            assert_eq!(status.signal(), Some(9), "child must have been interrupted by SIGKILL");
+            println!(
+                "cleanup crash {attempt}: backup={} marker={} part={}",
+                residue.backup().exists(),
+                residue.marker().exists(),
+                residue.part().exists()
+            );
+            assert_eq!(fs::read(residue.backup()).await.expect("backup at paused unlink"), original_backup);
+            assert_eq!(fs::read(residue.part()).await.expect("payload survives each crash"), original_part);
+            assert!(residue.marker().is_file(), "transaction marker survives each crash");
+            assert!(
+                residue
+                    .object_dir
+                    .join(residue.transaction.to_string())
+                    .join(DELETE_QUORUM_COMMITTED_FILE)
+                    .is_file(),
+                "quorum receipt survives each crash"
+            );
+        }
+
+        let reopened = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("reopen disk after process interruption");
+        reopened
+            .delete(
+                "bucket",
+                &format!("object/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retry the already committed coordinator transaction");
+        assert_eq!(original_part, b"stale");
+        let bucket_result = reopened.delete_volume("bucket", false).await;
+        println!("non-force bucket deletion after retry: {bucket_result:?}");
+        assert!(
+            !residue.object_dir.exists(),
+            "repeated delete after two crashes must reclaim this known-successful transaction"
+        );
+        bucket_result.expect("non-force bucket deletion after retry");
+    }
+
+    // Normal post-quorum cleanup must preserve its data-dir marker until the
+    // rollback backup is gone, including across an interrupted retry.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_removes_backup_before_data_and_can_retry() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = residue.part();
+        let rollback_path = format!("{object}/{}", residue.transaction);
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            old_data_dir: Some(residue.transaction),
+            ..Default::default()
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &data_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let mut cleanup = Box::pin(disk.delete(bucket, &rollback_path, opts.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("cleanup must reach data removal"),
+                result = cleanup.as_mut() => panic!("cleanup ended before data removal: {result:?}"),
+            }
+        })
+        .await
+        .expect("cleanup reaches physical payload unlink");
+
+        let backup_gone = !residue.backup().exists();
+        let marker_present = residue.marker().exists();
+        let original_part = fs::read(residue.part()).await.expect("paused data must remain readable");
+        drop(cleanup);
+
+        // The in-flight unlink retains metadata ownership after cancellation.
+        // Retry must wait for that physical operation before removing proof.
+        let mut retry = Box::pin(disk.delete(bucket, &rollback_path, opts));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), retry.as_mut())
+                .await
+                .is_err(),
+            "retry cannot bypass the parked cleanup's namespace ownership"
+        );
+        assert!(residue.marker().is_file());
+        assert!(
+            residue
+                .object_dir
+                .join(residue.transaction.to_string())
+                .join(DELETE_QUORUM_COMMITTED_FILE)
+                .is_file()
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("retry completes after the abandoned unlink releases ownership")
+            .expect("retry cleanup");
+
+        assert!(
+            backup_gone,
+            "post-quorum cleanup must remove the backup before touching its data-dir evidence"
+        );
+        assert!(marker_present, "data removal must still have its transaction marker");
+        assert_eq!(original_part, b"stale");
+        assert!(!residue.object_dir.exists(), "interrupted cleanup and retry must leave no object residue");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_backup_error_preserves_data_and_marker() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let backup_bytes = fs::read(residue.backup()).await.expect("read rollback evidence");
+        let backup = residue.backup();
+        let held_backup = residue.object_dir.join("held-backup");
+        let blocked_backup = backup.clone();
+        let retained_backup = held_backup.clone();
+        // Replace only the classified backup inode with a directory so the
+        // real unlink fails, while retaining its exact bytes for retry.
+        let _hook = hooks::install_at(hooks::Stage::Remove, &backup, move || {
+            std::fs::rename(&blocked_backup, retained_backup).expect("retain rollback bytes");
+            std::fs::create_dir(blocked_backup).expect("block the actual backup unlink");
+        });
+        let rollback_path = format!("{object}/{}", residue.transaction);
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            old_data_dir: Some(residue.transaction),
+            ..Default::default()
+        };
+        disk.delete(bucket, &rollback_path, opts.clone())
+            .await
+            .expect_err("backup removal failure must be returned");
+
+        assert!(backup.is_dir(), "the native backup unlink must have encountered the blocker");
+        assert_eq!(fs::read(&held_backup).await.expect("backup bytes must survive"), backup_bytes);
+        assert!(residue.marker().exists(), "backup failure must retain the data-dir transaction marker");
+        assert_eq!(fs::read(residue.part()).await.expect("payload must survive backup failure"), b"stale");
+
+        fs::remove_dir(&backup).await.expect("remove the one-shot unlink blocker");
+        fs::rename(&held_backup, &backup)
+            .await
+            .expect("restore the unchanged backup inode");
+        assert_eq!(fs::read(&backup).await.expect("canonical rollback backup"), backup_bytes);
+        disk.delete(bucket, &rollback_path, opts)
+            .await
+            .expect("retry cleanup after one-shot unlink failure");
+        assert!(!residue.object_dir.exists(), "successful retry must reclaim the transaction");
+    }
+
+    #[tokio::test]
+    async fn quorum_delete_cleanup_preserves_other_generations_transactions_and_children() {
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let newer_data_dir = Uuid::new_v4();
+        let newer_data = residue.object_dir.join(newer_data_dir.to_string());
+        fs::create_dir_all(&newer_data).await.expect("create newer data directory");
+        fs::write(newer_data.join("part.1"), b"newer payload")
+            .await
+            .expect("write newer payload");
+        let metadata = test_meta(test_file_info(object, Uuid::new_v4(), Some(newer_data_dir), None));
+        fs::write(residue.object_dir.join(STORAGE_FORMAT_FILE), &metadata)
+            .await
+            .expect("publish newer metadata before old transaction cleanup");
+        let unrelated = Uuid::new_v4();
+        let unrelated_backup = residue
+            .object_dir
+            .join(unrelated.to_string())
+            .join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(unrelated_backup.parent().expect("backup parent"))
+            .await
+            .expect("create unrelated transaction");
+        fs::write(&unrelated_backup, b"corrupt unproven backup")
+            .await
+            .expect("write ambiguous backup");
+        let mismatched_marker = newer_data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{unrelated}"));
+        fs::write(&mismatched_marker, []).await.expect("write unrelated marker");
+        let child = residue.object_dir.join("child").join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(child.parent().expect("child parent"))
+            .await
+            .expect("create descendant");
+        fs::write(&child, b"child metadata").await.expect("write descendant metadata");
+
+        disk.delete(
+            bucket,
+            &format!("{object}/{}", residue.transaction),
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                old_data_dir: Some(residue.transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clean only the successful transaction");
+
+        assert!(!residue.backup().exists() && !residue.part().exists() && !residue.marker().exists());
+        assert_eq!(
+            fs::read(residue.object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read newer metadata"),
+            metadata
+        );
+        assert_eq!(fs::read(newer_data.join("part.1")).await.expect("read newer payload"), b"newer payload");
+        assert_eq!(
+            fs::read(&unrelated_backup).await.expect("read unproven backup"),
+            b"corrupt unproven backup"
+        );
+        assert!(mismatched_marker.exists());
+        assert_eq!(fs::read(child).await.expect("read descendant"), b"child metadata");
+    }
+
     // Internal maintenance retains its legacy cleanup behavior while user
     // buckets require the separate set-wide authorization boundary.
     #[tokio::test]
