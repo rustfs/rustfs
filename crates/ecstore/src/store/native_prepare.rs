@@ -1,6 +1,7 @@
 //! Private native object preparation; a data quorum is not publication authority.
 use super::ECStore;
 use crate::bucket::utils::check_put_object_args;
+use crate::disk::DiskAPI;
 use crate::{
     disk::local::native_prepare::NativePreparationReceipt,
     error::{Error, Result},
@@ -12,6 +13,13 @@ pub struct NativeQuorumPreparation {
     receipts: Vec<NativePreparationReceipt>,
 }
 impl NativeQuorumPreparation {
+    pub(crate) fn into_receipts(self) -> Vec<NativePreparationReceipt> {
+        self.receipts
+    }
+    pub(crate) fn receipts(&self) -> &[NativePreparationReceipt] {
+        &self.receipts
+    }
+
     pub fn preparation_id(&self) -> Uuid {
         self.receipts[0].preparation_id()
     }
@@ -25,7 +33,7 @@ impl NativeQuorumPreparation {
         self.receipts[0].object_length()
     }
     pub fn receipt_count(&self) -> usize {
-        self.receipts.len()
+        self.receipts().len()
     }
     pub fn disk_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
         self.receipts.iter().map(NativePreparationReceipt::disk_id)
@@ -40,13 +48,14 @@ struct Identity {
     distribution: [u8; 32],
 }
 struct Observation {
+    set: std::sync::Arc<crate::set_disk::SetDisks>,
     identity: Option<Identity>,
     metadata: Vec<Option<bytes::Bytes>>,
     prepared: Vec<bool>,
     unknown: bool,
 }
 impl NativeQuorumPreparation {
-    fn from_receipts(quorum: usize, receipts: Vec<NativePreparationReceipt>) -> Result<Self> {
+    pub(crate) fn from_receipts(quorum: usize, receipts: Vec<NativePreparationReceipt>) -> Result<Self> {
         let first = receipts.first().ok_or_else(|| Error::other("empty native quorum"))?;
         let distinct: std::collections::HashSet<_> = receipts.iter().map(NativePreparationReceipt::disk_id).collect();
         if receipts.len() < quorum
@@ -67,55 +76,74 @@ impl ECStore {
         incarnation: Uuid,
         fence: std::sync::Arc<crate::object_api::ObjectLockConfigSnapshot>,
     ) -> Result<Vec<Observation>> {
+        self.native_observations_scan(bucket, key, preparation, incarnation, fence, false)
+            .await
+    }
+    async fn native_observations_scan(
+        &self,
+        bucket: &str,
+        key: &str,
+        preparation: Uuid,
+        incarnation: Uuid,
+        fence: std::sync::Arc<crate::object_api::ObjectLockConfigSnapshot>,
+        all_sets: bool,
+    ) -> Result<Vec<Observation>> {
         let mut pools = Vec::new();
         for pool in &self.pools {
-            let candidates = pool
-                .get_disks_by_key(key)
-                .probe_native_candidates(self.id, bucket, key, preparation, incarnation, fence.clone())
-                .await;
-            let mut observed = Observation {
-                identity: None,
-                metadata: Vec::new(),
-                prepared: Vec::new(),
-                unknown: false,
+            let sets = if all_sets {
+                pool.disk_set.clone()
+            } else {
+                vec![pool.get_disks_by_key(key)]
             };
-            for candidate in candidates {
-                let mut bytes = None;
-                let mut prepared = false;
-                match candidate {
-                    Ok(crate::disk::local::native_prepare::NativePreparationProbe::Absent) => {}
-                    Ok(crate::disk::local::native_prepare::NativePreparationProbe::Existing {
-                        version,
-                        prepared: ready,
-                        object_digest,
-                        object_length,
-                        set_digest,
-                        distribution_digest,
-                        metadata,
-                    }) => {
-                        let identity = Identity {
+            for set in sets {
+                let candidates = set
+                    .probe_native_candidates(self.id, bucket, key, preparation, incarnation, fence.clone(), all_sets)
+                    .await;
+                let mut observed = Observation {
+                    set,
+                    identity: None,
+                    metadata: Vec::new(),
+                    prepared: Vec::new(),
+                    unknown: false,
+                };
+                for candidate in candidates {
+                    let mut bytes = None;
+                    let mut prepared = false;
+                    match candidate {
+                        Ok(crate::disk::local::native_prepare::NativePreparationProbe::Absent) => {}
+                        Ok(crate::disk::local::native_prepare::NativePreparationProbe::Existing {
                             version,
-                            digest: object_digest,
-                            length: object_length,
-                            set: set_digest,
-                            distribution: distribution_digest,
-                        };
-                        if version != preparation || observed.identity.as_ref().is_some_and(|old| old != &identity) {
-                            return Err(Error::other("conflicting native preparation identity"));
+                            prepared: ready,
+                            object_digest,
+                            object_length,
+                            set_digest,
+                            distribution_digest,
+                            metadata,
+                        }) => {
+                            let identity = Identity {
+                                version,
+                                digest: object_digest,
+                                length: object_length,
+                                set: set_digest,
+                                distribution: distribution_digest,
+                            };
+                            if observed.identity.as_ref().is_some_and(|old| old != &identity) {
+                                return Err(Error::other("conflicting native preparation identity"));
+                            }
+                            observed.identity = Some(identity);
+                            bytes = metadata;
+                            prepared = ready;
                         }
-                        observed.identity = Some(identity);
-                        bytes = metadata;
-                        prepared = ready;
+                        Err(crate::disk::error::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            return Err(Error::from(error));
+                        }
+                        Err(_) => observed.unknown = true,
                     }
-                    Err(crate::disk::error::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
-                        return Err(Error::from(error));
-                    }
-                    Err(_) => observed.unknown = true,
+                    observed.metadata.push(bytes);
+                    observed.prepared.push(prepared);
                 }
-                observed.metadata.push(bytes);
-                observed.prepared.push(prepared);
+                pools.push(observed);
             }
-            pools.push(observed);
         }
         Ok(pools)
     }
@@ -145,8 +173,69 @@ impl ECStore {
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
         check_put_object_args(bucket, key)?;
-        if preparation.is_nil() || self.pools.is_empty() || data.size() < 0 || data.size() > 1024 * 1024 {
+        if preparation.is_nil() || self.pools.is_empty() || data.size() < -1 {
             return Err(Error::other("unsupported native preparation"));
+        }
+        let mut remote = false;
+        for pool in &self.pools {
+            if pool
+                .get_disks_by_key(key)
+                .disks
+                .read()
+                .await
+                .iter()
+                .flatten()
+                .any(|disk| !disk.is_local())
+            {
+                remote = true;
+                break;
+            }
+        }
+        if remote || data.size() < 0 || data.size() > 1024 * 1024 {
+            let fence = self.object_lock_config_snapshot(bucket).await?;
+            let incarnation = self.bucket_incarnation_id(bucket).await?;
+            let owner = std::sync::Arc::new(
+                self.handle_new_ns_lock(bucket, key)
+                    .await?
+                    .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+                    .await?,
+            );
+            let observations = self
+                .native_observations_scan(bucket, key, preparation, incarnation, fence.clone(), true)
+                .await?;
+            if let Some(selected) = Self::existing_native_pool(&observations)? {
+                let identity = observations[selected]
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| Error::other("missing native identity"))?;
+                let mut hash = Sha256::new();
+                let mut length = 0_u64;
+                let mut buffer = vec![0_u8; 64 * 1024];
+                loop {
+                    let size = data.stream.read(&mut buffer).await?;
+                    if size == 0 {
+                        break;
+                    }
+                    length = length
+                        .checked_add(u64::try_from(size).map_err(Error::other)?)
+                        .ok_or_else(|| Error::other("native retry length overflow"))?;
+                    hash.update(&buffer[..size]);
+                }
+                if hash.finalize().as_slice() != identity.digest || length != identity.length {
+                    return Err(Error::other("native streaming retry content conflict"));
+                }
+                drop(owner);
+                return self.recover_native_object(bucket, key, preparation).await;
+            }
+            let selected = if self.pools.len() == 1 {
+                0
+            } else {
+                self.get_pool_idx_no_lock(bucket, key, data.size().max(0)).await?
+            };
+            let set = self.pools[selected].get_disks_by_key(key);
+            let (quorum, receipts) =
+                Box::pin(set.prepare_native_stream(self.id, bucket, key, preparation, incarnation, data, fence, owner)).await?;
+            return NativeQuorumPreparation::from_receipts(quorum, receipts);
         }
         let length = data.size();
         let mut body = Vec::new();
@@ -200,19 +289,34 @@ impl ECStore {
         if preparation.is_nil() || self.pools.is_empty() {
             return Err(Error::other("invalid native preparation"));
         }
-        let fence = self.object_lock_config_snapshot(bucket).await?;
-        let incarnation = self.bucket_incarnation_id(bucket).await?;
         let _owner = self
             .handle_new_ns_lock(bucket, key)
             .await?
             .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
+        self.recover_native_object_unlocked(bucket, key, preparation)
+            .await
+            .map(|(owner, _)| owner)
+    }
+    /// Caller owns the distributed namespace lock; each disk still acquires its actual physical recovery owners.
+    pub(crate) async fn recover_native_object_unlocked(
+        &self,
+        bucket: &str,
+        key: &str,
+        preparation: Uuid,
+    ) -> Result<(NativeQuorumPreparation, Vec<(Uuid, bytes::Bytes)>)> {
+        check_put_object_args(bucket, key)?;
+        if preparation.is_nil() || self.pools.is_empty() {
+            return Err(Error::other("invalid native preparation"));
+        }
+        let fence = self.object_lock_config_snapshot(bucket).await?;
+        let incarnation = self.bucket_incarnation_id(bucket).await?;
         let observations = self
-            .native_observations(bucket, key, preparation, incarnation, fence.clone())
+            .native_observations_scan(bucket, key, preparation, incarnation, fence.clone(), true)
             .await?;
         let selected = Self::existing_native_pool(&observations)?.ok_or_else(|| Error::other("native preparation absent"))?;
-        let (quorum, receipts) = self.pools[selected]
-            .get_disks_by_key(key)
+        let (quorum, receipts, metadata) = observations[selected]
+            .set
             .recover_native_bytes(
                 self.id,
                 bucket,
@@ -223,6 +327,6 @@ impl ECStore {
                 observations[selected].prepared.clone(),
             )
             .await?;
-        NativeQuorumPreparation::from_receipts(quorum, receipts)
+        Ok((NativeQuorumPreparation::from_receipts(quorum, receipts)?, metadata))
     }
 }

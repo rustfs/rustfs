@@ -10538,6 +10538,37 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        if volume == RUSTFS_META_BUCKET && path.starts_with("native-preparations/") {
+            #[cfg(unix)]
+            {
+                let segments = path.split('/').collect::<Vec<_>>();
+                if segments.len() != 4 {
+                    return Err(DiskError::InvalidPath);
+                }
+                let preparation = Uuid::parse_str(segments[1]).map_err(|_| DiskError::InvalidPath)?;
+                let data_dir = Uuid::parse_str(segments[2]).map_err(|_| DiskError::InvalidPath)?;
+                let part = segments[3]
+                    .strip_prefix("part.")
+                    .and_then(|number| number.parse::<usize>().ok())
+                    .filter(|part| *part > 0)
+                    .ok_or(DiskError::InvalidPath)?;
+                if segments[1] != preparation.to_string()
+                    || segments[2] != data_dir.to_string()
+                    || segments[3] != format!("part.{part}")
+                {
+                    return Err(DiskError::InvalidPath);
+                }
+                let root = self.io_root().to_path_buf();
+                let file =
+                    tokio::task::spawn_blocking(move || native_prepare::open_stream_part(&root, preparation, data_dir, part))
+                        .await
+                        .map_err(DiskError::from)?
+                        .map_err(to_file_error)?;
+                return Ok(Box::new(tokio::fs::File::from_std(file)));
+            }
+            #[cfg(not(unix))]
+            return Err(DiskError::UnsupportedDisk);
+        }
         self.io_backend
             .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
             .await

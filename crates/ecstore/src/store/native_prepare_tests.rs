@@ -428,3 +428,361 @@ async fn native_object_prepare_nonzero_set_reopens_the_routed_identity() {
         "NP02_OPERATION_IDENTITY_BOUND: select actual key/set facts"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_large_restart() {
+    let (dirs, store) = fixture().await;
+    let body = (0..(5 * 1024 * 1024 + 37))
+        .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+        .collect::<Vec<_>>();
+    let expected: [u8; 32] = Sha256::digest(&body).into();
+    let preparation = Uuid::new_v4();
+    let prepared = store
+        .prepare_native_object(BUCKET, KEY, preparation, &mut PutObjReader::from_vec(body.clone()))
+        .await
+        .expect("actual multi-block streaming preparation");
+    assert_eq!(prepared.object_digest(), expected);
+    assert_eq!(prepared.object_length(), u64::try_from(body.len()).expect("bounded content length"));
+    assert!(prepared.receipt_count() >= 3);
+    assert_not_published(&store).await;
+    let mut records = Vec::new();
+    for disk in &dirs {
+        let path = disk
+            .path()
+            .join(".rustfs.sys/native-preparations")
+            .join(preparation.to_string());
+        let metadata = std::fs::read(path.join("xl.meta")).expect("exact streaming metadata");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("intent.json")).expect("durable locator"))
+                .expect("strict streaming intent JSON");
+        assert_eq!(record["format"], 3);
+        assert_eq!(record["set_disks"].as_array().expect("persistent disk set").len(), 4);
+        assert_eq!(record["data_dir"], preparation.to_string());
+        assert!(
+            std::fs::metadata(path.join(preparation.to_string()).join("part.1"))
+                .expect("real non-inline shard")
+                .len()
+                > 0
+        );
+        records.push((path, metadata));
+    }
+    drop(prepared);
+    drop(store);
+    let restarted = reopen(&dirs).await;
+    let recovered = restarted
+        .recover_native_object(BUCKET, KEY, preparation)
+        .await
+        .expect("actual streaming reopen recovery");
+    assert_eq!(recovered.object_digest(), expected);
+    assert_eq!(recovered.object_length(), u64::try_from(body.len()).expect("length"));
+    assert_eq!(recovered.version_id(), preparation);
+    for (path, bytes) in records {
+        assert_eq!(std::fs::read(path.join("xl.meta")).expect("preserved metadata"), bytes);
+    }
+    assert_not_published(&restarted).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_locator_conflict() {
+    let (dirs, store) = fixture().await;
+    let preparation = Uuid::new_v4();
+    let body = vec![17; 2 * 1024 * 1024 + 1];
+    drop(
+        store
+            .prepare_native_object(BUCKET, KEY, preparation, &mut PutObjReader::from_vec(body))
+            .await
+            .expect("real durable streaming preparation"),
+    );
+    for disk in &dirs {
+        let path = disk
+            .path()
+            .join(".rustfs.sys/native-preparations")
+            .join(preparation.to_string());
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("intent.json")).expect("record")).expect("JSON");
+        record["set_disks"]
+            .as_array_mut()
+            .expect("saved physical disk order")
+            .swap(0, 1);
+        // Preserve the actual record serialization order; receipt marker signs exact canonical record bytes.
+        let bytes = crate::disk::local::native_prepare::canonical_test_record(&record);
+        std::fs::write(path.join("intent.json"), &bytes).expect("install conflicting durable locator");
+        std::fs::write(path.join("PREPARED"), Sha256::digest(&bytes)).expect("matching record marker");
+    }
+    assert!(
+        store.recover_native_object(BUCKET, KEY, preparation).await.is_err(),
+        "NATIVE_STREAM_REQUIRES_SAVED_PHYSICAL_SET"
+    );
+    assert_not_published(&store).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_crash_barriers() {
+    use crate::disk::local::native_prepare::{clear_native_preparation_probe, fail_native_preparation};
+    for (stage, after, recoverable) in [
+        ("part.1:file", false, false),
+        ("intent.json:file", true, false),
+        ("PREPARED:directory", true, true),
+    ] {
+        let (dirs, store) = fixture().await;
+        let preparation = Uuid::new_v4();
+        fail_native_preparation(preparation, stage, after);
+        let result = store
+            .prepare_native_object(BUCKET, KEY, preparation, &mut PutObjReader::from_vec(vec![23; 2 * 1024 * 1024 + 3]))
+            .await;
+        assert!(result.is_err(), "injected disk barrier must not return a receipt: {stage}");
+        clear_native_preparation_probe(preparation);
+        assert_not_published(&store).await;
+        drop(store);
+        let restarted = reopen(&dirs).await;
+        let recovered = restarted.recover_native_object(BUCKET, KEY, preparation).await;
+        assert_eq!(recovered.is_ok(), recoverable, "durable boundary: {stage}");
+        assert_not_published(&restarted).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_multi_part_restart() {
+    use crate::disk::Disk;
+    use rustfs_filemeta::FileInfoOpts;
+    let (dirs, store) = fixture().await;
+    let body = vec![29; 3 * 1024 * 1024 + 13];
+    let encoded_preparation = Uuid::new_v4();
+    drop(
+        store
+            .prepare_native_object(BUCKET, KEY, encoded_preparation, &mut PutObjReader::from_vec(body.clone()))
+            .await
+            .expect("existing ordinary streaming encoder fixture"),
+    );
+    let preparation = Uuid::new_v4();
+    let incarnation = store.bucket_incarnation_id(BUCKET).await.expect("actual incarnation");
+    let fence = store.object_lock_config_snapshot(BUCKET).await.expect("actual bucket fence");
+    let set = store.pools[0].get_disks_by_key(KEY);
+    let disks = set.disks.read().await.clone();
+    let guard = store
+        .handle_new_ns_lock(BUCKET, KEY)
+        .await
+        .expect("actual commit namespace")
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await
+        .expect("owned commit lock");
+    let mut candidates = Vec::new();
+    for (dir, disk) in dirs.iter().zip(disks) {
+        let original = dir
+            .path()
+            .join(".rustfs.sys/native-preparations")
+            .join(encoded_preparation.to_string());
+        let metadata = std::fs::read(original.join("xl.meta")).expect("encoder metadata");
+        let mut info = rustfs_filemeta::get_file_info(
+            &metadata,
+            BUCKET,
+            KEY,
+            &encoded_preparation.to_string(),
+            FileInfoOpts {
+                data: false,
+                include_free_versions: false,
+                include_part_checksums: true,
+            },
+        )
+        .expect("exact FileInfo");
+        let first = info.erasure.block_size;
+        let codec = crate::erasure::coding::Erasure::try_new_with_options(
+            info.erasure.data_blocks,
+            info.erasure.parity_blocks,
+            first,
+            info.uses_legacy_checksum,
+        )
+        .expect("existing erasure geometry");
+        let split = crate::erasure::coding::bitrot_shard_file_size(
+            usize::try_from(codec.shard_file_size(i64::try_from(first).expect("part size"))).expect("shard size"),
+            codec.shard_size(),
+            info.erasure.get_checksum_info(1).algorithm,
+        );
+        let shard = std::fs::read(original.join(encoded_preparation.to_string()).join("part.1")).expect("actual encoded shard");
+        let disk = disk.expect("actual disk");
+        let Disk::Local(local) = disk.as_ref() else {
+            panic!("local fixture");
+        };
+        local
+            .get_disk()
+            .begin_native_stream(preparation, store.id, BUCKET, incarnation, fence.clone())
+            .await
+            .expect("actual private owner");
+        let destination = dir
+            .path()
+            .join(".rustfs.sys/native-preparations")
+            .join(preparation.to_string())
+            .join(preparation.to_string());
+        std::fs::create_dir(&destination).expect("private part fixture directory");
+        std::fs::write(destination.join("part.1"), &shard[..split]).expect("first actual encoded blocks");
+        std::fs::write(destination.join("part.2"), &shard[split..]).expect("remaining actual encoded blocks");
+        info.version_id = Some(preparation);
+        info.data_dir = Some(preparation);
+        info.parts.clear();
+        info.add_object_part(1, String::new(), first, None, i64::try_from(first).expect("size"), None, None);
+        info.add_object_part(
+            2,
+            String::new(),
+            body.len() - first,
+            None,
+            i64::try_from(body.len() - first).expect("size"),
+            None,
+            None,
+        );
+        candidates.push((disk.clone(), info));
+    }
+    let owner = set
+        .attest_native_stream(
+            store.id,
+            BUCKET,
+            KEY,
+            preparation,
+            incarnation,
+            candidates,
+            Sha256::digest(&body).into(),
+            u64::try_from(body.len()).expect("length"),
+            fence,
+        )
+        .await
+        .expect("actual adoption verifies/fsyncs both parts without rereading upload or taking namespace");
+    assert!(owner.receipt_count() >= 3);
+    drop(owner);
+    drop(guard);
+    drop(set);
+    drop(store);
+    let restarted = reopen(&dirs).await;
+    let recovered = restarted
+        .recover_native_object(BUCKET, KEY, preparation)
+        .await
+        .expect("actual multi-part recovery decode");
+    assert_eq!(recovered.object_digest(), <[u8; 32]>::from(Sha256::digest(&body)));
+    assert_eq!(recovered.object_length(), u64::try_from(body.len()).expect("length"));
+    assert_not_published(&restarted).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_rejects_overwrite() {
+    use crate::disk::{DiskAPI, RUSTFS_META_BUCKET};
+    let (dirs, store) = fixture().await;
+    let preparation = Uuid::new_v4();
+    drop(
+        store
+            .prepare_native_object(BUCKET, KEY, preparation, &mut PutObjReader::from_vec(vec![31; 2 * 1024 * 1024 + 11]))
+            .await
+            .expect("attested private stream"),
+    );
+    let disk = store.pools[0].get_disks_by_key(KEY).disks.read().await[0]
+        .clone()
+        .expect("actual disk");
+    let path = format!("native-preparations/{preparation}/{preparation}/part.1");
+    let full = dirs[0].path().join(RUSTFS_META_BUCKET).join(&path);
+    let before = std::fs::read(&full).expect("attested shard bytes");
+    assert!(
+        disk.create_file("", RUSTFS_META_BUCKET, &path, 1).await.is_err(),
+        "NATIVE_STREAM_ATTESTED_PART_MUST_NOT_BE_TRUNCATED"
+    );
+    assert_eq!(std::fs::read(&full).expect("retained shard"), before);
+    assert!(store.recover_native_object(BUCKET, KEY, preparation).await.is_ok());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_stream_prepare_record_locator() {
+    use crate::disk::Disk;
+    let (dirs, store) = fixture().await;
+    let preparation = Uuid::new_v4();
+    drop(
+        store
+            .prepare_native_object(BUCKET, KEY, preparation, &mut PutObjReader::from_vec(vec![37; 2 * 1024 * 1024 + 9]))
+            .await
+            .expect("actual prepared locator"),
+    );
+    let disk = store.pools[0].get_disks_by_key(KEY).disks.read().await[0]
+        .clone()
+        .expect("actual disk");
+    let Disk::Local(local) = disk.as_ref() else {
+        panic!("local fixture");
+    };
+    let listed = local
+        .get_disk()
+        .list_native_preparations(store.id, None, 1)
+        .await
+        .expect("descriptor-relative list");
+    assert_eq!(listed.records.len(), 1);
+    assert!(listed.unfinished.is_empty());
+    assert_eq!(listed.next, None);
+    let record = &listed.records[0];
+    assert_eq!(record.preparation, preparation);
+    assert_eq!(record.bucket, BUCKET);
+    assert_eq!(record.key, KEY);
+    assert_eq!(record.version, preparation);
+    assert!(record.prepared);
+    let path = dirs[0]
+        .path()
+        .join(".rustfs.sys/native-preparations")
+        .join(preparation.to_string());
+    assert_eq!(
+        record.metadata.as_ref(),
+        std::fs::read(path.join("xl.meta")).expect("retained exact metadata")
+    );
+    let direct = local
+        .get_disk()
+        .locate_native_preparation(store.id, preparation)
+        .await
+        .expect("direct locator")
+        .expect("present record");
+    assert_eq!(direct.metadata, record.metadata);
+    assert!(
+        local
+            .get_disk()
+            .locate_native_preparation(store.id, Uuid::new_v4())
+            .await
+            .expect("healthy absence")
+            .is_none()
+    );
+    assert!(local.get_disk().list_native_preparations(store.id, None, 65).await.is_err());
+    // Sender-owned namespace guard must not be acquired again by the recovery receiver.
+    let guard = store
+        .handle_new_ns_lock(BUCKET, KEY)
+        .await
+        .expect("namespace")
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await
+        .expect("actual sender lock");
+    let (owner, metadata) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.recover_native_object_unlocked(BUCKET, KEY, preparation),
+    )
+    .await
+    .expect("no recursive namespace lock")
+    .expect("actual disk recovery under sender lock");
+    assert!(metadata.iter().any(|(id, bytes)| {
+        owner
+            .receipts()
+            .iter()
+            .any(|receipt| receipt.disk_id() == *id && receipt.metadata_digest() == &<[u8; 32]>::from(Sha256::digest(bytes)))
+    }));
+    drop(guard);
+    // Moving a published part must not erase its durable location facts; locate grants no readiness.
+    std::fs::rename(
+        path.join(preparation.to_string()).join("part.1"),
+        dirs[0].path().join("published-part-test"),
+    )
+    .expect("publication progress fixture");
+    let located = local
+        .get_disk()
+        .locate_native_preparation(store.id, preparation)
+        .await
+        .expect("retained locator after part move")
+        .expect("retained record");
+    assert_eq!(located.metadata, record.metadata);
+    assert!(
+        store.recover_native_object(BUCKET, KEY, preparation).await.is_err(),
+        "prepared marker is not publication authority"
+    );
+}
