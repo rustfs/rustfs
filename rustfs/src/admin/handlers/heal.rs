@@ -732,17 +732,35 @@ fn merge_replacement_recovery_records(
     records.into_values().collect()
 }
 
-/// Distinct replacement generations must not claim the same target slot: two
-/// completed histories for one replaced disk cannot be reconciled into a
-/// definitive cluster view. Identical copies of one task are deduplicated by
-/// the merge, and disagreeing copies already surface as `Unknown` records.
-fn replacement_generations_claim_overlapping_targets(records: &[rustfs_heal::ReplacementRecoveryRecord]) -> bool {
+/// A definitive local snapshot can retain multiple generations for one slot,
+/// including completed replacements and committed handoff predecessors. Only
+/// overlapping generations never observed together in a definitive snapshot
+/// leave the merged peer histories ambiguous. Disagreeing copies of one task
+/// are already rejected by the merge.
+fn replacement_generations_claim_conflicting_targets(
+    records: &[rustfs_heal::ReplacementRecoveryRecord],
+    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
+) -> bool {
+    let local_histories = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.definitive)
+        .map(|snapshot| {
+            snapshot
+                .records
+                .iter()
+                .map(|record| record.task_id.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
     records.iter().any(|left| {
         !left.target_slots.is_empty()
             && records.iter().any(|right| {
                 right.task_id != left.task_id
                     && !right.target_slots.is_empty()
                     && right.target_slots.iter().any(|slot| left.target_slots.contains(slot))
+                    && !local_histories
+                        .iter()
+                        .any(|history| history.contains(left.task_id.as_str()) && history.contains(right.task_id.as_str()))
             })
     })
 }
@@ -782,13 +800,13 @@ fn aggregate_replacement_recovery_cluster_status(
     // different completed tasks on different peers, and peers without an
     // anchor report definitive empty snapshots. Peers conflict only when they
     // disagree about one task (the merge marks those copies `Unknown`) or
-    // when distinct generations claim the same target slot; disjoint
-    // generations merge into one definitive cluster history.
+    // claim overlapping targets without a shared definitive local history.
+    // Retained histories and disjoint generations can be merged.
     let records = merge_replacement_recovery_records(&snapshots);
     if records
         .iter()
         .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
-        || replacement_generations_claim_overlapping_targets(&records)
+        || replacement_generations_claim_conflicting_targets(&records, &snapshots)
     {
         reason.get_or_insert("peer_replacement_recovery_status_conflict");
     }
@@ -2205,6 +2223,14 @@ mod tests {
         }
     }
 
+    fn replacement_snapshot_with_retained_history() -> rustfs_heal::ReplacementRecoverySnapshot {
+        let mut snapshot = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        snapshot
+            .records
+            .push(replacement_record("22222222-2222-4222-8222-222222222222"));
+        snapshot
+    }
+
     #[tokio::test]
     async fn heal_selector_preflight_rejects_before_probe_and_token_creation() {
         use crate::admin::storage_api::runtime::PoolEndpoints;
@@ -2379,10 +2405,9 @@ mod tests {
     }
 
     #[test]
-    fn replacement_recovery_cluster_rejects_overlapping_targets_across_generations() {
-        // Both helper records claim the same target slot, so two completed
-        // generations over one replaced disk stay non-definitive even though
-        // the task ids differ.
+    fn replacement_recovery_cluster_rejects_overlapping_targets_without_shared_history() {
+        // Separate anchors cannot establish that these overlapping records
+        // describe compatible historical replacement instances.
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let peer = replacement_snapshot("22222222-2222-4222-8222-222222222222");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
@@ -2445,6 +2470,97 @@ mod tests {
         assert!(!cluster.definitive);
         assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
         assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_retained_history_on_one_anchor() {
+        let local = replacement_snapshot_with_retained_history();
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], vec![Ok(Some(empty))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_matching_retained_histories() {
+        let local = replacement_snapshot_with_retained_history();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], vec![Ok(Some(local.clone()))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_committed_handoff_history() {
+        let mut local = replacement_snapshot_with_retained_history();
+        let successor = local.records[1].task_id.clone();
+        let predecessor = &mut local.records[0];
+        predecessor.state = rustfs_heal::ReplacementRecoveryState::Unrecoverable;
+        predecessor.reason = Some(format!("replacement responsibility transferred to {successor}"));
+        predecessor.verified_at = None;
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_merges_retained_history_with_disjoint_peer_generation() {
+        let local = replacement_snapshot_with_retained_history();
+        let mut peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        peer.records[0].target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let mut expected = local.records.clone();
+        expected.extend(peer.records.clone());
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_retained_history_reported_only_by_peer() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot_with_retained_history();
+        let expected = peer.records.clone();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_overlap_outside_retained_history() {
+        let local = replacement_snapshot_with_retained_history();
+        let peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 3);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_disagreeing_copies_in_retained_history() {
+        let local = replacement_snapshot_with_retained_history();
+        let mut peer = local.clone();
+        peer.records[0].verified_at = Some(43);
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 2);
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+        assert_eq!(cluster.records[1].state, rustfs_heal::ReplacementRecoveryState::Completed);
     }
 
     #[test]
