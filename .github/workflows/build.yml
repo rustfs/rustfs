@@ -437,9 +437,9 @@ jobs:
           # self-hosted runner by running concurrently.
           for binary in "${BINARY_NAMES[@]}"; do
             PROFILE_ARGS=()
-            if [[ "$binary" == "rustfs" && "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
-              # The in-process profiler resolves names from the final executable.
-              # Retain function symbols without enabling DWARF source information.
+            if [[ "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+              # Share one profile so the CLI does not rebuild the dependency
+              # closure. Only the server keeps symbols for the profiler.
               PROFILE_ARGS=(--config 'profile.release.strip="none"')
             fi
             if [[ "${{ matrix.cross }}" == "true" ]]; then
@@ -449,6 +449,10 @@ jobs:
               cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
             fi
           done
+
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            strip --strip-all "target/${{ matrix.target }}/release/rustfs-cli"
+          fi
 
           # All release targets use same-architecture runners, including GNU
           # builds that use Zig only to select the glibc ABI floor.
