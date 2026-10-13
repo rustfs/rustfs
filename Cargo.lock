@@ -1020,7 +1020,7 @@ dependencies = [
  "lru 0.18.5",
  "percent-encoding",
  "regex-lite",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tracing",
  "url",
 ]
@@ -1120,7 +1120,7 @@ dependencies = [
  "http 1.5.0",
  "p256 0.13.2",
  "percent-encoding",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "time",
  "tracing",
@@ -1155,7 +1155,7 @@ dependencies = [
  "md-5 0.11.0",
  "pin-project-lite",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tracing",
 ]
 
@@ -1518,7 +1518,7 @@ checksum = "144e573728da132683b9488acd528274c790e07fc06ff81ee29f9d8f8b1041e0"
 dependencies = [
  "blowfish",
  "pbkdf2 0.13.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -4084,7 +4084,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "suppaftp",
  "tempfile",
  "time",
@@ -4174,7 +4174,7 @@ dependencies = [
  "ed25519 3.0.0",
  "rand_core 0.10.1",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "subtle",
  "zeroize",
@@ -4795,7 +4795,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -4957,7 +4957,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -6384,7 +6384,7 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
 dependencies = [
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -7577,7 +7577,7 @@ dependencies = [
  "elliptic-curve 0.14.1",
  "primefield",
  "primeorder 0.14.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -7603,7 +7603,7 @@ dependencies = [
  "fiat-crypto 0.3.0",
  "primefield",
  "primeorder 0.14.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -7617,7 +7617,7 @@ dependencies = [
  "elliptic-curve 0.14.1",
  "primefield",
  "primeorder 0.14.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -7643,7 +7643,7 @@ dependencies = [
  "futures",
  "log",
  "rand 0.10.3",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "windows",
@@ -8032,7 +8032,7 @@ dependencies = [
  "pbkdf2 0.13.0",
  "rand_core 0.10.1",
  "scrypt 0.12.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "spki 0.8.1",
 ]
 
@@ -8150,7 +8150,7 @@ dependencies = [
  "md-5 0.11.0",
  "memchr",
  "rand 0.10.3",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "stringprep",
 ]
 
@@ -9289,7 +9289,7 @@ dependencies = [
  "pkcs1 0.8.0-rc.4",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "spki 0.8.1",
  "zeroize",
@@ -9404,7 +9404,7 @@ dependencies = [
  "scrypt 0.12.0",
  "sec1 0.8.1",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sha3 0.12.0",
  "signature 3.0.0",
  "spki 0.8.1",
@@ -9494,7 +9494,7 @@ version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d84e8ba78bd384263e5922f084cbe1b081c3b7e69add59c8fb097b879ba968a"
 dependencies = [
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "walkdir",
 ]
 
@@ -9647,7 +9647,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serial_test",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "shadow-rs",
  "snap",
  "socket2",
@@ -9712,7 +9712,7 @@ dependencies = [
  "md-5 0.11.0",
  "pretty_assertions",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "xxhash-rust",
 ]
 
@@ -9762,7 +9762,7 @@ dependencies = [
  "object 0.40.0",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "symbolic-demangle",
 ]
 
@@ -9776,7 +9776,7 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "time",
 ]
 
@@ -9795,7 +9795,7 @@ dependencies = [
  "rsa 0.10.0-rc.18",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "test-case",
  "thiserror 2.0.21",
  "time",
@@ -9904,7 +9904,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "shadow-rs",
  "smallvec",
  "temp-env",
@@ -9973,7 +9973,7 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -10013,7 +10013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "temp-env",
  "tempfile",
  "thiserror 2.0.21",
@@ -10072,7 +10072,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "temp-env",
  "tempfile",
@@ -10129,7 +10129,7 @@ dependencies = [
  "pbkdf2 0.13.0",
  "rand 0.10.3",
  "rustls",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "socket2",
  "thiserror 2.0.21",
  "tracing",
@@ -10153,7 +10153,7 @@ dependencies = [
  "rand 0.10.3",
  "rustfs-kafka",
  "rustls",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -10223,7 +10223,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "temp-env",
  "tempfile",
@@ -10300,7 +10300,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -10557,7 +10557,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "socket2",
  "subtle",
  "tempfile",
@@ -10651,7 +10651,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "temp-env",
  "thiserror 2.0.21",
  "tokio",
@@ -10679,7 +10679,7 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "walkdir",
 ]
@@ -10716,7 +10716,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -10836,7 +10836,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "temp-env",
  "tempfile",
  "thiserror 2.0.21",
@@ -10942,7 +10942,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "snap",
  "sysinfo",
  "tempfile",
@@ -10988,7 +10988,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -11079,7 +11079,7 @@ dependencies = [
  "rustix",
  "serde",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "siphasher",
  "snap",
  "temp-env",
@@ -11104,7 +11104,7 @@ dependencies = [
  "rustfs-tokio-tar",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tar-codec",
  "tar-framing",
  "thiserror 2.0.21",
@@ -11341,7 +11341,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "smallvec",
  "std-next",
  "subtle",
@@ -11405,7 +11405,7 @@ dependencies = [
  "jiff",
  "nom 8.0.0",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "smallvec",
  "std-next",
  "subtle",
@@ -11470,9 +11470,9 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "dyn-clone",
  "ref-cast",
@@ -11506,7 +11506,7 @@ dependencies = [
  "cfg-if",
  "pbkdf2 0.13.0",
  "salsa20 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -11723,7 +11723,7 @@ dependencies = [
  "indexmap 2.14.2",
  "jiff",
  "schemars 0.9.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -11818,9 +11818,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -12190,7 +12190,7 @@ dependencies = [
  "sec1 0.8.1",
  "serde",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "ssh-cipher",
  "ssh-encoding",
@@ -12777,7 +12777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
 dependencies = [
  "rustls",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
