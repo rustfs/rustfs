@@ -33,6 +33,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | Document | Use this when |
 |---|---|
 | [capture-checkpoint-contract.md](capture-checkpoint-contract.md) | changing Capture checkpoint capture, provenance, installation, recovery, or log cleanup |
+| [native-source-reader.md](native-source-reader.md) | exposing a live native capture writer through a same-UID local read-only source interface |
 | [native-object-preparation.md](native-object-preparation.md) | changing private native object preparation, durable shard receipts, retry placement, or recovery before capture publication |
 | [local-descriptor-cache.md](local-descriptor-cache.md) | changing descriptor cache keys/open modes or invalidation after local mutations |
 | [erasure-coding.md](erasure-coding.md) | changing anything under `crates/ecstore/src/erasure/`, `crates/filemeta/`, `crates/ecstore/src/set_disk/`, storage-class or layout code, or any decode, quorum, or heal boundary (normative spec) |

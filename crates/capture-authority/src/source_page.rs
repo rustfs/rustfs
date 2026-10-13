@@ -23,7 +23,7 @@ pub struct EventCursor {
     revision: u64,
 }
 impl EventCursor {
-    fn new(cluster: [u8; 16], event: [u8; 16], value: &CreatedEvent) -> Self {
+    pub(crate) fn new(cluster: [u8; 16], event: [u8; 16], value: &CreatedEvent) -> Self {
         Self {
             cluster,
             term: value.decision_log_id.term,
@@ -39,12 +39,14 @@ impl EventCursor {
         self == &Self::new(cluster, event, value)
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceEvent {
     pub event_id: [u8; 16],
     pub captured: CreatedEvent,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventPage {
     pub events: Vec<SourceEvent>,
     pub next: Option<EventCursor>,

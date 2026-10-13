@@ -9806,6 +9806,7 @@ version = "1.0.1"
 dependencies = [
  "openraft",
  "redb",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

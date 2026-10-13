@@ -15,6 +15,10 @@ mod native_checkpoint_tests;
 pub use native_checkpoint::{CheckpointError, CheckpointLimits, CheckpointReceipt};
 mod created;
 mod source_page;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod source_reader;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod source_reader_tests;
 pub use source_page::{EventCursor, EventPage, MAX_EVENT_PAGE, SourceEvent};
 mod native_snapshot;
 mod node;
@@ -54,6 +58,8 @@ pub struct NativeLogWriter {
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
     checkpoint_admission: std::sync::Arc<tokio::sync::Mutex<()>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    source_reader_admission: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +78,8 @@ impl NativeLogWriter {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
             ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_admission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            source_reader_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(source_reader::MAX_CONNECTIONS)),
         }
     }
 
@@ -236,7 +244,8 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const VOTE: TableDefinition<u8, &[u8]> = TableDefinition::new("vote");
 const LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
     pub cluster_id: [u8; 16],
     pub node_id: u64,
@@ -247,7 +256,8 @@ pub struct VoteRecord {
     pub voted_node: u64,
     pub committed: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogId {
     pub term: u64,
     pub leader_node: u64,

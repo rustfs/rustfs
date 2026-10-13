@@ -1,12 +1,14 @@
 use crate::{LogId, StoreError, decode_id, encode_id};
 
 pub const MAX_OBJECT_KEY_LENGTH: usize = 4096;
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectIdentity {
     pub bucket_incarnation: [u8; 16],
     pub key: Vec<u8>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedIdentity {
     pub version_id: [u8; 16],
     pub preparation_id: [u8; 16],
@@ -21,7 +23,8 @@ pub struct DecideCreated {
     pub prepared: PreparedIdentity,
     pub binding_revision: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureBinding {
     pub revision: u64,
     pub binding_id: [u8; 16],
@@ -47,7 +50,8 @@ pub struct CreatedVersion {
     pub decision_log_id: LogId,
     pub binding_revision: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatedEvent {
     pub object: ObjectIdentity,
     pub prepared: PreparedIdentity,
