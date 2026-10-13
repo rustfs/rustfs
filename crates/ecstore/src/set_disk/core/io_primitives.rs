@@ -3618,6 +3618,7 @@ impl SetDisks {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rename_data_commit_from_observations(
         observations: RenameDataObservations<'_>,
         write_quorum: usize,
