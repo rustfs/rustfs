@@ -899,12 +899,14 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
 }
 
 #[test]
-fn complete_usage_candidate_with_changed_generation_is_superseded() {
+fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     let all_buckets = vec!["bucket".to_string()];
     let completed_set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false, false);
 
     assert!(completed_usage.is_some());
+    // A moved dirty generation shades buckets for the next cycle; only a
+    // guardrail veto supersedes a structurally complete candidate.
     assert_eq!(
         classify_nsscanner_cycle(
             completed_usage.is_some(),
@@ -913,6 +915,17 @@ fn complete_usage_candidate_with_changed_generation_is_superseded() {
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
             ScannerCycleActivityStatus::Unchanged,
+        ),
+        ScannerCycleStatus::Complete
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            completed_usage.is_some(),
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Changed,
         ),
         ScannerCycleStatus::Superseded
     );

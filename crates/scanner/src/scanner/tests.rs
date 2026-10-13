@@ -6432,6 +6432,7 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -6480,6 +6481,7 @@ async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_iden
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -6521,6 +6523,7 @@ async fn test_observational_usage_uses_bootstrap_pending_primary_as_baseline() {
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -7403,6 +7406,7 @@ async fn test_store_data_usage_in_backend_preserves_superseded_status() {
             scanner_epoch: Some(7),
             scanner_cycle: Some(11),
             usage_snapshot_converged: Some(false),
+            usage_snapshot_observational: true,
             ..complete_usage_with_bucket_count(None, 1)
         })
         .await
@@ -7431,6 +7435,56 @@ async fn test_store_data_usage_in_backend_preserves_superseded_status() {
 }
 
 #[tokio::test]
+async fn test_store_data_usage_in_backend_publishes_pending_bucket_certification_as_authoritative() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let observed_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str());
+    let authoritative = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(10),
+        usage_snapshot_converged: Some(true),
+        ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 1)
+    };
+    store.objects.lock().await.insert(
+        authoritative_key.clone(),
+        serde_json::to_vec(&authoritative).expect("authoritative snapshot should encode"),
+    );
+    store.revisions.lock().await.insert(authoritative_key.clone(), 1);
+
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(11),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_buckets: vec!["bucket-0".to_string()],
+            usage_snapshot_pending_bucket_count: 1,
+            ..complete_usage_with_bucket_count(None, 1)
+        })
+        .await
+        .expect("certified usage snapshot should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+    assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+    let objects = store.objects.lock().await;
+    assert!(
+        !objects.contains_key(&observed_key),
+        "pending buckets do not make a snapshot observational"
+    );
+    let saved = serde_json::from_slice::<DataUsageInfo>(objects.get(&authoritative_key).expect("authoritative snapshot"))
+        .expect("persisted usage snapshot should decode");
+    assert_eq!(saved.scanner_cycle, Some(11));
+    assert_eq!(saved.usage_snapshot_converged, Some(false));
+    assert_eq!(saved.usage_snapshot_pending_buckets, vec!["bucket-0".to_string()]);
+    assert_eq!(saved.usage_snapshot_pending_bucket_count, 1);
+    assert!(!saved.usage_snapshot_observational);
+    assert_eq!(saved.usage_snapshot_authoritative_baseline, None);
+    assert!(data_usage_info_has_persisted_baseline_identity(&saved));
+}
+
+#[tokio::test]
 #[serial]
 async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_save() {
     let store = Arc::new(MemoryConfigStore::default());
@@ -7453,6 +7507,7 @@ async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_s
             scanner_epoch: Some(7),
             scanner_cycle: Some(11),
             usage_snapshot_converged: Some(false),
+            usage_snapshot_observational: true,
             ..complete_usage_with_bucket_count(None, 1)
         })
         .await
@@ -9835,23 +9890,46 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
 }
 
 #[test]
-fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acquisition() {
-    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
-    let expected_digest = Some(scanner_activity_snapshot_digest(&before));
-    assert_eq!(scanner_post_lease_activity_defer_reason(expected_digest, Ok(before.clone())), None);
+fn post_lease_activity_proof_rejects_a_peer_whose_dirty_usage_moved_before_lease_acquisition() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3)),
+    ]);
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(before.clone())), None);
 
+    // Local generation movement in the lease window is the next cycle's
+    // work: its buckets stay in the dirty map and the walk remains certified.
+    let mut local_shaded = before.clone();
+    let local = local_shaded
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local node should be present");
+    local.namespace_generation += 1;
+    local.dirty_usage_generation += 1;
+    local.dirty_usage_pending = true;
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(local_shaded)), None);
+
+    // A peer PUT tail that drained before the lease leaves the movement
+    // generation accepted by the lease unchanged, but the peer's dirty state
+    // moved and this phase cannot name its buckets.
     let mut after = before.clone();
-    after
-        .get_mut("node-2")
-        .expect("writer should be present")
-        .namespace_generation += 1;
+    let writer = after.get_mut("node-2").expect("writer should be present");
+    writer.namespace_generation += 1;
+    writer.dirty_usage_generation += 1;
     assert_eq!(
         before["node-2"].movement_generation, after["node-2"].movement_generation,
         "the existing movement-only lease remains valid after a PUT tail drains"
     );
     assert!(scanner_activity_allows_usage_publication(&after));
-    let reason = scanner_post_lease_activity_defer_reason(expected_digest, Ok(after));
+    let reason = scanner_post_lease_activity_defer_reason(Some(&before), Ok(after));
     assert_eq!(reason, Some(ScannerCycleDeferReason::ActivityBaselineUnavailable));
+
+    // A guardrail field moving in the window still defers.
+    let mut moved = before.clone();
+    moved.get_mut("node-2").expect("peer should be present").movement_generation += 1;
+    assert_eq!(
+        scanner_post_lease_activity_defer_reason(Some(&before), Ok(moved)),
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
 
     let result = ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_remote_dirty_usage_acknowledgements(vec![
         ScannerDirtyUsageAcknowledgement {
@@ -9935,15 +10013,13 @@ fn remote_lease_validation_failure_preserves_movement_defer_for_remote_fence_los
 #[test]
 fn post_lease_activity_proof_requires_a_complete_matching_baseline() {
     let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
-    let digest = scanner_activity_snapshot_digest(&before);
     let mut blocked = before.clone();
     blocked.get_mut("node-2").expect("peer should be present").publication_blocked = true;
-    let blocked_digest = scanner_activity_snapshot_digest(&blocked);
     for (expected, observed) in [
-        (None, Ok(before)),
-        (Some(digest), Err("peer is unavailable".to_string())),
-        (Some(digest), Ok(BTreeMap::new())),
-        (Some(blocked_digest), Ok(blocked)),
+        (None, Ok(before.clone())),
+        (Some(&before), Err("peer is unavailable".to_string())),
+        (Some(&before), Ok(BTreeMap::new())),
+        (Some(&blocked), Ok(blocked.clone())),
     ] {
         assert_eq!(
             scanner_post_lease_activity_defer_reason(expected, observed),

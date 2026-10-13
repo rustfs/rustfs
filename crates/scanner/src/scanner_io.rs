@@ -39,7 +39,7 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -1000,9 +1000,13 @@ fn classify_nsscanner_cycle(
         return ScannerCycleStatus::Incomplete;
     }
 
-    match (activity_status, dirty_usage_status) {
-        (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        _ => ScannerCycleStatus::Superseded,
+    // Termination is snapshot-at-the-beginning: a structurally complete walk
+    // that the guardrail did not veto is `Complete`. Buckets whose dirty
+    // generation moved during the walk stay pending for the next cycle and
+    // are reported in the publication; they no longer supersede the cycle.
+    match activity_status {
+        ScannerCycleActivityStatus::Unchanged => ScannerCycleStatus::Complete,
+        ScannerCycleActivityStatus::Changed | ScannerCycleActivityStatus::Unverified => ScannerCycleStatus::Superseded,
     }
 }
 
@@ -1014,24 +1018,52 @@ fn should_publish_observational_snapshot(status: ScannerCycleStatus) -> bool {
     matches!(status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable))
 }
 
+/// Pending buckets of a cycle, sorted so the publication is deterministic.
+pub(crate) type ScannerCyclePendingBuckets = BTreeSet<String>;
+
+/// Stamp the certification outcome of a cycle on its usage snapshot. A
+/// `Complete` cycle publishes an authoritative snapshot that is converged
+/// only when no bucket is pending; any other publishable status is an
+/// observational snapshot routed to the observed object. The marks are part
+/// of the bytes the publication expectation digests, so every writer applies
+/// exactly this function.
+fn apply_scanner_cycle_publication_marks(
+    data_usage_info: &mut DataUsageInfo,
+    status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
+) {
+    let complete = status == ScannerCycleStatus::Complete;
+    data_usage_info.usage_snapshot_observational = !complete;
+    data_usage_info.usage_snapshot_converged = Some(complete && pending_buckets.is_empty());
+    if complete {
+        data_usage_info.usage_snapshot_pending_buckets = pending_buckets.iter().cloned().collect();
+        data_usage_info.usage_snapshot_pending_bucket_count = u64::try_from(pending_buckets.len()).unwrap_or(u64::MAX);
+    } else {
+        data_usage_info.usage_snapshot_pending_buckets.clear();
+        data_usage_info.usage_snapshot_pending_bucket_count = 0;
+    }
+}
+
 fn prepare_usage_snapshot_for_publication(
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     mut data_usage_info: DataUsageInfo,
 ) -> Option<DataUsageInfo> {
     if !should_publish_usage_snapshot(status) {
         return None;
     }
 
-    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    apply_scanner_cycle_publication_marks(&mut data_usage_info, status, pending_buckets);
     Some(data_usage_info)
 }
 
 async fn publish_usage_snapshot(
     updates: &mpsc::Sender<DataUsageInfo>,
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     data_usage_info: DataUsageInfo,
 ) -> Result<bool> {
-    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
+    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, pending_buckets, data_usage_info) else {
         return Ok(false);
     };
     send_data_usage_update(updates, data_usage_info).await?;
@@ -1045,6 +1077,9 @@ async fn publish_observational_snapshot(
     data_usage_info.usage_snapshot_complete = false;
     data_usage_info.usage_snapshot_partial = true;
     data_usage_info.usage_snapshot_converged = Some(false);
+    data_usage_info.usage_snapshot_observational = true;
+    data_usage_info.usage_snapshot_pending_buckets.clear();
+    data_usage_info.usage_snapshot_pending_bucket_count = 0;
     send_data_usage_update(updates, data_usage_info).await?;
     Ok(true)
 }
@@ -1467,6 +1502,8 @@ pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
+    activity_baseline: Option<Arc<crate::scanner::ScannerActivitySnapshot>>,
+    pending_dirty_usage_buckets: usize,
     observational_snapshot_published: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
@@ -1485,6 +1522,8 @@ impl ScannerCycleResult {
             status,
             publication_epoch: None,
             activity_digest: None,
+            activity_baseline: None,
+            pending_dirty_usage_buckets: 0,
             observational_snapshot_published: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
@@ -1514,8 +1553,32 @@ impl ScannerCycleResult {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn activity_digest(&self) -> Option<[u8; 32]> {
         self.activity_digest
+    }
+
+    fn with_activity_baseline(mut self, baseline: Arc<crate::scanner::ScannerActivitySnapshot>) -> Self {
+        self.publication_expectation = None;
+        self.activity_baseline = Some(baseline);
+        self
+    }
+
+    /// The pre-walk activity probe the post-lease guardrail recheck compares
+    /// against.
+    pub(crate) fn activity_baseline(&self) -> Option<&crate::scanner::ScannerActivitySnapshot> {
+        self.activity_baseline.as_deref()
+    }
+
+    fn with_pending_dirty_usage_buckets(mut self, pending: usize) -> Self {
+        self.publication_expectation = None;
+        self.pending_dirty_usage_buckets = pending;
+        self
+    }
+
+    /// Buckets a `Complete` cycle left pending for the next cycle.
+    pub(crate) fn pending_dirty_usage_buckets(&self) -> usize {
+        self.pending_dirty_usage_buckets
     }
 
     pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {

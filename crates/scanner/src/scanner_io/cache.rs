@@ -578,8 +578,12 @@ pub(super) fn empty_namespace_usage_candidate(
 }
 
 impl ValidatedUsageCandidate {
-    pub(super) fn prepare(mut self, status: ScannerCycleStatus) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
-        self.data.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    pub(super) fn prepare(
+        mut self,
+        status: ScannerCycleStatus,
+        pending_buckets: &ScannerCyclePendingBuckets,
+    ) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        apply_scanner_cycle_publication_marks(&mut self.data, status, pending_buckets);
         let expectation = if status == ScannerCycleStatus::Complete {
             struct DigestWriter(Sha256);
             impl std::io::Write for DigestWriter {

@@ -2036,7 +2036,10 @@ where
         && let Ok(result) = &scan_result
         && result.status == ScannerCycleStatus::Complete
     {
-        scanner_post_lease_activity_defer_reason(result.activity_digest(), probe_scanner_activity(storeapi.as_ref(), true).await)
+        scanner_post_lease_activity_defer_reason(
+            result.activity_baseline(),
+            probe_scanner_activity(storeapi.as_ref(), true).await,
+        )
     } else {
         None
     };
@@ -2372,6 +2375,7 @@ where
     } else {
         "incomplete_coverage"
     };
+    let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2583,6 +2587,7 @@ where
         state = "completed",
         duration = ?now.elapsed(),
         cycles_total = cycle_info.cycle_completed.len(),
+        pending_dirty_buckets = pending_dirty_usage_buckets,
         "Scanner cycle completed"
     );
 
@@ -3606,14 +3611,22 @@ fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_
         )
 }
 
+/// Re-prove the guardrail after every peer granted a publication lease. The
+/// comparison uses the guardrail fields (`scanner_activity_guardrail_veto`),
+/// not the full digest: local generation movement in this window is the next
+/// cycle's work and its buckets stay in the dirty map. A peer whose dirty
+/// usage moved keeps deferring in this phase, as it does during the walk.
 fn scanner_post_lease_activity_defer_reason(
-    expected_digest: Option<[u8; 32]>,
+    baseline: Option<&ScannerActivitySnapshot>,
     activity: Result<ScannerActivitySnapshot, String>,
 ) -> Option<ScannerCycleDeferReason> {
     match activity {
         Ok(snapshot)
             if scanner_activity_allows_usage_publication(&snapshot)
-                && expected_digest == Some(scanner_activity_snapshot_digest(&snapshot)) =>
+                && baseline.is_some_and(|baseline| {
+                    scanner_activity_guardrail_veto(baseline, &snapshot).is_none()
+                        && scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none()
+                }) =>
         {
             None
         }
@@ -3621,8 +3634,13 @@ fn scanner_post_lease_activity_defer_reason(
             let blocker = match &observed {
                 Err(_) => "probe_failed",
                 Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
-                Ok(_) if expected_digest.is_none() => "baseline_missing",
-                Ok(_) => "activity_changed",
+                Ok(_) if baseline.is_none() => "baseline_missing",
+                Ok(snapshot) => baseline
+                    .and_then(|baseline| {
+                        scanner_activity_guardrail_veto(baseline, snapshot)
+                            .or_else(|| scanner_peer_dirty_usage_moved(baseline, snapshot))
+                    })
+                    .map_or("activity_changed", |veto| veto.field),
             };
             debug!(
                 target: "rustfs::scanner",
