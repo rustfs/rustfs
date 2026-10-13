@@ -3180,6 +3180,9 @@ enum SyncMode {
     FileOnly,
 }
 
+// Keep 2 MiB of shard data plus up to 128 32-byte hashes in one file buffer.
+const SHARD_FILE_MAX_BUF_SIZE: usize = 2 * 1024 * 1024 + 4096;
+
 #[allow(
     dead_code,
     reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
@@ -3445,7 +3448,8 @@ async fn read_dir_entry_batch_with_walk_stall(
 }
 
 impl FileCacheReclaimReader {
-    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
@@ -3531,7 +3535,8 @@ impl AsyncRead for FileCacheReclaimReader {
 }
 
 impl FileCacheReclaimWriter {
-    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+    fn new(mut inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_shutdown {
             let _ = set_fd_nocache(&inner);
@@ -27300,6 +27305,80 @@ mod test {
         let mut body = Vec::new();
         reader.read_to_end(&mut body).await.expect("reader should forward reads");
         assert!(body.ends_with(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_round_trip_checksum_sized_file_buffers() {
+        use sha2::{Digest, Sha256};
+        use std::io::IoSlice;
+
+        let dir = tempfile::tempdir().expect("create wrapper test directory");
+        for checksum_bytes in [32, 64] {
+            let wire_len = 2 * 1024 * 1024 + checksum_bytes;
+            let content: Vec<_> = (0u8..=250).cycle().take(wire_len).collect();
+            let path = dir.path().join(format!("frame-{checksum_bytes}"));
+            let file = File::create(&path).await.expect("create writer file");
+            let mut writer = FileCacheReclaimWriter::new(file, wire_len, true);
+            let mut bufs = Vec::new();
+            for frame in content.chunks(wire_len / (checksum_bytes / 32)) {
+                bufs.push(IoSlice::new(&frame[..32]));
+                bufs.push(IoSlice::new(&frame[32..]));
+            }
+            let accepted = writer.write_vectored(&bufs).await.expect("accept checksum and data slices");
+            assert_eq!(accepted, wire_len, "checksum overhead must fit alongside 2 MiB of data");
+            let tail = b"short final tail!";
+            writer.write_all(tail).await.expect("write after the accepted frame");
+            writer.flush().await.expect("flush pending writes");
+            writer.shutdown().await.expect("finish writes before cache reclaim");
+            writer.inner.sync_all().await.expect("sync the completed test file");
+
+            let file = File::open(&path).await.expect("reopen completed file");
+            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true);
+            let mut actual = vec![0; wire_len];
+            let read = reader
+                .read(&mut actual)
+                .await
+                .expect("read the complete large frame in one request");
+            assert_eq!(read, wire_len, "the file buffer must read checksum overhead alongside 2 MiB of data");
+            assert_eq!(actual, content, "large reads must preserve every accepted byte");
+            assert_eq!(Sha256::digest(&actual), Sha256::digest(&content), "frame digest must survive file I/O");
+            let mut actual_tail = [0; 32];
+            assert_eq!(
+                reader
+                    .read_exact(&mut actual_tail)
+                    .await
+                    .expect_err("short tail must report EOF")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(&actual_tail[..tail.len()], tail, "short read must preserve the available tail");
+            assert_eq!(reader.read(&mut [0; 1]).await.expect("read at EOF"), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_cache_reclaim_writer_propagates_shutdown_error_after_acceptance() {
+        use std::io::IoSlice;
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .expect("open full device");
+        let payload = vec![31; 2 * 1024 * 1024 + 64];
+        let mut writer = FileCacheReclaimWriter::new(file, payload.len(), true);
+        let accepted = writer
+            .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+            .await
+            .expect("Tokio may accept bytes before the blocking write fails");
+        assert_eq!(accepted, payload.len(), "the expanded buffer must accept the complete frame");
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("accepted bytes must not hide a failed blocking write");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!writer.reclaimed, "failed shutdown must not run successful-write cache reclaim");
     }
 
     #[cfg(target_os = "macos")]
