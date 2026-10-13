@@ -18,7 +18,6 @@ members = [
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/checksums", # client checksums
     "crates/common", # Shared utilities and data structures
-    "crates/capture-authority", # Durable capture authority storage
     "crates/data-usage", # Shared data usage models and algorithms
     "crates/config", # Configuration management
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
@@ -104,7 +103,6 @@ rustfs-config = { path = "./crates/config", version = "1.0.1" }
 rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.1" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.1" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.1" }
-rustfs-capture-authority = { path = "crates/capture-authority", version = "1.0.1" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.1" }
 rustfs-iam = { path = "crates/iam", version = "1.0.1" }
@@ -316,8 +314,6 @@ ratelimit = "2.0.0"
 rayon = "1.12.0"
 rustfs-erasure-codec = { version = "9.0.0" }
 reed-solomon-simd = "3.1.0"
-openraft = { version = "=0.9.25", default-features = false, features = ["serde"] }
-redb = "=4.3.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
 redis = { version = "1.7.1" }

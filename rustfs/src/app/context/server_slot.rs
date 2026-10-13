@@ -33,7 +33,6 @@ use std::sync::{Arc, OnceLock};
 #[derive(Default)]
 pub struct ServerContextSlot {
     app_context: OnceLock<Arc<AppContext>>,
-    capture_service: std::sync::Mutex<Option<Arc<crate::startup_capture::NativeCaptureService>>>,
     bootstrap_target: Option<BootstrapLocalTarget>,
     heal_topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
 }
@@ -52,7 +51,6 @@ impl ServerContextSlot {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             app_context: OnceLock::new(),
-            capture_service: std::sync::Mutex::new(None),
             bootstrap_target: None,
             heal_topology_fingerprint: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -94,36 +92,6 @@ impl ServerContextSlot {
     /// Immutable, restricted startup capability; never resolves an ambient store.
     pub fn bootstrap_target(&self) -> Option<BootstrapLocalTarget> {
         self.bootstrap_target.clone()
-    }
-
-    pub(crate) fn install_capture_service(
-        &self,
-        service: Arc<crate::startup_capture::NativeCaptureService>,
-    ) -> std::io::Result<()> {
-        let mut installed = self
-            .capture_service
-            .lock()
-            .map_err(|_| std::io::Error::other("capture service slot poisoned"))?;
-        if installed.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "capture service already installed",
-            ));
-        }
-        *installed = Some(service);
-        Ok(())
-    }
-
-    pub(crate) fn installed_capture_service(&self) -> Option<Arc<crate::startup_capture::NativeCaptureService>> {
-        self.capture_service.lock().ok()?.clone()
-    }
-
-    pub(crate) fn remove_capture_service(&self, service: &Arc<crate::startup_capture::NativeCaptureService>) {
-        if let Ok(mut installed) = self.capture_service.lock()
-            && installed.as_ref().is_some_and(|current| Arc::ptr_eq(current, service))
-        {
-            installed.take();
-        }
     }
 
     /// This server's installed application context, if startup has completed.

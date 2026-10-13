@@ -8,7 +8,6 @@ collection:
 
 ## Operations
 
-- [Native capture Raft runtime](operations/native-capture.md): explicit creation, recovery, shared reader, and shutdown.
 
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.

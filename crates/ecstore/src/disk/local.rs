@@ -20,7 +20,6 @@ mod commit;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
-pub mod native_prepare;
 mod replacement_lease;
 #[cfg(any(target_os = "linux", test))]
 #[path = "uring_driver_budget.rs"]

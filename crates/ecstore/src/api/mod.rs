@@ -597,7 +597,6 @@ pub mod rio {
 }
 
 pub mod rpc {
-    pub use crate::cluster::rpc::capture_raft::{CaptureRaftError, CaptureRaftLimits, CaptureRaftNetworkFactory, CaptureRaftRpc};
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,

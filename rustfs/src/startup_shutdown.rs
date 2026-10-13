@@ -247,12 +247,8 @@ pub(crate) async fn run_startup_shutdown_sequence(
     optional_runtimes: OptionalRuntimeServices,
     capacity_tasks: Option<CapacityBackgroundTasks>,
     ctx: CancellationToken,
-    capture_runtime: Option<crate::startup_capture::NativeCaptureRuntime>,
 ) -> std::io::Result<()> {
     let (s3_shutdown_handle, console_shutdown_handle) = listener_shutdown_handles;
-    if let Some(capture) = &capture_runtime {
-        capture.stop_admission();
-    }
     ctx.cancel();
 
     // Stop long-lived peer/disk background monitors while the runtime and tracing
@@ -467,10 +463,6 @@ pub(crate) async fn run_startup_shutdown_sequence(
         console_shutdown_handle.shutdown().await;
     }
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
-    let capture_result = match capture_runtime {
-        Some(capture) => capture.shutdown().await,
-        None => Ok(()),
-    };
     // FTP, SFTP and WebDAV can start deletes too: wait for detached mutations
     // only after every front end has stopped.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
@@ -480,7 +472,6 @@ pub(crate) async fn run_startup_shutdown_sequence(
         rustfs_heal::heal::clear_unclean_shutdown_markers(),
     )
     .await;
-    capture_result?;
     state_manager.update(ServiceState::Stopped);
     info!(
         target: "rustfs::main::handle_shutdown",

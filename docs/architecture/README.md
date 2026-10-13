@@ -32,13 +32,6 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 
 | Document | Use this when |
 |---|---|
-| [native-raft-transport.md](native-raft-transport.md) | mounting authenticated TCP capture Raft RPCs or configuring bounded transport |
-| [native-raft-owner.md](native-raft-owner.md) | starting real capture Raft lifecycle or wiring native decision submission and a shared reader |
-| [native-raft-state-machine.md](native-raft-state-machine.md) | adapting native capture application state to OpenRaft or receiving durable snapshots |
-| [capture-raft-log-storage.md](capture-raft-log-storage.md) | adapting native capture persistence to OpenRaft log traits or changing checkpoint-authorized prefix purge |
-| [capture-checkpoint-contract.md](capture-checkpoint-contract.md) | changing Capture checkpoint capture, provenance, installation, recovery, or log cleanup |
-| [native-source-reader.md](native-source-reader.md) | exposing a live native capture writer through a same-UID local read-only source interface |
-| [native-object-preparation.md](native-object-preparation.md) | changing private native object preparation, durable shard receipts, retry placement, or recovery before capture publication |
 | [local-descriptor-cache.md](local-descriptor-cache.md) | changing descriptor cache keys/open modes or invalidation after local mutations |
 | [erasure-coding.md](erasure-coding.md) | changing anything under `crates/ecstore/src/erasure/`, `crates/filemeta/`, `crates/ecstore/src/set_disk/`, storage-class or layout code, or any decode, quorum, or heal boundary (normative spec) |
 | [placement-repair-invariants.md](placement-repair-invariants.md) | changing anything that resolves an object to a pool, set, or disk, or that admits scanner or heal work |
