@@ -2145,10 +2145,49 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let (entry, objects) = {
+            let guards = self.table_maintenance_read_guards(table_bucket).await?;
+            let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
+            // Fix membership while rename cannot remove the source directory. The
+            // bounded listing has no per-job reads under the publication lock.
+            let objects = sidecar
+                .list_table_metadata_maintenance_audit_objects_for_entry(&entry)
+                .await?;
+            Self::ensure_table_maintenance_read_guards(&guards)?;
+            (entry, objects)
+        };
+        // History is observational, not a transactionally atomic snapshot. Read
+        // every fixed member outside the bucket lock, but never skip a member
+        // that disappeared during rename (including an A -> B -> A round trip).
+        let reports = sidecar
+            .read_table_metadata_maintenance_audit_reports_for_entry(&entry, &objects)
+            .await?;
+
         let guards = self.table_maintenance_read_guards(table_bucket).await?;
-        let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
-        let result = ObjectTableCatalogStore::new(self.object_backend.clone())
-            .get_table_maintenance_scheduler_report_for_entry_at(&entry, OffsetDateTime::now_utc())
+        if self.maintenance_table_entry(table_bucket, namespace, table).await? != entry {
+            return Err(TableCatalogStoreError::Unavailable(
+                "table changed during the maintenance scheduler read; retry the scheduler report".to_string(),
+            ));
+        }
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        let paths = TableCatalogObjectPaths::default();
+        let selected_objects = reports
+            .iter()
+            .map(|report| paths.table_maintenance_job_path(table_bucket, &namespace, &table, &entry.table_id, &report.job.job_id))
+            .collect::<Vec<_>>();
+        // Only the fixed-size audit window, effective config and current alias
+        // are refreshed under the final read fence.
+        let reports = sidecar
+            .read_table_metadata_maintenance_audit_reports_for_entry(&entry, &selected_objects)
+            .await?;
+        let result = sidecar
+            .get_table_maintenance_scheduler_report_with_audit_reports_for_entry_at(
+                &entry,
+                OffsetDateTime::now_utc(),
+                Some(reports),
+            )
             .await;
         Self::ensure_table_maintenance_read_guards(&guards)?;
         result

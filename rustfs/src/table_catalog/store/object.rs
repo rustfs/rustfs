@@ -15,6 +15,7 @@
 use super::*;
 
 const TABLE_MAINTENANCE_RENAME_MAX_OBJECTS: usize = 4096;
+const TABLE_MAINTENANCE_SCHEDULER_HISTORY_MAX_OBJECTS: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3455,6 +3456,16 @@ where
         entry: &TableEntry,
         now: OffsetDateTime,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        self.get_table_maintenance_scheduler_report_with_audit_reports_for_entry_at(entry, now, None)
+            .await
+    }
+
+    pub(super) async fn get_table_maintenance_scheduler_report_with_audit_reports_for_entry_at(
+        &self,
+        entry: &TableEntry,
+        now: OffsetDateTime,
+        reports: Option<Vec<TableMetadataMaintenanceReport>>,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         let effective = self
@@ -3469,9 +3480,13 @@ where
                 MAINTENANCE_JOB_ALIAS_CURRENT,
             )
             .await?;
-        let reports = self
-            .list_table_metadata_maintenance_audit_reports(&entry.table_bucket, &namespace, &table, &entry.table_id)
-            .await?;
+        let reports = match reports {
+            Some(reports) => reports,
+            None => {
+                self.list_table_metadata_maintenance_audit_reports(&entry.table_bucket, &namespace, &table, &entry.table_id)
+                    .await?
+            }
+        };
         let quarantine = table_maintenance_scheduler_quarantine_boundary(&effective.config, &reports);
         let mut recommended_actions = Vec::new();
 
@@ -3811,26 +3826,105 @@ where
         let jobs_prefix = self
             .paths
             .table_maintenance_jobs_prefix(table_bucket, namespace, table, table_id);
+        let objects = self.backend.list_objects(self.catalog_bucket(), &jobs_prefix).await?;
+        self.read_table_metadata_maintenance_audit_reports(table_bucket, namespace, table, table_id, &objects, false)
+            .await
+    }
+
+    pub(super) async fn list_table_metadata_maintenance_audit_objects_for_entry(
+        &self,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<Vec<String>> {
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        let prefix = self
+            .paths
+            .table_maintenance_jobs_prefix(&entry.table_bucket, &namespace, &table, &entry.table_id);
+        let mut objects = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let remaining = TABLE_MAINTENANCE_SCHEDULER_HISTORY_MAX_OBJECTS.saturating_sub(objects.len());
+            let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS.min(remaining + 1)).ok_or_else(|| {
+                TableCatalogStoreError::Internal("maintenance scheduler page limit must be positive".to_string())
+            })?;
+            let page = self
+                .backend
+                .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
+                .await?;
+            if page.objects.len() > limit.get() || (page.is_truncated && page.objects.is_empty()) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "invalid maintenance scheduler history listing page".to_string(),
+                ));
+            }
+            for object in page.objects {
+                if !object.starts_with(&prefix) || cursor.as_ref().is_some_and(|cursor| object <= *cursor) {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "maintenance scheduler history listing escaped its prefix or did not advance".to_string(),
+                    ));
+                }
+                if objects.len() == TABLE_MAINTENANCE_SCHEDULER_HISTORY_MAX_OBJECTS {
+                    return Err(TableCatalogStoreError::Unavailable(
+                        "maintenance scheduler history exceeds the 4096-object read budget".to_string(),
+                    ));
+                }
+                cursor = Some(object.clone());
+                objects.push(object);
+            }
+            if !page.is_truncated {
+                return Ok(objects);
+            }
+        }
+    }
+
+    pub(super) async fn read_table_metadata_maintenance_audit_reports_for_entry(
+        &self,
+        entry: &TableEntry,
+        objects: &[String],
+    ) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReport>> {
+        self.read_table_metadata_maintenance_audit_reports(
+            &entry.table_bucket,
+            &parse_namespace_for_store(&entry.namespace)?,
+            &parse_table_for_store(&entry.table)?,
+            &entry.table_id,
+            objects,
+            true,
+        )
+        .await
+    }
+
+    async fn read_table_metadata_maintenance_audit_reports(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+        objects: &[String],
+        require_present: bool,
+    ) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReport>> {
         let mut reports = Vec::new();
-        for object in self.backend.list_objects(self.catalog_bucket(), &jobs_prefix).await? {
+        for object in objects {
             if !object.ends_with(".json") {
                 continue;
             }
             if let Some((report, _)) = self
-                .read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &object)
+                .read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), object)
                 .await?
             {
                 validate_table_maintenance_report_owner(&report, table_bucket, namespace, table, table_id)?;
                 if self
                     .paths
                     .table_maintenance_job_path(table_bucket, namespace, table, table_id, &report.job.job_id)
-                    != object
+                    != *object
                 {
                     return Err(TableCatalogStoreError::Invalid(
                         "table maintenance report identity does not match its object path".to_string(),
                     ));
                 }
                 reports.push(table_maintenance_report_with_recommended_actions(report));
+            } else if require_present {
+                return Err(TableCatalogStoreError::Unavailable(
+                    "maintenance scheduler history changed during the read; retry the scheduler report".to_string(),
+                ));
             }
         }
         reports.sort_by(|left, right| {

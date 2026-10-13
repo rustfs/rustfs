@@ -111,6 +111,16 @@ Backup, restore, register, drop, and subsequent rename operations recover a
 pending migration before proceeding. Complete pending rename recovery before
 rolling back to a version that does not understand maintenance migration intents.
 
+Durable-strong scheduler reports read an observational history set, not an atomic
+snapshot of all maintenance jobs. They fix at most 4096 history-object names
+under the publication read fence, scan those objects outside the fence, and
+refresh the selected 10-job audit window, effective configuration, and current
+job under a final read fence. Exceeding the history budget fails closed with an
+unavailable response; retrying does not remove that size limit. A listed object
+that disappears during the scan also returns unavailable; retry after concurrent
+rename or maintenance activity has settled. No history object is silently omitted
+when a rename removes its old path.
+
 | Capability | Status | Claim |
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the pointer. |

@@ -5571,7 +5571,7 @@ async fn seed_strong_rename_maintenance_state(
 
 #[tokio::test]
 async fn durable_strong_maintenance_gets_hold_publication_read_lock_through_sidecar_reads() {
-    for read_kind in ["config", "report", "scheduler"] {
+    for read_kind in ["config", "report"] {
         let backend = TestCatalogObjectBackend::default();
         let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
         let source = seed_strong_rename_maintenance_state(&store, &backend).await;
@@ -5592,16 +5592,6 @@ async fn durable_strong_maintenance_gets_hold_publication_read_lock_through_side
                     .unwrap()
                     .unwrap();
                 assert_eq!(report.job.job_id, "running-rename");
-                serde_json::to_value(report).unwrap()
-            }
-            "scheduler" => {
-                let report = store
-                    .get_table_maintenance_scheduler_report("analytics", "sales", "orders")
-                    .await
-                    .unwrap();
-                assert!(report.background_enabled);
-                assert!(!report.audit_timeline.is_empty());
-                assert_eq!(report.current_job.as_ref().unwrap().job_id, "running-rename");
                 serde_json::to_value(report).unwrap()
             }
             _ => unreachable!(),
@@ -5629,13 +5619,6 @@ async fn durable_strong_maintenance_gets_hold_publication_read_lock_through_side
                         .get_table_metadata_maintenance_report("analytics", "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
                         .await
                         .unwrap()
-                        .unwrap(),
-                )
-                .unwrap(),
-                "scheduler" => serde_json::to_value(
-                    read_store
-                        .get_table_maintenance_scheduler_report("analytics", "sales", "orders")
-                        .await
                         .unwrap(),
                 )
                 .unwrap(),
@@ -5677,6 +5660,186 @@ async fn durable_strong_maintenance_gets_hold_publication_read_lock_through_side
         assert_renamed_maintenance_objects(&backend, &destination, &expected_objects).await;
         assert!(rename_maintenance_objects(&backend, &source).await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn durable_strong_scheduler_history_scan_allows_same_bucket_commit() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+    let source = seed_strong_rename_maintenance_state(&store, &backend).await;
+    let namespace = Namespace::parse("sales").unwrap();
+    let payments = IdentifierSegment::parse("payments").unwrap();
+    let payments_current = default_table_metadata_file_path(&namespace, &payments, "00001.metadata.json");
+    let payments_next = default_table_metadata_file_path(&namespace, &payments, "00002.metadata.json");
+    let mut payments_entry = test_table_entry("analytics", &namespace, &payments, payments_current.clone());
+    payments_entry.table_id = "payments-id".to_string();
+    payments_entry.table_uuid = "payments-uuid".to_string();
+    payments_entry.warehouse_location = "s3://analytics/tables/payments-id".to_string();
+    store.create_table(payments_entry).await.unwrap();
+    backend.seed_object("analytics", &payments_next, b"{}".to_vec()).await;
+    let expected = store
+        .get_table_maintenance_scheduler_report("analytics", "sales", "orders")
+        .await
+        .unwrap();
+    assert_eq!(expected.audit_timeline.len(), 4);
+    let job_path = TableCatalogObjectPaths::default().table_maintenance_job_path(
+        "analytics",
+        &namespace,
+        &IdentifierSegment::parse("orders").unwrap(),
+        &source.table_id,
+        "queued-rename",
+    );
+    let pause = backend.pause_next_read(RUSTFS_META_BUCKET, &job_path).await;
+    let read_store = Arc::clone(&store);
+    let read = tokio::spawn(async move {
+        read_store
+            .get_table_maintenance_scheduler_report("analytics", "sales", "orders")
+            .await
+    });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .expect("scheduler GET must reach a history read");
+    let committed = tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        store.commit_table(TableCommitRequest {
+            table_bucket: "analytics".to_string(),
+            namespace: "sales".to_string(),
+            table: "payments".to_string(),
+            commit_id: "payments-during-scheduler-history".to_string(),
+            idempotency_key: None,
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: payments_current,
+            new_metadata_location: payments_next.clone(),
+            requirements: Vec::new(),
+            writer: Some("maintenance-test".to_string()),
+        }),
+    )
+    .await
+    .expect("history scanning must not hold the bucket publication reader")
+    .unwrap();
+    assert_eq!(committed.table.metadata_location, payments_next);
+    assert!(!read.is_finished());
+    let before_read_completion = maintenance_test_object_versions(&backend).await;
+    pause.release();
+    assert_eq!(
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        store.load_table("analytics", "sales", "payments").await.unwrap().unwrap(),
+        committed.table
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before_read_completion);
+}
+
+#[tokio::test]
+async fn durable_strong_scheduler_history_missing_during_rename_rejects_even_after_content_etag_aba() {
+    for round_trip in [false, true] {
+        let backend = TestCatalogObjectBackend::content_addressed();
+        let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+        let source = seed_strong_rename_maintenance_state(&store, &backend).await;
+        let expected_objects = rename_maintenance_objects(&backend, &source).await;
+        let root = rename_maintenance_root(&source);
+        for (suffix, value) in &expected_objects {
+            backend
+                .put_json(RUSTFS_META_BUCKET, &format!("{root}{suffix}"), value.clone())
+                .await;
+        }
+        let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+        let snapshot_before = backend
+            .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let job_path = TableCatalogObjectPaths::default().table_maintenance_job_path(
+            "analytics",
+            &Namespace::parse("sales").unwrap(),
+            &IdentifierSegment::parse("orders").unwrap(),
+            &source.table_id,
+            "queued-rename",
+        );
+        let job_before = backend.read_object(RUSTFS_META_BUCKET, &job_path).await.unwrap().unwrap();
+        let before_read = backend.pause_before_next_read(RUSTFS_META_BUCKET, &job_path).await;
+        let after_read = backend.pause_next_read(RUSTFS_META_BUCKET, &job_path).await;
+        let read_store = Arc::clone(&store);
+        let read = tokio::spawn(async move {
+            read_store
+                .get_table_maintenance_scheduler_report("analytics", "sales", "orders")
+                .await
+        });
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, before_read.wait_started())
+            .await
+            .expect("fixed history membership must precede reading its job");
+        tokio::time::timeout(
+            TABLE_CATALOG_TEST_TIMEOUT,
+            store.rename_table("analytics", "sales", "orders", "sales", "orders_v2"),
+        )
+        .await
+        .expect("rename must proceed while history reading is paused")
+        .unwrap();
+        assert!(!backend.object_exists(RUSTFS_META_BUCKET, &job_path).await.unwrap());
+        before_read.release();
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, after_read.wait_started())
+            .await
+            .expect("history read must capture the missing object before returning");
+        if round_trip {
+            tokio::time::timeout(
+                TABLE_CATALOG_TEST_TIMEOUT,
+                store.rename_table("analytics", "sales", "orders_v2", "sales", "orders"),
+            )
+            .await
+            .expect("reverse rename must proceed before the missing read is returned")
+            .unwrap();
+            assert_eq!(store.load_table("analytics", "sales", "orders").await.unwrap().unwrap(), source);
+            let snapshot_after = backend
+                .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot_after.data, snapshot_before.data);
+            assert_eq!(snapshot_after.etag, snapshot_before.etag);
+            let job_after = backend.read_object(RUSTFS_META_BUCKET, &job_path).await.unwrap().unwrap();
+            assert_eq!(job_after.data, job_before.data);
+            assert_eq!(job_after.etag, job_before.etag);
+            assert_renamed_maintenance_objects(&backend, &source, &expected_objects).await;
+        }
+        let before_read_completion = maintenance_test_object_versions(&backend).await;
+        after_read.release();
+        assert_matches!(
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, read).await.unwrap().unwrap(),
+            Err(TableCatalogStoreError::Unavailable(message)) if message.contains("maintenance scheduler history changed")
+        );
+        assert_eq!(maintenance_test_object_versions(&backend).await, before_read_completion);
+    }
+}
+
+#[tokio::test]
+async fn durable_strong_scheduler_history_membership_budget_precedes_report_reads() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let source = seed_strong_maintenance_table(&store, &backend).await;
+    let prefix = TableCatalogObjectPaths::default().table_maintenance_jobs_prefix(
+        "analytics",
+        &Namespace::parse("sales").unwrap(),
+        &IdentifierSegment::parse("orders").unwrap(),
+        &source.table_id,
+    );
+    for index in 0..4097 {
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &format!("{prefix}{index:064x}.json"), b"not-json".to_vec())
+            .await;
+    }
+    let before = maintenance_test_object_versions(&backend).await;
+    assert_matches!(
+        store.get_table_maintenance_scheduler_report("analytics", "sales", "orders").await,
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("maintenance scheduler history exceeds")
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before);
 }
 
 #[tokio::test]
