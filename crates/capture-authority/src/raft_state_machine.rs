@@ -128,6 +128,8 @@ pub struct NativeRaftStateMachine {
     pub(crate) limits: CheckpointLimits,
     #[cfg(test)]
     pub(crate) build_before_ordering: Arc<TestPause>,
+    // Declared last: every clone releases its writer before the final owner lease.
+    pub(crate) owner_lease: Option<Arc<crate::raft_owner::OwnerLease>>,
 }
 impl NativeRaftStateMachine {
     pub fn new(writer: NativeLogWriter, limits: CheckpointLimits) -> Result<Self, NativeSnapshotError> {
@@ -138,6 +140,7 @@ impl NativeRaftStateMachine {
             limits,
             #[cfg(test)]
             build_before_ordering: Arc::new(TestPause::default()),
+            owner_lease: None,
         })
     }
     fn maximum(&self) -> u64 {

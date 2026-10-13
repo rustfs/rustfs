@@ -28,7 +28,11 @@ mod raft_state_machine;
 pub use raft_state_machine::NativeRaftStateMachine;
 #[cfg(test)]
 mod native_snapshot_install_tests;
+mod raft_owner;
+pub use raft_owner::{NativeRaftOwner, NativeRaftOwnerError};
 mod raft_log_storage;
+#[cfg(test)]
+mod raft_owner_tests;
 #[cfg(test)]
 mod raft_state_machine_tests;
 pub use raft_log_storage::NativeRaftLogStore;
@@ -55,12 +59,15 @@ mod truncate;
 #[derive(Clone)]
 pub struct NativeLogReader {
     store: std::sync::Arc<std::sync::Mutex<Store>>,
+    // Last: owned replication reads release Store before signaling owner drain.
+    pub(crate) owner_lease: Option<std::sync::Arc<raft_owner::OwnerLease>>,
 }
 
 impl NativeLogReader {
     pub fn new(store: Store) -> Self {
         Self {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
+            owner_lease: None,
         }
     }
 }
@@ -108,6 +115,7 @@ impl NativeLogWriter {
     pub fn reader(&self) -> NativeLogReader {
         NativeLogReader {
             store: self.store.clone(),
+            owner_lease: None,
         }
     }
 
@@ -232,13 +240,17 @@ fn native_read_error(error: NativeReaderError) -> openraft::StorageError<u64> {
 
 async fn native_read_worker<F>(
     store: std::sync::Arc<std::sync::Mutex<Store>>,
+    lease: Option<std::sync::Arc<raft_owner::OwnerLease>>,
     read: F,
 ) -> Result<Vec<CaptureRaftEntry>, openraft::StorageError<u64>>
 where
     F: FnOnce(&Store) -> Result<Vec<CaptureRaftEntry>, StoreError> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let store = store.lock().map_err(|_| native_read_error(NativeReaderError::Poisoned))?;
+        // Locals drop in reverse order, even on error or cancelled async readers.
+        let _lease = lease;
+        let owner = store;
+        let store = owner.lock().map_err(|_| native_read_error(NativeReaderError::Poisoned))?;
         read(&store).map_err(|error| native_read_error(NativeReaderError::Store(error)))
     })
     .await
@@ -251,7 +263,7 @@ impl openraft::RaftLogReader<CaptureTypeConfig> for NativeLogReader {
         range: RB,
     ) -> Result<Vec<CaptureRaftEntry>, openraft::StorageError<u64>> {
         let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
-        native_read_worker(self.store.clone(), move |store| store.read_native_range(bounds)).await
+        native_read_worker(self.store.clone(), self.owner_lease.clone(), move |store| store.read_native_range(bounds)).await
     }
 }
 
@@ -1363,7 +1375,7 @@ mod tests {
         let async_thread = std::thread::current().id();
         let (sender, receiver) = mpsc::channel();
         runtime.block_on(async {
-            let read = native_read_worker(reader.store.clone(), move |store| {
+            let read = native_read_worker(reader.store.clone(), None, move |store| {
                 sender.send(std::thread::current().id()).expect("send worker thread");
                 store.read_native_range(..)
             })
@@ -1382,7 +1394,7 @@ mod tests {
         let mut reader = NativeLogReader::new(store);
         let runtime = u19_runtime();
         let error = runtime
-            .block_on(native_read_worker(reader.store.clone(), |_| panic!("test worker panic")))
+            .block_on(native_read_worker(reader.store.clone(), None, |_| panic!("test worker panic")))
             .expect_err("worker panic must fail");
         assert!(error.to_string().contains("native log reader worker failed"));
         u19_assert_io(error);

@@ -10,10 +10,15 @@ use redb::{ReadableDatabase, ReadableTable};
 #[derive(Clone)]
 pub struct NativeRaftLogStore {
     writer: NativeLogWriter,
+    // Last: owner drain is signaled only after this clone releases its writer.
+    pub(crate) owner_lease: Option<std::sync::Arc<crate::raft_owner::OwnerLease>>,
 }
 impl NativeRaftLogStore {
     pub fn new(writer: NativeLogWriter) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            owner_lease: None,
+        }
     }
 }
 fn error(error: NativeWriteError, operation: fn(openraft::AnyError) -> StorageIOError<u64>) -> StorageError<u64> {
@@ -26,7 +31,9 @@ impl RaftLogReader<CaptureTypeConfig> for NativeRaftLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<CaptureRaftEntry>, StorageError<u64>> {
-        self.writer.reader().try_get_log_entries(range).await
+        let mut reader = self.writer.reader();
+        reader.owner_lease = self.owner_lease.clone();
+        reader.try_get_log_entries(range).await
     }
 }
 impl RaftLogStorage<CaptureTypeConfig> for NativeRaftLogStore {
@@ -65,7 +72,9 @@ impl RaftLogStorage<CaptureTypeConfig> for NativeRaftLogStore {
             .map_err(|e| error(e, StorageIOError::read_logs))
     }
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.writer.reader()
+        let mut reader = self.writer.reader();
+        reader.owner_lease = self.owner_lease.clone();
+        reader
     }
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         self.writer
