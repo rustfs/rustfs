@@ -5875,7 +5875,7 @@ where
                 )),
             );
         }
-        if !is_valid_table_metadata_location(&namespace, &table, &request.new_metadata_location) {
+        if !is_valid_table_metadata_location_for_entry(&current, &request.new_metadata_location) {
             return table_commit_result(
                 &request.table_bucket,
                 &request.namespace,
