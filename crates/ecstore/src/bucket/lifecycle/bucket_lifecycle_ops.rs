@@ -2417,6 +2417,16 @@ fn is_slow_down(err: &Error) -> bool {
     matches!(err, Error::SlowDown)
 }
 
+/// Lifecycle expiry is idempotent when the exact object or version has already
+/// disappeared between the scanner listing and the delete admission.
+///
+/// Keep this predicate narrower than bucket/volume "not found" helpers: an
+/// unavailable bucket or disk is an operational failure and must not be
+/// reported as a completed expiry.
+fn is_lifecycle_expiry_already_gone(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_version_not_found(err)
+}
+
 /// Resolves the expiry worker count from the single documented knob,
 /// `RUSTFS_MAX_EXPIRY_WORKERS`: a set, parsable, non-zero value wins;
 /// anything else falls back to `min(cpus, 16)`. The historical
@@ -4920,6 +4930,20 @@ async fn expire_transitioned_object_with_lock_lost_signal(
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
                 Ok(dobj)
             }
+            Err(err) if is_lifecycle_expiry_already_gone(&err) => {
+                debug!(
+                    event = EVENT_LIFECYCLE_DELETE_COMPLETED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    operation = "delete_restored_object",
+                    reason = "already_gone",
+                    "Lifecycle delete target was already absent"
+                );
+                crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+                Ok(oi.clone())
+            }
             Err(err) => Err(std::io::Error::other(err)),
         };
     }
@@ -4930,6 +4954,8 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     // pointing to a remote tier version that has already been removed. If this
     // only creates a delete marker, remote cleanup must be driven by persisted
     // free-version recovery rather than the visible delete result.
+    // Keep remote transitioned not-found errors visible: local metadata
+    // absence alone does not prove that the tier object was cleaned up.
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
         Err(e) => {
@@ -5802,6 +5828,20 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
         .await
     {
         Ok(dobj) => dobj,
+        Err(err) if is_lifecycle_expiry_already_gone(&err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_DELETE_COMPLETED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "delete_object",
+                reason = "already_gone",
+                "Lifecycle delete target was already absent"
+            );
+            crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+            return true;
+        }
         Err(e) => {
             error!(
                 event = EVENT_LIFECYCLE_DELETE_FAILED,
@@ -6041,18 +6081,19 @@ mod tests {
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
-        get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
-        lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, lifecycle_version_delete_target, manual_transition_duration_elapsed,
-        manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink, manual_transition_version_marker,
-        manual_transition_worker_failure_reason, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, persist_manual_transition_job_progress_if_owned,
-        persist_manual_transition_page_checkpoint, recover_manual_transition_job, recover_manual_transition_jobs,
-        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_coordinator,
-        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
-        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        get_lock_acquire_timeout, is_lifecycle_expiry_already_gone, jitter_tier_free_version_recovery_delay,
+        lifecycle_action_blocked_by_replication, lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object,
+        lifecycle_replication_blocks_action, lifecycle_rule_has_date_expiration, lifecycle_version_delete_target,
+        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
+        manual_transition_version_marker, manual_transition_worker_failure_reason,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        persist_manual_transition_job_progress_if_owned, persist_manual_transition_page_checkpoint,
+        recover_manual_transition_job, recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_coordinator, run_tier_free_version_recovery_loop,
+        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -10511,6 +10552,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lifecycle_expiry_already_gone_only_accepts_object_or_version_absence() {
+        assert!(is_lifecycle_expiry_already_gone(&Error::FileNotFound));
+        assert!(is_lifecycle_expiry_already_gone(&Error::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
+        assert!(is_lifecycle_expiry_already_gone(&Error::FileVersionNotFound));
+        assert!(is_lifecycle_expiry_already_gone(&Error::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+
+        assert!(!is_lifecycle_expiry_already_gone(&Error::VolumeNotFound));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::DiskNotFound));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::ErasureReadQuorum));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::MethodNotAllowed));
+    }
+
     #[tokio::test]
     async fn manual_transition_counts_already_transitioned_object() {
         let lc = latest_transition_lifecycle();
@@ -13385,7 +13446,9 @@ mod tests {
                 .bucket_incarnation_id_from_disk(&bucket)
                 .await
                 .expect("bucket incarnation");
-            for (attempt_incarnation, expected) in [(Uuid::new_v4(), false), (incarnation, true), (incarnation, false)] {
+            // Replaying the same scanner snapshot after the delete is an
+            // already-gone success and must not be reported as a failure.
+            for (attempt_incarnation, expected) in [(Uuid::new_v4(), false), (incarnation, true), (incarnation, true)] {
                 assert_eq!(
                     super::apply_expiry_on_non_transitioned_objects(
                         ecstore.clone(),
