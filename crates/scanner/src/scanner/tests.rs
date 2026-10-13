@@ -10252,6 +10252,8 @@ fn remote_restart_is_distinct_from_deferred_cluster_activity() {
     assert!(scanner_activity_observed_work(ScannerActivityObservation::RemoteRestarted));
 }
 
+type ActivityFieldMutations = Vec<(&'static str, Box<dyn Fn(&mut ScannerNodeActivity)>)>;
+
 #[test]
 fn guardrail_veto_is_attributed_to_the_field_and_host_that_moved() {
     let before = BTreeMap::from([
@@ -10260,7 +10262,7 @@ fn guardrail_veto_is_attributed_to_the_field_and_host_that_moved() {
     ]);
     assert_eq!(scanner_activity_guardrail_veto(&before, &before), None);
 
-    let cases: Vec<(&str, Box<dyn Fn(&mut ScannerNodeActivity)>)> = vec![
+    let cases: ActivityFieldMutations = vec![
         ("instance_id", Box::new(|activity| activity.instance_id = "restarted".to_string())),
         ("protocol_version", Box::new(|activity| activity.protocol_version += 1)),
         ("topology_digest", Box::new(|activity| activity.topology_digest = [4; 32])),
@@ -10301,7 +10303,7 @@ fn generation_movement_shades_buckets_without_a_guardrail_veto() {
         (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
         ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
     ]);
-    let shade: Vec<(&str, Box<dyn Fn(&mut ScannerNodeActivity)>)> = vec![
+    let shade: ActivityFieldMutations = vec![
         ("namespace_generation", Box::new(|activity| activity.namespace_generation += 1)),
         ("dirty_usage_generation", Box::new(|activity| activity.dirty_usage_generation += 1)),
         ("dirty_usage_pending", Box::new(|activity| activity.dirty_usage_pending = true)),
