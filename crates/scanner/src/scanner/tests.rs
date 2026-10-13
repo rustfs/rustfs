@@ -138,6 +138,11 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
     let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
     instance_ctx.set_endpoints(endpoint_pools.clone());
+    if pool_count == 1 && sets_per_pool == 1 && drives_per_set == 1 {
+        instance_ctx
+            .update_erasure_type(crate::storage_api::EcstoreSetupType::ErasureSD)
+            .await;
+    }
     if preinitialize_disks {
         init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
@@ -1462,8 +1467,19 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 #[tokio::test]
 #[serial]
 async fn coordinator_persists_only_an_observation_during_pending_put() {
+    for drives_per_set in [1, 4] {
+        assert_bootstrap_observation_retry(drives_per_set).await;
+    }
+}
+
+async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let temp_dir = tempfile::tempdir().expect("bootstrap directory should be created");
+    let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), false, 1, 1, drives_per_set).await;
+    initialize_usage_baseline_bootstrap(store.clone())
+        .await
+        .expect("cold startup should persist its bootstrap identity");
+    let mut bootstrap = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
     let mut pause_backlog = ScannerPauseBacklogController::claim(store.clone(), scanner_pause_backlog_now())
         .await
         .expect("scanner pause backlog should be available");
@@ -1488,6 +1504,25 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
             .await
             .expect("fixture object should finish its rename fanout");
     }
+    let cold_bucket = "scanner-coordinator-cold";
+    store
+        .make_bucket(cold_bucket, &crate::storage_api::scan::MakeBucketOptions::default())
+        .await
+        .expect("cold bucket should be created");
+    let mut cold_reader = PutObjReader::from_vec(b"cold".to_vec());
+    store.pools[0].disk_set[0]
+        .put_object(
+            cold_bucket,
+            "object",
+            &mut cold_reader,
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cold object should persist before scanning");
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     crate::scanner_io::record_dirty_usage_bucket(&bucket);
     let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
     let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -1530,7 +1565,7 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
     )
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
-    assert_eq!(budget.progress().0, 1, "the coordinator must reach actual object traversal");
+    assert_eq!(budget.progress().0, 2, "the coordinator must reach actual object traversal");
     assert!(
         matches!(
             outcome,
@@ -1560,6 +1595,16 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
         .expect("the pending cycle should persist its non-authoritative observation");
     let observed: DataUsageInfo = serde_json::from_slice(&observed).expect("observed usage should decode");
     assert_eq!(observed.usage_snapshot_converged, Some(false));
+    assert!(observed.is_complete_bucket_usage_snapshot());
+    assert_eq!(observed.objects_total_count, 2);
+    assert!(!bootstrap.record_cycle(outcome));
+    assert!(bootstrap.pending(), "an observation cannot discharge authority bootstrap");
+    crate::storage_api::ecstore_invalidate_data_usage_snapshot_cache().await;
+    let displayed = crate::storage_api::scanner_io::load_admin_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("admin should load the durable complete observation");
+    assert_eq!(displayed.objects_total_count, 2);
+    assert_eq!(displayed.usage_snapshot_converged, Some(false));
 
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
@@ -1592,7 +1637,12 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
             1,
             Arc::clone(&retry_budget),
             ScannerCycleScheduling {
-                requires_full_scan: true,
+                requires_full_scan: ScannerMaintenanceFeatures::default().requires_full_scan(
+                    Some(scanner_maintenance_generation()),
+                    scanner_maintenance_generation(),
+                    ScannerCycleWakeReason::Timer,
+                    true,
+                ),
                 service_cohort: None,
             },
         ),
@@ -1601,13 +1651,15 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
     .expect("the same cycle must converge after the pending PUT drains");
     assert_eq!(
         retry_budget.progress().0,
-        1,
-        "the same-cycle retry must not reuse the pre-tail bucket cache"
+        if drives_per_set == 1 { 1 } else { 2 },
+        "Normal retries reuse cold inventory; Deep retries still visit every bucket"
     );
     assert!(matches!(
         outcome,
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
     ));
+    assert!(bootstrap.record_cycle(outcome));
+    assert!(!bootstrap.pending());
     assert_eq!(cycle_info.next, retry_cycle + 1);
     assert!(!crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket));
     let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -1616,10 +1668,10 @@ async fn coordinator_persists_only_an_observation_during_pending_put() {
     let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("the persisted usage should decode");
     assert_eq!(usage.usage_snapshot_converged, Some(true));
     assert_eq!(usage.scanner_cycle, Some(retry_cycle));
-    assert_eq!(usage.objects_total_count, 1);
+    assert_eq!(usage.objects_total_count, 2);
     assert_eq!(
         usage.objects_total_size,
-        u64::try_from(committed_body.len()).expect("fixture body length")
+        u64::try_from(committed_body.len() + 4).expect("fixture total body length")
     );
     let bucket_usage = usage
         .buckets_usage
@@ -8437,7 +8489,7 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ..Default::default()
     };
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &default_config),
+        scanner_superseded_retry_interval(backoff, &default_config, ScannerMaintenanceFeatures::default()),
         Some(SCANNER_RETRY_BASE_INTERVAL),
         "the default adaptive cadence must retain fast convergence"
     );
@@ -8453,12 +8505,122 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
             ..Default::default()
         };
 
+        for features in [
+            ScannerMaintenanceFeatures::default(),
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                scanner_superseded_retry_interval(backoff, &runtime_config, features),
+                Some(runtime_config.cycle_interval),
+                "{source:?} cycle cadence must not be shortened by convergence retries"
+            );
+        }
+    }
+}
+
+#[test]
+fn superseded_retry_does_not_delay_required_maintenance() {
+    let features = ScannerMaintenanceFeatures {
+        lifecycle: true,
+        ..Default::default()
+    };
+    assert!(features.needs_regular_cycle());
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(2),
+        cycle_interval_source: ScannerRuntimeConfigSource::Env,
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for consecutive_cycles in 1..=12 {
+        backoff.record_retryable_cycle(true);
         assert_eq!(
-            scanner_superseded_retry_interval(backoff, &runtime_config),
-            Some(runtime_config.cycle_interval),
-            "{source:?} cycle cadence must not be shortened by convergence retries"
+            scanner_superseded_retry_interval(backoff, &config, features),
+            Some(config.cycle_interval),
+            "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
     }
+}
+
+#[test]
+fn superseded_retry_only_caps_regular_maintenance() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..6 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(
+        scanner_superseded_retry_interval(backoff, &config, ScannerMaintenanceFeatures::default()),
+        Some(Duration::from_secs(160)),
+    );
+    for features in [
+        ScannerMaintenanceFeatures {
+            lifecycle: true,
+            ..Default::default()
+        },
+        ScannerMaintenanceFeatures {
+            replication: true,
+            ..Default::default()
+        },
+        ScannerMaintenanceFeatures {
+            inspection_failed: true,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(scanner_superseded_retry_interval(backoff, &config, features), Some(config.cycle_interval));
+        assert_eq!(scanner_superseded_retry_interval(ScannerRetryBackoff::default(), &config, features), None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn superseded_maintenance_wait_keeps_convergence_fencing() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let features = ScannerMaintenanceFeatures {
+        lifecycle: true,
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..12 {
+        backoff.record_retryable_cycle(true);
+    }
+    let interval = scanner_superseded_retry_interval(backoff, &config, features);
+    assert_eq!(interval, Some(config.cycle_interval));
+    let generations = ScannerCycleObservedGenerations::for_wait(
+        &config,
+        interval,
+        crate::scanner_io::dirty_usage_generation(),
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+    );
+    assert!(generations.dirty_usage.is_none());
+    assert!(generations.defer_cluster_activity);
+    let ctx = CancellationToken::new();
+    let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+    let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
+    let started = tokio::time::Instant::now();
+    let reason = wait_for_next_scanner_cycle_with_activity(
+        &ctx,
+        interval.expect("maintenance must retain its convergence interval"),
+        Some(Duration::from_secs(1)),
+        &mut seen,
+        generations,
+        || false,
+        || std::future::ready(Ok(changed.clone())),
+    )
+    .await;
+    assert_eq!(reason, ScannerCycleWakeReason::Timer);
+    assert_eq!(started.elapsed(), config.cycle_interval);
+    assert_eq!(seen, Some(changed));
 }
 
 #[test]
@@ -8995,18 +9157,10 @@ fn usage_bootstrap_rebuild_bypasses_clean_idle_until_authoritative_cycle() {
         cycle_interval: Duration::from_secs(60),
         ..Default::default()
     };
-    let features = ScannerMaintenanceFeatures::default();
-    let generation = Some(scanner_maintenance_generation());
     let mut clean_idle_backoff = ScannerCleanIdleBackoff { interval_multiplier: 8 };
     let mut rebuild = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
 
     assert!(!rebuild.clean_idle_backoff_enabled(true));
-    assert!(rebuild.requires_full_scan(
-        features,
-        generation,
-        scanner_maintenance_generation(),
-        ScannerCycleWakeReason::DirtyUsage,
-    ));
 
     let plan = rebuild.wait_plan(scanner_cycle_wait_plan(&config, clean_idle_backoff, true, std::convert::identity), None);
     assert_eq!(plan.delay, Duration::ZERO);
@@ -9040,6 +9194,40 @@ fn usage_bootstrap_rebuild_bypasses_clean_idle_until_authoritative_cycle() {
     );
 }
 
+#[test]
+fn superseded_retry_preserves_full_maintenance_boundaries() {
+    let features = ScannerMaintenanceFeatures::default();
+    for (wake, ordinary_full, retry_full) in [
+        (ScannerCycleWakeReason::Timer, true, false),
+        (ScannerCycleWakeReason::DirtyUsage, false, false),
+        (ScannerCycleWakeReason::ClusterActivity, false, false),
+        (ScannerCycleWakeReason::ClusterMaintenance, true, true),
+        (ScannerCycleWakeReason::MovementGeneration, true, true),
+        (ScannerCycleWakeReason::Recovery, true, true),
+    ] {
+        assert_eq!(features.requires_full_scan(Some(7), 7, wake, false), ordinary_full, "{wake:?}");
+        assert_eq!(features.requires_full_scan(Some(7), 7, wake, true), retry_full, "{wake:?} retry");
+        assert!(features.requires_full_scan(None, 7, wake, true));
+        assert!(features.requires_full_scan(Some(6), 7, wake, true));
+        for unsafe_features in [
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..features
+            },
+            ScannerMaintenanceFeatures {
+                replication: true,
+                ..features
+            },
+            ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..features
+            },
+        ] {
+            assert!(unsafe_features.requires_full_scan(Some(7), 7, wake, true));
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff() {
@@ -9068,12 +9256,12 @@ async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff()
             (ScannerCycleWakeReason::ClusterMaintenance, true),
         ] {
             assert_eq!(
-                features.requires_full_scan(generation, scanner_maintenance_generation(), wake),
+                features.requires_full_scan(generation, scanner_maintenance_generation(), wake, false),
                 full,
                 "{wake:?}"
             );
         }
-        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage, false));
         for unsafe_features in [
             ScannerMaintenanceFeatures {
                 lifecycle: true,
@@ -9091,18 +9279,25 @@ async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff()
             assert!(unsafe_features.requires_full_scan(
                 generation,
                 scanner_maintenance_generation(),
-                ScannerCycleWakeReason::DirtyUsage
+                ScannerCycleWakeReason::DirtyUsage,
+                false
             ));
         }
         crate::scanner_io::record_scanner_maintenance_change("maintenance-proof-change");
-        assert!(features.requires_full_scan(generation, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        assert!(features.requires_full_scan(
+            generation,
+            scanner_maintenance_generation(),
+            ScannerCycleWakeReason::DirtyUsage,
+            false
+        ));
         let (refreshed, refreshed_generation) = detect_stable_scanner_maintenance_features(&ctx, &store)
             .await
             .expect("changed maintenance generation should be inspected");
         assert!(!refreshed.requires_full_scan(
             Some(refreshed_generation),
             scanner_maintenance_generation(),
-            ScannerCycleWakeReason::DirtyUsage
+            ScannerCycleWakeReason::DirtyUsage,
+            false
         ));
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     })

@@ -96,6 +96,10 @@ When a finite deadline expires, RustFS cancels cooperative scanner work and wait
 
 An explicit `scanner.cycle` or `RUSTFS_SCANNER_CYCLE` is a minimum inter-cycle cadence: dirty-usage notifications do not bypass that configured interval. The default adaptive policy continues to use dirty-usage notifications to wake the scanner between timer-driven cycles.
 
+Under continuous writes, a structurally complete walk can finish as `superseded`. Its durable observation remains separate from quota authority and leaves dirty work pending. Superseded retries may reuse that complete inventory to refresh dirty buckets, even while authority bootstrap is pending; missing or invalid coverage still forces a full walk. Ordinary maintenance timers, Deep scans, active lifecycle/replication and changed maintenance configuration retain full scans. Server info and datausageinfo can display complete observations, while Last Completed Scan advances only after an authoritative completed cycle. A write-free window is therefore not required to display observed counts, but arbitrary continuous writes do not guarantee authoritative completion. Historically dirty buckets remain eligible for rewalk, so narrower retries do not guarantee shorter cycles.
+
+Superseded convergence retries retain exponential backoff for usage-only work. Active lifecycle or replication rules, and uncertain maintenance inspection, cap that retry interval at the ordinary configured cadence so complete observations cannot defer regular maintenance. An explicit cycle remains the duty-cycle floor. Convergence mode still suppresses dirty/activity shortcuts and does not grant quota authority; deferred backend/proof retries and pause catch-up limits retain their existing scheduling. Cycle runtime, pacing, and disk admission can still delay completed maintenance. Sustained supersedes with active maintenance may therefore run more full scans than usage-only convergence; use the existing pacing controls to manage that background I/O.
+
 ## Single-disk clean-idle scheduling
 
 An erasure single-disk deployment using the built-in cycle and bitrot defaults automatically backs off repeated clean idle scans instead of walking the same unchanged namespace every minute. Each successful timer-driven cycle that finds no dirty usage or unresolved maintenance work doubles the next interval. The status endpoint reports the effective interval and multiplier.
@@ -227,7 +231,7 @@ When a running scanner leader already holds `leader.lock`, submit a durable asyn
 
 The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
 
-A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must run as a full scan until an authoritative usage snapshot replaces the marker.
+A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must rebuild full inventory. After a complete observation is durably saved, superseded retries may refresh dirty buckets using its validated coverage; bootstrap remains pending until authoritative publication replaces the marker.
 
 ## Cleanup With The Scanner Disabled
 
