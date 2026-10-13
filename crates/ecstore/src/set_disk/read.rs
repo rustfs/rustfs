@@ -1573,6 +1573,7 @@ impl SetDisks {
                 error: err,
                 exact_quorum,
                 repair,
+                ..
             } = erasure
                 .clone()
                 .decode_with_stripe_handles_and_reopeners_with_diagnostics(
@@ -1934,6 +1935,20 @@ impl SetDisks {
                         deferred_reopeners,
                     )
                     .await;
+                rustfs_io_metrics::record_get_object_quantized_range_frames(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    u64::try_from(outcome.frame_count).unwrap_or(u64::MAX),
+                );
+                rustfs_io_metrics::record_get_object_quantized_range_read_dispatches(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    u64::try_from(outcome.read_dispatch_count).unwrap_or(u64::MAX),
+                );
                 let mut repair_needed = outcome.repair.needed(!unattempted_data_shards);
                 if require_reconstruction_surplus && outcome.exact_quorum && outcome.error.is_none() {
                     return Err(Error::other("two-phase read completed with exact reconstruction quorum"));

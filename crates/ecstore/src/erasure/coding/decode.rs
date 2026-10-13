@@ -52,6 +52,8 @@ pub(crate) struct DecodeOutcome {
     pub(crate) error: Option<std::io::Error>,
     pub(crate) exact_quorum: bool,
     pub(crate) repair: ShardReadRepair,
+    pub(crate) frame_count: usize,
+    pub(crate) read_dispatch_count: usize,
 }
 
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
@@ -1017,6 +1019,15 @@ where
         let mut state = StripeReadState::with_slot_count(self.readers.len(), self.data_shards);
         self.read_into_state(&mut state).await;
         state.into_parts()
+    }
+
+    pub(crate) fn read_shape(&self) -> (usize, usize) {
+        self.readers.iter().flatten().fold((0, 0), |(frames, dispatches), reader| {
+            (
+                frames.saturating_add(reader.last_frame_count()),
+                dispatches.saturating_add(reader.last_read_dispatch_count()),
+            )
+        })
     }
 
     async fn read_into_state(&mut self, state: &mut StripeReadState) {
@@ -2498,6 +2509,7 @@ impl Erasure {
 
         let stripe_read_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
         let (mut shards, errs) = reader.read().await;
+        let (frame_count, read_dispatch_count) = reader.read_shape();
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
         let exact_quorum = shards.iter().filter(|shard| shard.is_some()).count() == self.data_shards;
         let repair = ShardReadRepair::default();
@@ -2531,6 +2543,8 @@ impl Erasure {
             error: ret_err,
             exact_quorum,
             repair,
+            frame_count,
+            read_dispatch_count,
         }
     }
 
@@ -2983,6 +2997,8 @@ impl Erasure {
             error: ret_err,
             exact_quorum,
             repair,
+            frame_count: 0,
+            read_dispatch_count: 0,
         }
     }
 }

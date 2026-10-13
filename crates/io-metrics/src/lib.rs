@@ -1200,6 +1200,57 @@ pub fn record_get_object_quantized_range_quorum_window_bytes(
     .increment(bytes);
 }
 
+/// Record authenticated bitrot frames consumed by one quantized Range decode.
+///
+/// This is a program-visible read-shape counter. It does not represent physical
+/// disk I/O, network RPCs, or the number of returned bytes.
+#[inline(always)]
+pub fn record_get_object_quantized_range_frames(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+    frames: u64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_frames_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(frames);
+}
+
+/// Record underlying AsyncRead dispatches used by one quantized Range decode.
+///
+/// A dispatch is one call into the shard reader. It is intentionally separate
+/// from frames because a partial reader can require multiple dispatches, while
+/// an in-memory/chunk handoff can require none.
+#[inline(always)]
+pub fn record_get_object_quantized_range_read_dispatches(
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    quantum: &'static str,
+    dispatches: u64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_quantized_range_read_dispatches_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket,
+        "quantum" => quantum
+    )
+    .increment(dispatches);
+}
+
 /// Record GetObject metadata fanout duration.
 #[inline(always)]
 pub fn record_get_object_metadata_fanout_duration(path: &'static str, duration_secs: f64) {
@@ -3793,6 +3844,26 @@ mod tests {
         });
 
         assert!(0.005_f64.is_sign_positive());
+    }
+
+    #[test]
+    fn quantized_range_shape_metrics_capture_frame_and_dispatch_totals() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_get_stage_metrics_enabled(true);
+            record_get_object_quantized_range_frames("legacy_duplex", "plain_single_part", "le_1mib", "256kib", 8);
+            record_get_object_quantized_range_read_dispatches("legacy_duplex", "plain_single_part", "le_1mib", "256kib", 11);
+            set_get_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_io_get_object_quantized_range_frames_total"), Some(8));
+        assert_eq!(
+            counter_total(&rows, "rustfs_io_get_object_quantized_range_read_dispatches_total"),
+            Some(11)
+        );
     }
 
     #[test]

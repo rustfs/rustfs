@@ -110,6 +110,8 @@ pin_project! {
         skip_verify: bool,
         last_verify_duration: Duration,
         integrity: Option<crate::io_support::shard_integrity::ShardVerifier>,
+        last_frame_count: usize,
+        last_read_dispatch_count: usize,
     }
 }
 
@@ -136,11 +138,21 @@ where
             skip_verify,
             last_verify_duration: Duration::ZERO,
             integrity: None,
+            last_frame_count: 0,
+            last_read_dispatch_count: 0,
         }
     }
 
     pub(crate) fn last_verify_duration(&self) -> Duration {
         self.last_verify_duration
+    }
+
+    pub(crate) fn last_frame_count(&self) -> usize {
+        self.last_frame_count
+    }
+
+    pub(crate) fn last_read_dispatch_count(&self) -> usize {
+        self.last_read_dispatch_count
     }
 
     pub(crate) fn integrity_proof(&self) -> Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>> {
@@ -180,7 +192,7 @@ where
         // intermediate copy. There is no leading hash to co-locate, so a combined
         // buffer would only add a memcpy.
         if self.hash_algo.size() == 0 {
-            let data_len = fill(&mut self.inner, out).await?;
+            let data_len = fill(&mut self.inner, out, &mut self.last_read_dispatch_count).await?;
             return self.finish_len(data_len, want);
         }
 
@@ -189,6 +201,7 @@ where
         }
 
         let need = self.hash_algo.size() + want;
+        self.last_frame_count = 1;
         self.read_scratch_block(need, want).await?;
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         if let Some(integrity) = &mut self.integrity {
@@ -203,6 +216,8 @@ where
     /// verify timer and reject a request larger than one shard.
     fn begin_read(&mut self, want: usize) -> std::io::Result<()> {
         self.last_verify_duration = Duration::ZERO;
+        self.last_frame_count = 0;
+        self.last_read_dispatch_count = 0;
         if self.frame_size == 0 || self.frame_size > self.shard_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -225,6 +240,7 @@ where
         while offset < want {
             let frame_want = (want - offset).min(self.frame_size);
             let need = hash_size + frame_want;
+            self.last_frame_count = self.last_frame_count.saturating_add(1);
             self.read_scratch_block(need, frame_want).await?;
             let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
             out[offset..offset + frame_want].copy_from_slice(data);
@@ -256,7 +272,7 @@ where
         if self.buf.len() < need {
             self.buf.resize(need, 0);
         }
-        let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
+        let filled = fill(&mut self.inner, &mut self.buf[..need], &mut self.last_read_dispatch_count).await?;
         if filled < need {
             return Err(short_shard_read(filled.saturating_sub(self.hash_algo.size()), want));
         }
@@ -374,6 +390,7 @@ where
         }
 
         let need = hash_size + want;
+        self.last_frame_count = 1;
 
         if let Some(block) = self.inner.try_take_block(need) {
             let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
@@ -519,6 +536,7 @@ where
         while offset < want {
             let frame_want = (want - offset).min(self.frame_size);
             let need = hash_size + frame_want;
+            self.last_frame_count = self.last_frame_count.saturating_add(1);
             self.read_scratch_block(need, frame_want).await?;
             let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
             out.extend_from_slice(data);
@@ -756,12 +774,13 @@ where
 /// of bytes actually read. A raw tokio File typically satisfies this in one
 /// `read` (one spawn_blocking round-trip); the loop only re-enters on a genuine
 /// partial read. Callers treat `filled < buf.len()` as a truncated shard.
-async fn fill<R>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize>
+async fn fill<R>(reader: &mut R, buf: &mut [u8], dispatches: &mut usize) -> std::io::Result<usize>
 where
     R: AsyncRead + Unpin,
 {
     let mut filled = 0;
     while filled < buf.len() {
+        *dispatches = (*dispatches).saturating_add(1);
         let n = reader.read(&mut buf[filled..]).await.map_err(|e| {
             error!("bitrot reader read error: {}", e);
             e
@@ -2202,6 +2221,8 @@ mod tests {
         assert_eq!(n, shard_size);
         assert_eq!(out, payload);
         assert_eq!(reads.load(Ordering::SeqCst), 1, "one contiguous read for hash+data");
+        assert_eq!(r.last_frame_count(), 1);
+        assert_eq!(r.last_read_dispatch_count(), 1);
     }
 
     #[tokio::test]
@@ -2226,6 +2247,8 @@ mod tests {
         assert_eq!(n, shard_size);
         assert_eq!(out, payload);
         assert!(reads.load(Ordering::SeqCst) > 1, "partial reads should loop");
+        assert_eq!(r.last_frame_count(), 1);
+        assert_eq!(r.last_read_dispatch_count(), reads.load(Ordering::SeqCst));
     }
 
     // --- backlog#959 / ECA-18 invariant guards -------------------------------
@@ -2392,10 +2415,14 @@ mod tests {
         let mut first = vec![0u8; 16];
         assert_eq!(reader.read(&mut first).await.expect("read first frames"), first.len());
         assert_eq!(&first, &data[..16]);
+        assert_eq!(reader.last_frame_count(), 2);
+        assert_eq!(reader.last_read_dispatch_count(), 2);
 
         let mut second = vec![0u8; 16];
         assert_eq!(reader.read(&mut second).await.expect("read remaining frames"), second.len());
         assert_eq!(&second, &data[16..]);
+        assert_eq!(reader.last_frame_count(), 2);
+        assert_eq!(reader.last_read_dispatch_count(), 2);
     }
 
     #[tokio::test]
@@ -2414,6 +2441,36 @@ mod tests {
         let mut decoded = vec![0u8; SHARD];
         assert_eq!(reader.read(&mut decoded).await.expect("read all frames"), SHARD);
         assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn quantized_read_shape_separates_frames_from_partial_dispatches() {
+        const SHARD: usize = 32;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data: Vec<u8> = (0..SHARD).map(|index| index.wrapping_mul(17).wrapping_add(3) as u8).collect();
+
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        writer.write(&data).await.expect("write quantized shard");
+        writer.shutdown().await.expect("finish quantized shard");
+        let encoded = writer.into_inline_data().expect("inline quantized bytes");
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            data: Cursor::new(encoded),
+            reads: reads.clone(),
+            chunk: 3,
+        };
+        let mut reader = BitrotReader::new_with_frame_size(source, SHARD, FRAME, algo, false);
+        let mut decoded = vec![0u8; SHARD];
+        assert_eq!(reader.read(&mut decoded).await.expect("read quantized shard"), SHARD);
+        assert_eq!(decoded, data);
+        assert_eq!(reader.last_frame_count(), SHARD / FRAME);
+        assert_eq!(reader.last_read_dispatch_count(), reads.load(Ordering::SeqCst));
+        assert!(
+            reader.last_read_dispatch_count() > reader.last_frame_count(),
+            "partial underlying reads must be distinguishable from authenticated frame count"
+        );
     }
 
     /// A truncated shard must be an error, never a partially filled buffer — that
