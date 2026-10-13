@@ -1348,16 +1348,14 @@ pub(super) fn should_clear_dirty_usage_snapshot(
 
 /// Buckets the walk cannot certify against its start snapshot: every dirty
 /// bucket whose generation differs from the snapshot's, including buckets
-/// dirtied after the snapshot was taken. Buckets in `failed_buckets` are
-/// excluded from certification by `dirty_usage_buckets_excluding_failed`, so
-/// they are pending as well.
-pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets, failed_buckets: &HashSet<String>) -> BTreeSet<String> {
+/// dirtied after the snapshot was taken. Only a `Complete` cycle reads this,
+/// and a failed bucket never reaches `Complete`, so the failed set that
+/// `dirty_usage_buckets_excluding_failed` removes is empty here.
+pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) -> BTreeSet<String> {
     let dirty_buckets = dirty_usage_buckets();
     dirty_buckets
         .iter()
-        .filter(|(bucket, generation)| {
-            failed_buckets.contains(bucket.as_str()) || snapshot.get(bucket.as_str()) != Some(*generation)
-        })
+        .filter(|(bucket, generation)| snapshot.get(bucket.as_str()) != Some(*generation))
         .map(|(bucket, _)| bucket.clone())
         .collect()
 }

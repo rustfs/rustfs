@@ -452,7 +452,7 @@ where
             activity_status,
         );
         let pending_buckets = if status == ScannerCycleStatus::Complete {
-            pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets, &HashSet::new())
+            pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets)
         } else {
             ScannerCyclePendingBuckets::new()
         };
@@ -800,7 +800,7 @@ where
     // guardrail verdict so a bucket written during the walk is reported in
     // the same publication that certifies the others.
     let pending_buckets = if cycle_status == ScannerCycleStatus::Complete {
-        pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets, &failed_buckets)
+        pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets)
     } else {
         ScannerCyclePendingBuckets::new()
     };

@@ -3053,7 +3053,7 @@ mod tests {
 
         let observed = DataUsageInfo {
             usage_snapshot_observational: true,
-            ..certified.clone()
+            ..certified
         };
         let encoded = rmp_serde::to_vec_named(&observed).expect("encode observed snapshot");
         let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode observed snapshot");
