@@ -243,6 +243,13 @@ impl HealStorageAPI for NoticeStorage {
     async fn bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
         Ok(Some(self.bucket_incarnation_id))
     }
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::storage_api::owner::DiskSetSelector>,
+    ) -> rustfs_heal::Result<Vec<BucketInfo>> {
+        self.list_buckets().await
+    }
+
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }

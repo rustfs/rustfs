@@ -2633,4 +2633,156 @@ mod tests {
         };
         assert!(!outage_candidate_targets_replacement(&insufficient_peer_shards, 12, replacement_set_slot));
     }
+    async fn two_node_heal_status(
+        cluster: &RustFSTestClusterEnvironment,
+        bucket: Option<&str>,
+        recreate: bool,
+        scan_mode: u8,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        let url = format!("{}/rustfs/admin/v3/heal/{}", cluster.nodes[0].url, bucket.unwrap_or_default());
+        let options = serde_json::json!({
+            "recursive": true, "dryRun": false, "remove": false,
+            "recreate": recreate, "scanMode": scan_mode, "updateParity": false, "nolock": false,
+        });
+        let started =
+            start_root_heal_when_control_ready(&url, &options.to_string(), &cluster.access_key, &cluster.secret_key).await?;
+        let started: serde_json::Value = serde_json::from_str(&started)?;
+        let token = started["clientToken"]
+            .as_str()
+            .ok_or_else(|| format!("missing heal token: {started}"))?;
+        let status_url = format!("{url}?clientToken={token}");
+        let deadline = Instant::now() + Duration::from_secs(240);
+        loop {
+            let body = timeout(
+                Duration::from_secs(20),
+                signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key),
+            )
+            .await??;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            match status["summary"].as_str() {
+                Some("finished" | "stopped") => return Ok(status),
+                Some("running") if Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+                _ => return Err(format!("heal did not reach a terminal state: {status}").into()),
+            }
+        }
+    }
+
+    async fn verify_two_node_directory_recovery(remove_bucket: bool, scan_mode: u8) -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
+        // Isolate explicit administrator recovery from scanner, MRF, and disk healing.
+        for key in [
+            "RUSTFS_HEAL_AUTO_HEAL_ENABLE",
+            "RUSTFS_HEAL_MRF_ENABLE",
+            "RUSTFS_SCANNER_ENABLED",
+            "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE",
+        ] {
+            cluster.set_env(key, "false");
+        }
+        cluster.start().await?;
+        let source = cluster.create_s3_client(0)?;
+        let target = cluster.create_s3_client(1)?;
+        let bucket = "two-node-directory-recovery";
+        source.create_bucket().bucket(bucket).send().await?;
+        let objects = [
+            ("empty", Vec::new()),
+            ("nested/inline", vec![0x3c; 1024]),
+            ("nested/external", (0_u8..=255).cycle().take(1024 * 1024).collect::<Vec<_>>()),
+        ];
+        for (key, bytes) in &objects {
+            source
+                .put_object()
+                .bucket(bucket)
+                .key(*key)
+                .body(ByteStream::from(bytes.clone()))
+                .send()
+                .await?;
+        }
+        let target_bucket = Path::new(&cluster.nodes[1].data_dir).join(bucket);
+        let original = objects
+            .iter()
+            .map(|(key, _)| census_object_version_on_disk(Path::new(&cluster.nodes[1].data_dir), bucket, key, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        for census in &original {
+            assert!(census.has_xl_meta, "fixture must have a target metadata copy: {census:?}");
+        }
+        assert!(
+            !original[2].present_part_fingerprints.is_empty(),
+            "large fixture must exercise external parts"
+        );
+        let removed = Path::new(&cluster.temp_dir).join("removed");
+        tokio::fs::create_dir(&removed).await?;
+        if remove_bucket {
+            tokio::fs::rename(&target_bucket, removed.join(bucket)).await?;
+            let status = two_node_heal_status(&cluster, None, false, scan_mode).await?;
+            assert_eq!(
+                status["summary"], "stopped",
+                "missing bucket must not look like an empty successful scan: {status}"
+            );
+            assert_eq!(status["outcome"]["execution"]["state"], "aborted");
+            assert_eq!(status["outcome"]["coverage"], "partial");
+            assert_eq!(status["outcome"]["counters"]["processed"], 0);
+            assert!(!target_bucket.exists(), "default discovery must not silently recreate a bucket");
+            let scoped_default = two_node_heal_status(&cluster, Some(bucket), false, scan_mode).await?;
+            assert_eq!(
+                scoped_default["summary"], "stopped",
+                "default namespace quorum protection must remain: {scoped_default}"
+            );
+        } else {
+            for (index, (key, _)) in objects.iter().enumerate() {
+                tokio::fs::rename(target_bucket.join(key), removed.join(index.to_string())).await?;
+            }
+        }
+        let status = two_node_heal_status(&cluster, remove_bucket.then_some(bucket), remove_bucket, scan_mode).await?;
+        assert_eq!(status["summary"], "finished", "explicit recovery should complete: {status}");
+        assert_eq!(status["outcome"]["execution"]["state"], "completed");
+        assert_eq!(status["outcome"]["coverage"], "complete");
+        for ((key, _), before) in objects.iter().zip(&original) {
+            let after = census_object_version_on_disk(Path::new(&cluster.nodes[1].data_dir), bucket, key, None)?;
+            assert!(after.has_xl_meta, "metadata must be restored before GET: {key}");
+            assert_eq!(
+                after.present_part_fingerprints, before.present_part_fingerprints,
+                "external shard bytes must match: {key}"
+            );
+            assert_eq!(
+                after.inline_data_fingerprint, before.inline_data_fingerprint,
+                "inline shard bytes must match: {key}"
+            );
+        }
+        cluster.stop_node(0)?;
+        for (key, expected) in &objects {
+            let actual = timeout(Duration::from_secs(30), async {
+                target
+                    .get_object()
+                    .bucket(bucket)
+                    .key(*key)
+                    .send()
+                    .await?
+                    .body
+                    .collect()
+                    .await
+                    .map(|body| body.into_bytes())
+                    .map_err(Box::<dyn Error + Send + Sync>::from)
+            })
+            .await??;
+            assert_eq!(actual.len(), expected.len(), "target-only read length: {key}");
+            assert_eq!(sha256_hex(&actual), sha256_hex(expected), "target-only content: {key}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_two_node_bucket_discovery_and_explicit_recreate() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(true, 2).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_object_directory_recovery_normal() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(false, 1).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_object_directory_recovery_deep() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(false, 2).await
+    }
 }
