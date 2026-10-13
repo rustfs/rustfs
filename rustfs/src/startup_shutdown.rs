@@ -243,13 +243,13 @@ where
 pub(crate) async fn run_startup_shutdown_sequence(
     state_manager: &ServiceStateManager,
     shutdown_signal: ShutdownSignal,
-    s3_shutdown_handle: Option<ShutdownHandle>,
-    console_shutdown_handle: Option<ShutdownHandle>,
+    listener_shutdown_handles: (Option<ShutdownHandle>, Option<ShutdownHandle>),
     optional_runtimes: OptionalRuntimeServices,
     capacity_tasks: Option<CapacityBackgroundTasks>,
     ctx: CancellationToken,
     capture_runtime: Option<crate::startup_capture::NativeCaptureRuntime>,
 ) -> std::io::Result<()> {
+    let (s3_shutdown_handle, console_shutdown_handle) = listener_shutdown_handles;
     if let Some(capture) = &capture_runtime {
         capture.stop_admission();
     }

@@ -3,6 +3,9 @@ mod config;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests;
 
+use crate::storage_api::startup::capture::{
+    CaptureRaftLimits, CaptureRaftNetworkFactory, CaptureRaftRpc, normalize_tonic_rpc_audience,
+};
 use crate::{config::Config, storage_api::server::http::ServerContextSlot};
 use config::CaptureConfig;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10,7 +13,6 @@ use config::CaptureMode;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustfs_capture_authority::Store;
 use rustfs_capture_authority::{CheckpointLimits, NativeLogWriter, NativeRaftOwner};
-use rustfs_ecstore::api::rpc::{CaptureRaftLimits, CaptureRaftNetworkFactory, CaptureRaftRpc, normalize_tonic_rpc_audience};
 use rustfs_protos::proto_gen::node_service::{
     CaptureRaftRequest, CaptureRaftResponse,
     capture_raft_service_server::{CaptureRaftService, CaptureRaftServiceServer},

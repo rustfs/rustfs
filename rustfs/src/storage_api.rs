@@ -343,6 +343,12 @@ pub(crate) mod site_replication {
 }
 
 pub(crate) mod startup {
+    pub(crate) mod capture {
+        pub(crate) use crate::storage::storage_api::ecstore_rpc::{
+            CaptureRaftLimits, CaptureRaftNetworkFactory, CaptureRaftRpc, normalize_tonic_rpc_audience,
+        };
+    }
+
     pub(crate) mod heal_control {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::heal_control_startup_consumer::heal_topology_fingerprint;

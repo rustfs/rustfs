@@ -166,8 +166,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let shutdown_result = run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
-        s3_shutdown_tx,
-        console_shutdown_tx,
+        (s3_shutdown_tx, console_shutdown_tx),
         optional_runtimes,
         capacity_tasks,
         shutdown_token,
