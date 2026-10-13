@@ -112,6 +112,7 @@ pub(crate) struct StartupRuntimeLifecycle {
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
     pub(crate) capacity_tasks: Option<CapacityBackgroundTasks>,
     pub(crate) service_runtime: StartupServiceRuntime,
+    pub(crate) capture_runtime: Option<crate::startup_capture::NativeCaptureRuntime>,
     pub(crate) store: Arc<ECStore>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) readiness: Arc<GlobalReadiness>,
@@ -125,6 +126,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         console_shutdown_tx,
         capacity_tasks,
         service_runtime,
+        capture_runtime,
         store,
         shutdown_token,
         readiness,
@@ -149,14 +151,19 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         iam_bootstrap = ?iam_bootstrap,
         "RustFS server ready"
     );
-    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
+    if let Err(error) = publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await {
+        if let Some(capture) = capture_runtime {
+            capture.shutdown().await?;
+        }
+        return Err(error);
+    }
     startup_runtime_sources::publish_init_time_now().await;
     let event_notifier_reconciler = start_persisted_event_notifier_reconciler(store.clone(), shutdown_token.clone());
 
     let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
-    run_startup_shutdown_sequence(
+    let shutdown_result = run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
         s3_shutdown_tx,
@@ -164,6 +171,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         optional_runtimes,
         capacity_tasks,
         shutdown_token,
+        capture_runtime,
     )
     .await;
     shutdown_connect_runtimes(heartbeat, inventory).await;
@@ -184,6 +192,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
             "Persisted notification runtime reconciler task failed to join"
         );
     }
+
+    shutdown_result?;
 
     info!(
         target: "rustfs::main::run",

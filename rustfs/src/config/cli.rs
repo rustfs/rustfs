@@ -1593,6 +1593,10 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 
+    /// Configuration file for the optional native capture Raft runtime.
+    #[arg(long, env = "RUSTFS_NATIVE_CAPTURE_CONFIG")]
+    pub native_capture_config: Option<PathBuf>,
+
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
 
@@ -1711,6 +1715,7 @@ pub fn default_server_opts() -> ServerOpts {
         console_address: DEFAULT_CONSOLE_ADDRESS.to_string(),
         obs_endpoint: DEFAULT_OBS_ENDPOINT.to_string(),
         tls_path: None,
+        native_capture_config: None,
         license: None,
         region: None,
         kms_enable: false,

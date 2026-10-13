@@ -2277,13 +2277,15 @@ fn process_connection(
                 .max_encoding_message_size(tier_mutation_control_max_message_size),
             check_auth,
         );
-        let rpc_service = RpcRequestPathService::new(
-            Routes::new(node_service)
-                .add_service(InterceptedService::new(storage::tonic_service::make_scanner_control_server(), check_auth))
-                .add_service(heal_control_service)
-                .add_service(tier_mutation_control_service)
-                .prepare(),
-        );
+        let mut rpc_routes = Routes::new(node_service)
+            .add_service(InterceptedService::new(storage::tonic_service::make_scanner_control_server(), check_auth))
+            .add_service(heal_control_service)
+            .add_service(tier_mutation_control_service);
+        // Capture verifies its own replay nonce; check_auth must not consume it twice.
+        if let Some(capture) = server_ctx.installed_capture_service() {
+            rpc_routes = rpc_routes.add_service(capture.to_service());
+        }
+        let rpc_service = RpcRequestPathService::new(rpc_routes.prepare());
 
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);

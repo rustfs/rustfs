@@ -289,6 +289,7 @@ mod tests {
         assert_eq!(config.console_address, DEFAULT_CONSOLE_ADDRESS);
         assert_eq!(config.obs_endpoint, DEFAULT_OBS_ENDPOINT);
         assert_eq!(config.tls_path, None);
+        assert_eq!(config.native_capture_config, None);
         assert_eq!(config.license, None);
         assert_eq!(config.region, Some(RUSTFS_REGION.to_string()));
         assert!(!config.kms_enable);
@@ -302,6 +303,34 @@ mod tests {
         assert!(!config.kms_allow_insecure_dev_defaults);
         assert!(!config.buffer_profile_disable);
         assert_eq!(config.buffer_profile, "GeneralPurpose");
+    }
+
+    #[test]
+    #[serial]
+    fn test_native_capture_config_entry() {
+        with_env_var("RUSTFS_NATIVE_CAPTURE_CONFIG", "/tmp/native-capture-env.json", || {
+            let opt = Opt::parse_from(["rustfs", "server", "/test/volume"]);
+            assert_eq!(opt.native_capture_config, Some("/tmp/native-capture-env.json".into()));
+            let config = Config::from_opt(opt).expect("environment capture configuration path");
+            assert_eq!(config.native_capture_config, Some("/tmp/native-capture-env.json".into()));
+
+            let opt = Opt::parse_from([
+                "rustfs",
+                "/test/volume",
+                "--native-capture-config",
+                "/tmp/native-capture-cli.json",
+            ]);
+            let config = Config::from_opt(opt).expect("CLI capture configuration path");
+            assert_eq!(config.native_capture_config, Some("/tmp/native-capture-cli.json".into()));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_native_capture_config_default_disabled() {
+        let opt = Opt::from_server_opts(default_server_opts());
+        assert_eq!(opt.native_capture_config, None);
+        assert_eq!(Config::from_opt(opt).expect("default configuration").native_capture_config, None);
     }
 
     #[test]

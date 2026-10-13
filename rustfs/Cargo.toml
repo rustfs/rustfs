@@ -223,6 +223,8 @@ hotpath-cpu = [
 workspace = true
 
 [dependencies]
+rustfs-capture-authority = { workspace = true }
+openraft = { workspace = true, features = ["storage-v2"] }
 hotpath.workspace = true
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }

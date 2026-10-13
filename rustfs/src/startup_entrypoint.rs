@@ -1958,69 +1958,84 @@ async fn run(config: Config) -> Result<()> {
 
     let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes, &instance_ctx).await?;
     let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
-    let StartupHttpServers {
-        state_manager,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-    } = init_startup_http_servers(&config, readiness.clone(), server_ctx.clone()).await?;
+    let mut capture_runtime = crate::startup_capture::start_capture(&config, &server_ctx).await?;
+    let result = async {
+        let StartupHttpServers {
+            state_manager,
+            s3_shutdown_tx,
+            console_shutdown_tx,
+        } = init_startup_http_servers(&config, readiness.clone(), server_ctx.clone()).await?;
 
-    let StartupStorageRuntime {
-        store,
-        shutdown_token: ctx,
-    } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
+        let StartupStorageRuntime {
+            store,
+            shutdown_token: ctx,
+        } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
 
-    #[cfg(feature = "e2e-test-hooks")]
-    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
-        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
-        let release = std::path::PathBuf::from(
-            std::env::var_os("RUSTFS_E2E_STARTUP_CAS_RELEASE")
-                .ok_or_else(|| Error::other("startup CAS fixture requires a release path"))?,
-        );
-        if server_ctx.installed_object_store().is_some() {
-            return Err(Error::other("startup CAS gate reached an installed slot"));
-        }
-        let line = format!(
-            "RUSTFS_E2E_STARTUP_CAS {}\n",
-            serde_json::json!({
-                "kind": "gate", "nonce": nonce, "pid": std::process::id(), "slot_installed": false,
-            })
-        );
-        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
-        tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            while !tokio::fs::try_exists(&release).await? {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
+            let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+            let release = std::path::PathBuf::from(
+                std::env::var_os("RUSTFS_E2E_STARTUP_CAS_RELEASE")
+                    .ok_or_else(|| Error::other("startup CAS fixture requires a release path"))?,
+            );
+            if server_ctx.installed_object_store().is_some() {
+                return Err(Error::other("startup CAS gate reached an installed slot"));
             }
-            Ok::<_, Error>(())
+            let line = format!(
+                "RUSTFS_E2E_STARTUP_CAS {}\n",
+                serde_json::json!({
+                    "kind": "gate", "nonce": nonce, "pid": std::process::id(), "slot_installed": false,
+                })
+            );
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+            tokio::time::timeout(std::time::Duration::from_secs(180), async {
+                while !tokio::fs::try_exists(&release).await? {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Ok::<_, Error>(())
+            })
+            .await
+            .map_err(|_| Error::other("startup CAS gate release timed out"))??;
+        }
+
+        if let Some(capture) = &mut capture_runtime {
+            let audience = crate::storage_api::server::http::try_current_local_node_name()
+                .ok_or_else(|| Error::other("native capture Ping audience unavailable"))?;
+            capture.finish_startup(&audience).await?;
+        }
+
+        let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
+
+        let service_runtime = init_startup_runtime_services(
+            &config,
+            endpoint_pools,
+            store.clone(),
+            ctx.clone(),
+            readiness.clone(),
+            state_manager.clone(),
+            server_ctx,
+        )
+        .await?;
+
+        run_startup_runtime_lifecycle(StartupRuntimeLifecycle {
+            server_address,
+            state_manager,
+            s3_shutdown_tx,
+            console_shutdown_tx,
+            capacity_tasks,
+            service_runtime,
+            capture_runtime: capture_runtime.take(),
+            store,
+            shutdown_token: ctx,
+            readiness,
         })
         .await
-        .map_err(|_| Error::other("startup CAS gate release timed out"))??;
     }
-
-    let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
-
-    let service_runtime = init_startup_runtime_services(
-        &config,
-        endpoint_pools,
-        store.clone(),
-        ctx.clone(),
-        readiness.clone(),
-        state_manager.clone(),
-        server_ctx,
-    )
-    .await?;
-
-    run_startup_runtime_lifecycle(StartupRuntimeLifecycle {
-        server_address,
-        state_manager,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        capacity_tasks,
-        service_runtime,
-        store,
-        shutdown_token: ctx,
-        readiness,
-    })
-    .await
+    .await;
+    if let Some(capture) = capture_runtime {
+        capture.shutdown().await?;
+    }
+    result
 }
 
 #[cfg(test)]

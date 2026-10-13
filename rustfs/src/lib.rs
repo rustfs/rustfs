@@ -107,6 +107,7 @@ pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;
 pub(crate) mod startup_background;
 pub(crate) mod startup_bucket_metadata;
+pub(crate) mod startup_capture;
 pub(crate) mod startup_deadlock;
 pub(crate) mod startup_embedded;
 pub(crate) mod startup_embedded_optional;

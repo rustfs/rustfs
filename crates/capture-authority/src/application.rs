@@ -625,6 +625,19 @@ impl Store {
     pub fn native_application_state(&self) -> Result<(Option<LogId>, crate::CaptureMembership), StoreError> {
         native_application_state(&self.database.begin_read()?)
     }
+
+    /// Check that a recovered native state supports provenance-backed snapshots.
+    /// This does not promote legacy records or change durable metadata.
+    pub fn validate_native_provenance_state(&self) -> Result<(), StoreError> {
+        let tx = self.database.begin_read()?;
+        let schema = number(required(tx.open_table(META)?.get("schema")?)?.value())?;
+        if !matches!(schema, 6 | 7) {
+            return Err(StoreError::UnsupportedSchema);
+        }
+        native_application_state(&tx)?;
+        read_binding(&tx.open_table(META)?)?;
+        Ok(())
+    }
     /// Bootstrap the immutable capture policy. The caller must be the trusted
     /// deployment provisioning owner. This crate does not authenticate callers;
     /// do not expose this public method through an ordinary object request API.

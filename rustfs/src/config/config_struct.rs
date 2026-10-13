@@ -24,6 +24,7 @@ use rustfs_config::{
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
@@ -110,6 +111,9 @@ pub struct Config {
     /// tls path for rustfs API and console.
     pub tls_path: Option<String>,
 
+    /// Optional native capture Raft configuration file.
+    pub native_capture_config: Option<PathBuf>,
+
     /// License key for enterprise features
     pub license: Option<String>,
 
@@ -166,6 +170,7 @@ impl Config {
             console_address: DEFAULT_CONSOLE_ADDRESS.to_string(),
             obs_endpoint: rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
             tls_path: None,
+            native_capture_config: None,
             license: None,
             region: Some(RUSTFS_REGION.to_string()),
             kms_enable: false,
@@ -200,6 +205,7 @@ impl Config {
             console_address,
             obs_endpoint,
             tls_path,
+            native_capture_config,
             license,
             region,
             kms_enable,
@@ -243,6 +249,7 @@ impl Config {
             console_address,
             obs_endpoint,
             tls_path,
+            native_capture_config,
             license,
             region,
             kms_enable,
