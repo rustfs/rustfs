@@ -43,7 +43,8 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` (`DEFAULT_SCANNER_IDLE_MODE`) | Enables preset scanner sleeps and foreground-read backoff. `false` disables those sleeps; per-disk foreground-priority admission remains active. |
 | `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `14` (`DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS`) | Timeout for saving scanner cache; runtime enforces a minimum of `1` and keeps the default persistence budget within the distributed publication lease. |
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS`) | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
-| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
+| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps walker-count-derived concurrency. |
+| `scanner.walkers_per_disk` | `RUSTFS_SCANNER_WALKERS_PER_DISK` | count | `1` (`DEFAULT_SCANNER_WALKERS_PER_DISK`) | Bucket walkers spawned per local disk of a set. The walkers of one disk share its scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. The resulting walker count is what `scanner.max_concurrent_disk_scans` caps, and the disk count stays the floor. Valid range is `1` through `16` (`MAX_SCANNER_WALKERS_PER_DISK`); `1` keeps today's I/O profile and is the right value for rotational media. The `disk_concurrency_budget` log line reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and its `reason` (`available_walkers`, `configured_cap`, or `count_budget`). |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` (`DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS`) | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
 | `scanner.alert_excess_versions` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS` | versions | `100` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS`) | Version count threshold for scanner alerts. |
 | `scanner.alert_excess_version_size` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE` | bytes | `1099511627776` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE`) | Retained version byte threshold for scanner alerts. |
@@ -143,6 +144,7 @@ runtime_config.delay.value
 runtime_config.max_wait_seconds.value
 runtime_config.cycle_interval_seconds.value
 runtime_config.bitrot_cycle_seconds.value
+runtime_config.walkers_per_disk.value
 cycle_schedule.effective_interval_seconds
 cycle_schedule.clean_idle_backoff_enabled
 cycle_schedule.clean_idle_backoff_multiplier
