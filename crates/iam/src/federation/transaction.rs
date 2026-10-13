@@ -17,6 +17,7 @@ use super::{
     FederatedProviderView, FederatedRedirectPolicy, FederatedSession, FederatedSessionBinding, FederatedSessionTransaction,
     FederationError, OpaqueLogoutContinuation, Result, StandardOidcAuthentication,
 };
+use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use std::sync::Arc;
 
 const DEFAULT_OIDC_PROVIDER_ID: &str = "default";
@@ -133,22 +134,28 @@ impl FederatedIdentityService {
         let authorization = self.verify_identity(jwt).await?;
         if !authorization.has_authorization_context() {
             tracing::warn!(
-                provider_id = %authorization.provider_id,
-                username = %authorization.claims.username,
-                sub = %authorization.claims.sub,
-                policy_count = authorization.policies.len(),
-                group_count = authorization.groups.len(),
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                provider_id = %authorization.provider_id(),
+                username = %authorization.username(),
+                sub = %authorization.subject(),
+                policy_count = authorization.policies().len(),
+                group_count = authorization.mapped_iam_groups().len(),
                 "AssumeRoleWithWebIdentity has no mapped policies or groups"
             );
             return Err(FederationError::NoAuthorizationContext);
         }
         tracing::debug!(
-            provider_id = %authorization.provider_id,
-            username = %authorization.claims.username,
-            policy_count = authorization.policies.len(),
-            group_count = authorization.groups.len(),
-            policies = ?authorization.policies,
-            groups = ?authorization.groups,
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            provider_id = %authorization.provider_id(),
+            username = %authorization.username(),
+            policy_count = authorization.policies().len(),
+            group_count = authorization.mapped_iam_groups().len(),
+            policies = ?authorization.policies(),
+            groups = ?authorization.mapped_iam_groups(),
             "AssumeRoleWithWebIdentity mapped OIDC policies and groups"
         );
 
@@ -379,19 +386,19 @@ mod tests {
         ) -> core::result::Result<Credentials, FederatedSessionBindingError> {
             self.events.lock().expect("event log should not be poisoned").push("bind");
             self.transactions.lock().expect("transactions should not be poisoned").push((
-                transaction.authorization.provider_id.clone(),
+                transaction.authorization.provider_id().to_string(),
                 transaction.duration_seconds,
                 transaction.session_policy.clone(),
             ));
             self.mapped_policies
                 .lock()
                 .expect("mapped policies should not be poisoned")
-                .push(transaction.authorization.policies.clone());
+                .push(transaction.authorization.policies().to_vec());
             if self.fail {
                 return Err(FederatedSessionBindingError::Internal("binding failed".to_string()));
             }
             Ok(Credentials {
-                access_key: transaction.authorization.claims.session_identity(),
+                access_key: transaction.authorization.session_identity(),
                 ..Default::default()
             })
         }
@@ -487,7 +494,7 @@ mod tests {
             .await
             .expect("callback flow should complete");
         assert_eq!(login.session.credentials.access_key, "user");
-        assert_eq!(login.session.authorization.provider_id, "corp");
+        assert_eq!(login.session.authorization.provider_id(), "corp");
         assert_eq!(login.redirect_after.as_deref(), Some("/browser"));
         assert_eq!(login.logout_token, "logout-token");
         assert_eq!(
@@ -501,7 +508,7 @@ mod tests {
             .await
             .expect("web identity flow should complete");
         assert_eq!(web_identity.credentials.access_key, "user");
-        assert_eq!(web_identity.authorization.provider_id, "partner");
+        assert_eq!(web_identity.authorization.provider_id(), "partner");
         assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
         assert_eq!(
             binding
@@ -530,8 +537,8 @@ mod tests {
             .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
             .await
             .expect("standard callback flow should complete");
-        assert_eq!(login.session.authorization.provider_id, "corp");
-        assert_eq!(login.session.authorization.policies, ["readwrite"]);
+        assert_eq!(login.session.authorization.provider_id(), "corp");
+        assert_eq!(login.session.authorization.policies(), ["readwrite"]);
         assert_eq!(
             events.lock().expect("event log should not be poisoned").as_slice(),
             ["exchange", "bind", "logout"]
@@ -542,8 +549,8 @@ mod tests {
             .assume_role_with_web_identity("jwt", 7200, Some("session-policy".to_string()), binding.as_ref())
             .await
             .expect("standard web identity flow should complete");
-        assert_eq!(web_identity.authorization.provider_id, "partner");
-        assert_eq!(web_identity.authorization.policies, ["readwrite"]);
+        assert_eq!(web_identity.authorization.provider_id(), "partner");
+        assert_eq!(web_identity.authorization.policies(), ["readwrite"]);
         assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
         assert_eq!(
             binding
@@ -586,8 +593,8 @@ mod tests {
             .await
             .expect("a mapped group is an authorization context");
 
-        assert_eq!(session.authorization.policies, ["developers"]);
-        assert_eq!(session.authorization.groups, ["developers"]);
+        assert_eq!(session.authorization.policies(), ["developers"]);
+        assert_eq!(session.authorization.mapped_iam_groups(), ["developers"]);
         assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
     }
 
