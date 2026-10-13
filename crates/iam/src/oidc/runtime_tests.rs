@@ -371,12 +371,12 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
                 .await
                 .unwrap_or_else(|err| panic!("hidden={hidden}, explicit={explicit}: {err}"));
             let (identity, redirect_after, _) = exchange.into_parts();
+            assert_eq!(identity.source_groups(), ["readwrite"]);
             let authorization = mapper.map(identity);
-            assert_eq!(authorization.provider_id, "console");
-            assert_eq!(authorization.claims.sub, "existing-user");
-            assert_eq!(authorization.claims.email, "user@example.com");
-            assert_eq!(authorization.claims.groups, vec!["readwrite"]);
-            assert_eq!(authorization.policies, vec!["team/readwrite"]);
+            assert_eq!(authorization.provider_id(), "console");
+            assert_eq!(authorization.subject(), "existing-user");
+            assert_eq!(authorization.email(), "user@example.com");
+            assert_eq!(authorization.policies(), ["team/readwrite"]);
             assert_eq!(redirect_after.as_deref(), Some("/buckets"));
             assert!(matches!(sys.exchange_code(&state, "test-authorization-code", redirect).await,
                 Err(error) if error == "invalid or expired OIDC state"));

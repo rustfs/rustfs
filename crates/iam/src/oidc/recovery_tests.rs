@@ -177,9 +177,9 @@ async fn web_identity_recovers_transport_failure_and_preserves_verification() {
             .await
             .expect("verify recovered workload token");
         let authorization = mapper.map(identity);
-        assert_eq!(authorization.provider_id, "workload");
-        assert_eq!(authorization.claims.sub, "recovered-user");
-        assert_eq!(authorization.policies, vec!["team/readonly"]);
+        assert_eq!(authorization.provider_id(), "workload");
+        assert_eq!(authorization.subject(), "recovered-user");
+        assert_eq!(authorization.policies(), ["team/readonly"]);
         assert!(
             sys.authorize_url("workload", "https://console.example.com/callback", None)
                 .await
