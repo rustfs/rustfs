@@ -308,7 +308,12 @@ impl HealTask {
             "Heal cluster started"
         );
 
-        let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
+        let bucket_infos = if self.source == HealRequestSource::Admin {
+            self.await_with_control(self.storage.list_buckets_for_admin_heal(None))
+                .await?
+        } else {
+            self.await_with_control(self.storage.list_buckets()).await?
+        };
         let mut failed = 0_u64;
         let mut retryable = 0_u64;
         let mut permanent = 0_u64;

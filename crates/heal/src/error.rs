@@ -90,6 +90,9 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    #[error("Bucket discovery incomplete for the requested heal scope; not all buckets could be traversed")]
+    BucketDiscoveryIncomplete,
+
     #[error("Invalid heal type: {heal_type}")]
     InvalidHealType { heal_type: String },
 
@@ -127,7 +130,7 @@ impl Error {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
             Error::ReplacementTargetNotReady(_) | Error::DanglingDeleteDeferred { .. } => true,
-            Error::TransientSkip { .. } => true,
+            Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
             // Configuration) are terminal - retrying cannot fix them - while
