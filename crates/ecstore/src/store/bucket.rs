@@ -20,6 +20,7 @@ use crate::bucket::{
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
+use crate::storage_api_contracts::admin::DiskSetSelector;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
@@ -1232,13 +1233,13 @@ impl ECStore {
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO(backlog): support cached bucket listing via opts.cached
         Ok(self
-            .list_bucket_from_sets(opts, usize::MAX, BucketInfoQuorum::Write)
+            .list_bucket_from_sets(opts, usize::MAX, BucketInfoQuorum::Write, None)
             .await?
             .buckets)
     }
 
     pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY, BucketInfoQuorum::Write)
+        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY, BucketInfoQuorum::Write, None)
             .await
     }
 
@@ -1254,9 +1255,28 @@ impl ECStore {
                 },
                 SCANNER_BUCKET_LIST_SET_CONCURRENCY,
                 BucketInfoQuorum::Read,
+                None,
             )
             .await?
             .buckets)
+    }
+
+    /// Preserve namespace completeness for administrator traversal. A scoped
+    /// request must not depend on unrelated sets being available.
+    pub async fn list_buckets_for_admin_heal(
+        &self,
+        selector: Option<DiskSetSelector>,
+    ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
+        self.list_bucket_from_sets(
+            &BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            },
+            SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+            BucketInfoQuorum::Write,
+            selector,
+        )
+        .await
     }
 
     async fn list_bucket_from_sets(
@@ -1264,10 +1284,15 @@ impl ECStore {
         opts: &BucketOptions,
         max_concurrency: usize,
         quorum: BucketInfoQuorum,
+        selector: Option<DiskSetSelector>,
     ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        let set_count = self.pools.iter().map(|pool| pool.disk_set.len()).sum();
+        let sets = self
+            .bucket_sets()
+            .filter(|(pool, set, _)| selector.is_none_or(|scope| scope.pool_idx == *pool && scope.set_idx == *set))
+            .collect::<Vec<_>>();
+        let set_count = sets.len();
         let concurrency = bucket_list_set_concurrency(set_count, max_concurrency);
-        let mut set_listings = stream::iter(self.bucket_sets().map(move |(pool_index, set_index, set)| async move {
+        let mut set_listings = stream::iter(sets.into_iter().map(move |(pool_index, set_index, set)| async move {
             set.list_bucket_with_quorum(quorum)
                 .await
                 .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
@@ -2234,6 +2259,64 @@ mod tests {
                 .await
                 .expect("metadata marker should be written");
         }
+    }
+
+    #[tokio::test]
+    async fn admin_bucket_discovery_preserves_completeness_and_scope() {
+        use crate::storage_api_contracts::admin::DiskSetSelector;
+        let (temp, store) = setup_bucket_quorum_test_env(&[2, 2], None).await;
+        let empty = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("empty namespace enumeration");
+        assert!(empty.buckets.is_empty());
+        assert!(empty.topology_complete);
+        for disk in 0..2 {
+            tokio::fs::create_dir(temp.path().join(format!("pool0-disk{disk}/healthy-bucket")))
+                .await
+                .expect("healthy bucket");
+        }
+        tokio::fs::create_dir(temp.path().join("pool1-disk0/partial-bucket"))
+            .await
+            .expect("single surviving bucket directory");
+        let global = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("online disk enumeration");
+        assert!(!global.topology_complete, "a filtered sub-quorum bucket must invalidate coverage");
+        assert_eq!(global.buckets.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["healthy-bucket"]);
+        let healthy = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+            .await
+            .expect("healthy scope");
+        assert!(healthy.topology_complete);
+        assert_eq!(healthy.buckets.len(), 1);
+        assert_eq!(healthy.set_buckets.len(), 1);
+        let partial = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(1, 0)))
+            .await
+            .expect("partial scope");
+        assert!(!partial.topology_complete);
+        assert!(
+            partial.buckets.is_empty(),
+            "missing buckets cannot be mistaken for a complete empty namespace"
+        );
+        let invalid = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 1)))
+            .await
+            .expect("unconfigured scope");
+        assert!(!invalid.topology_complete);
+        assert!(invalid.buckets.is_empty());
+        let offline = take_set_disks_offline(&store, &store.pools[1].disk_set[0], &[0]).await;
+        assert!(store.list_buckets_for_admin_heal(None).await.is_err(), "quorum errors must remain errors");
+        assert!(
+            store
+                .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+                .await
+                .expect("unrelated offline pool")
+                .topology_complete
+        );
+        restore_set_disks(&store, &store.pools[1].disk_set[0], offline).await;
     }
 
     #[test]

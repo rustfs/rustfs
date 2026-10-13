@@ -477,7 +477,7 @@ impl Operation for OidcCallbackHandler {
                 callback_federation_error(error)
             })?;
         let authorization = &login.session.authorization;
-        let actual_provider_id = &authorization.provider_id;
+        let actual_provider_id = authorization.provider_id();
 
         debug!(
             event = EVENT_ADMIN_OIDC_STATE,
@@ -493,10 +493,10 @@ impl Operation for OidcCallbackHandler {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            policy_count = authorization.policies.len(),
-            group_count = authorization.groups.len(),
-            policies = ?authorization.policies,
-            groups = ?authorization.groups,
+            policy_count = authorization.policies().len(),
+            group_count = authorization.mapped_iam_groups().len(),
+            policies = ?authorization.policies(),
+            groups = ?authorization.mapped_iam_groups(),
             state = "claims_mapped",
             "admin oidc state"
         );

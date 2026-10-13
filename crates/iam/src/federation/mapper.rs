@@ -12,11 +12,122 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{FederatedAuthorization, VerifiedFederatedIdentity};
+use super::{FederatedClaims, VerifiedFederatedIdentity};
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_utils::HashAlgorithm;
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
+
+#[cfg(any(test, feature = "test-util"))]
+#[path = "test_support.rs"]
+pub(super) mod test_support;
+
+/// Read-only authorization result produced by core federation mapping.
+///
+/// The claims representation stays inside IAM:
+///
+/// ```compile_fail
+/// use rustfs_iam::federation::FederatedClaims;
+/// ```
+///
+/// Callers cannot mutate mapped fields:
+///
+/// ```compile_fail
+/// use rustfs_iam::federation::FederatedAuthorization;
+///
+/// fn mutate(authorization: &mut FederatedAuthorization) {
+///     authorization.groups.clear();
+/// }
+/// ```
+///
+/// Callers cannot construct authorization results:
+///
+/// ```compile_fail
+/// use rustfs_iam::federation::FederatedAuthorization;
+///
+/// fn construct(authorization: FederatedAuthorization) -> FederatedAuthorization {
+///     FederatedAuthorization { ..authorization }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct FederatedAuthorization {
+    provider_id: String,
+    claims: FederatedClaims,
+    policies: Vec<String>,
+    group_claim_policies: Vec<String>,
+    groups: Vec<String>,
+    roles_claim_key: Option<String>,
+    roles: Vec<String>,
+}
+
+impl FederatedAuthorization {
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.claims.sub
+    }
+
+    pub fn email(&self) -> &str {
+        &self.claims.email
+    }
+
+    pub fn username(&self) -> &str {
+        &self.claims.username
+    }
+
+    pub fn session_identity(&self) -> String {
+        self.claims.session_identity()
+    }
+
+    pub fn policies(&self) -> &[String] {
+        &self.policies
+    }
+
+    /// Subset of `policies` derived only from the groups claim (including merged roles claim
+    /// values); these may be ignored when no policy of that name exists. Everything else in
+    /// `policies` must resolve.
+    pub fn group_claim_policies(&self) -> &[String] {
+        &self.group_claim_policies
+    }
+
+    pub fn mapped_iam_groups(&self) -> &[String] {
+        &self.groups
+    }
+
+    pub fn roles_claim_key(&self) -> Option<&str> {
+        self.roles_claim_key.as_deref()
+    }
+
+    pub fn roles(&self) -> &[String] {
+        &self.roles
+    }
+
+    pub fn has_authorization_context(&self) -> bool {
+        !self.policies.is_empty() || !self.groups.is_empty()
+    }
+
+    pub fn oidc_virtual_parent(&self) -> Option<String> {
+        let issuer = self.claims.raw.get("iss")?.as_str()?;
+        let subject = self.claims.sub.as_str();
+        if issuer.is_empty() || subject.is_empty() {
+            return None;
+        }
+
+        let subject_len = u64::try_from(subject.len()).ok()?;
+        let issuer_len = u64::try_from(issuer.len()).ok()?;
+        let mut source = Vec::with_capacity(23 + subject.len() + issuer.len());
+        source.extend_from_slice(b"openid:");
+        source.extend_from_slice(&subject_len.to_be_bytes());
+        source.extend_from_slice(subject.as_bytes());
+        source.extend_from_slice(&issuer_len.to_be_bytes());
+        source.extend_from_slice(issuer.as_bytes());
+        let digest = HashAlgorithm::SHA256.hash_encode(&source);
+        Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(digest.as_ref()))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct FederatedAuthorizationRule {
@@ -308,8 +419,136 @@ fn claim_value_type(value: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::{FederatedClaims, FederatedProviderRef, VerifiedFederatedIdentity};
-    use serde_json::json;
+    use crate::federation::{FederatedAuthorizationFixture, FederatedClaims, FederatedProviderRef, VerifiedFederatedIdentity};
+    use serde_json::{Value, json};
+
+    fn authorization(policies: Vec<String>, groups: Vec<String>) -> FederatedAuthorization {
+        FederatedAuthorizationFixture {
+            provider_id: "standard_oidc".to_string(),
+            sub: "subject".to_string(),
+            attributes: HashMap::from([("iss".to_string(), Value::String("https://idp.example.test".to_string()))]),
+            policies,
+            mapped_iam_groups: groups,
+            ..Default::default()
+        }
+        .into_authorization()
+    }
+
+    #[test]
+    fn authorization_context_accepts_policy_or_group() {
+        assert!(!authorization(Vec::new(), Vec::new()).has_authorization_context());
+        assert!(authorization(vec!["consoleAdmin".to_string()], Vec::new()).has_authorization_context());
+        assert!(authorization(Vec::new(), vec!["RustFS.ConsoleAdmin".to_string()]).has_authorization_context());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_is_issuer_scoped() {
+        let first = authorization(Vec::new(), Vec::new());
+        let mut second = first.clone();
+        second
+            .claims
+            .raw
+            .insert("iss".to_string(), Value::String("https://other-idp.example.test".to_string()));
+
+        assert_eq!(
+            first.oidc_virtual_parent().as_deref(),
+            Some("HwDfWftzOy4jiuS3WjKytC_Sg_A2hKhrRAFtBDhoBr0")
+        );
+        assert!(!rustfs_policy::auth::contains_reserved_chars(
+            first.oidc_virtual_parent().as_deref().expect("virtual parent")
+        ));
+        assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_length_delimits_identity_parts() {
+        let mut first = authorization(Vec::new(), Vec::new());
+        first.claims.sub = "subject".to_string();
+        first.claims.raw.insert(
+            "iss".to_string(),
+            Value::String("https://issuer.example/path:https://other.example".to_string()),
+        );
+        let mut second = authorization(Vec::new(), Vec::new());
+        second.claims.sub = "subject:https://issuer.example/path".to_string();
+        second
+            .claims
+            .raw
+            .insert("iss".to_string(), Value::String("https://other.example".to_string()));
+
+        assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_requires_verified_identity_parts() {
+        let mut missing_issuer = authorization(Vec::new(), Vec::new());
+        missing_issuer.claims.raw.clear();
+        let mut missing_subject = authorization(Vec::new(), Vec::new());
+        missing_subject.claims.sub.clear();
+
+        assert!(missing_issuer.oidc_virtual_parent().is_none());
+        assert!(missing_subject.oidc_virtual_parent().is_none());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_preserves_exact_subject() {
+        let plain = authorization(Vec::new(), Vec::new());
+        let mut padded = plain.clone();
+        padded.claims.sub = format!(" {} ", plain.claims.sub);
+
+        assert_ne!(plain.oidc_virtual_parent(), padded.oidc_virtual_parent());
+    }
+
+    #[test]
+    fn authorization_accessors_preserve_exact_values_and_distinct_groups() {
+        let attributes = HashMap::from([("custom".to_string(), json!(["value", null, 7]))]);
+        let authorization = FederatedAuthorizationFixture {
+            provider_id: " Corp Provider ".to_string(),
+            sub: " subject ".to_string(),
+            email: " email@example.test ".to_string(),
+            username: " username ".to_string(),
+            source_groups: vec!["different-source-group".to_string()],
+            attributes: attributes.clone(),
+            policies: vec![" policy-b ".to_string(), "policy-a".to_string(), " policy-b ".to_string()],
+            group_claim_policies: vec![" policy-b ".to_string(), " policy-b ".to_string()],
+            mapped_iam_groups: vec!["mapped-a".to_string(), "mapped-b".to_string()],
+            roles_claim_key: Some(" Roles ".to_string()),
+            roles: vec!["role-b".to_string(), " role-a ".to_string(), "role-b".to_string()],
+        }
+        .into_authorization();
+
+        assert_eq!(authorization.provider_id(), " Corp Provider ");
+        assert_eq!(authorization.subject(), " subject ");
+        assert_eq!(authorization.email(), " email@example.test ");
+        assert_eq!(authorization.username(), " username ");
+        assert_eq!(authorization.session_identity(), " username ");
+        assert_eq!(authorization.policies(), [" policy-b ", "policy-a", " policy-b "]);
+        assert_eq!(authorization.group_claim_policies(), [" policy-b ", " policy-b "]);
+        assert_eq!(authorization.claims.groups, ["different-source-group"]);
+        assert_eq!(authorization.claims.raw, attributes);
+        assert_eq!(authorization.mapped_iam_groups(), ["mapped-a", "mapped-b"]);
+        assert_eq!(authorization.roles_claim_key(), Some(" Roles "));
+        assert_eq!(authorization.roles(), ["role-b", " role-a ", "role-b"]);
+    }
+
+    #[test]
+    fn default_authorization_fixture_has_no_identity_or_mapping() {
+        let authorization = FederatedAuthorizationFixture::default().into_authorization();
+
+        assert_eq!(authorization.provider_id(), "");
+        assert_eq!(authorization.subject(), "");
+        assert_eq!(authorization.email(), "");
+        assert_eq!(authorization.username(), "");
+        assert_eq!(authorization.session_identity(), "oidc-user-unknown");
+        assert!(authorization.claims.groups.is_empty());
+        assert!(authorization.claims.raw.is_empty());
+        assert!(authorization.policies().is_empty());
+        assert!(authorization.group_claim_policies().is_empty());
+        assert!(authorization.mapped_iam_groups().is_empty());
+        assert!(authorization.roles_claim_key().is_none());
+        assert!(authorization.roles().is_empty());
+        assert!(!authorization.has_authorization_context());
+        assert!(authorization.oidc_virtual_parent().is_none());
+    }
 
     fn mapper(rule: FederatedAuthorizationRule) -> CoreFederatedAuthorizationMapper {
         CoreFederatedAuthorizationMapper::new(FederatedAuthorizationRules::new([rule]))

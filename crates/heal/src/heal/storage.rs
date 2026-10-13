@@ -491,6 +491,10 @@ pub trait HealStorageAPI: Send + Sync {
     /// Get all buckets
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>>;
 
+    /// Return only a complete bucket inventory for an administrator task.
+    /// Incomplete discovery must fail before traversal or scope checkpointing.
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>>;
+
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
 
@@ -1333,6 +1337,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(false)
             }
         }
+    }
+
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>> {
+        let listing = self.ecstore.list_buckets_for_admin_heal(selector).await?;
+        if !listing.topology_complete {
+            return Err(Error::BucketDiscoveryIncomplete);
+        }
+        Ok(listing.buckets)
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
