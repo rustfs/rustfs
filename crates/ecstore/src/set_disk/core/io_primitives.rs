@@ -3607,6 +3607,7 @@ impl SetDisks {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rename_data_commit_from_observations(
         disks: &[Option<DiskStore>],
         file_infos: &[FileInfo],
