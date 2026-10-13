@@ -329,6 +329,33 @@ where
         Ok(publication)
     }
 
+    async fn table_maintenance_read_guards(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<(TableCatalogLockGuard, TableCatalogLockGuard)> {
+        // Keep the catalog identity and its sidecars in one publication interval,
+        // including an A -> B -> A rename that would evade an entry-only recheck.
+        let migration = self.acquire_snapshot_write_permit().await?;
+        let publication = self
+            .object_backend
+            .acquire_read_lock(table_bucket, &default_table_bucket_publication_lock_path())
+            .await?;
+        let guards = (migration, publication);
+        Self::ensure_table_maintenance_read_guards(&guards)?;
+        Ok(guards)
+    }
+
+    fn ensure_table_maintenance_read_guards(
+        guards: &(TableCatalogLockGuard, TableCatalogLockGuard),
+    ) -> TableCatalogStoreResult<()> {
+        if guards.0.is_lock_lost() || guards.1.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable(
+                "table maintenance read lost its migration or publication fence; retry the read".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn require_table_maintenance_publication(
         publication: &(dyn TableCommitPublication + Sync),
         table_bucket: &str,
@@ -2048,10 +2075,13 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        let guards = self.table_maintenance_read_guards(table_bucket).await?;
         let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
-        ObjectTableCatalogStore::new(self.object_backend.clone())
+        let result = ObjectTableCatalogStore::new(self.object_backend.clone())
             .get_table_maintenance_config_for_entry(&entry)
-            .await
+            .await;
+        Self::ensure_table_maintenance_read_guards(&guards)?;
+        result
     }
 
     pub(crate) async fn put_table_maintenance_config(
@@ -2092,10 +2122,11 @@ where
         table: &str,
         job_id: &str,
     ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        let guards = self.table_maintenance_read_guards(table_bucket).await?;
         let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
-        ObjectTableCatalogStore::new(self.object_backend.clone())
+        let result = ObjectTableCatalogStore::new(self.object_backend.clone())
             .get_table_metadata_maintenance_report_for_entry_unlocked(
                 &entry.table_bucket,
                 &namespace,
@@ -2103,7 +2134,9 @@ where
                 &entry.table_id,
                 job_id,
             )
-            .await
+            .await;
+        Self::ensure_table_maintenance_read_guards(&guards)?;
+        result
     }
 
     pub(crate) async fn get_table_maintenance_scheduler_report(
@@ -2112,10 +2145,13 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        let guards = self.table_maintenance_read_guards(table_bucket).await?;
         let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
-        ObjectTableCatalogStore::new(self.object_backend.clone())
+        let result = ObjectTableCatalogStore::new(self.object_backend.clone())
             .get_table_maintenance_scheduler_report_for_entry_at(&entry, OffsetDateTime::now_utc())
-            .await
+            .await;
+        Self::ensure_table_maintenance_read_guards(&guards)?;
+        result
     }
 
     pub(crate) async fn run_table_maintenance_scheduler_once(
