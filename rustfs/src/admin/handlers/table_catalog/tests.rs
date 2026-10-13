@@ -1029,6 +1029,7 @@ fn table_commit_publication_acquires_migration_permits_before_publication_lock()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence() {
     use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::test_support::RecordingLeaseClient;
     use crate::table_catalog::{TableCatalogLockGuard, TableCatalogObjectPaths, TableCommitPublication};
     use rustfs_lock::LockClient;
 
@@ -1040,9 +1041,12 @@ async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence(
     TableCommitPublication::prepare(&commit_backend, "analytics", "sales", "orders")
         .await
         .unwrap();
-    let client = Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(
-        Arc::new(rustfs_lock::FastObjectLockManager::new()),
-    ))));
+    let client = Arc::new(RecordingLeaseClient {
+        inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+            rustfs_lock::FastObjectLockManager::new(),
+        )))),
+        acquired: std::sync::Mutex::new(None),
+    });
     let lock = rustfs_lock::NamespaceLockWrapper::new(
         rustfs_lock::NamespaceLock::with_clients_and_quorum(
             "rest-publication-fence-probe".to_string(),
@@ -1056,7 +1060,14 @@ async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence(
         "rest-publication-migration".to_string(),
     );
     let guard = lock.get_read_lock(StdDuration::from_secs(5)).await.unwrap();
-    let lock_id = guard.lock_id().expect("distributed migration lease has an ID").clone();
+    // The guard exposes an aggregate ID; LocalClient owns the recorded response ID.
+    let lock_id = client
+        .acquired
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("local migration lease has an ID");
+    assert!(client.check_status(&lock_id).await.unwrap().is_some());
     {
         let mut publication = commit_backend.publication.lock();
         publication.guards.push(TableCatalogLockGuard::test_namespace(guard));

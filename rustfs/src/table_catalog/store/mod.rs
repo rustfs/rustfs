@@ -2551,52 +2551,11 @@ where
 mod tests {
     use super::*;
     use crate::storage_api::protocols::client::{BucketOperations as _, MakeBucketOptions};
-    use crate::table_catalog::test_support::TestCatalogObjectBackend;
+    use crate::table_catalog::test_support::{RecordingLeaseClient, TestCatalogObjectBackend};
     use crate::table_catalog::tests::{test_bucket_entry, test_namespace_entry, test_table_entry};
-    use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
+    use rustfs_lock::LockClient;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-
-    #[derive(Debug)]
-    struct RecordingLeaseClient {
-        inner: rustfs_lock::LocalClient,
-        acquired: Mutex<Option<LockId>>,
-    }
-
-    #[async_trait::async_trait]
-    impl LockClient for RecordingLeaseClient {
-        async fn acquire_lock(&self, request: &LockRequest) -> rustfs_lock::Result<LockResponse> {
-            let response = self.inner.acquire_lock(request).await?;
-            if let Some(info) = response.lock_info.as_ref() {
-                *self.acquired.lock().expect("record lease") = Some(info.id.clone());
-            }
-            Ok(response)
-        }
-        async fn release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
-            self.inner.release(id).await
-        }
-        async fn refresh(&self, id: &LockId) -> rustfs_lock::Result<bool> {
-            self.inner.refresh(id).await
-        }
-        async fn force_release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
-            self.inner.force_release(id).await
-        }
-        async fn check_status(&self, id: &LockId) -> rustfs_lock::Result<Option<LockInfo>> {
-            self.inner.check_status(id).await
-        }
-        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
-            self.inner.get_stats().await
-        }
-        async fn close(&self) -> rustfs_lock::Result<()> {
-            self.inner.close().await
-        }
-        async fn is_online(&self) -> bool {
-            self.inner.is_online().await
-        }
-        async fn is_local(&self) -> bool {
-            self.inner.is_local().await
-        }
-    }
 
     #[tokio::test]
     async fn table_maintenance_publication_reuses_attached_migration_read_permit() {

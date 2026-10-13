@@ -22,11 +22,53 @@
 //! fixed values (sequence 7 / snapshot 20), which keeps every produced byte
 //! identical to the pre-extraction fixtures.
 
+use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 use super::*;
+
+#[derive(Debug)]
+pub(crate) struct RecordingLeaseClient {
+    pub(crate) inner: rustfs_lock::LocalClient,
+    pub(crate) acquired: Mutex<Option<LockId>>,
+}
+
+#[async_trait::async_trait]
+impl LockClient for RecordingLeaseClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> rustfs_lock::Result<LockResponse> {
+        let response = self.inner.acquire_lock(request).await?;
+        if let Some(info) = response.lock_info.as_ref() {
+            *self.acquired.lock().expect("record lease") = Some(info.id.clone());
+        }
+        Ok(response)
+    }
+    async fn release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+        self.inner.release(id).await
+    }
+    async fn refresh(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+        self.inner.refresh(id).await
+    }
+    async fn force_release(&self, id: &LockId) -> rustfs_lock::Result<bool> {
+        self.inner.force_release(id).await
+    }
+    async fn check_status(&self, id: &LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+        self.inner.check_status(id).await
+    }
+    async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+    async fn close(&self) -> rustfs_lock::Result<()> {
+        self.inner.close().await
+    }
+    async fn is_online(&self) -> bool {
+        self.inner.is_online().await
+    }
+    async fn is_local(&self) -> bool {
+        self.inner.is_local().await
+    }
+}
 
 pub(crate) fn table_metadata_json(table_uuid: &str, location: &str) -> serde_json::Value {
     serde_json::json!({
