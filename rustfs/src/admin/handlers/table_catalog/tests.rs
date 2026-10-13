@@ -4211,24 +4211,46 @@ fn table_metadata_file_name_scoping_is_bounded_and_identity_sensitive() {
 
 #[tokio::test]
 async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metadata_files() {
+    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::DurableStrong, "curated").await;
+}
+
+#[tokio::test]
+async fn object_catalog_cross_namespace_rename_accepts_isolated_standard_commits() {
+    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::ObjectBacked, "curated").await;
+}
+
+#[tokio::test]
+async fn object_catalog_same_namespace_rename_accepts_isolated_standard_commits() {
+    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::ObjectBacked, "analytics").await;
+}
+
+#[tokio::test]
+async fn strong_catalog_same_namespace_rename_accepts_isolated_standard_commits() {
+    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::DurableStrong, "analytics").await;
+}
+
+async fn assert_renamed_and_recreated_table_commits(mode: crate::table_catalog::TableCatalogBackingMode, destination: &str) {
     let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-    let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
+    let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
     let source_namespace = crate::table_catalog::Namespace::parse("analytics").expect("source namespace should parse");
-    let destination_namespace = crate::table_catalog::Namespace::parse("curated").expect("destination namespace should parse");
+    let destination_namespace = crate::table_catalog::Namespace::parse(destination).expect("destination namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &source_namespace).await;
-    create_namespace_response(
-        &store,
-        "warehouse",
-        CreateNamespaceRequest {
-            namespace: vec!["curated".to_string()],
-            properties: BTreeMap::new(),
-        },
-        true,
-    )
-    .await
-    .expect("destination namespace should be created");
+    let original = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+    if source_namespace != destination_namespace {
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec![destination.to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("destination namespace should be created");
+    }
     store
-        .rename_table("warehouse", "analytics", "events", "curated", "events_v2")
+        .rename_table("warehouse", "analytics", "events", destination, "events_v2")
         .await
         .expect("table should rename");
 
@@ -4249,7 +4271,7 @@ async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metad
     .expect("source identifier should be reusable");
 
     let renamed = store
-        .load_table("warehouse", "curated", "events_v2")
+        .load_table("warehouse", destination, "events_v2")
         .await
         .expect("renamed table lookup should succeed")
         .expect("renamed table should exist");
@@ -4259,18 +4281,196 @@ async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metad
         .expect("recreated table lookup should succeed")
         .expect("recreated table should exist");
     assert_ne!(renamed.table_id, recreated.table_id);
+    assert_ne!(renamed.table_uuid, recreated.table_uuid);
+    assert_ne!(renamed.warehouse_location, recreated.warehouse_location);
+    assert_eq!(renamed.table_id, original.table_id);
+    assert_eq!(renamed.table_uuid, original.table_uuid);
+    assert_eq!(renamed.warehouse_location, original.warehouse_location);
+    assert_eq!(renamed.metadata_location, original.metadata_location);
+    assert_eq!(renamed.version_token, original.version_token);
+    assert_eq!(renamed.generation, original.generation);
 
     let commit_id = "11111111-1111-4111-8111-111111111111";
+    let renamed_request = || {
+        let mut request = standard_property_commit_request(commit_id, &renamed.table_uuid, "curated");
+        request.idempotency_key = Some("renamed-request".to_string());
+        request
+    };
     let renamed_commit = standard_commit_table_response(
         &store,
         &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &destination_namespace,
         "events_v2",
-        standard_property_commit_request(commit_id, &renamed.table_uuid, "curated"),
+        renamed_request(),
     )
     .await
     .expect("renamed table commit should succeed");
+    let committed = store
+        .load_table("warehouse", destination, "events_v2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.table_id, renamed.table_id);
+    assert_eq!(committed.table_uuid, renamed.table_uuid);
+    assert_eq!(committed.warehouse_location, renamed.warehouse_location);
+    assert_eq!(committed.generation, renamed.generation + 1);
+    assert_ne!(committed.version_token, renamed.version_token);
+    assert_ne!(committed.metadata_location, renamed.metadata_location);
+    assert_eq!(renamed_commit.metadata["table-uuid"], renamed.table_uuid);
+    assert_eq!(renamed_commit.metadata["location"], renamed.warehouse_location);
+    assert_eq!(renamed_commit.metadata["properties"]["owner"], "curated");
+    let receipt = store
+        .get_commit_by_id("warehouse", &renamed.table_id, commit_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, crate::table_catalog::CommitLogStatus::Committed);
+    assert_eq!(receipt.new_version_token, committed.version_token);
+    assert_eq!(receipt.new_metadata_location, committed.metadata_location);
+    assert_eq!(
+        store
+            .get_commit_by_idempotency_key("warehouse", &renamed.table_id, receipt.idempotency_key.as_deref().unwrap())
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    let replay = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &destination_namespace,
+        "events_v2",
+        renamed_request(),
+    )
+    .await
+    .expect("same commit ID should replay after rename");
+    assert_eq!(replay.metadata_location, renamed_commit.metadata_location);
+    assert_eq!(replay.metadata, renamed_commit.metadata);
+    assert_eq!(
+        store.load_table("warehouse", destination, "events_v2").await.unwrap(),
+        Some(committed.clone())
+    );
+
+    let stale_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: "warehouse".to_string(),
+        namespace: destination.to_string(),
+        table: "events_v2".to_string(),
+        commit_id: "stale-after-rename".to_string(),
+        idempotency_key: Some("stale-after-rename".to_string()),
+        operation: "append".to_string(),
+        expected_version_token: renamed.version_token.clone(),
+        expected_metadata_location: renamed.metadata_location.clone(),
+        new_metadata_location: committed.metadata_location.clone(),
+        requirements: Vec::new(),
+        writer: None,
+    };
+    for metadata_only in [false, true] {
+        let mut request = stale_request.clone();
+        if metadata_only {
+            request.expected_version_token = committed.version_token.clone();
+            request.commit_id = "stale-metadata-after-rename".to_string();
+            request.idempotency_key = Some(request.commit_id.clone());
+        }
+        assert!(matches!(
+            store.commit_table(request.clone()).await,
+            Err(crate::table_catalog::TableCatalogStoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .get_commit_by_id("warehouse", &renamed.table_id, &request.commit_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_commit_by_idempotency_key("warehouse", &renamed.table_id, request.idempotency_key.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_table("warehouse", destination, "events_v2").await.unwrap(),
+            Some(committed.clone())
+        );
+    }
+    let current_namespace_path = crate::table_catalog::default_table_metadata_dir_path(
+        &destination_namespace,
+        &crate::table_catalog::IdentifierSegment::parse("events_v2").unwrap(),
+    );
+    let foreign_namespace_path = crate::table_catalog::default_table_metadata_dir_path(
+        &source_namespace,
+        &crate::table_catalog::IdentifierSegment::parse("foreign").unwrap(),
+    );
+    let retained_directory = committed.metadata_location.rsplit_once('/').unwrap().0;
+    let persisted_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &committed.metadata_location)
+        .await
+        .unwrap();
+    for (index, location) in [
+        format!("{current_namespace_path}/00003.metadata.json"),
+        format!("{foreign_namespace_path}/00003.metadata.json"),
+        format!("s3://other-warehouse/{foreign_namespace_path}/00003.metadata.json"),
+        format!("{retained_directory}/../00003.metadata.json"),
+        format!("{retained_directory}/child/00003.metadata.json"),
+        format!("{retained_directory}/%2e%2e.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index < 2 {
+            metadata_backend
+                .put_json("warehouse", &location, persisted_metadata.clone())
+                .await;
+        }
+        let mut request = stale_request.clone();
+        request.commit_id = format!("invalid-renamed-path-{index}");
+        request.idempotency_key = Some(request.commit_id.clone());
+        request.expected_version_token = committed.version_token.clone();
+        request.expected_metadata_location = committed.metadata_location.clone();
+        request.new_metadata_location = location;
+        assert!(matches!(
+            store.commit_table(request.clone()).await,
+            Err(crate::table_catalog::TableCatalogStoreError::Invalid(_))
+        ));
+        assert!(
+            store
+                .get_commit_by_id("warehouse", &renamed.table_id, &request.commit_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_commit_by_idempotency_key("warehouse", &renamed.table_id, request.idempotency_key.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_table("warehouse", destination, "events_v2").await.unwrap(),
+            Some(committed.clone())
+        );
+        assert_eq!(
+            store.load_table("warehouse", "analytics", "events").await.unwrap(),
+            Some(recreated.clone())
+        );
+    }
+    let wrong_identity = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &destination_namespace,
+        "events_v2",
+        standard_property_commit_request("22222222-2222-4222-8222-222222222222", &recreated.table_uuid, "wrong-identity"),
+    )
+    .await
+    .expect_err("recreated source identity cannot commit to the renamed table");
+    assert_eq!(wrong_identity.status_code(), Some(StatusCode::CONFLICT));
+    assert_eq!(
+        store.load_table("warehouse", destination, "events_v2").await.unwrap(),
+        Some(committed.clone())
+    );
     let recreated_commit = standard_commit_table_response(
         &store,
         &trusted_table_commit_backend(&metadata_backend),
@@ -4300,7 +4500,7 @@ async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metad
     assert!(
         !renamed_commit
             .metadata_location
-            .contains("/namespaces/curated/tables/events_v2/")
+            .contains(&format!("/namespaces/{destination}/tables/events_v2/"))
     );
     assert!(
         recreated_commit
@@ -4309,8 +4509,8 @@ async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metad
     );
     assert_eq!(recreated_commit.metadata["table-uuid"], recreated.table_uuid);
     assert_eq!(recreated_commit.metadata["properties"]["owner"], "analytics");
-    for metadata_location in [renamed_commit.metadata_location, recreated_commit.metadata_location] {
-        let object_key = test_snapshot_object_key("warehouse", &metadata_location);
+    for metadata_location in [&renamed_commit.metadata_location, &recreated_commit.metadata_location] {
+        let object_key = test_snapshot_object_key("warehouse", metadata_location);
         assert!(
             metadata_backend
                 .object_exists("warehouse", &object_key)
@@ -4318,6 +4518,27 @@ async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metad
                 .expect("metadata lookup should succeed")
         );
     }
+    let restarted = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend, mode);
+    assert_eq!(
+        restarted.load_table("warehouse", destination, "events_v2").await.unwrap(),
+        Some(committed)
+    );
+    let recreated_after = restarted
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recreated_after.table_id, recreated.table_id);
+    assert_eq!(recreated_after.table_uuid, recreated.table_uuid);
+    assert_eq!(recreated_after.warehouse_location, recreated.warehouse_location);
+    assert_eq!(recreated_after.generation, recreated.generation + 1);
+    assert_eq!(
+        restarted
+            .get_commit_by_id("warehouse", &renamed.table_id, commit_id)
+            .await
+            .unwrap(),
+        Some(receipt)
+    );
 }
 
 #[tokio::test]
