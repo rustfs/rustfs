@@ -188,7 +188,7 @@
 
 ## v0.5.4
 ## New Features
-- Add report transfromation function which allows changing the report before
+- Add report transformation function which allows changing the report before
   sending it to the Pyroscope Server.
 - Add Gzip support.
 

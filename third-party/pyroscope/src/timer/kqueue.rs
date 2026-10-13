@@ -20,7 +20,7 @@ const LOG_TAG: &str = "Pyroscope::Timer";
 /// Timer will send an event to attached listeners (mpsc::Sender) every 10th
 /// second (...10, ...20, ...)
 ///
-/// The Timer thread will run continously until all Senders are dropped.
+/// The Timer thread will run continuously until all Senders are dropped.
 /// The Timer thread will be joined when all Senders are dropped.
 
 #[derive(Debug, Default)]

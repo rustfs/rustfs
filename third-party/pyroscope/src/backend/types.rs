@@ -86,7 +86,7 @@ impl From<StackBuffer> for Vec<Report> {
     }
 }
 
-/// Metdata
+/// Metadata
 /// Metadata attached to a StackTrace or a Report. For now, this is just tags.
 #[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct Metadata {
