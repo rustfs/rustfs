@@ -101,6 +101,7 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+    SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
@@ -144,6 +145,8 @@ use rustfs_storage_api as storage_contracts;
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::DiskSetSelector;
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
         ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,

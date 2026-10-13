@@ -601,6 +601,13 @@ impl HealStorageAPI for MockStorage {
         Ok(None)
     }
 
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
+    }
+
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         if let Some(hook) = manager_recovery_test_hook() {
             *hook.listed.lock().expect("manager recovery listed lock should not poison") = true;
@@ -5900,5 +5907,27 @@ fn test_heal_config_respects_feature_flags() {
             assert!(!config.set_bulkhead_enable);
             assert!(!config.page_parallel_enable);
         },
+    );
+}
+
+#[test]
+fn admin_bucket_discovery_retries_keep_the_existing_budget() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+    request.source = HealRequestSource::Admin;
+    let id = request.id.clone();
+    let error = Err(Error::BucketDiscoveryIncomplete);
+    for attempt in 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result(&task, &error).expect("discovery can recover within budget");
+        assert_eq!(retry.id, id);
+        assert_eq!(retry.retry_attempts, attempt);
+        assert!(delay > Duration::ZERO);
+        request = retry;
+    }
+    let task = HealTask::from_request(request, storage);
+    assert!(
+        retry_request_for_result(&task, &error).is_none(),
+        "persistent incompleteness must terminate"
     );
 }

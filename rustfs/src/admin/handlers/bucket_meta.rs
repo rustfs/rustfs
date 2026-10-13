@@ -525,10 +525,13 @@ impl Operation for ImportBucketMetadata {
         // First pass: read all file contents into memory
         let mut file_contents = Vec::new();
         for i in 0..zip_reader.len() {
-            let mut file = zip_reader
+            let (mut file, file_path) = zip_reader
                 .by_index(i)
+                .and_then(|file| {
+                    let path = file.name()?.into_owned();
+                    Ok((file, path))
+                })
                 .map_err(|e| s3_error!(InternalError, "failed to read archive entry: {e}"))?;
-            let file_path = file.name().to_string();
 
             let mut content = Vec::new();
             file.read_to_end(&mut content)
@@ -1564,7 +1567,7 @@ mod backup_zip_compatibility_tests {
             let mut content = Vec::new();
             file.read_to_end(&mut content).expect("read diagnostic config");
             assert!(!content.windows(RAW_SECRET.len()).any(|window| window == RAW_SECRET));
-            files.insert(file.name().to_string(), content);
+            files.insert(file.name().expect("diagnostic entry name").into_owned(), content);
         }
         assert!(!files.contains_key(&format!("_diagnostic/{BUCKET}/{config_file}")));
         assert_eq!(files[&format!("_diagnostic/{BUCKET}/{BUCKET_VERSIONING_CONFIG}")], VERSIONING_XML);
@@ -1701,8 +1704,9 @@ mod backup_zip_compatibility_tests {
                 let mut content = Vec::new();
                 file.read_to_end(&mut content).expect("read diagnostic config");
                 assert!(!content.windows(SECRET.len()).any(|window| window == SECRET.as_bytes()));
-                assert!(file.name() == DIAGNOSTIC_EXPORT_MANIFEST || file.name().starts_with("_diagnostic/"));
-                files.insert(file.name().to_string(), content);
+                let file_path = file.name().expect("diagnostic entry name").into_owned();
+                assert!(file_path == DIAGNOSTIC_EXPORT_MANIFEST || file_path.starts_with("_diagnostic/"));
+                files.insert(file_path, content);
             }
             assert_eq!(files[&format!("_diagnostic/{HEALTHY}/{BUCKET_VERSIONING_CONFIG}")], VERSIONING_XML);
             assert!(files.contains_key(&format!("_diagnostic/{UNREADABLE}/{BUCKET_VERSIONING_CONFIG}")));

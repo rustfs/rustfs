@@ -79,6 +79,13 @@ impl HealStorageAPI for PausedTraversal {
         self.inner.get_bucket_info(bucket).await
     }
 
+    async fn list_buckets_for_admin_heal(
+        &self,
+        selector: Option<storage_api::integration::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.inner.list_buckets_for_admin_heal(selector).await
+    }
+
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         self.inner.list_buckets().await
     }

@@ -80,6 +80,13 @@ impl HealStorageAPI for RunningStorage {
             ..Default::default()
         }))
     }
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
+    }
+
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }

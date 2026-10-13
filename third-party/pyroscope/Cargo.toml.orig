@@ -1,0 +1,119 @@
+[package]
+name = "pyroscope"
+description = """
+Pyroscope Profiler Agent for continuous profiling of Rust, Python and Ruby applications.
+"""
+keywords = ["pyroscope", "profiler", "profiling", "pprof"]
+authors = ["Abid Omar <contact@omarabid.com>"]
+version = "2.1.1"
+edition = "2021"
+license = "Apache-2.0"
+homepage = "https://grafana.com/docs/pyroscope/latest/configure-client/language-sdks/rust/"
+documentation = "https://docs.rs/pyroscope"
+repository = "https://github.com/grafana/pyroscope-rs"
+readme = "README.md"
+autobins = false
+autoexamples = true
+autotests = true
+autobenches = true
+rust-version = "1.66"
+
+[dependencies]
+thiserror = "2.0"
+log = "0.4"
+reqwest = { version = "0.13", features = ["blocking", "query"], default-features = false }
+uuid = { version = "1.20.0", features = ["v4"] }
+url = "2.2.2"
+libflate = "2.1.0"
+libc = "^0.2.124"
+prost = "0.14"
+serde_json = "1.0.115"
+jemalloc_pprof = { version = "0.9", features = ["symbolize"], optional = true }
+
+
+# pprofrs dependencies
+backtrace = { version = "0.3", optional = true }
+once_cell = { version = "1.9", optional = true }
+nix = { version = "0.31", default-features = false, features = ["signal", "fs"], optional = true }
+spin = { version = "0.12", optional = true }
+tempfile = { version = "3.1", optional = true }
+findshlibs = { version = "0.10", optional = true }
+smallvec = { version = "1.7", optional = true }
+framehop = { version = "0.16", optional = true }
+memmap2 = { version = "0.9", optional = true }
+object = { version = "0.40", optional = true }
+aligned-vec = { version = "0.6", optional = true }
+symbolic-demangle = { version = "13.1.0", default-features = false, features = ["rust"], optional = true }
+
+
+
+[dev-dependencies]
+assert_matches = "=1.5.0"
+claims = "=0.8.0"
+tikv-jemallocator = { version = "0.7", features = ["profiling"] }
+env_logger = "=0.11.10"
+
+[[example]]
+name = "jemalloc"
+required-features = ["backend-jemalloc"]
+
+[features]
+default = ["rustls-tls"]
+rustls-tls = ["reqwest/rustls"]
+native-tls = ["reqwest/native-tls"]
+native-tls-vendored = ["reqwest/native-tls-vendored"]
+rustls-no-provider = ["reqwest/rustls-no-provider"]
+backend-pprof-rs = [
+    "dep:backtrace",
+    "dep:backtrace",
+    "dep:once_cell",
+    "dep:nix",
+    "dep:spin",
+    "dep:tempfile",
+    "dep:findshlibs",
+    "dep:smallvec",
+    "dep:framehop",
+    "dep:memmap2",
+    "dep:object",
+    "dep:aligned-vec",
+    "dep:symbolic-demangle",
+]
+backend-jemalloc = ["dep:jemalloc_pprof"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+rpath = false
+lto = false
+debug-assertions = true
+codegen-units = 4
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = "symbols"
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+
+[profile.test]
+opt-level = 1
+debug = true
+rpath = false
+lto = false
+debug-assertions = true
+codegen-units = 4
+
+[profile.bench]
+opt-level = 3
+debug = false
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+
+[[test]]
+name = "rustfs_zstd"
+path = "tests/rustfs_zstd.rs"
+required-features = ["backend-pprof-rs"]

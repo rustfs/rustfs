@@ -1191,11 +1191,59 @@ mod tests {
         .into())
     }
 
+    fn scanner_cycle_completion_budget(
+        cycle_end: u64,
+        interval: Option<u64>,
+        now: u64,
+        active: bool,
+    ) -> Result<Duration, &'static str> {
+        if cycle_end > now {
+            return Err("scanner cycle timestamp is in the future");
+        }
+        if active {
+            return Ok(Duration::from_secs(60));
+        }
+        let interval = interval
+            .filter(|interval| *interval != 0)
+            .ok_or("scanner schedule has no positive interval")?;
+        let next_cycle = cycle_end
+            .checked_add(interval)
+            .ok_or("scanner schedule timestamp overflows")?;
+        let budget = next_cycle
+            .saturating_sub(now)
+            .checked_add(60)
+            .ok_or("scanner completion budget overflows")?;
+        Ok(Duration::from_secs(budget))
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_accounts_for_captured_retry_schedule() {
+        assert_eq!(
+            scanner_cycle_completion_budget(1_791_815_390, Some(256), 1_791_815_447, false),
+            Ok(Duration::from_secs(259)),
+        );
+        assert_eq!(scanner_cycle_completion_budget(100, Some(1), 110, false), Ok(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_does_not_grant_planned_sleep_to_active_cycle() {
+        assert_eq!(scanner_cycle_completion_budget(100, Some(256), 110, true), Ok(Duration::from_secs(60)));
+        assert_eq!(scanner_cycle_completion_budget(0, None, 110, true), Ok(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn scanner_cycle_completion_budget_rejects_invalid_schedule() {
+        for (end, interval, now) in [(101, 1, 100), (100, 0, 100), (u64::MAX, 1, u64::MAX), (1, u64::MAX - 1, 1)] {
+            assert!(scanner_cycle_completion_budget(end, Some(interval), now, false).is_err());
+        }
+    }
+
     async fn wait_for_scanner_cycle_after(
         cluster: &RustFSTestClusterEnvironment,
         previous_cycle_end: u64,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut deadline = Instant::now() + Duration::from_secs(60);
+        let mut schedule_accounted = false;
         loop {
             let mut latest_cycle_end = 0;
             let mut versions_observed = false;
@@ -1237,14 +1285,36 @@ mod tests {
                 let versions_scanned = metrics["versions_scanned"]
                     .as_u64()
                     .ok_or("scanner status is missing its version-coverage counter")?;
-                latest_cycle_end = latest_cycle_end.max(cycle_end);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                if cycle_end > now {
+                    return Err("scanner cycle timestamp is in the future".into());
+                }
+                let schedule = &status["cycle_schedule"];
+                if !schedule_accounted && schedule["execution_role"].as_str() == Some("leader") {
+                    let active = metrics["current_cycle_active"]
+                        .as_bool()
+                        .ok_or("scanner status is missing its active-cycle flag")?;
+                    if active || (cycle_end != 0 && schedule["effective_interval_available"].as_bool() == Some(true)) {
+                        let interval = schedule["effective_interval_seconds"].as_u64();
+                        let budget = scanner_cycle_completion_budget(cycle_end, interval, now, active)?;
+                        deadline = Instant::now().checked_add(budget).ok_or("scanner deadline overflows")?;
+                        schedule_accounted = true;
+                    }
+                }
+                // Superseded walks complete all sets while withholding quota authority.
+                // Deferred and partial attempts do not certify completed scanning.
+                if matches!(metrics["last_cycle_result"].as_str(), Some("success" | "superseded")) {
+                    latest_cycle_end = latest_cycle_end.max(cycle_end);
+                }
                 versions_observed |= versions_scanned > 0;
                 observations.push(format!(
-                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}",
+                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, partial_reason={}, schedule={}",
                     metrics["current_cycle"],
                     metrics["current_cycle_active"],
                     metrics["leader_lock_state"],
                     metrics["last_cycle_result"],
+                    metrics["last_cycle_partial_reason"],
+                    schedule,
                 ));
             }
             // The coordinator records cycle completion, but remote workers
@@ -1555,7 +1625,8 @@ mod tests {
         }
 
         if background_enabled {
-            wait_for_scanner_cycle_after(&cluster, 0).await?;
+            let baseline_cycle_floor = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            wait_for_scanner_cycle_after(&cluster, baseline_cycle_floor).await?;
         }
 
         cluster.stop_node(1)?;
@@ -2561,5 +2632,157 @@ mod tests {
             erasure_distribution: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
         };
         assert!(!outage_candidate_targets_replacement(&insufficient_peer_shards, 12, replacement_set_slot));
+    }
+    async fn two_node_heal_status(
+        cluster: &RustFSTestClusterEnvironment,
+        bucket: Option<&str>,
+        recreate: bool,
+        scan_mode: u8,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        let url = format!("{}/rustfs/admin/v3/heal/{}", cluster.nodes[0].url, bucket.unwrap_or_default());
+        let options = serde_json::json!({
+            "recursive": true, "dryRun": false, "remove": false,
+            "recreate": recreate, "scanMode": scan_mode, "updateParity": false, "nolock": false,
+        });
+        let started =
+            start_root_heal_when_control_ready(&url, &options.to_string(), &cluster.access_key, &cluster.secret_key).await?;
+        let started: serde_json::Value = serde_json::from_str(&started)?;
+        let token = started["clientToken"]
+            .as_str()
+            .ok_or_else(|| format!("missing heal token: {started}"))?;
+        let status_url = format!("{url}?clientToken={token}");
+        let deadline = Instant::now() + Duration::from_secs(240);
+        loop {
+            let body = timeout(
+                Duration::from_secs(20),
+                signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key),
+            )
+            .await??;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            match status["summary"].as_str() {
+                Some("finished" | "stopped") => return Ok(status),
+                Some("running") if Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+                _ => return Err(format!("heal did not reach a terminal state: {status}").into()),
+            }
+        }
+    }
+
+    async fn verify_two_node_directory_recovery(remove_bucket: bool, scan_mode: u8) -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
+        // Isolate explicit administrator recovery from scanner, MRF, and disk healing.
+        for key in [
+            "RUSTFS_HEAL_AUTO_HEAL_ENABLE",
+            "RUSTFS_HEAL_MRF_ENABLE",
+            "RUSTFS_SCANNER_ENABLED",
+            "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE",
+        ] {
+            cluster.set_env(key, "false");
+        }
+        cluster.start().await?;
+        let source = cluster.create_s3_client(0)?;
+        let target = cluster.create_s3_client(1)?;
+        let bucket = "two-node-directory-recovery";
+        source.create_bucket().bucket(bucket).send().await?;
+        let objects = [
+            ("empty", Vec::new()),
+            ("nested/inline", vec![0x3c; 1024]),
+            ("nested/external", (0_u8..=255).cycle().take(1024 * 1024).collect::<Vec<_>>()),
+        ];
+        for (key, bytes) in &objects {
+            source
+                .put_object()
+                .bucket(bucket)
+                .key(*key)
+                .body(ByteStream::from(bytes.clone()))
+                .send()
+                .await?;
+        }
+        let target_bucket = Path::new(&cluster.nodes[1].data_dir).join(bucket);
+        let original = objects
+            .iter()
+            .map(|(key, _)| census_object_version_on_disk(Path::new(&cluster.nodes[1].data_dir), bucket, key, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        for census in &original {
+            assert!(census.has_xl_meta, "fixture must have a target metadata copy: {census:?}");
+        }
+        assert!(
+            !original[2].present_part_fingerprints.is_empty(),
+            "large fixture must exercise external parts"
+        );
+        let removed = Path::new(&cluster.temp_dir).join("removed");
+        tokio::fs::create_dir(&removed).await?;
+        if remove_bucket {
+            tokio::fs::rename(&target_bucket, removed.join(bucket)).await?;
+            let status = two_node_heal_status(&cluster, None, false, scan_mode).await?;
+            assert_eq!(
+                status["summary"], "stopped",
+                "missing bucket must not look like an empty successful scan: {status}"
+            );
+            assert_eq!(status["outcome"]["execution"]["state"], "aborted");
+            assert_eq!(status["outcome"]["coverage"], "partial");
+            assert_eq!(status["outcome"]["counters"]["processed"], 0);
+            assert!(!target_bucket.exists(), "default discovery must not silently recreate a bucket");
+            let scoped_default = two_node_heal_status(&cluster, Some(bucket), false, scan_mode).await?;
+            assert_eq!(
+                scoped_default["summary"], "stopped",
+                "default namespace quorum protection must remain: {scoped_default}"
+            );
+        } else {
+            for (index, (key, _)) in objects.iter().enumerate() {
+                tokio::fs::rename(target_bucket.join(key), removed.join(index.to_string())).await?;
+            }
+        }
+        let status = two_node_heal_status(&cluster, remove_bucket.then_some(bucket), remove_bucket, scan_mode).await?;
+        assert_eq!(status["summary"], "finished", "explicit recovery should complete: {status}");
+        assert_eq!(status["outcome"]["execution"]["state"], "completed");
+        assert_eq!(status["outcome"]["coverage"], "complete");
+        for ((key, _), before) in objects.iter().zip(&original) {
+            let after = census_object_version_on_disk(Path::new(&cluster.nodes[1].data_dir), bucket, key, None)?;
+            assert!(after.has_xl_meta, "metadata must be restored before GET: {key}");
+            assert_eq!(
+                after.present_part_fingerprints, before.present_part_fingerprints,
+                "external shard bytes must match: {key}"
+            );
+            assert_eq!(
+                after.inline_data_fingerprint, before.inline_data_fingerprint,
+                "inline shard bytes must match: {key}"
+            );
+        }
+        cluster.stop_node(0)?;
+        for (key, expected) in &objects {
+            let actual = timeout(Duration::from_secs(30), async {
+                target
+                    .get_object()
+                    .bucket(bucket)
+                    .key(*key)
+                    .send()
+                    .await?
+                    .body
+                    .collect()
+                    .await
+                    .map(|body| body.into_bytes())
+                    .map_err(Box::<dyn Error + Send + Sync>::from)
+            })
+            .await??;
+            assert_eq!(actual.len(), expected.len(), "target-only read length: {key}");
+            assert_eq!(sha256_hex(&actual), sha256_hex(expected), "target-only content: {key}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_two_node_bucket_discovery_and_explicit_recreate() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(true, 2).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_object_directory_recovery_normal() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(false, 1).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_object_directory_recovery_deep() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(false, 2).await
     }
 }

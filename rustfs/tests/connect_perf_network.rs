@@ -669,9 +669,26 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
     assert_eq!(export.archive_sha256, hex(&Sha256::digest(&export.archive_bytes)));
     let mut archive = zip::ZipArchive::new(Cursor::new(&export.archive_bytes)).expect("three-file archive");
     assert_eq!(archive.len(), 3);
-    assert_eq!(archive.by_index(0).expect("envelope entry").name(), "envelope.json");
-    assert_eq!(archive.by_index(1).expect("signature entry").name(), "envelope.sig");
-    assert_eq!(archive.by_index(2).expect("result entry").name(), "result.json");
+    assert_eq!(
+        archive
+            .by_index(0)
+            .expect("envelope entry")
+            .name()
+            .expect("archive entry name"),
+        "envelope.json"
+    );
+    assert_eq!(
+        archive
+            .by_index(1)
+            .expect("signature entry")
+            .name()
+            .expect("archive entry name"),
+        "envelope.sig"
+    );
+    assert_eq!(
+        archive.by_index(2).expect("result entry").name().expect("archive entry name"),
+        "result.json"
+    );
 
     let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("envelope JSON");
     assert_eq!(envelope["toolId"], "performance.network");

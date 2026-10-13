@@ -110,6 +110,13 @@ fn test_heal_task_status_atomic_update() {
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
+        async fn list_buckets_for_admin_heal(
+            &self,
+            _selector: Option<storage_api::bug_fixes::DiskSetSelector>,
+        ) -> rustfs_heal::Result<Vec<BucketInfo>> {
+            self.list_buckets().await
+        }
+
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(vec![])
         }
@@ -203,6 +210,13 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
 
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
+        }
+
+        async fn list_buckets_for_admin_heal(
+            &self,
+            _selector: Option<storage_api::bug_fixes::DiskSetSelector>,
+        ) -> rustfs_heal::Result<Vec<BucketInfo>> {
+            self.list_buckets().await
         }
 
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {

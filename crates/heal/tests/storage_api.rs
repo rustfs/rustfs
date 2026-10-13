@@ -2,7 +2,7 @@
 pub(crate) mod bug_fixes {
     pub(crate) use rustfs_ecstore::api::disk::DiskStore;
     pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
-    pub(crate) use rustfs_storage_api::BucketInfo;
+    pub(crate) use rustfs_storage_api::{BucketInfo, DiskSetSelector};
 }
 
 #[allow(unused_imports)]

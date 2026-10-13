@@ -213,12 +213,12 @@ jobs:
           fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -246,7 +246,8 @@ jobs:
           echo "Selected platforms: ${selected}"
 
   build-rustfs:
-    name: Build RustFS
+    # Acceptance workflows select artifacts by this stable platform name.
+    name: Build RustFS (${{ matrix.target_id }})
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
@@ -273,7 +274,7 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}
+          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}
           # main only. A cache saved on refs/tags/X is scoped to that tag: no
           # other tag, no main run and no PR can restore it, so every release
           # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
@@ -410,35 +411,53 @@ jobs:
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.platform }}-${{ startsWith(matrix.target, 'aarch64-') && 'aarch64' || 'x86_64' }}
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          BINARY_NAMES=(rustfs)
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_NAMES+=(rustfs-cli)
-          fi
           FEATURE_ARGS=()
           if [[ -n "${{ matrix.features }}" ]]; then
             FEATURE_ARGS=(--features "${{ matrix.features }}")
           fi
 
-          # Build one binary at a time so release LTO links cannot exhaust a
-          # self-hosted runner by running concurrently.
-          for binary in "${BINARY_NAMES[@]}"; do
-            PROFILE_ARGS=()
-            if [[ "$binary" == "rustfs" && "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
-              # The in-process profiler resolves names from the final executable.
-              # Retain function symbols without enabling DWARF source information.
-              PROFILE_ARGS=(--config 'profile.release.strip="none"')
-            fi
-            if [[ "${{ matrix.cross }}" == "true" ]]; then
-              # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
-            else
-              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
-            fi
-          done
+          # gnu targets pin an explicit glibc baseline (`<target>.<glibc>` for
+          # cargo-zigbuild) so release binaries link no symbols newer than it
+          # and run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+          TARGET_ARG="$BUILD_TARGET"
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            TARGET_ARG="${TARGET_ARG}.${{ matrix.glibc }}"
+          fi
+
+          PROFILE_ARGS=()
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            # The in-process profiler resolves names from the final executable.
+            # Retain function symbols without enabling DWARF source information.
+            PROFILE_ARGS=(--config 'profile.release.strip="none"')
+          fi
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cargo zigbuild --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          else
+            cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          fi
+
+          # All release targets use same-architecture runners, including GNU
+          # builds that use Zig only to select the glibc ABI floor.
+          bin="target/${{ matrix.target }}/release/rustfs"
+          if [[ -f "${bin}.exe" ]]; then
+            bin="${bin}.exe"
+          fi
+          version_output=$("$bin" --version)
+          if ! grep -Fxq "build target : ${BUILD_TARGET}" <<< "$version_output" || \
+             ! grep -Fxq "build os     : ${BUILD_OS}" <<< "$version_output" || \
+             ! grep -Fxq "rust channel : stable-${BUILD_TARGET}" <<< "$version_output"; then
+            echo "release binary reports an unexpected compile target" >&2
+            exit 1
+          fi
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            python3 scripts/release/check_glibc.py "${{ matrix.glibc }}" \
+              "target/${{ matrix.target }}/release/rustfs"
+          fi
 
       - name: Verify macOS binary has no dynamic liblzma dependency
         if: matrix.platform == 'macos'
@@ -554,9 +573,6 @@ jobs:
           fi
 
           BINARY_FILES=("$BINARY_NAME")
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_FILES+=("rustfs-cli")
-          fi
 
           if [[ "$TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
             BINARY_FILES+=(rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256)
@@ -671,7 +687,7 @@ jobs:
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
-      - name: Verify packaged Linux binaries
+      - name: Verify packaged Linux binary
         if: matrix.platform == 'linux'
         shell: bash
         run: |
@@ -679,7 +695,7 @@ jobs:
 
           package_file="${{ steps.package.outputs.package_file }}"
           archive_members="$(unzip -Z1 "$package_file" | sort)"
-          expected_members=$'rustfs\nrustfs-cli'
+          expected_members='rustfs'
           target="${{ matrix.target }}"
           features="${{ matrix.features }}"
           if [[ "$target" == *-linux-gnu && "$features" == "pyroscope" ]]; then
@@ -691,13 +707,14 @@ jobs:
             exit 1
           fi
 
-          # Every Linux target builds natively, so executing the binaries here
+          # musl targets build natively; the gnu legs are same-arch
+          # cargo-zigbuild builds pinned to the release glibc baseline. Either
+          # way the binaries run on their runner, so executing them here
           # proves each artifact matches its runner architecture.
-          cli_dir="$(mktemp -d)"
-          trap 'rm -rf "$cli_dir"' EXIT
-          unzip -q "$package_file" rustfs rustfs-cli -d "$cli_dir"
-          "$cli_dir/rustfs" --version
-          "$cli_dir/rustfs-cli" --help >/dev/null
+          binary_dir="$(mktemp -d)"
+          trap 'rm -rf "$binary_dir"' EXIT
+          unzip -q "$package_file" rustfs -d "$binary_dir"
+          "$binary_dir/rustfs" --version
 
       - name: Verify packaged console
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'

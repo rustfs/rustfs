@@ -3209,6 +3209,13 @@ mod tests {
             Ok(None)
         }
 
+        async fn list_buckets_for_admin_heal(
+            &self,
+            _selector: Option<crate::storage::storage_api::contract::admin::DiskSetSelector>,
+        ) -> rustfs_heal::Result<Vec<HealBucketInfo>> {
+            self.list_buckets().await
+        }
+
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<HealBucketInfo>> {
             Ok(Vec::new())
         }
