@@ -2451,6 +2451,17 @@ impl RenameConvergence {
     }
 }
 
+struct RenameDataObservations<'a> {
+    disks: &'a [Option<DiskStore>],
+    file_infos: &'a [FileInfo],
+    disk_versions: &'a [Option<Vec<u8>>],
+    errs: &'a [Option<DiskError>],
+    cleanup_data_dirs: &'a [Option<Uuid>],
+    old_current_sizes: &'a [Option<OldCurrentSize>],
+    old_current_source_checked: &'a [bool],
+    old_current_sources: &'a [Option<FileInfo>],
+}
+
 pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) online_disks: Vec<Option<DiskStore>>,
     /// Disks whose capacity must be marked for this commit. Under early ACK,
@@ -3608,16 +3619,19 @@ impl SetDisks {
     }
 
     fn rename_data_commit_from_observations(
-        disks: &[Option<DiskStore>],
-        file_infos: &[FileInfo],
-        disk_versions: &[Option<Vec<u8>>],
-        errs: &[Option<DiskError>],
-        cleanup_data_dirs: &[Option<Uuid>],
-        old_current_sizes: &[Option<OldCurrentSize>],
-        old_current_source_checked: &[bool],
-        old_current_sources: &[Option<FileInfo>],
+        observations: RenameDataObservations<'_>,
         write_quorum: usize,
     ) -> disk::error::Result<RenameDataCommit> {
+        let RenameDataObservations {
+            disks,
+            file_infos,
+            disk_versions,
+            errs,
+            cleanup_data_dirs,
+            old_current_sizes,
+            old_current_source_checked,
+            old_current_sources,
+        } = observations;
         let data_dir = Self::reduce_common_data_dir(cleanup_data_dirs, write_quorum);
         let convergence = Self::classify_rename_convergence(disk_versions, errs);
         let old_current_size = Self::reduce_common_old_current_size(old_current_sizes, write_quorum);
@@ -3944,14 +3958,16 @@ impl SetDisks {
 
                     if !sent_commit && success_count >= write_quorum {
                         let snapshot_commit = Self::rename_data_commit_from_observations(
-                            &coordinator_disks,
-                            &file_infos,
-                            &disk_versions,
-                            &errs,
-                            &cleanup_data_dirs,
-                            &old_current_sizes,
-                            &old_current_source_checked,
-                            &old_current_sources,
+                            RenameDataObservations {
+                                disks: &coordinator_disks,
+                                file_infos: &file_infos,
+                                disk_versions: &disk_versions,
+                                errs: &errs,
+                                cleanup_data_dirs: &cleanup_data_dirs,
+                                old_current_sizes: &old_current_sizes,
+                                old_current_source_checked: &old_current_source_checked,
+                                old_current_sources: &old_current_sources,
+                            },
                             write_quorum,
                         );
                         if let Ok(commit) = snapshot_commit.as_ref() {
