@@ -2818,6 +2818,163 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
 
+    type RateLimitTestCore = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<crate::server::hybrid::HybridBody<s3s::Body, Empty<Bytes>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+    type RateLimitTestStack = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+
+    fn rate_limited_external_stack(
+        peer: SocketAddr,
+        proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
+        inner: RateLimitTestCore,
+    ) -> RateLimitTestStack {
+        use crate::server::rate_limit::RateLimitQuota;
+
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        RateLimitTestStack::new(external_service_stack!(
+            inner,
+            Some(RemoteAddr(peer)),
+            proxy_layer,
+            false,
+            Some(RateLimitLayer::new(
+                Some(RateLimitQuota {
+                    requests_per_minute: 1,
+                    burst: 1
+                }),
+                None,
+                vec![]
+            )),
+            false,
+            readiness,
+            None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+            HttpCompressionConfig::default(),
+            ServerContextSlot::new(),
+            false
+        ))
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_socket_peers_without_trusted_proxies() {
+        use crate::server::hybrid::HybridBody;
+        use tower::ServiceExt;
+
+        for peer in ["192.0.2.10:51000", "[2001:db8::10]:51000"] {
+            let peer: SocketAddr = peer.parse().expect("socket peer");
+            for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let inner_calls = calls.clone();
+                let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                    assert_eq!(
+                        request
+                            .extensions()
+                            .get::<Option<RemoteAddr>>()
+                            .copied()
+                            .flatten()
+                            .map(|addr| addr.0),
+                        Some(peer)
+                    );
+                    inner_calls.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                            HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                                rest_body: s3s::Body::empty(),
+                            },
+                        ))
+                    }
+                });
+                let mut service = rate_limited_external_stack(peer, None, RateLimitTestCore::new(inner));
+
+                for (forwarded, expected) in [
+                    ("203.0.113.1", StatusCode::OK),
+                    ("203.0.113.2", StatusCode::TOO_MANY_REQUESTS),
+                ] {
+                    let request = HttpRequest::builder()
+                        .uri("/bucket/object")
+                        .version(version)
+                        .header("x-forwarded-for", forwarded)
+                        .header("x-real-ip", forwarded)
+                        .body(s3s::Body::empty())
+                        .expect("request");
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("service ready")
+                        .call(request)
+                        .await
+                        .expect("response");
+                    assert_eq!(response.status(), expected, "peer={peer}, version={version:?}");
+                    if expected == StatusCode::TOO_MANY_REQUESTS {
+                        assert!(response.headers().contains_key(http::header::RETRY_AFTER));
+                        let body = response.into_body().collect().await.expect("body").to_bytes();
+                        assert!(String::from_utf8_lossy(&body).contains("<Code>TooManyRequests</Code>"));
+                    }
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "throttled requests must not reach the inner service");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_validated_proxy_clients_independently() {
+        use crate::server::hybrid::HybridBody;
+        use rustfs_trusted_proxies::{
+            LegacyTrustedProxyLayer, TrustedProxy, TrustedProxyConfig, TrustedProxyLayer, ValidationMode,
+        };
+        use tower::ServiceExt;
+
+        let peer: SocketAddr = "192.0.2.100:51000".parse().expect("proxy peer");
+        for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+            let proxy_config =
+                TrustedProxyConfig::new(vec![TrustedProxy::Single(peer.ip())], ValidationMode::HopByHop, false, 3, false, vec![]);
+            let proxy_layer = TrustedProxyLayer::legacy(LegacyTrustedProxyLayer::new(proxy_config, None, true));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let inner_calls = calls.clone();
+            let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                let info = request.extensions().get::<ClientInfo>().expect("validated client context");
+                assert!(info.is_from_trusted_proxy);
+                assert_ne!(info.real_ip, peer.ip());
+                inner_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                        HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                            rest_body: s3s::Body::empty(),
+                        },
+                    ))
+                }
+            });
+            let mut service = rate_limited_external_stack(peer, Some(proxy_layer), RateLimitTestCore::new(inner));
+
+            for (client, expected) in [
+                ("203.0.113.1", StatusCode::OK),
+                ("203.0.113.2", StatusCode::OK),
+                ("203.0.113.1", StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let request = HttpRequest::builder()
+                    .uri("/bucket/object")
+                    .version(version)
+                    .header("x-forwarded-for", client)
+                    .body(s3s::Body::empty())
+                    .expect("request");
+                let response = service
+                    .ready()
+                    .await
+                    .expect("service ready")
+                    .call(request)
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), expected, "client={client}, version={version:?}");
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[test]
     fn peer_transport_close_kind_uses_io_error_sources() {
         #[derive(Debug)]
