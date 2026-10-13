@@ -1953,10 +1953,7 @@ async fn barrier(volume: &str, object: &str, transaction: Uuid, stage: &str, dri
         .map_err(to_file_error)?
         == b"io_error"
     {
-        return Err(DiskError::Io(std::io::Error::new(
-            ErrorKind::Other,
-            "injected delete recovery barrier failure",
-        )));
+        return Err(DiskError::Io(std::io::Error::other("injected delete recovery barrier failure")));
     }
     Ok(())
 }

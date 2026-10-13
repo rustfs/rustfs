@@ -325,6 +325,24 @@ fn map_status(status: tonic::Status) -> NetworkPeerProbeError {
     match status.code() {
         Code::Unavailable | Code::Unknown => NetworkPeerProbeError::Unreachable,
         Code::DeadlineExceeded => NetworkPeerProbeError::TimedOut,
+        Code::Cancelled | Code::Internal => {
+            let mut source = std::error::Error::source(&status);
+            while let Some(error) = source {
+                if error
+                    .downcast_ref::<h2::Error>()
+                    .is_some_and(|error| matches!(error.reason(), Some(h2::Reason::CANCEL | h2::Reason::NO_ERROR)))
+                {
+                    return NetworkPeerProbeError::Unreachable;
+                }
+                source = if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    // io::Error::source skips its immediate custom error.
+                    error.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+                } else {
+                    error.source()
+                };
+            }
+            NetworkPeerProbeError::ProtocolFailure
+        }
         _ => NetworkPeerProbeError::ProtocolFailure,
     }
 }
@@ -334,6 +352,35 @@ mod tests {
     use super::*;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+
+    #[test]
+    fn peer_transport_resets_are_unreachable_without_reclassifying_application_errors() {
+        for reason in [h2::Reason::CANCEL, h2::Reason::NO_ERROR] {
+            let status = tonic::Status::from_error(Box::new(h2::Error::from(reason)));
+            assert!(matches!(status.code(), Code::Cancelled | Code::Internal));
+            let code = status.code();
+            assert_eq!(map_status(status), NetworkPeerProbeError::Unreachable);
+            let mut wrapped = tonic::Status::new(code, "wrapped transport reset");
+            wrapped.set_source(Arc::new(std::io::Error::other(h2::Error::from(reason))));
+            assert_eq!(map_status(wrapped), NetworkPeerProbeError::Unreachable);
+        }
+        for reason in [h2::Reason::PROTOCOL_ERROR, h2::Reason::COMPRESSION_ERROR] {
+            let status = tonic::Status::from_error(Box::new(h2::Error::from(reason)));
+            assert_eq!(map_status(status), NetworkPeerProbeError::ProtocolFailure);
+        }
+        for status in [
+            tonic::Status::cancelled("peer cancelled the application request"),
+            tonic::Status::internal("peer rejected the probe"),
+            tonic::Status::unauthenticated("authentication rejected"),
+            tonic::Status::permission_denied("authorization rejected"),
+        ] {
+            assert_eq!(map_status(status), NetworkPeerProbeError::ProtocolFailure);
+        }
+        assert_eq!(
+            map_status(tonic::Status::deadline_exceeded("probe deadline elapsed")),
+            NetworkPeerProbeError::TimedOut
+        );
+    }
 
     fn pacing(duration: Duration) -> Arc<DiagnosticPacing> {
         NetworkPeerProbeClient::from_endpoint_pools(&topology())

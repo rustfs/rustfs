@@ -399,7 +399,14 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_and_invalid_r
     assert_eq!(fs::metadata(&net_output).expect("output metadata").permissions().mode() & 0o777, 0o600);
     let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("top.net archive");
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("archive member").name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("archive member")
+                .name()
+                .expect("archive entry name")
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(names, ["envelope.json", "envelope.sig", "result.json"]);
 

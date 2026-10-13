@@ -18,6 +18,11 @@ use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{DeleteOptions, Disk, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
+use rustfs_io_metrics::{
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL,
+};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -331,15 +336,38 @@ async fn rename_local_data_with_ctx(
     destination: (&str, &str),
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
+    let handler_started = rustfs_io_metrics::put_stage_timer();
+    let lookup_started = rustfs_io_metrics::put_stage_timer();
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let lookup_ms = lookup_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = lookup_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, duration_ms);
+    }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = admit_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
+    }
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
+    let local_rename_started = rustfs_io_metrics::put_stage_timer();
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
         .await
         .result;
+    let local_rename_ms = local_rename_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = local_rename_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME, duration_ms);
+    }
     drop(owner);
+    if let Some(handler_started) = handler_started {
+        let handler_ms = handler_started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL, handler_ms);
+        let child_ms = lookup_ms.unwrap_or(0.0) + admit_ms.unwrap_or(0.0) + local_rename_ms.unwrap_or(0.0);
+        let overhead_ms = (handler_ms - child_ms).max(0.0);
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD, overhead_ms);
+    }
     result
 }
 

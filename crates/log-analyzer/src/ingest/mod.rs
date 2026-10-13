@@ -307,7 +307,13 @@ fn walk_zip_entries<R: Read + Seek>(
         if entry.is_dir() {
             continue;
         }
-        let entry_path = entry.name().to_string();
+        let entry_path = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(_) => {
+                ctx.skip(format!("{provenance}!<entry {index}>"), SkipReason::Unreadable);
+                continue;
+            }
+        };
         let child_provenance = format!("{provenance}!{entry_path}");
         let child_node = node_from_entry_path(&entry_path).or_else(|| node.clone());
         let child_name = leaf_name(&entry_path).to_string();
