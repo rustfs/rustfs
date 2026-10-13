@@ -66,6 +66,9 @@ procedure is required.
 For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
 drive ownership, snapshot freshness, counter queries, and rolling upgrades.
 
+For per-bucket capacity and object counts, see [Bucket usage metrics](operations/bucket-usage-metrics.md):
+OTLP export, cluster deduplication, accounting semantics, and scanner freshness.
+
 For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
 activation, legacy repair results, multipart mode changes, and rollback limits.
 
