@@ -20,6 +20,7 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'third-party/pyroscope/**'
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
@@ -39,6 +40,7 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'third-party/pyroscope/**'
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
@@ -128,6 +130,13 @@ jobs:
 
       - name: Run cargo-deny
         run: cargo deny check --hide-inclusion-graph advisories sources bans licenses
+
+      - name: Test patched profiling dependency
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/pyroscope-dependency
+        run: >-
+          cargo test --manifest-path third-party/pyroscope/Cargo.toml
+          --features backend-pprof-rs --lib --test rustfs_zstd
 
   workflow-pin-report:
     name: Workflow Pin Report
