@@ -87,6 +87,40 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 ## Maintenance Matrix
 
+Object-backed and durable-strong catalogs support the configuration, scheduler,
+worker, job inspection, heartbeat, and quarantine endpoints. Durable-strong
+maintenance resolves table identity from the authoritative catalog snapshot;
+recoverable job and configuration records remain separate objects. The worker
+performs metadata and unreferenced-object cleanup without changing the catalog
+pointer. The direct `/maintenance/metadata` endpoint, including snapshot
+expiration and compaction plan/commit, remains object-backed only. A configured
+`background-enabled` table still requires explicit scheduler and worker ticks.
+
+Renamed tables retain their original metadata paths. Durable-strong scheduling
+and cleanup fail closed with a conflict if another table shares a scanned
+metadata or warehouse directory, including a recreated source name after rename.
+Such tables require disjoint cleanup roots before maintenance can run; enabling
+deletion does not override this ownership check.
+
+Durable-strong rename preserves maintenance configuration, job identifiers,
+current/latest aliases, history, audit events, and quarantine state. A persisted
+rename intent protects sidecar migration across interruption: the source remains
+authoritative until the catalog CAS succeeds, and the destination records are
+ready before publication. Retry the same rename to finish pending recovery.
+Backup, restore, register, drop, and subsequent rename operations recover a
+pending migration before proceeding. Complete pending rename recovery before
+rolling back to a version that does not understand maintenance migration intents.
+
+Durable-strong scheduler reports read an observational history set, not an atomic
+snapshot of all maintenance jobs. They fix at most 4096 history-object names
+under the publication read fence, scan those objects outside the fence, and
+refresh the selected 10-job audit window, effective configuration, and current
+job under a final read fence. Exceeding the history budget fails closed with an
+unavailable response; retrying does not remove that size limit. A listed object
+that disappears during the scan also returns unavailable; retry after concurrent
+rename or maintenance activity has settled. No history object is silently omitted
+when a rename removes its old path.
+
 | Capability | Status | Claim |
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the pointer. |
