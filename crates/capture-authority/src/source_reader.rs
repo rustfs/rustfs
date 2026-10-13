@@ -1,11 +1,15 @@
 //! Same-UID local reads from an owner's live native store. No ACK or cursor writes.
-use crate::{EventCursor, EventPage, NativeLogWriter, NativeWriteError, NodeIdentity, StoreError};
+use crate::{EventCursor, EventPage, NativeLogWriter, NativeWriteError, NodeIdentity, SourceEvent, StoreError};
 use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs,
+    future::Future,
+    io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -62,6 +66,8 @@ pub enum ReaderError {
     PathChanged,
     #[error("SOURCE_READER_TIMEOUT")]
     Timeout,
+    #[error("SOURCE_READER_PUBLICATION_UNAVAILABLE")]
+    PublicationUnavailable,
     #[error("SOURCE_READER_PROTOCOL")]
     Protocol,
     #[error("SOURCE_READER_REJECTED: {0:?}")]
@@ -170,11 +176,17 @@ impl Shutdown {
         let _ = self.0.send(true);
     }
 }
+/// Checks actual object publication after the durable event read releases the Store lock.
+pub trait PublicationReadiness: Send + Sync {
+    fn is_published(&self, event: SourceEvent) -> Pin<Box<dyn Future<Output = Result<bool, ReaderError>> + Send + '_>>;
+}
+
 pub struct SourceReaderServer {
     listener: UnixListener,
     writer: NativeLogWriter,
     socket: SocketPath,
     shutdown: watch::Receiver<bool>,
+    publication: Option<Arc<dyn PublicationReadiness>>,
 }
 impl SourceReaderServer {
     pub fn bind(path: impl AsRef<Path>, writer: NativeLogWriter) -> Result<(Self, Shutdown), ReaderError> {
@@ -203,10 +215,17 @@ impl SourceReaderServer {
                 writer,
                 socket,
                 shutdown,
+                publication: None,
             },
             Shutdown(sender),
         ))
     }
+    /// Install before serving when committed events can precede physical publication.
+    pub fn with_publication_readiness(mut self, publication: Arc<dyn PublicationReadiness>) -> Self {
+        self.publication = Some(publication);
+        self
+    }
+
     pub async fn serve(mut self) -> Result<(), ReaderError> {
         let mut tasks = JoinSet::new();
         let outcome = async {
@@ -228,8 +247,9 @@ impl SourceReaderServer {
                     continue;
                 }
                 let writer = self.writer.clone();
+                let publication = self.publication.clone();
                 tasks.spawn(async move {
-                    let _ = connection(stream, writer, permit).await;
+                    let _ = connection(stream, writer, permit, publication).await;
                 });
                 while let Some(result) = tasks.try_join_next() {
                     result.map_err(ReaderError::Worker)?;
@@ -325,7 +345,37 @@ async fn frame_write(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), Reader
     stream.write_all(bytes).await?;
     Ok(())
 }
-async fn connection(mut stream: UnixStream, writer: NativeLogWriter, permit: OwnedSemaphorePermit) -> Result<(), ReaderError> {
+async fn publication_prefix(
+    reply: &mut ReadPageReply,
+    cursor: Option<EventCursor>,
+    publication: &dyn PublicationReadiness,
+) -> Result<(), ReaderError> {
+    let ReadPageReply::Page { response } = reply else {
+        return Ok(());
+    };
+    let mut ready = 0;
+    for event in &response.page.events {
+        if !publication.is_published(event.clone()).await? {
+            break;
+        }
+        ready += 1;
+    }
+    response.page.events.truncate(ready);
+    response.page.next = response
+        .page
+        .events
+        .last()
+        .map(|event| EventCursor::new(response.identity.cluster_id, event.event_id, &event.captured))
+        .or(cursor);
+    Ok(())
+}
+
+async fn connection(
+    mut stream: UnixStream,
+    writer: NativeLogWriter,
+    permit: OwnedSemaphorePermit,
+    publication: Option<Arc<dyn PublicationReadiness>>,
+) -> Result<(), ReaderError> {
     let bytes = tokio::time::timeout(IO_TIMEOUT, frame_read(&mut stream, MAX_REQUEST_BYTES))
         .await
         .map_err(|_| ReaderError::Timeout)??;
@@ -338,10 +388,18 @@ async fn connection(mut stream: UnixStream, writer: NativeLogWriter, permit: Own
                 .map_err(|_| ReaderError::Timeout)?;
         }
     };
-    // The blocking worker owns admission until read + bounded serialization finish, even
-    // if a deadline, shutdown or a dropped serve task cancels its awaiting connection.
+    // Admission follows blocking workers if their awaiting connection is cancelled.
+    let cursor = request.cursor.clone();
+    let (mut reply, permit) = tokio::task::spawn_blocking(move || (read_page(&writer, request), permit))
+        .await
+        .map_err(ReaderError::Worker)?;
+    if let Some(publication) = publication {
+        match tokio::time::timeout(IO_TIMEOUT, publication_prefix(&mut reply, cursor, publication.as_ref())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => reply = reject(Rejection::StoreUnavailable),
+        }
+    }
     let (bytes, _permit) = tokio::task::spawn_blocking(move || {
-        let reply = read_page(&writer, request);
         let bytes = encode(&reply, MAX_RESPONSE_BYTES).or_else(|_| encode(&reject(Rejection::ResponseLimit), MAX_RESPONSE_BYTES));
         (bytes, permit)
     })

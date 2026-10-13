@@ -500,3 +500,152 @@ async fn source_reader_checkpoint_replay() {
     );
     stop(path, shutdown, task).await;
 }
+
+struct PublicationFixture {
+    writer: NativeLogWriter,
+    ready_through: std::sync::atomic::AtomicU64,
+    unavailable: std::sync::atomic::AtomicBool,
+}
+impl PublicationReadiness for PublicationFixture {
+    fn is_published(
+        &self,
+        event: SourceEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, ReaderError>> + Send + '_>> {
+        Box::pin(async move {
+            assert!(self.writer.store.try_lock().is_ok(), "PUBLICATION_CHECK_RELEASES_STORE_LOCK");
+            if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ReaderError::PublicationUnavailable);
+            }
+            Ok(event.captured.decision_log_id.index == 3
+                || event.captured.decision_log_id.index <= self.ready_through.load(std::sync::atomic::Ordering::SeqCst))
+        })
+    }
+}
+
+#[tokio::test]
+async fn source_reader_publication_prefix_resumes_without_skipping() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let (dir, writer) = fixture();
+    for (index, event) in [(1, 9), (2, 10), (3, 11)] {
+        apply(&writer, index, event).await;
+    }
+    let publication = Arc::new(PublicationFixture {
+        writer: writer.clone(),
+        ready_through: AtomicU64::new(0),
+        unavailable: AtomicBool::new(false),
+    });
+    let path = dir.path().join("reader.sock");
+    let (server, shutdown) = SourceReaderServer::bind(&path, writer).expect("bind reader");
+    let task = tokio::spawn(server.with_publication_readiness(publication.clone()).serve());
+    let client = SourceReaderClient::new(&path).expect("reader client");
+    let held = client.page(identity().cluster_id, None, 3).await.expect("held page").page;
+    assert!(held.events.is_empty(), "UNPUBLISHED_EVENT_MUST_NOT_ESCAPE");
+    assert_eq!(held.next, None, "UNPUBLISHED_EVENT_MUST_NOT_ADVANCE_CURSOR");
+    publication.ready_through.store(1, Ordering::SeqCst);
+    let first = client
+        .page(identity().cluster_id, None, 3)
+        .await
+        .expect("published prefix")
+        .page;
+    assert_eq!(first.events.iter().map(|event| event.event_id).collect::<Vec<_>>(), vec![[9; 16]]);
+    let cursor = first.next.expect("first published cursor");
+    let held = client
+        .page(identity().cluster_id, Some(cursor.clone()), 3)
+        .await
+        .expect("held suffix")
+        .page;
+    assert!(held.events.is_empty());
+    assert_eq!(held.next, Some(cursor.clone()), "HELD_SUFFIX_PRESERVES_INPUT_CURSOR");
+    publication.ready_through.store(3, Ordering::SeqCst);
+    let rest = client
+        .page(identity().cluster_id, Some(cursor), 3)
+        .await
+        .expect("publication recovered")
+        .page;
+    assert_eq!(
+        rest.events.iter().map(|event| event.event_id).collect::<Vec<_>>(),
+        vec![[10; 16], [11; 16]],
+        "PUBLICATION_RECOVERY_MUST_NOT_SKIP"
+    );
+    stop(path, shutdown, task).await;
+}
+
+#[tokio::test]
+async fn source_reader_publication_error_is_retryable_without_cursor_loss() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let (dir, writer) = fixture();
+    apply(&writer, 1, 9).await;
+    let publication = Arc::new(PublicationFixture {
+        writer: writer.clone(),
+        ready_through: AtomicU64::new(1),
+        unavailable: AtomicBool::new(true),
+    });
+    let path = dir.path().join("reader.sock");
+    let (server, shutdown) = SourceReaderServer::bind(&path, writer).expect("bind reader");
+    let task = tokio::spawn(server.with_publication_readiness(publication.clone()).serve());
+    let client = SourceReaderClient::new(&path).expect("reader client");
+    assert!(
+        matches!(
+            client.page(identity().cluster_id, None, 3).await,
+            Err(ReaderError::Rejected(Rejection::StoreUnavailable))
+        ),
+        "PUBLICATION_ERROR_MUST_NOT_RELEASE_EVENT"
+    );
+    publication.unavailable.store(false, Ordering::SeqCst);
+    let page = client
+        .page(identity().cluster_id, None, 3)
+        .await
+        .expect("retry publication check")
+        .page;
+    assert_eq!(page.events[0].event_id, [9; 16]);
+    stop(path, shutdown, task).await;
+}
+
+struct StalledPublication;
+impl PublicationReadiness for StalledPublication {
+    fn is_published(
+        &self,
+        _event: SourceEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, ReaderError>> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+#[tokio::test]
+async fn source_reader_publication_timeout_releases_admission_and_drains() {
+    let (dir, writer) = fixture();
+    apply(&writer, 1, 9).await;
+    let path = dir.path().join("reader.sock");
+    let (server, shutdown) = SourceReaderServer::bind(&path, writer.clone()).expect("bind reader");
+    let task = tokio::spawn(
+        server
+            .with_publication_readiness(std::sync::Arc::new(StalledPublication))
+            .serve(),
+    );
+    let reply = tokio::time::timeout(IO_TIMEOUT + std::time::Duration::from_secs(2), raw(&path, request()))
+        .await
+        .expect("publication check is bounded");
+    assert!(
+        matches!(
+            reply,
+            ReadPageReply::Rejected {
+                error: Rejection::StoreUnavailable,
+                ..
+            }
+        ),
+        "STALLED_PUBLICATION_MUST_NOT_RELEASE_EVENT"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), stop(path, shutdown, task))
+        .await
+        .expect("reader drains after publication timeout");
+    assert_eq!(
+        writer.source_reader_admission.available_permits(),
+        MAX_CONNECTIONS,
+        "PUBLICATION_TIMEOUT_RELEASES_ADMISSION"
+    );
+}
