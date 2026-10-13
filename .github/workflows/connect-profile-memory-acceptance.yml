@@ -127,7 +127,7 @@ jobs:
           ' <<<"$run" >/dev/null
           jobs=$(gh api --paginate --slurp "repos/rustfs/rustfs/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e '
-            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu, [a-z0-9-]+, x86_64-unknown-linux-gnu, false, linux, pyroscope\\)$"))] as $matches
+            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu\\)$"))] as $matches
             | ($matches | length) == 1 and $matches[0].conclusion == "success"
           ' <<<"$jobs" >/dev/null
           artifact=$(gh api "repos/rustfs/rustfs/actions/artifacts/${ARTIFACT_ID}")
@@ -172,7 +172,7 @@ jobs:
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
-                  expected = {'rustfs', 'rustfs-cli', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'}
+                  expected = {'rustfs', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'}
                   assert {entry.filename for entry in entries} == expected and len(entries) == len(expected)
                   assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
                   assert inner.testzip() is None
