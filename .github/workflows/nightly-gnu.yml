@@ -82,11 +82,25 @@ jobs:
         with:
           cache-shared-key: build-x86_64-unknown-linux-gnu
           cache-save-if: 'false'
+          install-cross-tools: 'true'
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
 
       - name: Build RustFS
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p rustfs --bins
+        # Pin the glibc baseline (`<target>.<glibc>` for cargo-zigbuild) so
+        # nightlies run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31 -p rustfs --bins
+
+      - name: Verify glibc symbol baseline
+        # The DEB/RPM steps below declare glibc >= 2.31; keep the binary honest.
+        run: |
+          bin="target/x86_64-unknown-linux-gnu/release/rustfs"
+          max_sym=$(strings "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+          echo "highest GLIBC symbol reference in $bin: ${max_sym:-none}"
+          if [[ "$(printf '%s\n' "${max_sym:-GLIBC_0}" "GLIBC_2.31" | sort -V | tail -1)" != "GLIBC_2.31" ]]; then
+            echo "$bin references $max_sym, newer than the pinned GLIBC_2.31" >&2
+            exit 1
+          fi
 
       - name: Build DEB package
         id: deb

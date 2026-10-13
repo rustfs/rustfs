@@ -213,12 +213,12 @@ jobs:
           fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -246,7 +246,10 @@ jobs:
           echo "Selected platforms: ${selected}"
 
   build-rustfs:
-    name: Build RustFS
+    # Explicit matrix-expression name: the auto-generated name embeds every
+    # matrix value, so adding fields (cross, glibc) would break the
+    # connect-* acceptance workflows that match this name.
+    name: Build RustFS (${{ matrix.target_id }})
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
@@ -423,6 +426,14 @@ jobs:
             FEATURE_ARGS=(--features "${{ matrix.features }}")
           fi
 
+          # gnu targets pin an explicit glibc baseline (`<target>.<glibc>` for
+          # cargo-zigbuild) so release binaries link no symbols newer than it
+          # and run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+          TARGET_ARG="$BUILD_TARGET"
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            TARGET_ARG="${TARGET_ARG}.${{ matrix.glibc }}"
+          fi
+
           # Build one binary at a time so release LTO links cannot exhaust a
           # self-hosted runner by running concurrently.
           for binary in "${BINARY_NAMES[@]}"; do
@@ -434,11 +445,35 @@ jobs:
             fi
             if [[ "${{ matrix.cross }}" == "true" ]]; then
               # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
+              cargo zigbuild --release --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
             else
-              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
+              cargo build --release --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
             fi
           done
+
+          # Version metadata must name the compile target, not the build host
+          # (#8048). The channel line embeds the full target triple, so this
+          # one grep catches host/target mismatches.
+          bin="target/${{ matrix.target }}/release/rustfs"
+          if [[ -f "${bin}.exe" ]]; then
+            bin="${bin}.exe"
+          fi
+          expect="rust channel : stable-${BUILD_TARGET}"
+          if ! grep -a -qF "${expect}" "${bin}"; then
+            echo "embedded version metadata missing '${expect}' in ${bin}" >&2
+            exit 1
+          fi
+
+          # The RPM/DEB dependency declarations promise glibc >= ${{ matrix.glibc }};
+          # assert the binary references no newer symbol version (#8062).
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            max_sym=$(strings "${bin}" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+            echo "highest GLIBC symbol reference in ${bin}: ${max_sym:-none}"
+            if [[ "$(printf '%s\n' "${max_sym:-GLIBC_0}" "GLIBC_${{ matrix.glibc }}" | sort -V | tail -1)" != "GLIBC_${{ matrix.glibc }}" ]]; then
+              echo "${bin} references ${max_sym}, newer than the pinned GLIBC_${{ matrix.glibc }}" >&2
+              exit 1
+            fi
+          fi
 
       - name: Verify macOS binary has no dynamic liblzma dependency
         if: matrix.platform == 'macos'
@@ -691,7 +726,9 @@ jobs:
             exit 1
           fi
 
-          # Every Linux target builds natively, so executing the binaries here
+          # musl targets build natively; the gnu legs are same-arch
+          # cargo-zigbuild builds pinned to the release glibc baseline. Either
+          # way the binaries run on their runner, so executing them here
           # proves each artifact matches its runner architecture.
           cli_dir="$(mktemp -d)"
           trap 'rm -rf "$cli_dir"' EXIT

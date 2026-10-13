@@ -20,7 +20,7 @@
 
 use super::{InfoOpts, InfoType};
 use crate::runtime_sources::current_buffer_config;
-use crate::version::build;
+use crate::version::{self, build};
 use rustfs_credentials::Masked;
 use serde::Serialize;
 use std::fmt;
@@ -464,7 +464,7 @@ impl BuildInfo {
             build::PKG_VERSION,
             build::BUILD_TIME,
             build::BUILD_RUST_CHANNEL,
-            build::BUILD_OS,
+            version::BUILD_OS,
             build::RUST_VERSION,
             build::BRANCH,
             build::COMMIT_HASH,
@@ -504,7 +504,7 @@ impl BuildInfo {
             version: build::PKG_VERSION,
             build_time: build::BUILD_TIME,
             build_profile: build::BUILD_RUST_CHANNEL,
-            build_os: build::BUILD_OS,
+            build_os: version::BUILD_OS,
             rust_version: build::RUST_VERSION,
             git_branch: build::BRANCH,
             git_commit: build::COMMIT_HASH,

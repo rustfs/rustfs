@@ -19,6 +19,16 @@ shadow!(build);
 
 const BUILD_VERSION_OVERRIDE: Option<&str> = option_env!("RUSTFS_BUILD_VERSION");
 
+/// Build OS/arch of the compile target (e.g. `linux-aarch64`), taken from the
+/// cargo target cfg rather than the build host so cross builds report the
+/// target platform (#8048). shadow-rs `build::BUILD_OS` names the host.
+pub const BUILD_OS: &str = env!("RUSTFS_BUILD_OS");
+
+/// Rust channel and target triple of the compile target (e.g.
+/// `stable-aarch64-unknown-linux-musl`). shadow-rs `build::RUST_CHANNEL`
+/// embeds the host triple instead (#8048).
+pub const RUST_CHANNEL: &str = env!("RUSTFS_RUST_CHANNEL");
+
 #[allow(clippy::const_is_empty)]
 const DEFAULT_DISPLAY_VERSION: &str = {
     if !build::TAG.is_empty() {

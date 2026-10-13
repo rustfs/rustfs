@@ -127,7 +127,7 @@ jobs:
           ' <<<"$run" >/dev/null
           jobs=$(gh api --paginate --slurp "repos/rustfs/rustfs/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e '
-            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu, [a-z0-9-]+, x86_64-unknown-linux-gnu, false, linux, pyroscope\\)$"))] as $matches
+            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu\\)$"))] as $matches
             | ($matches | length) == 1 and $matches[0].conclusion == "success"
           ' <<<"$jobs" >/dev/null
           artifact=$(gh api "repos/rustfs/rustfs/actions/artifacts/${ARTIFACT_ID}")
