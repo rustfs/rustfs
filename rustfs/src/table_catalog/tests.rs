@@ -2507,7 +2507,9 @@ fn metadata_log_locations_normalize_same_bucket_s3_uris() {
     });
 
     assert_eq!(
-        metadata_log_locations(&metadata, "warehouse", &namespace, &table),
+        metadata_log_locations_matching(&metadata, "warehouse", |location| {
+            is_valid_table_metadata_location(&namespace, &table, location)
+        }),
         BTreeSet::from([metadata_location])
     );
 }
