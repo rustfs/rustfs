@@ -39,7 +39,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tracing::debug;
 
 #[cfg(all(test, feature = "hotpath"))]
@@ -142,6 +142,7 @@ struct BitrotReaderSource {
     path: String,
     offset: usize,
     length: usize,
+    shard_size: usize,
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 }
@@ -155,6 +156,7 @@ impl BitrotReaderSource {
             &self.path,
             self.offset,
             self.length,
+            self.shard_size,
             self.use_mmap_read,
             self.stage_metrics.map(|metrics| metrics.path),
         )
@@ -170,6 +172,7 @@ async fn open_reader_source(
     path: &str,
     offset: usize,
     length: usize,
+    shard_size: usize,
     use_mmap_read: bool,
     metrics_path: Option<&'static str>,
 ) -> disk::error::Result<Option<BoxedObjectReader>> {
@@ -182,12 +185,33 @@ async fn open_reader_source(
     } else if let Some(disk) = disk {
         #[cfg(test)]
         crate::set_disk::disk_call_counters::record_shard_open(path, false);
-        open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path)
-            .await
-            .map(Some)
+        let reader = open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path).await?;
+        let reader = if disk.is_local() {
+            buffer_local_shard_stream(reader, length, shard_size)?
+        } else {
+            reader
+        };
+        Ok(Some(reader))
     } else {
         Ok(None)
     }
+}
+
+fn buffer_local_shard_stream(reader: ShardReader, length: usize, shard_size: usize) -> disk::error::Result<ShardReader> {
+    if shard_size == 0 || shard_size > 128 * 1024 || length < shard_size.saturating_mul(4) {
+        return Ok(reader);
+    }
+    let ShardReader::Stream(reader) = reader else {
+        return Ok(reader);
+    };
+    let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
+    // Small layout stripes otherwise dispatch a blocking file read per frame.
+    // Buffer only long local streams, and bound the source before buffering so
+    // prefetch cannot cross the authenticated window selected for this request.
+    Ok(ShardReader::Stream(Box::new(tokio::io::BufReader::with_capacity(
+        256 * 1024,
+        reader.take(limit),
+    ))))
 }
 
 struct FirstReadMetricsReader {
@@ -761,6 +785,7 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_frame_size_and_stage_me
         path,
         offset,
         length,
+        shard_size,
         use_mmap_read,
         stage_metrics.map(|metrics| metrics.path),
     )
@@ -864,6 +889,7 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
         path: if inline_source { String::new() } else { path.to_string() },
         offset,
         length,
+        shard_size,
         use_mmap_read,
         stage_metrics: None,
     };
@@ -944,6 +970,108 @@ mod tests {
     use super::*;
     use rustfs_rio::ChunkReader;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingWindowReader {
+        source: Cursor<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingWindowReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, out: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let before = out.filled().len();
+            let result = Pin::new(&mut self.source).poll_read(cx, out);
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(out.filled().len() - before, Ordering::Relaxed);
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_local_shard_stream_coalesces_reads_without_crossing_window() {
+        const SHARD: usize = 32 * 1024;
+        const TAIL: usize = 12_001;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![37; 9 * SHARD + TAIL];
+        let mut encoded = Vec::new();
+        {
+            let mut writer = crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD, algo.clone());
+            for chunk in data.chunks(SHARD) {
+                writer.write(chunk).await.expect("encode full shards and short tail");
+            }
+        }
+        let window = encoded.len();
+        encoded.extend_from_slice(&vec![99; 100_000]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let source = ShardReader::Stream(Box::new(CountingWindowReader {
+            source: Cursor::new(encoded),
+            reads: Arc::clone(&reads),
+            bytes: Arc::clone(&bytes),
+        }));
+        let source = buffer_local_shard_stream(source, window, SHARD).expect("buffer the exact local window");
+        let mut reader = BitrotReader::new(source, SHARD, algo, false);
+        let mut actual = Vec::new();
+        for chunk in data.chunks(SHARD) {
+            reader
+                .read_appending(&mut actual, chunk.len())
+                .await
+                .expect("verify each buffered shard");
+        }
+        assert_eq!(actual, data);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            window,
+            "prefetch must not consume the sentinel beyond the window"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            2,
+            "ten logical reads should share two bounded physical reads"
+        );
+        let mut extra = vec![0; 1];
+        assert_eq!(
+            reader.read(&mut extra).await.expect_err("window ended").kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(bytes.load(Ordering::Relaxed), window);
+    }
+
+    #[tokio::test]
+    async fn buffered_local_shard_stream_still_rejects_corrupt_prefetched_frame() {
+        const SHARD: usize = 32 * 1024;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let payload = vec![73; SHARD];
+        let mut encoded = Vec::new();
+        {
+            let mut writer = crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD, algo.clone());
+            for _ in 0..5 {
+                writer.write(&payload).await.expect("encode fixture shards");
+            }
+        }
+        encoded[SHARD + algo.size() + algo.size() + 7] ^= 1;
+        let window = encoded.len();
+        let source = buffer_local_shard_stream(ShardReader::Stream(Box::new(Cursor::new(encoded))), window, SHARD)
+            .expect("buffer corruption fixture");
+        let mut reader = BitrotReader::new(source, SHARD, algo, false);
+        let mut output = vec![0xa5; SHARD];
+        reader.read(&mut output).await.expect("first frame is valid");
+        assert_eq!(output, payload);
+        output.fill(0xa5);
+        assert_eq!(
+            reader
+                .read(&mut output)
+                .await
+                .expect_err("corrupt second frame must fail")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(
+            output.iter().all(|byte| *byte == 0xa5),
+            "corrupt prefetched data must not escape verification"
+        );
+    }
 
     #[test]
     fn bitrot_create_file_size_grows_known_length_by_checksums() {

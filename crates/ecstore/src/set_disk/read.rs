@@ -1804,8 +1804,7 @@ impl SetDisks {
                     return Err(Error::other("EC read quantum shard offset exceeds encoded block"));
                 }
                 let shard_remaining = block_shard_size - within_shard;
-                let read_full_block =
-                    within_block == 0 && block_data_len == erasure.block_size && segment_remaining >= block_data_len;
+                let read_full_block = within_block == 0 && segment_remaining >= block_data_len;
                 let (segment_length, read_shard_size, read_offset, output_offset) = if read_full_block {
                     // A complete logical block needs every data shard, but
                     // each shard only once. Group its data-shard segments
@@ -1933,6 +1932,9 @@ impl SetDisks {
                         read_costs,
                         deferred_stripe_handles,
                         deferred_reopeners,
+                        !skip_verify_bitrot
+                            && !require_reconstruction_surplus
+                            && multipart_part_checksum_algo(fi, part_number).size() > 0,
                     )
                     .await;
                 rustfs_io_metrics::record_get_object_quantized_range_frames(
@@ -6141,6 +6143,102 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quantized_range_preserves_frame_shard_block_and_odd_tail_boundaries() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const FRAME_SIZE: usize = 16 * 1024;
+        const TAIL_SIZE: usize = 17_409;
+        let payload: Vec<u8> = (0..BLOCK_SIZE + TAIL_SIZE)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+            .collect();
+        let erasure = coding::Erasure::new(2, 2, BLOCK_SIZE);
+        let mut encoded = vec![Vec::new(); erasure.total_shard_count()];
+        for block in payload.chunks(BLOCK_SIZE) {
+            for (index, shard) in erasure
+                .encode_data(block)
+                .expect("fixture block encodes")
+                .into_iter()
+                .enumerate()
+            {
+                let mut writer = BitrotWriter::new(Vec::new(), FRAME_SIZE, HashAlgorithm::HighwayHash256S);
+                for frame in shard.chunks(FRAME_SIZE) {
+                    writer.write(frame).await.expect("fixture frame writes");
+                }
+                encoded[index].extend(writer.into_inner());
+            }
+        }
+        let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+        fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+        fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+        fi.erasure.block_size = BLOCK_SIZE;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME_SIZE);
+        fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), None, fi.size, None, None);
+        let files: Vec<FileInfo> = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let mut file = fi.clone();
+                file.erasure.index = index + 1;
+                file.data = Some(Bytes::copy_from_slice(bytes));
+                file
+            })
+            .collect();
+        let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        for damage in ["healthy", "corrupt-tail", "missing-data"] {
+            let mut files = files.clone();
+            let mut disks = disks.clone();
+            if damage == "corrupt-tail" {
+                let mut bytes = files[0].data.take().expect("tail shard fixture").to_vec();
+                *bytes.last_mut().expect("odd tail byte") ^= 0x80;
+                files[0].data = Some(Bytes::from(bytes));
+            } else if damage == "missing-data" {
+                disks[0] = None;
+            }
+            for (offset, length) in [
+                (3, 29),
+                (FRAME_SIZE - 3, 9),
+                (erasure.shard_size() - 3, 9),
+                (BLOCK_SIZE - 3, 9),
+                (BLOCK_SIZE + TAIL_SIZE.div_ceil(2) - 3, 9),
+                (BLOCK_SIZE, TAIL_SIZE),
+                (payload.len() - 7, 7),
+                (0, payload.len()),
+            ] {
+                let mut output = Vec::new();
+                SetDisks::get_object_with_fileinfo(
+                    CODEC_STREAMING_TEST_BUCKET,
+                    CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
+                    offset,
+                    i64::try_from(length).expect("range length fits i64"),
+                    &mut output,
+                    fi.clone(),
+                    files.clone(),
+                    &disks,
+                    0,
+                    0,
+                    false,
+                    true,
+                    true,
+                    false,
+                    GET_OBJECT_PATH_SET_DISK,
+                    "plain",
+                    "small",
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{damage}, offset={offset}, length={length}: range must recover: {error}"));
+                assert_eq!(
+                    output,
+                    payload[offset..offset + length],
+                    "{damage}, offset={offset}, length={length}: frame/shard/block/tail order must stay exact"
+                );
+            }
+        }
     }
 
     #[test]

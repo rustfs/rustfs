@@ -234,24 +234,73 @@ where
     }
 
     async fn read_quantized(&mut self, out: &mut [u8], want: usize) -> std::io::Result<usize> {
-        let hash_size = self.hash_algo.size();
         let mut offset = 0;
-        let mut verify = Duration::ZERO;
-        while offset < want {
-            let frame_want = (want - offset).min(self.frame_size);
-            let need = hash_size + frame_want;
-            self.last_frame_count = self.last_frame_count.saturating_add(1);
-            self.read_scratch_block(need, frame_want).await?;
-            let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
-            out[offset..offset + frame_want].copy_from_slice(data);
-            offset += frame_want;
-            verify += frame_verify;
-        }
+        self.read_quantized_frames(want, |data| {
+            out[offset..offset + data.len()].copy_from_slice(data);
+            offset += data.len();
+        })
+        .await?;
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(&out[..want]).await?;
         }
-        self.last_verify_duration = verify;
         Ok(want)
+    }
+
+    /// Coalesce only the frames belonging to the requested logical shard.
+    /// This bounds scratch growth and disk dispatches without reading ahead
+    /// outside the range selected by the caller. Frames share at most 2 MiB
+    /// of serialized bytes and 128 hashes, matching the default Tokio file
+    /// buffer cap. A frame exceeding this cap retains its original size.
+    /// Each frame must authenticate before its bytes reach the sink.
+    async fn read_quantized_frames(&mut self, want: usize, mut append: impl FnMut(&[u8])) -> std::io::Result<()> {
+        const MAX_BATCH_WIRE_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_BATCH_FRAMES: usize = 128;
+
+        let hash_size = self.hash_algo.size();
+        let frame_wire_size = self
+            .frame_size
+            .checked_add(hash_size)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot frame length overflows"))?;
+        let frames_per_batch = (MAX_BATCH_WIRE_BYTES / frame_wire_size).clamp(1, MAX_BATCH_FRAMES);
+        let batch_data_limit = self
+            .frame_size
+            .checked_mul(frames_per_batch)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot batch length overflows"))?;
+        let mut remaining = want;
+        let mut verify = Duration::ZERO;
+        while remaining != 0 {
+            let batch_want = remaining.min(batch_data_limit);
+            let frames = batch_want.div_ceil(self.frame_size);
+            let need = frames
+                .checked_mul(hash_size)
+                .and_then(|hash_bytes| batch_want.checked_add(hash_bytes))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot batch length overflows"))?;
+            if self.buf.len() < need {
+                self.buf.reserve_exact(need - self.buf.len());
+                self.buf.resize(need, 0);
+            }
+            self.last_frame_count = self.last_frame_count.saturating_add(frames);
+            let filled = fill(&mut self.inner, &mut self.buf[..need], &mut self.last_read_dispatch_count).await?;
+            if filled != need {
+                let complete_payload = (filled / frame_wire_size) * self.frame_size;
+                let partial_payload = (filled % frame_wire_size).saturating_sub(hash_size);
+                return Err(short_shard_read(complete_payload + partial_payload, batch_want));
+            }
+            let mut wire_offset = 0;
+            let mut batch_remaining = batch_want;
+            while batch_remaining != 0 {
+                let frame_want = batch_remaining.min(self.frame_size);
+                let wire_end = wire_offset + hash_size + frame_want;
+                let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[wire_offset..wire_end])?;
+                append(data);
+                verify += frame_verify;
+                wire_offset = wire_end;
+                batch_remaining -= frame_want;
+            }
+            remaining -= batch_want;
+        }
+        self.last_verify_duration = verify;
+        Ok(())
     }
 
     /// Read a full `[hash][data]` block of `need` bytes into the scratch buffer
@@ -530,20 +579,7 @@ where
     }
 
     async fn read_quantized_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
-        let hash_size = self.hash_algo.size();
-        let mut offset = 0;
-        let mut verify = Duration::ZERO;
-        while offset < want {
-            let frame_want = (want - offset).min(self.frame_size);
-            let need = hash_size + frame_want;
-            self.last_frame_count = self.last_frame_count.saturating_add(1);
-            self.read_scratch_block(need, frame_want).await?;
-            let (data, frame_verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
-            out.extend_from_slice(data);
-            offset += frame_want;
-            verify += frame_verify;
-        }
-        self.last_verify_duration = verify;
+        self.read_quantized_frames(want, |data| out.extend_from_slice(data)).await?;
         // The outer `read_appending` call performs the optional protected
         // shard verification over the complete logical shard.
         Ok(want)
@@ -2191,6 +2227,8 @@ mod tests {
         }
     }
 
+    impl ShardSource for CountingReader {}
+
     async fn encode_one_block(payload: &[u8], shard_size: usize, algo: HashAlgorithm) -> Vec<u8> {
         let mut w = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo);
         w.write(payload).await.unwrap();
@@ -2411,18 +2449,228 @@ mod tests {
         writer.shutdown().await.expect("finish quantized shard");
         let encoded = writer.into_inline_data().expect("inline quantized bytes");
 
-        let mut reader = BitrotReader::new_with_frame_size(Cursor::new(encoded), SHARD, FRAME, algo, false);
+        let mut reader = BitrotReader::new_with_frame_size(Cursor::new(encoded), SHARD, FRAME, algo.clone(), false);
         let mut first = vec![0u8; 16];
         assert_eq!(reader.read(&mut first).await.expect("read first frames"), first.len());
         assert_eq!(&first, &data[..16]);
         assert_eq!(reader.last_frame_count(), 2);
-        assert_eq!(reader.last_read_dispatch_count(), 2);
+        assert_eq!(reader.last_read_dispatch_count(), 1);
+        assert_eq!(
+            reader.inner_ref().position(),
+            u64::try_from(16 + 2 * algo.size()).expect("wire length fits u64")
+        );
 
         let mut second = vec![0u8; 16];
         assert_eq!(reader.read(&mut second).await.expect("read remaining frames"), second.len());
         assert_eq!(&second, &data[16..]);
         assert_eq!(reader.last_frame_count(), 2);
+        assert_eq!(reader.last_read_dispatch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn quantized_appending_coalesces_full_and_tail_frames_without_read_ahead() {
+        const SHARD: usize = 35;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = (0..SHARD)
+            .map(|index| u8::try_from(index).expect("fixture byte fits u8"))
+            .collect::<Vec<_>>();
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        writer.write(&data).await.expect("write full frames and tail");
+        writer.shutdown().await.expect("finish tail");
+        let encoded = writer.into_inline_data().expect("inline bytes available");
+        let encoded_len = encoded.len();
+
+        let mut reader = BitrotReader::new_with_frame_size(Cursor::new(Bytes::from(encoded)), SHARD, FRAME, algo.clone(), false);
+        let mut out = vec![0xa5; 5];
+        assert_eq!(reader.read_appending(&mut out, 24).await.expect("read first three frames"), 24);
+        assert_eq!(&out[..5], &[0xa5; 5]);
+        assert_eq!(&out[5..], &data[..24]);
+        assert_eq!(reader.last_frame_count(), 3);
+        assert_eq!(reader.last_read_dispatch_count(), 1);
+        assert_eq!(
+            reader.inner_ref().position(),
+            u64::try_from(24 + 3 * algo.size()).expect("wire length fits u64")
+        );
+
+        assert_eq!(
+            reader
+                .read_appending(&mut out, 11)
+                .await
+                .expect("read remaining frame and short tail"),
+            11
+        );
+        assert_eq!(&out[5..], &data);
+        assert_eq!(reader.last_frame_count(), 2);
+        assert_eq!(reader.last_read_dispatch_count(), 1);
+        assert_eq!(reader.inner_ref().position(), u64::try_from(encoded_len).expect("wire length fits u64"));
+
+        assert_eq!(reader.read_appending(&mut out, 0).await.expect("empty read is a no-op"), 0);
+        assert_eq!(reader.last_frame_count(), 0);
+        assert_eq!(reader.last_read_dispatch_count(), 0);
+        let error = reader
+            .read_appending(&mut out, 1)
+            .await
+            .expect_err("EOF is not a clean short success");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(&out[5..], &data);
+    }
+
+    #[tokio::test]
+    async fn quantized_batch_rejects_truncation_in_every_hash_and_payload() {
+        const SHARD: usize = 35;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![0x17; SHARD];
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        writer.write(&data).await.expect("write full frames and tail");
+        writer.shutdown().await.expect("finish tail");
+        let encoded = writer.into_inline_data().expect("inline bytes available");
+
+        for skip_verify in [false, true] {
+            for end in 0..encoded.len() {
+                let truncated = &encoded[..end];
+                let mut reader =
+                    BitrotReader::new_with_frame_size(Cursor::new(truncated), SHARD, FRAME, algo.clone(), skip_verify);
+                let mut out = vec![0xa5; SHARD];
+                let error = reader.read(&mut out).await.expect_err("truncated framed read must fail");
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "wire end={end}, skip_verify={skip_verify}");
+                assert_eq!(crate::disk::error::Error::from(error), crate::disk::error::Error::FileCorrupt);
+                assert_eq!(out, vec![0xa5; SHARD], "incomplete batch must not emit payload");
+
+                let mut reader =
+                    BitrotReader::new_with_frame_size(Cursor::new(truncated), SHARD, FRAME, algo.clone(), skip_verify);
+                let mut out = vec![0xa5; 5];
+                let error = reader
+                    .read_appending(&mut out, SHARD)
+                    .await
+                    .expect_err("truncated append must fail");
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "wire end={end}, skip_verify={skip_verify}");
+                assert_eq!(out, vec![0xa5; 5], "incomplete batch must preserve existing output");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quantized_batch_verifies_each_frame_before_exposing_its_payload() {
+        const SHARD: usize = 35;
+        const FRAME: usize = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![0x17; SHARD];
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        writer.write(&data).await.expect("write full frames and tail");
+        writer.shutdown().await.expect("finish tail");
+        let encoded = writer.into_inline_data().expect("inline bytes available");
+
+        for frame in 0..SHARD.div_ceil(FRAME) {
+            for corrupt_offset in [0, algo.size()] {
+                let mut corrupt = encoded.clone();
+                corrupt[frame * (FRAME + algo.size()) + corrupt_offset] ^= 0x80;
+                let mut reader =
+                    BitrotReader::new_with_frame_size(Cursor::new(corrupt.clone()), SHARD, FRAME, algo.clone(), false);
+                let mut out = vec![0xa5; SHARD];
+                let error = reader
+                    .read(&mut out)
+                    .await
+                    .expect_err("every hash and data frame must authenticate");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(crate::disk::error::Error::from(error), crate::disk::error::Error::FileCorrupt);
+                let verified_len = frame * FRAME;
+                assert_eq!(&out[..verified_len], &data[..verified_len]);
+                assert!(
+                    out[verified_len..].iter().all(|byte| *byte == 0xa5),
+                    "failed frame must not reach the sink"
+                );
+
+                let mut reader = BitrotReader::new_with_frame_size(Cursor::new(corrupt), SHARD, FRAME, algo.clone(), false);
+                let mut out = vec![0xa5; 5];
+                let error = reader
+                    .read_appending(&mut out, SHARD)
+                    .await
+                    .expect_err("append must authenticate each frame");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(&out[..5], &[0xa5; 5]);
+                assert_eq!(&out[5..], &data[..verified_len], "only verified preceding frames may be appended");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quantized_batches_bound_scratch_by_wire_bytes_and_frame_count() {
+        let algo = HashAlgorithm::HighwayHash256S;
+        for (frame, shard, expected_dispatches) in [
+            (2, 2 * 513, 5),
+            (16 * 1024, 2 * 1024 * 1024 + 16 * 1024, 2),
+            (1024 * 1024, 2 * 1024 * 1024, 2),
+            (3 * 1024 * 1024, 3 * 1024 * 1024 + 1024, 2),
+        ] {
+            let data = vec![0x17; shard];
+            let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), frame, algo.clone());
+            writer.write(&data).await.expect("write many frames");
+            writer.shutdown().await.expect("finish many frames");
+            let encoded = writer.into_inline_data().expect("inline bytes available");
+            let reads = Arc::new(AtomicUsize::new(0));
+            let source = CountingReader {
+                data: Cursor::new(encoded),
+                reads: reads.clone(),
+                chunk: usize::MAX,
+            };
+            let mut reader = BitrotReader::new_with_frame_size(source, shard, frame, algo.clone(), false);
+            let mut out = Vec::new();
+            assert_eq!(
+                reader
+                    .read_appending(&mut out, shard)
+                    .await
+                    .expect("read multiple bounded batches"),
+                shard
+            );
+            assert_eq!(out, data);
+            assert_eq!(reader.last_frame_count(), shard.div_ceil(frame));
+            assert_eq!(reader.last_read_dispatch_count(), expected_dispatches);
+            assert_eq!(reads.load(Ordering::SeqCst), expected_dispatches);
+            assert!(
+                reader.buf.len() <= (2usize * 1024 * 1024).max(frame + algo.size()),
+                "batch wire bytes must have a fixed bound"
+            );
+            assert!(
+                reader.buf.capacity() <= (2usize * 1024 * 1024).max(frame + algo.size()),
+                "scratch capacity must avoid geometric growth past the batch bound"
+            );
+            if frame == 1024 * 1024 {
+                assert_eq!(reader.buf.len(), frame + algo.size(), "two 1 MiB frames do not fit one Tokio file buffer");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quantized_tokio_file_keeps_large_frames_within_its_buffer_cap() {
+        const FRAME: usize = 1024 * 1024;
+        const SHARD: usize = 2 * FRAME;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![0x17; SHARD];
+        let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), FRAME, algo.clone());
+        writer.write(&data).await.expect("write two 1 MiB authenticated frames");
+        writer.shutdown().await.expect("finish encoded fixture");
+        let encoded = writer.into_inline_data().expect("inline bytes available");
+        let directory = tempfile::tempdir().expect("create file fixture directory");
+        let path = directory.path().join("quantized-shard");
+        tokio::fs::write(&path, &encoded).await.expect("write real file fixture");
+        let file = tokio::fs::File::open(&path).await.expect("open real file fixture");
+        assert_eq!(file.max_buf_size(), 2 * FRAME, "exercise Tokio's default file buffer cap");
+        let mut reader = BitrotReader::new_with_frame_size(file, SHARD, FRAME, algo.clone(), false);
+        let mut decoded = vec![0; SHARD];
+        assert_eq!(
+            reader
+                .read(&mut decoded)
+                .await
+                .expect("read real file with bounded frame batches"),
+            SHARD
+        );
+        assert_eq!(decoded, data);
+        assert_eq!(reader.last_frame_count(), 2);
+        // This counts completed AsyncRead calls, not physical disk requests.
         assert_eq!(reader.last_read_dispatch_count(), 2);
+        assert_eq!(reader.buf.len(), FRAME + algo.size(), "avoid a 2 MiB plus hashes scratch allocation");
     }
 
     #[tokio::test]
