@@ -689,6 +689,11 @@ impl TableCatalogLockGuard {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_namespace(guard: rustfs_lock::NamespaceLockGuard) -> Self {
+        Self::namespace(guard)
+    }
+
     fn write_namespace(guard: WriteCommitGuard) -> Self {
         let lock_lost = guard.lock_lost_signal();
         Self {
@@ -969,6 +974,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         None
     }
 
+    fn table_commit_object_mutation_fence(&self) -> Option<TableCatalogObjectMutationFence> {
+        None
+    }
+
     fn complete_table_commit_publication(&self) {}
 }
 
@@ -1093,6 +1102,10 @@ where
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         TableCatalogObjectBackend::catalog_migration_read_permit_status(self)
+    }
+
+    fn object_mutation_fence(&self) -> Option<TableCatalogObjectMutationFence> {
+        self.table_commit_object_mutation_fence()
     }
 
     fn complete(&self) {
@@ -3070,6 +3083,149 @@ mod tests {
                     .object_exists(&entry.table_bucket, &entry.metadata_location)
                     .await
                     .unwrap()
+            );
+        }
+    }
+
+    fn maintenance_rename_destination(entry: &TableEntry) -> (TableEntry, String, String) {
+        let mut destination = entry.clone();
+        destination.table = "tablearchived".to_string();
+        let paths = TableCatalogObjectPaths::default();
+        let namespace = Namespace::parse(&entry.namespace).unwrap();
+        let source_path = paths.table_maintenance_config_path(
+            &entry.table_bucket,
+            &namespace,
+            &IdentifierSegment::parse(&entry.table).unwrap(),
+            &entry.table_id,
+        );
+        let destination_path = paths.table_maintenance_config_path(
+            &destination.table_bucket,
+            &namespace,
+            &IdentifierSegment::parse(&destination.table).unwrap(),
+            &destination.table_id,
+        );
+        (destination, source_path, destination_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn table_maintenance_rename_await_loss_prevents_destination_copy() {
+        let MaintenanceMutationFixture {
+            backend, sidecar, entry, ..
+        } = maintenance_mutation_fixture(false).await;
+        let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
+        let source_before = backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap();
+        assert!(source_before.is_some());
+        assert!(!backend.object_exists(RUSTFS_META_BUCKET, &destination_path).await.unwrap());
+        let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
+        let fence = publication.object_mutation_fence().unwrap();
+        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &destination_path).await;
+        let operation = sidecar.prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence);
+        let interfere = async {
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
+                .await
+                .unwrap();
+            lose_maintenance_lease(&client, &publication).await;
+            pause.release();
+        };
+        let (result, ()) = tokio::join!(operation, interfere);
+        assert!(result.is_err());
+        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap(), source_before);
+        assert!(!backend.object_exists(RUSTFS_META_BUCKET, &destination_path).await.unwrap());
+        assert!(
+            sidecar
+                .read_table_maintenance_rename_intent(&entry.table_bucket)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn table_maintenance_rename_await_loss_prevents_source_cleanup() {
+        let MaintenanceMutationFixture {
+            backend, sidecar, entry, ..
+        } = maintenance_mutation_fixture(false).await;
+        let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
+        let source_before = backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap();
+        assert!(source_before.is_some());
+        let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
+        let fence = publication.object_mutation_fence().unwrap();
+        let (intent, intent_etag) = sidecar
+            .prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence)
+            .await
+            .unwrap()
+            .expect("source maintenance config must be prepared for rename");
+        let destination_before = backend.read_object(RUSTFS_META_BUCKET, &destination_path).await.unwrap();
+        assert!(destination_before.is_some());
+        let pause = backend.pause_next_delete(RUSTFS_META_BUCKET, &source_path).await;
+        let operation = sidecar.finish_table_maintenance_rename(&intent, &intent_etag, true, &fence);
+        let interfere = async {
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
+                .await
+                .unwrap();
+            lose_maintenance_lease(&client, &publication).await;
+            pause.release();
+        };
+        let (result, ()) = tokio::join!(operation, interfere);
+        assert!(result.is_err());
+        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap(), source_before);
+        assert_eq!(
+            backend.read_object(RUSTFS_META_BUCKET, &destination_path).await.unwrap(),
+            destination_before
+        );
+        assert!(
+            sidecar
+                .read_table_maintenance_rename_intent(&entry.table_bucket)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn table_maintenance_rename_delete_cas_preserves_same_content_replacement() {
+        for committed in [true, false] {
+            let MaintenanceMutationFixture {
+                backend, sidecar, entry, ..
+            } = maintenance_mutation_fixture(false).await;
+            let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
+            let fence = TableCatalogObjectMutationFence::default();
+            let (intent, intent_etag) = sidecar
+                .prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence)
+                .await
+                .unwrap()
+                .expect("source maintenance config must be prepared for rename");
+            let (target_path, other_path) = if committed {
+                (&source_path, &destination_path)
+            } else {
+                (&destination_path, &source_path)
+            };
+            let target_before = backend.read_object(RUSTFS_META_BUCKET, target_path).await.unwrap().unwrap();
+            let other_before = backend.read_object(RUSTFS_META_BUCKET, other_path).await.unwrap();
+            assert!(other_before.is_some());
+            let pause = backend.pause_next_delete(RUSTFS_META_BUCKET, target_path).await;
+            let operation = sidecar.finish_table_maintenance_rename(&intent, &intent_etag, committed, &fence);
+            let interfere = async {
+                tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
+                    .await
+                    .unwrap();
+                backend
+                    .seed_object(RUSTFS_META_BUCKET, target_path, target_before.data.clone())
+                    .await;
+                pause.release();
+            };
+            let (result, ()) = tokio::join!(operation, interfere);
+            assert!(matches!(result, Err(TableCatalogStoreError::Conflict(_))));
+            let replacement = backend.read_object(RUSTFS_META_BUCKET, target_path).await.unwrap().unwrap();
+            assert_eq!(replacement.data, target_before.data);
+            assert_ne!(replacement.etag, target_before.etag);
+            assert_eq!(backend.read_object(RUSTFS_META_BUCKET, other_path).await.unwrap(), other_before);
+            assert!(
+                sidecar
+                    .read_table_maintenance_rename_intent(&entry.table_bucket)
+                    .await
+                    .unwrap()
+                    .is_some()
             );
         }
     }

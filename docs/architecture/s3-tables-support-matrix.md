@@ -102,6 +102,15 @@ metadata or warehouse directory, including a recreated source name after rename.
 Such tables require disjoint cleanup roots before maintenance can run; enabling
 deletion does not override this ownership check.
 
+Durable-strong rename preserves maintenance configuration, job identifiers,
+current/latest aliases, history, audit events, and quarantine state. A persisted
+rename intent protects sidecar migration across interruption: the source remains
+authoritative until the catalog CAS succeeds, and the destination records are
+ready before publication. Retry the same rename to finish pending recovery.
+Backup, restore, register, drop, and subsequent rename operations recover a
+pending migration before proceeding. Complete pending rename recovery before
+rolling back to a version that does not understand maintenance migration intents.
+
 | Capability | Status | Claim |
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the pointer. |

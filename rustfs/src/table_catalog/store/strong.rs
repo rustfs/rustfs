@@ -344,6 +344,77 @@ where
         Ok(())
     }
 
+    // Call only with migration -> bucket publication -> local write locks held.
+    // Reads remain side-effect free: a prepared rename never removes its source sidecars,
+    // and a published rename already has a complete destination before this cleanup.
+    pub(super) async fn recover_table_maintenance_rename_unlocked(
+        &self,
+        table_bucket: &str,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<Option<(object::TableMaintenanceRenameIntent, bool)>> {
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let Some((intent, etag)) = sidecar
+            .read_table_maintenance_rename_intent(table_bucket)
+            .await
+            .map_err(object::maintenance_rename_recovery_error)?
+        else {
+            return Ok(None);
+        };
+        let fence = fence.ok_or_else(|| {
+            TableCatalogStoreError::Conflict("maintenance rename recovery requires a storage mutation fence".to_string())
+        })?;
+        fence.ensure_held()?;
+        let source_key = Self::table_key(
+            table_bucket,
+            &parse_namespace_for_store(&intent.source.namespace)?,
+            &parse_table_for_store(&intent.source.table)?,
+        );
+        let destination_key = Self::table_key(
+            table_bucket,
+            &parse_namespace_for_store(&intent.destination.namespace)?,
+            &parse_table_for_store(&intent.destination.table)?,
+        );
+        let committed = {
+            let state = self.state.lock().await;
+            let source = state.tables.get(&source_key);
+            let destination = state.tables.get(&destination_key);
+            let owned_tables = state
+                .tables
+                .values()
+                .filter(|entry| entry.table_bucket == table_bucket && entry.table_id == intent.source.table_id)
+                .count();
+            if owned_tables != 1 {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename recovery table identity is not unique; repair persisted state before retrying rename"
+                        .to_string(),
+                ));
+            }
+            let identity_matches = |entry: &TableEntry| {
+                entry.table_id == intent.source.table_id
+                    && entry.table_uuid == intent.source.table_uuid
+                    && entry.state == TableCatalogEntryState::Active
+            };
+            if source.is_some_and(identity_matches) && destination.is_none() {
+                false
+            } else if source.is_none()
+                && destination.is_some_and(identity_matches)
+                && state
+                    .snapshot_etag
+                    .as_deref()
+                    .is_some_and(|etag| etag != intent.source_snapshot_etag)
+            {
+                true
+            } else {
+                return Err(TableCatalogStoreError::Conflict("maintenance rename recovery does not match the catalog publication state; repair persisted state before retrying rename".to_string()));
+            }
+        };
+        sidecar
+            .finish_table_maintenance_rename(&intent, &etag, committed, fence)
+            .await
+            .map_err(object::maintenance_rename_recovery_error)?;
+        Ok(Some((intent, committed)))
+    }
+
     pub fn new(object_backend: B) -> Self {
         Self::new_with_snapshot_requirement(object_backend, false)
     }
@@ -3158,6 +3229,14 @@ where
         self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
         let publication_identity = (entry.table_bucket.clone(), entry.namespace.clone(), entry.table.clone());
+        let mut recovery_fence = publication.object_mutation_fence();
+        if let Some(fence) = recovery_fence.as_mut() {
+            fence
+                .signals
+                .extend(_migration_guard.as_ref().and_then(TableCatalogLockGuard::lock_lost_signal));
+        }
+        self.recover_table_maintenance_rename_unlocked(&entry.table_bucket, recovery_fence.as_ref())
+            .await?;
         let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
@@ -3292,9 +3371,9 @@ where
         destination_namespace: &str,
         destination_table: &str,
     ) -> TableCatalogStoreResult<()> {
-        let publication = TableCommitLockPublication::new(&self.object_backend);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let publication = self.table_maintenance_publication().await?;
         publication.begin_table_bucket(table_bucket).await?;
+        publication.prepare(table_bucket, source_namespace, source_table).await?;
         if !publication.holds_table_bucket(table_bucket) {
             return Err(TableCatalogStoreError::Internal(
                 "table rename requires a table-bucket publication fence".to_string(),
@@ -3310,8 +3389,21 @@ where
         let destination_table = parse_table_for_store(destination_table)?;
         let source_key = Self::table_key(table_bucket, &source_namespace, &source_table);
         let destination_key = Self::table_key(table_bucket, &destination_namespace, &destination_table);
+        let fence = publication
+            .object_mutation_fence()
+            .ok_or_else(|| TableCatalogStoreError::Internal("table rename requires a storage mutation fence".to_string()))?;
+        if let Some((recovered, true)) = self
+            .recover_table_maintenance_rename_unlocked(table_bucket, Some(&fence))
+            .await?
+            && recovered.source.namespace == source_namespace.public_name()
+            && recovered.source.table == source_table.as_str()
+            && recovered.destination.namespace == destination_namespace.public_name()
+            && recovered.destination.table == destination_table.as_str()
+        {
+            return Ok(());
+        }
 
-        let (snapshot, precondition, postcondition) = {
+        let (snapshot, precondition, postcondition, source, destination) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, table_bucket)?;
             Self::ensure_identifier_is_unambiguous_locked(&state, &source_key)?;
@@ -3356,7 +3448,7 @@ where
 
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
             draft_state.tables.remove(&source_key);
-            let mut destination = source;
+            let mut destination = source.clone();
             destination.namespace = destination_namespace.public_name();
             destination.table = destination_table.as_str().to_string();
             draft_state.tables.insert(destination_key.clone(), destination.clone());
@@ -3366,11 +3458,31 @@ where
                 StrongSnapshotWritePostcondition::TableRenamed {
                     source_key,
                     destination_key,
-                    table_id: destination.table_id,
+                    table_id: destination.table_id.clone(),
                 },
+                source,
+                destination,
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+        let TableCatalogPutPrecondition::IfMatch(source_snapshot_etag) = &precondition else {
+            return Err(TableCatalogStoreError::Internal(
+                "table rename requires an existing snapshot watermark".to_string(),
+            ));
+        };
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let pending = sidecar
+            .prepare_table_maintenance_rename(&source, &destination, source_snapshot_etag, &fence)
+            .await
+            .map_err(object::maintenance_rename_recovery_error)?;
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, Some(&fence))
+            .await?;
+        if let Some((intent, etag)) = pending {
+            sidecar
+                .finish_table_maintenance_rename(&intent, &etag, true, &fence)
+                .await
+                .map_err(object::maintenance_rename_recovery_error)?;
+        }
+        Ok(())
     }
 
     async fn resolve_table_data_plane_resource(
@@ -3646,8 +3758,7 @@ where
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
-        let publication = TableCommitLockPublication::new(&self.object_backend);
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let publication = self.table_maintenance_publication().await?;
         publication.begin_table_bucket(table_bucket).await?;
         publication.prepare(table_bucket, namespace, table).await?;
         if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
@@ -3658,6 +3769,9 @@ where
         let _publication_completion = TableCommitPublicationCompletion::new(&publication);
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
+        let recovery_fence = publication.object_mutation_fence();
+        self.recover_table_maintenance_rename_unlocked(table_bucket, recovery_fence.as_ref())
+            .await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let key = Self::table_key(table_bucket, &namespace, &table);

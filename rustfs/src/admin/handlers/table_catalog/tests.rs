@@ -1026,6 +1026,88 @@ fn table_commit_publication_acquires_migration_permits_before_publication_lock()
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{TableCatalogLockGuard, TableCatalogObjectPaths, TableCommitPublication};
+    use rustfs_lock::LockClient;
+
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+    let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+    TableCommitPublication::begin_table_bucket(&commit_backend, "analytics")
+        .await
+        .unwrap();
+    TableCommitPublication::prepare(&commit_backend, "analytics", "sales", "orders")
+        .await
+        .unwrap();
+    let client = Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(
+        Arc::new(rustfs_lock::FastObjectLockManager::new()),
+    ))));
+    let lock = rustfs_lock::NamespaceLockWrapper::new(
+        rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            "rest-publication-fence-probe".to_string(),
+            vec![client.clone() as Arc<dyn LockClient>],
+            1,
+        ),
+        rustfs_lock::ObjectKey::new(
+            RUSTFS_META_BUCKET,
+            TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path(),
+        ),
+        "rest-publication-migration".to_string(),
+    );
+    let guard = lock.get_read_lock(StdDuration::from_secs(5)).await.unwrap();
+    let lock_id = guard.lock_id().expect("distributed migration lease has an ID").clone();
+    {
+        let mut publication = commit_backend.publication.lock();
+        publication.guards.push(TableCatalogLockGuard::test_namespace(guard));
+        publication.catalog_migration_read_permit = true;
+    }
+    let fence = TableCommitPublication::object_mutation_fence(&commit_backend)
+        .expect("REST publication must forward its held guards to the storage fence");
+    fence.ensure_held().unwrap();
+    assert!(TableCommitPublication::holds_table_bucket(&commit_backend, "analytics"));
+    assert!(TableCommitPublication::holds_table(&commit_backend, "analytics", "sales", "orders"));
+    assert_eq!(TableCommitPublication::catalog_migration_read_permit_status(&commit_backend), Some(true));
+
+    let object = "rest-publication-fence-probe.json";
+    metadata_backend
+        .seed_object(RUSTFS_META_BUCKET, object, b"before".to_vec())
+        .await;
+    let before = metadata_backend
+        .read_object(RUSTFS_META_BUCKET, object)
+        .await
+        .unwrap()
+        .unwrap();
+    let pause = metadata_backend.pause_next_put(RUSTFS_META_BUCKET, object).await;
+    let operation = metadata_backend.put_object_fenced(
+        RUSTFS_META_BUCKET,
+        object,
+        b"after".to_vec(),
+        crate::table_catalog::TableCatalogPutPrecondition::IfMatch(before.etag.clone().unwrap()),
+        &fence,
+    );
+    let interfere = async {
+        tokio::time::timeout(StdDuration::from_secs(5), pause.wait_started())
+            .await
+            .unwrap();
+        assert!(client.force_release(&lock_id).await.unwrap());
+        tokio::time::timeout(StdDuration::from_secs(15), async {
+            while fence.ensure_held().is_ok() {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("REST publication fence observes migration lease loss during backend await");
+        assert!(!TableCommitPublication::holds_table_bucket(&commit_backend, "analytics"));
+        assert!(!TableCommitPublication::holds_table(&commit_backend, "analytics", "sales", "orders"));
+        assert_eq!(TableCommitPublication::catalog_migration_read_permit_status(&commit_backend), Some(false));
+        pause.release();
+    };
+    let (result, ()) = tokio::join!(operation, interfere);
+    assert!(result.is_err());
+    assert_eq!(metadata_backend.read_object(RUSTFS_META_BUCKET, object).await.unwrap(), Some(before));
+}
+
 #[test]
 fn table_catalog_resource_builds_policy_object_scope() {
     let namespace = crate::table_catalog::Namespace::parse("analytics.daily_events").expect("namespace should parse");

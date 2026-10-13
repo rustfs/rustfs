@@ -14,6 +14,129 @@
 
 use super::*;
 
+const TABLE_MAINTENANCE_RENAME_MAX_OBJECTS: usize = 4096;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TableMaintenanceRenameObject {
+    etag: String,
+    data: serde_json::Value,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TableMaintenanceRenameIntent {
+    version: u16,
+    pub(super) source: TableEntry,
+    pub(super) destination: TableEntry,
+    pub(super) source_snapshot_etag: String,
+    source_objects: BTreeMap<String, TableMaintenanceRenameObject>,
+    destination_etags: BTreeMap<String, String>,
+}
+
+fn maintenance_rename_intent_path(table_bucket: &str) -> String {
+    format!(
+        "{}maintenance-rename-intent.json",
+        TableCatalogObjectPaths::default().table_bucket_root_prefix(table_bucket)
+    )
+}
+
+pub(super) fn maintenance_rename_recovery_error(mut error: TableCatalogStoreError) -> TableCatalogStoreError {
+    let message = match &mut error {
+        TableCatalogStoreError::NotFound(message)
+        | TableCatalogStoreError::NamespaceNotFound(message)
+        | TableCatalogStoreError::TableNotFound(message)
+        | TableCatalogStoreError::AlreadyExists(message)
+        | TableCatalogStoreError::Conflict(message)
+        | TableCatalogStoreError::Invalid(message)
+        | TableCatalogStoreError::Unsupported(message)
+        | TableCatalogStoreError::Unavailable(message)
+        | TableCatalogStoreError::Internal(message) => message,
+    };
+    *message = format!(
+        "maintenance rename recovery required; retry the same rename after transient errors, or repair invalid persisted state before retrying: {message}"
+    );
+    error
+}
+
+fn maintenance_rename_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    let namespace = parse_namespace_for_store(&entry.namespace)?;
+    let table = parse_table_for_store(&entry.table)?;
+    let path = TableCatalogObjectPaths::default().table_maintenance_config_path(
+        &entry.table_bucket,
+        &namespace,
+        &table,
+        &entry.table_id,
+    );
+    Ok(path.trim_end_matches(MAINTENANCE_CONFIG_FILE).to_string())
+}
+
+fn maintenance_rename_suffix_is_valid(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        MAINTENANCE_CONFIG_FILE | MAINTENANCE_CURRENT_JOB_FILE | MAINTENANCE_LATEST_JOB_FILE
+    ) || suffix
+        .strip_prefix(&format!("{MAINTENANCE_JOB_ROOT}/"))
+        .and_then(|suffix| suffix.strip_suffix(".json"))
+        .is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn maintenance_rename_data(
+    entry: &TableEntry,
+    destination: &TableEntry,
+    suffix: &str,
+    data: &serde_json::Value,
+) -> TableCatalogStoreResult<serde_json::Value> {
+    if !maintenance_rename_suffix_is_valid(suffix) {
+        return Err(TableCatalogStoreError::Invalid(
+            "unexpected table maintenance rename object path".to_string(),
+        ));
+    }
+    if suffix == MAINTENANCE_CONFIG_FILE {
+        let config = serde_json::from_value::<TableMaintenanceConfig>(data.clone())
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid maintenance rename config: {err}")))?;
+        validate_table_maintenance_config(&config)?;
+        return Ok(data.clone());
+    }
+    let report = serde_json::from_value::<TableMetadataMaintenanceReport>(data.clone())
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid maintenance rename report: {err}")))?;
+    let namespace = parse_namespace_for_store(&entry.namespace)?;
+    let table = parse_table_for_store(&entry.table)?;
+    validate_table_maintenance_report_owner(&report, &entry.table_bucket, &namespace, &table, &entry.table_id)?;
+    if suffix.starts_with(&format!("{MAINTENANCE_JOB_ROOT}/"))
+        && suffix != format!("{MAINTENANCE_JOB_ROOT}/{}.json", table_catalog_path_hash(&report.job.job_id))
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "maintenance rename job does not match its object path".to_string(),
+        ));
+    }
+    // Preserve every report field, including audit records and unknown additive fields.
+    // Only catalog owner identifiers change; physical locations and generations do not.
+    let mut renamed = data.clone();
+    for field in ["job", "snapshot-expiration", "compaction"] {
+        let Some(owner) = renamed.get_mut(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if owner.get("table_bucket").and_then(serde_json::Value::as_str) != Some(entry.table_bucket.as_str())
+            || owner.get("namespace").and_then(serde_json::Value::as_str) != Some(entry.namespace.as_str())
+            || owner.get("table").and_then(serde_json::Value::as_str) != Some(entry.table.as_str())
+            || owner.get("table_id").and_then(serde_json::Value::as_str) != Some(entry.table_id.as_str())
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "maintenance rename nested report owner does not match its table".to_string(),
+            ));
+        }
+        owner["namespace"] = serde_json::Value::String(destination.namespace.clone());
+        owner["table"] = serde_json::Value::String(destination.table.clone());
+    }
+    Ok(renamed)
+}
+
 fn ensure_table_maintenance_publication_held(
     publication: Option<&(dyn TableCommitPublication + Sync)>,
     entry: &TableEntry,
@@ -701,6 +824,299 @@ where
         }
         entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
         Ok(entries)
+    }
+
+    async fn collect_table_maintenance_rename_objects(
+        &self,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<BTreeMap<String, TableMaintenanceRenameObject>> {
+        let prefix = maintenance_rename_prefix(entry)?;
+        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("maintenance rename page limit must be positive".to_string()))?;
+        let mut cursor: Option<String> = None;
+        let mut objects = BTreeMap::new();
+        let mut total_bytes = 0usize;
+        loop {
+            let page = self
+                .backend
+                .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
+                .await?;
+            if page.objects.len() > limit.get() || (page.is_truncated && page.objects.is_empty()) {
+                return Err(TableCatalogStoreError::Invalid("invalid maintenance rename listing page".to_string()));
+            }
+            for object in page.objects {
+                if cursor.as_ref().is_some_and(|cursor| object <= *cursor) {
+                    return Err(TableCatalogStoreError::Invalid("maintenance rename listing did not advance".to_string()));
+                }
+                let suffix = object
+                    .strip_prefix(&prefix)
+                    .filter(|suffix| maintenance_rename_suffix_is_valid(suffix))
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Invalid("maintenance rename listing escaped its owner paths".to_string())
+                    })?;
+                if objects.len() >= TABLE_MAINTENANCE_RENAME_MAX_OBJECTS {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "maintenance rename object count exceeds its limit".to_string(),
+                    ));
+                }
+                let value = self
+                    .backend
+                    .read_object_limited(self.catalog_bucket(), &object, TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE)
+                    .await?
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Conflict("maintenance rename object disappeared during collection".to_string())
+                    })?;
+                total_bytes = total_bytes.saturating_add(value.data.len());
+                if total_bytes > TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_BYTES {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "maintenance rename content exceeds its byte limit".to_string(),
+                    ));
+                }
+                let etag = value
+                    .etag
+                    .filter(|etag| !etag.is_empty())
+                    .ok_or_else(|| TableCatalogStoreError::Conflict("maintenance rename object has no ETag".to_string()))?;
+                let data = serde_json::from_slice(&value.data)
+                    .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid maintenance rename JSON: {err}")))?;
+                maintenance_rename_data(entry, entry, suffix, &data)?;
+                objects.insert(suffix.to_string(), TableMaintenanceRenameObject { etag, data });
+                cursor = Some(object);
+            }
+            if !page.is_truncated {
+                return Ok(objects);
+            }
+        }
+    }
+
+    pub(super) async fn read_table_maintenance_rename_intent(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<Option<(TableMaintenanceRenameIntent, String)>> {
+        let object = maintenance_rename_intent_path(table_bucket);
+        let Some(value) = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), &object, TABLE_CATALOG_BACKUP_MAX_SIZE)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let intent: TableMaintenanceRenameIntent = serde_json::from_slice(&value.data)
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid maintenance rename intent: {err}")))?;
+        let etag = value
+            .etag
+            .filter(|etag| !etag.is_empty())
+            .ok_or_else(|| TableCatalogStoreError::Conflict("maintenance rename intent has no ETag".to_string()))?;
+        validate_table_entry_version_and_id(&intent.source)?;
+        validate_table_entry_version_and_id(&intent.destination)?;
+        let mut expected_destination = intent.source.clone();
+        expected_destination.namespace.clone_from(&intent.destination.namespace);
+        expected_destination.table.clone_from(&intent.destination.table);
+        if intent.version != 1
+            || intent.source_snapshot_etag.is_empty()
+            || intent.source.table_bucket != table_bucket
+            || intent.source.state != TableCatalogEntryState::Active
+            || intent.destination != expected_destination
+            || (intent.source.namespace == intent.destination.namespace && intent.source.table == intent.destination.table)
+            || intent.source_objects.len() > TABLE_MAINTENANCE_RENAME_MAX_OBJECTS
+            || intent.destination_etags.len() > TABLE_MAINTENANCE_RENAME_MAX_OBJECTS
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "invalid maintenance rename intent identity, version, or count".to_string(),
+            ));
+        }
+        maintenance_rename_prefix(&intent.source)?;
+        maintenance_rename_prefix(&intent.destination)?;
+        let mut total_bytes = 0usize;
+        for (suffix, value) in &intent.source_objects {
+            let size = serde_json::to_vec(&value.data)
+                .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid maintenance rename data: {err}")))?
+                .len();
+            total_bytes = total_bytes.saturating_add(size);
+            if value.etag.is_empty()
+                || size > TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE
+                || total_bytes > TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_BYTES
+            {
+                return Err(TableCatalogStoreError::Invalid(
+                    "maintenance rename intent object exceeds its limits".to_string(),
+                ));
+            }
+            maintenance_rename_data(&intent.source, &intent.destination, suffix, &value.data)?;
+        }
+        if intent
+            .destination_etags
+            .iter()
+            .any(|(suffix, etag)| !maintenance_rename_suffix_is_valid(suffix) || etag.is_empty())
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "invalid maintenance rename destination watermark".to_string(),
+            ));
+        }
+        Ok(Some((intent, etag)))
+    }
+
+    pub(super) async fn prepare_table_maintenance_rename(
+        &self,
+        source: &TableEntry,
+        destination: &TableEntry,
+        source_snapshot_etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<Option<(TableMaintenanceRenameIntent, String)>> {
+        fence.ensure_held()?;
+        let source_objects = self.collect_table_maintenance_rename_objects(source).await?;
+        let destination_objects = self.collect_table_maintenance_rename_objects(destination).await?;
+        if source_objects.is_empty() && destination_objects.is_empty() {
+            return Ok(None);
+        }
+        let intent = TableMaintenanceRenameIntent {
+            version: 1,
+            source: source.clone(),
+            destination: destination.clone(),
+            source_snapshot_etag: source_snapshot_etag.to_string(),
+            source_objects,
+            destination_etags: destination_objects
+                .into_iter()
+                .map(|(key, value)| (key, value.etag))
+                .collect(),
+        };
+        let object = maintenance_rename_intent_path(&source.table_bucket);
+        let data = serde_json::to_vec(&intent)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize maintenance rename intent: {err}")))?;
+        if data.len() > TABLE_CATALOG_BACKUP_MAX_SIZE {
+            return Err(TableCatalogStoreError::Invalid(
+                "maintenance rename intent exceeds its byte limit".to_string(),
+            ));
+        }
+        self.backend
+            .put_object_fenced(self.catalog_bucket(), &object, data, TableCatalogPutPrecondition::IfAbsent, fence)
+            .await?;
+        let (persisted_intent, intent_etag) = self
+            .read_table_maintenance_rename_intent(&source.table_bucket)
+            .await?
+            .ok_or_else(|| TableCatalogStoreError::Conflict("maintenance rename intent disappeared".to_string()))?;
+        if persisted_intent != intent {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance rename intent changed during preparation".to_string(),
+            ));
+        }
+        let destination_prefix = maintenance_rename_prefix(destination)?;
+        for (suffix, value) in &intent.source_objects {
+            let renamed = maintenance_rename_data(source, destination, suffix, &value.data)?;
+            let data = serde_json::to_vec(&renamed).map_err(|err| {
+                TableCatalogStoreError::Internal(format!("failed to serialize renamed maintenance object: {err}"))
+            })?;
+            let precondition = intent
+                .destination_etags
+                .get(suffix)
+                .map_or(TableCatalogPutPrecondition::IfAbsent, |etag| {
+                    TableCatalogPutPrecondition::IfMatch(etag.clone())
+                });
+            self.backend
+                .put_object_fenced(self.catalog_bucket(), &format!("{destination_prefix}{suffix}"), data, precondition, fence)
+                .await?;
+        }
+        // Inactive leftovers from a former visit to this name must not resurrect jobs or overrides.
+        for (suffix, etag) in &intent.destination_etags {
+            if !intent.source_objects.contains_key(suffix) {
+                self.backend
+                    .delete_object_if_match_fenced(self.catalog_bucket(), &format!("{destination_prefix}{suffix}"), etag, fence)
+                    .await?;
+            }
+        }
+        let current_source = self.collect_table_maintenance_rename_objects(source).await?;
+        if current_source.len() != intent.source_objects.len()
+            || current_source
+                .iter()
+                .any(|(suffix, value)| intent.source_objects.get(suffix).is_none_or(|saved| saved.etag != value.etag))
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance rename source changed before catalog publication".to_string(),
+            ));
+        }
+        let current_destination = self.collect_table_maintenance_rename_objects(destination).await?;
+        if current_destination.len() != intent.source_objects.len() {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance rename destination is not a complete mirror".to_string(),
+            ));
+        }
+        for (suffix, value) in &intent.source_objects {
+            if current_destination.get(suffix).map(|value| &value.data)
+                != Some(&maintenance_rename_data(source, destination, suffix, &value.data)?)
+            {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename destination changed before publication".to_string(),
+                ));
+            }
+        }
+        fence.ensure_held()?;
+        Ok(Some((intent, intent_etag)))
+    }
+
+    pub(super) async fn finish_table_maintenance_rename(
+        &self,
+        intent: &TableMaintenanceRenameIntent,
+        intent_etag: &str,
+        committed: bool,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        let authoritative = if committed { &intent.destination } else { &intent.source };
+        let authoritative_objects = self.collect_table_maintenance_rename_objects(authoritative).await?;
+        if intent
+            .source_objects
+            .keys()
+            .any(|suffix| !authoritative_objects.contains_key(suffix))
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance rename authoritative records are incomplete; repair persisted state before retrying rename"
+                    .to_string(),
+            ));
+        }
+        let entry = if committed { &intent.source } else { &intent.destination };
+        let prefix = maintenance_rename_prefix(entry)?;
+        let current = self.collect_table_maintenance_rename_objects(entry).await?;
+        // Validate the whole cleanup set before the first delete. A failed or interrupted copy
+        // is recognizable by its exact planned JSON; every deletion still uses the observed ETag.
+        for (suffix, value) in &current {
+            let allowed = if committed {
+                intent
+                    .source_objects
+                    .get(suffix)
+                    .is_some_and(|saved| saved.etag == value.etag)
+            } else if intent.destination_etags.get(suffix) == Some(&value.etag) {
+                true
+            } else if let Some(saved) = intent.source_objects.get(suffix) {
+                value.data == maintenance_rename_data(&intent.source, &intent.destination, suffix, &saved.data)?
+            } else {
+                false
+            };
+            if !allowed {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename cleanup encountered a changed object watermark".to_string(),
+                ));
+            }
+        }
+        for (suffix, value) in current {
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &format!("{prefix}{suffix}"), &value.etag, fence)
+                .await?;
+        }
+        let object = maintenance_rename_intent_path(&intent.source.table_bucket);
+        match self
+            .backend
+            .delete_object_if_match_fenced(self.catalog_bucket(), &object, intent_etag, fence)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                fence.ensure_held()?;
+                // A lost delete response after removal must not strand a committed rename.
+                if self.backend.object_metadata(self.catalog_bucket(), &object).await?.is_none() {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     pub(in crate::table_catalog) async fn read_entry<T>(
