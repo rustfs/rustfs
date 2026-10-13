@@ -122,6 +122,8 @@ test-util = []
 e2e-test-hooks = []
 
 [dependencies]
+rustfs-capture-authority = { workspace = true }
+openraft = { workspace = true, features = ["storage-v2"] }
 hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }

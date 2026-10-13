@@ -535,6 +535,62 @@ impl tonic::service::Interceptor for TonicInterceptor {
     }
 }
 
+pub(crate) type CaptureRaftClient = rustfs_protos::proto_gen::node_service::capture_raft_service_client::CaptureRaftServiceClient<
+    InterceptedService<AuthenticatedChannel, TonicInterceptor>,
+>;
+
+/// Capture RPCs always perform the real authenticated epoch handshake, never seed replay state.
+pub(crate) async fn capture_raft_time_out_client(
+    addr: &str,
+    connect_timeout: std::time::Duration,
+    request_max: usize,
+    response_max: usize,
+) -> Result<CaptureRaftClient, super::capture_raft::CaptureRaftError> {
+    use super::capture_raft::CaptureRaftError;
+    let interceptor = TonicInterceptor::Signature(gen_tonic_signature_interceptor()).with_rpc_audience(addr)?;
+    let channel = tokio::time::timeout(connect_timeout, async {
+        match runtime_sources::cached_node_channel(addr).await {
+            Some(channel) => Ok(channel),
+            None => create_new_channel(addr)
+                .await
+                .map_err(|_| CaptureRaftError::ChannelUnavailable),
+        }
+    })
+    .await
+    .map_err(|_| CaptureRaftError::Deadline)??;
+    let audience = interceptor
+        .replay_scope_audience()
+        .ok_or(CaptureRaftError::Authentication)?
+        .to_owned();
+    let authenticated = ReplayScopeChannel::new(channel, Some(audience.clone()));
+    let mut ping = NodeServiceClient::with_interceptor(authenticated.clone(), interceptor)
+        .max_encoding_message_size(1024)
+        .max_decoding_message_size(8192);
+    ping.ping(tonic::Request::new(rustfs_protos::proto_gen::node_service::PingRequest {
+        version: 1,
+        body: bytes::Bytes::new(),
+    }))
+    .await
+    .map_err(|status| CaptureRaftError::Status(Box::new(status)))?;
+    {
+        let peers = PEER_REPLAY_STATES.lock().map_err(|_| CaptureRaftError::Authentication)?;
+        let state = peers.get(&audience).ok_or(CaptureRaftError::Authentication)?;
+        if !matches!(state.cache_capability, Some(PeerReplayCapability::Capable { boot_epoch }) if Some(boot_epoch) == state.boot_epoch)
+        {
+            return Err(CaptureRaftError::Authentication);
+        }
+    }
+    let interceptor = TonicInterceptor::Signature(gen_tonic_signature_interceptor()).with_rpc_audience(addr)?;
+    Ok(
+        rustfs_protos::proto_gen::node_service::capture_raft_service_client::CaptureRaftServiceClient::with_interceptor(
+            authenticated,
+            interceptor,
+        )
+        .max_encoding_message_size(request_max)
+        .max_decoding_message_size(response_max),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

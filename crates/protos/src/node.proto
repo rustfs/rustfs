@@ -1331,3 +1331,12 @@ service TierMutationControlService {
   rpc CommitTierMutation(TierMutationCommitRequest) returns (TierMutationControlResponse) {};
   rpc AbortTierMutation(TierMutationAbortRequest) returns (TierMutationControlResponse) {};
 }
+
+// Capture authority uses a bounded, versioned canonical body, not protobuf re-encoding.
+message CaptureRaftRequest { bytes body = 1; }
+message CaptureRaftResponse { bytes body = 1; bytes response_proof = 2; }
+service CaptureRaftService {
+  rpc AppendEntries(CaptureRaftRequest) returns (CaptureRaftResponse);
+  rpc Vote(CaptureRaftRequest) returns (CaptureRaftResponse);
+  rpc InstallSnapshot(CaptureRaftRequest) returns (CaptureRaftResponse);
+}

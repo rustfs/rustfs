@@ -104,6 +104,7 @@ rustfs-config = { path = "./crates/config", version = "1.0.1" }
 rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.1" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.1" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.1" }
+rustfs-capture-authority = { path = "crates/capture-authority", version = "1.0.1" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.1" }
 rustfs-iam = { path = "crates/iam", version = "1.0.1" }

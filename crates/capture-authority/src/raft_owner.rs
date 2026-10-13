@@ -101,7 +101,7 @@ impl Drop for OwnerLease {
 pub struct NativeRaftOwner {
     raft: Raft<CaptureTypeConfig>,
     writer: NativeLogWriter,
-    node_id: u64,
+    identity: crate::NodeIdentity,
     accepting: AtomicBool,
     drain: Arc<DrainState>,
     #[cfg(test)]
@@ -157,12 +157,17 @@ impl NativeRaftOwner {
         Ok(Self {
             raft,
             writer,
-            node_id,
+            identity,
             accepting: AtomicBool::new(true),
             drain,
             #[cfg(test)]
             snapshot_build_pause,
         })
+    }
+
+    /// Identity read from durable META and checked before starting this owner.
+    pub fn identity(&self) -> crate::NodeIdentity {
+        self.identity
     }
 
     fn require_running(&self) -> Result<(), NativeRaftOwnerError> {
@@ -176,7 +181,7 @@ impl NativeRaftOwner {
     /// Only explicit first-cluster formation calls initialize; start never does.
     pub async fn bootstrap(&self, members: BTreeMap<u64, CaptureNode>) -> Result<(), NativeRaftOwnerError> {
         self.require_running()?;
-        if !members.contains_key(&self.node_id) {
+        if !members.contains_key(&self.identity.node_id) {
             return Err(NativeRaftOwnerError::MissingLocalMember);
         }
         for node in members.values() {

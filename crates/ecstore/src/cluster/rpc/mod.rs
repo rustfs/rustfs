@@ -13,6 +13,9 @@
 // limitations under the License.
 
 pub(crate) mod background_monitor;
+pub mod capture_raft;
+#[cfg(test)]
+mod capture_raft_tests;
 pub(crate) mod client;
 pub(crate) mod context_propagation;
 pub(crate) mod http_auth;
