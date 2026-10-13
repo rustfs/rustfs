@@ -491,11 +491,11 @@ pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
 
 pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::File>) -> io::Result<()> {
     #[cfg(test)]
-    fsync_dir_recorder::record(dir.as_ref());
+    fsync_dir_recorder::record(dir);
     #[cfg(unix)]
     {
         #[cfg(test)]
-        if let Some(kind) = fsync_dir_recorder::take_failure(dir.as_ref()) {
+        if let Some(kind) = fsync_dir_recorder::take_failure(dir) {
             return Err(io::Error::from(kind));
         }
         match opened {

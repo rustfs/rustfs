@@ -3566,7 +3566,7 @@ mod tests {
             .track_cleanup_mutation(
                 "delete",
                 DiskMetricMutation::Delete,
-                || std::future::pending::<Result<()>>(),
+                std::future::pending::<Result<()>>,
                 Duration::from_millis(10),
             )
             .await;
