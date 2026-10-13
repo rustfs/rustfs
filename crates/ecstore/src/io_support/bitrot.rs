@@ -142,7 +142,7 @@ struct BitrotReaderSource {
     path: String,
     offset: usize,
     length: usize,
-    shard_size: usize,
+    small_shard: bool,
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 }
@@ -156,7 +156,7 @@ impl BitrotReaderSource {
             &self.path,
             self.offset,
             self.length,
-            self.shard_size,
+            self.small_shard,
             self.use_mmap_read,
             self.stage_metrics.map(|metrics| metrics.path),
         )
@@ -172,7 +172,7 @@ async fn open_reader_source(
     path: &str,
     offset: usize,
     length: usize,
-    shard_size: usize,
+    small_shard: bool,
     use_mmap_read: bool,
     metrics_path: Option<&'static str>,
 ) -> disk::error::Result<Option<BoxedObjectReader>> {
@@ -185,9 +185,10 @@ async fn open_reader_source(
     } else if let Some(disk) = disk {
         #[cfg(test)]
         crate::set_disk::disk_call_counters::record_shard_open(path, false);
+        let buffer_stream = small_shard && length >= MIN_BUFFERED_STREAM_BYTES;
         let reader = open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path).await?;
-        let reader = if disk.is_local() {
-            buffer_local_shard_stream(reader, length, shard_size)?
+        let reader = if buffer_stream && matches!(reader, ShardReader::Stream(_)) && disk.is_local() {
+            buffer_local_shard_stream(reader, length)?
         } else {
             reader
         };
@@ -197,9 +198,10 @@ async fn open_reader_source(
     }
 }
 
-fn buffer_local_shard_stream(reader: ShardReader, length: usize, shard_size: usize) -> disk::error::Result<ShardReader> {
-    const MIN_BUFFERED_STREAM_BYTES: usize = 1024 * 1024;
-    if shard_size == 0 || shard_size > 128 * 1024 || length < MIN_BUFFERED_STREAM_BYTES || length < shard_size.saturating_mul(4) {
+const MIN_BUFFERED_STREAM_BYTES: usize = 1024 * 1024;
+
+fn buffer_local_shard_stream(reader: ShardReader, length: usize) -> disk::error::Result<ShardReader> {
+    if length < MIN_BUFFERED_STREAM_BYTES {
         return Ok(reader);
     }
     let ShardReader::Stream(reader) = reader else {
@@ -788,7 +790,7 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_frame_size_and_stage_me
         path,
         offset,
         length,
-        shard_size,
+        shard_size != 0 && shard_size <= 128 * 1024,
         use_mmap_read,
         stage_metrics.map(|metrics| metrics.path),
     )
@@ -892,7 +894,7 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
         path: if inline_source { String::new() } else { path.to_string() },
         offset,
         length,
-        shard_size,
+        small_shard: shard_size != 0 && shard_size <= 128 * 1024,
         use_mmap_read,
         stage_metrics: None,
     };
@@ -1013,7 +1015,7 @@ mod tests {
             reads: Arc::clone(&reads),
             bytes: Arc::clone(&bytes),
         }));
-        let source = buffer_local_shard_stream(source, window, SHARD).expect("buffer the exact local window");
+        let source = buffer_local_shard_stream(source, window).expect("buffer the exact local window");
         let mut reader = BitrotReader::new(source, SHARD, algo, false);
         let mut actual = Vec::new();
         for chunk in data.chunks(SHARD) {
@@ -1064,7 +1066,6 @@ mod tests {
                 bytes: Arc::clone(&bytes),
             })),
             window,
-            SHARD,
         )
         .expect("buffer corruption fixture");
         let mut reader = BitrotReader::new(source, SHARD, algo, false);
@@ -1130,7 +1131,6 @@ mod tests {
                 bytes: Arc::clone(&bytes),
             })),
             wire_window,
-            SHARD,
         )
         .expect("open conservative short range stream");
         let mut reader = BitrotReader::new(source, SHARD, algo.clone(), false);
@@ -1325,6 +1325,61 @@ mod tests {
         .expect("local disk should be created");
 
         (disk, dir)
+    }
+
+    #[tokio::test]
+    async fn deferred_local_opener_applies_buffer_gate_to_current_window() {
+        use tokio::io::AsyncReadExt;
+
+        const SHARD: usize = 128 * 1024;
+        const WINDOW: usize = 1024 * 1024;
+        let (disk, _dir) = local_test_disk().await;
+        let payload: Vec<_> = (0u8..=250).cycle().take(2 * WINDOW + 1).collect();
+        disk.make_volume("test-bucket").await.expect("create test volume");
+        disk.write_all("test-bucket", "obj/buffer-gate", Bytes::from(payload.clone()))
+            .await
+            .expect("write source with bytes beyond every requested window");
+        for (shard_size, length, advance, expected_end) in [
+            (SHARD, WINDOW, 0, WINDOW),
+            (SHARD + 1, WINDOW, 0, payload.len()),
+            (SHARD, WINDOW + SHARD, 1, WINDOW + SHARD),
+            (SHARD, WINDOW, 1, payload.len()),
+        ] {
+            let (_reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+                None,
+                Some(disk.clone()),
+                "test-bucket",
+                "obj/buffer-gate",
+                0,
+                length,
+                shard_size,
+                HashAlgorithm::None,
+                false,
+                false,
+            );
+            assert!(handle.advance_stripes(advance), "advance the unopened source");
+            let source = {
+                let mut state = handle.state.lock().expect("lock pending reader state");
+                let DeferredObjectReaderState::Pending(source) = &mut *state else {
+                    panic!("advancing stripes must leave the source unopened");
+                };
+                source.take().expect("pending source must be available")
+            };
+            let mut source = source
+                .open()
+                .await
+                .expect("open advanced local source")
+                .expect("disk source must produce a reader");
+            let mut actual = Vec::new();
+            source.read_to_end(&mut actual).await.expect("read the opened source");
+            // Unbuffered local streams expose the file remainder; buffered streams
+            // must stop at the current encoded window, including after an advance.
+            assert_eq!(
+                actual.as_slice(),
+                &payload[advance * shard_size..expected_end],
+                "wrong buffering boundary for shard {shard_size}, advance {advance}"
+            );
+        }
     }
 
     #[cfg(feature = "hotpath")]
