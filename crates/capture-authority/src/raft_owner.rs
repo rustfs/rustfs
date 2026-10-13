@@ -205,6 +205,17 @@ impl NativeRaftOwner {
             .map_err(|error| NativeRaftOwnerError::Write(Box::new(error)))
     }
 
+    /// Re-read an exact successful first decision from this owner's durable view.
+    /// Use the Created result's decision LogId, not an idempotent retry entry's outer LogId.
+    pub async fn authorize_created(
+        &self,
+        expected: crate::DecideCreated,
+        expected_decision: crate::LogId,
+    ) -> Result<crate::CommittedCreatedAuthorization, NativeRaftOwnerError> {
+        self.require_running()?;
+        Ok(self.writer.authorize_created(expected, expected_decision).await?)
+    }
+
     pub fn metrics(&self) -> watch::Receiver<RaftMetrics<u64, CaptureNode>> {
         self.raft.metrics()
     }

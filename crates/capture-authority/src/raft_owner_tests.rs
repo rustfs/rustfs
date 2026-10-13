@@ -880,3 +880,6 @@ async fn raft_owner_shutdown_inflight_replication() {
     drop(store);
     cluster.stop().await;
 }
+
+#[path = "committed_created_authorization_tests.rs"]
+mod authorization;

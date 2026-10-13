@@ -43,8 +43,9 @@ pub use native_snapshot::{NativeSnapshotError, NativeSnapshotView};
 mod raft_types;
 pub mod snapshot;
 pub use created::{
-    CaptureBinding, CreatedApplyResult, CreatedEvent, CreatedOperation, CreatedOperationProvenance, CreatedResult,
-    CreatedVersion, DecideCreated, MAX_OBJECT_KEY_LENGTH, ObjectIdentity, PreparedIdentity,
+    CaptureBinding, CommittedCreatedAuthorization, CreatedApplyResult, CreatedEvent, CreatedOperation,
+    CreatedOperationProvenance, CreatedResult, CreatedVersion, DecideCreated, MAX_OBJECT_KEY_LENGTH, ObjectIdentity,
+    PreparedIdentity,
 };
 pub use node::{CaptureNode, CaptureNodeError};
 pub use raft_types::{
@@ -103,6 +104,14 @@ impl NativeLogWriter {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             source_reader_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(source_reader::MAX_CONNECTIONS)),
         }
+    }
+
+    async fn authorize_created(
+        &self,
+        expected: DecideCreated,
+        decision: LogId,
+    ) -> Result<CommittedCreatedAuthorization, NativeWriteError> {
+        self.write(move |store| store.authorize_created(&expected, decision)).await
     }
 
     pub async fn snapshot_view(&self) -> Result<NativeSnapshotView, NativeSnapshotError> {
@@ -309,6 +318,8 @@ pub enum StoreError {
     UnsupportedSchema,
     #[error("corrupt record")]
     CorruptRecord,
+    #[error("Created publication authorization does not match a committed successful decision")]
+    CreatedAuthorizationMismatch,
     #[error("invalid event page limit")]
     InvalidEventPage,
     #[error("invalid membership")]
@@ -360,6 +371,7 @@ impl StoreError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::IdentityMismatch => "identity_mismatch",
+            Self::CreatedAuthorizationMismatch => "created_authorization_mismatch",
             Self::InvalidEventPage => "invalid_event_page",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::CorruptRecord => "corrupt_record",

@@ -1142,3 +1142,85 @@ fn validate_application_tables(
     }
     Ok(first_operations)
 }
+
+impl Store {
+    pub(crate) fn authorize_created(
+        &self,
+        expected: &DecideCreated,
+        decision: LogId,
+    ) -> Result<crate::CommittedCreatedAuthorization, StoreError> {
+        if !self.writable {
+            return Err(StoreError::WriteDisabled);
+        }
+        expected.encode()?;
+        let tx = self.database.begin_read()?;
+        let meta = tx.open_table(META)?;
+        let schema = number(required(meta.get("schema")?)?.value())?;
+        if !matches!(schema, 6 | 7) {
+            return Err(StoreError::UnsupportedSchema);
+        }
+        let (applied, _) = native_application_state(&tx)?;
+        let committed = crate::committed::validate_committed(&meta, &tx.open_table(LOGS)?)?;
+        let identity = crate::decode_identity(required(meta.get("identity")?)?.value())?;
+        let binding = read_binding(&meta)?;
+        let operations = tx.open_table(OPERATIONS)?;
+        let record = operations
+            .get(expected.operation_id.as_slice())?
+            .ok_or(StoreError::CreatedAuthorizationMismatch)?;
+        let provenance = decode_provenance(record.value())?;
+        let command = DecideCreated::decode(&provenance.operation.canonical_command)?;
+        if command.encode()? != provenance.operation.canonical_command {
+            return Err(StoreError::CorruptRecord);
+        }
+        if command.operation_id != expected.operation_id
+            || command.object != expected.object
+            || command.expected_head != expected.expected_head
+            || command.binding_revision != expected.binding_revision
+        {
+            return Err(StoreError::CreatedAuthorizationMismatch);
+        }
+        if command.prepared != expected.prepared {
+            return Err(StoreError::CreatedAuthorizationMismatch);
+        }
+        let CreatedResult::Created {
+            version_id,
+            event_id,
+            decision_log_id,
+        } = provenance.operation.result
+        else {
+            return Err(StoreError::CreatedAuthorizationMismatch);
+        };
+        if decision_log_id != decision
+            || provenance.first_decision_log_id != decision
+            || version_id != command.prepared.version_id
+            || event_id != command.operation_id
+            || binding.revision != command.binding_revision
+        {
+            return Err(StoreError::CreatedAuthorizationMismatch);
+        }
+        for boundary in [applied, committed] {
+            if boundary.is_none_or(|boundary| {
+                boundary.index < decision.index || (boundary.index == decision.index && boundary != decision)
+            }) {
+                return Err(StoreError::CreatedAuthorizationMismatch);
+            }
+        }
+        let events = tx.open_table(EVENTS)?;
+        let event = decode_event(required(events.get(command.operation_id.as_slice())?)?.value())?;
+        let versions = tx.open_table(VERSIONS)?;
+        let version = decode_version(
+            required(versions.get(version_key(&command.object, command.prepared.version_id)?.as_slice())?)?.value(),
+        )?;
+        if event.object != command.object
+            || event.prepared != command.prepared
+            || event.decision_log_id != decision
+            || event.binding != binding
+            || version.prepared != command.prepared
+            || version.decision_log_id != decision
+            || version.binding_revision != binding.revision
+        {
+            return Err(StoreError::CorruptRecord);
+        }
+        Ok(crate::CommittedCreatedAuthorization::verified(identity, command, binding, decision))
+    }
+}
