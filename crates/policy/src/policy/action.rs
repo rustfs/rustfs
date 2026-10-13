@@ -562,6 +562,14 @@ pub enum AdminAction {
     GetTableLifecycleAction,
     #[strum(serialize = "admin:SetTableLifecycle")]
     SetTableLifecycleAction,
+    #[strum(serialize = "admin:CreatePluginDelegation")]
+    CreatePluginDelegationAction,
+    #[strum(serialize = "admin:IssuePluginAttempt")]
+    IssuePluginAttemptAction,
+    #[strum(serialize = "admin:GetPluginDelegation")]
+    GetPluginDelegationAction,
+    #[strum(serialize = "admin:RevokePluginDelegation")]
+    RevokePluginDelegationAction,
     #[strum(serialize = "admin:GetTableCredentials")]
     GetTableCredentialsAction,
     #[strum(serialize = "admin:RunTableMaintenance")]
@@ -703,6 +711,10 @@ impl AdminAction {
                 | AdminAction::GetTableLifecycleAction
                 | AdminAction::SetTableLifecycleAction
                 | AdminAction::GetTableCredentialsAction
+                | AdminAction::IssuePluginAttemptAction
+                | AdminAction::GetPluginDelegationAction
+                | AdminAction::CreatePluginDelegationAction
+                | AdminAction::RevokePluginDelegationAction
                 | AdminAction::RunTableMaintenanceAction
                 | AdminAction::GetTableMetadataLocationAction
                 | AdminAction::SetTableMetadataLocationAction
@@ -901,6 +913,25 @@ mod tests {
         let arr = parsed.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:*");
+    }
+
+    #[test]
+    fn plugin_delegation_actions_are_explicit_and_unscoped() {
+        for (name, expected) in [
+            ("admin:GetPluginDelegation", AdminAction::GetPluginDelegationAction),
+            ("admin:CreatePluginDelegation", AdminAction::CreatePluginDelegationAction),
+            ("admin:RevokePluginDelegation", AdminAction::RevokePluginDelegationAction),
+        ] {
+            assert_eq!(AdminAction::try_from(name).unwrap(), expected);
+            assert!(expected.is_valid());
+            assert!(!expected.is_table_resource_scoped());
+        }
+        assert_eq!(
+            AdminAction::try_from("admin:IssuePluginAttempt").unwrap(),
+            AdminAction::IssuePluginAttemptAction
+        );
+        assert!(AdminAction::IssuePluginAttemptAction.is_valid());
+        assert!(AdminAction::try_from("admin:IssuePluginCredentials").is_err());
     }
 
     #[test]

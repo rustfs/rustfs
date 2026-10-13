@@ -23,6 +23,10 @@ const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminActi
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
 const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
+const ISSUE_PLUGIN_ATTEMPT: AdminActionRef = AdminActionRef::new("IssuePluginAttemptAction");
+const GET_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("GetPluginDelegationAction");
+const CREATE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("CreatePluginDelegationAction");
+const REVOKE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("RevokePluginDelegationAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
 const CREATE_USER: AdminActionRef = AdminActionRef::new("CreateUserAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
@@ -635,6 +639,30 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v4/runtime/capabilities",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/issue-attempt",
+        ISSUE_PLUGIN_ATTEMPT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/plugin-delegations/{id}",
+        GET_PLUGIN_DELEGATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations",
+        CREATE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/revoke",
+        REVOKE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,

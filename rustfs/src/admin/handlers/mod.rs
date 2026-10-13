@@ -224,3 +224,7 @@ mod tests {
     // The current tests focus on data structures and basic functionality that can be
     // tested in isolation without complex dependencies.
 }
+
+pub mod plugin_delegation;
+
+pub mod plugin_attempt;

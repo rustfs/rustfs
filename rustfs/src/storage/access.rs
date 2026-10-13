@@ -64,6 +64,13 @@ use std::sync::OnceLock;
 use time::OffsetDateTime;
 use url::{Url, form_urlencoded};
 
+fn iam_authorization_error(err: IamError) -> ApiError {
+    match err {
+        IamError::IAMActionNotAllowed => ApiError::access_denied(),
+        other => ApiError::from(other),
+    }
+}
+
 const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
@@ -1411,7 +1418,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             let allowed = iam_store
                 .try_eval_prepared(&prepared, &final_args)
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(iam_authorization_error)?;
             if !allowed
                 && matches!(
                     action,
@@ -1433,7 +1440,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 if !iam_store
                     .try_eval_prepared(&prepared, &final_args)
                     .await
-                    .map_err(ApiError::from)?
+                    .map_err(iam_authorization_error)?
                 {
                     return Err(denial.deny("iam_explicit_deny", action));
                 }
@@ -3541,6 +3548,14 @@ mod tests {
     use serial_test::serial;
     use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
+
+    #[test]
+    fn terminal_iam_denial_is_access_denied_and_backend_failure_stays_internal() {
+        let denied = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IAMActionNotAllowed));
+        assert_eq!(denied.code(), &S3ErrorCode::AccessDenied);
+        let unavailable = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IamSysNotInitialized));
+        assert_eq!(unavailable.code(), &S3ErrorCode::InternalError);
+    }
 
     struct UnreadyIam;
 
