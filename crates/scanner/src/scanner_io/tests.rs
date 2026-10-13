@@ -44,6 +44,7 @@ use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod per_bucket_certification;
 mod scoped_entry_fallback;
 mod service_cohort;
 mod usage_expiration;
@@ -1318,6 +1319,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                     observed_usage_candidate: None,
                     requires_full_scan,
                     resolved_scope_observer: Some(observer),
+                    post_walk_gate: None,
                     service_cohort: None,
                 },
             ),
@@ -1408,6 +1410,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     observed_usage_candidate: None,
                     requires_full_scan: false,
                     resolved_scope_observer: None,
+                    post_walk_gate: None,
                     service_cohort: None,
                 },
             ),
@@ -1461,6 +1464,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     observed_usage_candidate: None,
                     requires_full_scan,
                     resolved_scope_observer: None,
+                    post_walk_gate: None,
                     service_cohort: None,
                 },
             ),
@@ -2394,7 +2398,7 @@ fn complete_segment_reuse_baseline(
 }
 
 #[test]
-fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance() {
+fn scoped_scan_requires_a_complete_authoritative_baseline_with_exact_set_provenance() {
     let source = DataUsageCacheSource::new(1, 2);
     let expected_sources = HashSet::from([source]);
     let scan_plan_digest = DataUsageScanPlanDigest([9; 32]);
@@ -2412,19 +2416,41 @@ fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance(
         Some(scan_plan_digest)
     );
 
-    let mut incomplete = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
-    incomplete.usage_snapshot_converged = Some(false);
-    let incomplete = bytes::Bytes::from(serde_json::to_vec(&incomplete).expect("test baseline should encode"));
+    // A complete cycle that left buckets pending publishes unconverged on
+    // the authoritative object and is still the structural baseline: its
+    // pending buckets stay dirty and are rescanned, the rest reuse.
+    let mut pending = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
+    pending.usage_snapshot_converged = Some(false);
+    pending.usage_snapshot_pending_buckets = vec!["bucket-a".to_string()];
+    pending.usage_snapshot_pending_bucket_count = 1;
+    let pending = bytes::Bytes::from(serde_json::to_vec(&pending).expect("test baseline should encode"));
     assert_eq!(
         complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
-            authoritative_data: Some(&incomplete),
+            authoritative_data: Some(&pending),
             observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
             scan_plan_digest,
         }),
-        None
+        Some(scan_plan_digest)
+    );
+
+    let mut observational = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
+    observational.usage_snapshot_converged = Some(false);
+    observational.usage_snapshot_observational = true;
+    let observational = bytes::Bytes::from(serde_json::to_vec(&observational).expect("test baseline should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            authoritative_data: Some(&observational),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        }),
+        None,
+        "an observational snapshot in the authoritative slot is not a baseline"
     );
 
     let mut wrong_provenance = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
@@ -2531,13 +2557,34 @@ fn scoped_scan_accepts_only_a_complete_observation_tied_to_the_authoritative_bas
     observation_of_nonconverged_authoritative.usage_snapshot_set_states[0].scanner_cycle = Some(8);
     observation_of_nonconverged_authoritative.usage_snapshot_authoritative_baseline =
         Some(nonconverged_authoritative.snapshot_identity());
+    observation_of_nonconverged_authoritative.usage_snapshot_observational = true;
+    let mut observational_in_authoritative_slot = nonconverged_authoritative.clone();
+    observational_in_authoritative_slot.usage_snapshot_observational = true;
     let nonconverged_authoritative =
         bytes::Bytes::from(serde_json::to_vec(&nonconverged_authoritative).expect("nonconverged baseline should encode"));
+    let observational_in_authoritative_slot = bytes::Bytes::from(
+        serde_json::to_vec(&observational_in_authoritative_slot).expect("observational baseline should encode"),
+    );
     let observation_of_nonconverged_authoritative =
         bytes::Bytes::from(serde_json::to_vec(&observation_of_nonconverged_authoritative).expect("observation should encode"));
+    // The unconverged authoritative snapshot is itself the baseline, so the
+    // observation chained on it is not consulted.
     assert_eq!(
         complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
             authoritative_data: Some(&nonconverged_authoritative),
+            observed_candidate_data: Some(&observation_of_nonconverged_authoritative),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 9,
+            scan_plan_digest,
+        }),
+        Some(scan_plan_digest)
+    );
+    // An observational snapshot that somehow sits in the authoritative slot
+    // is neither a baseline nor an anchor for a chained observation.
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            authoritative_data: Some(&observational_in_authoritative_slot),
             observed_candidate_data: Some(&observation_of_nonconverged_authoritative),
             expected_sources: &expected_sources,
             leader_epoch: 11,

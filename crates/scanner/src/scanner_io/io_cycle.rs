@@ -77,6 +77,8 @@ where
         service_cohort: None,
         #[cfg(test)]
         resolved_scope_observer: None,
+        #[cfg(test)]
+        post_walk_gate: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -96,6 +98,11 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     #[cfg(test)]
     pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
+    /// Holds the post-walk guardrail probe until the test releases it, so a
+    /// write issued after `resolved_scope_observer` fired is ordered before
+    /// certification regardless of how fast the walk finishes.
+    #[cfg(test)]
+    pub(crate) post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 pub(super) struct ScannerBucketScopeResolution<'a> {
@@ -287,6 +294,8 @@ where
         service_cohort,
         #[cfg(test)]
         resolved_scope_observer,
+        #[cfg(test)]
+        post_walk_gate,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -705,6 +714,10 @@ where
     record_set_scan_concurrency_limit(0);
     record_set_scans_queued(0);
     record_set_scans_active(0);
+    #[cfg(test)]
+    if let Some(gate) = post_walk_gate {
+        let _ = gate.await;
+    }
 
     let first_err = first_err_mutex.lock().await.take();
     let results = results_mutex.lock().await.clone();

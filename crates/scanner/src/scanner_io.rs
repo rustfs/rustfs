@@ -409,14 +409,26 @@ fn resolve_remote_dirty_usage_scope(
     }
 }
 
+/// `expected_converged` is `None` for the authoritative object: a `Complete`
+/// cycle with pending buckets publishes there unconverged and is still a
+/// structural baseline, because the buckets it could not certify stay in the
+/// dirty map and are rescanned rather than reused. The convergence marker
+/// must still be present; a snapshot without one was not written by a
+/// certifying scanner.
 fn complete_scanner_cache_snapshot_plan_digest(
     snapshot: &DataUsageInfo,
     proof: ScannerCacheBaselineProof<'_>,
-    expected_converged: bool,
+    expected_converged: Option<bool>,
 ) -> Option<DataUsageScanPlanDigest> {
+    // The observational mark disqualifies only the authoritative slot: an
+    // observed candidate carries it by construction.
+    let marks_accepted = match expected_converged {
+        Some(expected) => snapshot.usage_snapshot_converged == Some(expected),
+        None => snapshot.usage_snapshot_converged.is_some() && !snapshot.usage_snapshot_observational,
+    };
     if !snapshot.is_complete_bucket_usage_snapshot()
         || snapshot.usage_snapshot_partial
-        || snapshot.usage_snapshot_converged != Some(expected_converged)
+        || !marks_accepted
         || snapshot.scanner_epoch != Some(proof.leader_epoch)
         || snapshot.usage_snapshot_set_states.len() != proof.expected_sources.len()
     {
@@ -455,7 +467,7 @@ fn complete_scanner_cache_snapshot_plan_digest(
 
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
     let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
+    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, None) {
         return Some(validated_digest);
     }
 
@@ -464,7 +476,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
     // remains observational: this proof grants bucket-scope reuse only and
     // never changes authoritative usage publication or dirty acknowledgement.
     let authoritative_has_identity = (crate::scanner::data_usage_info_has_persisted_baseline_identity(&authoritative)
-        && authoritative.usage_snapshot_converged != Some(false))
+        && !authoritative.usage_snapshot_observational)
         || crate::scanner::data_usage_info_is_bootstrap_pending(&authoritative);
     if !authoritative_has_identity {
         return None;
@@ -474,7 +486,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         return None;
     }
 
-    complete_scanner_cache_snapshot_plan_digest(&observed, proof, false)
+    complete_scanner_cache_snapshot_plan_digest(&observed, proof, Some(false))
 }
 
 fn scanner_segment_reuse_baseline_producer_evidence(
@@ -492,7 +504,9 @@ fn scanner_segment_reuse_baseline_producer_evidence(
     let Ok(authoritative) = serde_json::from_slice::<DataUsageInfo>(authoritative_data) else {
         return (evidence, false);
     };
-    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, true).is_none() {
+    // Segment (prefix) reuse keeps requiring a converged baseline: its
+    // producer evidence is proven against a dirty snapshot that was current.
+    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, Some(true)).is_none() {
         return (evidence, false);
     }
     let Some(cold_zero_walk_oracle) =

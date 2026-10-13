@@ -48,6 +48,7 @@ async fn complete_candidate(store: &Arc<ECStore>, cycle: u64) -> (crate::scanner
             requires_full_scan: true,
             service_cohort: None,
             resolved_scope_observer: None,
+            post_walk_gate: None,
         },
     )
     .await
@@ -270,6 +271,7 @@ async fn scoped_ack_publication_observed_candidate_reuse_requires_a_new_root_pro
             requires_full_scan: false,
             service_cohort: None,
             resolved_scope_observer: Some(observer),
+            post_walk_gate: None,
         },
     )
     .await

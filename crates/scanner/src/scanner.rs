@@ -1904,6 +1904,8 @@ where
             service_cohort: scheduling.service_cohort,
             #[cfg(test)]
             resolved_scope_observer: None,
+            #[cfg(test)]
+            post_walk_gate: None,
         },
     )
     .await;
