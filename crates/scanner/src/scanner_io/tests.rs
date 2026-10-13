@@ -4474,3 +4474,186 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
     assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
     assert!(cache.info.last_update.is_none());
 }
+
+#[tokio::test]
+#[serial]
+async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_retries() {
+    use crate::storage_api::owner::ObjectOperations as _;
+    for same_cycle in [false, true] {
+        let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+        clear_dirty_usage_buckets_for_tests();
+        let bucket = "status-bucket";
+        let object = "cold/object";
+        let set = store.pools[0].disk_set[0].clone();
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create status bucket");
+        let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ScannerObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist initial object");
+        wait_for_namespace_commit_tails(store.as_ref()).await;
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let initial = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: 1,
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("initial full usage scan");
+        assert_eq!(initial.status, ScannerCycleStatus::Complete);
+        let baseline = receiver.recv().await.expect("initial usage publication");
+        assert!(baseline.buckets_usage[bucket].replication_info.is_empty());
+
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+        let mut cache = DataUsageCache::default();
+        cache
+            .load(set.clone(), &cache_name)
+            .await
+            .expect("load complete bucket cache");
+        assert!(cache.info.snapshot_complete);
+        // Keep an accounting context with no remote work in this local fixture.
+        cache.info.replication = Some(Arc::new(ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![s3s::dto::ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: None,
+                    destination: s3s::dto::Destination {
+                        bucket: "arn:test".to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("status".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+            Some(crate::storage_api::EcstoreBucketTargets::default()),
+        )));
+        // A complete compacted prefix is eligible for normal usage sampling.
+        let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
+        compacted.children.clear();
+        compacted.compacted = true;
+        cache.cache.clear();
+        cache.replace(bucket, "", DataUsageEntry::default());
+        cache.replace("status-bucket/cold", bucket, compacted);
+        cache
+            .save(set.clone(), &cache_name)
+            .await
+            .expect("persist compacted prefix fixture");
+        let cycle = (2..18)
+            .find(|cycle| {
+                !rustfs_data_usage::hash_path("status-bucket/cold")
+                    .mod_(*cycle, crate::scanner_folder::data_usage_update_dir_cycles())
+            })
+            .expect("choose a cycle outside the compacted prefix sampling window");
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_REPLICATION_STATUS,
+            "arn:test=COMPLETED;".to_string(),
+        );
+        let updated = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    eval_metadata: Some(metadata),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist replication-only metadata update");
+        assert_eq!(updated.replication_status.as_str(), "COMPLETED");
+        assert!(updated.version_id.is_some_and(|version| !version.is_nil()));
+        let persisted = set
+            .get_object_info(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read back status writeback");
+        assert_eq!(persisted.replication_status.as_str(), "COMPLETED");
+        let namespace_generation = dirty_usage_generation();
+        record_status_class_mutation(
+            bucket,
+            object,
+            crate::segment_invalidation::SegmentInvalidationProducerIdentity::Replication,
+        );
+        assert_eq!(dirty_usage_generation(), namespace_generation);
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: if same_cycle { 1 } else { u64::from(cycle) },
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("normal scan must refresh the status bucket");
+        assert_eq!(result.status, ScannerCycleStatus::Complete);
+        let refreshed = receiver.recv().await.expect("refreshed usage publication");
+        assert_eq!(refreshed.buckets_usage[bucket].objects_count, 1);
+        assert_eq!(refreshed.buckets_usage[bucket].size, 7);
+        assert_eq!(
+            refreshed.buckets_usage[bucket]
+                .replication_info
+                .get("arn:test")
+                .map_or(0, |target| target.replicated_size),
+            7,
+            "a replication maintenance walk must refresh compacted statistics before publishing"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+}

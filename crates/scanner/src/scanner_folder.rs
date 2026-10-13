@@ -2294,6 +2294,12 @@ impl FolderScanner {
                         // Usage sampling is not proof that a Deep check ran.
                         if self.scan_mode != HealScanMode::Deep
                             && !forward_sweep
+                            && !self
+                                .old_cache
+                                .info
+                                .replication
+                                .as_ref()
+                                .is_some_and(|config| config.has_active_rules("", true))
                             && !into.compacted
                             && self.old_cache.is_compacted(&h)
                         {

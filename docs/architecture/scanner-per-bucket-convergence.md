@@ -120,6 +120,14 @@ phase lifts that forcing, `Status` hits must then join the scoped rescan set,
 and that set must travel to the coordinator through the peer dirty-usage
 snapshot, because hits land on whichever node commits the writeback.
 
+A replication maintenance walk refreshes compacted prefixes rather than
+sampling their old totals. A completed bucket cache with active replication
+starts a new coverage sweep even when the cycle is retried; unfinished
+checkpoints retain their existing frontier. Set persistence binds the
+observed replication statistics to its execution digest, so same-cycle
+reuse cannot restore statistics from an earlier walk. None of these cache
+requirements changes the namespace generation or publication fences.
+
 ### Snapshot at the beginning
 
 A cycle is responsible for the namespace as it was at its start snapshot.
