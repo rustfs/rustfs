@@ -975,23 +975,45 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
     ecstore_admin::get_local_server_property().await
 }
 
+/// Bridge an ECStore committed replication-path mutation into the scanner's
+/// dirty-usage tracking.
+///
+/// A replication status writeback changes only replication state on an
+/// existing version. It is status class: it must not count as namespace
+/// activity, or every scanner cycle is `Superseded` for as long as replication
+/// runs (#8375). The scanner's own queued replication heals write back through
+/// the same path and are covered by the same rule. Tier-expiration cleanup
+/// removes data and stays on the namespace path.
+pub(crate) fn record_committed_replication_mutation(
+    bucket: &str,
+    object: &str,
+    source: ecstore_bucket::replication::ScannerDirtyUsageMutationSource,
+) {
+    match source {
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+            rustfs_scanner::record_status_class_mutation(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication,
+            );
+        }
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+            rustfs_scanner::record_dirty_usage_object_from_producer(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration,
+            );
+        }
+    }
+}
+
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
     let mutation_journal = durable_dirty_usage_journal.clone();
     rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
         mutation_journal.record_committed_mutation(bucket, object, producer);
     })));
-    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
-        let producer = match source {
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
-            }
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
-            }
-        };
-        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
-    })));
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(record_committed_replication_mutation)));
     rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
         durable_dirty_usage_journal.clear_confirmed_buckets(cleared);
     })));
@@ -2378,6 +2400,34 @@ mod tests {
         lock_bucket_targets_metadata, new_instance_ctx, retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
     };
     use std::time::Duration;
+
+    #[test]
+    #[serial_test::serial]
+    fn replication_status_writebacks_are_status_class_and_tier_expiration_is_namespace() {
+        use ecstore_bucket::replication::ScannerDirtyUsageMutationSource;
+        let bucket = format!("status-class-{}", uuid::Uuid::new_v4().simple());
+        let before = rustfs_scanner::scanner_dirty_usage_state();
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::Replication);
+        let after_replication = rustfs_scanner::scanner_dirty_usage_state();
+        assert_eq!(
+            after_replication.generation, before.generation,
+            "a replication status writeback must not advance the scanner dirty-usage generation"
+        );
+        assert!(
+            rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_none(),
+            "a replication status writeback must not mark the bucket dirty"
+        );
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::TierExpiration);
+        let after_expiry = rustfs_scanner::scanner_dirty_usage_state();
+        assert!(
+            after_expiry.generation > before.generation,
+            "tier expiration removes data and must stay on the namespace path"
+        );
+        assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_some());
+        rustfs_scanner::clear_dirty_usage_bucket(&bucket);
+    }
 
     #[tokio::test]
     async fn site_metrics_snapshot_includes_live_failure_windows() {
