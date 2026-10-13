@@ -198,7 +198,8 @@ async fn open_reader_source(
 }
 
 fn buffer_local_shard_stream(reader: ShardReader, length: usize, shard_size: usize) -> disk::error::Result<ShardReader> {
-    if shard_size == 0 || shard_size > 128 * 1024 || length < shard_size.saturating_mul(4) {
+    const MIN_BUFFERED_STREAM_BYTES: usize = 1024 * 1024;
+    if shard_size == 0 || shard_size > 128 * 1024 || length < MIN_BUFFERED_STREAM_BYTES || length < shard_size.saturating_mul(4) {
         return Ok(reader);
     }
     let ShardReader::Stream(reader) = reader else {
@@ -206,8 +207,10 @@ fn buffer_local_shard_stream(reader: ShardReader, length: usize, shard_size: usi
     };
     let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
     // Small layout stripes otherwise dispatch a blocking file read per frame.
-    // Buffer only long local streams, and bound the source before buffering so
-    // prefetch cannot cross the authenticated window selected for this request.
+    // Short ranges keep direct reads: the caller's conservative stream span
+    // can include an extra stripe beyond the final requested block. Long
+    // streams stay bounded to that span; prefetched frames still authenticate
+    // individually when consumed by the bitrot reader.
     Ok(ShardReader::Stream(Box::new(tokio::io::BufReader::with_capacity(
         256 * 1024,
         reader.take(limit),
@@ -993,7 +996,7 @@ mod tests {
         const SHARD: usize = 32 * 1024;
         const TAIL: usize = 12_001;
         let algo = HashAlgorithm::HighwayHash256S;
-        let data = vec![37; 9 * SHARD + TAIL];
+        let data = vec![37; 37 * SHARD + TAIL];
         let mut encoded = Vec::new();
         {
             let mut writer = crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD, algo.clone());
@@ -1027,8 +1030,8 @@ mod tests {
         );
         assert_eq!(
             reads.load(Ordering::Relaxed),
-            2,
-            "ten logical reads should share two bounded physical reads"
+            5,
+            "thirty-eight logical reads should share five bounded source reads"
         );
         let mut extra = vec![0; 1];
         assert_eq!(
@@ -1046,18 +1049,34 @@ mod tests {
         let mut encoded = Vec::new();
         {
             let mut writer = crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD, algo.clone());
-            for _ in 0..5 {
+            for _ in 0..33 {
                 writer.write(&payload).await.expect("encode fixture shards");
             }
         }
         encoded[SHARD + algo.size() + algo.size() + 7] ^= 1;
         let window = encoded.len();
-        let source = buffer_local_shard_stream(ShardReader::Stream(Box::new(Cursor::new(encoded))), window, SHARD)
-            .expect("buffer corruption fixture");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let source = buffer_local_shard_stream(
+            ShardReader::Stream(Box::new(CountingWindowReader {
+                source: Cursor::new(encoded),
+                reads: Arc::clone(&reads),
+                bytes: Arc::clone(&bytes),
+            })),
+            window,
+            SHARD,
+        )
+        .expect("buffer corruption fixture");
         let mut reader = BitrotReader::new(source, SHARD, algo, false);
         let mut output = vec![0xa5; SHARD];
         reader.read(&mut output).await.expect("first frame is valid");
         assert_eq!(output, payload);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            256 * 1024,
+            "long stream must prefetch the corrupt second frame"
+        );
         output.fill(0xa5);
         assert_eq!(
             reader
@@ -1070,6 +1089,68 @@ mod tests {
         assert!(
             output.iter().all(|byte| *byte == 0xa5),
             "corrupt prefetched data must not escape verification"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "corrupt prefetched frame must fail without another source read"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_local_shard_stream_does_not_prefetch_conservative_short_range_tail() {
+        const BLOCK: usize = 256 * 1024;
+        const SHARD: usize = BLOCK / 2;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let erasure = crate::erasure::coding::Erasure::new(2, 2, BLOCK);
+        // An aligned 1 MiB Range consumes four data-shard frames, while the
+        // existing reader planner conservatively opens five logical shards.
+        let logical_window = erasure.shard_file_offset(0, 4 * BLOCK, 6 * BLOCK);
+        assert_eq!(logical_window, 5 * SHARD);
+        let (_, wire_window) = adjust_shard_read_params(0, logical_window, SHARD, &algo);
+        let payload = vec![73; SHARD];
+        let mut encoded = Vec::new();
+        {
+            let mut writer = crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD, algo.clone());
+            for _ in 0..4 {
+                writer.write(&payload).await.expect("encode requested range frames");
+            }
+            writer
+                .write(&vec![99; SHARD])
+                .await
+                .expect("encode unrequested conservative tail frame");
+        }
+        assert_eq!(encoded.len(), wire_window);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let source = buffer_local_shard_stream(
+            ShardReader::Stream(Box::new(CountingWindowReader {
+                source: Cursor::new(encoded),
+                reads: Arc::clone(&reads),
+                bytes: Arc::clone(&bytes),
+            })),
+            wire_window,
+            SHARD,
+        )
+        .expect("open conservative short range stream");
+        let mut reader = BitrotReader::new(source, SHARD, algo.clone(), false);
+        let mut output = Vec::new();
+        for _ in 0..4 {
+            reader
+                .read_appending(&mut output, SHARD)
+                .await
+                .expect("read and authenticate requested frame");
+        }
+        assert_eq!(output, payload.repeat(4));
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            4 * (SHARD + algo.size()),
+            "four decoded frames must not prefetch the unrequested fifth frame"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            4,
+            "short range should retain direct per-frame source reads"
         );
     }
 
