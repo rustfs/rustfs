@@ -72,3 +72,7 @@ pub(crate) mod pinned_erasure_fixtures {
         storage::init_local_disks_with_instance_ctx,
     };
 }
+
+pub(crate) mod bucket_config_codec {
+    pub(crate) use rustfs_ecstore::api::bucket::utils::{deserialize, serialize};
+}

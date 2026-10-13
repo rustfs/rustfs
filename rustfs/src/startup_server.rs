@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    config::Config,
+    config::{Config, S3Stack},
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
     storage_api::server::http::ServerContextSlot,
@@ -41,6 +41,7 @@ const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
+const GATEWAY_STACK_NOT_ASSEMBLED: &str = "gateway stack is not assembled yet (rustfs/backlog#2734 T2.5)";
 
 pub(crate) struct StartupListenContext {
     pub(crate) readiness: Arc<GlobalReadiness>,
@@ -81,6 +82,12 @@ pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
 ) -> Result<StartupListenContext> {
+    match config.s3_stack {
+        S3Stack::Legacy => {}
+        // REPLACED BY T2.5
+        // Refuse before any listener or storage exists; never fall back to legacy.
+        S3Stack::Gateway => return Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_ASSEMBLED)),
+    }
     crate::server::init_console_prefix()?;
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());

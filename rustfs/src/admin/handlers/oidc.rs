@@ -1313,6 +1313,20 @@ mod tests {
         let error = config_service_error(oidc_config::OidcAdminConfigError::Task("cancelled"));
         assert_eq!(error.code(), &S3ErrorCode::InternalError);
         assert_eq!(error.message(), Some("OIDC config update task cancelled"));
+
+        let error = rustfs_iam::oidc::build_upsert_provider_config(
+            "default",
+            rustfs_iam::oidc::OidcProviderConfigInput {
+                config_url: "https://127.0.0.1/.well-known/openid-configuration".to_string(),
+                client_id: "client".to_string(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect_err("loopback config URL should be rejected");
+        let error = config_service_error(oidc_config::OidcAdminConfigError::Config(error));
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("not allowed"));
     }
 
     /// The OIDC config gate now authorizes through the shared admin gate, which

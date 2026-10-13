@@ -69,6 +69,7 @@ crc-fast.workspace = true
 rustfs-common.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 rustfs-ecstore.workspace = true
+rustfs-s3-types = { workspace = true }
 rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }

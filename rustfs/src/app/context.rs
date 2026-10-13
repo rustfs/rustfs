@@ -16,6 +16,7 @@
 //! This module introduces explicit dependency injection entry points
 //! for storage, IAM, and KMS handles.
 
+mod envelope;
 mod global;
 mod handles;
 mod interfaces;
@@ -23,6 +24,8 @@ mod runtime_sources;
 mod server_slot;
 mod startup;
 
+pub(crate) use envelope::RequestHead;
+pub use envelope::{RequestCredentials, RequestEnvelope};
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;

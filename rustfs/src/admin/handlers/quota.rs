@@ -322,7 +322,9 @@ impl Operation for SetBucketQuotaHandler {
                 Some(limit) => BucketQuota::new_sharded(limit),
                 None => BucketQuota::new(None),
             },
-            Some(_) => return Err(s3_error!(InvalidArgument, "unsupported quota reservation protocol")),
+            Some(_) => {
+                return Err(rustfs_s3_types::s3_error!(InvalidArgument, "unsupported quota reservation protocol").into());
+            }
         };
 
         let metadata_sys_lock = bucket_metadata_from_context()

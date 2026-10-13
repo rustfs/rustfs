@@ -30,9 +30,7 @@ use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
-use rustfs_targets::{
-    extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
@@ -78,7 +76,7 @@ where
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    let mut resp_elements = extract_resp_elements(response);
+    let mut resp_elements = extract_params_header(&response.headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
 }
@@ -185,7 +183,7 @@ impl OperationHelper {
                     .user_agent(get_request_user_agent(&req.headers))
                     .req_host(get_request_host(&req.headers))
                     .req_path(req.uri.path().to_string())
-                    .req_query(extract_req_params(req))
+                    .req_query(extract_params_header(&req.headers))
                     .request_id(&request_id),
             )
         } else {
@@ -340,7 +338,7 @@ impl OperationHelper {
 
             let mut final_builder = builder.api(api_details.clone());
             if let Ok(res) = result {
-                final_builder = final_builder.resp_header(extract_resp_elements(res));
+                final_builder = final_builder.resp_header(extract_params_header(&res.headers));
             }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
