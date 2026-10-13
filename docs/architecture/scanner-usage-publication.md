@@ -29,10 +29,15 @@ rename work ends, including when the request caller is cancelled. Scan admission
 remains movement-only so sustained PUTs do not stop namespace walks and
 scanner-driven lifecycle discovery. The post-walk local publication check and
 remote publication leases reject pending fanouts. Begin/end namespace generations
-invalidate scans and cached plans across the fanout; after acquiring remote
-leases, the coordinator rechecks the full activity digest before publishing an
+invalidate cached plans across the fanout; after acquiring remote leases, the
+coordinator rechecks the guardrail fields of the activity snapshot (the
+structural digest and the movement fields, plus the peers' dirty-usage state
+while per-bucket certification is local only) before publishing an
 authoritative aggregate. This catches a tail that finishes between the scan's
-last probe and lease acquisition.
+last probe and lease acquisition. Local namespace and dirty-usage generation
+movement in that window is not a veto: its buckets stay in the dirty map and
+are the next cycle's work, as described in
+[scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md).
 
 This adds no namespace or movement lock. An already-verified older snapshot may
 still precede a newly started write. Sustained or stalled PUT tails can delay
@@ -142,7 +147,11 @@ requires a compatibility window and a dedicated cleanup entry.
 Observed snapshots are a diagnostic and availability layer. They may be served
 only when the snapshot explicitly reports that it is partial or observational,
 and only to consumers that do not make hard quota, durability, or deletion
-decisions from it. Admin usage views may expose this state with completeness
+decisions from it. The scanner routes a snapshot to the observed object by the
+explicit `usage_snapshot_observational` mark that a vetoed or unverifiable cycle
+sets, not by `usage_snapshot_converged`: a complete cycle that certified every
+bucket but the ones written during its walk publishes an unconverged
+authoritative snapshot that names those buckets as pending. Admin usage views may expose this state with completeness
 flags so operators can see progress while the authoritative publication is
 blocked. Quota enforcement must not use an observed snapshot as the current
 usage authority.
