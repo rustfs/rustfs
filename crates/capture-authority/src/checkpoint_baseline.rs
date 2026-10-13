@@ -41,7 +41,7 @@ fn metadata_limits() -> snapshot::Limits {
 }
 pub(crate) fn encode_metadata(metadata: &BaselineMetadata) -> Result<Vec<u8>, StoreError> {
     metadata.limits.validate()?;
-    if metadata.generation == 0 || metadata.header.applied.is_none() {
+    if metadata.generation == 0 {
         return Err(StoreError::CorruptRecord);
     }
     let mut bytes = b"CBAS\x01".to_vec();
@@ -202,7 +202,17 @@ pub(crate) fn validate_baseline_with_budget(
 
 fn validate_baseline_inner(tx: &ReadTransaction, metadata: &BaselineMetadata, index_max: u64) -> Result<(), StoreError> {
     encode_metadata(metadata)?;
-    let cut = required(metadata.header.applied)?;
+    let Some(cut) = metadata.header.applied else {
+        if metadata.header.membership != CaptureMembership::new(None, vec![], std::collections::BTreeMap::new())? {
+            return Err(StoreError::CorruptRecord);
+        }
+        for definition in [HEADS, VERSIONS, EVENTS, OPERATIONS] {
+            if tx.open_table(definition)?.len()? != 0 {
+                return Err(StoreError::CorruptRecord);
+            }
+        }
+        return Ok(());
+    };
     let heads = tx.open_table(HEADS)?;
     let versions = tx.open_table(VERSIONS)?;
     let events = tx.open_table(EVENTS)?;
@@ -366,7 +376,8 @@ pub(crate) fn validate_recovery_with_limits(
 fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<CheckpointLimits>) -> Result<(), StoreError> {
     let meta = tx.open_table(crate::META)?;
     let metadata = required(read_metadata(&meta)?)?;
-    let cut = required(metadata.header.applied)?;
+    crate::raft_state_machine::selected_meta(&meta, &metadata)?;
+    let cut = metadata.header.applied;
     let recovery_limits = override_limits.unwrap_or(metadata.limits);
     recovery_limits.validate()?;
     let identity = crate::decode_identity(required(meta.get("identity")?)?.value())?;
@@ -376,13 +387,13 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
     }
     let purged = read_purged(&meta)?;
     validate_baseline_with_budget(tx, &metadata, recovery_limits.staging_bytes)?;
-    let last = required(application::read_applied(&meta)?)?;
-    at_or_before(cut, last)?;
+    let last = application::read_applied(&meta)?;
+    optional_at_or_before(cut, last)?;
     let logs = tx.open_table(crate::LOGS)?;
-    let committed = required(crate::committed::validate_committed(&meta, &logs)?)?;
-    at_or_before(last, committed)?;
-    let declared_tail = crate::decode_id(required(meta.get("tail")?)?.value())?;
-    at_or_before(committed, declared_tail)?;
+    let committed = crate::committed::validate_committed(&meta, &logs)?;
+    optional_at_or_before(last, committed)?;
+    let declared_tail = meta.get("tail")?.map(|v| crate::decode_id(v.value())).transpose()?;
+    optional_at_or_before(committed, declared_tail)?;
     let (_directory, scratch) = recovery_scratch(recovery_limits.staging_bytes)?;
     for (source, target) in [
         (HEADS, application::HEADS),
@@ -407,10 +418,11 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
         write.commit().map_err(StoreError::StagingCommit)?;
     }
     let mut membership: CaptureMembership = metadata.header.membership.clone();
-    if let Some(retained_cut) = logs.get(cut.index)? {
-        if crate::decode_log(retained_cut.value())?.id != cut {
-            return Err(StoreError::CorruptRecord);
-        }
+    if let Some(cut) = cut
+        && let Some(retained_cut) = logs.get(cut.index)?
+        && crate::decode_log(retained_cut.value())?.id != cut
+    {
+        return Err(StoreError::CorruptRecord);
     }
     let results = tx.open_table(application::APPLY_RESULTS)?;
     // Covered entries may remain until purge. Check their exact typed responses
@@ -418,62 +430,64 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
     let operations = tx.open_table(OPERATIONS)?;
     let mut actual_tail = purged;
     let mut prefix_next = purged.map_or(Some(0), |id| id.index.checked_add(1));
-    for row in logs.range(..=cut.index)? {
-        let (key, bytes) = row?;
-        if purged.is_some_and(|purged| key.value() <= purged.index) {
-            return Err(StoreError::CorruptRecord);
-        }
-        if bytes.value().len() > 1024 * 1024 {
-            return Err(StoreError::CorruptRecord);
-        }
-        let entry = crate::decode_log(bytes.value())?;
-        if entry.id.index != key.value() || prefix_next != Some(key.value()) {
-            return Err(StoreError::CorruptRecord);
-        }
-        actual_tail = Some(entry.id);
-        prefix_next = key.value().checked_add(1);
-        let native = application::decode_native_entry(entry)?;
-        let bytes = required(results.get(key.value())?)?;
-        if bytes.value().len() > 1024 * 1024 {
-            return Err(StoreError::CorruptRecord);
-        }
-        let response = application::decode_response(bytes.value())?;
-        application::validate_response_kind(&native, &response)?;
-        if let openraft::EntryPayload::Normal(command) = native.payload {
-            let operation =
-                application::decode_provenance(required(operations.get(command.created().operation_id.as_slice())?)?.value())?;
-            let canonical = command.created().encode()?;
-            let expected = if operation.operation.canonical_command == canonical {
-                operation.operation.result
-            } else {
-                CreatedResult::OperationConflict
-            };
-            if response.created_result() != Some(&expected) {
+    if let Some(cut) = cut {
+        for row in logs.range(..=cut.index)? {
+            let (key, bytes) = row?;
+            if purged.is_some_and(|purged| key.value() <= purged.index) {
                 return Err(StoreError::CorruptRecord);
             }
-            if operation.first_decision_log_id.index == key.value()
-                && operation.first_decision_log_id != LogId::from(native.log_id)
-            {
+            if bytes.value().len() > 1024 * 1024 {
+                return Err(StoreError::CorruptRecord);
+            }
+            let entry = crate::decode_log(bytes.value())?;
+            if entry.id.index != key.value() || prefix_next != Some(key.value()) {
+                return Err(StoreError::CorruptRecord);
+            }
+            actual_tail = Some(entry.id);
+            prefix_next = key.value().checked_add(1);
+            let native = application::decode_native_entry(entry)?;
+            let bytes = required(results.get(key.value())?)?;
+            if bytes.value().len() > 1024 * 1024 {
+                return Err(StoreError::CorruptRecord);
+            }
+            let response = application::decode_response(bytes.value())?;
+            application::validate_response_kind(&native, &response)?;
+            if let openraft::EntryPayload::Normal(command) = native.payload {
+                let operation = application::decode_provenance(
+                    required(operations.get(command.created().operation_id.as_slice())?)?.value(),
+                )?;
+                let canonical = command.created().encode()?;
+                let expected = if operation.operation.canonical_command == canonical {
+                    operation.operation.result
+                } else {
+                    CreatedResult::OperationConflict
+                };
+                if response.created_result() != Some(&expected) {
+                    return Err(StoreError::CorruptRecord);
+                }
+                if operation.first_decision_log_id.index == key.value()
+                    && operation.first_decision_log_id != LogId::from(native.log_id)
+                {
+                    return Err(StoreError::CorruptRecord);
+                }
+            }
+        }
+        for row in results.range(..=cut.index)? {
+            let (key, _) = row?;
+            if purged.is_some_and(|purged| key.value() <= purged.index) || logs.get(key.value())?.is_none() {
                 return Err(StoreError::CorruptRecord);
             }
         }
-    }
-    for row in results.range(..=cut.index)? {
-        let (key, _) = row?;
-        if purged.is_some_and(|purged| key.value() <= purged.index) || logs.get(key.value())?.is_none() {
+        if purged.is_none_or(|purged| purged.index < cut.index) && logs.get(cut.index)?.is_none() {
             return Err(StoreError::CorruptRecord);
         }
     }
-    if purged.is_none_or(|purged| purged.index < cut.index) && logs.get(cut.index)?.is_none() {
-        return Err(StoreError::CorruptRecord);
-    }
-
-    if actual_tail != Some(cut) {
+    if actual_tail != cut {
         return Err(StoreError::CorruptRecord);
     }
 
     let mut observed = cut;
-    let mut next = cut.index.checked_add(1);
+    let mut next = cut.map_or(Some(0), |cut| cut.index.checked_add(1));
     let mut budget = Budget::new(recovery_limits.snapshot);
     if let Some(start) = next {
         for row in logs.range(start..)? {
@@ -486,7 +500,7 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
             next = key.value().checked_add(1);
             actual_tail = Some(entry.id);
             let native = application::decode_native_entry(entry.clone())?;
-            if key.value() > last.index {
+            if last.is_none_or(|last| key.value() > last.index) {
                 continue;
             }
             let response_bytes = required(results.get(key.value())?)?;
@@ -520,16 +534,16 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
                 return Err(StoreError::CorruptRecord);
             }
             write.commit().map_err(StoreError::StagingCommit)?;
-            observed = entry.id;
+            observed = Some(entry.id);
         }
         for row in results.range(start..)? {
             let (key, _) = row?;
-            if key.value() > last.index || logs.get(key.value())?.is_none() {
+            if last.is_none_or(|last| key.value() > last.index) || logs.get(key.value())?.is_none() {
                 return Err(StoreError::CorruptRecord);
             }
         }
     }
-    if actual_tail != Some(declared_tail) || observed != last || application::native_application_state(tx)?.1 != membership {
+    if actual_tail != declared_tail || observed != last || application::native_application_state(tx)?.1 != membership {
         return Err(StoreError::CorruptRecord);
     }
     let recovered = scratch.begin_read()?;
@@ -554,4 +568,12 @@ fn validate_recovery_inner(tx: &ReadTransaction, override_limits: Option<Checkpo
         }
     }
     Ok(())
+}
+
+fn optional_at_or_before(id: Option<LogId>, cut: Option<LogId>) -> Result<(), StoreError> {
+    match (id, cut) {
+        (None, _) => Ok(()),
+        (Some(id), Some(cut)) => at_or_before(id, cut),
+        _ => Err(StoreError::CorruptRecord),
+    }
 }

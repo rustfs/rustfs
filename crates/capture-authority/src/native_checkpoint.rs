@@ -165,7 +165,7 @@ pub(crate) fn recovery_scratch(maximum: u64) -> Result<(tempfile::TempDir, redb:
     Ok((directory, database))
 }
 
-fn stage_database(path: std::path::PathBuf, maximum: u64) -> Result<redb::Database, StoreError> {
+pub(crate) fn stage_database(path: std::path::PathBuf, maximum: u64) -> Result<redb::Database, StoreError> {
     let file = File::options().read(true).write(true).create_new(true).open(path)?;
     let backend = BoundedBackend::new(file, maximum)?;
     Ok(redb::Database::builder()
@@ -201,7 +201,7 @@ impl Write for PayloadFile {
     }
 }
 
-struct StageSink<'a>(&'a redb::WriteTransaction);
+pub(crate) struct StageSink<'a>(pub(crate) &'a redb::WriteTransaction);
 
 impl snapshot::StagingSink for StageSink<'_> {
     fn row(&mut self, section: snapshot::Section, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -521,11 +521,10 @@ impl NativeLogWriter {
                 return Err(CheckpointError::Conflict("live applied and committed bounds"));
             }
             drop(logs);
-            if let Some(previous) = &previous {
-                let old = previous.header.applied.ok_or(StoreError::CorruptRecord)?;
-                if old.index > cut.index || (old.index == cut.index && old != cut) {
-                    return Err(CheckpointError::Conflict("published checkpoint cut"));
-                }
+            if let Some(old) = previous.as_ref().and_then(|previous| previous.header.applied)
+                && (old.index > cut.index || (old.index == cut.index && old != cut))
+            {
+                return Err(CheckpointError::Conflict("published checkpoint cut"));
             }
             let mut metadata = stage.metadata;
             metadata.generation = previous.map_or(Ok(1), |old| {
@@ -572,6 +571,7 @@ impl NativeLogWriter {
                 .map_err(StoreError::from)?;
             meta.insert("schema", 7u64.to_be_bytes().as_slice())
                 .map_err(StoreError::from)?;
+            crate::raft_state_machine::publish_local_meta(&mut meta, &metadata)?;
             drop(meta);
             if cancelled.load(Ordering::Acquire) {
                 return Err(CheckpointError::Cancelled);

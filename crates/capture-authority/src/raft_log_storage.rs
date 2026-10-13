@@ -121,9 +121,46 @@ impl RaftLogStorage<CaptureTypeConfig> for NativeRaftLogStore {
             .map_err(|e| error(e, StorageIOError::write_logs))
     }
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        self.writer
-            .write(move |store| store.purge_native_prefix(log_id.into(), None))
-            .await
-            .map_err(|e| error(e, StorageIOError::write_logs))
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(error(NativeWriteError::Store(StoreError::StaleCheckpoint), StorageIOError::write_logs));
+            }
+            let notified = self.writer.snapshot_receives.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let receives = self.writer.snapshot_receives.clone();
+            // Observe coverage and receive ownership while install is excluded by ordering.
+            let (result, pending) = self
+                .writer
+                .write(move |store| Ok((store.purge_native_prefix(log_id.into(), None), receives.pending())))
+                .await
+                .map_err(|e| error(e, StorageIOError::write_logs))?;
+            if matches!(&result, Err(StoreError::StaleCheckpoint)) {
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .writer
+                        .snapshot_receives
+                        .purge_recheck
+                        .lock()
+                        .expect("test hook lock")
+                        .take();
+                    if let Some((entered, resume)) = hook {
+                        entered.notify_one();
+                        resume.notified().await;
+                    }
+                }
+                if pending {
+                    #[cfg(test)]
+                    let _waiter = crate::raft_state_machine::Waiter::new(self.writer.snapshot_receives.clone());
+                    if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                        return Err(error(NativeWriteError::Store(StoreError::StaleCheckpoint), StorageIOError::write_logs));
+                    }
+                    continue;
+                }
+            }
+            return result.map_err(|e| error(e.into(), StorageIOError::write_logs));
+        }
     }
 }

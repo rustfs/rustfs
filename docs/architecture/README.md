@@ -32,6 +32,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 
 | Document | Use this when |
 |---|---|
+| [native-raft-state-machine.md](native-raft-state-machine.md) | adapting native capture application state to OpenRaft or receiving durable snapshots |
 | [capture-raft-log-storage.md](capture-raft-log-storage.md) | adapting native capture persistence to OpenRaft log traits or changing checkpoint-authorized prefix purge |
 | [capture-checkpoint-contract.md](capture-checkpoint-contract.md) | changing Capture checkpoint capture, provenance, installation, recovery, or log cleanup |
 | [native-source-reader.md](native-source-reader.md) | exposing a live native capture writer through a same-UID local read-only source interface |

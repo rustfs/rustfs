@@ -21,7 +21,16 @@ pub mod source_reader;
 mod source_reader_tests;
 pub use source_page::{EventCursor, EventPage, MAX_EVENT_PAGE, SourceEvent};
 mod native_snapshot;
+mod native_snapshot_data;
+pub use native_snapshot_data::NativeSnapshotData;
+mod native_snapshot_install;
+mod raft_state_machine;
+pub use raft_state_machine::NativeRaftStateMachine;
+#[cfg(test)]
+mod native_snapshot_install_tests;
 mod raft_log_storage;
+#[cfg(test)]
+mod raft_state_machine_tests;
 pub use raft_log_storage::NativeRaftLogStore;
 mod node;
 #[cfg(test)]
@@ -61,6 +70,7 @@ impl NativeLogReader {
 pub struct NativeLogWriter {
     store: std::sync::Arc<std::sync::Mutex<Store>>,
     ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
+    snapshot_receives: std::sync::Arc<raft_state_machine::ReceiveState>,
     checkpoint_admission: std::sync::Arc<tokio::sync::Mutex<()>>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     source_reader_admission: std::sync::Arc<tokio::sync::Semaphore>,
@@ -81,6 +91,7 @@ impl NativeLogWriter {
         Self {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
             ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_receives: std::sync::Arc::new(raft_state_machine::ReceiveState::default()),
             checkpoint_admission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             source_reader_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(source_reader::MAX_CONNECTIONS)),
@@ -538,7 +549,10 @@ impl Store {
         let read = self.database.begin_read()?;
         let meta = read.open_table(META)?;
         let selected = checkpoint_baseline::read_metadata(&meta)?.ok_or(StoreError::StaleCheckpoint)?;
-        let cut = selected.header.applied.ok_or(StoreError::CorruptRecord)?;
+        let Some(cut) = selected.header.applied else {
+            checkpoint_baseline::validate_recovery(&read)?;
+            return Err(StoreError::StaleCheckpoint);
+        };
         if expected.is_some_and(|(generation, id)| generation != selected.generation || id != cut) {
             return Err(StoreError::StaleCheckpoint);
         }

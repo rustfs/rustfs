@@ -136,7 +136,7 @@ openraft::declare_raft_types!(
         NodeId = u64,
         Node = CaptureNode,
         Entry = openraft::Entry<Self>,
-        SnapshotData = std::io::Cursor<Vec<u8>>,
+        SnapshotData = crate::NativeSnapshotData,
         AsyncRuntime = openraft::TokioRuntime,
         Responder = openraft::impls::OneshotResponder<Self>,
 );
@@ -925,7 +925,7 @@ mod tests {
                     NodeId = u64,
                     Node = CaptureNode,
                     Entry = CaptureRaftEntry,
-                    SnapshotData = std::io::Cursor<Vec<u8>>,
+                    SnapshotData = crate::NativeSnapshotData,
                     AsyncRuntime = openraft::TokioRuntime,
                     Responder = openraft::impls::OneshotResponder<CaptureTypeConfig>,
                 >,
