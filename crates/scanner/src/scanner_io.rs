@@ -1049,6 +1049,10 @@ async fn publish_observational_snapshot(
     Ok(true)
 }
 
+/// Post-walk verdict of the cluster activity guardrail. `Changed` is an
+/// attributed veto (or, for peers, the phase-2 dirty-usage fallback); local
+/// namespace and dirty-usage generation movement is not a veto and is
+/// certified per bucket instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCycleActivityStatus {
     Unchanged,
@@ -1069,10 +1073,47 @@ where
     let publication_blocked = store.scanner_data_usage_publication_blocked().await;
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
-            let status = if !publication_blocked && after == *before {
-                ScannerCycleActivityStatus::Unchanged
+            let veto = if publication_blocked {
+                Some(crate::scanner::ScannerActivityGuardrailVeto::new(
+                    crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+                    "publication_blocked",
+                ))
             } else {
+                crate::scanner::scanner_activity_guardrail_veto(before, &after)
+            };
+            let status = if let Some(veto) = veto {
+                warn!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_guardrail_veto",
+                    stage = "post_scan_probe",
+                    field = veto.field,
+                    host = %veto.host,
+                    "Scanner cycle publication vetoed by the cluster activity guardrail"
+                );
+                global_metrics().record_scanner_guardrail_veto(veto.reason());
                 ScannerCycleActivityStatus::Changed
+            } else if let Some(moved) = crate::scanner::scanner_peer_dirty_usage_moved(before, &after) {
+                // Per-bucket certification covers the local dirty map only;
+                // a peer whose dirty state moved keeps today's whole-cycle
+                // outcome until scoped acknowledgements can name its buckets.
+                tracing::info!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_peer_dirty_usage_moved",
+                    stage = "post_scan_probe",
+                    field = moved.field,
+                    host = %moved.host,
+                    "Scanner cycle superseded because a peer's dirty usage moved during the walk"
+                );
+                global_metrics().record_scanner_guardrail_veto(moved.reason());
+                ScannerCycleActivityStatus::Changed
+            } else {
+                ScannerCycleActivityStatus::Unchanged
             };
             (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
         }

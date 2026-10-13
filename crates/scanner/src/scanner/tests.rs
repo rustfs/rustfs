@@ -10177,6 +10177,130 @@ fn remote_restart_is_distinct_from_deferred_cluster_activity() {
 }
 
 #[test]
+fn guardrail_veto_is_attributed_to_the_field_and_host_that_moved() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    assert_eq!(scanner_activity_guardrail_veto(&before, &before), None);
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut ScannerNodeActivity)>)> = vec![
+        ("instance_id", Box::new(|activity| activity.instance_id = "restarted".to_string())),
+        ("protocol_version", Box::new(|activity| activity.protocol_version += 1)),
+        ("topology_digest", Box::new(|activity| activity.topology_digest = [4; 32])),
+        ("maintenance_generation", Box::new(|activity| activity.maintenance_generation += 1)),
+        ("data_movement_active", Box::new(|activity| activity.data_movement_active = true)),
+        ("movement_generation", Box::new(|activity| activity.movement_generation += 1)),
+        ("publication_blocked", Box::new(|activity| activity.publication_blocked = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &cases {
+            let mut after = before.clone();
+            mutate(after.get_mut(host).expect("host should be present"));
+            let veto = scanner_activity_guardrail_veto(&before, &after).unwrap_or_else(|| panic!("{field} on {host} must veto"));
+            assert_eq!(veto.field, *field, "{host}");
+            assert_eq!(veto.host, host);
+            assert_eq!(veto.reason(), format!("{field}@{host}"));
+            assert!(SCANNER_ACTIVITY_GUARDRAIL_VETO_FIELDS.contains(field));
+        }
+    }
+
+    let mut peer_lost = before.clone();
+    peer_lost.remove("node-2");
+    assert_eq!(
+        scanner_activity_guardrail_veto(&before, &peer_lost),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "peer_set"))
+    );
+    let mut peer_added = before.clone();
+    peer_added.insert("node-3".to_string(), scanner_node_activity("third", 1, 1));
+    assert_eq!(
+        scanner_activity_guardrail_veto(&before, &peer_added),
+        Some(ScannerActivityGuardrailVeto::new("node-3", "peer_set"))
+    );
+}
+
+#[test]
+fn generation_movement_shades_buckets_without_a_guardrail_veto() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    let shade: Vec<(&str, Box<dyn Fn(&mut ScannerNodeActivity)>)> = vec![
+        ("namespace_generation", Box::new(|activity| activity.namespace_generation += 1)),
+        ("dirty_usage_generation", Box::new(|activity| activity.dirty_usage_generation += 1)),
+        ("dirty_usage_pending", Box::new(|activity| activity.dirty_usage_pending = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &shade {
+            let mut after = before.clone();
+            mutate(after.get_mut(host).expect("host should be present"));
+            assert_ne!(after, before);
+            assert_eq!(scanner_activity_guardrail_veto(&before, &after), None, "{field} on {host} must not veto");
+            assert!(SCANNER_ACTIVITY_SHADE_FIELDS.contains(field));
+            assert_eq!(
+                scanner_activity_structural_digest(&before),
+                scanner_activity_structural_digest(&after),
+                "{field} must stay outside the structural digest"
+            );
+        }
+    }
+
+    // Everything shaded at once on every host is still not a veto.
+    let mut all_shaded = before.clone();
+    for activity in all_shaded.values_mut() {
+        activity.namespace_generation += 3;
+        activity.dirty_usage_generation += 3;
+        activity.dirty_usage_pending = true;
+    }
+    assert_eq!(scanner_activity_guardrail_veto(&before, &all_shaded), None);
+}
+
+#[test]
+fn peer_dirty_usage_movement_is_reported_for_remote_hosts_only() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &before), None);
+
+    let mut local_moved = before.clone();
+    let local = local_moved
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local activity should exist");
+    local.dirty_usage_generation += 1;
+    local.dirty_usage_pending = true;
+    local.namespace_generation += 1;
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &local_moved), None);
+
+    let mut remote_namespace_only = before.clone();
+    remote_namespace_only
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .namespace_generation += 1;
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &remote_namespace_only), None);
+
+    let mut remote_generation = before.clone();
+    remote_generation
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .dirty_usage_generation += 1;
+    assert_eq!(
+        scanner_peer_dirty_usage_moved(&before, &remote_generation),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "dirty_usage_generation"))
+    );
+
+    let mut remote_pending = before.clone();
+    remote_pending
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .dirty_usage_pending = true;
+    assert_eq!(
+        scanner_peer_dirty_usage_moved(&before, &remote_pending),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "dirty_usage_pending"))
+    );
+}
+
+#[test]
 fn local_maintenance_wakeup_releases_a_remote_maintenance_block() {
     let blocked = scanner_activity_backoff_blocked_after_wake(false, ScannerCycleWakeReason::ClusterMaintenance);
     assert!(blocked);
