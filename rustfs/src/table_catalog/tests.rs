@@ -5307,6 +5307,215 @@ async fn durable_strong_scheduler_revalidates_entry_after_unlocked_planning() {
 }
 
 #[tokio::test]
+async fn durable_strong_direct_worker_plans_without_bucket_publication_lock() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+    let entry = seed_strong_maintenance_table(&store, &backend).await;
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let other = IdentifierSegment::parse("payments").unwrap();
+    let other_current = default_table_metadata_file_path(&namespace, &other, "00001.metadata.json");
+    let other_next = default_table_metadata_file_path(&namespace, &other, "00002.metadata.json");
+    let mut other_entry = test_table_entry(bucket, &namespace, &other, other_current.clone());
+    other_entry.table_id = "payments-id".to_string();
+    other_entry.table_uuid = "payments-uuid".to_string();
+    other_entry.warehouse_location = format!("s3://{bucket}/tables/payments-id");
+    store.create_table(other_entry).await.unwrap();
+    backend.seed_object(bucket, &other_next, b"{}".to_vec()).await;
+    assert!(
+        store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pause = backend.pause_next_read(bucket, &entry.metadata_location).await;
+    let worker_store = Arc::clone(&store);
+    let worker = tokio::spawn(async move {
+        worker_store
+            .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "direct-paused-plan".to_string())
+            .await
+    });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .expect("direct worker planner must reach current metadata read");
+    let committed = tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        store.commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: "sales".to_string(),
+            table: "payments".to_string(),
+            commit_id: "unrelated-during-direct-worker".to_string(),
+            idempotency_key: None,
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: other_current,
+            new_metadata_location: other_next.clone(),
+            requirements: Vec::new(),
+            writer: Some("maintenance-test".to_string()),
+        }),
+    )
+    .await
+    .expect("direct worker planning must release the bucket publication writer")
+    .unwrap();
+    assert_eq!(committed.table.metadata_location, other_next);
+    assert!(!worker.is_finished());
+    pause.release();
+    let completed = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker)
+        .await
+        .expect("direct worker must finish after planning resumes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+    assert_eq!(completed.job.worker_id.as_deref(), Some("direct-paused-plan"));
+    assert_eq!(completed.current_metadata_location, entry.metadata_location);
+    assert_eq!(store.load_table(bucket, "sales", "payments").await.unwrap().unwrap(), committed.table);
+    assert_eq!(
+        store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .unwrap()
+            .unwrap(),
+        completed
+    );
+}
+
+#[tokio::test]
+async fn durable_strong_direct_worker_does_not_overwrite_new_scheduler_claim() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+    let entry = seed_strong_maintenance_table(&store, &backend).await;
+    let bucket = "analytics";
+    let previous = store
+        .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "previous-worker".to_string())
+        .await
+        .unwrap();
+    assert_eq!(previous.job.status, TableMetadataMaintenanceJobStatus::Successful);
+    let pause = backend.pause_next_read(bucket, &entry.metadata_location).await;
+    let worker_store = Arc::clone(&store);
+    let worker = tokio::spawn(async move {
+        worker_store
+            .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "stale-direct-plan".to_string())
+            .await
+    });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .expect("direct worker planner must reach current metadata read");
+    assert_eq!(
+        store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .unwrap()
+            .unwrap(),
+        previous
+    );
+    let winning_claim = tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        store.run_table_maintenance_scheduler_once(bucket, "sales", "orders", "winning-scheduler".to_string()),
+    )
+    .await
+    .expect("scheduler must be able to claim while the direct worker plans")
+    .unwrap();
+    assert_eq!(winning_claim.report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+    assert_ne!(winning_claim.report.job.job_id, previous.job.job_id);
+    let before_claim = maintenance_test_object_versions(&backend).await;
+    pause.release();
+    assert_matches!(
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker).await.unwrap().unwrap(),
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("current maintenance job changed during planning")
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before_claim);
+    assert_eq!(
+        store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .unwrap()
+            .unwrap(),
+        winning_claim.report
+    );
+    assert_eq!(
+        store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &previous.job.job_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        previous
+    );
+}
+
+#[tokio::test]
+async fn durable_strong_direct_worker_revalidates_entry_and_full_config_after_planning() {
+    for change_config in [false, true] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+        let entry = seed_strong_maintenance_table(&store, &backend).await;
+        let bucket = "analytics";
+        let pause = backend.pause_next_read(bucket, &entry.metadata_location).await;
+        let worker_store = Arc::clone(&store);
+        let worker = tokio::spawn(async move {
+            worker_store
+                .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "stale-direct-plan".to_string())
+                .await
+        });
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+            .await
+            .expect("direct worker planner must reach current metadata read");
+        let expected_conflict = if change_config {
+            let mut config = store.get_table_maintenance_config(bucket, "sales", "orders").await.unwrap();
+            config.max_retry_attempts = 1;
+            tokio::time::timeout(
+                TABLE_CATALOG_TEST_TIMEOUT,
+                store.put_table_maintenance_config(bucket, "sales", "orders", config),
+            )
+            .await
+            .expect("direct worker planning must permit config changes")
+            .unwrap();
+            "maintenance config changed during worker planning"
+        } else {
+            let namespace = Namespace::parse("sales").unwrap();
+            let table = IdentifierSegment::parse("orders").unwrap();
+            let next = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+            backend.seed_object(bucket, &next, b"{}".to_vec()).await;
+            let committed = tokio::time::timeout(
+                TABLE_CATALOG_TEST_TIMEOUT,
+                store.commit_table(TableCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: "sales".to_string(),
+                    table: "orders".to_string(),
+                    commit_id: "target-during-direct-worker".to_string(),
+                    idempotency_key: None,
+                    operation: "append".to_string(),
+                    expected_version_token: entry.version_token,
+                    expected_metadata_location: entry.metadata_location,
+                    new_metadata_location: next.clone(),
+                    requirements: Vec::new(),
+                    writer: Some("maintenance-test".to_string()),
+                }),
+            )
+            .await
+            .expect("direct worker planning must permit target table commits")
+            .unwrap();
+            assert_eq!(committed.table.metadata_location, next);
+            "table changed during maintenance worker planning"
+        };
+        let before_claim = maintenance_test_object_versions(&backend).await;
+        pause.release();
+        assert_matches!(
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker).await.unwrap().unwrap(),
+            Err(TableCatalogStoreError::Conflict(message)) if message.contains(expected_conflict)
+        );
+        assert_eq!(maintenance_test_object_versions(&backend).await, before_claim);
+        assert!(
+            store
+                .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn durable_strong_quarantine_mutation_rejects_non_current_job() {
     let backend = TestCatalogObjectBackend::default();
     let object_store = ObjectTableCatalogStore::new(backend.clone());

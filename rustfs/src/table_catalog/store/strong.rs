@@ -2268,10 +2268,64 @@ where
         let mut report = if let Some(queued) = queued {
             *queued
         } else {
-            sidecar
+            let planned_job = sidecar
+                .get_table_metadata_maintenance_report_for_entry_unlocked(
+                    table_bucket,
+                    &namespace,
+                    &table,
+                    &entry.table_id,
+                    MAINTENANCE_JOB_ALIAS_CURRENT,
+                )
+                .await?;
+            // Only fresh planning is read-only; queued execution and deletion keep publication held.
+            publication.release_publication_locks();
+            let report = sidecar
                 .plan_table_metadata_maintenance_for_entry(&entry, effective.config.retain_recent_metadata_files)
-                .await?
+                .await?;
+            publication.begin_table_bucket(table_bucket).await?;
+            publication
+                .prepare(table_bucket, &namespace.public_name(), table.as_str())
+                .await?;
+            Self::require_table_maintenance_publication(
+                &publication,
+                table_bucket,
+                &namespace.public_name(),
+                table.as_str(),
+                "worker revalidation",
+            )?;
+            let current = self
+                .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+                .await?;
+            if current != entry {
+                return Err(TableCatalogStoreError::Conflict(
+                    "table changed during maintenance worker planning".to_string(),
+                ));
+            }
+            let current_effective = sidecar
+                .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await?;
+            if current_effective != effective {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance config changed during worker planning".to_string(),
+                ));
+            }
+            let current_job = sidecar
+                .get_table_metadata_maintenance_report_for_entry_unlocked(
+                    table_bucket,
+                    &namespace,
+                    &table,
+                    &entry.table_id,
+                    MAINTENANCE_JOB_ALIAS_CURRENT,
+                )
+                .await?;
+            if current_job != planned_job {
+                return Err(TableCatalogStoreError::Conflict(
+                    "current maintenance job changed during planning".to_string(),
+                ));
+            }
+            report
         };
+        let now = OffsetDateTime::now_utc();
         let effective = sidecar
             .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
             .await?;

@@ -3087,9 +3087,14 @@ mod tests {
             } = maintenance_mutation_fixture(data_orphan).await;
             let now = OffsetDateTime::now_utc();
             let window = time::Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS);
-            report.job.cleanup_watermark_unix_seconds = (now - window * 3).unix_timestamp();
+            report.job.cleanup_watermark_unix_seconds = (now - window * 3_i32).unix_timestamp();
             backend
-                .seed_object_with_mod_time(&entry.table_bucket, &orphan, b"changed since plan".to_vec(), Some(now - window * 2))
+                .seed_object_with_mod_time(
+                    &entry.table_bucket,
+                    &orphan,
+                    b"changed since plan".to_vec(),
+                    Some(now - window * 2_i32),
+                )
                 .await;
             let before = backend.read_object(&entry.table_bucket, &orphan).await.unwrap();
             let publication = TableCommitLockPublication::new(&backend);
