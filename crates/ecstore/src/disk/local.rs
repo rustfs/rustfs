@@ -10538,7 +10538,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        if volume == RUSTFS_META_BUCKET && path.starts_with("native-preparations/") {
+        if crate::disk::native_prepare_rpc::is_native_stream_path(volume, path)? {
             #[cfg(unix)]
             {
                 let segments = path.split('/').collect::<Vec<_>>();
@@ -11583,6 +11583,68 @@ mod test {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_stream_reserved_split_never_truncates_attested_shard() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "native-split-regression";
+        let key = "object";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real bucket");
+        let preparation = Uuid::new_v4();
+        drop(
+            store
+                .prepare_native_object(
+                    bucket,
+                    key,
+                    preparation,
+                    &mut crate::object_api::PutObjReader::from_vec(vec![51; 2 * 1024 * 1024 + 7]),
+                )
+                .await
+                .expect("actual erasure/bitrot preparation"),
+        );
+        let mut endpoint = Endpoint::try_from(dirs[0].path().to_str().expect("root")).expect("endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let disk = LocalDisk::new(&endpoint, false).await.expect("actual LocalDisk");
+        let path = format!("native-preparations/{preparation}/{preparation}/part.1");
+        let full = dirs[0].path().join(RUSTFS_META_BUCKET).join(&path);
+        let before = std::fs::read(&full).expect("actual durable shard");
+        for (volume, candidate) in [
+            (
+                format!("{RUSTFS_META_BUCKET}/native-preparations/{preparation}"),
+                format!("{preparation}/part.1"),
+            ),
+            (
+                format!("{RUSTFS_META_BUCKET}/native-preparations"),
+                format!("{preparation}/{preparation}/part.1"),
+            ),
+            (RUSTFS_META_BUCKET.to_owned(), format!("./{path}")),
+            (
+                RUSTFS_META_BUCKET.to_owned(),
+                format!("native-preparations//{preparation}/{preparation}/part.1"),
+            ),
+        ] {
+            assert!(
+                matches!(disk.create_file("", &volume, &candidate, 1).await, Err(DiskError::InvalidPath)),
+                "NATIVE_RESERVED_SPLIT_MUST_REJECT_BEFORE_TRUNCATE: {volume}/{candidate}"
+            );
+            assert_eq!(
+                std::fs::read(&full).expect("retained actual shard"),
+                before,
+                "NATIVE_RESERVED_SPLIT_MUST_PRESERVE_ATTESTED_SHARD"
+            );
+        }
+        assert!(store.recover_native_object(bucket, key, preparation).await.is_ok());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
