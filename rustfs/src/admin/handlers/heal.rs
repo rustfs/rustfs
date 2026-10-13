@@ -732,6 +732,21 @@ fn merge_replacement_recovery_records(
     records.into_values().collect()
 }
 
+/// Distinct replacement generations must not claim the same target slot: two
+/// completed histories for one replaced disk cannot be reconciled into a
+/// definitive cluster view. Identical copies of one task are deduplicated by
+/// the merge, and disagreeing copies already surface as `Unknown` records.
+fn replacement_generations_claim_overlapping_targets(records: &[rustfs_heal::ReplacementRecoveryRecord]) -> bool {
+    records.iter().any(|left| {
+        !left.target_slots.is_empty()
+            && records.iter().any(|right| {
+                right.task_id != left.task_id
+                    && !right.target_slots.is_empty()
+                    && right.target_slots.iter().any(|slot| left.target_slots.contains(slot))
+            })
+    })
+}
+
 fn aggregate_replacement_recovery_cluster_status(
     mut snapshots: Vec<rustfs_heal::ReplacementRecoverySnapshot>,
     peer_statuses: Vec<Result<Option<rustfs_heal::ReplacementRecoverySnapshot>, String>>,
@@ -762,23 +777,18 @@ fn aggregate_replacement_recovery_cluster_status(
         reason.get_or_insert("peer_replacement_recovery_status_not_definitive");
     }
 
-    // Replacement recovery state is anchored on one surviving disk. Nodes
-    // without that disk legitimately report a definitive empty snapshot, so
-    // only non-empty snapshots must agree with each other.
-    let mut non_empty_records = snapshots
-        .iter()
-        .filter(|snapshot| !snapshot.records.is_empty())
-        .map(|snapshot| canonical_replacement_records(&snapshot.records));
-    if let Some(first_records) = non_empty_records.next()
-        && non_empty_records.any(|records| records != first_records)
-    {
-        reason.get_or_insert("peer_replacement_recovery_status_conflict");
-    }
-
+    // Replacement completion proofs are anchored per generation on one
+    // surviving disk, so sequential automatic generations legitimately leave
+    // different completed tasks on different peers, and peers without an
+    // anchor report definitive empty snapshots. Peers conflict only when they
+    // disagree about one task (the merge marks those copies `Unknown`) or
+    // when distinct generations claim the same target slot; disjoint
+    // generations merge into one definitive cluster history.
     let records = merge_replacement_recovery_records(&snapshots);
     if records
         .iter()
         .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
+        || replacement_generations_claim_overlapping_targets(&records)
     {
         reason.get_or_insert("peer_replacement_recovery_status_conflict");
     }
@@ -2369,7 +2379,10 @@ mod tests {
     }
 
     #[test]
-    fn replacement_recovery_cluster_requires_matching_peer_records() {
+    fn replacement_recovery_cluster_rejects_overlapping_targets_across_generations() {
+        // Both helper records claim the same target slot, so two completed
+        // generations over one replaced disk stay non-definitive even though
+        // the task ids differ.
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let peer = replacement_snapshot("22222222-2222-4222-8222-222222222222");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
@@ -2377,6 +2390,61 @@ mod tests {
         assert!(!cluster.definitive);
         assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
         assert_eq!(cluster.records.len(), 2);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_merges_disjoint_generations_across_anchors() {
+        // rustfs/rustfs#8366: sequential automatic generations anchor their
+        // completion proofs on different surviving disks, so peers hold
+        // disjoint completed tasks and the remaining peers hold none at all.
+        let mut rebuilt_record = replacement_record("11111111-1111-4111-8111-111111111111");
+        rebuilt_record.target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let mut anchor_record = replacement_record("22222222-2222-4222-8222-222222222222");
+        anchor_record.target_slots = vec!["http://node-a:9000/mnt/disk1".to_string()];
+        let rebuilt = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![rebuilt_record],
+            definitive: true,
+            reason: None,
+        };
+        let anchor = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![anchor_record],
+            definitive: true,
+            reason: None,
+        };
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let cluster =
+            aggregate_replacement_recovery_cluster_status(vec![rebuilt], vec![Ok(Some(anchor)), Ok(Some(empty))], 3, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records.len(), 2);
+        assert!(
+            cluster
+                .records
+                .iter()
+                .all(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Completed))
+        );
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_peer_disagreement_about_one_task() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let mut disagreeing = replacement_record("11111111-1111-4111-8111-111111111111");
+        disagreeing.set_disk_id = Some("pool_0_set_1".to_string());
+        let peer = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![disagreeing],
+            definitive: true,
+            reason: None,
+        };
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
     }
 
     #[test]
