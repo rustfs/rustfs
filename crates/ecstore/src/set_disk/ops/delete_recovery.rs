@@ -1570,6 +1570,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_batch_with_missing_version_recovers_after_preparation_failure() {
+        use crate::disk::RUSTFS_META_TMP_BUCKET;
+        use crate::storage_api_contracts::object::ObjectToDelete;
+
+        let bucket = "recover-batch-missing-version";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let deleted = put(&store, bucket, &vec![48; 4096], true).await.expect("version to delete");
+        let remaining = vec![49; 4096];
+        let retained = put(&store, bucket, &remaining, true).await.expect("version to retain");
+        let missing = Uuid::new_v4();
+        let temporary = dirs[3].path().join(RUSTFS_META_TMP_BUCKET);
+        let saved = dirs[3].path().join("saved-delete-tmp");
+        tokio::fs::rename(&temporary, &saved)
+            .await
+            .expect("save returning disk's staging directory");
+        tokio::fs::write(&temporary, b"block preparation")
+            .await
+            .expect("fail staging after the recovery preflight");
+
+        let (objects, errors) = store
+            .delete_objects(
+                bucket,
+                [deleted, missing]
+                    .into_iter()
+                    .map(|version| ObjectToDelete {
+                        object_name: "object".into(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(objects.len(), 2);
+        assert!(errors.iter().all(Option::is_none), "batch deletion succeeds at quorum: {errors:?}");
+        assert!(
+            disks[3]
+                .discover_delete_transactions(bucket, Some("object"), None, 100)
+                .await
+                .expect("inspect failed preparation")
+                .transactions
+                .is_empty(),
+            "returning disk must adopt the quorum decision without a local preparation"
+        );
+        tokio::fs::remove_file(&temporary).await.expect("remove preparation failure");
+        tokio::fs::rename(&saved, &temporary)
+            .await
+            .expect("restore returning disk staging");
+
+        let result = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("recover batch containing a missing non-null version");
+        assert!(result.detail.contains("blocked=0"), "{}", result.detail);
+        assert_eq!(body(&store, bucket, Some(retained)).await, remaining);
+        for version in [deleted, missing] {
+            assert_eq!(
+                disks[3]
+                    .read_version(bucket, bucket, "object", &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect_err("returning disk must not retain or create a deleted version"),
+                DiskError::FileVersionNotFound
+            );
+        }
+        for disk in &disks {
+            assert!(
+                disk.discover_delete_transactions(bucket, Some("object"), None, 100)
+                    .await
+                    .expect("inspect converged batch")
+                    .transactions
+                    .is_empty(),
+                "every participant must converge and release the decision"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_dry_run_matches_adoption_of_already_absent_non_null_version() {
         let bucket = "recover-preview-non-null";
         let (_dirs, store, disks) = fixture(bucket).await;

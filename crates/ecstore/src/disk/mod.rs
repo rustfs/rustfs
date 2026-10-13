@@ -1904,7 +1904,7 @@ impl DeleteRecoveryJournal {
             }
             let id = request.version_id.unwrap_or_default();
             let Some(original) = originals.get(&id) else {
-                return false;
+                return !id.is_nil() && !locals.contains_key(&id);
             };
             match locals.get(&id) {
                 Some(local) => local == original,
@@ -2944,6 +2944,30 @@ mod delete_recovery_adoption_tests {
         };
         assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
         assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let missing = Uuid::new_v4();
+        journal.requests.push(FileInfo {
+            version_id: Some(missing),
+            ..Default::default()
+        });
+        assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
+        assert!(
+            journal.matches_adoption_source(std::slice::from_ref(&source)),
+            "a missing non-null version in the batch remains a no-op"
+        );
+        let mut unexpected = source.clone();
+        unexpected.version_id = Some(missing);
+        assert!(
+            !journal.matches_adoption_source(&[source.clone(), unexpected]),
+            "a version absent from the authority cannot be deleted locally"
+        );
+        for version_id in [None, Some(Uuid::nil())] {
+            journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_adoption_source(std::slice::from_ref(&source)),
+                "a missing null version cannot establish its generation"
+            );
+        }
+        journal.requests.pop();
         let mut foreign = source.clone();
         foreign.metadata_digest = [2; 32];
         assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
