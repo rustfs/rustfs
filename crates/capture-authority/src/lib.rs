@@ -21,7 +21,11 @@ pub mod source_reader;
 mod source_reader_tests;
 pub use source_page::{EventCursor, EventPage, MAX_EVENT_PAGE, SourceEvent};
 mod native_snapshot;
+mod raft_log_storage;
+pub use raft_log_storage::NativeRaftLogStore;
 mod node;
+#[cfg(test)]
+mod raft_log_storage_tests;
 pub use native_snapshot::{NativeSnapshotError, NativeSnapshotView};
 mod raft_types;
 pub mod snapshot;
@@ -522,14 +526,43 @@ impl Store {
         })
     }
     fn purge_checkpoint(&mut self, generation: u64, cut: LogId) -> Result<(), StoreError> {
+        self.purge_native_prefix(cut, Some((generation, cut)))
+    }
+
+    /// The selected durable baseline authorizes only an exact covered log prefix.
+    /// Caller holds NativeLogWriter ordering and Store ownership throughout validation/commit.
+    fn purge_native_prefix(&mut self, through: LogId, expected: Option<(u64, LogId)>) -> Result<(), StoreError> {
+        if !self.writable {
+            return Err(StoreError::WriteDisabled);
+        }
         let read = self.database.begin_read()?;
-        let selected = checkpoint_baseline::read_metadata(&read.open_table(META)?)?.ok_or(StoreError::StaleCheckpoint)?;
-        if selected.generation != generation || selected.header.applied != Some(cut) {
+        let meta = read.open_table(META)?;
+        let selected = checkpoint_baseline::read_metadata(&meta)?.ok_or(StoreError::StaleCheckpoint)?;
+        let cut = selected.header.applied.ok_or(StoreError::CorruptRecord)?;
+        if expected.is_some_and(|(generation, id)| generation != selected.generation || id != cut) {
             return Err(StoreError::StaleCheckpoint);
         }
-        // Re-read the committed generation and prove baseline + suffix recovery
-        // before removing any historical evidence. The writer owns ordering.
+        if through.index > cut.index || (through.index == cut.index && through != cut) {
+            return Err(StoreError::StaleCheckpoint);
+        }
         checkpoint_baseline::validate_recovery(&read)?;
+        if let Some(purged) = checkpoint_baseline::read_purged(&meta)? {
+            if through == purged {
+                return Ok(());
+            }
+            if through.index <= purged.index {
+                return Err(StoreError::InvalidCommittedLog);
+            }
+        }
+        let logs = read.open_table(LOGS)?;
+        let record = logs.get(through.index)?.ok_or(StoreError::InvalidCommittedLog)?;
+        if decode_log(record.value())?.id != through {
+            return Err(StoreError::InvalidCommittedLog);
+        }
+        let generation = selected.generation;
+        drop(record);
+        drop(logs);
+        drop(meta);
         drop(read);
         let tx = self.write_transaction()?;
         {
@@ -538,13 +571,16 @@ impl Store {
             if selected.generation != generation || selected.header.applied != Some(cut) {
                 return Err(StoreError::StaleCheckpoint);
             }
-            if checkpoint_baseline::read_purged(&meta)? == Some(cut) {
-                return Ok(());
+            let mut logs = tx.open_table(LOGS)?;
+            let record = logs.get(through.index)?.ok_or(StoreError::InvalidCommittedLog)?;
+            if decode_log(record.value())?.id != through {
+                return Err(StoreError::InvalidCommittedLog);
             }
-            tx.open_table(LOGS)?.retain(|index, _| index > cut.index)?;
+            drop(record);
+            logs.retain(|index, _| index > through.index)?;
             tx.open_table(application::APPLY_RESULTS)?
-                .retain(|index, _| index > cut.index)?;
-            meta.insert(checkpoint_baseline::PURGED_KEY, checkpoint_baseline::encode_purged(cut).as_slice())?;
+                .retain(|index, _| index > through.index)?;
+            meta.insert(checkpoint_baseline::PURGED_KEY, checkpoint_baseline::encode_purged(through).as_slice())?;
         }
         self.commit(tx)
     }

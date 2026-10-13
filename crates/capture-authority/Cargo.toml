@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Durable local storage for capture authority"
 
 [dependencies]
-openraft = { workspace = true }
+openraft = { workspace = true, features = ["storage-v2"] }
 redb = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
