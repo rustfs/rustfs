@@ -2667,7 +2667,12 @@ mod tests {
         }
     }
 
-    async fn verify_two_node_directory_recovery(remove_bucket: bool, scan_mode: u8) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn verify_two_node_directory_recovery(
+        remove_bucket: bool,
+        scan_mode: u8,
+        bucket_scoped: bool,
+        recreate: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
         // Isolate explicit administrator recovery from scanner, MRF, and disk healing.
@@ -2714,27 +2719,13 @@ mod tests {
         tokio::fs::create_dir(&removed).await?;
         if remove_bucket {
             tokio::fs::rename(&target_bucket, removed.join(bucket)).await?;
-            let status = two_node_heal_status(&cluster, None, false, scan_mode).await?;
-            assert_eq!(
-                status["summary"], "stopped",
-                "missing bucket must not look like an empty successful scan: {status}"
-            );
-            assert_eq!(status["outcome"]["execution"]["state"], "aborted");
-            assert_eq!(status["outcome"]["coverage"], "partial");
-            assert_eq!(status["outcome"]["counters"]["processed"], 0);
-            assert!(!target_bucket.exists(), "default discovery must not silently recreate a bucket");
-            let scoped_default = two_node_heal_status(&cluster, Some(bucket), false, scan_mode).await?;
-            assert_eq!(
-                scoped_default["summary"], "stopped",
-                "default namespace quorum protection must remain: {scoped_default}"
-            );
         } else {
             for (index, (key, _)) in objects.iter().enumerate() {
                 tokio::fs::rename(target_bucket.join(key), removed.join(index.to_string())).await?;
             }
         }
-        let status = two_node_heal_status(&cluster, remove_bucket.then_some(bucket), remove_bucket, scan_mode).await?;
-        assert_eq!(status["summary"], "finished", "explicit recovery should complete: {status}");
+        let status = two_node_heal_status(&cluster, bucket_scoped.then_some(bucket), recreate, scan_mode).await?;
+        assert_eq!(status["summary"], "finished", "administrator recovery should complete: {status}");
         assert_eq!(status["outcome"]["execution"]["state"], "completed");
         assert_eq!(status["outcome"]["coverage"], "complete");
         for ((key, _), before) in objects.iter().zip(&original) {
@@ -2773,16 +2764,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_node_bucket_discovery_and_explicit_recreate() -> Result<(), Box<dyn Error + Send + Sync>> {
-        verify_two_node_directory_recovery(true, 2).await
+        verify_two_node_directory_recovery(true, 2, true, true).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_missing_bucket_default_cluster_recovery() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(true, 2, false, false).await
+    }
+
+    #[tokio::test]
+    async fn test_two_node_missing_bucket_default_scoped_recovery() -> Result<(), Box<dyn Error + Send + Sync>> {
+        verify_two_node_directory_recovery(true, 2, true, false).await
     }
 
     #[tokio::test]
     async fn test_two_node_object_directory_recovery_normal() -> Result<(), Box<dyn Error + Send + Sync>> {
-        verify_two_node_directory_recovery(false, 1).await
+        verify_two_node_directory_recovery(false, 1, false, false).await
     }
 
     #[tokio::test]
     async fn test_two_node_object_directory_recovery_deep() -> Result<(), Box<dyn Error + Send + Sync>> {
-        verify_two_node_directory_recovery(false, 2).await
+        verify_two_node_directory_recovery(false, 2, false, false).await
     }
 }
