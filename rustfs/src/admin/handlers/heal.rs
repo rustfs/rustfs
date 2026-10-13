@@ -673,96 +673,80 @@ where
     }
 }
 
-fn canonical_replacement_records(
-    records: &[rustfs_heal::ReplacementRecoveryRecord],
-) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
-    let mut records = records.to_vec();
-    for record in &mut records {
-        record.target_slots.sort();
+fn reconcile_replacement_recovery_records(
+    snapshots: Vec<rustfs_heal::ReplacementRecoverySnapshot>,
+) -> (Vec<rustfs_heal::ReplacementRecoveryRecord>, bool) {
+    struct Observation {
+        record: rustfs_heal::ReplacementRecoveryRecord,
+        sources: Vec<usize>,
     }
-    records.sort_by(|left, right| {
-        (
-            &left.task_id,
-            &left.generation,
-            &left.set_disk_id,
-            left.state,
-            &left.target_slots,
-            &left.verified_at,
-            &left.reason,
-        )
-            .cmp(&(
-                &right.task_id,
-                &right.generation,
-                &right.set_disk_id,
-                right.state,
-                &right.target_slots,
-                &right.verified_at,
-                &right.reason,
-            ))
-    });
-    records
-}
 
-fn merge_replacement_recovery_records(
-    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
-) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
-    let mut records = BTreeMap::<String, rustfs_heal::ReplacementRecoveryRecord>::new();
-    for snapshot in snapshots {
-        for record in canonical_replacement_records(&snapshot.records) {
-            match records.entry(record.task_id.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(record);
-                }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+    let mut observations = BTreeMap::<String, Observation>::new();
+    for (source, snapshot) in snapshots.into_iter().enumerate() {
+        for mut record in snapshot.records {
+            record.target_slots.sort();
+            let observation = match observations.entry(record.task_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Observation {
+                    record,
+                    sources: Vec::new(),
+                }),
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let task_id = entry.key().clone();
-                    entry.insert(rustfs_heal::ReplacementRecoveryRecord {
-                        task_id,
-                        state: rustfs_heal::ReplacementRecoveryState::Unknown,
-                        generation: None,
-                        set_disk_id: None,
-                        target_slots: Vec::new(),
-                        reason: Some("peer replacement recovery records disagree".to_string()),
-                        verified_at: None,
-                    });
+                    if entry.get().record != record {
+                        entry.get_mut().record = rustfs_heal::ReplacementRecoveryRecord {
+                            task_id: entry.key().clone(),
+                            state: rustfs_heal::ReplacementRecoveryState::Unknown,
+                            generation: None,
+                            set_disk_id: None,
+                            target_slots: Vec::new(),
+                            reason: Some("peer replacement recovery records disagree".to_string()),
+                            verified_at: None,
+                        };
+                    }
+                    entry.into_mut()
                 }
+            };
+            // Snapshot order keeps sources sorted; repeated copies within one
+            // snapshot must not duplicate a generation's provenance.
+            if snapshot.definitive && observation.sources.last() != Some(&source) {
+                observation.sources.push(source);
             }
         }
     }
-    records.into_values().collect()
-}
 
-/// A definitive local snapshot can retain multiple generations for one slot,
-/// including completed replacements and committed handoff predecessors. Only
-/// overlapping generations never observed together in a definitive snapshot
-/// leave the merged peer histories ambiguous. Disagreeing copies of one task
-/// are already rejected by the merge.
-fn replacement_generations_claim_conflicting_targets(
-    records: &[rustfs_heal::ReplacementRecoveryRecord],
-    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
-) -> bool {
-    let local_histories = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.definitive)
-        .map(|snapshot| {
-            snapshot
-                .records
+    let conflict = if observations
+        .values()
+        .any(|observation| observation.record.state == rustfs_heal::ReplacementRecoveryState::Unknown)
+    {
+        true
+    } else {
+        let mut target_sources = BTreeMap::<&str, Vec<&[usize]>>::new();
+        for observation in observations.values() {
+            for target in &observation.record.target_slots {
+                target_sources.entry(target).or_default().push(&observation.sources);
+            }
+        }
+        target_sources.into_values().any(|sources| {
+            if sources.len() < 2 {
+                return false;
+            }
+            // A complete retained history normally has one common anchor.
+            // Checking that witness avoids comparing every historical pair.
+            if sources[0]
                 .iter()
-                .map(|record| record.task_id.as_str())
-                .collect::<HashSet<_>>()
-        })
-        .collect::<Vec<_>>();
-    records.iter().any(|left| {
-        !left.target_slots.is_empty()
-            && records.iter().any(|right| {
-                right.task_id != left.task_id
-                    && !right.target_slots.is_empty()
-                    && right.target_slots.iter().any(|slot| left.target_slots.contains(slot))
-                    && !local_histories
-                        .iter()
-                        .any(|history| history.contains(left.task_id.as_str()) && history.contains(right.task_id.as_str()))
+                .any(|source| sources[1..].iter().all(|other| other.binary_search(source).is_ok()))
+            {
+                return false;
+            }
+            // Pairwise shared history is sufficient even without one anchor
+            // containing the whole group. A transitive chain alone is not.
+            sources.iter().enumerate().any(|(index, left)| {
+                sources[index + 1..]
+                    .iter()
+                    .any(|right| !left.iter().any(|source| right.binary_search(source).is_ok()))
             })
-    })
+        })
+    };
+    (observations.into_values().map(|observation| observation.record).collect(), conflict)
 }
 
 fn aggregate_replacement_recovery_cluster_status(
@@ -802,12 +786,8 @@ fn aggregate_replacement_recovery_cluster_status(
     // disagree about one task (the merge marks those copies `Unknown`) or
     // claim overlapping targets without a shared definitive local history.
     // Retained histories and disjoint generations can be merged.
-    let records = merge_replacement_recovery_records(&snapshots);
-    if records
-        .iter()
-        .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
-        || replacement_generations_claim_conflicting_targets(&records, &snapshots)
-    {
+    let (records, conflict) = reconcile_replacement_recovery_records(snapshots);
+    if conflict {
         reason.get_or_insert("peer_replacement_recovery_status_conflict");
     }
 
@@ -2561,6 +2541,104 @@ mod tests {
         assert_eq!(cluster.records.len(), 2);
         assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
         assert_eq!(cluster.records[1].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_reconciles_target_and_source_matrix() {
+        let task_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ];
+        for targets in 0u8..8 {
+            let mut records = task_ids.map(replacement_record);
+            for (task, record) in records.iter_mut().enumerate() {
+                record.target_slots = vec![format!("http://node-a:9000/mnt/disk{}", (targets >> task) & 1)];
+            }
+            // All non-empty source subsets cover pairwise histories without
+            // one common anchor, transitive-only histories, and empty peers.
+            for a in 1u8..8 {
+                for b in 1u8..8 {
+                    for c in 1u8..8 {
+                        let masks = [a, b, c];
+                        let snapshots = (0..3)
+                            .map(|source| rustfs_heal::ReplacementRecoverySnapshot {
+                                records: records
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(task, _)| masks[*task] & (1 << source) != 0)
+                                    .map(|(_, record)| record.clone())
+                                    .collect(),
+                                definitive: true,
+                                reason: None,
+                            })
+                            .collect::<Vec<_>>();
+                        let expected = (0..3).all(|left| {
+                            (left + 1..3).all(|right| {
+                                records[left].target_slots != records[right].target_slots || masks[left] & masks[right] != 0
+                            })
+                        });
+                        let mut snapshots = snapshots.into_iter();
+                        let local = snapshots.next().expect("three source snapshots");
+                        let cluster = aggregate_replacement_recovery_cluster_status(
+                            vec![local],
+                            snapshots.map(|snapshot| Ok(Some(snapshot))).collect(),
+                            3,
+                            true,
+                        );
+
+                        assert_eq!(cluster.definitive, expected, "targets={targets}, sources={masks:?}");
+                        assert_eq!(cluster.reason.is_none(), expected);
+                        assert_eq!(cluster.records, records);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_overlap_on_a_secondary_target() {
+        let mut local = replacement_snapshot_with_retained_history();
+        local.records[0].target_slots.push("http://node-a:9000/mnt/disk2".to_string());
+        let mut peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        peer.records[0].target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 3);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_deduplicates_reordered_targets() {
+        let mut local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        local.records[0].target_slots.push("http://node-a:9000/mnt/disk2".to_string());
+        let mut peer = local.clone();
+        peer.records[0].target_slots.reverse();
+        let expected = local.records.clone();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_history_from_a_high_index_peer() {
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let mut peers = vec![Ok(Some(empty.clone())); 80];
+        let history = replacement_snapshot_with_retained_history();
+        let expected = history.records.clone();
+        peers.push(Ok(Some(history)));
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![empty], peers, 82, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
     }
 
     #[test]
