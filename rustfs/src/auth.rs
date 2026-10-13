@@ -15,6 +15,7 @@
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
+use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
@@ -769,6 +770,21 @@ pub fn get_condition_values_with_query_and_client_info(
             args.insert((*grant_header).to_string(), values);
         }
         clone_header.remove(*grant_header);
+    }
+
+    // `s3:if-none-match` / `s3:if-match` must describe the precondition the write
+    // enforces, which ignores a blank header. A raw copy would let `If-None-Match:`
+    // with no value satisfy `Null: false` while the object is overwritten.
+    for conditional_header in [IF_NONE_MATCH, IF_MATCH] {
+        if let Some(value) = clone_header
+            .get(&conditional_header)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            args.insert(conditional_header.as_str().to_string(), vec![value.to_string()]);
+        }
+        clone_header.remove(&conditional_header);
     }
 
     // Claims and group membership are part of the verified identity, so they are
@@ -2037,6 +2053,104 @@ mod tests {
             conditions.get("x-amz-grant-read"),
             Some(&vec!["uri=http://acs.amazonaws.com/groups/global/AllUsers".to_string()])
         );
+    }
+
+    #[test]
+    fn test_get_condition_values_with_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("If-None-Match", HeaderValue::from_static("*"));
+        headers.insert("If-Match", HeaderValue::from_static("\"9b2cf535f27731c974343645a3985328\""));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
+        assert_eq!(
+            conditions.get("if-match"),
+            Some(&vec!["\"9b2cf535f27731c974343645a3985328\"".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_get_condition_values_without_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut blank = HeaderMap::new();
+        blank.insert("If-None-Match", HeaderValue::from_static(""));
+        blank.insert("If-Match", HeaderValue::from_static(""));
+
+        for headers in [HeaderMap::new(), blank] {
+            let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+            assert!(!conditions.contains_key("if-none-match"), "headers {headers:?}");
+            assert!(!conditions.contains_key("if-match"), "headers {headers:?}");
+        }
+    }
+
+    /// The policy keys `s3:if-none-match` and `s3:if-match` must resolve to the
+    /// condition names the request headers populate; otherwise a policy that
+    /// requires a conditional write denies every write.
+    #[tokio::test]
+    async fn conditional_write_policy_keys_match_request_header_condition_values() {
+        use rustfs_policy::policy::action::{Action, S3Action};
+        use rustfs_policy::policy::{Args, Policy};
+
+        let policy = Policy::parse_config(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:PutObject"],
+                        "Resource": ["arn:aws:s3:::bucket/create-only/*"],
+                        "Condition": {"StringEquals": {"s3:if-none-match": "*"}}
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:PutObject"],
+                        "Resource": ["arn:aws:s3:::bucket/etag-guarded/*"],
+                        "Condition": {"Null": {"s3:if-match": "false"}}
+                    }
+                ]
+            }"#,
+        )
+        .expect("policy with conditional write keys must parse");
+        let cred = create_test_credentials();
+        let claims = HashMap::new();
+
+        let mut if_none_match = HeaderMap::new();
+        if_none_match.insert("If-None-Match", HeaderValue::from_static("*"));
+        let mut if_match = HeaderMap::new();
+        if_match.insert("If-Match", HeaderValue::from_static("\"etag\""));
+        let no_condition = HeaderMap::new();
+        let mut blank_if_match = HeaderMap::new();
+        blank_if_match.insert("If-Match", HeaderValue::from_static(""));
+
+        let cases = [
+            (&if_none_match, "create-only/object", true),
+            (&no_condition, "create-only/object", false),
+            (&if_match, "create-only/object", false),
+            (&if_match, "etag-guarded/object", true),
+            (&no_condition, "etag-guarded/object", false),
+            // Storage ignores a blank precondition, so it must not satisfy `Null: false`.
+            (&blank_if_match, "etag-guarded/object", false),
+        ];
+        for (headers, object, expected) in cases {
+            let conditions = get_condition_values(headers, &cred, None, None, None);
+            let allowed = policy
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &None,
+                    action: Action::S3Action(S3Action::PutObjectAction),
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object,
+                    claims: &claims,
+                    deny_only: false,
+                })
+                .await;
+            assert_eq!(allowed, expected, "object {object} with headers {headers:?}");
+        }
     }
 
     #[test]

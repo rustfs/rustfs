@@ -237,6 +237,12 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:x-amz-grant-write-acp")]
     S3XAmzGrantWriteAcp,
 
+    #[strum(serialize = "s3:if-match")]
+    S3IfMatch,
+
+    #[strum(serialize = "s3:if-none-match")]
+    S3IfNoneMatch,
+
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
     #[strum(serialize = "s3:RequestObjectTagKeys")]
@@ -400,6 +406,8 @@ mod tests {
         "s3:object-lock-remaining-retention-days",
         KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
     )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -428,6 +436,8 @@ mod tests {
         "s3:object-lock-remaining-retention-days",
         KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
     )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -452,6 +462,8 @@ mod tests {
         "s3:object-lock-remaining-retention-days",
         KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
     )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -466,6 +478,13 @@ mod tests {
         let except = format!("{{\"data\":\"{except}\"}}");
         let data = serde_json::to_string(&TestCase { data: value }).expect("marshal failed");
         assert_eq!(data, except);
+    }
+
+    #[test_case("s3:if-match", "if-match")]
+    #[test_case("s3:if-none-match", "if-none-match")]
+    fn conditional_write_key_names_match_request_header_names(key: &str, header: &str) {
+        let key_name = KeyName::try_from(key).expect("conditional write key must parse");
+        assert_eq!(key_name.name(), header);
     }
 
     #[test]
