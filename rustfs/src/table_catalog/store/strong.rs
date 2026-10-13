@@ -321,6 +321,29 @@ impl<B> StrongTableCatalogStore<B>
 where
     B: TableCatalogObjectBackend,
 {
+    async fn table_maintenance_publication(&self) -> TableCatalogStoreResult<TableCommitLockPublication<'_, B>> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        let migration_guard = self.acquire_snapshot_write_permit().await?;
+        // The publication checks must cover migration lease loss throughout sidecar writes and cleanup.
+        publication.attach_catalog_migration_read_guard(migration_guard)?;
+        Ok(publication)
+    }
+
+    fn require_table_maintenance_publication(
+        publication: &(dyn TableCommitPublication + Sync),
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        operation: &str,
+    ) -> TableCatalogStoreResult<()> {
+        if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table maintenance {operation} publication fence was lost"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(object_backend: B) -> Self {
         Self::new_with_snapshot_requirement(object_backend, false)
     }
@@ -1879,6 +1902,648 @@ where
         state.tables.insert(key, next.clone());
 
         Ok(TableCommitResult { table: next, commit_log })
+    }
+
+    async fn maintenance_table_entry(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableEntry> {
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let key = Self::table_key(table_bucket, &namespace, &table);
+        let state = self.state.lock().await;
+        Self::ensure_identifier_is_unambiguous_locked(&state, &key)?;
+        state
+            .tables
+            .get(&key)
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned()
+            .ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!("table {}/{}/{}", table_bucket, namespace.public_name(), table.as_str()))
+            })
+    }
+
+    fn maintenance_cleanup_roots(entry: &TableEntry) -> TableCatalogStoreResult<Vec<String>> {
+        let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
+        let table_root = metadata_dir
+            .strip_suffix(&format!("/{METADATA_DIR}"))
+            .ok_or_else(|| TableCatalogStoreError::Invalid("maintenance metadata directory has no table root".to_string()))?;
+        let warehouse = table_warehouse_object_prefix(entry)?;
+        Ok(vec![
+            format!("{metadata_dir}/"),
+            format!("{table_root}/{DATA_DIR}/"),
+            format!("{table_root}/{DELETE_DIR}/"),
+            format!("{warehouse}{METADATA_DIR}/"),
+            format!("{warehouse}{DATA_DIR}/"),
+            format!("{warehouse}{DELETE_DIR}/"),
+        ])
+    }
+
+    async fn maintenance_cleanup_entry(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableEntry> {
+        let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
+        let roots = Self::maintenance_cleanup_roots(&entry)?;
+        let state = self.state.lock().await;
+        for other in state.tables.values().filter(|other| {
+            other.table_bucket == table_bucket
+                && other.state != TableCatalogEntryState::Deleted
+                && (other.namespace != entry.namespace || other.table != entry.table)
+        }) {
+            let other_roots = Self::maintenance_cleanup_roots(other)?;
+            if roots.iter().any(|root| {
+                other_roots
+                    .iter()
+                    .any(|other_root| warehouse_object_prefixes_overlap(root, other_root))
+            }) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table maintenance requires exclusive metadata and warehouse roots; shared with {}/{}",
+                    other.namespace, other.table
+                )));
+            }
+        }
+        Ok(entry)
+    }
+
+    pub(crate) async fn get_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .get_table_maintenance_config_for_entry(&entry)
+            .await
+    }
+
+    pub(crate) async fn put_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableMaintenanceConfig,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        validate_table_maintenance_config(&config)?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "config update",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let entry = self
+            .maintenance_table_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .put_table_maintenance_config_for_entry_with_publication(&entry, config, Some(&publication))
+            .await
+    }
+
+    pub(crate) async fn get_table_metadata_maintenance_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+    ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                &entry.table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
+                job_id,
+            )
+            .await
+    }
+
+    pub(crate) async fn get_table_maintenance_scheduler_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .get_table_maintenance_scheduler_report_for_entry_at(&entry, OffsetDateTime::now_utc())
+            .await
+    }
+
+    pub(crate) async fn run_table_maintenance_scheduler_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "scheduler",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let entry = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let now = OffsetDateTime::now_utc();
+        let effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        let preflight = sidecar
+            .table_metadata_maintenance_scheduler_preflight_with_publication(
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
+                &scheduler_id,
+                now,
+                effective,
+                Some(&publication),
+            )
+            .await?;
+        let effective = match preflight {
+            TableMaintenanceSchedulerPreflight::Ready(effective) => effective,
+            TableMaintenanceSchedulerPreflight::Complete(report) => {
+                publication.release_publication_locks();
+                let scheduler = sidecar
+                    .get_table_maintenance_scheduler_report_for_entry_at(&entry, now)
+                    .await?;
+                return Ok(TableMaintenanceSchedulerRunResult {
+                    report: *report,
+                    scheduler,
+                });
+            }
+        };
+
+        // Planning only reads objects. Keep the migration permit, not the bucket-wide writer.
+        let planned_effective = effective;
+        publication.release_publication_locks();
+        let mut report = sidecar
+            .plan_table_metadata_maintenance_for_entry(&entry, planned_effective.config.retain_recent_metadata_files)
+            .await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "scheduler revalidation",
+        )?;
+        let current = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        if current != entry {
+            return Err(TableCatalogStoreError::Conflict("table changed during maintenance planning".to_string()));
+        }
+        let now = OffsetDateTime::now_utc();
+        let effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        if effective.config != planned_effective.config || effective.source != planned_effective.source {
+            return Err(TableCatalogStoreError::Conflict("maintenance config changed during planning".to_string()));
+        }
+        match sidecar
+            .table_metadata_maintenance_scheduler_preflight_with_publication(
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
+                &scheduler_id,
+                now,
+                effective,
+                Some(&publication),
+            )
+            .await?
+        {
+            TableMaintenanceSchedulerPreflight::Ready(effective) => {
+                if report.job.retain_recent_metadata_files != effective.config.retain_recent_metadata_files {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "maintenance config changed before scheduler claim".to_string(),
+                    ));
+                }
+                if entry.metadata_location != report.current_metadata_location {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "current metadata location changed before maintenance scheduler claim".to_string(),
+                    ));
+                }
+                let before_status = Some(report.job.status.clone());
+                let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+                let scheduled_at = maintenance_timestamp(now);
+                report.job.operation = if effective.config.delete_enabled {
+                    TableMetadataMaintenanceOperation::Delete
+                } else {
+                    TableMetadataMaintenanceOperation::DryRun
+                };
+                report.job.status = TableMetadataMaintenanceJobStatus::Queued;
+                report.job.failure_reason = None;
+                report.job.config_source = effective.source;
+                report.job.scheduler_id = Some(scheduler_id);
+                report.job.scheduler_lease_id = Uuid::new_v4().to_string();
+                report.job.scheduled_at = Some(scheduled_at);
+                report.job.worker_id = None;
+                report.job.lease_id = String::new();
+                report.job.attempt = 0;
+                report.job.max_retry_attempts = effective.config.max_retry_attempts;
+                report.job.next_retry_after = None;
+                report.job.quarantine_enabled = effective.config.quarantine_enabled;
+                report.job.quarantine_retention_seconds = effective.config.quarantine_retention_seconds;
+                report.job.heartbeat_at = None;
+                report.job.started_at = None;
+                report.job.finished_at = None;
+                refresh_table_maintenance_report_recommended_actions(&mut report);
+                push_table_maintenance_audit_event(
+                    &mut report,
+                    now,
+                    TableMaintenanceAuditActor::Scheduler,
+                    TableMaintenanceAuditAction::SchedulerQueued,
+                    None,
+                    before_status,
+                    before_quarantined_object_count,
+                );
+                Self::require_table_maintenance_publication(
+                    &publication,
+                    table_bucket,
+                    &namespace.public_name(),
+                    table.as_str(),
+                    "scheduler report",
+                )?;
+                sidecar
+                    .put_table_metadata_maintenance_report_for_entry_with_publication(&report, &entry, Some(&publication))
+                    .await?;
+            }
+            TableMaintenanceSchedulerPreflight::Complete(completed) => report = *completed,
+        }
+
+        publication.release_publication_locks();
+        let scheduler = sidecar
+            .get_table_maintenance_scheduler_report_for_entry_at(&entry, now)
+            .await?;
+        Ok(TableMaintenanceSchedulerRunResult { report, scheduler })
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_worker_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "worker",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let entry = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let now = OffsetDateTime::now_utc();
+        let effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        let (effective, queued) = match sidecar
+            .table_metadata_maintenance_worker_preflight_with_publication(
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
+                &worker_id,
+                now,
+                effective,
+                Some(&publication),
+            )
+            .await?
+        {
+            TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
+            TableMaintenanceWorkerPreflight::Complete(report) => return Ok(*report),
+        };
+
+        let mut report = if let Some(queued) = queued {
+            *queued
+        } else {
+            sidecar
+                .plan_table_metadata_maintenance_for_entry(&entry, effective.config.retain_recent_metadata_files)
+                .await?
+        };
+        let effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        let (effective, queued) = match sidecar
+            .table_metadata_maintenance_worker_preflight_with_publication(
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
+                &worker_id,
+                now,
+                effective,
+                Some(&publication),
+            )
+            .await?
+        {
+            TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
+            TableMaintenanceWorkerPreflight::Complete(report) => return Ok(*report),
+        };
+        if let Some(queued) = queued {
+            if queued.job.job_id != report.job.job_id {
+                return Err(TableCatalogStoreError::Conflict(
+                    "queued maintenance job changed before worker claim".to_string(),
+                ));
+            }
+            report = *queued;
+        }
+        if report.job.retain_recent_metadata_files != effective.config.retain_recent_metadata_files {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance config changed before worker claim".to_string(),
+            ));
+        }
+        if entry.metadata_location != report.current_metadata_location || entry.generation != report.job.current_generation {
+            return Err(TableCatalogStoreError::Conflict(
+                "current metadata location changed before maintenance worker claim".to_string(),
+            ));
+        }
+
+        let current = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        if current != entry {
+            return Err(TableCatalogStoreError::Conflict(
+                "table changed before maintenance worker claim".to_string(),
+            ));
+        }
+        let was_queued_claim = matches!(report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+        let before_status = Some(report.job.status.clone());
+        let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+        let started_at = maintenance_timestamp(now);
+        if !was_queued_claim {
+            report.job.operation = if effective.config.delete_enabled {
+                TableMetadataMaintenanceOperation::Delete
+            } else {
+                TableMetadataMaintenanceOperation::DryRun
+            };
+        }
+        report.job.status = TableMetadataMaintenanceJobStatus::Running;
+        report.job.failure_reason = None;
+        report.job.config_source = effective.source;
+        report.job.worker_id = Some(worker_id);
+        report.job.lease_id = Uuid::new_v4().to_string();
+        report.job.attempt = 1;
+        report.job.max_retry_attempts = effective.config.max_retry_attempts;
+        report.job.next_retry_after = None;
+        report.job.quarantine_enabled = effective.config.quarantine_enabled;
+        report.job.quarantine_retention_seconds = effective.config.quarantine_retention_seconds;
+        report.job.heartbeat_at = Some(started_at.clone());
+        report.job.started_at = Some(started_at);
+        report.job.finished_at = None;
+        refresh_table_maintenance_report_recommended_actions(&mut report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            now,
+            TableMaintenanceAuditActor::Worker,
+            TableMaintenanceAuditAction::WorkerStarted,
+            None,
+            before_status,
+            before_quarantined_object_count,
+        );
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "worker report",
+        )?;
+        sidecar
+            .put_table_metadata_maintenance_report_for_entry_with_publication(&report, &entry, Some(&publication))
+            .await?;
+
+        let delete = matches!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "worker finish",
+        )?;
+        sidecar
+            .finish_table_metadata_maintenance_run_for_entry_with_publication(&entry, delete, &effective, report, &publication)
+            .await
+    }
+
+    pub(crate) async fn heartbeat_table_metadata_maintenance_job(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        lease_id: &str,
+        worker_id: &str,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "heartbeat",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let entry = self
+            .maintenance_table_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        sidecar
+            .heartbeat_table_metadata_maintenance_job_for_entry_with_publication(
+                &entry,
+                TableMaintenanceHeartbeatRef {
+                    table_bucket,
+                    namespace: &namespace.public_name(),
+                    table: table.as_str(),
+                    job_id,
+                    lease_id,
+                    worker_id,
+                },
+                OffsetDateTime::now_utc(),
+                Some(&publication),
+            )
+            .await
+    }
+
+    pub(crate) async fn apply_table_maintenance_quarantine_operation(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        request: TableMaintenanceQuarantineOperationRequest,
+    ) -> TableCatalogStoreResult<TableMaintenanceQuarantineOperationResult> {
+        let action = request.action.clone();
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "quarantine",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let entry = self
+            .maintenance_table_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let report_lookup = if matches!(action, TableMaintenanceQuarantineAction::Inspect) {
+            job_id
+        } else {
+            MAINTENANCE_JOB_ALIAS_CURRENT
+        };
+        let mut report = sidecar
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
+                report_lookup,
+            )
+            .await?
+            .ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!(
+                    "maintenance job {}/{}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str(),
+                    job_id
+                ))
+            })?;
+
+        if !matches!(action, TableMaintenanceQuarantineAction::Inspect) {
+            if report.job.job_id != job_id {
+                return Err(TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
+            }
+            if !matches!(report.job.status, TableMetadataMaintenanceJobStatus::Failed) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance quarantine operation requires a failed job".to_string(),
+                ));
+            }
+            if !report.job.quarantine_enabled || report.job.quarantined_object_count == 0 {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance job has no active quarantine boundary".to_string(),
+                ));
+            }
+            let before_status = Some(report.job.status.clone());
+            let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+            report.job.quarantined_object_count = 0;
+            let audit_action = match &action {
+                TableMaintenanceQuarantineAction::Inspect => unreachable!(),
+                TableMaintenanceQuarantineAction::Release => {
+                    report.job.failure_reason =
+                        Some(table_maintenance_quarantine_operator_reason("released", request.reason.as_deref()));
+                    TableMaintenanceAuditAction::QuarantineRelease
+                }
+                TableMaintenanceQuarantineAction::Retry => {
+                    report.job.next_retry_after = None;
+                    report.job.failure_reason = Some(table_maintenance_quarantine_operator_reason(
+                        "released for retry",
+                        request.reason.as_deref(),
+                    ));
+                    TableMaintenanceAuditAction::QuarantineRetry
+                }
+                TableMaintenanceQuarantineAction::Abandon => {
+                    report.job.next_retry_after = None;
+                    report.job.failure_reason =
+                        Some(table_maintenance_quarantine_operator_reason("abandoned", request.reason.as_deref()));
+                    TableMaintenanceAuditAction::QuarantineAbandon
+                }
+            };
+            refresh_table_maintenance_report_recommended_actions(&mut report);
+            push_table_maintenance_audit_event(
+                &mut report,
+                OffsetDateTime::now_utc(),
+                TableMaintenanceAuditActor::Operator,
+                audit_action,
+                request.reason,
+                before_status,
+                before_quarantined_object_count,
+            );
+            Self::require_table_maintenance_publication(
+                &publication,
+                table_bucket,
+                &namespace.public_name(),
+                table.as_str(),
+                "quarantine update",
+            )?;
+            sidecar
+                .put_table_metadata_maintenance_report_for_entry_with_publication(&report, &entry, Some(&publication))
+                .await?;
+        }
+
+        let scheduler = sidecar
+            .get_table_maintenance_scheduler_report_for_entry_at(&entry, OffsetDateTime::now_utc())
+            .await?;
+        Ok(TableMaintenanceQuarantineOperationResult {
+            action,
+            report,
+            scheduler,
+        })
     }
 
     pub(crate) async fn plan_table_commit_recovery(

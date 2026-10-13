@@ -495,6 +495,7 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) pause_put_attempts: BTreeMap<(String, String), BTreeMap<usize, TestCatalogObjectPause>>,
     pub(crate) fail_delete_attempts: BTreeMap<(String, String), BTreeSet<usize>>,
     pub(crate) fail_after_delete_attempts: BTreeMap<(String, String), BTreeSet<usize>>,
+    pub(crate) pause_delete_attempts: BTreeMap<(String, String), BTreeMap<usize, TestCatalogObjectPause>>,
     pub(crate) put_attempts: BTreeMap<(String, String), usize>,
     pub(crate) delete_attempts: BTreeMap<(String, String), usize>,
     pub(crate) write_lock_acquisitions: BTreeMap<(String, String), usize>,
@@ -689,6 +690,27 @@ impl TestCatalogObjectBackend {
         pause
     }
 
+    pub(crate) async fn pause_next_delete(&self, bucket: &str, object: &str) -> TestCatalogObjectPause {
+        let mut state = self.state.lock().await;
+        let key = (bucket.to_string(), object.to_string());
+        let next_attempt = state.delete_attempts.get(&key).copied().unwrap_or_default() + 1;
+        Self::pause_delete_attempt_unlocked(&mut state, key, next_attempt)
+    }
+
+    fn pause_delete_attempt_unlocked(
+        state: &mut TestCatalogObjectState,
+        key: (String, String),
+        attempt: usize,
+    ) -> TestCatalogObjectPause {
+        let pause = TestCatalogObjectPause::default();
+        state
+            .pause_delete_attempts
+            .entry(key)
+            .or_default()
+            .insert(attempt, pause.clone());
+        pause
+    }
+
     pub(crate) async fn put_attempt_count(&self, bucket: &str, object: &str) -> usize {
         self.state
             .lock()
@@ -697,6 +719,188 @@ impl TestCatalogObjectBackend {
             .get(&(bucket.to_string(), object.to_string()))
             .copied()
             .unwrap_or_default()
+    }
+}
+
+impl TestCatalogObjectBackend {
+    async fn put_object_with_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<()> {
+        if let Some(fence) = fence {
+            fence.ensure_held()?;
+        }
+        let mut fail_put_object_path = self.fail_put_object_path.lock().await;
+        if fail_put_object_path.as_deref() == Some(object) {
+            fail_put_object_path.take();
+            return Err(TableCatalogStoreError::Internal("injected metadata write failure".to_string()));
+        }
+        drop(fail_put_object_path);
+
+        let mut corrupt_put_object_path = self.corrupt_put_object_path.lock().await;
+        let data = if corrupt_put_object_path.as_deref() == Some(object) {
+            corrupt_put_object_path.take();
+            b"{}".to_vec()
+        } else {
+            data
+        };
+        drop(corrupt_put_object_path);
+
+        let key = (bucket.to_string(), object.to_string());
+        let (attempt, pause) = {
+            let mut state = self.state.lock().await;
+            let attempt = {
+                let attempts = state.put_attempts.entry(key.clone()).or_default();
+                *attempts += 1;
+                *attempts
+            };
+            if state
+                .fail_put_attempts
+                .get(&key)
+                .is_some_and(|attempts| attempts.contains(&attempt))
+            {
+                return Err(TableCatalogStoreError::Internal(format!(
+                    "injected put failure for {object} attempt {attempt}"
+                )));
+            }
+            let pause = state
+                .pause_put_attempts
+                .get_mut(&key)
+                .and_then(|attempts| attempts.remove(&attempt));
+            (attempt, pause)
+        };
+        if let Some(pause) = pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
+
+        let result = {
+            let mut state = self.state.lock().await;
+            let precondition_failure = match &precondition {
+                TableCatalogPutPrecondition::IfAbsent if state.objects.contains_key(&key) => {
+                    Some(TableCatalogStoreError::Conflict(format!("object already exists: {object}")))
+                }
+                TableCatalogPutPrecondition::IfMatch(expected) => match state.objects.get(&key) {
+                    None => Some(TableCatalogStoreError::Conflict(format!("object is missing: {object}"))),
+                    Some(current) if &current.etag != expected => {
+                        Some(TableCatalogStoreError::Conflict(format!("object changed: {object}")))
+                    }
+                    Some(_) => None,
+                },
+                _ => None,
+            };
+            if let Some(err) = precondition_failure {
+                Err(err)
+            } else {
+                if let Some(fence) = fence {
+                    fence.ensure_held()?;
+                }
+                let etag = if self.content_addressed_etags {
+                    content_etag(&data)
+                } else {
+                    state.next_etag()
+                };
+                state.objects.insert(
+                    key.clone(),
+                    TestCatalogObjectRecord {
+                        data,
+                        etag,
+                        mod_time: Some(OffsetDateTime::now_utc()),
+                    },
+                );
+                if state
+                    .fail_after_put_attempts
+                    .get(&key)
+                    .is_some_and(|attempts| attempts.contains(&attempt))
+                {
+                    Err(TableCatalogStoreError::Internal(format!(
+                        "injected post-commit put failure for {object} attempt {attempt}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Some(barrier) = &self.put_object_barrier {
+            barrier.wait().await;
+        }
+        result?;
+        if let Some(fence) = fence {
+            fence.ensure_held()?;
+        }
+        Ok(())
+    }
+
+    async fn delete_object_if_match_with_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<()> {
+        if let Some(fence) = fence {
+            fence.ensure_held()?;
+        }
+        let mut state = self.state.lock().await;
+        let key = (bucket.to_string(), object.to_string());
+        let attempt = {
+            let attempts = state.delete_attempts.entry(key.clone()).or_default();
+            *attempts += 1;
+            *attempts
+        };
+        if state
+            .fail_delete_attempts
+            .get(&key)
+            .is_some_and(|attempts| attempts.contains(&attempt))
+        {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "injected delete failure for {object} attempt {attempt}"
+            )));
+        }
+        let pause = state
+            .pause_delete_attempts
+            .get_mut(&key)
+            .and_then(|attempts| attempts.remove(&attempt));
+        if let Some(pause) = pause {
+            drop(state);
+            pause.started.notify_one();
+            pause.release.notified().await;
+            state = self.state.lock().await;
+        }
+        match state.objects.get(&key) {
+            None => {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "conditionally delete catalog object: {bucket}/{object} disappeared before cleanup"
+                )));
+            }
+            Some(record) if record.etag != expected_etag => {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "conditionally delete catalog object: {bucket}/{object} changed before cleanup"
+                )));
+            }
+            Some(_) => {}
+        }
+        if let Some(fence) = fence {
+            fence.ensure_held()?;
+        }
+        state.objects.remove(&key);
+        if state
+            .fail_after_delete_attempts
+            .get(&key)
+            .is_some_and(|attempts| attempts.contains(&attempt))
+        {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "injected post-commit delete failure for {object} attempt {attempt}"
+            )));
+        }
+        if let Some(fence) = fence {
+            fence.ensure_held()?;
+        }
+        Ok(())
     }
 }
 
@@ -835,98 +1039,19 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        let mut fail_put_object_path = self.fail_put_object_path.lock().await;
-        if fail_put_object_path.as_deref() == Some(object) {
-            fail_put_object_path.take();
-            return Err(TableCatalogStoreError::Internal("injected metadata write failure".to_string()));
-        }
-        drop(fail_put_object_path);
+        self.put_object_with_fence(bucket, object, data, precondition, None).await
+    }
 
-        let mut corrupt_put_object_path = self.corrupt_put_object_path.lock().await;
-        let data = if corrupt_put_object_path.as_deref() == Some(object) {
-            corrupt_put_object_path.take();
-            b"{}".to_vec()
-        } else {
-            data
-        };
-        drop(corrupt_put_object_path);
-
-        let key = (bucket.to_string(), object.to_string());
-        let (attempt, pause) = {
-            let mut state = self.state.lock().await;
-            let attempt = {
-                let attempts = state.put_attempts.entry(key.clone()).or_default();
-                *attempts += 1;
-                *attempts
-            };
-            if state
-                .fail_put_attempts
-                .get(&key)
-                .is_some_and(|attempts| attempts.contains(&attempt))
-            {
-                return Err(TableCatalogStoreError::Internal(format!(
-                    "injected put failure for {object} attempt {attempt}"
-                )));
-            }
-            let pause = state
-                .pause_put_attempts
-                .get_mut(&key)
-                .and_then(|attempts| attempts.remove(&attempt));
-            (attempt, pause)
-        };
-        if let Some(pause) = pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
-
-        let result = {
-            let mut state = self.state.lock().await;
-            let precondition_failure = match &precondition {
-                TableCatalogPutPrecondition::IfAbsent if state.objects.contains_key(&key) => {
-                    Some(TableCatalogStoreError::Conflict(format!("object already exists: {object}")))
-                }
-                TableCatalogPutPrecondition::IfMatch(expected) => match state.objects.get(&key) {
-                    None => Some(TableCatalogStoreError::Conflict(format!("object is missing: {object}"))),
-                    Some(current) if &current.etag != expected => {
-                        Some(TableCatalogStoreError::Conflict(format!("object changed: {object}")))
-                    }
-                    Some(_) => None,
-                },
-                _ => None,
-            };
-            if let Some(err) = precondition_failure {
-                Err(err)
-            } else {
-                let etag = if self.content_addressed_etags {
-                    content_etag(&data)
-                } else {
-                    state.next_etag()
-                };
-                state.objects.insert(
-                    key.clone(),
-                    TestCatalogObjectRecord {
-                        data,
-                        etag,
-                        mod_time: Some(OffsetDateTime::now_utc()),
-                    },
-                );
-                if state
-                    .fail_after_put_attempts
-                    .get(&key)
-                    .is_some_and(|attempts| attempts.contains(&attempt))
-                {
-                    Err(TableCatalogStoreError::Internal(format!(
-                        "injected post-commit put failure for {object} attempt {attempt}"
-                    )))
-                } else {
-                    Ok(())
-                }
-            }
-        };
-        if let Some(barrier) = &self.put_object_barrier {
-            barrier.wait().await;
-        }
-        result
+    async fn put_object_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object_with_fence(bucket, object, data, precondition, Some(fence))
+            .await
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -960,46 +1085,19 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     }
 
     async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()> {
-        let mut state = self.state.lock().await;
-        let key = (bucket.to_string(), object.to_string());
-        let attempt = {
-            let attempts = state.delete_attempts.entry(key.clone()).or_default();
-            *attempts += 1;
-            *attempts
-        };
-        if state
-            .fail_delete_attempts
-            .get(&key)
-            .is_some_and(|attempts| attempts.contains(&attempt))
-        {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "injected delete failure for {object} attempt {attempt}"
-            )));
-        }
-        match state.objects.get(&key) {
-            None => {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "conditionally delete catalog object: {bucket}/{object} disappeared before cleanup"
-                )));
-            }
-            Some(record) if record.etag != expected_etag => {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "conditionally delete catalog object: {bucket}/{object} changed before cleanup"
-                )));
-            }
-            Some(_) => {}
-        }
-        state.objects.remove(&key);
-        if state
-            .fail_after_delete_attempts
-            .get(&key)
-            .is_some_and(|attempts| attempts.contains(&attempt))
-        {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "injected post-commit delete failure for {object} attempt {attempt}"
-            )));
-        }
-        Ok(())
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, None)
+            .await
+    }
+
+    async fn delete_object_if_match_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, Some(fence))
+            .await
     }
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {

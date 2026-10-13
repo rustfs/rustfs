@@ -87,6 +87,21 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 ## Maintenance Matrix
 
+Object-backed and durable-strong catalogs support the configuration, scheduler,
+worker, job inspection, heartbeat, and quarantine endpoints. Durable-strong
+maintenance resolves table identity from the authoritative catalog snapshot;
+recoverable job and configuration records remain separate objects. The worker
+performs metadata and unreferenced-object cleanup without changing the catalog
+pointer. The direct `/maintenance/metadata` endpoint, including snapshot
+expiration and compaction plan/commit, remains object-backed only. A configured
+`background-enabled` table still requires explicit scheduler and worker ticks.
+
+Renamed tables retain their original metadata paths. Durable-strong scheduling
+and cleanup fail closed with a conflict if another table shares a scanned
+metadata or warehouse directory, including a recreated source name after rename.
+Such tables require disjoint cleanup roots before maintenance can run; enabling
+deletion does not override this ownership check.
+
 | Capability | Status | Claim |
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the pointer. |
