@@ -178,6 +178,11 @@ impl Shutdown {
 }
 /// Checks actual object publication after the durable event read releases the Store lock.
 pub trait PublicationReadiness: Send + Sync {
+    /// Check instance lifecycle even when the durable page contains no events.
+    fn check_ready(&self) -> Pin<Box<dyn Future<Output = Result<(), ReaderError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn is_published(&self, event: SourceEvent) -> Pin<Box<dyn Future<Output = Result<bool, ReaderError>> + Send + '_>>;
 }
 
@@ -353,6 +358,7 @@ async fn publication_prefix(
     let ReadPageReply::Page { response } = reply else {
         return Ok(());
     };
+    publication.check_ready().await?;
     let mut ready = 0;
     for event in &response.page.events {
         if !publication.is_published(event.clone()).await? {

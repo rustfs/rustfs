@@ -507,6 +507,16 @@ struct PublicationFixture {
     unavailable: std::sync::atomic::AtomicBool,
 }
 impl PublicationReadiness for PublicationFixture {
+    fn check_ready(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ReaderError>> + Send + '_>> {
+        Box::pin(async move {
+            assert!(self.writer.store.try_lock().is_ok(), "READINESS_CHECK_RELEASES_STORE_LOCK");
+            if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ReaderError::PublicationUnavailable);
+            }
+            Ok(())
+        })
+    }
+
     fn is_published(
         &self,
         event: SourceEvent,
@@ -604,6 +614,39 @@ async fn source_reader_publication_error_is_retryable_without_cursor_loss() {
         .expect("retry publication check")
         .page;
     assert_eq!(page.events[0].event_id, [9; 16]);
+    stop(path, shutdown, task).await;
+}
+
+#[tokio::test]
+async fn source_reader_empty_page_checks_instance_readiness() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let (dir, writer) = fixture();
+    let publication = Arc::new(PublicationFixture {
+        writer: writer.clone(),
+        ready_through: AtomicU64::new(0),
+        unavailable: AtomicBool::new(true),
+    });
+    let path = dir.path().join("reader.sock");
+    let (server, shutdown) = SourceReaderServer::bind(&path, writer).expect("bind reader");
+    let task = tokio::spawn(server.with_publication_readiness(publication.clone()).serve());
+    let client = SourceReaderClient::new(&path).expect("reader client");
+    for unavailable in [true, false, true] {
+        publication.unavailable.store(unavailable, Ordering::SeqCst);
+        let response = client.page(identity().cluster_id, None, 3).await;
+        if unavailable {
+            assert!(
+                matches!(response, Err(ReaderError::Rejected(Rejection::StoreUnavailable))),
+                "EMPTY_PAGE_MUST_CHECK_INSTANCE_READINESS"
+            );
+        } else {
+            let page = response.expect("ready empty instance").page;
+            assert!(page.events.is_empty());
+            assert_eq!(page.next, None);
+        }
+    }
     stop(path, shutdown, task).await;
 }
 
