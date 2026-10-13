@@ -74,6 +74,52 @@ pub struct CreatedApplyResult {
     pub result: CreatedResult,
 }
 
+/// Local publication authority re-read from the actual owner's durable Created decision.
+/// This is not a serializable remote proof and does not attest physical preparation durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedCreatedAuthorization {
+    identity: crate::NodeIdentity,
+    command: DecideCreated,
+    binding: CaptureBinding,
+    decision_log_id: LogId,
+}
+impl CommittedCreatedAuthorization {
+    pub(crate) fn verified(
+        identity: crate::NodeIdentity,
+        command: DecideCreated,
+        binding: CaptureBinding,
+        decision_log_id: LogId,
+    ) -> Self {
+        Self {
+            identity,
+            command,
+            binding,
+            decision_log_id,
+        }
+    }
+    pub fn identity(&self) -> crate::NodeIdentity {
+        self.identity
+    }
+    pub fn operation_id(&self) -> [u8; 16] {
+        self.command.operation_id
+    }
+    pub fn object(&self) -> &ObjectIdentity {
+        &self.command.object
+    }
+    pub fn expected_head(&self) -> Option<[u8; 16]> {
+        self.command.expected_head
+    }
+    pub fn prepared(&self) -> &PreparedIdentity {
+        &self.command.prepared
+    }
+    pub fn binding(&self) -> &CaptureBinding {
+        &self.binding
+    }
+    pub fn decision_log_id(&self) -> LogId {
+        self.decision_log_id
+    }
+}
+
 pub(crate) struct Decoder<'a> {
     bytes: &'a [u8],
 }
