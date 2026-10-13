@@ -569,6 +569,25 @@ pub struct DataUsageInfo {
     /// which last-known-good generation contributed to the view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// Buckets whose dirty-usage generation moved while this complete
+    /// snapshot was being walked. Their `buckets_usage` values are the walk
+    /// result, which the cycle could not certify as current; the next cycle
+    /// rescans them. Sorted. Empty on a converged snapshot and on an
+    /// observational one. A bucket created during the walk may be listed
+    /// here without a `buckets_usage` entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_snapshot_pending_buckets: Vec<String>,
+    /// Length of `usage_snapshot_pending_buckets`, carried for readers that
+    /// only need the count. The scanner writes both from one set.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub usage_snapshot_pending_bucket_count: u64,
+    /// Set by the scanner on a snapshot whose authoritative publication was
+    /// vetoed or could not be verified. It is routed to the observed object
+    /// and never replaces the authoritative snapshot. Absent on snapshots
+    /// written before per-bucket certification, which keep
+    /// `usage_snapshot_converged == Some(false)` as their observed marker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_observational: bool,
     /// An observational view may contain only the sets that completed this
     /// cycle (or retained a compatible last-known-good cache).
     #[serde(default)]
@@ -582,6 +601,10 @@ pub struct DataUsageInfo {
     /// Per-disk snapshot information when available
     #[serde(default)]
     pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Stable identity fields changed by both coordinated scanner publication and
@@ -3009,6 +3032,58 @@ mod tests {
         assert_eq!(legacy.buckets_count, 0);
         assert!(current.is_complete_bucket_usage_snapshot());
         assert_eq!(current.usage_snapshot_converged, Some(false));
+    }
+
+    #[test]
+    fn pending_bucket_certification_fields_round_trip_and_stay_additive() {
+        let certified = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_buckets: vec!["hot-a".to_string(), "hot-b".to_string()],
+            usage_snapshot_pending_bucket_count: 2,
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&certified).expect("encode certified snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode certified snapshot");
+        assert_eq!(decoded, certified);
+        assert!(!decoded.usage_snapshot_observational);
+        let legacy: LegacyUsageReader = rmp_serde::from_slice(&encoded).expect("legacy reader should ignore pending fields");
+        assert_eq!(legacy.buckets_count, 0);
+
+        let observed = DataUsageInfo {
+            usage_snapshot_observational: true,
+            ..certified.clone()
+        };
+        let encoded = rmp_serde::to_vec_named(&observed).expect("encode observed snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode observed snapshot");
+        assert!(decoded.usage_snapshot_observational);
+
+        // Older snapshots carry none of the fields and decode to the defaults;
+        // a converged snapshot writes none of them (named encoding carries
+        // field names, so a skipped field leaves no trace in the bytes).
+        let converged = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(true),
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&converged).expect("encode converged snapshot");
+        for key in [
+            "usage_snapshot_pending_buckets",
+            "usage_snapshot_pending_bucket_count",
+            "usage_snapshot_observational",
+        ] {
+            assert!(
+                !encoded.windows(key.len()).any(|window| window == key.as_bytes()),
+                "{key} must be skipped when empty"
+            );
+        }
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode converged snapshot");
+        assert!(decoded.usage_snapshot_pending_buckets.is_empty());
+        assert_eq!(decoded.usage_snapshot_pending_bucket_count, 0);
+        assert!(!decoded.usage_snapshot_observational);
+        assert!(decoded.is_complete_bucket_usage_snapshot());
     }
 
     #[test]
