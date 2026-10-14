@@ -221,7 +221,7 @@ jobs:
           npm --prefix connect-harness/web ci
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
           make -C connect-harness e2e-connected-dispatch-check
-          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+          TMPDIR="$GITHUB_WORKSPACE" RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
             CONNECT_E2E_TOP_DISK_EVIDENCE="$GITHUB_WORKSPACE/top-disk-service-job-evidence.json" \
             make -C connect-harness e2e-connected E2E_SCENARIO=top-disk

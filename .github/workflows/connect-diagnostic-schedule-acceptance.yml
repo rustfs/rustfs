@@ -170,7 +170,7 @@ jobs:
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
           make -C connect-harness e2e-connected-dispatch-check
           (cd connect-harness && ./tests/connectivity/diagnostic-schedule-evidence.test.sh)
-          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+          TMPDIR="$GITHUB_WORKSPACE" RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
             CONNECT_E2E_DIAGNOSTIC_SCHEDULE_EVIDENCE="$GITHUB_WORKSPACE/diagnostic-schedule-evidence.json" \
             make -C connect-harness e2e-connected E2E_SCENARIO=diagnostic-schedule
