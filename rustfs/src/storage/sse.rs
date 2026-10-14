@@ -4127,6 +4127,7 @@ pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>)
     for key in KEYS.iter() {
         metadata.remove(*key);
     }
+    rustfs_utils::http::metadata_compat::remove_str(metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
 }
 
 pub fn mark_encrypted_multipart_metadata(metadata: &mut HashMap<String, String>) {

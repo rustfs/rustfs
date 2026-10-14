@@ -684,12 +684,12 @@ def check_ilm_build_budget(root: Path) -> list[str]:
         return [".github/workflows/ci.yml: missing workflow"]
     workflow = workflow_path.read_text()
     job = re.search(
-        r"^  test-ilm-integration-serial:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
+        r"^  test-and-lint:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
         workflow,
         re.MULTILINE | re.DOTALL,
     )
     if job is None:
-        return [".github/workflows/ci.yml: missing test-ilm-integration-serial job"]
+        return [".github/workflows/ci.yml: ILM integration must share the workspace test job"]
 
     step = re.search(
         r"^      - name: Run ignored ILM integration tests serially\n(?P<body>.*?)(?=^      - name:|\Z)",
@@ -705,6 +705,16 @@ def check_ilm_build_budget(root: Path) -> list[str]:
     )
     if budget not in step.group("body"):
         return [".github/workflows/ci.yml: ILM integration must keep the measured 3/2 Cargo build budget"]
+    for required in (
+        "        if: needs.classify-changes.outputs.mode == 'full'",
+        "cargo nextest run --profile default -j1 --run-ignored ignored-only",
+        "--all --exclude e2e_test",
+        "-E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'",
+        'status=${PIPESTATUS[0]}',
+        'exit "${status}"',
+    ):
+        if required not in step.group("body"):
+            return [f".github/workflows/ci.yml: ILM integration is missing {required.strip()}"]
     return []
 
 
@@ -5566,12 +5576,17 @@ class SelfTests(unittest.TestCase):
             workflow.parent.mkdir(parents=True)
             valid = (
                 "jobs:\n"
-                "  test-ilm-integration-serial:\n"
+                "  test-and-lint:\n"
                 "    steps:\n"
                 "      - name: Run ignored ILM integration tests serially\n"
+                "        if: needs.classify-changes.outputs.mode == 'full'\n"
                 "        env:\n"
                 "          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}\n"
-                "        run: cargo nextest run\n"
+                "        run: |\n"
+                "          cargo nextest run --profile default -j1 --run-ignored ignored-only --all --exclude e2e_test \\\n"
+                "            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'\n"
+                "          status=${PIPESTATUS[0]}\n"
+                '          exit "${status}"\n'
                 "  next-job:\n"
                 "    steps: []\n"
             )
@@ -5580,6 +5595,18 @@ class SelfTests(unittest.TestCase):
 
             workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
             self.assertEqual(len(check_ilm_build_budget(root)), 1)
+            for old, new in (
+                ("test-and-lint:", "test-ilm-integration-serial:"),
+                ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
+                ("--profile default", "--profile ci"),
+                ("-j1", "-j2"),
+                ("ignored-only", "default"),
+                ("--all --exclude e2e_test", "-p rustfs-scanner -p rustfs"),
+                ("binary(lifecycle_integration_test)", "none()"),
+                ('exit "${status}"', "exit 0"),
+            ):
+                workflow.write_text(valid.replace(old, new))
+                self.assertTrue(check_ilm_build_budget(root), (old, new))
 
     def test_vault_tests_require_cross_process_serialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

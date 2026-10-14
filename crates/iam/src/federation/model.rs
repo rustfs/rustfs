@@ -164,40 +164,6 @@ impl FederatedAuthorization {
     }
 }
 
-pub struct FederatedCodeExchange {
-    pub authorization: FederatedAuthorization,
-    pub redirect_after: Option<String>,
-    pub id_token: String,
-}
-
-impl FederatedCodeExchange {
-    pub(crate) fn into_parts(self) -> (FederatedAuthorization, Option<String>, OpaqueLogoutContinuation) {
-        let Self {
-            authorization,
-            redirect_after,
-            id_token,
-        } = self;
-        let continuation = OpaqueLogoutContinuation {
-            provider: FederatedProviderRef::new(authorization.provider_id.clone()),
-            id_token,
-        };
-        (authorization, redirect_after, continuation)
-    }
-}
-
-impl fmt::Debug for FederatedCodeExchange {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FederatedCodeExchange")
-            .field("provider_id", &self.authorization.provider_id)
-            .field("policy_count", &self.authorization.policies.len())
-            .field("group_count", &self.authorization.groups.len())
-            .field("redirect_after_present", &self.redirect_after.is_some())
-            .field("id_token_present", &!self.id_token.is_empty())
-            .finish()
-    }
-}
-
 /// Carries the provider-bound ID token between code exchange and logout token creation.
 pub(crate) struct OpaqueLogoutContinuation {
     provider: FederatedProviderRef,
@@ -397,27 +363,13 @@ mod tests {
 
     #[test]
     fn logout_continuation_binds_provider_and_redacts_token() {
-        let mut authorization = authorization(Vec::new(), Vec::new());
-        authorization
-            .claims
-            .raw
-            .insert("attribute_poison".to_string(), Value::String("secret-attribute".to_string()));
-        let exchange = FederatedCodeExchange {
-            authorization,
-            redirect_after: Some("/console?poison=redirect-secret".to_string()),
-            id_token: "secret-id-token".to_string(),
-        };
-        let debug = format!("{exchange:?}");
-        let (_, _, continuation) = exchange.into_parts();
+        let continuation =
+            OpaqueLogoutContinuation::new(FederatedProviderRef::new("standard_oidc".to_string()), "secret-id-token".to_string());
         let continuation_debug = format!("{continuation:?}");
         let (provider, id_token) = continuation.into_parts();
 
         assert_eq!(provider.as_str(), "standard_oidc");
         assert_eq!(id_token, "secret-id-token");
-        assert!(!debug.contains("secret-id-token"));
-        assert!(!debug.contains("secret-attribute"));
-        assert!(!debug.contains("redirect-secret"));
-        assert!(debug.contains("id_token_present: true"));
         assert!(!continuation_debug.contains("secret-id-token"));
         assert!(continuation_debug.contains("[REDACTED]"));
     }

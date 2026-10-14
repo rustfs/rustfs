@@ -108,6 +108,10 @@ fn should_retry_format_load(err: &Error) -> bool {
     )
 }
 
+fn format_load_retry_exhausted(err: &Error, retries: u32) -> bool {
+    retries >= 10 && !matches!(err, Error::ErasureReadQuorum | Error::FirstDiskWait | Error::NotFirstDisk)
+}
+
 fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_resume_required: bool) -> bool {
     rebalance_resume_required && !decommission_running
 }
@@ -484,7 +488,7 @@ impl ECStore {
             check_disk_fatal_errs(&errs)?;
 
             let loaded_format = {
-                let mut times = 0;
+                let mut times = 0_u32;
                 let mut interval = 1;
                 loop {
                     match init_format::connect_load_init_formats_with_instance_ctx(
@@ -500,13 +504,13 @@ impl ECStore {
                         Ok(fm) => break Ok(fm),
                         Err(e) if !should_retry_format_load(&e) => break Err(e),
                         // Wrap the final error if we are giving up
-                        Err(e) if times >= 10 => {
+                        Err(e) if format_load_retry_exhausted(&e, times) => {
                             break Err(Error::other(format!("store init failed to load formats after {times} retries: {e}")));
                         }
                         // Retrying so just drop the error
                         Err(_) => {}
                     }
-                    times += 1;
+                    times = times.saturating_add(1);
                     if interval < 16 {
                         interval *= 2;
                     }
@@ -519,6 +523,12 @@ impl ECStore {
                         "Retrying storage format load"
                     );
                     select! {
+                        _ = ctx.cancelled() => {
+                            return Err(Error::other(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "storage format initialization cancelled",
+                            )));
+                        }
                         _ = tokio::signal::ctrl_c() => {
                             info!(
                                 event = EVENT_STORE_FORMAT_RETRY,
@@ -2199,6 +2209,23 @@ mod tests {
         tokio::time::advance(super::LOCAL_DECOMMISSION_WATCHDOG_INTERVAL).await;
         task.await.expect("watchdog task should exit after cancellation");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn format_peer_wait_does_not_exhaust_the_retry_budget() {
+        for retries in [0, 9, 10, u32::MAX] {
+            for error in [
+                StorageError::ErasureReadQuorum,
+                StorageError::FirstDiskWait,
+                StorageError::NotFirstDisk,
+            ] {
+                assert!(
+                    !super::format_load_retry_exhausted(&error, retries),
+                    "peer availability must remain retryable"
+                );
+            }
+            assert_eq!(super::format_load_retry_exhausted(&StorageError::Timeout, retries), retries >= 10);
+        }
     }
 
     #[test]

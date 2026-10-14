@@ -695,6 +695,7 @@ impl From<StorageError> for ApiError {
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
+            | StorageError::Timeout
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => {
                 S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())
@@ -1716,6 +1717,37 @@ mod tests {
             let api_error: ApiError = storage_error.into();
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
+        }
+    }
+
+    #[test]
+    fn disk_quorum_timeouts_map_to_retryable_service_unavailable() {
+        use crate::storage_api::error::{DiskError, OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
+
+        let errors = [
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            None,
+        ];
+        for reduced in [
+            reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3),
+        ] {
+            let reduced = reduced.expect("quorum of timeouts must retain its typed cause");
+            assert_eq!(reduced, DiskError::Timeout);
+            let error = ApiError::from(StorageError::from(reduced));
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            let response = S3Error::from(error);
+            assert_eq!(response.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        }
+        let degraded = [None, None, None, Some(DiskError::Timeout)];
+        assert!(reduce_write_quorum_errs(&degraded, OBJECT_OP_IGNORED_ERRS, 3).is_none());
+        for failure in [DiskError::FileCorrupt, DiskError::Io(IoError::other("unknown disk failure"))] {
+            let errors = [Some(failure.clone()), Some(failure.clone()), Some(failure), None];
+            let reduced =
+                reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3).expect("permanent failures must remain errors");
+            assert_eq!(ApiError::from(StorageError::from(reduced)).code, S3ErrorCode::InternalError);
         }
     }
 

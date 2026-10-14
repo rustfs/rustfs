@@ -368,6 +368,13 @@ pub async fn put_opts_with_replication_authorization(
     metadata: HashMap<String, String>,
     replication_request_authorized: bool,
 ) -> Result<ObjectOptions> {
+    if vid.is_some() && !replication_request_authorized {
+        return Err(StorageError::InvalidArgument(
+            bucket.to_owned(),
+            object.to_owned(),
+            "A destination versionId requires replication authorization".to_owned(),
+        ));
+    }
     let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
@@ -1532,7 +1539,15 @@ mod tests {
         let headers = create_test_headers();
         let invalid_uuid = "invalid-uuid".to_string();
 
-        let result = put_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, HashMap::new()).await;
+        let result = put_opts_with_replication_authorization(
+            "test-bucket",
+            "test-object",
+            Some(invalid_uuid),
+            &headers,
+            HashMap::new(),
+            true,
+        )
+        .await;
 
         assert!(result.is_err());
         if let Err(err) = result {
@@ -1556,11 +1571,33 @@ mod tests {
         // get_opts / del_opts already do.
         let headers = create_test_headers();
 
-        let opts = put_opts("test-bucket", "test-object", Some("null".to_string()), &headers, HashMap::new())
-            .await
-            .expect("PUT with versionId=null must be accepted as the null version");
+        let opts = put_opts_with_replication_authorization(
+            "test-bucket",
+            "test-object",
+            Some("null".to_string()),
+            &headers,
+            HashMap::new(),
+            true,
+        )
+        .await
+        .expect("PUT with versionId=null must be accepted as the null version");
 
         assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
+    async fn ordinary_writes_cannot_choose_a_destination_version() {
+        let headers = create_test_headers();
+        for version in ["null", "", "0194e0f1-0000-7000-8000-000000000000"] {
+            let err = put_opts("test-bucket", "test-object", Some(version.to_owned()), &headers, HashMap::new())
+                .await
+                .expect_err("ordinary PUT must not overwrite a selected version");
+            assert!(matches!(err, StorageError::InvalidArgument(_, _, _)));
+            let err = copy_dst_opts("test-bucket", "test-object", Some(version.to_owned()), &headers, HashMap::new())
+                .await
+                .expect_err("ordinary COPY must not overwrite a selected version");
+            assert!(matches!(err, StorageError::InvalidArgument(_, _, _)));
+        }
     }
 
     #[tokio::test]

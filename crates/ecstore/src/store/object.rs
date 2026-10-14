@@ -5351,13 +5351,41 @@ impl ECStore {
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         Box::pin(async move {
+            let count = objects.len();
+            let mut deleted = vec![DeletedObject::default(); count];
+            let mut errors: Vec<Option<Error>> = (0..count).map(|_| None).collect();
+            let mut accounting = vec![None; count];
+            let mut valid_objects = Vec::with_capacity(count);
+            let mut valid_indices = Vec::with_capacity(count);
+            // Validate the literal key before encoding it or taking locks. A
+            // dot-segment key must never reach filesystem path resolution.
+            for (index, object) in objects.into_iter().enumerate() {
+                match check_del_obj_args(bucket, &object.object_name) {
+                    Ok(()) => {
+                        valid_indices.push(index);
+                        valid_objects.push(object);
+                    }
+                    Err(err) => errors[index] = Some(err),
+                }
+            }
+            if valid_objects.is_empty() {
+                return (deleted, errors, accounting);
+            }
             let mut opts = opts;
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-            let result = self
-                .handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)
+            let (valid_deleted, valid_errors, valid_accounting) = self
+                .handle_delete_objects_with_journal_and_accounting_inner(bucket, valid_objects, opts, tier_journal_api)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
-            result
+            for (index, ((object, error), receipt)) in valid_indices
+                .into_iter()
+                .zip(valid_deleted.into_iter().zip(valid_errors).zip(valid_accounting))
+            {
+                deleted[index] = object;
+                errors[index] = error;
+                accounting[index] = receipt;
+            }
+            (deleted, errors, accounting)
         })
         .await
     }
@@ -9092,6 +9120,58 @@ mod tests {
             .await
             .expect("create the versioned bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_delete_rejects_dot_segments_and_keeps_valid_result_positions() {
+        let bucket = "batch-delete-key-validation";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        let options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let victim = store
+            .put_object(bucket, "victim/object", &mut PutObjReader::from_vec(b"victim".to_vec()), &options)
+            .await
+            .expect("write protected-prefix control object");
+        store
+            .put_object(bucket, "allowed/object", &mut PutObjReader::from_vec(b"allowed".to_vec()), &options)
+            .await
+            .expect("write valid deletion control object");
+        let keys = [
+            "allowed/../victim/object",
+            "allowed/object",
+            "a/./b",
+            "../other-bucket/object",
+        ];
+        let objects = keys
+            .iter()
+            .map(|key| ObjectToDelete {
+                object_name: (*key).to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let (deleted, errors) = store.handle_delete_objects(bucket, objects, options).await;
+        assert_eq!(deleted.len(), keys.len());
+        assert_eq!(errors.len(), keys.len());
+        for index in [0, 2, 3] {
+            assert!(
+                matches!(&errors[index], Some(StorageError::ObjectNameInvalid(_, _))),
+                "invalid key {}: {:?}",
+                keys[index],
+                errors[index]
+            );
+            assert!(!deleted[index].delete_marker);
+        }
+        assert!(errors[1].is_none(), "valid deletion must still succeed: {:?}", errors[1]);
+        assert!(deleted[1].delete_marker);
+        assert_eq!(deleted[1].object_name, "allowed/object");
+        let after = store
+            .get_object_info(bucket, "victim/object", &ObjectOptions::default())
+            .await
+            .expect("the resolved victim path must remain visible");
+        assert_eq!(after.version_id, victim.version_id);
+        assert_eq!(after.etag, victim.etag);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

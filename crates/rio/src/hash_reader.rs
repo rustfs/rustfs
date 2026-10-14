@@ -136,6 +136,7 @@ pin_project! {
         content_sha256: Option<String>,
         content_sha256_hasher: Option<Sha256Hasher>,
         checksum_on_finish: bool,
+        pub encrypted_etag: bool,
 
         // Read only at EOF; see the timing contract in `crate::trailer`.
         trailer: Option<SharedTrailerSource>,
@@ -184,6 +185,7 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
+            encrypted_etag: false,
             trailer: None,
         })
     }
@@ -224,6 +226,7 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
+            encrypted_etag: false,
             trailer: None,
         })
     }
@@ -294,6 +297,7 @@ impl HashReader {
                 content_hash,
                 content_hasher,
                 checksum_on_finish: false,
+                encrypted_etag: false,
                 trailer: existing_hash_reader.get_trailer().cloned(),
             })
         } else {
@@ -322,6 +326,7 @@ impl HashReader {
                 content_sha256: sha256hex.clone(),
                 content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
                 checksum_on_finish: false,
+                encrypted_etag: false,
                 trailer: None,
             })
         }
