@@ -4609,6 +4609,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_gate: None,
             },
         )
         .await
@@ -4715,6 +4716,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_gate: None,
             },
         )
         .await
