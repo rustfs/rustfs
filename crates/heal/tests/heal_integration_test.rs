@@ -611,9 +611,30 @@ mod serial_tests {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[serial]
-async fn replacement_delete_recovery_on_fresh_target() {
+fn replacement_delete_recovery_on_fresh_target() {
+    // Match the debug server's worker stack for the composed Heal future.
+    // Libtest otherwise polls it on its smaller calling-thread stack.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("replacement-delete-recovery".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("replacement recovery runtime");
+            runtime.block_on(replacement_delete_recovery_on_fresh_target_case());
+        })
+        .expect("replacement recovery test thread")
+        .join()
+        .expect("replacement recovery test result");
+}
+
+async fn replacement_delete_recovery_on_fresh_target_case() {
     use rustfs_heal::Error;
     use rustfs_heal::heal::task::HealTask;
     use rustfs_heal_contracts::heal_channel::HealRequestSource;
