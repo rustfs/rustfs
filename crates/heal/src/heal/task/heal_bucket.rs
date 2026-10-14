@@ -132,6 +132,19 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 }
 
 impl HealTask {
+    async fn recover_bucket_delete_transactions(&self, bucket: &str, opts: &HealOpts) -> Result<()> {
+        if let Some(result) = self
+            .await_with_control(
+                self.storage
+                    .recover_delete_transactions(bucket, None, self.bucket_incarnation_id, opts),
+            )
+            .await?
+        {
+            self.record_result_item(result).await;
+        }
+        Ok(())
+    }
+
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
         self.pace_mainline().await?;
         if self.source == HealRequestSource::Admin && matches!(self.heal_type, HealType::Bucket { .. }) {
@@ -224,18 +237,11 @@ impl HealTask {
             remove: self.source == HealRequestSource::Admin && self.options.remove_corrupted,
             ..heal_opts
         };
-        if let Some(result) = self
-            .await_with_control(self.storage.recover_delete_transactions(
-                bucket,
-                None,
-                self.bucket_incarnation_id,
-                &recovery_opts,
-            ))
-            .await?
-        {
-            self.record_result_item(result).await;
+        // Removal must settle survivor journals before deleting an empty
+        // replica's publication directory; repair must establish it first.
+        if heal_opts.remove {
+            self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
         }
-
         let heal_result = match self.bucket_incarnation_id {
             Some(expected) => {
                 self.await_with_control(self.storage.heal_bucket_at_incarnation(bucket, expected, &heal_opts))
@@ -260,6 +266,10 @@ impl HealTask {
                     "Heal bucket completed"
                 );
                 self.record_result_item(result).await;
+
+                if !heal_opts.remove {
+                    self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
+                }
 
                 if self.options.recursive {
                     self.heal_bucket_objects(bucket, "").await?;

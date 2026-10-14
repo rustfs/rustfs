@@ -29,6 +29,7 @@ use tempfile::TempDir;
 pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
+mod auto_scan;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
