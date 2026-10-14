@@ -294,7 +294,8 @@ impl ScannerIOCache for SetDisks {
             };
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
-            cache.info.scan_execution_digest = Some(execution_digest);
+            let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+            cache.info.scan_execution_digest = Some(replication_execution);
             cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
@@ -1566,7 +1567,8 @@ impl ScannerIOCache for SetDisks {
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
-                cache.info.scan_execution_digest = Some(execution_digest);
+                let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+                cache.info.scan_execution_digest = Some(replication_execution);
                 cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;
