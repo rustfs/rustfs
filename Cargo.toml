@@ -220,7 +220,7 @@ openidconnect = { default-features = false, version = "4.0" }
 pbkdf2 = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "=0.10.0-rc.18" }
-rustls = { default-features = false, version = "0.23.45" }
+rustls = { default-features = false, version = "0.23.46" }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.15.1"
 x509-parser = "0.18.1"
@@ -246,8 +246,8 @@ anyhow = "1.0.104"
 arc-swap = "1.9.2"
 rustfs-tokio-tar = { version = "0.7.1" }
 # Candidate Snowball parser versions exercised by rustfs-zip compatibility fixtures.
-tar-codec = "0.0.14"
-tar-framing = "0.0.14"
+tar-codec = "0.0.15"
+tar-framing = "0.0.15"
 atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.12.0" }
