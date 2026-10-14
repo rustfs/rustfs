@@ -67,7 +67,6 @@ members = [
     "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
 ]
-exclude = ["third-party/pyroscope"]
 resolver = "3"
 
 [workspace.package]
@@ -157,7 +156,7 @@ futures-lite = "2.6.1"
 futures-util = "0.3.34"
 pollster = "1.0.1"
 pulsar = { default-features = false, version = "6.9.0" }
-lapin = { default-features = false, version = "4.12.1" }
+lapin = { default-features = false, version = "4.12.2" }
 hyper = { version = "1.12.0" }
 h2 = { version = "0.4.20" }
 hyper-rustls = { default-features = false, version = "0.27.10" }
@@ -170,7 +169,7 @@ minlz = "1.2.3"
 reqwest = "0.13.5"
 rustfs-kafka-async = { version = "1.4.0" }
 socket2 = { version = "0.6.5" }
-tokio = { version = "1.53.2" }
+tokio = { version = "1.53.3" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
 tokio-stream = { version = "0.1.19" }
 tokio-test = "0.4.6"
@@ -355,13 +354,13 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.0.2"
+zip = "9.0.3"
 zstd = "0.14.2"
 
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
-dial9 = { version = "0.5.3", default-features = false }
+dial9 = { version = "0.5.4", default-features = false }
 opentelemetry = { version = "0.33.1" }
 opentelemetry-appender-tracing = { version = "0.33.1" }
 opentelemetry-otlp = { version = "0.33.1" }
@@ -369,7 +368,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 opentelemetry_sdk = { version = "0.33.1" }
 opentelemetry-semantic-conventions = { version = "0.33.1" }
 opentelemetry-stdout = { version = "0.33.1" }
-pyroscope = { version = "2.1.1" }
+pyroscope = { version = "2.1.2" }
 
 # FTP and SFTP
 libunftp = { version = "0.23.1" }
@@ -422,8 +421,3 @@ inherits = "release"
 inherits = "release"
 debug = true
 strip = "none"
-
-# Remove this patch when Pyroscope releases support for object 0.40 or later.
-# object 0.39 requires ruzstd 0.8, affected by RUSTSEC-2026-0344.
-[patch.crates-io]
-pyroscope = { path = "third-party/pyroscope" }

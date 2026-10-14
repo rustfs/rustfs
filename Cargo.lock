@@ -3708,9 +3708,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 dependencies = [
  "serde_core",
 ]
@@ -3800,9 +3800,9 @@ dependencies = [
 
 [[package]]
 name = "dial9"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35f95885a2167602b457c77caf898670c02eb0aaba72bef76ac5b0faef86e14"
+checksum = "734474ca4e814f893385c8fdea63688a9e6034ea19a5ec9846f8f515a69c9bed"
 dependencies = [
  "bon",
  "dial9-core",
@@ -3817,9 +3817,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-core"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f826078c782919cf9a4fb0b2b6755dab24d6c908b5181469b23cf6eb8f6fff"
+checksum = "4ff5074fab1f810a73d58336275eb163e795ab0ae923fcc8437ba58bf2994e33"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -3851,9 +3851,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-metrique"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c59e35e7b38ce255d3dc6310b48c3ea54307c42a0589eda44ea91ba24eadf67"
+checksum = "3dd61f8f3d44db27e7a5e970c216bf4c19db66ebb68b7f58db2549f010c3a02e"
 dependencies = [
  "dial9-core",
  "dial9-trace-format",
@@ -3865,9 +3865,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-perf-self-profile"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c429b209bc07612b2e60267e8bca80cd2b249f498e9a0b83f7caf514d5f5388"
+checksum = "d320bef9be4ef9c20ca9800cbfc369c319304b5e11d0a7aa931f5482aa5c1bd8"
 dependencies = [
  "blazesym",
  "bon",
@@ -3884,9 +3884,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-tokio-telemetry"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee46c0a97dd88ba151f9688c79de60c41cd7efc6855e6eb369af06326cba8f3"
+checksum = "1a98e1e673f2dd9e223811832be7a4344ddfe48282a2e7efbf1289e47e4322ce"
 dependencies = [
  "bon",
  "bytes",
@@ -4310,9 +4310,9 @@ dependencies = [
 
 [[package]]
 name = "equivalent"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "erased-serde"
@@ -6052,9 +6052,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lapin"
-version = "4.12.1"
+version = "4.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f6674e18d68e810f66ea962f8080f1ded75f813c1cd3fae9ed53bab760dfcfd"
+checksum = "3a585eb3060f00f09a1d231e3030afe59f2c2d63f794787ab1dd87d2f72df6a3"
 dependencies = [
  "amq-protocol",
  "async-rs",
@@ -8529,7 +8529,9 @@ dependencies = [
 
 [[package]]
 name = "pyroscope"
-version = "2.1.1"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357782a4af9b6b43bd3a9caa64dd802967498b1fce1d4e0bda552267d62de7cf"
 dependencies = [
  "aligned-vec",
  "backtrace",
@@ -8544,6 +8546,7 @@ dependencies = [
  "once_cell",
  "prost 0.14.4",
  "reqwest",
+ "ruzstd",
  "serde_json",
  "smallvec",
  "spin 0.12.3",
@@ -11207,9 +11210,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -12717,9 +12720,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -14081,18 +14084,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14175,9 +14178,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e2fc56a6707efb066c40aead2409ebb1224e6dde24a074e9fbc78ced500507b"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
  "aes 0.9.3",
  "bzip2",
