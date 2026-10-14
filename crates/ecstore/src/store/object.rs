@@ -59,7 +59,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use parking_lot::Mutex as ParkingMutex;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_io_metrics::{
@@ -2548,6 +2548,118 @@ async fn inject_conditional_delete_post_admission_mutations(store: &ECStore, buc
 }
 
 const CONDITIONAL_DELETE_SNAPSHOT_CONCURRENCY: usize = 16;
+const CONDITIONAL_DELETE_CAPABILITY_SET_CONCURRENCY: usize = 16;
+
+#[cfg(test)]
+struct ConditionalCapabilitySetProbeGateState {
+    started: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+    reject_first: AtomicBool,
+    changed: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+struct ConditionalCapabilitySetProbeGate {
+    bucket: String,
+    state: Arc<ConditionalCapabilitySetProbeGateState>,
+    abort_task: Option<tokio::task::AbortHandle>,
+}
+
+#[cfg(test)]
+static CONDITIONAL_CAPABILITY_SET_PROBE_GATES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<ConditionalCapabilitySetProbeGateState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl ConditionalCapabilitySetProbeGate {
+    fn install(bucket: &str, reject_first: bool) -> Self {
+        let state = Arc::new(ConditionalCapabilitySetProbeGateState {
+            started: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            reject_first: AtomicBool::new(reject_first),
+            changed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let previous = CONDITIONAL_CAPABILITY_SET_PROBE_GATES
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("conditional capability probe gates must not poison")
+            .insert(bucket.to_owned(), Arc::clone(&state));
+        assert!(previous.is_none(), "one probe gate per test bucket");
+        Self {
+            bucket: bucket.to_owned(),
+            state,
+            abort_task: None,
+        }
+    }
+
+    async fn wait_started(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let changed = self.state.changed.notified();
+                if self.state.started.load(Ordering::Acquire) >= count {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("bounded set probes must reach the requested admission count");
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConditionalCapabilitySetProbeGate {
+    fn drop(&mut self) {
+        if let Some(task) = &self.abort_task {
+            task.abort();
+        }
+        self.state.release.close();
+        let mut gates = CONDITIONAL_CAPABILITY_SET_PROBE_GATES
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("conditional capability probe gates must not poison");
+        if gates.get(&self.bucket).is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            gates.remove(&self.bucket);
+        }
+    }
+}
+
+#[cfg(test)]
+struct ConditionalCapabilitySetProbeActivity(Arc<ConditionalCapabilitySetProbeGateState>);
+
+#[cfg(test)]
+impl Drop for ConditionalCapabilitySetProbeActivity {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+async fn await_conditional_capability_set_probe_gate(bucket: &str) -> Result<()> {
+    let state = CONDITIONAL_CAPABILITY_SET_PROBE_GATES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("conditional capability probe gates must not poison")
+        .get(bucket)
+        .cloned();
+    let Some(state) = state else {
+        return Ok(());
+    };
+    let active = state.active.fetch_add(1, Ordering::AcqRel) + 1;
+    let _activity = ConditionalCapabilitySetProbeActivity(Arc::clone(&state));
+    state.max_active.fetch_max(active, Ordering::AcqRel);
+    state.started.fetch_add(1, Ordering::AcqRel);
+    state.changed.notify_one();
+    state.release.acquire().await.map_err(|_| Error::OperationCanceled)?.forget();
+    if state.reject_first.swap(false, Ordering::AcqRel) {
+        return Err(StorageError::GuardedDeleteUnsupported);
+    }
+    Ok(())
+}
 
 struct BatchDeletePhasePlan<'a> {
     indices: &'a [usize],
@@ -5961,24 +6073,29 @@ impl ECStore {
 
             // All relevant peers are checked before marker selection, capacity
             // admission, or any destructive work, even in a mixed batch.
-            let mut preflight_error = None;
+            let mut probe_sets = Vec::new();
             for (pool_idx, generations) in &pool_generations {
                 let pool = &self.pools[*pool_idx];
                 let mut checked_sets = HashSet::new();
                 for object in generations.keys() {
                     let set = pool.get_disks_by_key(object);
                     if checked_sets.insert(set.set_index) {
-                        if let Err(error) = set.preflight_guarded_delete_versions().await {
-                            preflight_error = Some(error);
-                            break;
-                        }
+                        probe_sets.push(set);
                     }
                 }
-                if preflight_error.is_some() {
-                    break;
-                }
             }
-            if let Some(error) = preflight_error {
+            let preflight = futures::stream::iter(probe_sets.into_iter().map(|set| async move {
+                #[cfg(test)]
+                await_conditional_capability_set_probe_gate(bucket).await?;
+                set.preflight_guarded_delete_versions().await
+            }))
+            .buffer_unordered(CONDITIONAL_DELETE_CAPABILITY_SET_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await;
+            // Every selected set must succeed before conditional mutation.
+            // These probes are read-only: the first error can safely cancel
+            // pending work instead of holding namespace locks for its timeout.
+            if let Err(error) = preflight {
                 for (idx, admitted) in admitted_conditions.iter().enumerate() {
                     if *admitted {
                         del_errs[idx] = Some(error.clone());
@@ -9705,6 +9822,157 @@ mod tests {
             .await
             .expect("create the bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_batch_delete_set_probes_are_bounded_before_mutation() {
+        assert_conditional_set_probe_admission(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_batch_delete_set_probe_error_cancels_pending_probes() {
+        assert_conditional_set_probe_admission(true).await;
+    }
+
+    async fn assert_conditional_set_probe_admission(reject_first: bool) {
+        use crate::storage_api_contracts::object::DeleteObjectCondition;
+        let bucket = if reject_first {
+            "conditional-capability-set-rejected"
+        } else {
+            "conditional-capability-set-supported"
+        };
+        let protected = "protected.bin";
+        let ordinary = "ordinary.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let mut dirs = Vec::new();
+        let mut sets = Vec::new();
+        for _ in 0..17 {
+            let (set_dirs, set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            dirs.extend(set_dirs);
+            sets.push(set);
+        }
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&sets, ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create all pool buckets");
+        let protected_before = store.pools[0]
+            .put_object(
+                bucket,
+                protected,
+                &mut PutObjReader::from_vec(b"protected data".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write conditional target");
+        let ordinary_before = store.pools[0]
+            .put_object(
+                bucket,
+                ordinary,
+                &mut PutObjReader::from_vec(b"ordinary data".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write ordinary control");
+        let mut gate = ConditionalCapabilitySetProbeGate::install(bucket, reject_first);
+        let delete_store = Arc::clone(&store);
+        let condition_etag = protected_before.etag.clone().expect("conditional target ETag");
+        let delete = tokio::spawn(async move {
+            delete_store
+                .handle_delete_objects(
+                    bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: protected.to_owned(),
+                            delete_condition: Some(DeleteObjectCondition::MatchEtag(condition_etag)),
+                            ..Default::default()
+                        },
+                        ObjectToDelete {
+                            object_name: ordinary.to_owned(),
+                            ..Default::default()
+                        },
+                    ],
+                    ObjectOptions::default(),
+                )
+                .await
+        });
+        gate.abort_task = Some(delete.abort_handle());
+        gate.wait_started(16).await;
+        assert_eq!(gate.state.started.load(Ordering::Acquire), 16, "the seventeenth probe must remain queued");
+        assert_eq!(gate.state.active.load(Ordering::Acquire), 16);
+        let read_options = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: false,
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        for (key, before) in [(protected, &protected_before), (ordinary, &ordinary_before)] {
+            let current = store.pools[0]
+                .get_object_info(bucket, key, &read_options)
+                .await
+                .expect("read disk metadata under the retained outer write lock");
+            assert_eq!(current.data_dir, before.data_dir, "pending probes cannot mutate {key}");
+            assert_eq!(current.etag, before.etag);
+        }
+        gate.state.release.add_permits(1);
+        if !reject_first {
+            gate.wait_started(17).await;
+            assert!(!delete.is_finished(), "one successful set cannot bypass still-running capability probes");
+            for (key, before) in [(protected, &protected_before), (ordinary, &ordinary_before)] {
+                let current = store.pools[0]
+                    .get_object_info(bucket, key, &read_options)
+                    .await
+                    .expect("read metadata while the final set remains paused");
+                assert_eq!(current.data_dir, before.data_dir, "all sets must approve before mutating {key}");
+                assert_eq!(current.etag, before.etag);
+            }
+            gate.state.release.add_permits(16);
+        }
+        let (_, errors) = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("capability admission must finish without releasing failed peers")
+            .expect("delete task joins");
+        assert_eq!(gate.state.max_active.load(Ordering::Acquire), 16, "capability fanout must be bounded");
+        assert_eq!(
+            gate.state.active.load(Ordering::Acquire),
+            0,
+            "completed or canceled probes must release their activity"
+        );
+        assert_eq!(
+            gate.state.started.load(Ordering::Acquire),
+            if reject_first { 16 } else { 17 },
+            "a rejected capability must cancel queued set probes"
+        );
+        if reject_first {
+            assert_eq!(errors[0], Some(StorageError::GuardedDeleteUnsupported));
+            let after = store
+                .get_object_info(bucket, protected, &ObjectOptions::default())
+                .await
+                .expect("rejected condition preserves data");
+            assert_eq!(after.data_dir, protected_before.data_dir);
+            assert_eq!(after.etag, protected_before.etag);
+        } else {
+            assert!(errors[0].is_none(), "all supported sets authorize conditional deletion: {errors:?}");
+            assert!(
+                store
+                    .get_object_info(bucket, protected, &ObjectOptions::default())
+                    .await
+                    .err()
+                    .is_some_and(|error| is_err_object_not_found(&error))
+            );
+        }
+        assert!(
+            errors[1].is_none(),
+            "ordinary deletion remains independent of capability admission: {errors:?}"
+        );
+        assert!(
+            store
+                .get_object_info(bucket, ordinary, &ObjectOptions::default())
+                .await
+                .err()
+                .is_some_and(|error| is_err_object_not_found(&error))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

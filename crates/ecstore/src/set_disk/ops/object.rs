@@ -8974,11 +8974,17 @@ impl SetDisks {
     /// Mixed-version peers must reject the operation before any group mutates.
     pub(crate) async fn preflight_guarded_delete_versions(&self) -> Result<()> {
         let disks = self.disks.read().await.clone();
-        for disk in disks.iter().flatten() {
-            disk.supports_guarded_delete_versions().await.map_err(Error::from)?;
-        }
-        Ok(())
+        guarded_delete_capability_barrier(disks.iter().flatten().map(|disk| disk.supports_guarded_delete_versions())).await
     }
+}
+
+async fn guarded_delete_capability_barrier<F>(probes: impl IntoIterator<Item = F>) -> Result<()>
+where
+    F: std::future::Future<Output = crate::disk::error::Result<()>>,
+{
+    // Capability probes are read-only, so a failure can cancel the remaining
+    // probes. Admission still requires every probe to complete successfully.
+    futures::future::try_join_all(probes).await.map(|_| ()).map_err(Error::from)
 }
 
 #[async_trait::async_trait]
@@ -23453,6 +23459,223 @@ mod delete_objects_lock_gating_tests {
             .expect("quoted response ETag");
         assert!(condition.matches(snapshot.etag.as_deref().expect("snapshot ETag")));
         assert!(matches!(generation, crate::disk::CurrentDeleteGeneration::Present { etag: stored, .. } if stored == etag));
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_drive_capability_barrier_waits_for_success_and_cancels_on_error() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio_util::sync::CancellationToken;
+
+        struct ProbeLifetime {
+            active: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for ProbeLifetime {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for unsupported in [false, true] {
+            let entered = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let all_entered = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicUsize::new(0));
+            let two_completed = Arc::new(tokio::sync::Notify::new());
+            let releases: Vec<_> = (0..3).map(|_| CancellationToken::new()).collect();
+            let mutation_started = Arc::new(AtomicBool::new(false));
+            let probes: Vec<_> = releases
+                .iter()
+                .enumerate()
+                .map(|(index, release)| {
+                    let entered = Arc::clone(&entered);
+                    let active = Arc::clone(&active);
+                    let dropped = Arc::clone(&dropped);
+                    let all_entered = Arc::clone(&all_entered);
+                    let completed = Arc::clone(&completed);
+                    let two_completed = Arc::clone(&two_completed);
+                    let release = release.clone();
+                    async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _lifetime = ProbeLifetime { active, dropped };
+                        if entered.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                            all_entered.notify_one();
+                        }
+                        release.cancelled().await;
+                        if completed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                            two_completed.notify_one();
+                        }
+                        if unsupported && index == 0 {
+                            Err(DiskError::GuardedDeleteUnsupported)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .collect();
+            let mutated = Arc::clone(&mutation_started);
+            let operation = tokio::spawn(async move {
+                guarded_delete_capability_barrier(probes).await?;
+                mutated.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), all_entered.notified())
+                .await
+                .expect("all drive probes start concurrently");
+            assert_eq!(entered.load(Ordering::SeqCst), 3);
+            assert_eq!(active.load(Ordering::SeqCst), 3);
+            assert!(!mutation_started.load(Ordering::SeqCst));
+            releases[0].cancel();
+            if !unsupported {
+                releases[1].cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(5), two_completed.notified())
+                    .await
+                    .expect("both released probes complete");
+                assert_eq!(completed.load(Ordering::SeqCst), 2);
+                assert!(!operation.is_finished(), "the last successful probe is required before admission");
+                assert!(!mutation_started.load(Ordering::SeqCst), "unknown capability prevents mutation");
+                releases[2].cancel();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                .await
+                .expect("a failed probe does not wait for unreleased peers")
+                .expect("probe task joins");
+            assert_eq!(active.load(Ordering::SeqCst), 0, "no probe lifetime leaks after the barrier returns");
+            assert_eq!(dropped.load(Ordering::SeqCst), 3, "completed and canceled probes release their resources");
+            if unsupported {
+                assert_eq!(result, Err(StorageError::GuardedDeleteUnsupported));
+                assert_eq!(completed.load(Ordering::SeqCst), 1, "unfinished peers are canceled rather than drained");
+                assert!(
+                    !releases[1].is_cancelled() && !releases[2].is_cancelled(),
+                    "the error returns while other peers remain blocked"
+                );
+                assert!(!mutation_started.load(Ordering::SeqCst), "unsupported capability prevents mutation");
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(completed.load(Ordering::SeqCst), 3);
+                assert!(mutation_started.load(Ordering::SeqCst), "all successful probes admit mutation");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_preserves_write_quorum_with_one_faulty_local_drive() {
+        use crate::disk::{CurrentDeleteGeneration, GuardedFileInfoVersions};
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "guarded-faulty-quorum";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture volume");
+        }
+        put_plain_object(&set, bucket, object).await;
+        let disk_info = disks[0]
+            .read_version(bucket, bucket, object, "", &crate::disk::ReadOptions::default())
+            .await
+            .expect("read authoritative disk metadata");
+        let (_, generation) = set
+            .conditional_delete_current_snapshot(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("capture guarded generation");
+        assert_eq!(
+            generation,
+            CurrentDeleteGeneration::from_file_info(&disk_info).expect("disk and set share a generation")
+        );
+        let metadata_path = disks[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(crate::disk::STORAGE_FORMAT_FILE);
+        let before = tokio::fs::read(&metadata_path)
+            .await
+            .expect("read faulty drive's original metadata");
+        disks[0].force_offline_for_test();
+        set.preflight_guarded_delete_versions()
+            .await
+            .expect("local capability is known independently of drive health");
+        let rejected_transaction = Uuid::new_v4();
+        let rejected = disks[0]
+            .delete_versions_guarded_recoverable(
+                bucket,
+                vec![GuardedFileInfoVersions {
+                    group: FileInfoVersions {
+                        name: object.to_owned(),
+                        versions: vec![FileInfo {
+                            name: object.to_owned(),
+                            version_id: disk_info.version_id,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    expected_current: generation.clone(),
+                }],
+                DeleteOptions {
+                    old_data_dir: Some(rejected_transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            vec![Some(DiskError::FaultyDisk)],
+            "a known capability does not allow mutation on a faulty drive"
+        );
+        let (_, errors) = set
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_owned(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    conditional_delete_generations: Some(Arc::new(HashMap::from([(object.to_owned(), generation)]))),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            errors[0].is_none(),
+            "three healthy drives satisfy the configured write quorum: {errors:?}"
+        );
+        assert_eq!(tokio::fs::read(&metadata_path).await.expect("faulty drive is not mutated"), before);
+        assert!(
+            !metadata_path
+                .parent()
+                .expect("object directory")
+                .join(rejected_transaction.to_string())
+                .exists()
+        );
+        for disk in &disks[1..] {
+            assert!(
+                !disk
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(crate::disk::STORAGE_FORMAT_FILE)
+                    .exists(),
+                "healthy quorum drives apply the guarded deletion"
+            );
+        }
+        assert!(
+            set.get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .err()
+                .is_some_and(|error| is_err_object_not_found(&error)),
+            "the healthy read quorum observes the completed delete"
+        );
     }
 
     #[tokio::test]
