@@ -292,6 +292,14 @@ impl<T: Store> IamSys<T> {
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
         crate::delegation::read_active(&self.store.api, owner, id, now).await
     }
+    /// Reads an owned delegation record for historical lookups, including expired or revoked records.
+    pub async fn read_owned_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_owned(&self.store.api, owner, id).await
+    }
 
     /// Create a new IamSys instance with the given IamCache store
     ///

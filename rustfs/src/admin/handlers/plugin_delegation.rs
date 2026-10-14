@@ -33,6 +33,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/submit"),
         AdminOperation(&Submit),
     )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/query"),
+        AdminOperation(&QueryRun),
+    )?;
     Ok(())
 }
 
@@ -219,12 +224,49 @@ impl Operation for Submit {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryRunInput {
+    version: u32,
+    run_id: uuid::Uuid,
+}
+
+struct QueryRun;
+#[async_trait::async_trait]
+impl Operation for QueryRun {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::GetPluginRunAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "query body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "query body unavailable"))?;
+        let input: QueryRunInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid query request"))?;
+        if input.version != 1 || input.run_id.is_nil() {
+            return Err(s3_error!(InvalidRequest, "invalid query request"));
+        }
+        let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
+        let result = plugin_runner::query(&plugin_runner::QueryRequest {
+            version: input.version,
+            run_id: input.run_id,
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+            actual_signer_access_key: &signer,
+        })
+        .await?;
+        response(&result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
-        for operation in 0..4 {
+        for operation in 0..5 {
             let req = S3Request {
                 input: Body::from("{}".to_owned()),
                 method: Method::POST,
@@ -242,6 +284,8 @@ mod tests {
                 Revoke.call(req, Params::new()).await
             } else if operation == 2 {
                 Submit.call(req, Params::new()).await
+            } else if operation == 3 {
+                QueryRun.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
             };
@@ -284,5 +328,19 @@ mod tests {
             &input.object.version_id,
             2,
         ));
+    }
+
+    #[test]
+    fn query_run_dto_rejects_client_authority_fields() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let input: QueryRunInput =
+            serde_json::from_str(&format!(r#"{{"version":1,"run_id":"{run_id}"}}"#)).expect("valid run query");
+        assert_eq!(input.run_id, run_id);
+        assert!(
+            serde_json::from_str::<QueryRunInput>(&format!(
+                r#"{{"version":1,"run_id":"{run_id}","actual_signer_access_key":"forged"}}"#
+            ))
+            .is_err()
+        );
     }
 }

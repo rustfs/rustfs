@@ -171,6 +171,14 @@ pub(crate) async fn read_active<T: Store>(store: &T, owner: &str, id: &str, now:
     check_active(store, record, now).await
 }
 
+pub(crate) async fn read_owned<T: Store>(store: &T, owner: &str, id: &str) -> Result<Delegation, DelegationError> {
+    let record = load(store, id).await?;
+    if record.owner_access_key != owner {
+        return Err(DelegationError::OwnerRejected);
+    }
+    Ok(record)
+}
+
 pub(crate) async fn read_active_for_broker<T: Store>(store: &T, id: &str, now: u64) -> Result<Delegation, DelegationError> {
     let record = load(store, id).await?;
     check_active(store, record, now).await

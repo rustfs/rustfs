@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
+const QUERY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/query";
 const MAX_RECEIPT_BYTES: usize = 4096;
+// The Runner bounds a result manifest to 1 MiB and reserves 4 KiB for its JSON envelope.
+const MAX_QUERY_RESPONSE_BYTES: usize = 1_052_672;
 
 #[derive(Serialize)]
 pub(crate) struct SubmitRequest<'a> {
@@ -40,6 +43,33 @@ pub(crate) struct Receipt {
     pub deadline_unix_micros: i64,
 }
 
+#[derive(Serialize)]
+pub(crate) struct QueryRequest<'a> {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+    pub actual_signer_access_key: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueryResponse {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub state: String,
+    pub epoch: i64,
+    #[serde(deserialize_with = "required_manifest")]
+    pub result_manifest: Option<serde_json::Value>,
+}
+
+fn required_manifest<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)
+}
+
 pub(crate) fn configured_deployment() -> S3Result<String> {
     std::env::var("RUSTFS_PLUGIN_RUNNER_DEPLOYMENT")
         .ok()
@@ -49,6 +79,74 @@ pub(crate) fn configured_deployment() -> S3Result<String> {
 
 pub(crate) async fn submit(request: &SubmitRequest<'_>) -> S3Result<Receipt> {
     let url = configured_url()?;
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
+            let receipt: Receipt =
+                serde_json::from_slice(&body).map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt invalid"))?;
+            if receipt.version != 1 || receipt.run_id.is_nil() || !literal(&receipt.pool) || receipt.deadline_unix_micros <= 0 {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner receipt invalid"));
+            }
+            Ok(receipt)
+        }
+        StatusCode::CONFLICT => Err(s3_error!(InvalidRequest, "idempotency key conflicts with existing job")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+    }
+}
+
+pub(crate) async fn query(request: &QueryRequest<'_>) -> S3Result<QueryResponse> {
+    let mut url = configured_url()?;
+    url.set_path(QUERY_ENDPOINT_PATH);
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_QUERY_RESPONSE_BYTES).await?;
+            let result: QueryResponse = serde_json::from_slice(&body)
+                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner query response invalid"))?;
+            if !valid_query_response(&result, request.run_id) {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner query response invalid"));
+            }
+            Ok(result)
+        }
+        StatusCode::NOT_FOUND => Err(s3_error!(NoSuchKey, "plugin run not found")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+    }
+}
+
+fn valid_query_response(response: &QueryResponse, run_id: uuid::Uuid) -> bool {
+    response.version == 1
+        && response.run_id == run_id
+        && response.epoch >= 0
+        && matches!(
+            response.state.as_str(),
+            "QUEUED" | "LEASED" | "RUNNING" | "RETRY_WAIT" | "SUCCEEDED" | "FAILED" | "CANCELLED"
+        )
+}
+
+async fn configured_client() -> S3Result<Client> {
     let tls = runtime_sources::current_outbound_tls_state().await;
     let identity = tls
         .mtls_identity
@@ -73,33 +171,9 @@ pub(crate) async fn submit(request: &SubmitRequest<'_>) -> S3Result<Receipt> {
             builder = builder.add_root_certificate(root);
         }
     }
-    let client = builder
+    builder
         .build()
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner transport unavailable"))?;
-    let response = client
-        .post(url)
-        .json(request)
-        .send()
-        .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
-
-    match response.status() {
-        StatusCode::OK => {
-            let body = bounded_body(response).await?;
-            let receipt: Receipt =
-                serde_json::from_slice(&body).map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt invalid"))?;
-            if receipt.version != 1 || receipt.run_id.is_nil() || !literal(&receipt.pool) || receipt.deadline_unix_micros <= 0 {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner receipt invalid"));
-            }
-            Ok(receipt)
-        }
-        StatusCode::CONFLICT => Err(s3_error!(InvalidRequest, "idempotency key conflicts with existing job")),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
-        }
-        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
-    }
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner transport unavailable"))
 }
 
 fn configured_url() -> S3Result<Url> {
@@ -123,19 +197,23 @@ fn parse_endpoint(raw: &str) -> Option<Url> {
     Some(url)
 }
 
-async fn bounded_body(mut response: reqwest::Response) -> S3Result<Vec<u8>> {
+async fn bounded_body(mut response: reqwest::Response, limit: usize) -> S3Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt unavailable"))?
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner response unavailable"))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_RECEIPT_BYTES {
-            return Err(s3_error!(ServiceUnavailable, "plugin runner receipt too large"));
+        if !bounded_len_allowed(body.len(), chunk.len(), limit) {
+            return Err(s3_error!(ServiceUnavailable, "plugin runner response too large"));
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn bounded_len_allowed(current: usize, additional: usize, limit: usize) -> bool {
+    current.checked_add(additional).is_some_and(|length| length <= limit)
 }
 
 pub(crate) fn validate_delegation_scope(
@@ -189,6 +267,9 @@ mod tests {
         }
         let valid = parse_endpoint("https://runner.example/v1/ingress/manual/jobs").unwrap();
         assert_eq!(valid.path(), ENDPOINT_PATH);
+        let mut query = valid;
+        query.set_path(QUERY_ENDPOINT_PATH);
+        assert_eq!(query.path(), QUERY_ENDPOINT_PATH);
     }
 
     #[test]
@@ -202,6 +283,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.version, 1);
+    }
+
+    #[test]
+    fn query_response_is_strict_and_bound_to_requested_run() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let valid: QueryResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","state":"SUCCEEDED","epoch":2,"result_manifest":{{"schema":"rustfs.result/v1"}}}}"#
+        ))
+        .expect("valid status response");
+        assert!(valid_query_response(&valid, run_id));
+        assert!(!valid_query_response(&valid, uuid::Uuid::from_u128(2)));
+        assert!(
+            serde_json::from_str::<QueryResponse>(&format!(
+                r#"{{"version":1,"run_id":"{run_id}","state":"SUCCEEDED","epoch":2}}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<QueryResponse>(&format!(
+                r#"{{"version":1,"run_id":"{run_id}","state":"SUCCEEDED","epoch":2,"result_manifest":null,"tenant":"other"}}"#
+            ))
+            .is_err()
+        );
+        let invalid: QueryResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","state":"UNKNOWN","epoch":-1,"result_manifest":null}}"#
+        ))
+        .expect("semantics are checked after decoding");
+        assert!(!valid_query_response(&invalid, run_id));
+    }
+
+    #[test]
+    fn query_body_limit_matches_runner_envelope_and_rejects_oversize() {
+        assert_eq!(MAX_QUERY_RESPONSE_BYTES, 1_052_672);
+        assert!(bounded_len_allowed(MAX_QUERY_RESPONSE_BYTES - 1, 1, MAX_QUERY_RESPONSE_BYTES));
+        assert!(!bounded_len_allowed(MAX_QUERY_RESPONSE_BYTES, 1, MAX_QUERY_RESPONSE_BYTES));
+        assert!(!bounded_len_allowed(usize::MAX, 1, MAX_QUERY_RESPONSE_BYTES));
     }
 
     #[test]
