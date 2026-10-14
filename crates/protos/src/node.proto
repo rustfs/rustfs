@@ -555,6 +555,14 @@ message DeleteVersionsRequest {
   bytes opts_bin = 6;
 }
 
+// Additive, fail-closed conditional batch protocol. Probe requests never mutate disk state.
+message GuardedDeleteVersionsRequest {
+  string disk = 1;
+  string volume = 2;
+  bytes payload = 3;
+  bool probe_only = 4;
+}
+
 message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
@@ -1268,6 +1276,7 @@ service NodeService {
   rpc DeleteVersionAtIncarnation(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteRetiredMarker(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
+  rpc GuardedDeleteVersions(GuardedDeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}; // auth-policy: body-bound
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {}; // auth-policy: read-only

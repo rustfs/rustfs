@@ -347,6 +347,25 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn delete_versions_guarded_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<DiskError>> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_guarded_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions_guarded_recoverable(volume, versions, opts).await
+            }
+        }
+    }
+
     pub(crate) async fn cached_disk_id(&self) -> Option<Uuid> {
         match self {
             Disk::Local(local_disk) => local_disk.get_current_disk_id().await,
@@ -357,6 +376,21 @@ impl Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.supports_guarded_delete_versions().await,
+            Self::Remote(disk) => disk.supports_guarded_delete_versions().await,
+        }
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_recoverable_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
     async fn delete_version_recoverable(
         &self,
         volume: &str,
@@ -1419,6 +1453,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<DeleteRecoveryPage> {
         Err(DiskError::MethodNotAllowed)
     }
+    /// A read-only capability check; unsupported implementations must fail closed.
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        Err(DiskError::GuardedDeleteUnsupported)
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        _volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        vec![Some(DiskError::GuardedDeleteUnsupported); versions.len()]
+    }
     async fn delete_version_recoverable(
         &self,
         _volume: &str,
@@ -1647,6 +1693,73 @@ pub struct FileInfoVersions {
 
     pub versions: Vec<FileInfo>,
     pub free_versions: Vec<FileInfo>,
+}
+
+/// The current object generation observed before a guarded batch delete.
+/// This transient value is never persisted in object metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CurrentDeleteGeneration {
+    Absent,
+    Present {
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        mod_time: OffsetDateTime,
+        delete_marker: bool,
+        etag: String,
+    },
+}
+
+impl CurrentDeleteGeneration {
+    pub fn from_file_info(fi: &FileInfo) -> Result<Self> {
+        let mod_time = fi.mod_time.ok_or(DiskError::FileCorrupt)?;
+        let etag = fi.get_etag().unwrap_or_default();
+        if !fi.deleted && (etag.is_empty() || fi.data_dir.is_none_or(|id| id.is_nil())) {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(Self::Present {
+            version_id: fi.version_id.filter(|id| !id.is_nil()),
+            data_dir: fi.data_dir.filter(|id| !id.is_nil()),
+            mod_time,
+            delete_marker: fi.deleted,
+            etag,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedFileInfoVersions {
+    pub group: FileInfoVersions,
+    pub expected_current: CurrentDeleteGeneration,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedDeleteVersionsPayload {
+    pub versions: Vec<GuardedFileInfoVersions>,
+    pub opts: DeleteOptions,
+}
+
+impl GuardedDeleteVersionsPayload {
+    pub fn validate(&self) -> Result<()> {
+        validate_delete_recovery_options(&self.opts)?;
+        if self.versions.is_empty()
+            || self.versions.len() > 1000
+            || self
+                .versions
+                .iter()
+                .try_fold(0_usize, |count, version| count.checked_add(version.group.versions.len()))
+                .is_none_or(|count| count > 1000)
+            || self
+                .versions
+                .iter()
+                .any(|version| version.group.name.starts_with('/') || version.group.versions.is_empty())
+        {
+            return Err(DiskError::InvalidPath);
+        }
+        Ok(())
+    }
 }
 
 impl FileInfoVersions {
@@ -2177,6 +2290,62 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_delete_generation_requires_reliable_current_identity() {
+        let mut fi = FileInfo::default();
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        fi.data_dir = Some(Uuid::new_v4());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        fi.version_id = Some(Uuid::nil());
+        assert!(matches!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Ok(CurrentDeleteGeneration::Present { version_id: None, .. })
+        ));
+        fi.data_dir = Some(Uuid::nil());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn guarded_delete_payload_rejects_malformed_or_unbounded_batches() {
+        let group = GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: "object".into(),
+                versions: vec![FileInfo::default()],
+                ..Default::default()
+            },
+            expected_current: CurrentDeleteGeneration::Absent,
+        };
+        let mut payload = GuardedDeleteVersionsPayload {
+            versions: vec![group],
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        payload.validate().expect("valid guarded batch");
+        let encoded = rmp_serde::to_vec_named(&payload).expect("serialize guarded batch");
+        let decoded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded batch");
+        decoded.validate().expect("round-trip guarded batch remains valid");
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<GuardedDeleteVersionsPayload>(&trailing).is_err());
+        let mut unknown = serde_json::to_value(&payload).expect("serialize guarded batch to map");
+        unknown
+            .as_object_mut()
+            .expect("payload is a map")
+            .insert("unrecognized".into(), true.into());
+        assert!(serde_json::from_value::<GuardedDeleteVersionsPayload>(unknown).is_err());
+        payload.versions[0].group.versions.resize_with(1001, FileInfo::default);
+        assert_eq!(payload.validate(), Err(DiskError::InvalidPath));
+        payload.versions[0].group.versions.truncate(1);
+        payload.opts.undo_delete = true;
+        assert_eq!(payload.validate(), Err(DiskError::FileCorrupt));
+    }
+
     use endpoint::Endpoint;
     use local::LocalDisk;
     use tokio::fs;

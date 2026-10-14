@@ -639,6 +639,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn guarded_delete_versions(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionsResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn delete_versions(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionsRequest>,

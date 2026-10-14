@@ -15,8 +15,8 @@
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    FileInfoVersions, GuardedDeleteVersionsPayload, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _,
+    UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
@@ -688,6 +688,58 @@ impl NodeService {
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
+    }
+
+    pub(super) async fn handle_guarded_delete_versions(
+        &self,
+        request: Request<GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        if request.get_ref().payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(Status::resource_exhausted("guarded delete payload exceeds limit"));
+        }
+        let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid guarded delete body length"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("guarded delete requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        let disk = self
+            .find_disk(&request.disk)
+            .await
+            .ok_or_else(|| Status::not_found("cannot find disk"))?;
+        if request.probe_only {
+            if !request.payload.is_empty() || !request.volume.is_empty() {
+                return Err(Status::invalid_argument("guarded capability probe must have no mutation payload"));
+            }
+            if let Err(error) = disk.supports_guarded_delete_versions().await {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(error.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
+            return Ok(Response::new(DeleteVersionsResponse {
+                success: true,
+                errors: Vec::new(),
+                error: None,
+                item_errors: Vec::new(),
+            }));
+        }
+        let payload: GuardedDeleteVersionsPayload = rustfs_protos::decode_delete_recovery_payload(&request.payload)
+            .map_err(|_| Status::invalid_argument("invalid guarded delete payload"))?;
+        payload
+            .validate()
+            .map_err(|_| Status::invalid_argument("invalid guarded delete options or batch"))?;
+        let (errors, item_errors) = encode_delete_versions_errors(
+            disk.delete_versions_guarded_recoverable(&request.volume, payload.versions, payload.opts)
+                .await,
+        );
+        Ok(Response::new(DeleteVersionsResponse {
+            success: true,
+            errors,
+            error: None,
+            item_errors,
+        }))
     }
 
     pub(super) async fn handle_delete_versions(

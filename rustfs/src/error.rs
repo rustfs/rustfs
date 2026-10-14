@@ -761,6 +761,8 @@ impl From<StorageError> for ApiError {
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::EntityTooLarge(_, _) => S3ErrorCode::EntityTooLarge,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            StorageError::ConditionalDeleteConflict => S3ErrorCode::OperationAborted,
+            StorageError::GuardedDeleteUnsupported => S3ErrorCode::NotImplemented,
             StorageError::NotModified => S3ErrorCode::NotModified,
             StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
             _ => S3ErrorCode::InternalError,
@@ -1700,6 +1702,23 @@ mod tests {
             let err = normalize_put_read_quorum_error(err);
             assert_eq!(err.code(), &S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(err.message(), Some("original message"));
+        }
+    }
+
+    #[test]
+    fn conditional_delete_storage_errors_preserve_api_contract() {
+        for (source, expected) in [
+            (StorageError::ConditionalDeleteConflict, S3ErrorCode::OperationAborted),
+            (StorageError::GuardedDeleteUnsupported, S3ErrorCode::NotImplemented),
+        ] {
+            let error = ApiError::from(source.clone());
+            assert_eq!(error.code, expected);
+            assert!(
+                error
+                    .source
+                    .as_ref()
+                    .is_some_and(|value| value.downcast_ref::<StorageError>() == Some(&source))
+            );
         }
     }
 

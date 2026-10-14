@@ -272,12 +272,13 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
-            DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType,
-            PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-            SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
-            StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_global_transition_state, get_local_server_property, reload_bucket_metadata,
-            reload_transition_tier_config, remove_bucket_metadata_if_absent, validate_batch_read_version_item_count,
+            DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, GuardedDeleteVersionsPayload, KMS_SIGNAL_SUBSYSTEM,
+            LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
+            ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts,
+            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_global_transition_state,
+            get_local_server_property, reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata_if_absent,
+            validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -484,12 +485,13 @@ pub(crate) mod ecstore_disk {
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction,
-        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
+        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -710,6 +712,8 @@ pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
+pub(crate) type GuardedFileInfoVersions = ecstore_disk::GuardedFileInfoVersions;
+pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersionsPayload;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
@@ -1382,6 +1386,13 @@ pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
 }
 
 pub(crate) trait StorageDiskRpcExt {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()>;
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
@@ -1515,6 +1526,17 @@ impl<T> StorageDiskRpcExt for T
 where
     T: ecstore_disk::DiskAPI,
 {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::supports_guarded_delete_versions(self).await
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        ecstore_disk::DiskAPI::delete_versions_guarded_recoverable(self, volume, versions, opts).await
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo> {
         ecstore_disk::DiskAPI::disk_info(self, opts).await
     }

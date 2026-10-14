@@ -19,8 +19,8 @@ use crate::disk::io_admission::{
 };
 use crate::disk::{
     CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint,
-    Error, FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
-    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    Error, FileInfoVersions, GuardedFileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, Result, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     health_state::{
         RuntimeDriveHealthState, classify_drive_recovery, get_drive_returning_probe_interval,
         get_drive_returning_success_threshold, get_drive_suspect_failure_threshold, record_drive_offline_duration,
@@ -2078,6 +2078,58 @@ impl LocalDiskWrapper {
         result
     }
 
+    pub(crate) async fn delete_versions_guarded_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let version_count = versions.len();
+        self.metrics.record_operation_call("delete_versions");
+        // Check if disk is faulty before proceeding
+        if self.health.is_faulty() {
+            self.metrics.record_availability_error();
+            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        }
+
+        // Check if disk is stale
+        if let Err(e) = self.check_disk_stale().await {
+            self.metrics.record_availability_error();
+            return vec![Some(e); versions.len()];
+        }
+
+        let _io_permit = match self.acquire_disk_io_permit().await {
+            Ok(permit) => permit,
+            Err(error) => return vec![Some(error); version_count],
+        };
+
+        // Record operation start
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
+        let waiting_guard = self.health.waiting_guard();
+        let metric_waiting_guard = self.metrics.waiting_guard();
+        let started = Instant::now();
+
+        // Execute the operation
+        let result = self
+            .disk
+            .delete_versions_guarded_with_namespace_owner(volume, versions, opts, namespace_owner)
+            .await;
+        self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
+
+        drop(waiting_guard);
+        drop(metric_waiting_guard);
+        let has_err = result.iter().any(|e| e.is_some());
+        if !has_err {
+            // Log success and decrement waiting counter
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
+            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
+        }
+
+        result
+    }
+
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
     }
@@ -2321,6 +2373,23 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.supports_guarded_delete_versions().await
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
+
     async fn delete_version_recoverable(
         &self,
         volume: &str,

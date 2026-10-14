@@ -52,12 +52,12 @@ use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_r
 use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
-    DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
-    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
-    RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    acquire_context_disk_io_permit, conv_part_err_to_int,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DataDirDeleteStatus,
+    DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
+    GuardedFileInfoVersions, MmapCopyStageMetrics, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META,
+    PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, acquire_context_disk_io_permit, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -6596,6 +6596,37 @@ impl LocalDisk {
         errs
     }
 
+    pub(crate) async fn delete_versions_guarded_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<DiskError>> {
+        let payload = super::GuardedDeleteVersionsPayload { versions, opts };
+        if let Err(error) = payload.validate() {
+            return vec![Some(error); payload.versions.len()];
+        }
+        let super::GuardedDeleteVersionsPayload { versions, mut opts } = payload;
+        opts.recoverable_delete = true;
+        let mut errors = Vec::with_capacity(versions.len());
+        for version in &versions {
+            errors.push(
+                self.delete_versions_guarded_internal(
+                    volume,
+                    &version.group.name,
+                    &version.group.versions,
+                    &opts,
+                    namespace_owner.clone(),
+                    Some(&version.expected_current),
+                )
+                .await
+                .err(),
+            );
+        }
+        errors
+    }
+
     async fn delete_version_inner(&self, volume: &str, path: &str, fi: FileInfo, mutation: DeleteVersionMutation) -> Result<()> {
         let DeleteVersionMutation {
             force_del_marker,
@@ -7879,6 +7910,19 @@ impl LocalDisk {
         opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        self.delete_versions_guarded_internal(volume, path, fis, opts, namespace_owner, None)
+            .await
+    }
+
+    async fn delete_versions_guarded_internal(
+        &self,
+        volume: &str,
+        path: &str,
+        fis: &[FileInfo],
+        opts: &DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        expected_current: Option<&CurrentDeleteGeneration>,
+    ) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let object_path = self.get_object_path(volume, path)?;
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
@@ -7929,6 +7973,9 @@ impl LocalDisk {
         {
             Ok(data) => data,
             Err(DiskError::FileNotFound) => {
+                if expected_current.is_some_and(|expected| *expected != CurrentDeleteGeneration::Absent) {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
                 self.finish_internal_delete_residue(volume, path, namespace_owner.clone())
                     .await;
                 // `deleted` alone can be an explicit marker purge; only
@@ -7950,6 +7997,19 @@ impl LocalDisk {
         let mut fm = FileMeta::default();
 
         fm.unmarshal_msg(&data)?;
+        if let Some(expected) = expected_current {
+            let actual = match fm.into_fileinfo(volume, path, "", false, false, false) {
+                Ok(fi) => CurrentDeleteGeneration::from_file_info(&fi)?,
+                Err(rustfs_filemeta::Error::FileNotFound) => CurrentDeleteGeneration::Absent,
+                Err(error) => return Err(error.into()),
+            };
+            // Metadata mutation ownership is held from this comparison through
+            // recovery preparation and publication, so a stale request cannot
+            // stage a replacement generation for deletion.
+            if &actual != expected {
+                return Err(DiskError::ConditionalDeleteConflict);
+            }
+        }
         let rollback_dir = opts.old_data_dir;
         let mut reserved_version_delete = false;
         let mut recovery_target = None;
@@ -10306,6 +10366,18 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
     async fn delete_version_recoverable(
         &self,
         volume: &str,
@@ -12489,6 +12561,166 @@ mod test {
             "the regression guard must exercise the old fixed 128 KiB read-ahead boundary"
         );
         assert!(!should_read_legacy_inline_part(&ec12, &config));
+    }
+
+    fn guarded_delete_group(fi: FileInfo, expected_current: CurrentDeleteGeneration) -> GuardedFileInfoVersions {
+        GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: fi.name.clone(),
+                versions: vec![fi],
+                ..Default::default()
+            },
+            expected_current,
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_queued_before_replacement_rejects_stale_generation() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut original = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"original")));
+        original.metadata.insert("etag".into(), "etag-a".into());
+        let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original generation");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(original.clone()))
+            .await
+            .expect("write original metadata");
+        let transaction = Uuid::new_v4();
+        let owner =
+            os::acquire_metadata_mutation_lease(&disk.get_object_path("bucket", object).expect("object path"), None).await;
+        let mut deletion = Box::pin(disk.delete_versions_guarded_recoverable(
+            "bucket",
+            vec![guarded_delete_group(original.clone(), expected)],
+            DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), deletion.as_mut())
+                .await
+                .is_err(),
+            "guarded delete waits for metadata ownership"
+        );
+        let mut replacement = original;
+        replacement.data_dir = Some(Uuid::new_v4());
+        replacement.mod_time = replacement.mod_time.map(|time| time + time::Duration::seconds(1));
+        replacement.metadata.insert("etag".into(), "etag-b".into());
+        let newer = test_meta(replacement);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("writer commits replacement while owning metadata");
+        drop(owner);
+        assert_eq!(deletion.await, vec![Some(DiskError::ConditionalDeleteConflict)]);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("replacement metadata remains"),
+            newer
+        );
+        assert!(
+            !object_dir.join(transaction.to_string()).exists(),
+            "rejected generation creates no recovery record"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_absence_guard_preserves_new_object() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut current = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"current")));
+        current.metadata.insert("etag".into(), "etag-current".into());
+        let newer = test_meta(current.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("write current metadata");
+        let transaction = Uuid::new_v4();
+        let errors = disk
+            .delete_versions_guarded_recoverable(
+                "bucket",
+                vec![guarded_delete_group(current, CurrentDeleteGeneration::Absent)],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors, vec![Some(DiskError::ConditionalDeleteConflict)]);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("current metadata remains"),
+            newer
+        );
+        assert!(!object_dir.join(transaction.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_recovery_rollback_preserves_replacement() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut original = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"original")));
+        original.metadata.insert("etag".into(), "etag-a".into());
+        let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original generation");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(original.clone()))
+            .await
+            .expect("write original metadata");
+        let transaction = Uuid::new_v4();
+        assert_eq!(
+            disk.delete_versions_guarded_recoverable(
+                "bucket",
+                vec![guarded_delete_group(original.clone(), expected)],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await,
+            vec![None]
+        );
+        let applied = disk
+            .inspect_delete_transaction("bucket", object, transaction)
+            .await
+            .expect("inspect prepared delete");
+        let mut replacement = original;
+        replacement.data_dir = Some(Uuid::new_v4());
+        replacement.mod_time = replacement.mod_time.map(|time| time + time::Duration::seconds(1));
+        replacement.metadata.insert("etag".into(), "etag-b".into());
+        let newer = test_meta(replacement);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("commit replacement after delete preparation");
+        let error = disk
+            .settle_delete_transaction(
+                "bucket",
+                object,
+                transaction,
+                applied.fingerprint,
+                super::super::DeleteRecoveryAction::Rollback,
+            )
+            .await
+            .expect_err("stale rollback cannot overwrite replacement");
+        assert_eq!(error, DiskError::OutdatedXLMeta);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("replacement remains after rejected rollback"),
+            newer
+        );
     }
 
     pub(super) fn test_meta(fi: FileInfo) -> Vec<u8> {

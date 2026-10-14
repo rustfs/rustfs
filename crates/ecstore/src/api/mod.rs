@@ -423,12 +423,13 @@ pub mod disk {
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction,
-        DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation,
-        DeleteRecoveryRpcReply, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions,
-        FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize, PartTransactionAction,
-        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
-        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk, validate_batch_read_version_item_count,
+        CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions,
+        DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection, DeleteRecoveryPage,
+        DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+        DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload, GuardedFileInfoVersions,
+        HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
+        ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions, new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

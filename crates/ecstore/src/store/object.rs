@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::rebalance::support::{LatestObjectInfoCandidate, resolve_latest_object_info_candidates_with_pool_state};
 use super::*;
 use crate::bucket::lifecycle::{
     bucket_lifecycle_ops::{enqueue_committed_free_versions, eval_action_from_lifecycle},
@@ -39,7 +40,7 @@ use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObj
 use crate::bucket::versioning::VersioningApi;
 use crate::core::pools::{DecommissionCapacityAdmission, DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
 use crate::diagnostics::object_lock::ObjectLockAttempt;
-use crate::disk::OldCurrentSize;
+use crate::disk::{CurrentDeleteGeneration, OldCurrentSize};
 use crate::object_api::{
     NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
     TierFreeVersionReceiptSink,
@@ -65,6 +66,7 @@ use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
 };
+use std::collections::HashSet;
 use std::{
     fmt,
     pin::Pin,
@@ -2484,6 +2486,97 @@ fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
     object_names
 }
 
+#[cfg(test)]
+static CONDITIONAL_DELETE_POST_ADMISSION_REBALANCE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+async fn inject_conditional_delete_post_admission_rebalance(store: &ECStore, bucket: &str) {
+    let pool_idx = CONDITIONAL_DELETE_POST_ADMISSION_REBALANCE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("conditional rebalance injection must not poison")
+        .remove(bucket);
+    if let Some(pool_idx) = pool_idx {
+        let mut pool_stats = vec![crate::services::rebalance::RebalanceStats::default(); store.pools.len()];
+        pool_stats[pool_idx].participating = true;
+        pool_stats[pool_idx].info.status = crate::services::rebalance::RebalStatus::Started;
+        *store.rebalance_meta.write().await = Some(crate::services::rebalance::RebalanceMeta {
+            pool_stats,
+            ..Default::default()
+        });
+    }
+}
+
+const CONDITIONAL_DELETE_SNAPSHOT_CONCURRENCY: usize = 16;
+
+struct ConditionalDeleteSnapshot {
+    current: ObjectInfo,
+    current_pool_idx: usize,
+    pool_generations: HashMap<usize, CurrentDeleteGeneration>,
+}
+
+fn resolve_conditional_delete_snapshot(
+    bucket: &str,
+    object: &str,
+    results: Vec<(usize, Result<(ObjectInfo, CurrentDeleteGeneration)>)>,
+    suspended_pools: &[bool],
+    opts: &ObjectOptions,
+) -> Result<ConditionalDeleteSnapshot> {
+    let mut candidates = Vec::with_capacity(results.len());
+    let mut pool_generations = HashMap::with_capacity(results.len());
+    for (idx, result) in results {
+        match result {
+            Ok((info, generation)) => {
+                pool_generations.insert(idx, generation);
+                candidates.push(LatestObjectInfoCandidate {
+                    info: Some(info),
+                    idx,
+                    err: None,
+                });
+            }
+            Err(error) if is_err_object_not_found(&error) || is_err_version_not_found(&error) => {
+                pool_generations.insert(idx, CurrentDeleteGeneration::Absent);
+                candidates.push(LatestObjectInfoCandidate {
+                    info: None,
+                    idx,
+                    err: Some(error),
+                });
+            }
+            // A readable old copy cannot establish the condition while a
+            // different pool might hold a newer, unreadable generation.
+            Err(error) => return Err(error),
+        }
+    }
+    let (current, current_pool_idx) =
+        resolve_latest_object_info_candidates_with_pool_state(candidates, suspended_pools, bucket, object, opts)?;
+    if current.delete_marker {
+        return Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()));
+    }
+    Ok(ConditionalDeleteSnapshot {
+        current,
+        current_pool_idx,
+        pool_generations,
+    })
+}
+
+fn check_batch_delete_condition(object: &ObjectToDelete, snapshot: &ConditionalDeleteSnapshot, bucket: &str) -> Result<()> {
+    let Some(condition) = object.delete_condition.as_ref() else {
+        return Ok(());
+    };
+    if object.version_id.is_some() || condition.validate().is_err() {
+        return Err(StorageError::InvalidArgument(
+            bucket.to_owned(),
+            object.object_name.clone(),
+            "invalid current-object delete condition".to_owned(),
+        ));
+    }
+    if !condition.matches(snapshot.current.etag.as_deref().unwrap_or_default()) {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(())
+}
+
 /// A CopyObject branch that writes a fresh local data stream owns new bytes and
 /// must not inherit the source version's remote-tier ownership record.  FileMeta
 /// exposes internal transition fields through `ObjectInfo::user_defined` for
@@ -2794,6 +2887,40 @@ impl RemoteTuplePublicationFence {
 }
 
 impl ECStore {
+    async fn conditional_delete_snapshot(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ConditionalDeleteSnapshot> {
+        let mut lookup_opts = opts.clone();
+        lookup_opts.no_lock = true;
+        lookup_opts.metadata_cache_safe = false;
+        lookup_opts.suppress_read_repair = true;
+        lookup_opts.http_preconditions = None;
+        lookup_opts.version_id = None;
+        lookup_opts.conditional_delete_generations = None;
+        let results = join_all(self.pools.iter().map(|pool| {
+            let lookup_opts = &lookup_opts;
+            async move {
+                (
+                    pool.pool_idx,
+                    pool.get_disks_by_key(object)
+                        .conditional_delete_current_snapshot(bucket, object, lookup_opts)
+                        .await,
+                )
+            }
+        }))
+        .await;
+        let suspended_pools = {
+            let pool_meta = self.pool_meta.read().await;
+            (0..self.pools.len())
+                .map(|idx| pool_meta.is_suspended(idx))
+                .collect::<Vec<_>>()
+        };
+        resolve_conditional_delete_snapshot(bucket, object, results, &suspended_pools, &lookup_opts)
+    }
+
     /// Acquire the pre-copy half of a data-movement publication fence. Legacy
     /// remote objects without a destination identity pin the named tier; an
     /// ordinary local source takes the zero-tier-manager-work `None` lease
@@ -5445,7 +5572,7 @@ impl ECStore {
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
-        let objects: Vec<ObjectToDelete> = objects
+        let mut objects: Vec<ObjectToDelete> = objects
             .iter()
             .map(|v| {
                 let mut v = v.clone();
@@ -5464,6 +5591,7 @@ impl ECStore {
         }
 
         let mut opts = opts;
+        opts.conditional_delete_generations = None;
         opts.tier_delete_journal_api = tier_journal_api;
         let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
             None
@@ -5551,23 +5679,144 @@ impl ECStore {
             notify_delete_namespace_acquired(bucket);
         }
 
+        let has_conditions = objects.iter().any(|object| object.delete_condition.is_some());
+        let mut pool_generations: HashMap<usize, HashMap<String, CurrentDeleteGeneration>> = HashMap::new();
+        let mut conditional_marker_targets = HashMap::new();
+        let mut representatives: Vec<usize> = (0..objects.len()).collect();
+        let mut admitted_conditions = vec![false; objects.len()];
+        if has_conditions {
+            let mut rebalancing = false;
+            for pool in &self.pools {
+                rebalancing |= self.is_pool_rebalancing(pool.pool_idx).await;
+            }
+            let mut conditional_names = Vec::with_capacity(objects.len());
+            for (idx, object) in objects.iter().enumerate() {
+                if let Some(condition) = object.delete_condition.as_ref() {
+                    if self.ctx.lock_manager().is_disabled() || object.version_id.is_some() || condition.validate().is_err() {
+                        del_errs[idx] = Some(StorageError::InvalidArgument(
+                            bucket.to_owned(),
+                            object.object_name.clone(),
+                            "conditional batch delete requires a valid current-object condition and namespace locking".to_owned(),
+                        ));
+                    } else if rebalancing {
+                        del_errs[idx] = Some(StorageError::SlowDown);
+                    } else {
+                        conditional_names.push(object.object_name.clone());
+                    }
+                }
+            }
+            conditional_names.sort_unstable();
+            conditional_names.dedup();
+            let snapshots = futures::stream::iter(conditional_names.into_iter().map(|object| {
+                let opts = &opts;
+                async move {
+                    let snapshot = self.conditional_delete_snapshot(bucket, &object, opts).await;
+                    (object, snapshot)
+                }
+            }))
+            .buffer_unordered(CONDITIONAL_DELETE_SNAPSHOT_CONCURRENCY)
+            .collect::<HashMap<_, _>>()
+            .await;
+
+            for (idx, object) in objects.iter_mut().enumerate() {
+                if object.delete_condition.is_none() || del_errs[idx].is_some() {
+                    continue;
+                }
+                let snapshot = snapshots
+                    .get(&object.object_name)
+                    .expect("each valid conditional key was included in the bounded snapshot pass");
+                let result = match snapshot {
+                    Ok(snapshot) => check_batch_delete_condition(object, snapshot, bucket),
+                    Err(error) => Err(error.clone()),
+                };
+                if let Err(error) = result {
+                    del_errs[idx] = Some(error);
+                    continue;
+                }
+                let snapshot = snapshot.as_ref().expect("condition admission requires a resolved snapshot");
+                conditional_marker_targets.insert(object.object_name.clone(), snapshot.current_pool_idx);
+                for (pool_idx, generation) in &snapshot.pool_generations {
+                    pool_generations
+                        .entry(*pool_idx)
+                        .or_default()
+                        .insert(object.object_name.clone(), generation.clone());
+                }
+                // The condition has been consumed once, against the global
+                // current object; disks receive only their local generation.
+                admitted_conditions[idx] = true;
+                object.delete_condition = None;
+            }
+
+            // All relevant peers are checked before marker selection, capacity
+            // admission, or any destructive work, even in a mixed batch.
+            let mut preflight_error = None;
+            for (pool_idx, generations) in &pool_generations {
+                let pool = &self.pools[*pool_idx];
+                let mut checked_sets = HashSet::new();
+                for object in generations.keys() {
+                    let set = pool.get_disks_by_key(object);
+                    if checked_sets.insert(set.set_index) {
+                        if let Err(error) = set.preflight_guarded_delete_versions().await {
+                            preflight_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if preflight_error.is_some() {
+                    break;
+                }
+            }
+            if let Some(error) = preflight_error {
+                for (idx, admitted) in admitted_conditions.iter().enumerate() {
+                    if *admitted {
+                        del_errs[idx] = Some(error.clone());
+                    }
+                }
+                pool_generations.clear();
+                conditional_marker_targets.clear();
+            }
+            // Duplicate current-object deletes share one marker/data mutation,
+            // while differently addressed historical versions remain distinct.
+            let mut actions = HashMap::with_capacity(objects.len());
+            for (idx, object) in objects.iter().enumerate() {
+                if del_errs[idx].is_none() {
+                    let key = (object.object_name.as_str(), object.version_id);
+                    representatives[idx] = *actions.entry(key).or_insert(idx);
+                }
+            }
+        }
+
+        #[cfg(test)]
+        inject_conditional_delete_post_admission_rebalance(self, bucket).await;
+
         let delete_config_snapshot = opts
             .delete_replication_config_snapshot
             .as_deref()
             .expect("batch delete replication config snapshot should be loaded");
         let latest_marker_objects = objects
             .iter()
-            .map(|object| batch_delete_creates_latest_marker(object, delete_config_snapshot))
+            .enumerate()
+            .map(|(idx, object)| {
+                del_errs[idx].is_none()
+                    && representatives[idx] == idx
+                    && batch_delete_creates_latest_marker(object, delete_config_snapshot)
+            })
             .collect::<Vec<_>>();
-        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(
-            |(object, creates_marker)| async move {
+        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(|(object, creates_marker)| {
+            let admitted_target = conditional_marker_targets.get(&object.object_name).copied();
+            async move {
                 if *creates_marker {
-                    Some(self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await)
+                    // Routing is part of condition admission. A rebalance
+                    // start cannot replace the validated current owner.
+                    Some(match admitted_target {
+                        Some(pool_idx) => Ok(pool_idx),
+                        None => self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await,
+                    })
                 } else {
                     None
                 }
-            },
-        ))
+            }
+        }))
         .await;
         let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
         for (idx, target_result) in marker_target_results.into_iter().enumerate() {
@@ -5601,15 +5850,23 @@ impl ECStore {
 
         let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
-            if self.is_pool_rebalancing(pool.pool_idx).await {
+            let rebalancing = self.is_pool_rebalancing(pool.pool_idx).await;
+            let guarded_generations = pool_generations.get(&pool.pool_idx);
+            if rebalancing && guarded_generations.is_none() {
                 continue;
             }
 
             let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
                 .iter()
                 .enumerate()
-                .filter(|(idx, _)| {
-                    batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
+                .filter(|(idx, object)| {
+                    del_errs[*idx].is_none()
+                        && representatives[*idx] == *idx
+                        // A newly rebalancing pool still owes every admitted
+                        // conditional key its guarded mutation. Ordinary keys
+                        // retain the existing rebalance skip behavior.
+                        && (!rebalancing || guarded_generations.is_some_and(|generations| generations.contains_key(&object.object_name)))
+                        && batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
                 })
                 .map(|(idx, object)| (idx, object.clone()))
                 .unzip();
@@ -5617,7 +5874,8 @@ impl ECStore {
                 continue;
             }
 
-            let pool_opts = opts.clone();
+            let mut pool_opts = opts.clone();
+            pool_opts.conditional_delete_generations = pool_generations.remove(&pool.pool_idx).map(Arc::new);
             futures.push(async move {
                 #[cfg(test)]
                 let pool_object_names = pool_objects
@@ -5662,6 +5920,16 @@ impl ECStore {
         for (object_indices, (_, _, pool_accounting)) in &results {
             for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
                 accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
+            }
+        }
+
+        if has_conditions {
+            for (idx, representative) in representatives.into_iter().enumerate() {
+                if representative != idx {
+                    del_objects[idx] = del_objects[representative].clone();
+                    del_errs[idx] = del_errs[representative].clone();
+                    accounting[idx] = None;
+                }
             }
         }
 
@@ -8784,6 +9052,98 @@ mod tests {
         assert_eq!(sorted_unique_delete_object_names(&objects), vec!["alpha", "beta"]);
     }
 
+    fn conditional_pool_fixture(etag: &str, timestamp: i64) -> (ObjectInfo, CurrentDeleteGeneration) {
+        let mod_time = OffsetDateTime::from_unix_timestamp(timestamp).expect("fixture timestamp");
+        let data_dir = Some(Uuid::from_u128(u128::try_from(timestamp).expect("positive fixture timestamp")));
+        let info = ObjectInfo {
+            etag: Some(etag.to_owned()),
+            mod_time: Some(mod_time),
+            data_dir,
+            ..Default::default()
+        };
+        let generation = CurrentDeleteGeneration::Present {
+            version_id: None,
+            data_dir,
+            mod_time,
+            delete_marker: false,
+            etag: etag.to_owned(),
+        };
+        (info, generation)
+    }
+
+    #[test]
+    fn conditional_delete_snapshot_rejects_unknown_pool_even_with_readable_old_copy() {
+        let error = resolve_conditional_delete_snapshot(
+            "bucket",
+            "key",
+            vec![
+                (0, Ok(conditional_pool_fixture("old", 1))),
+                (1, Err(StorageError::ErasureReadQuorum)),
+            ],
+            &[false, false],
+            &ObjectOptions::default(),
+        )
+        .err()
+        .expect("unknown pool must veto admission");
+        assert_eq!(error, StorageError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn conditional_delete_snapshot_keeps_each_pool_generation_and_explicit_absence() {
+        let old = conditional_pool_fixture("old", 1);
+        let new = conditional_pool_fixture("new", 2);
+        let old_generation = old.1.clone();
+        let new_generation = new.1.clone();
+        let snapshot = resolve_conditional_delete_snapshot(
+            "bucket",
+            "key",
+            vec![
+                (0, Ok(old)),
+                (1, Ok(new)),
+                (2, Err(StorageError::ObjectNotFound("bucket".to_owned(), "key".to_owned()))),
+            ],
+            &[true, false, false],
+            &ObjectOptions::default(),
+        )
+        .expect("all pools are known");
+        assert_eq!(snapshot.current.etag.as_deref(), Some("new"));
+        assert_eq!(snapshot.current_pool_idx, 1);
+        assert_eq!(snapshot.pool_generations.get(&0), Some(&old_generation));
+        assert_eq!(snapshot.pool_generations.get(&1), Some(&new_generation));
+        assert_eq!(snapshot.pool_generations.get(&2), Some(&CurrentDeleteGeneration::Absent));
+        let conditions = ["old", "new", "*", "new"];
+        let results = conditions.map(|etag| {
+            check_batch_delete_condition(
+                &ObjectToDelete {
+                    object_name: "key".to_owned(),
+                    delete_condition: Some(
+                        crate::storage_api_contracts::object::DeleteObjectCondition::parse(etag).expect("valid condition"),
+                    ),
+                    ..Default::default()
+                },
+                &snapshot,
+                "bucket",
+            )
+        });
+        assert_eq!(results[0], Err(StorageError::PreconditionFailed));
+        assert!(results[1..].iter().all(Result::is_ok), "duplicate conditions use one current snapshot");
+    }
+
+    #[test]
+    fn conditional_delete_snapshot_rejects_current_marker_and_missing_object() {
+        let (mut marker, generation) = conditional_pool_fixture("marker", 2);
+        marker.delete_marker = true;
+        for results in [
+            vec![(0, Ok((marker, generation)))],
+            vec![(0, Err(StorageError::ObjectNotFound("bucket".to_owned(), "key".to_owned())))],
+        ] {
+            let error = resolve_conditional_delete_snapshot("bucket", "key", results, &[false], &ObjectOptions::default())
+                .err()
+                .expect("missing live object must fail");
+            assert!(is_err_object_not_found(&error));
+        }
+    }
+
     async fn new_read_lock_test_store() -> ECStore {
         let format = FormatV3::new(1, 2);
         let endpoints = vec![
@@ -9169,6 +9529,197 @@ mod tests {
             .await
             .expect("create the versioned bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_batch_delete_freezes_routes_when_rebalance_starts_after_admission() {
+        use crate::storage_api_contracts::object::DeleteObjectCondition;
+        for versioned in [false, true] {
+            let bucket = if versioned {
+                "conditional-route-versioned"
+            } else {
+                "conditional-route-plain"
+            };
+            let object = "conditional-routed.bin";
+            let ordinary = "ordinary-routed.bin";
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (mut dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let (second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            dirs.extend(second_dirs);
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first_set, second_set], ctx).await);
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            store
+                .handle_make_bucket(
+                    bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: versioned,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create bucket in both pools");
+            let options = ObjectOptions {
+                versioned,
+                ..Default::default()
+            };
+            store.pools[0]
+                .put_object(bucket, object, &mut PutObjReader::from_vec(b"old".to_vec()), &options)
+                .await
+                .expect("write an older copy to the other pool");
+            let current = store.pools[1]
+                .put_object(bucket, object, &mut PutObjReader::from_vec(b"current".to_vec()), &options)
+                .await
+                .expect("write the current copy to the future rebalance pool");
+            let ordinary_before = store.pools[1]
+                .put_object(bucket, ordinary, &mut PutObjReader::from_vec(b"ordinary".to_vec()), &options)
+                .await
+                .expect("write the unconditional control key to the same pool");
+            CONDITIONAL_DELETE_POST_ADMISSION_REBALANCE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .expect("rebalance injection lock")
+                .insert(bucket.to_owned(), 1);
+            let (deleted, errors) = store
+                .handle_delete_objects(
+                    bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: object.to_owned(),
+                            delete_condition: Some(DeleteObjectCondition::MatchEtag(current.etag.clone().expect("current ETag"))),
+                            ..Default::default()
+                        },
+                        ObjectToDelete {
+                            object_name: ordinary.to_owned(),
+                            version_id: ordinary_before.version_id,
+                            ..Default::default()
+                        },
+                    ],
+                    options,
+                )
+                .await;
+            assert!(
+                store.is_pool_rebalancing(1).await,
+                "rebalance must have started in the admission-to-dispatch window"
+            );
+            assert!(errors[0].is_none(), "the frozen conditional action must commit: {errors:?}");
+            *store.rebalance_meta.write().await = None;
+            let ordinary_after = store.pools[1]
+                .get_object_info(bucket, ordinary, &ObjectOptions::default())
+                .await
+                .expect("unconditional key must retain the existing rebalance skip behavior");
+            assert_eq!(ordinary_after.data_dir, ordinary_before.data_dir);
+            if versioned {
+                let marker = deleted[0].delete_marker_version_id.expect("conditional marker result");
+                for pool in &store.pools {
+                    let versions = pool
+                        .clone()
+                        .inner_list_object_versions(bucket, object, None, None, None, 10)
+                        .await
+                        .expect("list the frozen marker destination");
+                    assert_eq!(
+                        versions
+                            .objects
+                            .iter()
+                            .any(|entry| entry.delete_marker && entry.version_id == Some(marker)),
+                        pool.pool_idx == 1,
+                        "the marker must stay with the admitted current owner"
+                    );
+                }
+            } else {
+                for pool in &store.pools {
+                    assert!(
+                        pool.get_object_info(bucket, object, &ObjectOptions::default())
+                            .await
+                            .err()
+                            .is_some_and(|error| is_err_object_not_found(&error)),
+                        "the current copy and stale copy must both be deleted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_batch_delete_mixed_duplicates_preserve_historical_actions() {
+        use crate::storage_api_contracts::object::DeleteObjectCondition;
+        let bucket = "conditional-batch-duplicates";
+        let object = "conditional-history.bin";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        let options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let old = store.pools[0]
+            .put_object(bucket, object, &mut PutObjReader::from_vec(b"old".to_vec()), &options)
+            .await
+            .expect("write older pool-local copy");
+        let current = store.pools[1]
+            .put_object(bucket, object, &mut PutObjReader::from_vec(b"new".to_vec()), &options)
+            .await
+            .expect("write current pool-local copy");
+        let mut objects = vec![ObjectToDelete {
+            object_name: object.to_owned(),
+            delete_condition: Some(DeleteObjectCondition::MatchEtag(old.etag.clone().expect("old etag"))),
+            ..Default::default()
+        }];
+        objects.extend((0..997).map(|_| ObjectToDelete {
+            object_name: object.to_owned(),
+            delete_condition: Some(DeleteObjectCondition::MatchEtag(current.etag.clone().expect("current etag"))),
+            ..Default::default()
+        }));
+        objects.push(ObjectToDelete {
+            object_name: object.to_owned(),
+            version_id: old.version_id,
+            ..Default::default()
+        });
+        objects.push(ObjectToDelete {
+            object_name: "missing".to_owned(),
+            delete_condition: Some(DeleteObjectCondition::Exists),
+            ..Default::default()
+        });
+        let calls = disk_call_counters::observe(object);
+        let (deleted, errors, accounting) = store
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, options, None)
+            .await;
+        assert!(
+            calls.total(disk_call_counters::KIND_READ_VERSION) <= 64,
+            "997 identical conditions must share one metadata snapshot and mutation plan"
+        );
+        assert_eq!(errors[0], Some(StorageError::PreconditionFailed));
+        assert!(
+            errors[1..=998].iter().all(Option::is_none),
+            "accepted conditions and historical delete: {errors:?}"
+        );
+        assert!(errors[999].as_ref().is_some_and(is_err_object_not_found));
+        let marker_id = deleted[1].delete_marker_version_id.expect("one created marker");
+        assert!(
+            deleted[1..=997]
+                .iter()
+                .all(|entry| entry.delete_marker && entry.delete_marker_version_id == Some(marker_id))
+        );
+        assert!(
+            accounting[2..=997].iter().all(Option::is_none),
+            "duplicate actions cannot duplicate accounting"
+        );
+        let versions = store
+            .clone()
+            .inner_list_object_versions(bucket, object, None, None, None, 10)
+            .await
+            .expect("list remaining versions");
+        assert_eq!(versions.objects.len(), 2, "one marker and the current data version must remain");
+        assert!(
+            versions
+                .objects
+                .iter()
+                .any(|entry| entry.version_id == current.version_id && !entry.delete_marker)
+        );
+        assert!(
+            versions
+                .objects
+                .iter()
+                .any(|entry| entry.version_id == Some(marker_id) && entry.delete_marker)
+        );
+        assert!(!versions.objects.iter().any(|entry| entry.version_id == old.version_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

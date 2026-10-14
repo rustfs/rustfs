@@ -199,10 +199,79 @@ pub struct ObjectToDeleteIdentity {
     pub delete_marker: bool,
 }
 
+/// A single ETag condition on the current live object of a bulk delete.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeleteObjectCondition {
+    Exists,
+    MatchEtag(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteObjectConditionError {
+    InvalidEtag,
+}
+
+impl fmt::Display for DeleteObjectConditionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEtag => f.write_str("a delete ETag condition must contain one non-empty ETag"),
+        }
+    }
+}
+
+impl std::error::Error for DeleteObjectConditionError {}
+
+impl DeleteObjectCondition {
+    pub fn parse(value: &str) -> Result<Self, DeleteObjectConditionError> {
+        let value = value.trim();
+        let value = match (value.starts_with('"'), value.ends_with('"')) {
+            (true, true) if value.len() >= 2 => &value[1..value.len() - 1],
+            (false, false) => value,
+            _ => return Err(DeleteObjectConditionError::InvalidEtag),
+        };
+        if value.trim().is_empty() || value.contains('"') {
+            return Err(DeleteObjectConditionError::InvalidEtag);
+        }
+        if value == "*" {
+            Ok(Self::Exists)
+        } else {
+            Ok(Self::MatchEtag(value.to_string()))
+        }
+    }
+
+    /// Reject malformed values constructed directly or decoded from a peer.
+    pub fn validate(&self) -> Result<(), DeleteObjectConditionError> {
+        match self {
+            Self::Exists => Ok(()),
+            Self::MatchEtag(value) if !value.trim().is_empty() && value != "*" && !value.contains('"') => Ok(()),
+            Self::MatchEtag(_) => Err(DeleteObjectConditionError::InvalidEtag),
+        }
+    }
+
+    pub fn requires_read_permission(&self) -> bool {
+        matches!(self, Self::MatchEtag(_))
+    }
+
+    /// The caller must separately require a live, existing object.
+    pub fn matches(&self, object_etag: &str) -> bool {
+        match self {
+            Self::Exists => true,
+            Self::MatchEtag(expected) => {
+                let object_etag = object_etag
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(object_etag);
+                self.validate().is_ok() && expected == object_etag
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    pub delete_condition: Option<DeleteObjectCondition>,
     /// RustFS-only precondition checked under the object write lock.
     #[doc(hidden)]
     pub expected_identity: Option<ObjectToDeleteIdentity>,
@@ -760,6 +829,41 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_object_condition_rejects_empty_or_malformed_etags() {
+        for value in ["", " \t ", "\"\"", "\" \t \"", "\"", "\"etag", "etag\"", "\"\"etag\"\""] {
+            assert_eq!(DeleteObjectCondition::parse(value), Err(DeleteObjectConditionError::InvalidEtag));
+        }
+        assert!(DeleteObjectCondition::MatchEtag(String::new()).validate().is_err());
+        assert!(!DeleteObjectCondition::MatchEtag(String::new()).matches(""));
+        assert!(DeleteObjectCondition::MatchEtag("*".to_string()).validate().is_err());
+    }
+
+    #[test]
+    fn delete_object_condition_is_a_case_sensitive_opaque_single_etag() {
+        let condition = DeleteObjectCondition::parse(" \"opaque-ETag-7\" ").expect("quoted ETag should parse");
+        assert_eq!(condition, DeleteObjectCondition::MatchEtag("opaque-ETag-7".to_string()));
+        assert!(condition.matches("opaque-ETag-7"));
+        assert!(condition.matches("\"opaque-ETag-7\""));
+        assert!(!condition.matches("opaque-etag-7"));
+        assert!(condition.requires_read_permission());
+        assert!(condition.validate().is_ok());
+
+        let condition = DeleteObjectCondition::parse("one,two").expect("ETags are opaque values");
+        assert!(condition.matches("one,two"));
+        assert!(!condition.matches("one"));
+        assert!(!condition.matches("two"));
+    }
+
+    #[test]
+    fn delete_object_condition_exists_does_not_require_read_permission() {
+        for value in ["*", " \"*\" "] {
+            let condition = DeleteObjectCondition::parse(value).expect("wildcard condition should parse");
+            assert_eq!(condition, DeleteObjectCondition::Exists);
+            assert!(!condition.requires_read_permission());
+        }
+    }
 
     #[test]
     fn version_marker_parse_folds_null_and_nil_uuid_into_null() {

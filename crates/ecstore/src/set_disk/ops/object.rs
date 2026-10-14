@@ -8952,6 +8952,35 @@ impl SetDisks {
     }
 }
 
+impl SetDisks {
+    /// Read current metadata without cache admission or read-side repair. The
+    /// outer batch owner already holds the sorted namespace write-lock set.
+    pub(crate) async fn conditional_delete_current_snapshot(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, crate::disk::CurrentDeleteGeneration)> {
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, false, false).await?;
+        let file_info = snapshot.fi();
+        let generation = crate::disk::CurrentDeleteGeneration::from_file_info(file_info)
+            .map_err(|error| to_object_err(error.into(), vec![bucket, object]))?;
+        Ok((
+            ObjectInfo::from_file_info(file_info, bucket, object, opts.versioned || opts.version_suspended),
+            generation,
+        ))
+    }
+
+    /// Mixed-version peers must reject the operation before any group mutates.
+    pub(crate) async fn preflight_guarded_delete_versions(&self) -> Result<()> {
+        let disks = self.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.supports_guarded_delete_versions().await.map_err(Error::from)?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     type Error = Error;
@@ -9279,6 +9308,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let current_generations = opts.conditional_delete_generations.as_deref();
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -9290,7 +9320,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
         }
 
-        let mut del_errs = (0..objects.len()).map(|_| None).collect::<Vec<_>>();
+        let mut del_errs = objects
+            .iter()
+            .map(|object| {
+                object.delete_condition.as_ref().map(|_| {
+                    StorageError::InvalidArgument(
+                        bucket.to_owned(),
+                        object.object_name.clone(),
+                        "conditional delete was not admitted by the store preflight".to_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
 
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
@@ -9387,6 +9428,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 continue;
             }
 
+            let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
             let replication_object_name = decode_dir_object(&dobj.object_name);
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let version_id = delete_file_info_version_id(dobj.version_id);
@@ -9400,6 +9442,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 object_lock_delete: opts.object_lock_delete.clone(),
                 object_lock_config_snapshot: Some(Arc::clone(&object_lock_config)),
                 no_lock: true,
+                suppress_read_repair: guarded,
                 ..Default::default()
             };
             // A missing bucket Object Lock configuration does not prove that
@@ -9431,6 +9474,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !opts.data_movement
                 && !opts.replication_request
                 && opts.http_preconditions.is_none()
+                && !guarded
             {
                 let recovery = self
                     .recover_delete_key(
@@ -9489,6 +9533,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !versioned
                 && !version_suspended
                 && opts.http_preconditions.is_none()
+                && !guarded
             {
                 missing_delete_retry_indices.push(i);
             }
@@ -9823,7 +9868,56 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
                         ..Default::default()
                     };
-                    if is_meta_bucketname(bucket) {
+                    if current_generations
+                        .is_some_and(|generations| vers.iter().any(|group| generations.contains_key(&group.name)))
+                    {
+                        let mut guarded = Vec::new();
+                        let mut ordinary = Vec::new();
+                        let mut guarded_indices = Vec::new();
+                        let mut ordinary_indices = Vec::new();
+                        let count = vers.len();
+                        for (index, group) in vers.into_iter().enumerate() {
+                            if let Some(generation) = current_generations.and_then(|generations| generations.get(&group.name)) {
+                                guarded_indices.push(index);
+                                guarded.push(crate::disk::GuardedFileInfoVersions {
+                                    group,
+                                    expected_current: generation.clone(),
+                                });
+                            } else {
+                                ordinary_indices.push(index);
+                                ordinary.push(group);
+                            }
+                        }
+                        let mut results = vec![None; count];
+                        let guarded_results = disk
+                            .delete_versions_guarded_recoverable_with_namespace_owner(
+                                bucket,
+                                guarded,
+                                options.clone(),
+                                disk_namespace_owner.clone(),
+                            )
+                            .await;
+                        for (index, error) in guarded_indices.into_iter().zip(guarded_results) {
+                            results[index] = error;
+                        }
+                        if !ordinary.is_empty() {
+                            let errors = if is_meta_bucketname(bucket) {
+                                disk.delete_versions(bucket, ordinary, options).await
+                            } else {
+                                disk.delete_versions_recoverable_with_namespace_owner(
+                                    bucket,
+                                    ordinary,
+                                    options,
+                                    disk_namespace_owner,
+                                )
+                                .await
+                            };
+                            for (index, error) in ordinary_indices.into_iter().zip(errors) {
+                                results[index] = error;
+                            }
+                        }
+                        results
+                    } else if is_meta_bucketname(bucket) {
                         disk.delete_versions(bucket, vers, options).await
                     } else {
                         disk.delete_versions_recoverable_with_namespace_owner(bucket, vers, options, disk_namespace_owner)
@@ -9865,6 +9959,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, self.set_drive_count / 2 + 1);
+            if disk_err
+                .iter()
+                .flatten()
+                .any(|error| matches!(error, DiskError::GuardedDeleteUnsupported))
+            {
+                has_err = Some(DiskError::GuardedDeleteUnsupported);
+            }
             if !is_meta_bucketname(bucket) && disk_err.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
                 has_err = Some(DiskError::UnsupportedDisk);
             }
@@ -23281,6 +23382,170 @@ mod delete_objects_lock_gating_tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("plain object should be written");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn conditional_delete_snapshot_preserves_multipart_etag() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-multipart-etag";
+        let object = "multipart.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let options = ObjectOptions::default();
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &options)
+            .await
+            .expect("create multipart upload");
+        let part = set_disks
+            .put_object_part(
+                bucket,
+                object,
+                &upload.upload_id,
+                1,
+                &mut PutObjReader::from_vec(vec![11; 4097]),
+                &options,
+            )
+            .await
+            .expect("upload the final part");
+        let committed = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &options,
+            )
+            .await
+            .expect("complete multipart object");
+        let (snapshot, generation) = set_disks
+            .conditional_delete_current_snapshot(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read current multipart snapshot");
+        let etag = committed.etag.as_deref().expect("multipart ETag");
+        assert!(etag.ends_with("-1"));
+        assert_eq!(snapshot.etag, committed.etag);
+        let condition = crate::storage_api_contracts::object::DeleteObjectCondition::parse(&format!("\"{etag}\""))
+            .expect("quoted response ETag");
+        assert!(condition.matches(snapshot.etag.as_deref().expect("snapshot ETag")));
+        assert!(matches!(generation, crate::disk::CurrentDeleteGeneration::Present { etag: stored, .. } if stored == etag));
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_rejects_unadmitted_conditions() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-unadmitted";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        put_plain_object(&set_disks, bucket, "protected").await;
+        let (_, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "protected".to_owned(),
+                    delete_condition: Some(crate::storage_api_contracts::object::DeleteObjectCondition::Exists),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(&errors[0], Some(StorageError::InvalidArgument(_, _, _))));
+        set_disks
+            .get_object_info(bucket, "protected", &ObjectOptions::default())
+            .await
+            .expect("unadmitted condition must not delete");
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_disk_generation_rejects_overwrite_in_mixed_batch() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-generation";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        put_plain_object(&set_disks, bucket, "protected").await;
+        put_plain_object(&set_disks, bucket, "ordinary").await;
+        let (_, generation) = set_disks
+            .conditional_delete_current_snapshot(
+                bucket,
+                "protected",
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("snapshot original generation");
+        let current = set_disks
+            .put_object(
+                bucket,
+                "protected",
+                &mut PutObjReader::from_vec(b"new-current".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("overwrite after snapshot");
+        let (_, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![
+                    ObjectToDelete {
+                        object_name: "protected".to_owned(),
+                        ..Default::default()
+                    },
+                    ObjectToDelete {
+                        object_name: "ordinary".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions {
+                    conditional_delete_generations: Some(Arc::new(HashMap::from([("protected".to_owned(), generation)]))),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors[0], Some(StorageError::ConditionalDeleteConflict));
+        assert!(errors[1].is_none(), "ordinary group still succeeds: {errors:?}");
+        let after = set_disks
+            .get_object_info(bucket, "protected", &ObjectOptions::default())
+            .await
+            .expect("new data survives stale delete");
+        assert_eq!(after.data_dir, current.data_dir);
+        assert_eq!(after.etag, current.etag);
+        assert!(
+            set_disks
+                .get_object_info(bucket, "ordinary", &ObjectOptions::default())
+                .await
+                .err()
+                .is_some_and(|error| is_err_object_not_found(&error))
+        );
     }
 
     #[tokio::test]
