@@ -9429,6 +9429,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
+            if guarded && dobj.version_id.is_some() {
+                del_errs[i] = Some(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    dobj.object_name.clone(),
+                    "current-object generation guards cannot protect explicit-version deletes".to_owned(),
+                ));
+                continue;
+            }
             let replication_object_name = decode_dir_object(&dobj.object_name);
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let version_id = delete_file_info_version_id(dobj.version_id);

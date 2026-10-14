@@ -340,6 +340,42 @@ async fn sdk_conditional_delete_objects_versioning_current_markers_and_explicit_
                 .count(),
             1
         );
+
+        if !suspended {
+            let directory = put(&client, bucket, "dir/", b"directory null-version payload").await?;
+            assert_eq!(
+                versions(&client, bucket, "dir/").await?,
+                BTreeSet::from([("null".to_string(), false)]),
+                "the directory PUT fixture must identify the synthetic null data version"
+            );
+            let result = delete_batch(
+                &client,
+                bucket,
+                vec![identifier("dir/", directory.e_tag(), None)?, identifier("dir/", None, None)?],
+                false,
+            )
+            .await?;
+            assert!(result.errors().is_empty(), "both distinct directory actions must succeed");
+            assert_eq!(result.deleted().len(), 2);
+            assert_eq!(result.deleted()[0].key(), Some("dir/"));
+            assert_eq!(result.deleted()[1].key(), Some("dir/"));
+            assert_eq!(result.deleted()[0].delete_marker(), Some(true));
+            let marker = result.deleted()[0]
+                .delete_marker_version_id()
+                .expect("conditional current-directory deletion creates a versioned marker");
+            assert!(
+                !uuid::Uuid::parse_str(marker)?.is_nil(),
+                "enabled current-directory deletion creates a UUID marker"
+            );
+            assert_eq!(result.deleted()[1].delete_marker(), None);
+            assert_eq!(result.deleted()[1].delete_marker_version_id(), None);
+            assert_eq!(result.deleted()[1].version_id(), None);
+            assert_eq!(
+                versions(&client, bucket, "dir/").await?,
+                BTreeSet::from([(marker.to_string(), true)]),
+                "current-marker creation and synthetic null-version removal are distinct actions: one marker remains and the null data version is gone"
+            );
+        }
     }
     Ok(())
 }

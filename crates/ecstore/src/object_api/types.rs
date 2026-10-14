@@ -942,8 +942,9 @@ pub struct ObjectOptions {
     /// serialized or copied into object metadata.
     #[doc(hidden)]
     pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
-    /// Pool-local generations admitted by the locked conditional batch preflight.
-    /// This is transient state and must never be populated from client metadata.
+    /// Pool-local generations for admitted current-object conditional actions.
+    /// Ordinary actions execute in a separate phase without this transient map.
+    /// This must never be populated from client metadata.
     #[doc(hidden)]
     pub conditional_delete_generations: Option<Arc<HashMap<String, crate::disk::CurrentDeleteGeneration>>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.

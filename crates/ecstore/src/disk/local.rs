@@ -12629,6 +12629,206 @@ mod test {
     }
 
     #[tokio::test]
+    async fn guarded_delete_remote_only_matching_generation_accepts_missing_and_nil_data_directory() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        for (case, data_dir, remote_version, remote_version_id) in [
+            ("absent", None, None, None),
+            ("empty", Some(Uuid::nil()), Some(String::new()), None),
+            ("nil-version", None, None, Some(Uuid::nil())),
+        ] {
+            let object = format!("guarded-remote-only-{case}");
+            let object_dir = dir.path().join("bucket").join(&object);
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("create remote-only object directory");
+            let mut original = test_file_info(&object, Uuid::nil(), data_dir, None);
+            original.metadata.insert("etag".into(), "etag-remote".into());
+            original.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            original.transition_tier = "WARM".into();
+            original.transitioned_objname = "remote/object".into();
+            original.transition_version = remote_version;
+            original.transition_version_id = remote_version_id;
+            let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture legacy remote-only generation");
+            let before = test_meta(original.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &before)
+                .await
+                .expect("write remote-only metadata");
+            let persisted = FileMeta::load(&before)
+                .expect("decode remote-only metadata")
+                .into_fileinfo("bucket", &object, "", false, false, false)
+                .expect("read remote-only generation");
+            assert_eq!(
+                CurrentDeleteGeneration::from_file_info(&persisted).expect("capture persisted remote generation"),
+                expected
+            );
+            // Observed transition state belongs to the guard; a version-removal
+            // descriptor must not request another transition commit.
+            let mut deletion = FileInfo {
+                name: original.name,
+                version_id: original.version_id,
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+            let free_version_id = Uuid::new_v4();
+            deletion.set_tier_free_version_id(&free_version_id.to_string());
+            let transaction = Uuid::new_v4();
+            assert_eq!(
+                disk.delete_versions_guarded_recoverable(
+                    "bucket",
+                    vec![guarded_delete_group(deletion, expected)],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await,
+                vec![None],
+                "matching remote-only guard succeeds: {case}"
+            );
+            let after = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("durable tier cleanup metadata");
+            let remaining = FileMeta::load(&after).expect("decode tier cleanup metadata");
+            assert_eq!(remaining.versions.len(), 1, "only the tier cleanup owner remains: {case}");
+            let listed = remaining
+                .get_file_info_versions("bucket", &object, false)
+                .expect("list live and free versions");
+            assert!(listed.versions.is_empty(), "matching remote-only object version is removed: {case}");
+            assert_eq!(
+                listed.free_versions.len(),
+                1,
+                "deletion retains exactly one remote cleanup record: {case}"
+            );
+            let cleanup = &listed.free_versions[0];
+            assert!(
+                cleanup.deleted && cleanup.tier_free_version(),
+                "remaining metadata is a canonical tier cleanup marker: {case}"
+            );
+            assert_eq!(cleanup.version_id, Some(free_version_id));
+            assert_eq!(cleanup.transition_tier, "WARM");
+            assert_eq!(cleanup.transitioned_objname, "remote/object");
+            assert_eq!(cleanup.transition_version, None);
+            assert_eq!(cleanup.transition_version_id, None);
+            assert_eq!(cleanup.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+            assert!(
+                matches!(
+                    remaining.into_fileinfo("bucket", &object, "", false, false, false),
+                    Err(rustfs_filemeta::Error::FileNotFound)
+                ),
+                "normal object reads no longer find the deleted version: {case}"
+            );
+            assert_eq!(
+                fs::read(object_dir.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("recoverable metadata backup"),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_remote_tuple_changes_preserve_metadata_data_and_recovery_state() {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITION_TIER_DESTINATION_ID, insert_str};
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        for changed_field in [
+            "backend",
+            "tier",
+            "object",
+            "version",
+            "version-state",
+            "status",
+            "local-to-remote",
+        ] {
+            let object = format!("guarded-remote-{changed_field}");
+            let data_dir = Uuid::new_v4();
+            let object_dir = dir.path().join("bucket").join(&object);
+            let data_path = object_dir.join(data_dir.to_string()).join("part.1");
+            fs::create_dir_all(data_path.parent().expect("data directory"))
+                .await
+                .expect("create data directory");
+            fs::write(&data_path, b"preserved-payload")
+                .await
+                .expect("write local data that must survive");
+            let mut original = test_file_info(&object, Uuid::nil(), Some(data_dir), None);
+            original.size = 17;
+            original.parts[0].size = 17;
+            original.parts[0].actual_size = 17;
+            original.metadata.insert("etag".into(), "etag-same".into());
+            original.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            original.transition_tier = "WARM".into();
+            original.transitioned_objname = "remote/object-a".into();
+            original.transition_version = Some("opaque/version-a==".into());
+            original.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+            insert_str(&mut original.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+            let mut current = original.clone();
+            match changed_field {
+                "backend" => insert_str(&mut current.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "cd".repeat(32)),
+                "tier" => current.transition_tier = "COLD".into(),
+                "object" => current.transitioned_objname = "remote/object-b".into(),
+                "version" => current.transition_version = Some("opaque/version-b==".into()),
+                "version-state" => current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown,
+                "status" => current.transition_status = "pending".into(),
+                "local-to-remote" => {
+                    original.transition_status.clear();
+                    original.transition_tier.clear();
+                    original.transitioned_objname.clear();
+                    original.transition_version = None;
+                    original.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+                    rustfs_utils::http::metadata_compat::remove_str(
+                        &mut original.metadata,
+                        SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    );
+                }
+                _ => unreachable!("test controls changed fields"),
+            }
+            let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original remote generation");
+            let actual = CurrentDeleteGeneration::from_file_info(&current).expect("capture changed remote generation");
+            assert_ne!(actual, expected, "remote identity change must alter the guard: {changed_field}");
+            assert_eq!(current.version_id, original.version_id);
+            assert_eq!(current.data_dir, original.data_dir);
+            assert_eq!(current.mod_time, original.mod_time);
+            assert_eq!(current.get_etag(), original.get_etag());
+            let current_metadata = test_meta(current);
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &current_metadata)
+                .await
+                .expect("publish changed remote identity");
+            let transaction = Uuid::new_v4();
+            let errors = disk
+                .delete_versions_guarded_recoverable(
+                    "bucket",
+                    vec![guarded_delete_group(original, expected)],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                errors,
+                vec![Some(DiskError::ConditionalDeleteConflict)],
+                "stale remote tuple is rejected: {changed_field}"
+            );
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("current metadata remains"),
+                current_metadata
+            );
+            assert_eq!(fs::read(&data_path).await.expect("payload remains"), b"preserved-payload");
+            assert!(
+                !object_dir.join(transaction.to_string()).exists(),
+                "stale remote tuple creates no recovery artifacts: {changed_field}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn guarded_delete_absence_guard_preserves_new_object() {
         let dir = tempfile::tempdir().expect("create disk directory");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
