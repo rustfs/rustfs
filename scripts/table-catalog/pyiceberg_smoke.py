@@ -27,6 +27,9 @@ import failure_coverage
 DEFAULT_PROFILE = "rustfs"
 CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
 VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
+CATALOG_BACKING_KEY = "rustfs.catalog-backing"
+CATALOG_BACKINGS = {"object", "durable-strong"}
+SMOKE_ROWS = [{"id": 1, "payload": "alpha"}, {"id": 2, "payload": "beta"}]
 REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.access-key-id",
     "s3.secret-access-key",
@@ -283,6 +286,8 @@ class SmokeResult:
     row_count: int
     cleanup_result: str
     table_warehouse_location: str
+    catalog_backing: str
+    catalog_probes: dict[str, str]
 
 
 class RestRequestError(RuntimeError):
@@ -536,7 +541,15 @@ def sign_rest_request(args: argparse.Namespace, deps: RuntimeDeps, request: Any)
     deps.botocore_auth(credentials, args.rest_signing_name, args.region).add_auth(request)
 
 
-def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+def signed_rest_request(
+    args: argparse.Namespace,
+    deps: RuntimeDeps,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    access_delegation: str | None = None,
+) -> dict[str, Any]:
     endpoint = normalized_endpoint(args.endpoint)
     url = f"{endpoint}{path}"
     payload = b"" if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -546,6 +559,8 @@ def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str
     }
     if body is not None:
         headers["content-type"] = "application/json"
+    if access_delegation is not None:
+        headers["X-Iceberg-Access-Delegation"] = access_delegation
 
     aws_request = deps.botocore_awsrequest(method=method, url=url, data=payload, headers=headers)
     sign_rest_request(args, deps, aws_request)
@@ -584,6 +599,21 @@ def signed_rest_request_expect_error(
             raise RuntimeError(f"{method} {path} failed with HTTP {error.status_code}, expected one of: {expected}") from error
         return error
     raise RuntimeError(f"{method} {path} unexpectedly succeeded")
+
+
+def discover_catalog_backing(args: argparse.Namespace, deps: RuntimeDeps) -> str:
+    query = urllib.parse.urlencode({"warehouse": profile_warehouse(args)})
+    response = signed_rest_request(args, deps, "GET", f"{args.rest_path}/v1/config?{query}")
+    defaults, overrides = response.get("defaults"), response.get("overrides")
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        raise RuntimeError("catalog config must return defaults and overrides")
+    backing = overrides.get(CATALOG_BACKING_KEY, defaults.get(CATALOG_BACKING_KEY))
+    if not isinstance(backing, str) or backing not in CATALOG_BACKINGS:
+        raise RuntimeError("catalog config did not identify a supported RustFS backing")
+    expected = "object" if args.catalog_backing == "object-backed" else args.catalog_backing
+    if expected != "operator-recorded" and expected != backing:
+        raise RuntimeError("configured catalog backing does not match the server config")
+    return backing
 
 
 def ensure_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
@@ -972,12 +1002,13 @@ def current_utc_timestamp() -> str:
 
 
 def pyiceberg_client_version(args: argparse.Namespace) -> str:
-    if args.client_version:
-        return args.client_version
     try:
-        return importlib.metadata.version("pyiceberg")
+        version = importlib.metadata.version("pyiceberg")
     except importlib.metadata.PackageNotFoundError:
-        return "operator-recorded"
+        version = "operator-recorded"
+    if args.client_version and args.client_version != version:
+        raise RuntimeError(f"expected PyIceberg {args.client_version}, found {version}")
+    return version
 
 
 def redacted_command(argv: list[str]) -> str:
@@ -1012,10 +1043,12 @@ def pyiceberg_live_evidence_record(
     operator: str,
     command: str,
 ) -> dict[str, Any]:
-    return engine_compatibility.live_conformance_evidence_record(
+    if catalog_backing != result.catalog_backing:
+        raise ValueError("evidence backing must match the observed server backing")
+    record = engine_compatibility.live_conformance_evidence_record(
         client_name="PyIceberg",
         client_version=client_version,
-        scenario="create-append-reload-scan-direct-rest-probes",
+        scenario=engine_compatibility.PYICEBERG_CORE_SCENARIO if args.skip_catalog_api_probes else engine_compatibility.PYICEBERG_BACKING_SCENARIO,
         rustfs_build=rustfs_build,
         git_sha=git_sha,
         catalog_backing=catalog_backing,
@@ -1034,6 +1067,10 @@ def pyiceberg_live_evidence_record(
         claim="automated-smoke",
         command=command,
     )
+    record["catalog_probes"] = result.catalog_probes.copy()
+    record["rest_signing_name"] = args.rest_signing_name
+    record["credential_vending_required"] = bool(args.require_vended_credentials)
+    return record
 
 
 def write_live_evidence(args: argparse.Namespace, result: SmokeResult) -> None:
@@ -1045,7 +1082,7 @@ def write_live_evidence(args: argparse.Namespace, result: SmokeResult) -> None:
         client_version=pyiceberg_client_version(args),
         rustfs_build=args.rustfs_build,
         git_sha=args.git_sha,
-        catalog_backing=args.catalog_backing,
+        catalog_backing=result.catalog_backing,
         run_timestamp_utc=args.run_timestamp_utc or current_utc_timestamp(),
         operator=args.operator,
         command=redacted_command(sys.argv),
@@ -1262,6 +1299,8 @@ def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
                 cleanup_namespace = False
             raise
 
+        run_namespace_properties_probe(args, deps, probe_namespace)
+        run_encoded_namespace_probe(args, deps, probe_namespace)
         view_path = view_endpoint_path(args, namespace=probe_namespace)
         for view_name in view_names:
             cleanup_views.append(view_name)
@@ -1315,6 +1354,111 @@ def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
                 print(f"warning: failed to clean up view pagination probe: {error}", file=sys.stderr)
 
 
+def run_encoded_namespace_probe(args: argparse.Namespace, deps: RuntimeDeps, parent: str) -> None:
+    segments = [parent, "encoded"]
+    path = namespace_endpoint_path(args, "\x1f".join(segments))
+    signed_rest_request(args, deps, "POST", namespace_endpoint_path(args), {"namespace": segments})
+    try:
+        response = signed_rest_request(args, deps, "GET", path)
+        if response.get("namespace") != segments:
+            raise RuntimeError("encoded namespace path did not preserve its component identity")
+        signed_rest_request_expect_error(args, deps, "GET", path.replace("%1F", "%251F"), expected_statuses={400})
+        if signed_rest_request(args, deps, "GET", path).get("namespace") != segments:
+            raise RuntimeError("double-encoded lookup changed the namespace identity")
+    finally:
+        signed_rest_request(args, deps, "DELETE", path)
+
+
+def run_namespace_properties_probe(args: argparse.Namespace, deps: RuntimeDeps, namespace: str) -> None:
+    path = namespace_endpoint_path(args, namespace)
+    before = signed_rest_request(args, deps, "GET", path)
+    properties = before.get("properties")
+    if not isinstance(properties, dict):
+        raise RuntimeError("namespace response did not include properties")
+    update = signed_rest_request(
+        args, deps, "POST", f"{path}/properties", {"updates": {"rustfs.smoke.updated": "true"}, "removals": ["rustfs.smoke"]}
+    )
+    if update.get("updated") != ["rustfs.smoke.updated"] or update.get("removed") != ["rustfs.smoke"]:
+        raise RuntimeError("namespace property update did not report the applied keys")
+    expected = {**properties, "rustfs.smoke.updated": "true"}
+    expected.pop("rustfs.smoke", None)
+    if signed_rest_request(args, deps, "GET", path).get("properties") != expected:
+        raise RuntimeError("namespace property update was not persisted")
+    signed_rest_request_expect_error(
+        args, deps, "POST", f"{path}/properties",
+        {"updates": {"rustfs.smoke.updated": "false"}, "removals": ["rustfs.smoke.updated"]},
+        expected_statuses={422},
+    )
+    if signed_rest_request(args, deps, "GET", path).get("properties") != expected:
+        raise RuntimeError("rejected namespace property update changed persisted properties")
+
+
+def run_table_rename_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    source = {"namespace": [args.namespace], "name": args.table}
+    destination = {"namespace": [args.namespace], "name": f"renamed-{uuid.uuid4().hex}"}
+    rename_path = f"{args.rest_path}/v1/{urllib.parse.quote(args.bucket, safe='')}/tables/rename"
+    source_path = table_endpoint_path(args)
+    destination_path = source_path.rsplit("/", 1)[0] + "/" + destination["name"]
+    before = signed_rest_request(args, deps, "GET", source_path)
+    signed_rest_request(args, deps, "POST", rename_path, {"source": source, "destination": destination})
+    try:
+        signed_rest_request_expect_error(args, deps, "GET", source_path, expected_statuses={404})
+        after = signed_rest_request(args, deps, "GET", destination_path)
+        for key in ("metadata-location", "metadata"):
+            if key not in before or after.get(key) != before[key]:
+                raise RuntimeError("table rename changed the Iceberg metadata or warehouse identity")
+    finally:
+        signed_rest_request(args, deps, "POST", rename_path, {"source": destination, "destination": source})
+    restored = signed_rest_request(args, deps, "GET", source_path)
+    if restored.get("metadata-location") != before["metadata-location"]:
+        raise RuntimeError("restored table rename changed the metadata pointer")
+
+
+def run_load_table_delegation_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    path = table_endpoint_path(args)
+    for token in (None, "remote-signing", "not-vended-credentials", "VENDED-CREDENTIALS"):
+        response = signed_rest_request(args, deps, "GET", path, access_delegation=token)
+        config = response.get("config", {})
+        if response.get("storage-credentials") or any(config.get(key) for key in REQUIRED_STORAGE_CREDENTIAL_KEYS):
+            raise RuntimeError("LoadTable returned credentials without exact delegation negotiation")
+    if args.require_vended_credentials:
+        response = signed_rest_request(args, deps, "GET", path, access_delegation="remote-signing, vended-credentials")
+        warehouse = table_warehouse_location(response.get("metadata"))
+        credentials = response.get("storage-credentials")
+        if not isinstance(credentials, list) or len(credentials) != 2 or any(not isinstance(item, dict) for item in credentials):
+            raise RuntimeError("LoadTable must vend exactly the warehouse and metadata scopes")
+        by_prefix = {item.get("prefix"): item for item in credentials}
+        warehouse_prefix = warehouse.rstrip("/") + "/"
+        metadata_location = response.get("metadata-location")
+        if not isinstance(metadata_location, str) or set(by_prefix) != {warehouse_prefix, metadata_location}:
+            raise RuntimeError("LoadTable vended scopes do not match the warehouse and current metadata")
+        credential = storage_credential_from_response({"storage-credentials": [by_prefix[warehouse_prefix]]})
+        metadata_credential = storage_credential_from_response({"storage-credentials": [by_prefix[metadata_location]]})
+        if any(credential.config[key] != metadata_credential.config[key] for key in REQUIRED_STORAGE_CREDENTIAL_KEYS):
+            raise RuntimeError("LoadTable scopes do not share the same temporary session")
+        verify_vended_credential_data_plane_scope(args, deps, credential, warehouse)
+
+
+def run_strong_backing_boundaries(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+    pointer_path = table_endpoint_path(args, "/metadata-location")
+    before = signed_rest_request(args, deps, "GET", pointer_path)
+    for key in ("metadata-location", "version-token", "generation"):
+        if key not in before:
+            raise RuntimeError("metadata-location response is missing the commit state")
+    path = table_endpoint_path(args, "/maintenance/metadata")
+    error = signed_rest_request_expect_error(
+        args, deps, "POST", path,
+        {"retain-recent-metadata-files": 1, "delete": False}, expected_statuses={400},
+    )
+    envelope = json.loads(error.response_body).get("error")
+    if not isinstance(envelope, dict) or (envelope.get("code"), envelope.get("type"), envelope.get("message")) != (
+        400, "BadRequestException", "operation is not supported with durable-strong table catalog backing"
+    ):
+        raise RuntimeError("strong metadata maintenance did not return the expected Iceberg error envelope")
+    if signed_rest_request(args, deps, "GET", pointer_path) != before:
+        raise RuntimeError("unsupported strong backing operation changed the table commit state")
+
+
 def maintenance_job_id(job: object) -> str | None:
     if not isinstance(job, dict):
         return None
@@ -1324,93 +1468,125 @@ def maintenance_job_id(job: object) -> str | None:
     return value
 
 
-def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps, backing: str = "object") -> None:
     config_path = table_endpoint_path(args, "/maintenance/config")
     scheduler_path = table_endpoint_path(args, "/maintenance/scheduler")
-    scheduler_run_path = table_endpoint_path(args, "/maintenance/scheduler/run")
-    signed_rest_request(args, deps, "PUT", config_path, default_maintenance_config())
+    pointer_path = table_endpoint_path(args, "/metadata-location")
+    before = signed_rest_request(args, deps, "GET", pointer_path)
+    for key in ("metadata-location", "version-token", "generation"):
+        if key not in before:
+            raise RuntimeError("metadata-location response is missing the commit state")
+    safe_config = default_maintenance_config()
+    signed_rest_request(args, deps, "PUT", config_path, safe_config)
     config = signed_rest_request(args, deps, "GET", config_path)
-    if config.get("version") != TABLE_MAINTENANCE_CONFIG_VERSION:
+    if any(config.get(key) != value for key, value in safe_config.items()):
         raise RuntimeError("maintenance config endpoint did not persist the smoke config")
 
-    report = signed_rest_request(
-        args,
-        deps,
-        "POST",
-        table_endpoint_path(args, "/maintenance/metadata"),
-        {"retain-recent-metadata-files": 1, "delete": False},
-    )
-    job = report.get("job")
-    job_id = maintenance_job_id(job)
-    if job_id is None:
-        raise RuntimeError("maintenance metadata endpoint did not return a job id")
-    audit_events = report.get("audit-events")
-    if not isinstance(audit_events, list) or not audit_events:
-        raise RuntimeError("maintenance metadata endpoint did not return audit events")
-    if not any(isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events):
-        raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
-    job_report = signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job_id}"))
-    if not isinstance(job_report.get("audit-events"), list):
-        raise RuntimeError("maintenance job endpoint did not return audit events")
-    quarantine = signed_rest_request(
-        args,
-        deps,
-        "POST",
-        table_endpoint_path(args, f"/maintenance/jobs/{job_id}/quarantine"),
-        {"action": "INSPECT"},
-    )
-    if quarantine.get("action") != "INSPECT" or not isinstance(quarantine.get("report"), dict):
-        raise RuntimeError("maintenance quarantine endpoint did not return an inspection report")
+    if backing == "durable-strong":
+        run_strong_backing_boundaries(args, deps)
+    elif backing == "object":
+        report = signed_rest_request(
+            args, deps, "POST", table_endpoint_path(args, "/maintenance/metadata"),
+            {"retain-recent-metadata-files": 1, "delete": False},
+        )
+        if maintenance_job_id(report.get("job")) is None:
+            raise RuntimeError("maintenance metadata endpoint did not return a job id")
+        audit_events = report.get("audit-events")
+        if not isinstance(audit_events, list) or not any(
+            isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events
+        ):
+            raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
+    else:
+        raise RuntimeError("maintenance probes require a known backing")
+
     scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
-    expected_scheduler_statuses = {"READY", "QUEUED", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
-    if scheduler.get("status") not in expected_scheduler_statuses:
+    expected_statuses = {"READY", "QUEUED", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
+    if scheduler.get("status") not in expected_statuses:
         raise RuntimeError("maintenance scheduler endpoint did not return a stable scheduler status")
-    scheduler_timeline = scheduler.get("audit_timeline")
-    if not isinstance(scheduler_timeline, list):
+    timeline = scheduler.get("audit_timeline")
+    if not isinstance(timeline, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("audit-events"), list) for item in timeline
+    ):
         raise RuntimeError("maintenance scheduler endpoint did not return an audit timeline")
-    if scheduler_timeline and not isinstance(scheduler_timeline[0].get("audit-events"), list):
-        raise RuntimeError("maintenance scheduler audit timeline did not include job audit events")
 
-    scheduler_config = default_maintenance_config()
-    scheduler_config["background-enabled"] = True
-    scheduler_config["worker-paused"] = False
-    signed_rest_request(args, deps, "PUT", config_path, scheduler_config)
-    scheduler_run = signed_rest_request(args, deps, "POST", scheduler_run_path, {"scheduler-id": "pyiceberg-smoke-scheduler"})
-    scheduler_run_job = scheduler_run.get("report", {}).get("job")
-    if not isinstance(scheduler_run_job, dict) or scheduler_run_job.get("status") != "QUEUED":
-        raise RuntimeError("maintenance scheduler run endpoint did not queue a maintenance job")
-    if scheduler_run_job.get("scheduler-id") != "pyiceberg-smoke-scheduler":
-        raise RuntimeError("maintenance scheduler run endpoint did not preserve scheduler identity")
-    scheduler_run_report = scheduler_run.get("scheduler")
-    if not isinstance(scheduler_run_report, dict) or scheduler_run_report.get("status") != "QUEUED":
-        raise RuntimeError("maintenance scheduler run endpoint did not return queued scheduler state")
+    scheduler_id = f"pyiceberg-smoke-{uuid.uuid4().hex}"
+    scheduler_config = {**safe_config, "background-enabled": True, "worker-paused": False}
+    try:
+        signed_rest_request(args, deps, "PUT", config_path, scheduler_config)
+        scheduler_run = signed_rest_request(
+            args, deps, "POST", f"{scheduler_path}/run", {"scheduler-id": scheduler_id}
+        )
+        queued = scheduler_run.get("report", {}).get("job", {})
+        job_id = maintenance_job_id(queued)
+        if job_id is None or queued.get("status") != "QUEUED" or queued.get("operation") != "DRY_RUN":
+            raise RuntimeError("maintenance scheduler run endpoint did not queue a dry-run job")
+        if queued.get("scheduler-id") != scheduler_id:
+            raise RuntimeError("maintenance scheduler run endpoint did not preserve scheduler identity")
+        if scheduler_run.get("scheduler", {}).get("status") != "QUEUED":
+            raise RuntimeError("maintenance scheduler run endpoint did not return queued scheduler state")
+        job_path = table_endpoint_path(args, f"/maintenance/jobs/{urllib.parse.quote(job_id, safe='')}")
+        job_report = signed_rest_request(args, deps, "GET", job_path)
+        if maintenance_job_id(job_report.get("job")) != job_id or not isinstance(job_report.get("audit-events"), list):
+            raise RuntimeError("maintenance job endpoint did not return the queued job and audit events")
+        quarantine = signed_rest_request(args, deps, "POST", f"{job_path}/quarantine", {"action": "INSPECT"})
+        if quarantine.get("action") != "INSPECT" or maintenance_job_id(quarantine.get("report", {}).get("job")) != job_id:
+            raise RuntimeError("maintenance quarantine endpoint did not return the queued job inspection")
 
-    worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
-    worker_job = worker.get("job")
-    expected_statuses = {"DISABLED", "PAUSED", "FAILED", "SUCCESSFUL", "RUNNING", "QUEUED"}
-    if not isinstance(worker_job, dict) or worker_job.get("status") not in expected_statuses:
-        raise RuntimeError("maintenance worker endpoint did not return a stable job status")
-    if not isinstance(worker.get("audit-events"), list):
-        raise RuntimeError("maintenance worker endpoint did not return audit events")
+        worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
+        job = worker.get("job")
+        if not isinstance(job, dict) or job.get("status") != "SUCCESSFUL":
+            raise RuntimeError("maintenance worker did not complete the dry-run job")
+        if maintenance_job_id(job) != job_id or job.get("operation") != "DRY_RUN":
+            raise RuntimeError("maintenance worker changed the queued job identity or operation")
+        for key in ("deleted_metadata_file_count", "deleted_object_count"):
+            if type(job.get(key)) is not int or job[key] != 0:
+                raise RuntimeError("maintenance dry-run did not report zero deletions")
+        if not isinstance(worker.get("audit-events"), list) or not worker["audit-events"]:
+            raise RuntimeError("maintenance worker endpoint did not return audit events")
+        if signed_rest_request(args, deps, "GET", pointer_path) != before:
+            raise RuntimeError("maintenance dry-run changed the table commit state")
+    finally:
+        # Leave smoke-owned tables paused even if admission or execution fails.
+        signed_rest_request(args, deps, "PUT", config_path, safe_config)
 
 
-def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> dict[str, Any]:
+def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps, backing: str) -> tuple[dict[str, Any], dict[str, str]]:
+    if backing not in CATALOG_BACKINGS:
+        raise RuntimeError("catalog probes require a known backing")
     table_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args))
     snapshot_id = current_snapshot_id_from_table_response(table_response)
     run_metadata_location_probe(args, deps, table_response)
     run_table_ref_probe(args, deps, snapshot_id)
     run_view_probe(args, deps)
-    run_maintenance_probe(args, deps)
+    run_table_rename_probe(args, deps)
+    run_load_table_delegation_probe(args, deps)
+    run_maintenance_probe(args, deps, backing)
     diagnostics = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/catalog/diagnostics"))
     if not isinstance(diagnostics, dict) or not diagnostics:
         raise RuntimeError("catalog diagnostics endpoint returned an empty response")
-    return table_response
+    exported = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/catalog/export"))
+    pointer = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/metadata-location"))
+    entry = exported.get("table", {})
+    location = entry.get("metadata_location")
+    if not isinstance(location, str) or not location:
+        raise RuntimeError("catalog export did not include its metadata location")
+    client_location = location if location.startswith("s3://") else f"s3://{args.bucket}/{location}"
+    if pointer.get("metadata-location") != client_location:
+        raise RuntimeError("catalog export does not match the current metadata pointer")
+    for public, stored in (("version-token", "version_token"), ("generation", "generation")):
+        if public not in pointer or entry.get(stored) != pointer[public]:
+            raise RuntimeError("catalog export does not match the current table commit state")
+    probes = engine_compatibility.pyiceberg_catalog_probe_results(backing, skipped=False, vended=bool(args.require_vended_credentials))
+    return signed_rest_request(args, deps, "GET", table_endpoint_path(args)), probes
 
 
 def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
+    if args.client_version:
+        pyiceberg_client_version(args)
     endpoint = normalized_endpoint(args.endpoint)
     ensure_local_proxy_bypass(endpoint)
     ensure_aws_env(args.access_key, args.secret_key, args.region)
+    backing = discover_catalog_backing(args, deps)
 
     print(f"[1/10] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
@@ -1457,10 +1633,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     print(f"[8/10] appending rows through PyIceberg")
     table = catalog.load_table(identifier)
     rows = deps.pyarrow.Table.from_pylist(
-        [
-            {"id": 1, "payload": "alpha"},
-            {"id": 2, "payload": "beta"},
-        ],
+        SMOKE_ROWS,
         schema=arrow_schema,
     )
     table.append(rows)
@@ -1470,9 +1643,12 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     scanned = loaded.scan().to_arrow()
     if scanned.num_rows != 2:
         raise RuntimeError(f"expected 2 rows after append, got {scanned.num_rows}")
+    if sorted(scanned.to_pylist(), key=lambda row: row["id"]) != SMOKE_ROWS:
+        raise RuntimeError("scan returned different data after append")
     loaded_table_location = table_warehouse_location(loaded)
     loaded_metadata_location = table_metadata_location(loaded)
     table_response = None
+    catalog_probes = {"direct-rest": "skipped"}
 
     if args.skip_catalog_api_probes:
         print("[10/10] skipping direct REST catalog API probes")
@@ -1480,7 +1656,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
             table_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args))
     else:
         print("[10/10] probing direct REST catalog APIs")
-        table_response = run_catalog_api_probes(args, deps)
+        table_response, catalog_probes = run_catalog_api_probes(args, deps, backing)
 
     metadata_location = loaded_metadata_location
     if isinstance(table_response, dict):
@@ -1500,6 +1676,8 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
         row_count=scanned.num_rows,
         cleanup_result="dropped-table-and-namespace" if args.cleanup else "not-requested",
         table_warehouse_location=loaded_table_location,
+        catalog_backing=backing,
+        catalog_probes=catalog_probes,
     )
 
 
