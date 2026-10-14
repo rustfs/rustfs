@@ -27,6 +27,7 @@ const ISSUE_PLUGIN_ATTEMPT: AdminActionRef = AdminActionRef::new("IssuePluginAtt
 const SUBMIT_PLUGIN_JOB: AdminActionRef = AdminActionRef::new("SubmitPluginJobAction");
 const GET_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("GetPluginRunAction");
 const CANCEL_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("CancelPluginRunAction");
+const LIST_PLUGIN_RUNS: AdminActionRef = AdminActionRef::new("ListPluginRunsAction");
 const GET_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("GetPluginDelegationAction");
 const CREATE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("CreatePluginDelegationAction");
 const REVOKE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("RevokePluginDelegationAction");
@@ -665,6 +666,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel",
         CANCEL_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/page",
+        LIST_PLUGIN_RUNS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -1992,6 +1999,17 @@ mod tests {
             .iter()
             .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
             .expect("plugin run cancel route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_page_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/page";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run page route policy");
         assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
     }
 

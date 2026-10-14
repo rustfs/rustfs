@@ -13,9 +13,12 @@ use std::time::Duration;
 const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
 const QUERY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/query";
 const CANCEL_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/cancel";
+const PAGE_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/page";
 const MAX_RECEIPT_BYTES: usize = 4096;
 // The Runner bounds a result manifest to 1 MiB and reserves 4 KiB for its JSON envelope.
 const MAX_QUERY_RESPONSE_BYTES: usize = 1_052_672;
+const MAX_PAGE_REQUEST_BYTES: usize = 4096;
+const MAX_PAGE_RESPONSE_BYTES: usize = 32 * 1024;
 
 #[derive(Serialize)]
 pub(crate) struct SubmitRequest<'a> {
@@ -80,6 +83,40 @@ pub(crate) struct CancelResponse {
     pub run_id: uuid::Uuid,
     pub state: String,
     pub cleanup_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunPageCursor {
+    pub created_at_unix_micros: i64,
+    pub run_id: uuid::Uuid,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PageRequest<'a> {
+    pub version: u32,
+    pub actual_signer_access_key: &'a str,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+    pub limit: u32,
+    pub cursor: Option<RunPageCursor>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunSummary {
+    pub run_id: uuid::Uuid,
+    pub state: String,
+    pub epoch: i64,
+    pub created_at_unix_micros: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageResponse {
+    pub version: u32,
+    pub runs: Vec<RunSummary>,
+    pub next_cursor: Option<RunPageCursor>,
 }
 
 fn required_manifest<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
@@ -180,6 +217,43 @@ pub(crate) async fn cancel(request: &CancelRequest<'_>) -> S3Result<CancelRespon
     }
 }
 
+pub(crate) async fn page(request: &PageRequest<'_>) -> S3Result<PageResponse> {
+    if !(1..=100).contains(&request.limit) || request.cursor.is_some_and(|cursor| cursor.run_id.is_nil()) {
+        return Err(s3_error!(InvalidRequest, "invalid plugin run page request"));
+    }
+    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run page request"))?;
+    if body.len() > MAX_PAGE_REQUEST_BYTES {
+        return Err(s3_error!(InvalidRequest, "plugin run page request too large"));
+    }
+    let mut url = configured_url()?;
+    url.set_path(PAGE_ENDPOINT_PATH);
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_PAGE_RESPONSE_BYTES).await?;
+            let result: PageResponse = serde_json::from_slice(&body)
+                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner page response invalid"))?;
+            if !valid_page_response(&result, request.limit) {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner page response invalid"));
+            }
+            Ok(result)
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+    }
+}
+
 fn cancel_status_error(status: StatusCode) -> s3s::S3Error {
     match status {
         StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
@@ -204,6 +278,37 @@ fn valid_query_response(response: &QueryResponse, run_id: uuid::Uuid) -> bool {
             response.state.as_str(),
             "QUEUED" | "LEASED" | "RUNNING" | "RETRY_WAIT" | "SUCCEEDED" | "FAILED" | "CANCELLED"
         )
+}
+
+fn valid_page_response(response: &PageResponse, limit: u32) -> bool {
+    if response.version != 1 || response.runs.len() > limit as usize {
+        return false;
+    }
+    let mut previous = None;
+    for run in &response.runs {
+        if run.run_id.is_nil()
+            || run.epoch < 0
+            || !matches!(
+                run.state.as_str(),
+                "QUEUED" | "LEASED" | "RUNNING" | "RETRY_WAIT" | "SUCCEEDED" | "FAILED" | "CANCELLED"
+            )
+        {
+            return false;
+        }
+        let key = (run.created_at_unix_micros, run.run_id);
+        if previous.is_some_and(|previous| previous <= key) {
+            return false;
+        }
+        previous = Some(key);
+    }
+    response.next_cursor.is_none_or(|cursor| {
+        response.runs.len() == limit as usize
+            && response.runs.last().is_some_and(|last| {
+                !cursor.run_id.is_nil()
+                    && cursor.created_at_unix_micros == last.created_at_unix_micros
+                    && cursor.run_id == last.run_id
+            })
+    })
 }
 
 async fn configured_client() -> S3Result<Client> {
@@ -332,6 +437,8 @@ mod tests {
         assert_eq!(query.path(), QUERY_ENDPOINT_PATH);
         query.set_path(CANCEL_ENDPOINT_PATH);
         assert_eq!(query.path(), CANCEL_ENDPOINT_PATH);
+        query.set_path(PAGE_ENDPOINT_PATH);
+        assert_eq!(query.path(), PAGE_ENDPOINT_PATH);
     }
 
     #[test]
@@ -419,6 +526,51 @@ mod tests {
             cancel_status_error(StatusCode::SERVICE_UNAVAILABLE).code(),
             &s3s::S3ErrorCode::ServiceUnavailable
         );
+    }
+
+    #[test]
+    fn run_page_response_is_strict_bounded_and_stably_ordered() {
+        let first = uuid::Uuid::from_u128(2);
+        let second = uuid::Uuid::from_u128(1);
+        let valid: PageResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"runs":[{{"run_id":"{first}","state":"QUEUED","epoch":0,"created_at_unix_micros":20}},{{"run_id":"{second}","state":"SUCCEEDED","epoch":1,"created_at_unix_micros":10}}],"next_cursor":null}}"#
+        ))
+        .unwrap();
+        assert!(valid_page_response(&valid, 2));
+        assert!(!valid_page_response(&valid, 1));
+        assert!(serde_json::from_str::<PageResponse>(&format!(
+            r#"{{"version":1,"runs":[{{"run_id":"{first}","state":"QUEUED","epoch":0,"created_at_unix_micros":20}}],"next_cursor":null,"tenant":"other"}}"#
+        ))
+        .is_err());
+
+        let cursor: PageResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"runs":[{{"run_id":"{first}","state":"QUEUED","epoch":0,"created_at_unix_micros":20}}],"next_cursor":{{"run_id":"{first}","created_at_unix_micros":20}}}}"#
+        ))
+        .unwrap();
+        assert!(valid_page_response(&cursor, 1));
+        let mismatched_cursor: PageResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"runs":[{{"run_id":"{first}","state":"QUEUED","epoch":0,"created_at_unix_micros":20}}],"next_cursor":{{"run_id":"{second}","created_at_unix_micros":20}}}}"#
+        ))
+        .unwrap();
+        assert!(!valid_page_response(&mismatched_cursor, 1));
+    }
+
+    #[test]
+    fn run_page_request_and_response_limits_reject_overflow() {
+        assert_eq!(MAX_PAGE_REQUEST_BYTES, 4096);
+        assert_eq!(MAX_PAGE_RESPONSE_BYTES, 32 * 1024);
+        assert!(bounded_len_allowed(MAX_PAGE_RESPONSE_BYTES - 1, 1, MAX_PAGE_RESPONSE_BYTES));
+        assert!(!bounded_len_allowed(MAX_PAGE_RESPONSE_BYTES, 1, MAX_PAGE_RESPONSE_BYTES));
+        let oversized_signer = "x".repeat(MAX_PAGE_REQUEST_BYTES);
+        let request = PageRequest {
+            version: 1,
+            actual_signer_access_key: &oversized_signer,
+            delegation_id: "d",
+            delegation_revision: "r",
+            limit: 1,
+            cursor: None,
+        };
+        assert!(serde_json::to_vec(&request).unwrap().len() > MAX_PAGE_REQUEST_BYTES);
     }
 
     #[test]

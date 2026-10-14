@@ -43,6 +43,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/cancel"),
         AdminOperation(&CancelRun),
     )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/page"),
+        AdminOperation(&PageRuns),
+    )?;
     Ok(())
 }
 
@@ -296,12 +301,56 @@ impl Operation for CancelRun {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageRunsInput {
+    version: u32,
+    limit: u32,
+    #[serde(default)]
+    cursor: Option<plugin_runner::RunPageCursor>,
+}
+
+fn valid_page_runs_input(input: &PageRunsInput) -> bool {
+    input.version == 1 && (1..=100).contains(&input.limit) && !input.cursor.is_some_and(|cursor| cursor.run_id.is_nil())
+}
+
+struct PageRuns;
+#[async_trait::async_trait]
+impl Operation for PageRuns {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "page body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "page body unavailable"))?;
+        let input: PageRunsInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid page request"))?;
+        if !valid_page_runs_input(&input) {
+            return Err(s3_error!(InvalidRequest, "invalid page request"));
+        }
+        let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
+        let result = plugin_runner::page(&plugin_runner::PageRequest {
+            version: input.version,
+            actual_signer_access_key: &signer,
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+            limit: input.limit,
+            cursor: input.cursor,
+        })
+        .await?;
+        response(&result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
-        for operation in 0..5 {
+        for operation in 0..6 {
             let req = S3Request {
                 input: Body::from("{}".to_owned()),
                 method: Method::POST,
@@ -323,6 +372,8 @@ mod tests {
                 QueryRun.call(req, Params::new()).await
             } else if operation == 4 {
                 CancelRun.call(req, Params::new()).await
+            } else if operation == 5 {
+                PageRuns.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
             };
@@ -379,5 +430,31 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn page_runs_dto_is_strict_and_bounded() {
+        let cursor = plugin_runner::RunPageCursor {
+            created_at_unix_micros: 10,
+            run_id: uuid::Uuid::from_u128(1),
+        };
+        let input: PageRunsInput = serde_json::from_str(
+            r#"{"version":1,"limit":100,"cursor":{"created_at_unix_micros":10,"run_id":"00000000-0000-0000-0000-000000000001"}}"#,
+        )
+        .expect("valid page request");
+        assert_eq!(input.cursor, Some(cursor));
+        for raw in [
+            r#"{"version":1,"limit":0}"#,
+            r#"{"version":1,"limit":101}"#,
+            r#"{"version":1,"limit":1,"unknown":true}"#,
+            r#"{"version":1,"limit":1,"actual_signer_access_key":"forged"}"#,
+            r#"{"version":1,"limit":1,"cursor":{"created_at_unix_micros":10,"run_id":"00000000-0000-0000-0000-000000000000"}}"#,
+        ] {
+            let rejected = match serde_json::from_str::<PageRunsInput>(raw) {
+                Ok(input) => !valid_page_runs_input(&input),
+                Err(_) => true,
+            };
+            assert!(rejected, "accepted invalid page request: {raw}");
+        }
     }
 }
