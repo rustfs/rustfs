@@ -1400,6 +1400,15 @@ impl ErasureSetHealer {
                 None => self.storage.heal_bucket(bucket, &bucket_opts).await?,
             };
             task.record_result_item(result).await;
+            // Keep recovery in the checkpoint's admitted incarnation and repair
+            // the publication bucket before adopting a survivor's delete proof.
+            if let Some(result) = self
+                .storage
+                .recover_delete_transactions(bucket, None, incarnation, &self.heal_opts)
+                .await?
+            {
+                task.record_result_item(result).await;
+            }
         }
 
         // 1. get bucket info

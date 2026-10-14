@@ -26,7 +26,13 @@ pub(crate) use rustfs_ecstore::api::disk::{
 };
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::layout::{
+    EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks as ecstore_init_local_disks;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
     HealObjectStorageResult as EcstoreHealObjectStorageResult, POOL_META_NAME as ECSTORE_POOL_META_NAME,
