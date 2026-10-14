@@ -758,7 +758,7 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
-            StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            StorageError::DiskFull | StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
@@ -978,6 +978,35 @@ mod tests {
         assert!(body.contains("<Code>ServiceUnavailable</Code>"));
         assert!(!body.contains("private-bucket"));
         assert!(!body.contains("private-key"));
+    }
+
+    #[tokio::test]
+    async fn capacity_failures_share_service_unavailable_without_lock_retry_advice() {
+        use crate::storage_api::error::DiskError;
+        use http_body_util::BodyExt as _;
+
+        for failure in [
+            StorageError::DiskFull,
+            StorageError::StorageFull,
+            StorageError::from(DiskError::DiskFull),
+        ] {
+            let expected_code = failure.code();
+            let error = S3Error::from(ApiError::from(failure));
+            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<StorageError>())
+                .expect("retain the original capacity failure");
+            assert_eq!(source.code(), expected_code);
+            let response = error.to_http_response().expect("serialize capacity refusal");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = response.into_body().collect().await.expect("read S3 error XML").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("S3 XML is UTF-8");
+            assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!xml.contains("InternalError"));
+        }
     }
 
     #[test]
@@ -1908,6 +1937,7 @@ mod tests {
                 S3ErrorCode::InvalidArgument,
             ),
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
+            (StorageError::DiskFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
             (StorageError::FaultyDisk, S3ErrorCode::ServiceUnavailable),

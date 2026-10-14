@@ -23,7 +23,7 @@ static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq)]
-enum PutReadQuorumTestStage {
+enum PutStorageTestStage {
     DefaultSse,
     Prelookup,
     Commit,
@@ -31,15 +31,15 @@ enum PutReadQuorumTestStage {
 
 #[cfg(test)]
 tokio::task_local! {
-    static PUT_READ_QUORUM_TEST_STAGE: PutReadQuorumTestStage;
+    static PUT_STORAGE_TEST_FAILURE: (PutStorageTestStage, StorageError);
 }
 
 #[cfg(test)]
-fn injected_put_read_quorum_failure(stage: PutReadQuorumTestStage) -> Option<StorageError> {
-    PUT_READ_QUORUM_TEST_STAGE
-        .try_with(|configured| *configured == stage)
-        .unwrap_or(false)
-        .then(|| StorageError::InsufficientReadQuorum("bucket".into(), "object".into()))
+fn injected_put_storage_failure(stage: PutStorageTestStage) -> Option<StorageError> {
+    PUT_STORAGE_TEST_FAILURE
+        .try_with(|(configured_stage, error)| (*configured_stage == stage).then(|| error.clone()))
+        .ok()
+        .flatten()
 }
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
@@ -1578,7 +1578,7 @@ impl DefaultObjectUsecase {
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await;
         #[cfg(test)]
-        let bucket_sse_config = injected_put_read_quorum_failure(PutReadQuorumTestStage::DefaultSse)
+        let bucket_sse_config = injected_put_storage_failure(PutStorageTestStage::DefaultSse)
             .map_or(bucket_sse_config, |err| Err(ApiError::from(err).into()));
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
         let bucket_sse_config = bucket_sse_config?;
@@ -1731,8 +1731,7 @@ impl DefaultObjectUsecase {
         // metadata fanout per PUT.
         let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
         #[cfg(test)]
-        let prelookup_required =
-            prelookup_required || injected_put_read_quorum_failure(PutReadQuorumTestStage::Prelookup).is_some();
+        let prelookup_required = prelookup_required || injected_put_storage_failure(PutStorageTestStage::Prelookup).is_some();
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
@@ -1749,7 +1748,7 @@ impl DefaultObjectUsecase {
             };
             #[cfg(test)]
             let previous_current_info =
-                injected_put_read_quorum_failure(PutReadQuorumTestStage::Prelookup).map_or(previous_current_info, Err);
+                injected_put_storage_failure(PutStorageTestStage::Prelookup).map_or(previous_current_info, Err);
             Some(match previous_current_info {
                 Ok(existing_obj_info) => {
                     validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?;
@@ -2076,7 +2075,7 @@ impl DefaultObjectUsecase {
             None
         };
         #[cfg(test)]
-        let injected_commit_error = injected_put_read_quorum_failure(PutReadQuorumTestStage::Commit);
+        let injected_commit_error = injected_put_storage_failure(PutStorageTestStage::Commit);
         let put_commit = spawn_traced_join({
             let store = Arc::clone(&store);
             let bucket = bucket.clone();
@@ -2343,9 +2342,9 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
 
         for (index, stage) in [
-            PutReadQuorumTestStage::DefaultSse,
-            PutReadQuorumTestStage::Prelookup,
-            PutReadQuorumTestStage::Commit,
+            PutStorageTestStage::DefaultSse,
+            PutStorageTestStage::Prelookup,
+            PutStorageTestStage::Commit,
         ]
         .into_iter()
         .enumerate()
@@ -2363,8 +2362,11 @@ mod tests {
                 if method == Method::POST {
                     req.extensions.insert(PostObjectRequestMarker);
                 }
-                let err = PUT_READ_QUORUM_TEST_STAGE
-                    .scope(stage, usecase.execute_put_object(&FS::new(), req))
+                let err = PUT_STORAGE_TEST_FAILURE
+                    .scope(
+                        (stage, StorageError::InsufficientReadQuorum("bucket".into(), "object".into())),
+                        usecase.execute_put_object(&FS::new(), req),
+                    )
                     .await
                     .expect_err("read quorum failure must refuse the upload");
                 assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "stage {index}, method {method}");
@@ -2389,6 +2391,54 @@ mod tests {
                     "failed PUT must leave no object: {lookup:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn put_capacity_failure_returns_unavailable_without_publishing_object() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-capacity-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("capacity PUT bucket must be created");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (index, failure) in [StorageError::DiskFull, StorageError::StorageFull].into_iter().enumerate() {
+            let key = format!("refused-{index}");
+            let input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(key.clone())
+                .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"capacity probe"))))
+                .content_length(Some(14))
+                .build()
+                .expect("capacity PUT input must build");
+            let request = build_request(input, Method::PUT);
+            let error = PUT_STORAGE_TEST_FAILURE
+                .scope((PutStorageTestStage::Commit, failure), usecase.execute_put_object(&FS::new(), request))
+                .await
+                .expect_err("capacity refusal must fail PUT");
+            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert!(matches!(
+                error.source().and_then(|source| source.downcast_ref::<StorageError>()),
+                Some(StorageError::DiskFull | StorageError::StorageFull)
+            ));
+            let response = error.to_http_response().expect("PUT error must serialize");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("PUT error XML must be readable")
+                .to_bytes();
+            let xml = std::str::from_utf8(&body).expect("PUT error XML must be UTF-8");
+            assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+            let lookup = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await;
+            assert!(
+                lookup.as_ref().is_err_and(is_err_object_not_found),
+                "failed PUT must publish no object: {lookup:?}"
+            );
         }
     }
 
