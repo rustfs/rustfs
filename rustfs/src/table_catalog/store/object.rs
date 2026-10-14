@@ -5153,7 +5153,7 @@ where
                 );
             }
         }
-        let warehouse_object_prefix = table_warehouse_object_prefix(&entry).ok();
+        let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
         let current_metadata_location = entry.metadata_location.clone();
         let retained_metadata_locations = retained.into_iter().collect::<Vec<_>>();
         let object_reports = metadata_maintenance_object_reports(maintenance_reasons);
@@ -5677,7 +5677,7 @@ where
                 "current metadata location changed before maintenance delete".to_string(),
             ));
         }
-        let warehouse_object_prefix = table_warehouse_object_prefix(&entry).ok();
+        let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
 
         let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
         else {

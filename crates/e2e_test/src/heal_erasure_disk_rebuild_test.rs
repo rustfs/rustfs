@@ -1969,11 +1969,16 @@ mod tests {
             let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
             let status: serde_json::Value = serde_json::from_str(&status_body)
                 .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {status_body}"))?;
-            if background_enabled || only_admin_heal_is_active(&status) {
+            let admin_active = background_rejoin_heal_evidence
+                || (status["state"].as_str() == Some("active")
+                    && status["healOperations"]["activeBySource"]["admin"].as_u64() == Some(1));
+            if admin_active && (background_enabled || only_admin_heal_is_active(&status)) {
                 break status;
             }
             if Instant::now() >= partial_deadline {
-                return Err(format!("non-admin heal did not drain before the interruption deadline: {status}").into());
+                return Err(
+                    format!("heal tasks did not reach the required interruption state before the deadline: {status}").into(),
+                );
             }
             sleep(Duration::from_millis(50)).await;
         };
