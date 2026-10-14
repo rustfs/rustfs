@@ -6,6 +6,8 @@
 
 The canonical `ApiError` conversion in `rustfs/src/error.rs` retains HTTP 503 and the S3 `ServiceUnavailable` code for typed lock acquisition timeouts, and adds `Retry-After: 1`. The header is a minimum retry delay, not a receipt that the competing owner has released its lock. Use bounded exponential backoff with jitter and keep the client's overall request budget.
 
+S3 data-plane catalog publication-lock timeouts use the same conversion, typed lock-failure counter, and generic public message; catalog resource and peer details remain in the internal error source. Catalog failures represented only as strings do not inherit lock retry advice.
+
 This advice does not change the lock acquisition budget or shorten a competing writer's commit tail. It is not added to unrelated disk timeouts, quorum failures, or errors that merely contain timeout text. A 503 near five seconds is insufficient to attribute the request to a namespace lock: disk metadata operations also have a five-second default budget. Correlate the typed lock-failure counters and acquisition events below before changing contention policy.
 
 ## Capture one acquisition and its competing owners

@@ -624,6 +624,26 @@ impl From<ApiError> for S3Error {
     }
 }
 
+impl From<crate::table_catalog::TableCatalogStoreError> for ApiError {
+    fn from(err: crate::table_catalog::TableCatalogStoreError) -> Self {
+        if let crate::table_catalog::TableCatalogStoreError::LockUnavailable { source, .. } = err {
+            // Use the storage boundary once so typed lock failures share its
+            // bounded metrics, public message, and retry advice.
+            return Self::from(StorageError::Lock(*source));
+        }
+        let code = if err.is_unavailable() {
+            S3ErrorCode::ServiceUnavailable
+        } else {
+            S3ErrorCode::InternalError
+        };
+        Self {
+            message: Self::error_code_to_message(&code),
+            code,
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         record_s3_lock_failure(&err);
@@ -1033,6 +1053,42 @@ mod tests {
         assert_eq!(labels["reason"], "timeout");
         assert_eq!(labels["resource_class"], "system_metadata");
         assert!(!labels.values().any(|value| value.contains("durable-dirty-producer-replay")));
+    }
+
+    #[test]
+    fn catalog_lock_failure_uses_canonical_metrics_and_retry_advice_once() {
+        let recorder = DebuggingRecorder::new();
+        let error = with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                S3Error::from(ApiError::from(crate::table_catalog::TableCatalogStoreError::LockUnavailable {
+                    message: "private catalog operation".to_owned(),
+                    source: Box::new(LockError::timeout(
+                        "private-bucket/.rustfs-table/warehouses/default/publication.lock@latest",
+                        std::time::Duration::from_secs(5),
+                    )),
+                }))
+            })
+        });
+        let response = error.to_http_response().expect("serialize catalog lock timeout");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        let metrics = recorder.snapshotter().snapshot().into_vec();
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("catalog lock failures should use the canonical counter");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["reason"], "timeout");
+        assert_eq!(labels["resource_class"], "object_namespace");
+        assert!(!labels.values().any(|value| value.contains("private")));
     }
 
     #[test]

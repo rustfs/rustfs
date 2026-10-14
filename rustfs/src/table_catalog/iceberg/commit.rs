@@ -277,7 +277,7 @@ fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &
             | TableCatalogStoreError::TableNotFound(_),
         ) => "not_found",
         Err(TableCatalogStoreError::Unsupported(_)) => "unsupported",
-        Err(TableCatalogStoreError::Unavailable(_)) => "unavailable",
+        Err(TableCatalogStoreError::Unavailable(_) | TableCatalogStoreError::LockUnavailable { .. }) => "unavailable",
         Err(TableCatalogStoreError::Internal(_)) => "failure",
     }
 }
@@ -286,7 +286,7 @@ fn duration_millis_u64(duration: StdDuration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn record_table_commit_cas_result(operation: &str, started: Instant, result: &TableCatalogStoreResult<()>) {
+pub(crate) fn record_table_commit_cas_result<T>(operation: &str, started: Instant, result: &TableCatalogStoreResult<T>) {
     let elapsed = started.elapsed();
     let result_label = table_catalog_store_result_label(result);
     counter!(
@@ -390,10 +390,15 @@ mod tests {
 
     #[test]
     fn table_catalog_unavailable_result_label_is_stable() {
-        let result: TableCatalogStoreResult<()> = Err(TableCatalogStoreError::Unavailable(
-            "catalog publication authority is temporarily unavailable".to_string(),
-        ));
-
-        assert_eq!(table_catalog_store_result_label(&result), "unavailable");
+        for error in [
+            TableCatalogStoreError::Unavailable("catalog publication authority is temporarily unavailable".to_string()),
+            TableCatalogStoreError::LockUnavailable {
+                message: "catalog publication authority is temporarily unavailable".to_string(),
+                source: Box::new(rustfs_lock::LockError::timeout("catalog/lock", StdDuration::from_secs(5))),
+            },
+        ] {
+            let result: TableCatalogStoreResult<()> = Err(error);
+            assert_eq!(table_catalog_store_result_label(&result), "unavailable");
+        }
     }
 }
