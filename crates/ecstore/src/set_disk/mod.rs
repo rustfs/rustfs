@@ -7733,6 +7733,10 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
     canonicalize_etag(etag) == canonicalize_etag(condition)
 }
 
+/// `If-None-Match` on a write means create-only (`*`); the S3 handlers reject any
+/// other value with 501 before it reaches the store. Any non-blank value therefore
+/// blocks the overwrite instead of being compared as an ETag, so a caller that skips
+/// that check still cannot turn the precondition into a weaker one.
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
     let if_none_match = if_none_match
         .as_deref()
@@ -7742,9 +7746,7 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
 
     match &oi.etag {
         Some(etag) => {
-            if let Some(if_none_match) = if_none_match
-                && e_tag_matches(etag, if_none_match)
-            {
+            if if_none_match.is_some() {
                 return true;
             }
             if let Some(if_match) = if_match
@@ -13492,17 +13494,19 @@ mod tests {
         let if_match = Some("*".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
+        // A non-wildcard If-None-Match is not an ETag comparison on writes: it never
+        // lets an existing object be overwritten, whatever the value.
         let if_none_match = Some("def".to_string());
         let if_match = None;
-        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("def".to_string());
         let if_match = Some("*".to_string());
-        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("def".to_string());
         let if_match = Some("\"abc\"".to_string());
-        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("*".to_string());
         let if_match = Some("\"abc\"".to_string());

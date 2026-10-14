@@ -1107,6 +1107,17 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     check_preconditions(headers, &info)
 }
 
+/// S3 accepts `If-None-Match` on PutObject, CopyObject and CompleteMultipartUpload
+/// only as `*` (create-only) and answers any other value with 501 NotImplemented.
+/// Treating it as an ETag comparison would let a write overwrite an existing key
+/// while still satisfying a policy that requires `s3:if-none-match`.
+pub(crate) fn reject_non_wildcard_write_if_none_match(if_none_match: Option<&s3s::dto::ETagCondition>) -> S3Result<()> {
+    match if_none_match {
+        Some(s3s::dto::ETagCondition::ETag(_)) => Err(S3Error::new(S3ErrorCode::NotImplemented)),
+        Some(s3s::dto::ETagCondition::Any) | None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1127,21 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
+        assert!(reject_non_wildcard_write_if_none_match(None).is_ok());
+        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any)).is_ok());
+
+        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
+        let err = reject_non_wildcard_write_if_none_match(Some(&etag)).expect_err("an ETag If-None-Match must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
+    }
 
     #[test]
     fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {

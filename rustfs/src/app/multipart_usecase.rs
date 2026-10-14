@@ -72,7 +72,7 @@ use super::storage_api::multipart_usecase::{
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout, reject_oversize_single_upload,
+    put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -580,6 +580,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_non_wildcard_write_if_none_match(if_none_match.as_ref())?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
@@ -589,25 +590,15 @@ impl DefaultMultipartUsecase {
 
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
                 Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
+                    if !info.delete_marker
+                        && let Some(ifmatch) = if_match
+                        && let Some(strong_etag) = ifmatch.into_etag()
+                        && info
+                            .etag
+                            .as_ref()
+                            .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                    {
+                        return Err(s3_error!(PreconditionFailed));
                     }
                 }
                 Err(err) => {
