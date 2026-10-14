@@ -51,6 +51,8 @@ An unreadable replica, lost fence, or conditional-write conflict leaves the orig
 - `rustfs_pool_metadata_blocks_total{reason}` and `rustfs_pool_metadata_recoveries_total` count block and recovery transitions. The original cause and phase remain attached to local typed errors; storage/RPC error numbers and on-disk formats are unchanged.
 - Node and cluster-write readiness include `pool_meta_write_blocked`. Waiting for the metadata save mutex is bounded to 100 ms and reports `pool_metadata_check_timeout`, not a persistent block. Cluster probes retain their existing cache and overall timeout behavior. Liveness and cluster-read quorum checks are unchanged. The authenticated node-local status and safe error fields are described in [S3 write failure diagnostics](s3-write-failure-diagnostics.md).
 
+System metadata writes wait for the complete rename result. If write quorum commits but a replica fails or signatures diverge, the write returns a repair-required error to its owning writer after committed cleanup and cache invalidation. The committed bytes are not rolled back. Generic MRF and heal-channel requests cannot supply the deployment and transaction authority needed to repair system metadata; pool CAS retains the uncertain outcome and its existing recovery fence. Ordinary object repair keeps its bucket-incarnation fencing.
+
 If a block persists, inspect the first block and subsequent recovery phase, restore disk/peer readability, and verify every metadata and identity copy before restarting. Do not delete metadata to make readiness green.
 
 ## Disk replacement and metadata erasure

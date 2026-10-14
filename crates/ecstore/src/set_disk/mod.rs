@@ -4778,6 +4778,10 @@ impl DiskHealthEntry {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("committed system metadata write requires repair by its owning writer")]
+pub(crate) struct SystemMetadataRepairRequired;
+
 impl SetDisks {
     pub(in crate::set_disk) async fn persist_delete_marker_purge(
         &self,
@@ -4888,7 +4892,7 @@ impl SetDisks {
                     state = "mrf_durable_admission_failed",
                     bucket, object, version_id, pool_index = self.pool_index, set_index = self.set_index,
                     error = %error,
-                    "Partial write repair falling back to the heal channel"
+                    "Partial write repair responsibility could not be persisted"
                 );
                 false
             }
@@ -4898,7 +4902,12 @@ impl SetDisks {
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
         mut request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
-    ) {
+    ) -> Result<()> {
+        // System metadata repair remains with the writer's deployment and
+        // transaction fence; a user-bucket MRF authority cannot authorize it.
+        if crate::bucket::utils::is_meta_bucketname(&request.bucket) {
+            return Err(Error::other(SystemMetadataRepairRequired));
+        }
         if let Some(object) = request.object_prefix.as_deref()
             && self
                 .persist_partial_write(
@@ -4909,10 +4918,10 @@ impl SetDisks {
                 )
                 .await
         {
-            return;
+            return Ok(());
         }
         if request.expected_bucket_incarnation_id.is_none() {
-            return;
+            return Ok(());
         }
         request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
@@ -4924,11 +4933,12 @@ impl SetDisks {
                 .clone();
             if let Some(capture) = capture {
                 let _ = capture.send(request);
-                return;
+                return Ok(());
             }
         }
 
         let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
+        Ok(())
     }
 
     #[cfg(test)]
