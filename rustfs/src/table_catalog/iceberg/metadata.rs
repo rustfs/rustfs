@@ -35,17 +35,6 @@ where
         .map(Some)
 }
 
-pub(crate) fn metadata_log_locations(
-    current_metadata: &serde_json::Value,
-    table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
-) -> BTreeSet<String> {
-    metadata_log_locations_matching(current_metadata, table_bucket, |location| {
-        is_valid_table_metadata_location(namespace, table, location)
-    })
-}
-
 pub(crate) fn metadata_log_locations_matching(
     current_metadata: &serde_json::Value,
     table_bucket: &str,

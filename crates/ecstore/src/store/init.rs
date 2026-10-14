@@ -22143,7 +22143,6 @@ mod tests {
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("kill-point bucket should be created");
-        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
 
         for (index, point, expected_state, expected_revision, expected_committed, expected_recovered) in [
             (
@@ -22187,10 +22186,14 @@ mod tests {
                 .await
                 .expect("kill-point source should be written");
             let remote_before = backend.object_count().await;
+            // Earlier cancellation/recovery cases must not consume this
+            // transaction's 30-second homogeneous-fleet proof window.
+            let _compaction_proof =
+                install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
             let barrier = TransitionTransactionKillPointBarrier::install(bucket, &object, point);
             let transition_store = store.clone();
             let transition_object = object.clone();
-            let transition = tokio::spawn(async move {
+            let mut transition = tokio::spawn(async move {
                 transition_store
                     .transition_object(
                         bucket,
@@ -22209,7 +22212,12 @@ mod tests {
                     )
                     .await
             });
-            barrier.wait_until_paused().await;
+            tokio::select! {
+                _ = barrier.wait_until_paused() => {}
+                result = &mut transition => {
+                    panic!("transition exited before reaching {point:?}: {result:?}");
+                }
+            }
             transition.abort();
             assert!(
                 transition

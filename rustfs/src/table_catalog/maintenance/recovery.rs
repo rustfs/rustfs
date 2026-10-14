@@ -72,6 +72,51 @@ fn insert_referenced_object_report(
     report.reasons.insert(reason);
 }
 
+#[derive(Clone, Copy)]
+enum TableMaintenanceObjectScope<'a> {
+    Logical {
+        namespace: &'a Namespace,
+        table: &'a IdentifierSegment,
+    },
+    Entry(&'a TableEntry),
+}
+
+impl TableMaintenanceObjectScope<'_> {
+    fn object_kind(
+        self,
+        warehouse_object_prefix: Option<&str>,
+        object_location: &str,
+    ) -> Option<TableMetadataMaintenanceObjectKind> {
+        match self {
+            Self::Logical { namespace, table } => {
+                table_maintenance_object_kind(namespace, table, warehouse_object_prefix, object_location)
+            }
+            Self::Entry(entry) => table_maintenance_object_kind_for_entry(entry, warehouse_object_prefix, object_location),
+        }
+    }
+
+    fn object_directories(self) -> TableCatalogStoreResult<(String, String, String)> {
+        match self {
+            Self::Logical { namespace, table } => Ok((
+                default_table_metadata_dir_path(namespace, table),
+                default_table_data_dir_path(namespace, table),
+                default_table_delete_dir_path(namespace, table),
+            )),
+            Self::Entry(entry) => {
+                let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
+                let table_root = metadata_dir.strip_suffix(&format!("/{METADATA_DIR}")).ok_or_else(|| {
+                    TableCatalogStoreError::Invalid(
+                        "current metadata location must be inside a table metadata directory".to_string(),
+                    )
+                })?;
+                let data_dir = format!("{table_root}/{DATA_DIR}");
+                let delete_dir = format!("{table_root}/{DELETE_DIR}");
+                Ok((metadata_dir, data_dir, delete_dir))
+            }
+        }
+    }
+}
+
 pub(crate) async fn metadata_maintenance_referenced_object_reports<B>(
     backend: &B,
     table_bucket: &str,
@@ -84,12 +129,55 @@ pub(crate) async fn metadata_maintenance_referenced_object_reports<B>(
 where
     B: TableCatalogObjectBackend,
 {
+    metadata_maintenance_referenced_object_reports_in_scope(
+        backend,
+        table_bucket,
+        TableMaintenanceObjectScope::Logical { namespace, table },
+        warehouse_object_prefix,
+        current_metadata,
+        retained_metadata_locations,
+    )
+    .await
+}
+
+pub(crate) async fn metadata_maintenance_referenced_object_reports_for_entry<B>(
+    backend: &B,
+    entry: &TableEntry,
+    warehouse_object_prefix: Option<&str>,
+    current_metadata: &serde_json::Value,
+    retained_metadata_locations: &[String],
+) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReferencedObjectReport>>
+where
+    B: TableCatalogObjectBackend,
+{
+    table_metadata_dir_path_for_entry(entry)?;
+    metadata_maintenance_referenced_object_reports_in_scope(
+        backend,
+        &entry.table_bucket,
+        TableMaintenanceObjectScope::Entry(entry),
+        warehouse_object_prefix,
+        current_metadata,
+        retained_metadata_locations,
+    )
+    .await
+}
+
+async fn metadata_maintenance_referenced_object_reports_in_scope<B>(
+    backend: &B,
+    table_bucket: &str,
+    scope: TableMaintenanceObjectScope<'_>,
+    warehouse_object_prefix: Option<&str>,
+    current_metadata: &serde_json::Value,
+    retained_metadata_locations: &[String],
+) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReferencedObjectReport>>
+where
+    B: TableCatalogObjectBackend,
+{
     let mut reports = BTreeMap::<String, TableMetadataMaintenanceReferencedObjectAccumulator>::new();
     metadata_maintenance_referenced_object_reports_for_metadata(
         backend,
         table_bucket,
-        namespace,
-        table,
+        scope,
         warehouse_object_prefix,
         current_metadata,
         &mut reports,
@@ -114,8 +202,7 @@ where
         metadata_maintenance_referenced_object_reports_for_metadata(
             backend,
             table_bucket,
-            namespace,
-            table,
+            scope,
             warehouse_object_prefix,
             &metadata,
             &mut reports,
@@ -137,8 +224,7 @@ where
 async fn metadata_maintenance_referenced_object_reports_for_metadata<B>(
     backend: &B,
     table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    scope: TableMaintenanceObjectScope<'_>,
     warehouse_object_prefix: Option<&str>,
     metadata: &serde_json::Value,
     reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
@@ -155,8 +241,7 @@ where
             metadata_maintenance_referenced_manifest_list(
                 backend,
                 table_bucket,
-                namespace,
-                table,
+                scope,
                 warehouse_object_prefix,
                 manifest_list_location,
                 reports,
@@ -182,8 +267,7 @@ where
             metadata_maintenance_referenced_manifest_file(
                 backend,
                 table_bucket,
-                namespace,
-                table,
+                scope,
                 warehouse_object_prefix,
                 manifest_location,
                 reports,
@@ -198,8 +282,7 @@ where
 async fn metadata_maintenance_referenced_manifest_list<B>(
     backend: &B,
     table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    scope: TableMaintenanceObjectScope<'_>,
     warehouse_object_prefix: Option<&str>,
     manifest_list_location: &str,
     reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
@@ -217,9 +300,12 @@ where
         );
         return Ok(());
     };
-    if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key).is_some_and(|kind| {
-        table_maintenance_object_kind_matches_reference(&kind, &TableMetadataMaintenanceObjectKind::ManifestList)
-    }) {
+    if !scope
+        .object_kind(warehouse_object_prefix, &manifest_list_key)
+        .is_some_and(|kind| {
+            table_maintenance_object_kind_matches_reference(&kind, &TableMetadataMaintenanceObjectKind::ManifestList)
+        })
+    {
         insert_referenced_object_report(
             reports,
             manifest_list_key,
@@ -272,8 +358,7 @@ where
         metadata_maintenance_referenced_manifest_file(
             backend,
             table_bucket,
-            namespace,
-            table,
+            scope,
             warehouse_object_prefix,
             &manifest_location,
             reports,
@@ -287,8 +372,7 @@ where
 async fn metadata_maintenance_referenced_manifest_file<B>(
     backend: &B,
     table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    scope: TableMaintenanceObjectScope<'_>,
     warehouse_object_prefix: Option<&str>,
     manifest_location: &str,
     reports: &mut BTreeMap<String, TableMetadataMaintenanceReferencedObjectAccumulator>,
@@ -306,7 +390,7 @@ where
         );
         return Ok(());
     };
-    if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key).is_some_and(|kind| {
+    if !scope.object_kind(warehouse_object_prefix, &manifest_key).is_some_and(|kind| {
         table_maintenance_object_kind_matches_reference(&kind, &TableMetadataMaintenanceObjectKind::ManifestFile)
     }) {
         insert_referenced_object_report(
@@ -360,7 +444,8 @@ where
             );
             continue;
         };
-        if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &file_key)
+        if !scope
+            .object_kind(warehouse_object_prefix, &file_key)
             .is_some_and(|kind| table_maintenance_object_kind_matches_reference(&kind, &object_kind))
         {
             insert_referenced_object_report(
@@ -643,8 +728,50 @@ pub(crate) async fn metadata_maintenance_object_cleanup_reports<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    let scanned_objects =
-        table_maintenance_cleanup_objects(backend, table_bucket, namespace, table, warehouse_object_prefix).await?;
+    metadata_maintenance_object_cleanup_reports_in_scope(
+        backend,
+        table_bucket,
+        TableMaintenanceObjectScope::Logical { namespace, table },
+        warehouse_object_prefix,
+        referenced_object_reports,
+        now,
+    )
+    .await
+}
+
+pub(crate) async fn metadata_maintenance_object_cleanup_reports_for_entry<B>(
+    backend: &B,
+    entry: &TableEntry,
+    warehouse_object_prefix: Option<&str>,
+    referenced_object_reports: &[TableMetadataMaintenanceReferencedObjectReport],
+    now: OffsetDateTime,
+) -> TableCatalogStoreResult<(usize, Vec<String>, Vec<String>, Vec<TableMetadataMaintenanceObjectCleanupReport>)>
+where
+    B: TableCatalogObjectBackend,
+{
+    metadata_maintenance_object_cleanup_reports_in_scope(
+        backend,
+        &entry.table_bucket,
+        TableMaintenanceObjectScope::Entry(entry),
+        warehouse_object_prefix,
+        referenced_object_reports,
+        now,
+    )
+    .await
+}
+
+async fn metadata_maintenance_object_cleanup_reports_in_scope<B>(
+    backend: &B,
+    table_bucket: &str,
+    scope: TableMaintenanceObjectScope<'_>,
+    warehouse_object_prefix: Option<&str>,
+    referenced_object_reports: &[TableMetadataMaintenanceReferencedObjectReport],
+    now: OffsetDateTime,
+) -> TableCatalogStoreResult<(usize, Vec<String>, Vec<String>, Vec<TableMetadataMaintenanceObjectCleanupReport>)>
+where
+    B: TableCatalogObjectBackend,
+{
+    let scanned_objects = table_maintenance_cleanup_objects(backend, table_bucket, scope, warehouse_object_prefix).await?;
     if referenced_object_reports
         .iter()
         .any(|report| report.state == TableMetadataMaintenanceObjectState::ManualReviewRequired)
@@ -700,17 +827,17 @@ where
 async fn table_maintenance_cleanup_objects<B>(
     backend: &B,
     table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    scope: TableMaintenanceObjectScope<'_>,
     warehouse_object_prefix: Option<&str>,
 ) -> TableCatalogStoreResult<BTreeMap<String, TableMetadataMaintenanceObjectKind>>
 where
     B: TableCatalogObjectBackend,
 {
     let mut objects = BTreeMap::new();
-    let mut metadata_prefixes = vec![format!("{}/", default_table_metadata_dir_path(namespace, table))];
-    let mut data_prefixes = vec![format!("{}/", default_table_data_dir_path(namespace, table))];
-    let mut delete_prefixes = vec![format!("{}/", default_table_delete_dir_path(namespace, table))];
+    let (metadata_dir, data_dir, delete_dir) = scope.object_directories()?;
+    let mut metadata_prefixes = vec![format!("{metadata_dir}/")];
+    let mut data_prefixes = vec![format!("{data_dir}/")];
+    let mut delete_prefixes = vec![format!("{delete_dir}/")];
     if let Some(warehouse_object_prefix) = warehouse_object_prefix {
         metadata_prefixes.push(format!("{warehouse_object_prefix}{METADATA_DIR}/"));
         data_prefixes.push(format!("{warehouse_object_prefix}{DATA_DIR}/"));
@@ -725,7 +852,7 @@ where
 
     for metadata_prefix in metadata_prefixes {
         for object in backend.list_objects(table_bucket, &metadata_prefix).await? {
-            if let Some(kind) = table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
+            if let Some(kind) = scope.object_kind(warehouse_object_prefix, &object)
                 && matches!(
                     kind,
                     TableMetadataMaintenanceObjectKind::ManifestList | TableMetadataMaintenanceObjectKind::ManifestFile
@@ -738,9 +865,7 @@ where
 
     for data_prefix in data_prefixes {
         for object in backend.list_objects(table_bucket, &data_prefix).await? {
-            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
-                == Some(TableMetadataMaintenanceObjectKind::DataFile)
-            {
+            if scope.object_kind(warehouse_object_prefix, &object) == Some(TableMetadataMaintenanceObjectKind::DataFile) {
                 objects.insert(object, TableMetadataMaintenanceObjectKind::DataFile);
             }
         }
@@ -748,9 +873,7 @@ where
 
     for delete_prefix in delete_prefixes {
         for object in backend.list_objects(table_bucket, &delete_prefix).await? {
-            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &object)
-                == Some(TableMetadataMaintenanceObjectKind::DeleteFile)
-            {
+            if scope.object_kind(warehouse_object_prefix, &object) == Some(TableMetadataMaintenanceObjectKind::DeleteFile) {
                 objects.insert(object, TableMetadataMaintenanceObjectKind::DeleteFile);
             }
         }

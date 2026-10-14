@@ -67,6 +67,7 @@ members = [
     "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
 ]
+exclude = ["third-party/pyroscope"]
 resolver = "3"
 
 [workspace.package]
@@ -421,3 +422,8 @@ inherits = "release"
 inherits = "release"
 debug = true
 strip = "none"
+
+# Remove this patch when Pyroscope releases support for object 0.40 or later.
+# object 0.39 requires ruzstd 0.8, affected by RUSTSEC-2026-0344.
+[patch.crates-io]
+pyroscope = { path = "third-party/pyroscope" }

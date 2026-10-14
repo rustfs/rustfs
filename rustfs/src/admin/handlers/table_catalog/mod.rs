@@ -1862,6 +1862,16 @@ where
             .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
     }
 
+    fn table_commit_object_mutation_fence(&self) -> Option<crate::table_catalog::TableCatalogObjectMutationFence> {
+        let publication = self.publication.lock();
+        Some(crate::table_catalog::TableCatalogObjectMutationFence::from_signals(
+            publication
+                .guards
+                .iter()
+                .map(crate::table_catalog::TableCatalogLockGuard::lock_lost_signal),
+        ))
+    }
+
     fn complete_table_commit_publication(&self) {
         self.complete_publication();
     }
