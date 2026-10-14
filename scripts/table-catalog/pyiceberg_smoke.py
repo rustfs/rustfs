@@ -200,7 +200,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
-        "expected_behavior": "background-enabled maintenance can be queued by the scheduler run endpoint, claimed by the worker run endpoint, and inspected through the scheduler status endpoint with disabled/paused state, queued-job handoff, current-job backpressure, retry deferral, quarantine boundary, audit timeline, per-job audit events, lease expiry recovery, heartbeat updates, and operator quarantine inspect/release/retry/abandon actions; built-in periodic scheduling is not claimed",
+        "expected_behavior": "background-enabled maintenance can be queued by the scheduler run endpoint, claimed by the worker run endpoint, and inspected through the scheduler status endpoint with disabled/paused state, queued-job handoff, current-job backpressure, retry deferral, quarantine boundary, audit timeline, per-job audit events, lease expiry recovery, heartbeat updates, and operator quarantine inspect/release/retry/abandon actions; opt-in periodic admission can queue jobs for allowlisted buckets, while workers still require an explicit operator invocation",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
@@ -212,13 +212,13 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "snapshot-expiration",
         "status": "manual-maintenance-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "metadata maintenance can report snapshot expiration plans and manually commit safe snapshot expiration through the catalog; background scheduling and manifest/data cleanup are not claimed",
+        "expected_behavior": "metadata maintenance can report snapshot expiration plans and manually commit safe snapshot expiration through the catalog; automatic snapshot expiration and background manifest/data cleanup are not claimed",
     },
     {
         "capability": "compaction-rewrite",
         "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local and sort-order-preserving Parquet rewrite through the catalog; manifests with position or equality delete files produce machine-readable row-level planning and fail closed before rewrite; built-in periodic scheduling, delete-file rewrite, and row-level compaction execution are not claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local and sort-order-preserving Parquet rewrite through the catalog; manifests with position or equality delete files produce machine-readable row-level planning and fail closed before rewrite; automatic compaction execution, delete-file rewrite, and row-level compaction execution are not claimed",
     },
     {
         "capability": "row-level-delete-update-merge",

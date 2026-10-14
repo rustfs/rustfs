@@ -581,6 +581,7 @@ fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn rejects_v2_manifest_lists_without_required_count_fields() {
@@ -609,9 +610,9 @@ mod tests {
             Ok(_) => panic!("v2 count fields must be declared in the writer schema"),
             Err(error) => error,
         };
-        assert_eq!(
+        assert_matches!(
             error,
-            TableCatalogStoreError::Invalid("Iceberg v2 manifest list Avro schema is missing added_files_count".to_string())
+            TableCatalogStoreError::Invalid(message) if message == "Iceberg v2 manifest list Avro schema is missing added_files_count"
         );
     }
 
@@ -622,15 +623,15 @@ mod tests {
             ("added_rows_count".to_string(), apache_avro::types::Value::Long(-1)),
         ]);
 
-        assert_eq!(
-            avro_nullable_non_negative_i32(&value, "added_files_count", "manifest list")
-                .expect_err("negative file counts must be rejected"),
-            TableCatalogStoreError::Invalid("manifest list field added_files_count must be a non-negative int".to_string())
+        assert_matches!(
+        avro_nullable_non_negative_i32(&value, "added_files_count", "manifest list")
+                        .expect_err("negative file counts must be rejected"),
+        TableCatalogStoreError::Invalid(message) if message == "manifest list field added_files_count must be a non-negative int"
         );
-        assert_eq!(
-            avro_nullable_non_negative_i64(&value, "added_rows_count", "manifest list")
-                .expect_err("negative row counts must be rejected"),
-            TableCatalogStoreError::Invalid("manifest list field added_rows_count must be a non-negative long".to_string())
+        assert_matches!(
+        avro_nullable_non_negative_i64(&value, "added_rows_count", "manifest list")
+                        .expect_err("negative row counts must be rejected"),
+        TableCatalogStoreError::Invalid(message) if message == "manifest list field added_rows_count must be a non-negative long"
         );
     }
 
@@ -685,9 +686,9 @@ mod tests {
             Ok(_) => panic!("manifest partitions must preserve their record shape"),
             Err(error) => error,
         };
-        assert_eq!(
+        assert_matches!(
             error,
-            TableCatalogStoreError::Invalid("manifest data file partition must be a record".to_string())
+            TableCatalogStoreError::Invalid(message) if message == "manifest data file partition must be a record"
         );
     }
 

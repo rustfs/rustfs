@@ -599,7 +599,21 @@ fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bo
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
+        // A typed lock acquisition timeout is transient contention. Keep its
+        // existing S3 code while advising a minimum delay before another attempt.
+        let lock_timeout = err.code == S3ErrorCode::ServiceUnavailable
+            && err.source.as_deref().is_some_and(|source| {
+                error_chain_find(source, |error| {
+                    matches!(error.downcast_ref::<LockError>(), Some(LockError::Timeout { .. })).then_some(())
+                })
+                .is_some()
+            });
         let mut s3e = S3Error::with_message(err.code, err.message);
+        if lock_timeout {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+            s3e.set_headers(headers);
+        }
         if let Some(status) = status {
             s3e.set_status_code(status);
         }
@@ -607,6 +621,26 @@ impl From<ApiError> for S3Error {
             s3e.set_source(source);
         }
         s3e
+    }
+}
+
+impl From<crate::table_catalog::TableCatalogStoreError> for ApiError {
+    fn from(err: crate::table_catalog::TableCatalogStoreError) -> Self {
+        if let crate::table_catalog::TableCatalogStoreError::LockUnavailable { source, .. } = err {
+            // Use the storage boundary once so typed lock failures share its
+            // bounded metrics, public message, and retry advice.
+            return Self::from(StorageError::Lock(*source));
+        }
+        let code = if err.is_unavailable() {
+            S3ErrorCode::ServiceUnavailable
+        } else {
+            S3ErrorCode::InternalError
+        };
+        Self {
+            message: Self::error_code_to_message(&code),
+            code,
+            source: Some(Box::new(err)),
+        }
     }
 }
 
@@ -920,6 +954,74 @@ mod tests {
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
 
+    #[tokio::test]
+    async fn lock_timeout_response_advises_retry_without_exposing_resource() {
+        use http_body_util::BodyExt as _;
+
+        let storage_error =
+            StorageError::Lock(LockError::timeout("private-bucket/private-key@latest", std::time::Duration::from_secs(5)));
+        let error = S3Error::from(ApiError::from(storage_error));
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        let source = error.source().expect("retain the typed storage cause");
+        assert!(source.downcast_ref::<StorageError>().is_some());
+        assert!(error_chain_has_type::<LockError>(source));
+        let response = error.to_http_response().expect("serialize lock timeout response");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read timeout error XML")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!body.contains("private-bucket"));
+        assert!(!body.contains("private-key"));
+    }
+
+    #[test]
+    fn lock_timeout_response_preserves_wrapped_source_and_requires_503() {
+        for code in [S3ErrorCode::ServiceUnavailable, S3ErrorCode::RequestTimeout] {
+            let should_advise_retry = code == S3ErrorCode::ServiceUnavailable;
+            let error = S3Error::from(ApiError {
+                message: ApiError::error_code_to_message(&code),
+                code: code.clone(),
+                source: Some(Box::new(IoError::other(LockError::timeout(
+                    "bucket/object@latest",
+                    std::time::Duration::from_secs(5),
+                )))),
+            });
+            assert_eq!(error.code(), &code);
+            let source = error.source().expect("preserve wrapped lock timeout");
+            assert!(error_chain_has_type::<LockError>(source));
+            let response = error.to_http_response().expect("serialize wrapped timeout");
+            assert_eq!(response.headers().contains_key(http::header::RETRY_AFTER), should_advise_retry);
+        }
+    }
+
+    #[test]
+    fn unrelated_unavailable_responses_do_not_inherit_lock_retry_advice() {
+        for failure in [
+            StorageError::Timeout,
+            StorageError::DiskNotFound,
+            StorageError::FileCorrupt,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "read",
+                bucket: "bucket".to_owned(),
+                object: "object".to_owned(),
+                required: 2,
+                achieved: 1,
+            },
+            StorageError::Io(IoError::other("Lock acquisition timeout for bucket/object after 5s")),
+            StorageError::SlowDown,
+        ] {
+            let error = S3Error::from(ApiError::from(failure));
+            let response = error.to_http_response().expect("serialize unrelated storage failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
     #[test]
     fn lock_503_mapping_records_operation_and_resource_class_without_resource_name() {
         let recorder = DebuggingRecorder::new();
@@ -951,6 +1053,42 @@ mod tests {
         assert_eq!(labels["reason"], "timeout");
         assert_eq!(labels["resource_class"], "system_metadata");
         assert!(!labels.values().any(|value| value.contains("durable-dirty-producer-replay")));
+    }
+
+    #[test]
+    fn catalog_lock_failure_uses_canonical_metrics_and_retry_advice_once() {
+        let recorder = DebuggingRecorder::new();
+        let error = with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                S3Error::from(ApiError::from(crate::table_catalog::TableCatalogStoreError::LockUnavailable {
+                    message: "private catalog operation".to_owned(),
+                    source: Box::new(LockError::timeout(
+                        "private-bucket/.rustfs-table/warehouses/default/publication.lock@latest",
+                        std::time::Duration::from_secs(5),
+                    )),
+                }))
+            })
+        });
+        let response = error.to_http_response().expect("serialize catalog lock timeout");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        let metrics = recorder.snapshotter().snapshot().into_vec();
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("catalog lock failures should use the canonical counter");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["reason"], "timeout");
+        assert_eq!(labels["resource_class"], "object_namespace");
+        assert!(!labels.values().any(|value| value.contains("private")));
     }
 
     #[test]

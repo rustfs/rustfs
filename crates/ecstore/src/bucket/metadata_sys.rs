@@ -525,6 +525,36 @@ pub(crate) async fn get_bucket_incarnation_id_in(ctx: &crate::runtime::instance:
     sys.get_bucket_incarnation_id_from_disk(bucket).await
 }
 
+/// Directory loss is recoverable only for a committed, non-retired generation.
+/// The caller retains the bucket lifecycle fence through the ensuing reconstruction.
+pub(crate) async fn validate_bucket_reconstruction_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    expected: Uuid,
+) -> Result<()> {
+    let api = bucket_metadata_sys_of(ctx)?.read().await.object_store();
+    let lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
+        .await?;
+    let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+    let (metadata, persisted) = load_bucket_metadata_parse_with_presence(api.clone(), bucket, true).await?;
+    if !persisted
+        || !metadata.bucket_incarnation_sidecar
+        || expected.is_nil()
+        || metadata.bucket_incarnation_id != expected
+        || !metadata.bucket_creation_committed
+    {
+        return Err(Error::PreconditionFailed);
+    }
+    if crate::bucket::retirement::is_retired(api, bucket, expected).await? {
+        return Err(Error::BucketNotFound(bucket.to_owned()));
+    }
+    if guard.is_lock_lost() {
+        return Err(Error::PreconditionFailed);
+    }
+    Ok(())
+}
+
 /// Validate against disk while retaining an already-held Object Lock fence.
 pub(crate) async fn get_bucket_incarnation_id_for_options_in(
     ctx: &crate::runtime::instance::InstanceContext,

@@ -14,7 +14,6 @@
 
 use super::*;
 use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
-use std::io::Write;
 use tokio::io::AsyncReadExt;
 
 // This prefix must not overlap either namespace understood by schema-1 readers.
@@ -68,24 +67,7 @@ impl RootHealReport {
     }
 
     pub(super) fn encode(&self) -> Result<EcstoreDiskBytes> {
-        struct BoundedWriter(Vec<u8>);
-        impl Write for BoundedWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if bytes.len() > MAX_ROOT_REPORT_BYTES.saturating_sub(self.0.len()) {
-                    return Err(std::io::Error::other("root heal report exceeds its size limit"));
-                }
-                self.0.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = BoundedWriter(Vec::new());
-        serde_json::to_writer(&mut writer, self)
-            .map_err(|error| Error::Serialization(format!("Serialize root heal report: {error}")))?;
-        Ok(writer.0.into())
+        encode_root_record(self, MAX_ROOT_REPORT_BYTES)
     }
 }
 

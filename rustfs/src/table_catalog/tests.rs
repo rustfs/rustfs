@@ -71,7 +71,7 @@ fn catalog_lock_authority_failures_are_typed_as_unavailable() {
     ] {
         assert_matches!(
             super::store::catalog_lock_acquisition_error("acquire catalog table lock", error),
-            TableCatalogStoreError::Unavailable(_)
+            TableCatalogStoreError::LockUnavailable { .. }
         );
     }
 
@@ -131,7 +131,7 @@ fn catalog_storage_retryable_lock_failures_are_typed_as_unavailable() {
     ] {
         assert_matches!(
             storage_error_to_catalog("stat catalog object", StorageError::Lock(error)),
-            TableCatalogStoreError::Unavailable(_)
+            TableCatalogStoreError::LockUnavailable { .. }
         );
     }
 
@@ -1600,9 +1600,9 @@ fn iceberg_metadata_validation_enforces_schema_evolution() {
     let mut incompatible = promoted;
     incompatible["schemas"][1]["fields"][0]["type"] = serde_json::Value::from("string");
     let error = validate_supported_table_metadata(&incompatible).expect_err("field IDs must retain compatible types");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("schema field 1 has an incompatible type evolution".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "schema field 1 has an incompatible type evolution"
     );
 
     let mut moved_into_collection = table_metadata_json_for_validation();
@@ -1644,20 +1644,18 @@ fn iceberg_metadata_validation_enforces_schema_evolution() {
     ]);
     reused["current-schema-id"] = serde_json::Value::from(2);
     let error = validate_supported_table_metadata(&reused).expect_err("removed Iceberg field IDs must never be reused");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("schema field 1 cannot be reused after removal".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "schema field 1 cannot be reused after removal"
     );
 
     let mut stale_last_column_id = table_metadata_json_for_validation();
     stale_last_column_id["last-column-id"] = serde_json::Value::from(0);
     let error = validate_supported_table_metadata(&stale_last_column_id)
         .expect_err("last-column-id must cover nested and top-level assigned field IDs");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid(
-            "last-column-id must be non-negative and cover every assigned schema field id".to_string()
-        )
+        TableCatalogStoreError::Invalid(message) if message == "last-column-id must be non-negative and cover every assigned schema field id"
     );
 }
 
@@ -1669,18 +1667,18 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     lower_column_watermark["last-column-id"] = serde_json::Value::from(0);
     let error = validate_table_metadata_transition(&current, &lower_column_watermark)
         .expect_err("last-column-id must not decrease across commits");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("last-column-id must not decrease across table metadata commits".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "last-column-id must not decrease across table metadata commits"
     );
 
     let mut lower_partition_watermark = current.clone();
     lower_partition_watermark["last-partition-id"] = serde_json::Value::from(998);
     let error = validate_table_metadata_transition(&current, &lower_partition_watermark)
         .expect_err("last-partition-id must not decrease across commits");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("last-partition-id must not decrease across table metadata commits".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "last-partition-id must not decrease across table metadata commits"
     );
 
     let mut current_sequence = current.clone();
@@ -1689,9 +1687,9 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     lower_sequence_watermark["last-sequence-number"] = serde_json::Value::from(1);
     let error = validate_table_metadata_transition(&current_sequence, &lower_sequence_watermark)
         .expect_err("last-sequence-number must not decrease across commits");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("last-sequence-number must not decrease across table metadata commits".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "last-sequence-number must not decrease across table metadata commits"
     );
 
     let mut current_partitioned = current.clone();
@@ -1709,9 +1707,9 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     modified_partition["partition-specs"][0]["fields"][0]["name"] = serde_json::Value::from("renamed_id");
     let error = validate_table_metadata_transition(&current_partitioned, &modified_partition)
         .expect_err("published partition specs must be immutable");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("existing partition spec 0 must not be modified".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "existing partition spec 0 must not be modified"
     );
 
     let mut current_sorted = current.clone();
@@ -1732,9 +1730,9 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     modified_sort["sort-orders"][1]["fields"][0]["direction"] = serde_json::Value::from("desc");
     let error =
         validate_table_metadata_transition(&current_sorted, &modified_sort).expect_err("published sort orders must be immutable");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("existing sort order 1 must not be modified".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "existing sort order 1 must not be modified"
     );
 
     let mut current_with_snapshot = current.clone();
@@ -1750,18 +1748,18 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     modified_snapshot["snapshots"][0]["timestamp-ms"] = serde_json::Value::from(2);
     let error = validate_table_metadata_transition(&current_with_snapshot, &modified_snapshot)
         .expect_err("published snapshots must be immutable");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("existing snapshot 10 must not be modified".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "existing snapshot 10 must not be modified"
     );
 
     let mut modified_history = current.clone();
     modified_history["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("string");
     let error = validate_table_metadata_transition(&current, &modified_history)
         .expect_err("published schema definitions must be immutable");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("existing schema 0 must not be modified".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "existing schema 0 must not be modified"
     );
 
     let mut current_with_retired_id = current.clone();
@@ -1786,9 +1784,9 @@ fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_histor
     reused_id["current-schema-id"] = serde_json::Value::from(2);
     let error = validate_table_metadata_transition(&current_with_retired_id, &reused_id)
         .expect_err("new schemas must not reuse a previously assigned field ID");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("schema field 1 cannot reuse a previously assigned field id".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "schema field 1 cannot reuse a previously assigned field id"
     );
 
     let mut valid = current.clone();
@@ -2130,9 +2128,9 @@ fn iceberg_metadata_validation_rejects_duplicate_snapshot_statistics() {
     metadata["statistics"] = serde_json::json!([statistics.clone(), statistics]);
 
     let error = validate_supported_table_metadata(&metadata).expect_err("a snapshot must not have duplicate statistics entries");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("statistics contains duplicate entries for snapshot 10".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "statistics contains duplicate entries for snapshot 10"
     );
 }
 
@@ -2191,9 +2189,9 @@ async fn snapshot_validation_bounds_changed_statistics_object_fanout() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("statistics object fanout must be bounded before storage lookups");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("statistics object count exceeds the commit limit".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "statistics object count exceeds the commit limit"
     );
 }
 
@@ -2252,9 +2250,9 @@ async fn snapshot_validation_bounds_changed_statistics_object_bytes() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("statistics bytes must be bounded before storage lookups");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("statistics bytes exceed the commit validation limit".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "statistics bytes exceed the commit validation limit"
     );
 }
 
@@ -2288,9 +2286,9 @@ async fn snapshot_validation_rechecks_retained_statistics_locations() {
     let error = validate_table_snapshot_changes(&context, Some(&current), &target)
         .await
         .expect_err("retained statistics must remain inside the table warehouse");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("statistics object is outside the table warehouse".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "statistics object is outside the table warehouse"
     );
 }
 
@@ -2328,9 +2326,9 @@ async fn snapshot_validation_rejects_non_puffin_table_statistics() {
     let error = validate_table_snapshot_changes(&context, Some(&current), &target)
         .await
         .expect_err("table statistics must be a Puffin file");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("table statistics object is not a Puffin file".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "table statistics object is not a Puffin file"
     );
 }
 
@@ -2373,9 +2371,9 @@ async fn snapshot_validation_accepts_non_parquet_partition_statistics() {
     let error = validate_table_snapshot_changes(&context, Some(&current), &target)
         .await
         .expect_err("partition statistics must use a supported table data-file envelope");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("partition statistics object is not a supported table data file".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "partition statistics object is not a supported table data file"
     );
 }
 
@@ -2413,9 +2411,9 @@ async fn snapshot_validation_rejects_statistics_size_mismatch() {
     let error = validate_table_snapshot_changes(&context, Some(&current), &target)
         .await
         .expect_err("statistics lengths must match the published object");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("statistics file-size-in-bytes does not match the object".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "statistics file-size-in-bytes does not match the object"
     );
 }
 
@@ -2431,11 +2429,9 @@ fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
         "summary": {"operation": "append"}
     }]);
     let error = validate_supported_table_metadata(&v2).expect_err("a v2 snapshot sequence must not exceed the table sequence");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid(
-            "Iceberg v2 snapshot sequence-number must be between zero and last-sequence-number".to_string()
-        )
+        TableCatalogStoreError::Invalid(message) if message == "Iceberg v2 snapshot sequence-number must be between zero and last-sequence-number"
     );
     v2["last-sequence-number"] = serde_json::Value::from(0);
     v2["snapshots"][0]
@@ -2443,9 +2439,9 @@ fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
         .expect("snapshot should be an object")
         .remove("sequence-number");
     let error = validate_supported_table_metadata(&v2).expect_err("Iceberg v2 snapshots must include sequence-number");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("Iceberg v2 snapshot sequence-number is required".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "Iceberg v2 snapshot sequence-number is required"
     );
 
     let mut v1 = serde_json::json!({
@@ -2464,9 +2460,9 @@ fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
         }]
     });
     let error = validate_supported_table_metadata(&v1).expect_err("v1 metadata must not carry a non-zero snapshot sequence");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("Iceberg v1 snapshot sequence-number must be zero when present".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "Iceberg v1 snapshot sequence-number must be zero when present"
     );
     v1["snapshots"][0]["sequence-number"] = serde_json::Value::from(0);
     validate_supported_table_metadata(&v1).expect("a zero v1 compatibility sequence should validate");
@@ -2676,9 +2672,9 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("manifest partition specs absent from table metadata must be rejected");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("snapshot manifest references missing partition spec 7".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "snapshot manifest references missing partition spec 7"
     );
 }
 
@@ -2759,9 +2755,9 @@ async fn iceberg_snapshot_graph_revalidates_unchanged_snapshots_after_spec_remov
     let error = validate_table_snapshot_changes(&context, Some(&current), &target)
         .await
         .expect_err("removing a spec referenced by an unchanged snapshot must fail");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("snapshot manifest references missing partition spec 7".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "snapshot manifest references missing partition spec 7"
     );
 }
 
@@ -2979,9 +2975,9 @@ async fn iceberg_snapshot_registration_validates_all_retained_snapshots() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("registration must validate every retained snapshot");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("snapshot manifest-list object is missing".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "snapshot manifest-list object is missing"
     );
 }
 
@@ -3091,9 +3087,9 @@ async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
     let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
         .expect_err("every manifest-list declaration must match the cached manifest object");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("manifest-list manifest_length does not match the manifest object".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "manifest-list manifest_length does not match the manifest object"
     );
 
     backend
@@ -3111,9 +3107,9 @@ async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
     let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
         .expect_err("every cached manifest must match each manifest-list partition spec declaration");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("manifest partition-spec-id does not match its manifest-list entry".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "manifest partition-spec-id does not match its manifest-list entry"
     );
 }
 
@@ -3165,9 +3161,9 @@ async fn iceberg_snapshot_graph_bounds_shared_manifest_traversals() {
     let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
         .expect_err("logical manifest traversals must remain bounded across shared snapshots");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("snapshot manifest traversal count exceeds the commit limit".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "snapshot manifest traversal count exceeds the commit limit"
     );
 }
 
@@ -3259,9 +3255,9 @@ async fn iceberg_v2_snapshot_graph_rejects_embedded_v2_manifests() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("new v2 snapshots must use a manifest list");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("new Iceberg v2 snapshots require manifest-list".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "new Iceberg v2 snapshots require manifest-list"
     );
 }
 
@@ -3304,9 +3300,9 @@ async fn iceberg_snapshot_graph_rejects_delete_files_in_data_manifest() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("a data manifest must not contain delete files");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("manifest-list content does not match manifest file content".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "manifest-list content does not match manifest file content"
     );
 }
 
@@ -3390,9 +3386,9 @@ async fn iceberg_snapshot_graph_rejects_manifest_length_mismatch() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("manifest-list lengths must match the published manifest object");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("manifest-list manifest_length does not match the manifest object".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "manifest-list manifest_length does not match the manifest object"
     );
 }
 
@@ -3435,9 +3431,9 @@ async fn iceberg_snapshot_graph_rejects_manifest_partition_spec_mismatch() {
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("manifest headers must agree with their manifest-list entry");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("manifest partition-spec-id does not match its manifest-list entry".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "manifest partition-spec-id does not match its manifest-list entry"
     );
 }
 
@@ -4225,9 +4221,9 @@ async fn durable_catalog_backup_rejects_incomplete_snapshot_graph() {
         .create_durable_catalog_backup(bucket, None)
         .await
         .expect_err("backup must reject a snapshot without a manifest graph");
-    assert_eq!(
+    assert_matches!(
         error,
-        TableCatalogStoreError::Invalid("snapshot manifest-list object is missing".to_string())
+        TableCatalogStoreError::Invalid(message) if message == "snapshot manifest-list object is missing"
     );
 }
 
@@ -10971,7 +10967,10 @@ async fn maintenance_quarantine_rejects_mutating_non_current_job() {
         .await
         .expect_err("mutating a non-current quarantine job should fail");
 
-    assert_eq!(error, TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
+    assert_matches!(
+        error,
+        TableCatalogStoreError::Conflict(message) if message == "maintenance job is not current"
+    );
 }
 
 #[tokio::test]
