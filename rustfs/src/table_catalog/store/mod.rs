@@ -56,7 +56,10 @@ pub(in crate::table_catalog) fn catalog_lock_acquisition_error(
     );
     let message = format!("failed to {operation}: {err}");
     if unavailable {
-        TableCatalogStoreError::Unavailable(message)
+        TableCatalogStoreError::LockUnavailable {
+            message,
+            source: Box::new(err),
+        }
     } else {
         TableCatalogStoreError::Internal(message)
     }

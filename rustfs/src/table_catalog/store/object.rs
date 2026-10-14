@@ -52,6 +52,7 @@ pub(super) fn maintenance_rename_recovery_error(mut error: TableCatalogStoreErro
         | TableCatalogStoreError::Invalid(message)
         | TableCatalogStoreError::Unsupported(message)
         | TableCatalogStoreError::Unavailable(message)
+        | TableCatalogStoreError::LockUnavailable { message, .. }
         | TableCatalogStoreError::Internal(message) => message,
     };
     *message = format!(
@@ -7483,4 +7484,23 @@ where
         self.read_commit_idempotency_entry(table_bucket, table_id, idempotency_key)
             .await
     }
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_lock_context_preserves_original_network_cause() {
+    let error = super::catalog_lock_acquisition_error(
+        "acquire catalog migration lock",
+        rustfs_lock::LockError::network("peer unavailable", std::io::Error::from(std::io::ErrorKind::TimedOut)),
+    );
+    let error = maintenance_rename_recovery_error(error);
+    assert!(error.is_unavailable());
+    assert!(error.to_string().contains("maintenance rename recovery required"));
+    let source = std::error::Error::source(&error).expect("retain the typed lock cause");
+    assert!(source.is::<rustfs_lock::LockError>());
+    let io = source
+        .source()
+        .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+        .expect("retain the original network cause without cloning it");
+    assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
 }

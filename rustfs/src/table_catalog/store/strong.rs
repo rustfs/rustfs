@@ -3859,8 +3859,7 @@ where
             }
             Err(err) => Err(err),
         };
-        let cas_result = result.as_ref().map(|_| ()).map_err(Clone::clone);
-        record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
+        record_table_commit_cas_result(&request.operation, cas_started, &result);
         table_commit_result(
             &request.table_bucket,
             &request.namespace,
