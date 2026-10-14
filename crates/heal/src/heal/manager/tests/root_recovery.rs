@@ -1873,8 +1873,8 @@ async fn root_recovery_legacy_cluster_requires_a_fresh_generation_bound_task() {
 
     let restarted = recovery_manager(vec![disk]);
     restarted.replay_root_heals().await.expect("replay legacy root record");
-    let queued = restarted.heal_queue.lock().await.requests().cloned().collect::<Vec<_>>();
-    assert!(queued.is_empty(), "unfenced legacy work must not bind to a later bucket generation");
+    let is_empty = restarted.heal_queue.lock().await.requests().next().cloned().is_none();
+    assert!(is_empty, "unfenced legacy work must not bind to a later bucket generation");
     assert!(
         restarted
             .root_recovery
