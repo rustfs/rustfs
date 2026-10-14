@@ -436,6 +436,17 @@ fn delete_response_version_id(version_id: Option<Uuid>, synthetic_version_id: bo
     }
 }
 
+fn delete_marker_response_version_id(
+    committed_version_id: Option<Uuid>,
+    creates_null_delete_marker: bool,
+    synthetic_version_id: bool,
+) -> Option<String> {
+    // The suspended-marker write shape uses None on disk. Only its response
+    // identity is null; changing the write shape would change delete semantics.
+    let version_id = committed_version_id.or_else(|| creates_null_delete_marker.then(Uuid::nil));
+    delete_response_version_id(version_id, synthetic_version_id)
+}
+
 fn project_delete_objects_pre_stat_error(
     object: ObjectToDelete,
     synthetic_version_id: bool,
@@ -537,6 +548,7 @@ impl DefaultObjectUsecase {
             error: Option<s3s::dto::Error>,
             emit_side_effects: bool,
             synthetic_version_id: bool,
+            version_suspended: bool,
             // The version identity the request addressed, before any
             // synthetic-directory synthesis. `None` means the request carried
             // no version id, i.e. a committed delete marker was created, not
@@ -835,14 +847,15 @@ impl DefaultObjectUsecase {
                 delete_results[didx].synthetic_version_id,
             ) {
                 Ok(deleted_object) => {
+                    let (versioned, version_suspended) = object_versioning[i];
                     delete_results[didx].delete_object = Some(deleted_object.clone());
+                    delete_results[didx].version_suspended = version_suspended;
                     if !committed_actions
                         .insert(delete_objects_action_identity(deleted_object, delete_results[didx].requested_version_id))
                     {
                         continue;
                     }
                     delete_results[didx].emit_side_effects = true;
-                    let (versioned, version_suspended) = object_versioning[i];
                     let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
                     let committed_delete_marker = dobjs[i].delete_marker;
                     let delete_accounting = accounting.get(i).and_then(Option::as_ref);
@@ -872,8 +885,9 @@ impl DefaultObjectUsecase {
             .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
             .map(|(result, object)| DeletedObject {
                 delete_marker: { if object.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: delete_response_version_id(
+                delete_marker_version_id: delete_marker_response_version_id(
                     object.delete_marker_version_id,
+                    object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
                     result.synthetic_version_id,
                 ),
                 key: Some(object.object_name.clone()),
@@ -2024,6 +2038,26 @@ mod tests {
         assert_eq!(delete_response_version_id(Some(Uuid::nil()), false), Some("null".to_string()));
         assert_eq!(delete_response_version_id(Some(Uuid::nil()), true), None);
         assert_eq!(delete_response_version_id(None, false), None);
+    }
+
+    #[test]
+    fn delete_objects_created_null_marker_response_uses_the_committed_marker_identity() {
+        let uuid = Uuid::new_v4();
+        assert_eq!(delete_marker_response_version_id(None, true, false), Some("null".to_string()));
+        assert_eq!(delete_marker_response_version_id(None, false, false), None);
+        assert_eq!(delete_marker_response_version_id(None, true, true), None);
+        assert_eq!(delete_marker_response_version_id(Some(uuid), false, false), Some(uuid.to_string()));
+        assert_eq!(
+            delete_marker_response_version_id(Some(uuid), true, false),
+            Some(uuid.to_string()),
+            "the committed identity takes precedence over any null fallback"
+        );
+        assert_eq!(
+            delete_marker_response_version_id(Some(Uuid::nil()), false, false),
+            Some("null".to_string()),
+            "explicit null-marker removal keeps its existing response identity"
+        );
+        assert_eq!(delete_marker_response_version_id(Some(Uuid::nil()), true, true), None);
     }
 
     #[test]

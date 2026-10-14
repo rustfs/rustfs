@@ -277,6 +277,9 @@ async fn sdk_conditional_delete_objects_versioning_current_markers_and_explicit_
         assert_eq!(result.deleted()[0].delete_marker(), Some(true));
         assert_eq!(result.deleted()[2].delete_marker_version_id(), Some(marker));
         assert_eq!(result.deleted()[1].version_id(), Some(historical_id));
+        if suspended {
+            assert_eq!(marker, "null", "a suspended current delete returns the created null marker identity");
+        }
         let history_after = versions(&client, bucket, "history").await?;
         assert_eq!(
             history_after.iter().filter(|(_, marker)| *marker).count(),
