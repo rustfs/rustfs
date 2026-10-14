@@ -460,6 +460,7 @@ pub(crate) mod workload {
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {

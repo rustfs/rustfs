@@ -2426,7 +2426,7 @@ pub(crate) fn read_destination_file_with_commit_guard(
         let Some(parent) = directories.destination.get() else {
             return Ok(None);
         };
-        return match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
+        match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
             Ok(mut file) => {
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)?;
@@ -2434,7 +2434,7 @@ pub(crate) fn read_destination_file_with_commit_guard(
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
-        };
+        }
     }
     #[cfg(windows)]
     {
@@ -2504,9 +2504,9 @@ pub(crate) async fn rename_all_with_prepared_source(
             {
                 #[cfg(any(test, feature = "test-util"))]
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-                return commit_guard
+                commit_guard
                     .directories
-                    .rename(&src_file_path, &dst_file_path, Some(&prepared_source));
+                    .rename(&src_file_path, &dst_file_path, Some(&prepared_source))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -2542,7 +2542,7 @@ pub(crate) async fn rename_all_with_commit_guard(
         let destination = dst_file_path.as_ref().to_path_buf();
         let guard = commit_guard.clone();
         let _ = (base_dir, publication_root);
-        return run_blocking_namespace_operation(lease, move || {
+        run_blocking_namespace_operation(lease, move || {
             guard.directories.prepare_destination()?;
             #[cfg(test)]
             prepared_publication_test_hooks::run_rename_destination(&source, &destination);
@@ -2555,7 +2555,7 @@ pub(crate) async fn rename_all_with_commit_guard(
         })
         .await
         .map_err(to_file_error)
-        .map_err(DiskError::from);
+        .map_err(DiskError::from)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -3890,7 +3890,7 @@ pub(crate) fn prepare_rename_commit_guard(
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        return Ok(RenameCommitGuard {
+        Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
                 root: publication_root.clone(),
                 source_path: source_parent.to_path_buf(),
@@ -3899,7 +3899,7 @@ pub(crate) fn prepare_rename_commit_guard(
                 destination,
                 destination_base: destination_base.to_path_buf(),
             }),
-        });
+        })
     }
     #[cfg(windows)]
     {

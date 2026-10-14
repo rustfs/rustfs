@@ -2200,6 +2200,18 @@ where
         table: &str,
         scheduler_id: String,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        self.run_table_maintenance_scheduler_once_with_guard(table_bucket, namespace, table, scheduler_id, None)
+            .await
+    }
+
+    pub(super) async fn run_table_maintenance_scheduler_once_with_guard(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+        periodic_guard: Option<&PeriodicTableMaintenanceQueueGuard<'_>>,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let publication = self.table_maintenance_publication().await?;
@@ -2223,6 +2235,20 @@ where
         let effective = sidecar
             .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
             .await?;
+        if let Some(periodic_guard) = periodic_guard {
+            sidecar
+                .validate_periodic_table_maintenance_queue_guard(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &effective,
+                    periodic_guard,
+                )
+                .await?;
+        }
         let preflight = sidecar
             .table_metadata_maintenance_scheduler_preflight_with_publication(
                 TableMaintenancePreflightContext {
@@ -2280,6 +2306,20 @@ where
             .await?;
         if effective.config != planned_effective.config || effective.source != planned_effective.source {
             return Err(TableCatalogStoreError::Conflict("maintenance config changed during planning".to_string()));
+        }
+        if let Some(periodic_guard) = periodic_guard {
+            sidecar
+                .validate_periodic_table_maintenance_queue_guard(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &effective,
+                    periodic_guard,
+                )
+                .await?;
         }
         match sidecar
             .table_metadata_maintenance_scheduler_preflight_with_publication(

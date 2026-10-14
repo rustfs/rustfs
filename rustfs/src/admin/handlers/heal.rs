@@ -2561,24 +2561,21 @@ mod tests {
                 for b in 1u8..8 {
                     for c in 1u8..8 {
                         let masks = [a, b, c];
-                        let snapshots = (0..3)
-                            .map(|source| rustfs_heal::ReplacementRecoverySnapshot {
-                                records: records
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(task, _)| masks[*task] & (1 << source) != 0)
-                                    .map(|(_, record)| record.clone())
-                                    .collect(),
-                                definitive: true,
-                                reason: None,
-                            })
-                            .collect::<Vec<_>>();
+                        let mut snapshots = (0..3).map(|source| rustfs_heal::ReplacementRecoverySnapshot {
+                            records: records
+                                .iter()
+                                .enumerate()
+                                .filter(|(task, _)| masks[*task] & (1 << source) != 0)
+                                .map(|(_, record)| record.clone())
+                                .collect(),
+                            definitive: true,
+                            reason: None,
+                        });
                         let expected = (0..3).all(|left| {
                             (left + 1..3).all(|right| {
                                 records[left].target_slots != records[right].target_slots || masks[left] & masks[right] != 0
                             })
                         });
-                        let mut snapshots = snapshots.into_iter();
                         let local = snapshots.next().expect("three source snapshots");
                         let cluster = aggregate_replacement_recovery_cluster_status(
                             vec![local],
