@@ -14,11 +14,13 @@ const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
 const QUERY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/query";
 const CANCEL_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/cancel";
 const PAGE_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/page";
+const REPLAY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/replay";
 const MAX_RECEIPT_BYTES: usize = 4096;
 // The Runner bounds a result manifest to 1 MiB and reserves 4 KiB for its JSON envelope.
 const MAX_QUERY_RESPONSE_BYTES: usize = 1_052_672;
 const MAX_PAGE_REQUEST_BYTES: usize = 4096;
 const MAX_PAGE_RESPONSE_BYTES: usize = 32 * 1024;
+const MAX_REPLAY_REQUEST_BYTES: usize = 16 * 1024;
 
 #[derive(Serialize)]
 pub(crate) struct SubmitRequest<'a> {
@@ -117,6 +119,26 @@ pub(crate) struct PageResponse {
     pub version: u32,
     pub runs: Vec<RunSummary>,
     pub next_cursor: Option<RunPageCursor>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ReplayRequest<'a> {
+    pub version: u32,
+    pub origin_run_id: uuid::Uuid,
+    pub idempotency_key: &'a str,
+    pub deadline_unix_micros: i64,
+    pub actual_signer_access_key: &'a str,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplayReceipt {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub pool: String,
+    pub deadline_unix_micros: i64,
 }
 
 fn required_manifest<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
@@ -254,6 +276,43 @@ pub(crate) async fn page(request: &PageRequest<'_>) -> S3Result<PageResponse> {
     }
 }
 
+pub(crate) async fn replay(request: &ReplayRequest<'_>) -> S3Result<ReplayReceipt> {
+    if request.version != 1
+        || request.origin_run_id.is_nil()
+        || !valid_idempotency_key(request.idempotency_key)
+        || request.deadline_unix_micros <= 0
+    {
+        return Err(s3_error!(InvalidRequest, "invalid plugin run replay request"));
+    }
+    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run replay request"))?;
+    if body.len() > MAX_REPLAY_REQUEST_BYTES {
+        return Err(s3_error!(InvalidRequest, "plugin run replay request too large"));
+    }
+    let mut url = configured_url()?;
+    url.set_path(REPLAY_ENDPOINT_PATH);
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
+            let result: ReplayReceipt = serde_json::from_slice(&body)
+                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner replay receipt invalid"))?;
+            if !valid_replay_receipt(&result, request.deadline_unix_micros) {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner replay receipt invalid"));
+            }
+            Ok(result)
+        }
+        status => Err(replay_status_error(status)),
+    }
+}
+
 fn cancel_status_error(status: StatusCode) -> s3s::S3Error {
     match status {
         StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
@@ -309,6 +368,25 @@ fn valid_page_response(response: &PageResponse, limit: u32) -> bool {
                     && cursor.run_id == last.run_id
             })
     })
+}
+
+fn valid_replay_receipt(receipt: &ReplayReceipt, requested_deadline: i64) -> bool {
+    receipt.version == 1
+        && !receipt.run_id.is_nil()
+        && literal(&receipt.pool)
+        && receipt.deadline_unix_micros == requested_deadline
+}
+
+fn replay_status_error(status: StatusCode) -> s3s::S3Error {
+    match status {
+        StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
+        StatusCode::CONFLICT => s3_error!(OperationAborted, "plugin run cannot be replayed"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => s3_error!(AccessDenied, "plugin runner rejected request"),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            s3_error!(InvalidRequest, "plugin runner rejected request")
+        }
+        _ => s3_error!(ServiceUnavailable, "plugin runner unavailable"),
+    }
 }
 
 async fn configured_client() -> S3Result<Client> {
@@ -439,6 +517,8 @@ mod tests {
         assert_eq!(query.path(), CANCEL_ENDPOINT_PATH);
         query.set_path(PAGE_ENDPOINT_PATH);
         assert_eq!(query.path(), PAGE_ENDPOINT_PATH);
+        query.set_path(REPLAY_ENDPOINT_PATH);
+        assert_eq!(query.path(), REPLAY_ENDPOINT_PATH);
     }
 
     #[test]
@@ -571,6 +651,54 @@ mod tests {
             cursor: None,
         };
         assert!(serde_json::to_vec(&request).unwrap().len() > MAX_PAGE_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn replay_receipt_is_strict_and_bound_to_requested_deadline() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let valid: ReplayReceipt =
+            serde_json::from_str(&format!(r#"{{"version":1,"run_id":"{run_id}","pool":"cpu","deadline_unix_micros":123}}"#))
+                .unwrap();
+        assert!(valid_replay_receipt(&valid, 123));
+        assert!(!valid_replay_receipt(&valid, 124));
+        assert!(
+            serde_json::from_str::<ReplayReceipt>(&format!(
+                r#"{{"version":1,"run_id":"{run_id}","pool":"cpu","deadline_unix_micros":123,"tenant":"other"}}"#
+            ))
+            .is_err()
+        );
+        let invalid: ReplayReceipt = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","pool":"bad*","deadline_unix_micros":123}}"#
+        ))
+        .unwrap();
+        assert!(!valid_replay_receipt(&invalid, 123));
+    }
+
+    #[test]
+    fn replay_request_body_and_runner_statuses_are_bounded() {
+        assert_eq!(MAX_REPLAY_REQUEST_BYTES, 16 * 1024);
+        let key = "\u{1}".repeat(1024);
+        let request = ReplayRequest {
+            version: 1,
+            origin_run_id: uuid::Uuid::from_u128(1),
+            idempotency_key: &key,
+            deadline_unix_micros: 123,
+            actual_signer_access_key: "owner-key",
+            delegation_id: "delegation",
+            delegation_revision: "revision",
+        };
+        assert!(valid_idempotency_key(&key));
+        let body = serde_json::to_vec(&request).unwrap();
+        assert!(body.len() <= MAX_REPLAY_REQUEST_BYTES);
+        assert!(body.len() > 4096, "test exercises JSON escaping of a maximum-length accepted key");
+        assert_eq!(replay_status_error(StatusCode::NOT_FOUND).code(), &s3s::S3ErrorCode::NoSuchKey);
+        assert_eq!(replay_status_error(StatusCode::CONFLICT).code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(replay_status_error(StatusCode::FORBIDDEN).code(), &s3s::S3ErrorCode::AccessDenied);
+        assert_eq!(replay_status_error(StatusCode::BAD_REQUEST).code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            replay_status_error(StatusCode::SERVICE_UNAVAILABLE).code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
     }
 
     #[test]

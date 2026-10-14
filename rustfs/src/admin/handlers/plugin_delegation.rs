@@ -48,6 +48,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/page"),
         AdminOperation(&PageRuns),
     )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/replay"),
+        AdminOperation(&ReplayRun),
+    )?;
     Ok(())
 }
 
@@ -345,12 +350,67 @@ impl Operation for PageRuns {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayRunInput {
+    version: u32,
+    origin_run_id: uuid::Uuid,
+    idempotency_key: String,
+    deadline_unix_micros: i64,
+}
+
+fn valid_replay_run_input(input: &ReplayRunInput) -> bool {
+    input.version == 1
+        && !input.origin_run_id.is_nil()
+        && plugin_runner::valid_idempotency_key(&input.idempotency_key)
+        && input.deadline_unix_micros > 0
+}
+
+struct ReplayRun;
+#[async_trait::async_trait]
+impl Operation for ReplayRun {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::ReplayPluginRunAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "replay body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "replay body unavailable"))?;
+        let input: ReplayRunInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid replay request"))?;
+        if !valid_replay_run_input(&input) {
+            return Err(s3_error!(InvalidRequest, "invalid replay request"));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .as_secs();
+        let record = iam
+            .read_active_plugin_delegation(&signer, id, now)
+            .await
+            .map_err(storage_error)?;
+        let result = plugin_runner::replay(&plugin_runner::ReplayRequest {
+            version: input.version,
+            origin_run_id: input.origin_run_id,
+            idempotency_key: &input.idempotency_key,
+            deadline_unix_micros: input.deadline_unix_micros,
+            actual_signer_access_key: &signer,
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+        })
+        .await?;
+        response(&result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
-        for operation in 0..6 {
+        for operation in 0..7 {
             let req = S3Request {
                 input: Body::from("{}".to_owned()),
                 method: Method::POST,
@@ -374,6 +434,8 @@ mod tests {
                 CancelRun.call(req, Params::new()).await
             } else if operation == 5 {
                 PageRuns.call(req, Params::new()).await
+            } else if operation == 6 {
+                ReplayRun.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
             };
@@ -455,6 +517,36 @@ mod tests {
                 Err(_) => true,
             };
             assert!(rejected, "accepted invalid page request: {raw}");
+        }
+    }
+
+    #[test]
+    fn replay_run_dto_is_strict_and_bounded() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let input: ReplayRunInput = serde_json::from_str(&format!(
+            r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"retry-1","deadline_unix_micros":123}}"#
+        ))
+        .expect("valid replay request");
+        assert!(valid_replay_run_input(&input));
+        for raw in [
+            format!(
+                r#"{{"version":1,"origin_run_id":"00000000-0000-0000-0000-000000000000","idempotency_key":"k","deadline_unix_micros":123}}"#
+            ),
+            format!(r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"","deadline_unix_micros":123}}"#),
+            format!(r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"k","deadline_unix_micros":0}}"#),
+            format!(
+                r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"k","deadline_unix_micros":123,"actual_signer_access_key":"forged"}}"#
+            ),
+            format!(
+                r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"{}","deadline_unix_micros":123}}"#,
+                "x".repeat(1025)
+            ),
+        ] {
+            let rejected = match serde_json::from_str::<ReplayRunInput>(&raw) {
+                Ok(input) => !valid_replay_run_input(&input),
+                Err(_) => true,
+            };
+            assert!(rejected, "accepted invalid replay request: {raw}");
         }
     }
 }

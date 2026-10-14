@@ -574,6 +574,8 @@ pub enum AdminAction {
     CancelPluginRunAction,
     #[strum(serialize = "admin:ListPluginRuns")]
     ListPluginRunsAction,
+    #[strum(serialize = "admin:ReplayPluginRun")]
+    ReplayPluginRunAction,
     #[strum(serialize = "admin:GetPluginDelegation")]
     GetPluginDelegationAction,
     #[strum(serialize = "admin:RevokePluginDelegation")]
@@ -724,6 +726,7 @@ impl AdminAction {
                 | AdminAction::GetPluginRunAction
                 | AdminAction::CancelPluginRunAction
                 | AdminAction::ListPluginRunsAction
+                | AdminAction::ReplayPluginRunAction
                 | AdminAction::GetPluginDelegationAction
                 | AdminAction::CreatePluginDelegationAction
                 | AdminAction::RevokePluginDelegationAction
@@ -937,6 +940,7 @@ mod tests {
             ("admin:GetPluginRun", AdminAction::GetPluginRunAction),
             ("admin:CancelPluginRun", AdminAction::CancelPluginRunAction),
             ("admin:ListPluginRuns", AdminAction::ListPluginRunsAction),
+            ("admin:ReplayPluginRun", AdminAction::ReplayPluginRunAction),
         ] {
             assert_eq!(AdminAction::try_from(name).unwrap(), expected);
             assert!(expected.is_valid());
@@ -951,6 +955,7 @@ mod tests {
         assert!(AdminAction::GetPluginRunAction.is_valid());
         assert!(AdminAction::CancelPluginRunAction.is_valid());
         assert!(AdminAction::ListPluginRunsAction.is_valid());
+        assert!(AdminAction::ReplayPluginRunAction.is_valid());
         assert!(AdminAction::try_from("admin:IssuePluginCredentials").is_err());
     }
 
