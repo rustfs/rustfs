@@ -121,12 +121,13 @@ impl KeyName {
     /// values for these keys. Without that check a caller could satisfy conditions such
     /// as `aws:userid` or `jwt:groups` simply by sending a header of the same name.
     ///
-    /// The `s3:` namespace is mixed: `s3:x-amz-*` keys mirror request headers by
-    /// design, while the rest (`s3:authType`, `s3:LocationConstraint`, ...) are
-    /// computed by the server.
+    /// The `s3:` namespace is mixed: `s3:x-amz-*`, `s3:if-match` and `s3:if-none-match`
+    /// mirror request headers by design, while the rest (`s3:authType`,
+    /// `s3:LocationConstraint`, ...) are computed by the server.
     pub fn is_server_derived(&self) -> bool {
         match self {
             KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) => true,
+            KeyName::S3(S3KeyName::S3IfMatch | S3KeyName::S3IfNoneMatch) => false,
             KeyName::S3(_) => !self.name().starts_with("x-amz-"),
         }
     }
@@ -485,6 +486,7 @@ mod tests {
     fn conditional_write_key_names_match_request_header_names(key: &str, header: &str) {
         let key_name = KeyName::try_from(key).expect("conditional write key must parse");
         assert_eq!(key_name.name(), header);
+        assert!(!key_name.is_server_derived(), "{key} is filled from a request header");
     }
 
     #[test]
