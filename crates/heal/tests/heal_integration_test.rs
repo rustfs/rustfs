@@ -533,3 +533,160 @@ mod serial_tests {
         info!("Direct heal storage API test passed");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn replacement_delete_recovery_on_fresh_target() {
+    use rustfs_heal::Error;
+    use rustfs_heal::heal::task::HealTask;
+    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+    use storage_api::integration::EcstoreStorageError;
+
+    for (source, erasure_set) in [
+        (HealRequestSource::AutoHeal, true),
+        (HealRequestSource::Admin, true),
+        (HealRequestSource::Admin, false),
+    ] {
+        let (disk_paths, ecstore, storage) = heal_env().await;
+        let bucket = "replacement-delete-prepass";
+        create_test_bucket(&ecstore, bucket).await;
+        let original = non_inline_test_data();
+        for key in ["live", "deleted"] {
+            upload_test_object(&ecstore, bucket, key, &original).await;
+            wait_for_object_copies(&disk_paths, bucket, key).await;
+        }
+        let retired = disk_paths[0].with_extension("retired");
+        std::fs::rename(&disk_paths[0], &retired).expect("detach target");
+        std::fs::create_dir_all(&disk_paths[0]).expect("empty replacement");
+        ecstore
+            .delete_object(bucket, "deleted", ObjectOptions::default())
+            .await
+            .expect("delete during outage");
+        let updated = vec![17; NON_INLINE_TEST_DATA_SIZE];
+        upload_test_object(&ecstore, bucket, "live", &updated).await;
+        upload_test_object(&ecstore, bucket, "outage-created", &original).await;
+        let (_, error) = storage.heal_format(false).await.expect("format target");
+        assert!(error.is_none(), "{error:?}");
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("survivor incarnation remains authoritative");
+        // A committed survivor journal must be adopted, but publishing its
+        // witness cannot recreate a missing bucket outside lifecycle ownership.
+        assert!(matches!(
+            storage
+                .recover_delete_transactions(bucket, None, None, &HealOpts::default())
+                .await,
+            Err(Error::Storage(EcstoreStorageError::FileNotFound))
+        ));
+        let heal_type = if erasure_set {
+            HealType::ErasureSet {
+                buckets: vec![bucket.to_owned()],
+                set_disk_id: "pool_0_set_0".to_owned(),
+            }
+        } else {
+            HealType::Bucket {
+                bucket: bucket.to_owned(),
+            }
+        };
+        let mut request = HealRequest::new(
+            heal_type,
+            HealOptions {
+                recursive: true,
+                pool_index: Some(0),
+                set_index: Some(0),
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = source;
+        if !erasure_set {
+            request.bucket_incarnation_id = Some(incarnation);
+        }
+        HealTask::from_request(request, storage.clone())
+            .execute()
+            .await
+            .unwrap_or_else(|err| panic!("{source:?} erasure_set={erasure_set}: {err}"));
+        // Check physical repair before GET can hide missing shards via read repair.
+        for key in ["live", "outage-created"] {
+            assert!(disk_paths[0].join(bucket).join(key).join("xl.meta").exists());
+            assert!(find_part_file(&disk_paths[0].join(bucket).join(key)).is_some());
+        }
+        for (key, expected) in [("live", updated.as_slice()), ("outage-created", original.as_slice())] {
+            let mut reader = ecstore
+                .get_object_reader(bucket, key, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("open rebuilt object");
+            assert_eq!(reader.read_all().await.expect("read rebuilt bytes"), expected);
+        }
+        assert!(matches!(
+            ecstore.get_object_info(bucket, "deleted", &ObjectOptions::default()).await,
+            Err(EcstoreStorageError::ObjectNotFound(_, _))
+        ));
+        assert_eq!(
+            ecstore
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("retained incarnation"),
+            incarnation
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn bucket_removal_recovers_delete_proofs_before_removing_empty_volumes() {
+    use rustfs_heal::heal::task::HealTask;
+    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+    let (disk_paths, ecstore, storage) = heal_env().await;
+    let bucket = "delete-proof-before-volume-removal";
+    create_test_bucket(&ecstore, bucket).await;
+    upload_test_object(&ecstore, bucket, "deleted", &non_inline_test_data()).await;
+    wait_for_object_copies(&disk_paths, bucket, "deleted").await;
+    std::fs::rename(&disk_paths[0], disk_paths[0].with_extension("retired")).expect("detach target");
+    std::fs::create_dir_all(&disk_paths[0]).expect("empty replacement");
+    ecstore
+        .delete_object(bucket, "deleted", ObjectOptions::default())
+        .await
+        .expect("delete at survivor quorum");
+    let (_, error) = storage.heal_format(false).await.expect("format target");
+    assert!(error.is_none());
+    storage
+        .heal_bucket(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("empty target volume");
+    assert!(disk_paths[0].join(bucket).exists());
+    let mut request = HealRequest::new(
+        HealType::Bucket {
+            bucket: bucket.to_owned(),
+        },
+        HealOptions {
+            recursive: false,
+            remove_corrupted: true,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    request.bucket_incarnation_id = Some(
+        ecstore
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("admitted incarnation"),
+    );
+    HealTask::from_request(request, storage)
+        .execute()
+        .await
+        .expect("settle journals before deleting empty volumes");
+    assert!(
+        disk_paths.iter().all(|path| !path.join(bucket).exists()),
+        "all empty replicas should be removed after proof settlement"
+    );
+}
