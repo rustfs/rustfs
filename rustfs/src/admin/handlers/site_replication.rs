@@ -15,7 +15,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_deployment_id, current_federated_identity_service, current_iam_handle, current_object_store_handle, current_region,
+    current_deployment_id, current_iam_handle, current_object_store_handle, current_oidc_config_query, current_region,
     current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
     object_store_from_req,
 };
@@ -2031,8 +2031,8 @@ async fn bootstrap_existing_metadata_after_add(
 }
 
 /// The OpenID half of the IDP settings a site reports to its site-replication
-/// peers, built from the providers this site has configured (in
-/// `list_providers` order) and the site's own region.
+/// peers, built from the active OIDC configuration snapshot and the site's own
+/// region.
 fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: String) -> OpenIDSettings {
     // `region` qualifies the provider identities, not the site: a site
     // without OpenID must report the empty settings in every region, or the
@@ -2042,53 +2042,53 @@ fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: St
         return OpenIDSettings::default();
     }
 
+    let mut providers = providers;
+    let claim_provider_index = providers
+        .iter()
+        .position(|(provider_id, _)| provider_id == "default")
+        .unwrap_or_default();
+    let (_, claim_provider) = providers.remove(claim_provider_index);
     let mut settings = OpenIDSettings {
         enabled: true,
         region,
+        claim_provider,
         ..Default::default()
     };
 
     for (provider_id, provider_settings) in providers {
-        let claim_provider_unset = settings.claim_provider.client_id.is_empty()
-            && settings.claim_provider.claim_name.is_empty()
-            && settings.claim_provider.role_policy.is_empty()
-            && settings.claim_provider.hashed_client_secret.is_empty();
-
-        if provider_id == "default" || claim_provider_unset {
-            settings.claim_provider = provider_settings;
-        } else {
-            settings.roles.insert(provider_id, provider_settings);
-        }
+        settings.roles.insert(provider_id, provider_settings);
     }
 
     settings
 }
 
+fn open_id_settings_from_snapshot(snapshot: &rustfs_iam::oidc::OidcSiteReplicationSnapshot, region: String) -> OpenIDSettings {
+    let providers = snapshot
+        .providers()
+        .iter()
+        .map(|provider| {
+            (
+                provider.provider_id.clone(),
+                OpenIDProviderSettings {
+                    claim_name: provider.claim_name.clone(),
+                    claim_userinfo_enabled: false,
+                    role_policy: provider.role_policy.clone(),
+                    client_id: provider.client_id.clone(),
+                    hashed_client_secret: provider.hashed_client_secret.clone(),
+                },
+            )
+        })
+        .collect();
+
+    open_id_settings(providers, region)
+}
+
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
-    if let Some(federation) = current_federated_identity_service() {
-        // A listed provider whose config cannot be resolved contributes
-        // nothing to the peer comparison, so it is dropped here rather than
-        // inside the settings builder.
-        let providers = federation
-            .list_providers()
-            .into_iter()
-            .filter_map(|provider| {
-                let config = federation.get_provider_config(&provider.provider_id)?;
-                Some((
-                    provider.provider_id.clone(),
-                    OpenIDProviderSettings {
-                        claim_name: config.claim_name.clone(),
-                        claim_userinfo_enabled: false,
-                        role_policy: config.role_policy.clone(),
-                        client_id: config.client_id.clone(),
-                        hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-                    },
-                ))
-            })
-            .collect();
-        settings.open_id = open_id_settings(providers, current_region().map(|region| region.to_string()).unwrap_or_default());
-    }
+    let region = current_region().map(|region| region.to_string()).unwrap_or_default();
+    settings.open_id = current_oidc_config_query()
+        .map(|query| open_id_settings_from_snapshot(&query.site_replication_snapshot(), region))
+        .unwrap_or_default();
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
     settings.ldap = ldap;
@@ -11386,6 +11386,33 @@ mod tests {
         }
     }
 
+    fn oidc_snapshot_provider(id: &str, client_id: &str) -> rustfs_iam::oidc::SourcedOidcProviderConfig {
+        rustfs_iam::oidc::SourcedOidcProviderConfig {
+            config: rustfs_iam::oidc::OidcProviderConfig {
+                id: id.to_string(),
+                enabled: true,
+                config_url: format!("https://idp.example.com/{id}/.well-known/openid-configuration"),
+                issuer: None,
+                client_id: client_id.to_string(),
+                client_secret: Some("secret".to_string()),
+                scopes: vec!["openid".to_string()],
+                other_audiences: Vec::new(),
+                redirect_uri: None,
+                redirect_uri_dynamic: true,
+                claim_name: "groups".to_string(),
+                claim_prefix: String::new(),
+                role_policy: "readwrite".to_string(),
+                display_name: id.to_string(),
+                groups_claim: "groups".to_string(),
+                roles_claim: String::new(),
+                email_claim: "email".to_string(),
+                username_claim: "username".to_string(),
+                hide_from_ui: false,
+            },
+            source: rustfs_iam::oidc::OidcProviderConfigSource::Persisted,
+        }
+    }
+
     fn ldap_settings_kvs() -> rustfs_config::server_config::KVS {
         rustfs_config::server_config::KVS(vec![
             rustfs_config::server_config::KV {
@@ -11443,6 +11470,20 @@ mod tests {
     }
 
     #[test]
+    fn test_open_id_settings_uses_first_named_provider_without_default() {
+        let settings = open_id_settings(
+            vec![
+                ("alpha".to_string(), openid_provider("client-a")),
+                ("corp".to_string(), openid_provider("client-b")),
+            ],
+            "eu-site-1".to_string(),
+        );
+
+        assert_eq!(settings.claim_provider.client_id, "client-a");
+        assert_eq!(settings.roles.get("corp").map(|provider| provider.client_id.as_str()), Some("client-b"));
+    }
+
+    #[test]
     fn idp_settings_preserve_site_replication_wire_shape() {
         let (ldap, ldap_configs) = ldap_settings_from_kvs(&ldap_settings_kvs());
         let settings = IDPSettings {
@@ -11497,6 +11538,50 @@ mod tests {
                         "ClientID": "client-a",
                         "HashedClientSecret": "hashed",
                     }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn oidc_config_snapshot_preserves_site_replication_settings() {
+        let snapshot = rustfs_iam::oidc::OidcSiteReplicationSnapshot::from_config_snapshot(
+            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![
+                oidc_snapshot_provider("corp", "client-b"),
+                oidc_snapshot_provider("default", "client-a"),
+            ]),
+        );
+
+        assert_eq!(
+            snapshot
+                .providers()
+                .iter()
+                .map(|provider| provider.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "corp"]
+        );
+
+        assert_eq!(
+            serde_json::to_value(open_id_settings_from_snapshot(&snapshot, "eu-site-1".to_string()))
+                .expect("serialize OpenID settings"),
+            serde_json::json!({
+                "Enabled": true,
+                "Region": "eu-site-1",
+                "Roles": {
+                    "corp": {
+                        "ClaimName": "groups",
+                        "ClaimUserinfoEnabled": false,
+                        "RolePolicy": "readwrite",
+                        "ClientID": "client-b",
+                        "HashedClientSecret": "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols",
+                    }
+                },
+                "ClaimProvider": {
+                    "ClaimName": "groups",
+                    "ClaimUserinfoEnabled": false,
+                    "RolePolicy": "readwrite",
+                    "ClientID": "client-a",
+                    "HashedClientSecret": "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols",
                 }
             })
         );

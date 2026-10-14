@@ -16,6 +16,7 @@ use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeErro
 use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unreadable_config_refusal};
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
+use rustfs_lock::LockError;
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
@@ -25,6 +26,58 @@ const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please r
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
 pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
+
+fn lock_resource_class(resource: Option<&str>) -> &'static str {
+    let Some(resource) = resource else {
+        return "unknown";
+    };
+    if resource == ".rustfs.sys/multipart"
+        || resource.starts_with(".rustfs.sys/multipart/")
+        || resource == ".minio.sys/multipart"
+        || resource.starts_with(".minio.sys/multipart/")
+    {
+        return "multipart_metadata";
+    }
+    if resource.starts_with(".rustfs.sys/") || resource.starts_with(".minio.sys/") {
+        return "system_metadata";
+    }
+    let Some((bucket, object)) = resource.split_once('/') else {
+        return "unknown";
+    };
+    let object = object.split('@').next().unwrap_or(object);
+    if object.is_empty() || object == bucket {
+        "bucket_namespace"
+    } else {
+        "object_namespace"
+    }
+}
+
+fn record_s3_lock_failure(err: &StorageError) {
+    let record = |resource: Option<&str>, mode: &'static str, reason: &'static str| {
+        rustfs_io_metrics::s3_http_metrics::record_s3_http_lock_failure(lock_resource_class(resource), mode, reason);
+    };
+    match err {
+        StorageError::Lock(lock_error) => match lock_error {
+            LockError::Timeout { resource, .. } => record(Some(resource), "unknown", "timeout"),
+            LockError::AlreadyLocked { resource, .. } => record(Some(resource), "unknown", "contention"),
+            LockError::QuorumNotReached { .. } | LockError::InsufficientNodes { .. } => record(None, "unknown", "quorum"),
+            LockError::Network { .. } | LockError::Internal { .. } => record(None, "unknown", "transport"),
+            _ => record(None, "unknown", "other"),
+        },
+        StorageError::NamespaceLockQuorumUnavailable {
+            mode, bucket, object, ..
+        } => {
+            let resource = format!("{bucket}/{object}");
+            let mode = match *mode {
+                "read" => "read",
+                "write" => "write",
+                _ => "other",
+            };
+            record(Some(&resource), mode, "quorum");
+        }
+        _ => {}
+    }
+}
 
 /// Map a KMS failure that surfaced on the S3 data path to its S3 error code.
 ///
@@ -525,6 +578,7 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        record_s3_lock_failure(&err);
         if err.pool_metadata_failure().is_some() {
             return ApiError {
                 code: S3ErrorCode::ServiceUnavailable,
@@ -641,6 +695,7 @@ impl From<StorageError> for ApiError {
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
+            | StorageError::Timeout
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => {
                 S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())
@@ -824,8 +879,51 @@ impl From<QuotaError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
+    use rustfs_s3_ops::S3Operation;
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn lock_503_mapping_records_operation_and_resource_class_without_resource_name() {
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                let error = ApiError::from(StorageError::Lock(LockError::timeout(
+                    ".rustfs.sys/scanner/durable-dirty-producer-replay.json",
+                    std::time::Duration::from_secs(5),
+                )));
+                assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            });
+        });
+
+        let metrics = recorder.snapshotter().snapshot().into_vec();
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("S3 lock failures should be observable");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["mode"], "unknown");
+        assert_eq!(labels["reason"], "timeout");
+        assert_eq!(labels["resource_class"], "system_metadata");
+        assert!(!labels.values().any(|value| value.contains("durable-dirty-producer-replay")));
+    }
+
+    #[test]
+    fn multipart_lock_resources_have_a_distinct_bounded_class() {
+        assert_eq!(lock_resource_class(Some(".rustfs.sys/multipart/upload-1")), "multipart_metadata");
+        assert_eq!(lock_resource_class(Some(".minio.sys/multipart/upload-1")), "multipart_metadata");
+    }
 
     /// rustfs/backlog#1734: a refusal to act on a stored bucket config that
     /// cannot be parsed is recoverable once an operator repairs the bytes, so
@@ -1619,6 +1717,37 @@ mod tests {
             let api_error: ApiError = storage_error.into();
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
+        }
+    }
+
+    #[test]
+    fn disk_quorum_timeouts_map_to_retryable_service_unavailable() {
+        use crate::storage_api::error::{DiskError, OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
+
+        let errors = [
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            None,
+        ];
+        for reduced in [
+            reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3),
+        ] {
+            let reduced = reduced.expect("quorum of timeouts must retain its typed cause");
+            assert_eq!(reduced, DiskError::Timeout);
+            let error = ApiError::from(StorageError::from(reduced));
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            let response = S3Error::from(error);
+            assert_eq!(response.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        }
+        let degraded = [None, None, None, Some(DiskError::Timeout)];
+        assert!(reduce_write_quorum_errs(&degraded, OBJECT_OP_IGNORED_ERRS, 3).is_none());
+        for failure in [DiskError::FileCorrupt, DiskError::Io(IoError::other("unknown disk failure"))] {
+            let errors = [Some(failure.clone()), Some(failure.clone()), Some(failure), None];
+            let reduced =
+                reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3).expect("permanent failures must remain errors");
+            assert_eq!(ApiError::from(StorageError::from(reduced)).code, S3ErrorCode::InternalError);
         }
     }
 

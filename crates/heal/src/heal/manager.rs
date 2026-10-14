@@ -45,6 +45,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
 
@@ -1901,6 +1902,10 @@ impl HealManager {
             }
             Ok(None) | Err(_) => None,
         }
+    }
+
+    pub(crate) async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        self.storage.mrf_bucket_incarnation_retired(bucket, expected).await
     }
 
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(

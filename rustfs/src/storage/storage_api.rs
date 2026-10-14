@@ -132,6 +132,7 @@ pub(crate) mod access_consumer {
         has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -504,7 +505,7 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, wait_for_detached_mutations,
     };
 }
 
@@ -1196,8 +1197,8 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>, buckets: &[String]) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata_for_buckets(store, buckets)
         .await
         .map_err(ecstore_bucket::migration::migration_startup_error)
 }
@@ -1340,6 +1341,10 @@ where
 
 pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
+}
+
+pub(crate) async fn wait_for_detached_mutations(timeout: std::time::Duration) -> bool {
+    ecstore_global::wait_for_detached_mutations(timeout).await
 }
 
 pub(crate) fn shutdown_background_monitors() {

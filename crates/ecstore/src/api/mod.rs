@@ -210,7 +210,8 @@ pub mod bucket {
 
     pub mod migration {
         pub use crate::bucket::migration::{
-            LegacyBlobDecryptFn, migration_startup_error, try_migrate_bucket_metadata, try_migrate_iam_config,
+            LegacyBlobDecryptFn, migration_startup_error, try_migrate_bucket_metadata, try_migrate_bucket_metadata_for_buckets,
+            try_migrate_iam_config,
         };
     }
 
@@ -240,7 +241,10 @@ pub mod bucket {
     }
 
     pub mod quota {
-        pub use crate::bucket::quota::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
+        pub use crate::bucket::quota::{
+            BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
+            QuotaOperation,
+        };
 
         pub mod checker {
             pub use crate::bucket::quota::checker::QuotaChecker;
@@ -362,10 +366,11 @@ pub mod config {
             ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config, delete_config_no_lock,
             is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
             read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
-            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_server_config,
-            save_server_config_no_lock, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-            server_config_path, try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock,
-            with_server_config_read_lock, with_server_config_write_lock,
+            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_config_with_opts_quiet,
+            save_server_config, save_server_config_no_lock, save_server_config_snapshot,
+            save_server_config_snapshot_with_generation, server_config_path, try_migrate_server_config,
+            with_config_object_read_lock, with_config_object_write_lock, with_server_config_read_lock,
+            with_server_config_write_lock,
         };
     }
 
@@ -468,7 +473,7 @@ pub mod event {
 pub mod global {
     pub use crate::runtime::global::{
         set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
-        update_erasure_type,
+        update_erasure_type, wait_for_detached_mutations,
     };
 }
 

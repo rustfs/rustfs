@@ -168,11 +168,13 @@ jobs:
           FILTER: ${{ inputs.filter }}
         run: |
           set -euo pipefail
+          rm -f target/nextest/e2e-distributed/junit.xml
           if [ -n "${FILTER}" ]; then
             python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
           else
             python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
           fi
+          test -s target/nextest/e2e-distributed/junit.xml
 
       - name: Upload distributed e2e diagnostics
         if: always()

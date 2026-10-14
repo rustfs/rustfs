@@ -14,8 +14,10 @@
 
 use crate::compress_index::{Index, TryGetIndex};
 use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
+use sha2::Sha256;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -29,6 +31,7 @@ pin_project! {
         pub finished: bool,
         pub checksum: Option<String>,
         resolved_etag: Option<String>,
+        encrypted_etag_mac: Option<Hmac<Sha256>>,
     }
 }
 
@@ -40,7 +43,19 @@ impl<R> EtagReader<R> {
             finished: false,
             checksum,
             resolved_etag: None,
+            encrypted_etag_mac: None,
         }
+    }
+
+    /// Protect the content fingerprint with the object's encryption material.
+    /// Plaintext checksum verification remains the inner reader's responsibility.
+    pub fn new_encrypted(inner: R, key: [u8; 32], nonce: [u8; 12]) -> std::io::Result<Self> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).map_err(std::io::Error::other)?;
+        mac.update(b"RustFS:encrypted-ETag:v1\0");
+        mac.update(&nonce);
+        let mut reader = Self::new(inner, None);
+        reader.encrypted_etag_mac = Some(mac);
+        Ok(reader)
     }
 
     /// Get the final md5 value (etag) as a hex string, only compute once.
@@ -108,6 +123,14 @@ impl<R> EtagResolvable for EtagReader<R> {
         true
     }
     fn try_resolve_etag(&mut self) -> Option<String> {
+        if let Some(mut mac) = self.encrypted_etag_mac.clone() {
+            if !self.finished {
+                return None;
+            }
+            mac.update(self.get_etag().as_bytes());
+            let protected = mac.finalize().into_bytes();
+            return Some(hex_simd::encode_to_string(&protected[..16], hex_simd::AsciiCase::Lower));
+        }
         // EtagReader provides its own etag, not delegating to inner
         if let Some(checksum) = &self.checksum {
             Some(checksum.clone())
@@ -147,6 +170,47 @@ mod tests {
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn encrypted_etags_hide_plaintext_fingerprints_including_empty_objects() {
+        for data in [b"".as_slice(), b"Salary 2026: 85000 EUR".as_slice()] {
+            let md5 = hex_simd::encode_to_string(Md5::digest(data), hex_simd::AsciiCase::Lower);
+            let mut tags = Vec::new();
+            for (key, nonce) in [([1; 32], [1; 12]), ([2; 32], [1; 12]), ([1; 32], [2; 12])] {
+                let mut reader = EtagReader::new_encrypted(Cursor::new(data), key, nonce).expect("create protected ETag reader");
+                assert!(reader.try_resolve_etag().is_none());
+                let mut output = Vec::new();
+                reader.read_to_end(&mut output).await.expect("read unchanged plaintext");
+                assert_eq!(output, data);
+                let tag = reader.try_resolve_etag().expect("resolve protected ETag after EOF");
+                assert_eq!(tag.len(), 32);
+                assert_ne!(tag, md5);
+                assert_eq!(reader.try_resolve_etag().as_ref(), Some(&tag));
+                tags.push(tag);
+            }
+            assert_ne!(tags[0], tags[1], "different keys must not link identical content");
+            assert_ne!(tags[0], tags[2], "different objects under a legacy key must not link identical content");
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_etag_reader_preserves_plaintext_digest_rejection() {
+        let plaintext = crate::HashReader::from_stream(
+            Cursor::new(b"actual plaintext"),
+            16,
+            16,
+            Some("00000000000000000000000000000000".to_owned()),
+            None,
+            false,
+        )
+        .expect("create checked plaintext reader");
+        let mut reader = EtagReader::new_encrypted(plaintext, [1; 32], [2; 12]).expect("create protected ETag reader");
+        let err = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("wrong plaintext MD5 must still be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[tokio::test]
     async fn test_etag_reader_basic() {

@@ -2788,6 +2788,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await;
                 if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                    #[cfg(test)]
+                    super::super::rename_fanout_barrier::checkpoint(
+                        object,
+                        0,
+                        super::super::rename_fanout_barrier::PHASE_LATE_METADATA_REFRESH,
+                    )
+                    .await;
                     let (full_fi, full_parts_metadata, full_online_disks) = Self::refresh_late_metadata_fanout(
                         &late_metadata_fanout_disks,
                         bucket,
@@ -3840,6 +3847,16 @@ impl SetDisks {
                 .map(crate::io_support::rio::compression_index_storage_bytes);
 
             let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+            if data.stream.encrypted_etag {
+                if opts.preserve_etag.as_ref().is_none_or(|preserved| preserved == &etag) {
+                    insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+                } else {
+                    rustfs_utils::http::metadata_compat::remove_str(
+                        &mut user_defined,
+                        rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+                    );
+                }
+            }
             if let Some(ref tag) = opts.preserve_etag {
                 etag = tag.clone();
             }
@@ -7078,6 +7095,82 @@ async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
     }
 }
 
+/// Pauses a delete after its per-disk commit and before the cleanup or rollback
+/// pass, the window in which an abandoned delete used to leave metadata-less
+/// residue behind.
+#[cfg(test)]
+struct DeleteCleanupBarrierState {
+    bucket: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DeleteCleanupBarrier {
+    state: Arc<DeleteCleanupBarrierState>,
+}
+
+#[cfg(test)]
+static DELETE_CLEANUP_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DeleteCleanupBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DeleteCleanupBarrier {
+    pub(crate) fn install(bucket: &str) -> Self {
+        let state = Arc::new(DeleteCleanupBarrierState {
+            bucket: bucket.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DELETE_CLEANUP_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete cleanup barrier mutex should not poison");
+        assert!(slot.is_none(), "delete cleanup barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("delete should reach the cleanup barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeleteCleanupBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DELETE_CLEANUP_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete cleanup barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_delete_before_cleanup(bucket: &str) {
+    let barrier = DELETE_CLEANUP_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete cleanup barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 fn persisted_transition_version_with_gate(
     remote_version: &str,
     remote_version_state_writer_enabled: bool,
@@ -7658,6 +7751,8 @@ impl SetDisks {
 
         let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
         let should_rollback = quorum_result.is_err();
+        #[cfg(test)]
+        pause_delete_before_cleanup(bucket).await;
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
             // backlog#1158: when rolling back, fan the idempotent undo out to every
@@ -8667,6 +8762,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        #[cfg(test)]
+        pause_delete_before_cleanup(bucket).await;
 
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
@@ -10522,6 +10619,65 @@ mod object_encryption_resolver_wiring_tests {
     use std::io::Cursor;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn encrypted_put_attests_only_etags_produced_by_its_encryption_reader() {
+        use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+        use crate::io_support::rio::{WriteEncryption, WritePlan};
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use tokio::io::AsyncReadExt;
+
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks_isolated(4).await;
+        let bucket = "encrypted-etag-proof";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket volume");
+        }
+        let plaintext = b"Salary 2026: 85000 EUR";
+        let size = plaintext.len() as i64;
+        let mut control = HashReader::from_stream(Cursor::new(plaintext), size, size, None, None, false).expect("control reader");
+        control.read_to_end(&mut Vec::new()).await.expect("read control plaintext");
+        let plaintext_md5 = control.try_resolve_etag().expect("control MD5");
+        for (object, preserved) in [("new", None), ("preserved", Some(plaintext_md5.clone()))] {
+            let reader =
+                HashReader::from_stream(Cursor::new(plaintext), size, size, None, None, false).expect("plaintext reader");
+            let reader = WritePlan::new()
+                .with_encryption(WriteEncryption::singlepart([1; 32], [2; 12]))
+                .apply(reader, size)
+                .expect("encrypted reader");
+            let mut opts = ObjectOptions {
+                preserve_etag: preserved.clone(),
+                user_defined: HashMap::from([
+                    ("x-amz-server-side-encryption-customer-algorithm".to_owned(), "AES256".to_owned()),
+                    (rustfs_utils::http::SSEC_ORIGINAL_SIZE_HEADER.to_owned(), size.to_string()),
+                ]),
+                ..Default::default()
+            };
+            // A copied producer marker cannot attest to a preserved plaintext tag.
+            insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            set_disks
+                .put_object(bucket, object, &mut PutObjReader::new(reader), &opts)
+                .await
+                .expect("store encrypted bytes");
+            let stored = set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("read persisted metadata");
+            if let Some(preserved) = preserved {
+                assert_eq!(stored.etag.as_deref(), Some(preserved.as_str()));
+                assert!(!rustfs_utils::http::etag_can_be_listed(&stored.user_defined));
+            } else {
+                assert_ne!(stored.etag.as_ref(), Some(&plaintext_md5));
+                assert_eq!(
+                    rustfs_utils::http::get_consistent_str(
+                        &stored.user_defined,
+                        rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG
+                    ),
+                    Some("v1")
+                );
+                assert!(rustfs_utils::http::etag_can_be_listed(&stored.user_defined));
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);

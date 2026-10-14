@@ -10095,6 +10095,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -10558,6 +10559,7 @@ dependencies = [
  "rustfs-keystone",
  "rustfs-policy",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-tls-runtime",
@@ -10572,6 +10574,7 @@ dependencies = [
  "sha2 0.11.0",
  "socket2",
  "subtle",
+ "sync_wrapper",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -10643,6 +10646,7 @@ dependencies = [
  "faster-hex",
  "futures",
  "hex-simd",
+ "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
  "http-body-util",
@@ -10753,13 +10757,18 @@ name = "rustfs-s3-types"
 version = "1.0.1"
 dependencies = [
  "bytes",
+ "futures-core",
  "hotpath",
  "http 1.5.0",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
  "s3s",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -10783,6 +10792,7 @@ dependencies = [
  "parking_lot",
  "rustfs-common",
  "rustfs-ecstore",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
  "s3s",
@@ -11116,6 +11126,7 @@ dependencies = [
  "async-compression",
  "futures",
  "hotpath",
+ "liblzma",
  "rustfs-rio",
  "rustfs-tokio-tar",
  "serde",

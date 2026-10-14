@@ -738,7 +738,12 @@ where
         .filter(|etag| !etag.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| Error::other("data usage snapshot has no ETag"))?;
-    let mut data_usage_info = parse_usage_snapshot(&reader.read_all().await?)?;
+    let mut data_usage_info = parse_usage_snapshot(
+        &reader
+            .read_all()
+            .await
+            .map_err(|err| map_data_usage_metadata_read_error(err, object))?,
+    )?;
     populate_backward_compatible_usage_maps(&mut data_usage_info);
     validate_complete_usage_snapshot(&mut data_usage_info);
     Ok(Some((data_usage_info, revision)))
@@ -2997,6 +3002,61 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct UsageSnapshotReadFailureStore;
+
+    struct UsageSnapshotFailureReader;
+
+    impl tokio::io::AsyncRead for UsageSnapshotFailureReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other(Error::VolumeNotFound)))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for UsageSnapshotReadFailureStore {
+        type Error = Error;
+        type RangeSpec = crate::storage_api_contracts::range::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<Self::RangeSpec>,
+            _headers: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::GetObjectReader, Self::Error> {
+            Ok(crate::object_api::GetObjectReader {
+                stream: Box::new(UsageSnapshotFailureReader),
+                object_info: ObjectInfo {
+                    etag: Some("usage-revision".to_string()),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut Self::PutObjectReader,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            unimplemented!("the read-failure fixture does not write")
+        }
+    }
+
     /// Minimal ObjectIO backing `load_data_usage_cache` tests: records the keys
     /// read and fails the first N reads with a transient (non-absence) error.
     #[derive(Debug, Default)]
@@ -3159,6 +3219,20 @@ mod tests {
                 Error::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-metadata/.usage.json".to_string())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn data_usage_removal_maps_missing_system_volume_during_snapshot_stream_read() {
+        let store = UsageSnapshotReadFailureStore;
+
+        let error = load_data_usage_for_bucket_removal(&store, "bucket-metadata/.usage.json")
+            .await
+            .expect_err("a system volume disappearing during body read must remain a retryable storage error");
+
+        assert_eq!(
+            error,
+            Error::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-metadata/.usage.json".to_string())
+        );
     }
 
     #[tokio::test]

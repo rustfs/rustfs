@@ -243,18 +243,90 @@ struct TargetSubscription {
 
 pub struct ListTargetSubscriptions {}
 
+fn subscription_target_arn(params: &Params<'_, '_>, region: &str) -> S3Result<String> {
+    let target_type = params
+        .get("target_type")
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "missing required parameter: 'target_type'"))?;
+    // Published consoles use the service name; admin routes use the subsystem name.
+    let spec = notification_target_specs()
+        .iter()
+        .find(|spec| spec.subsystem == target_type || spec.service == target_type)
+        .ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                format!("unsupported notification target type: '{target_type}'"),
+            )
+        })?;
+    let target_name = params
+        .get("target_name")
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "missing required parameter: 'target_name'"))?;
+    Ok(rustfs_targets::arn::TargetID::new(target_name.to_string(), spec.service.to_string())
+        .to_arn(region)
+        .to_string())
+}
+
+fn collect_target_subscriptions(
+    bucket: &str,
+    config: s3s::dto::NotificationConfiguration,
+    target_arn: &str,
+) -> S3Result<Vec<TargetSubscription>> {
+    let value = serde_json::to_value(config).map_err(|e| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
+    })?;
+    let mut subscriptions = Vec::new();
+    for key in [
+        "queue_configurations",
+        "topic_configurations",
+        "lambda_function_configurations",
+    ] {
+        if let Some(entries) = value.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
+                    .iter()
+                    .find_map(|field| entry.get(field).and_then(Value::as_str));
+                if arn != Some(target_arn) {
+                    continue;
+                }
+                let filters = entry
+                    .get("filter")
+                    .and_then(|v| v.get("key"))
+                    .and_then(|v| v.get("filter_rules"))
+                    .and_then(Value::as_array);
+                let filter_value = |name: &str| {
+                    filters.and_then(|rules| {
+                        rules.iter().find_map(|rule| {
+                            (rule.get("name").and_then(Value::as_str) == Some(name))
+                                .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
+                                .flatten()
+                        })
+                    })
+                };
+                subscriptions.push(TargetSubscription {
+                    bucket: bucket.to_string(),
+                    id: entry.get("id").and_then(Value::as_str).map(str::to_string),
+                    events: entry
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                        .unwrap_or_default(),
+                    prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
+                    suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
+                });
+            }
+        }
+    }
+    Ok(subscriptions)
+}
+
 #[async_trait::async_trait]
 impl Operation for ListTargetSubscriptions {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-        let (target_type, target_name) = extract_target_params(&params)?;
+        let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
+        let target_arn = subscription_target_arn(&params, &region)?;
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
-        let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
-        let target_arn = rustfs_targets::arn::TargetID::new(target_name.to_string(), target_type.to_string())
-            .to_arn(&region)
-            .to_string();
         let buckets = store
             .list_bucket(&BucketOptions::default())
             .await
@@ -267,50 +339,7 @@ impl Operation for ListTargetSubscriptions {
             else {
                 continue;
             };
-            let value = serde_json::to_value(config).map_err(|e| {
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
-            })?;
-            for key in [
-                "queue_configurations",
-                "topic_configurations",
-                "lambda_function_configurations",
-            ] {
-                if let Some(entries) = value.get(key).and_then(Value::as_array) {
-                    for entry in entries {
-                        let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
-                            .iter()
-                            .find_map(|field| entry.get(field).and_then(Value::as_str));
-                        if arn != Some(target_arn.as_str()) {
-                            continue;
-                        }
-                        let filters = entry
-                            .get("filter")
-                            .and_then(|v| v.get("key"))
-                            .and_then(|v| v.get("filter_rules"))
-                            .and_then(Value::as_array);
-                        let filter_value = |name: &str| {
-                            filters.and_then(|rules| {
-                                rules.iter().find_map(|rule| {
-                                    (rule.get("name").and_then(Value::as_str) == Some(name))
-                                        .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
-                                        .flatten()
-                                })
-                            })
-                        };
-                        subscriptions.push(TargetSubscription {
-                            bucket: bucket.name.clone(),
-                            id: entry.get("id").and_then(Value::as_str).map(str::to_string),
-                            events: entry
-                                .get("events")
-                                .and_then(Value::as_array)
-                                .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                                .unwrap_or_default(),
-                            prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
-                            suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
-                        });
-                    }
-                }
-            }
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, config, &target_arn)?);
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
@@ -644,6 +673,150 @@ mod tests {
             status: status.to_string(),
             state: if online { "online" } else { "offline" }.to_string(),
             reason: if online { "reachable" } else { "unreachable" }.to_string(),
+        }
+    }
+
+    fn subscription_router() -> Router<()> {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}/subscriptions", ())
+            .expect("subscription route should insert");
+        router
+    }
+
+    #[test]
+    fn target_subscriptions_resolve_legacy_and_admin_types_to_service_arns() {
+        let router = subscription_router();
+        for spec in notification_target_specs() {
+            for target_type in [spec.service, spec.subsystem] {
+                let path = format!("/v3/target/{target_type}/primary/subscriptions");
+                let params = router.at(&path).expect("subscription route should match").params;
+                for region in ["", "us-east-1", "eu-west-1"] {
+                    assert_eq!(
+                        subscription_target_arn(&params, region).expect("target type should resolve"),
+                        format!("arn:rustfs:sqs:{region}:primary:{}", spec.service)
+                    );
+                }
+                if target_type == spec.service {
+                    assert!(
+                        extract_target_params(&params).is_err(),
+                        "mutation routes must still require subsystem names"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_subscriptions_reject_unknown_and_other_domain_types() {
+        let router = subscription_router();
+        for target_type in ["unknown", "notify_unknown", "audit_webhook"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let err = subscription_target_arn(&params, "us-east-1").expect_err("unsupported type must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                Some(format!("unsupported notification target type: '{target_type}'").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn target_subscriptions_require_both_route_parameters() {
+        for (pattern, path, missing) in [
+            ("/v3/target/{target_name}", "/v3/target/primary", "target_type"),
+            ("/v3/target/{target_type}", "/v3/target/notify_webhook", "target_name"),
+        ] {
+            let mut router = Router::new();
+            router.insert(pattern, ()).expect("route should insert");
+            let params = router.at(path).expect("route should match").params;
+            let err = subscription_target_arn(&params, "us-east-1").expect_err("missing parameter must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some(format!("missing required parameter: '{missing}'").as_str()));
+        }
+    }
+
+    #[test]
+    fn target_subscriptions_match_all_config_kinds_without_crossing_target_identity() {
+        let config: s3s::dto::NotificationConfiguration = serde_json::from_value(serde_json::json!({
+            "queue_configurations": [
+                {
+                    "id": "uploads",
+                    "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook",
+                    "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                    "filter": { "key": { "filter_rules": [
+                        { "name": "prefix", "value": "photos/" },
+                        { "name": "suffix", "value": ".jpg" }
+                    ] } }
+                },
+                { "id": "other-service", "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:kafka", "events": ["s3:ObjectCreated:*"] },
+                { "id": "other-target", "queue_arn": "arn:rustfs:sqs:eu-west-1:secondary:webhook", "events": ["s3:ObjectCreated:*"] },
+                { "id": "other-region", "queue_arn": "arn:rustfs:sqs:us-east-1:primary:webhook", "events": ["s3:ObjectCreated:*"] }
+            ],
+            "topic_configurations": [
+                { "id": "topic", "topic_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectCreated:Put"] }
+            ],
+            "lambda_function_configurations": [
+                { "lambda_function_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectRemoved:Delete"] }
+            ]
+        }))
+        .expect("notification DTO should deserialize");
+        let router = subscription_router();
+        for target_type in ["webhook", "notify_webhook"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let arn = subscription_target_arn(&params, "eu-west-1").expect("webhook ARN should resolve");
+            let subscriptions =
+                collect_target_subscriptions("photos", config.clone(), &arn).expect("subscriptions should collect");
+            assert_eq!(
+                serde_json::to_value(subscriptions).expect("subscriptions should serialize"),
+                serde_json::json!([
+                    { "bucket": "photos", "id": "uploads", "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], "prefix": "photos/", "suffix": ".jpg" },
+                    { "bucket": "photos", "id": "topic", "events": ["s3:ObjectCreated:Put"], "prefix": null, "suffix": null },
+                    { "bucket": "photos", "id": null, "events": ["s3:ObjectRemoved:Delete"], "prefix": null, "suffix": null }
+                ])
+            );
+            assert!(
+                collect_target_subscriptions("photos", config.clone(), "arn:rustfs:sqs:eu-west-1:unused:webhook")
+                    .expect("unmatched subscriptions should collect")
+                    .is_empty()
+            );
+        }
+        assert!(
+            collect_target_subscriptions(
+                "empty",
+                s3s::dto::NotificationConfiguration::default(),
+                "arn:rustfs:sqs::primary:webhook"
+            )
+            .expect("empty configuration should collect")
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn target_subscriptions_authorize_before_resolving_either_type_form() {
+        let router = subscription_router();
+        for target_type in ["webhook", "notify_webhook", "unknown"] {
+            let path = format!("/v3/target/{target_type}/primary/subscriptions");
+            let params = router.at(&path).expect("subscription route should match").params;
+            let req = S3Request {
+                input: Body::empty(),
+                method: Method::GET,
+                uri: path.parse().expect("subscription path should parse"),
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let err = ListTargetSubscriptions {}
+                .call(req, params)
+                .await
+                .expect_err("credentials must be required");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(err.message(), Some("credentials not found"));
         }
     }
 

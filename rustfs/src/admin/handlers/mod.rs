@@ -19,6 +19,7 @@ pub mod audit;
 mod audit_runtime_config;
 pub mod batch_job;
 pub mod bucket_meta;
+pub mod bucket_recovery;
 pub mod cluster_snapshot;
 pub mod config_admin;
 pub mod diagnostics;
@@ -147,6 +148,7 @@ mod tests {
         let _storage_info_handler = system::StorageInfoHandler {};
         let _data_usage_handler = system::DataUsageInfoHandler {};
         let _metrics_handler = realtime::MetricsHandler {};
+        let _recover_orphaned_bucket = bucket_recovery::RecoverOrphanedBucketHandler {};
         let _profile_handler = profile_admin::ProfileHandler {};
         let _profile_status_handler = profile_admin::ProfileStatusHandler {};
         let _tls_status_handler = tls_debug::TlsStatusHandler {};

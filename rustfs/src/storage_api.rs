@@ -79,6 +79,12 @@ pub(crate) mod config_test {
 }
 
 pub(crate) mod error {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error::Error as DiskError;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error_reduce::{
+        OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    };
     pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
 
@@ -431,7 +437,7 @@ pub(crate) mod startup {
     pub(crate) mod shutdown {
         pub(crate) use crate::storage::storage_api::{
             mark_get_metadata_read_version_coalescing_service_ready, shutdown_background_monitors, shutdown_background_services,
-            store_compression_total_in_backend,
+            store_compression_total_in_backend, wait_for_detached_mutations,
         };
     }
 

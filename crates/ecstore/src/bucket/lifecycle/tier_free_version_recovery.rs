@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_version;
+use crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_version_with_cancel;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::object_api::ObjectInfo;
@@ -201,7 +201,11 @@ pub(super) async fn recover_tier_free_versions_with_cancel(
             return Err(tier_free_version_recovery_cancelled());
         }
         retry_cursor.visit(&oi);
-        if !record_recovered_free_version_enqueue(&mut stats, enqueue_recovered_free_version(&api, oi).await) {
+        let queued = enqueue_recovered_free_version_with_cancel(&api, oi, &cancel_token).await;
+        if cancel_token.is_cancelled() {
+            return Err(tier_free_version_recovery_cancelled());
+        }
+        if !record_recovered_free_version_enqueue(&mut stats, queued) {
             let (bucket_marker, object_marker) = retry_cursor.retry_markers();
             stats.truncated = true;
             stats.next_bucket_marker = bucket_marker;

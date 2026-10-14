@@ -527,6 +527,9 @@ pub enum AdminAction {
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
     ExportBucketMetadataAction,
+    /// Reconcile metadata left after an operator removed all physical bucket volumes.
+    #[strum(serialize = "admin:RecoverOrphanedBucket")]
+    RecoverOrphanedBucketAction,
     #[strum(serialize = "admin:GetTableCatalog")]
     GetTableCatalogAction,
     #[strum(serialize = "admin:MigrateTableCatalog")]
@@ -682,6 +685,7 @@ impl AdminAction {
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
+                | AdminAction::RecoverOrphanedBucketAction
                 | AdminAction::GetTableCatalogAction
                 | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableBucketAction
@@ -907,6 +911,14 @@ mod tests {
     #[test]
     fn test_get_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn orphaned_bucket_recovery_admin_action_is_valid() {
+        let action = AdminAction::try_from("admin:RecoverOrphanedBucket").expect("parse recovery action");
+        assert_eq!(action, AdminAction::RecoverOrphanedBucketAction);
+        assert!(action.is_valid());
+        assert_eq!(<&str>::from(action), "admin:RecoverOrphanedBucket");
     }
 
     #[test]

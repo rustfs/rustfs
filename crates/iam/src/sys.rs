@@ -2889,6 +2889,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_account_preserves_long_secret_keys_after_rotation_and_reload() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+
+        for length in [41, 90, 128, 256, 257, 4096] {
+            let access_key = format!("long-secret-{length}");
+            let secret_key = format!("{}a", "s".repeat(length - 1));
+            let (created, _) = iam_sys
+                .new_service_account("parent-user", None, service_account_opts(&access_key, &secret_key))
+                .await
+                .expect("create service account with a long secret");
+            assert_eq!(created.secret_key, secret_key);
+            get_claims_from_token_with_secret_allow_missing_exp(&created.session_token, &secret_key)
+                .expect("the complete secret verifies the created session token");
+
+            let rotated_secret = format!("{}b", "s".repeat(length - 1));
+            iam_sys
+                .update_service_account(
+                    &access_key,
+                    UpdateServiceAccountOpts {
+                        secret_key: Some(rotated_secret.clone()),
+                        session_policy: None,
+                        status: None,
+                        name: None,
+                        description: None,
+                        expiration: None,
+                        parent_user: None,
+                        allow_site_replicator_account: false,
+                    },
+                )
+                .await
+                .expect("rotate the complete long secret");
+
+            let persisted = iam_sys
+                .store
+                .api
+                .load_user_identity(&access_key, UserType::Svc)
+                .await
+                .expect("load the persisted service account identity");
+            assert_eq!(persisted.credentials.secret_key, rotated_secret);
+            get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &rotated_secret)
+                .expect("the rotated secret verifies the persisted session token");
+            assert!(
+                get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &secret_key).is_err()
+            );
+            assert!(
+                get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &rotated_secret[..40])
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn new_service_account_rejects_parent_access_key() {
         ensure_test_global_credentials();
 

@@ -14,18 +14,22 @@
 
 mod binding;
 mod error;
+mod mapper;
 mod model;
-pub mod oidc;
 mod provider;
-mod registry;
 mod transaction;
 
 pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
+pub(crate) use mapper::FederatedAuthorizationRule;
+#[cfg(test)]
+pub(crate) use mapper::FederatedAuthorizationRuleRef;
+pub use mapper::{CoreFederatedAuthorizationMapper, FederatedAuthorizationRules};
+pub(crate) use model::OpaqueLogoutContinuation;
 pub use model::{
-    FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedSession,
-    FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM,
+    FederatedAuthorization, FederatedClaims, FederatedLoginSession, FederatedProviderRef, FederatedSession,
+    FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM, VerifiedFederatedIdentity,
 };
-pub use provider::FederatedIdentityProvider;
-pub use registry::FederatedIdentityRegistry;
+pub(crate) use provider::{FederatedProviderQuery, StandardOidcAuthentication, VerifiedFederatedCodeExchange};
+pub use provider::{FederatedProviderView, FederatedRedirectPolicy};
 pub use transaction::FederatedIdentityService;

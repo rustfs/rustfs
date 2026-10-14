@@ -46,7 +46,7 @@ use rustfs_config::observability::{
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
     DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED,
-    DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, USE_STDOUT, VERSION,
 };
 use rustfs_utils::{
     get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_bool, get_env_opt_str, get_env_opt_u64, get_env_str,
@@ -162,7 +162,7 @@ pub struct OtelConfig {
     pub meter_interval: Option<u64>,
     /// OTel `service.name` attribute (default: `APP_NAME`).
     pub service_name: Option<String>,
-    /// OTel `service.version` attribute (default: `SERVICE_VERSION`).
+    /// OTel `service.version` attribute (default: the supplied application version or Cargo package version).
     pub service_version: Option<String>,
     /// Deployment environment tag, e.g. `production` or `development`.
     pub environment: Option<String>,
@@ -234,8 +234,14 @@ impl OtelConfig {
     /// `None` or an empty string the value is read from the
     /// `RUSTFS_OBS_ENDPOINT` environment variable instead.
     ///
-    /// When no endpoint is configured at all, `use_stdout` is forced to `true`
-    /// so that logs are still visible during development.
+    /// The default service version is the Cargo package version. Applications
+    /// that know their display/build version should use
+    /// [`OtelConfig::extract_otel_config_from_env_with_version`].
+    ///
+    /// When no endpoint is configured at all (neither the root endpoint nor any
+    /// per-signal one), `use_stdout` is forced to `true` so that logs are still
+    /// visible during development. With any endpoint set, `RUSTFS_OBS_USE_STDOUT`
+    /// is honoured.
     ///
     /// # Example
     /// ```no_run
@@ -250,14 +256,29 @@ impl OtelConfig {
     /// );
     /// ```
     pub fn extract_otel_config_from_env(endpoint: Option<String>) -> OtelConfig {
+        Self::extract_otel_config_from_env_with_version(endpoint, None)
+    }
+
+    /// Build an [`OtelConfig`] using `version` as the default OTel service version.
+    ///
+    /// An explicit `RUSTFS_OBS_SERVICE_VERSION` environment variable takes
+    /// precedence over `version`. When `version` is `None`, the current Cargo
+    /// package version is used.
+    pub fn extract_otel_config_from_env_with_version(endpoint: Option<String>, version: Option<String>) -> OtelConfig {
         let endpoint = match endpoint {
             Some(ep) if !ep.is_empty() => ep,
             _ => env::var(ENV_OBS_ENDPOINT).unwrap_or_default(),
         };
 
-        // Force stdout when there is no remote endpoint so that operators
-        // always have *some* log output in the default configuration.
-        let use_stdout = if endpoint.is_empty() {
+        // Force stdout only when no OTLP endpoint is configured at all, so that operators
+        // always have *some* log output in the default configuration. A per-signal endpoint
+        // (e.g. `RUSTFS_OBS_TRACE_ENDPOINT`) counts as configured: otherwise setting only that
+        // one forces the stdout exporters on and silently ignores `RUSTFS_OBS_USE_STDOUT=false`,
+        // printing every exported span to stdout.
+        let has_signal_endpoint = [ENV_OBS_TRACE_ENDPOINT, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_LOG_ENDPOINT]
+            .into_iter()
+            .any(|key| get_env_opt_str(key).is_some_and(|value| !value.is_empty()));
+        let use_stdout = if endpoint.is_empty() && !has_signal_endpoint {
             true
         } else {
             get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT)
@@ -312,7 +333,7 @@ impl OtelConfig {
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
             service_name: Some(get_env_str(ENV_OBS_SERVICE_NAME, APP_NAME)),
-            service_version: Some(get_env_str(ENV_OBS_SERVICE_VERSION, SERVICE_VERSION)),
+            service_version: Some(get_env_str(ENV_OBS_SERVICE_VERSION, version.as_deref().unwrap_or(VERSION))),
             environment: Some(get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT)),
             // Local logging
             logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
@@ -460,6 +481,29 @@ mod tests {
     }
 
     #[test]
+    fn service_version_uses_application_version_when_environment_is_unset() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_SERVICE_VERSION, || {
+                let config = OtelConfig::extract_otel_config_from_env_with_version(None, Some("2.3.4".to_string()));
+                assert_eq!(config.service_version.as_deref(), Some("2.3.4"));
+
+                let config = OtelConfig::extract_otel_config_from_env_with_version(None, None);
+                assert_eq!(config.service_version.as_deref(), Some(VERSION));
+            });
+        });
+    }
+
+    #[test]
+    fn service_version_environment_override_takes_precedence_over_application_version() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var(ENV_OBS_SERVICE_VERSION, Some("custom-build-42"), || {
+                let config = OtelConfig::extract_otel_config_from_env_with_version(None, Some("2.3.4".to_string()));
+                assert_eq!(config.service_version.as_deref(), Some("custom-build-42"));
+            });
+        });
+    }
+
+    #[test]
     fn profiling_export_defaults_to_disabled_when_unset() {
         with_profiling_env_lock(|| {
             temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
@@ -499,6 +543,45 @@ mod tests {
                 let config = OtelConfig::extract_otel_config_from_env(None);
                 assert_eq!(config.log_filename.as_deref(), Some(DEFAULT_OBS_LOG_FILENAME));
             });
+        });
+    }
+
+    #[test]
+    fn use_stdout_is_forced_only_when_no_endpoint_is_configured() {
+        with_profiling_env_lock(|| {
+            temp_env::with_vars_unset(
+                [
+                    ENV_OBS_ENDPOINT,
+                    ENV_OBS_TRACE_ENDPOINT,
+                    ENV_OBS_METRIC_ENDPOINT,
+                    ENV_OBS_LOG_ENDPOINT,
+                ],
+                || {
+                    temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                        // No endpoint at all: forced on, the explicit false is ignored.
+                        assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true));
+                    });
+                    for key in [ENV_OBS_TRACE_ENDPOINT, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_LOG_ENDPOINT] {
+                        temp_env::with_var(key, Some("http://localhost:4318/v1/signal"), || {
+                            temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(false), "{key}");
+                            });
+                            temp_env::with_var(ENV_OBS_USE_STDOUT, Some("true"), || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true), "{key}");
+                            });
+                            temp_env::with_var_unset(ENV_OBS_USE_STDOUT, || {
+                                assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(USE_STDOUT), "{key}");
+                            });
+                        });
+                    }
+                    temp_env::with_var(ENV_OBS_TRACE_ENDPOINT, Some(""), || {
+                        temp_env::with_var(ENV_OBS_USE_STDOUT, Some("false"), || {
+                            // An empty per-signal endpoint is not a configured endpoint.
+                            assert_eq!(OtelConfig::extract_otel_config_from_env(None).use_stdout, Some(true));
+                        });
+                    });
+                },
+            );
         });
     }
 

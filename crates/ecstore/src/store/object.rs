@@ -2456,6 +2456,27 @@ fn return_batch_delete_lock_error_with_accounting(
     (deleted, errors, vec![None; objects.len()])
 }
 
+const EVENT_DETACHED_DELETE_FAILED: &str = "detached_delete_failed";
+const LOG_SUBSYSTEM_STORE_DELETE: &str = "store_delete";
+
+/// A detached delete only fails to join when it panicked or the runtime is
+/// shutting down; report either as a failed delete to the waiting caller.
+fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) -> Error {
+    error!(
+        event = EVENT_DETACHED_DELETE_FAILED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_STORE_DELETE,
+        operation,
+        reason = if err.is_panic() { "task_panicked" } else { "task_cancelled" },
+        "Detached delete task failed"
+    );
+    if err.is_cancelled() {
+        Error::OperationCanceled
+    } else {
+        Error::Unexpected
+    }
+}
+
 fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
     let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
     object_names.sort_unstable();
@@ -4798,19 +4819,54 @@ impl ECStore {
         purged
     }
 
+    /// Delete one object (or a prefix) on behalf of a caller that may be
+    /// dropped mid-way, such as an S3 request whose client disconnects.
+    ///
+    /// The delete runs to completion on a detached task that owns its locks
+    /// and both on-disk phases, so the object is left either intact or fully
+    /// deleted, never with its metadata gone and its data still in place.
     pub async fn delete_object_with_tier_delete_journal(
         self: &Arc<Self>,
         bucket: &str,
         object: &str,
         opts: ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = self
-            .handle_delete_object_with_journal(bucket, object, opts, Some(Arc::clone(self)))
-            .await;
-        if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
-        }
-        result
+        self.delete_object_with_tier_delete_journal_and_guards(bucket, object, opts, None)
+            .await
+    }
+
+    /// [`Self::delete_object_with_tier_delete_journal`] for a caller that
+    /// holds namespace locks covering the delete and passes only their fences
+    /// in `opts`, such as the bucket lifecycle write lock of a recursive delete.
+    ///
+    /// The guards move into the detached task and are released only after
+    /// the delete has finished. Dropping the caller therefore cannot let a
+    /// writer into the scope they exclude while the delete is still running.
+    pub async fn delete_object_with_tier_delete_journal_and_guards(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+        guards: impl IntoIterator<Item = rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<ObjectInfo> {
+        let guards: Vec<_> = guards.into_iter().collect();
+        let store = Arc::clone(self);
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        self.ctx
+            .run_detached_mutation(async move {
+                let result = store
+                    .handle_delete_object_with_journal(&bucket, &object, opts, Some(Arc::clone(&store)))
+                    .await;
+                if result.is_ok() {
+                    list_objects::observe_list_objects_mutation(&store, &bucket).await;
+                }
+                // Keep: the only use of `guards` here, it moves them into the task so the locks outlive a dropped caller.
+                drop(guards);
+                result
+            })
+            .await
+            .unwrap_or_else(|err| Err(detached_delete_failed("delete_object", err)))
     }
 
     pub async fn delete_objects_with_tier_delete_journal(
@@ -4819,30 +4875,43 @@ impl ECStore {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        let result = self
-            .handle_delete_objects_with_journal(bucket, objects, opts, Some(Arc::clone(self)))
+        let (deleted, errors, _) = self
+            .delete_objects_with_tier_delete_journal_and_accounting(bucket, objects, opts)
             .await;
-        let success_count = result.1.iter().filter(|err| err.is_none()).count();
-        if success_count > 0 {
-            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
-        }
-        result
+        (deleted, errors)
     }
 
+    /// Batch form of [`Self::delete_object_with_tier_delete_journal`]: the
+    /// whole batch, including its object locks, runs on one detached task.
     pub async fn delete_objects_with_tier_delete_journal_and_accounting(
         self: &Arc<Self>,
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
-        let result = self
-            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, Some(Arc::clone(self)))
-            .await;
-        let success_count = result.1.iter().filter(|err| err.is_none()).count();
-        if success_count > 0 {
-            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
-        }
-        result
+        let store = Arc::clone(self);
+        let bucket = bucket.to_owned();
+        let object_count = objects.len();
+        self.ctx
+            .run_detached_mutation(async move {
+                let result = store
+                    .handle_delete_objects_with_journal_and_accounting(&bucket, objects, opts, Some(Arc::clone(&store)))
+                    .await;
+                let success_count = result.1.iter().filter(|err| err.is_none()).count();
+                if success_count > 0 {
+                    list_objects::observe_list_objects_mutations(&store, &bucket, success_count).await;
+                }
+                result
+            })
+            .await
+            .unwrap_or_else(|err| {
+                let err = detached_delete_failed("delete_objects", err);
+                (
+                    vec![DeletedObject::default(); object_count],
+                    vec![Some(err); object_count],
+                    vec![None; object_count],
+                )
+            })
     }
 
     #[instrument(skip(self))]
@@ -5282,13 +5351,41 @@ impl ECStore {
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         Box::pin(async move {
+            let count = objects.len();
+            let mut deleted = vec![DeletedObject::default(); count];
+            let mut errors: Vec<Option<Error>> = (0..count).map(|_| None).collect();
+            let mut accounting = vec![None; count];
+            let mut valid_objects = Vec::with_capacity(count);
+            let mut valid_indices = Vec::with_capacity(count);
+            // Validate the literal key before encoding it or taking locks. A
+            // dot-segment key must never reach filesystem path resolution.
+            for (index, object) in objects.into_iter().enumerate() {
+                match check_del_obj_args(bucket, &object.object_name) {
+                    Ok(()) => {
+                        valid_indices.push(index);
+                        valid_objects.push(object);
+                    }
+                    Err(err) => errors[index] = Some(err),
+                }
+            }
+            if valid_objects.is_empty() {
+                return (deleted, errors, accounting);
+            }
             let mut opts = opts;
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-            let result = self
-                .handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)
+            let (valid_deleted, valid_errors, valid_accounting) = self
+                .handle_delete_objects_with_journal_and_accounting_inner(bucket, valid_objects, opts, tier_journal_api)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
-            result
+            for (index, ((object, error), receipt)) in valid_indices
+                .into_iter()
+                .zip(valid_deleted.into_iter().zip(valid_errors).zip(valid_accounting))
+            {
+                deleted[index] = object;
+                errors[index] = error;
+                accounting[index] = receipt;
+            }
+            (deleted, errors, accounting)
         })
         .await
     }
@@ -9023,6 +9120,58 @@ mod tests {
             .await
             .expect("create the versioned bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_delete_rejects_dot_segments_and_keeps_valid_result_positions() {
+        let bucket = "batch-delete-key-validation";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        let options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let victim = store
+            .put_object(bucket, "victim/object", &mut PutObjReader::from_vec(b"victim".to_vec()), &options)
+            .await
+            .expect("write protected-prefix control object");
+        store
+            .put_object(bucket, "allowed/object", &mut PutObjReader::from_vec(b"allowed".to_vec()), &options)
+            .await
+            .expect("write valid deletion control object");
+        let keys = [
+            "allowed/../victim/object",
+            "allowed/object",
+            "a/./b",
+            "../other-bucket/object",
+        ];
+        let objects = keys
+            .iter()
+            .map(|key| ObjectToDelete {
+                object_name: (*key).to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let (deleted, errors) = store.handle_delete_objects(bucket, objects, options).await;
+        assert_eq!(deleted.len(), keys.len());
+        assert_eq!(errors.len(), keys.len());
+        for index in [0, 2, 3] {
+            assert!(
+                matches!(&errors[index], Some(StorageError::ObjectNameInvalid(_, _))),
+                "invalid key {}: {:?}",
+                keys[index],
+                errors[index]
+            );
+            assert!(!deleted[index].delete_marker);
+        }
+        assert!(errors[1].is_none(), "valid deletion must still succeed: {:?}", errors[1]);
+        assert!(deleted[1].delete_marker);
+        assert_eq!(deleted[1].object_name, "allowed/object");
+        let after = store
+            .get_object_info(bucket, "victim/object", &ObjectOptions::default())
+            .await
+            .expect("the resolved victim path must remain visible");
+        assert_eq!(after.version_id, victim.version_id);
+        assert_eq!(after.etag, victim.etag);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

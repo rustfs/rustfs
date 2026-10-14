@@ -81,6 +81,7 @@
 
 use super::{SwiftError, SwiftResult};
 use hmac::{Hmac, KeyInit, Mac};
+use rustfs_s3_types::Body;
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
@@ -386,7 +387,7 @@ pub async fn handle_formpost(
     body: Vec<u8>,
     tempurl_key: &str,
     credentials: &rustfs_credentials::Credentials,
-) -> SwiftResult<http::Response<s3s::Body>> {
+) -> SwiftResult<http::Response<Body>> {
     use axum::http::{Response, StatusCode};
 
     // Parse multipart boundary
@@ -407,7 +408,7 @@ pub async fn handle_formpost(
         return Response::builder()
             .status(StatusCode::SEE_OTHER)
             .header("location", redirect_url)
-            .body(s3s::Body::empty())
+            .body(Body::empty())
             .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
     }
 
@@ -422,7 +423,7 @@ pub async fn handle_formpost(
         return Response::builder()
             .status(StatusCode::SEE_OTHER)
             .header("location", redirect_url)
-            .body(s3s::Body::empty())
+            .body(Body::empty())
             .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
     }
 
@@ -488,7 +489,7 @@ pub async fn handle_formpost(
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header("location", redirect_url)
-        .body(s3s::Body::empty())
+        .body(Body::empty())
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 

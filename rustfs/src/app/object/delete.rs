@@ -511,6 +511,15 @@ impl DefaultObjectUsecase {
         // cannot flood the log.
         let mut bulk_denial_logged = false;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
+            if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
+                delete_results[idx].error = Some(s3s::dto::Error {
+                    code: Some(err.code().as_str().to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(err.to_string()),
+                    version_id: obj_id.version_id.clone(),
+                });
+                continue;
+            }
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
                 Ok(parsed) => parsed,
@@ -976,6 +985,8 @@ impl DefaultObjectUsecase {
         // Lock order is bucket lifecycle, then object/commit locks in storage.
         // Keep this guard alive through the physical delete: a preflight without
         // writer exclusion could authorize one subtree and delete a newer one.
+        // The delete takes ownership of it and releases it only when it has
+        // finished, even if this request is dropped first.
         let recursive_delete_guard = if force_header {
             Some(
                 store
@@ -1076,7 +1087,7 @@ impl DefaultObjectUsecase {
 
         let obj_info = {
             match store
-                .delete_object_with_tier_delete_journal(&bucket, &key, opts.clone())
+                .delete_object_with_tier_delete_journal_and_guards(&bucket, &key, opts.clone(), recursive_delete_guard)
                 .await
             {
                 Ok(obj) => obj,
@@ -1118,7 +1129,6 @@ impl DefaultObjectUsecase {
                 }
             }
         };
-        drop(recursive_delete_guard);
 
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;

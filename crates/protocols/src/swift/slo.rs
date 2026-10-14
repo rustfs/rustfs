@@ -18,12 +18,13 @@
 //! Large files (>5GB) are split into segments, and a manifest defines
 //! how segments are assembled on download.
 
+use super::handler::SwiftRequestBody;
 use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -264,7 +265,7 @@ pub async fn handle_slo_put(
     account: &str,
     container: &str,
     object: &str,
-    body: Body,
+    body: SwiftRequestBody,
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
@@ -408,9 +409,8 @@ pub async fn handle_slo_get(
             .header("content-length", manifest.total_size().to_string());
     }
 
-    // Convert stream to Body
-    let axum_body = axum::body::Body::from_stream(segment_stream);
-    let body = Body::http_body_unsync(axum_body);
+    // The segment fetches hold storage futures that are Send but not Sync.
+    let body = Body::from_stream(sync_wrapper::SyncStream::new(segment_stream));
 
     response
         .body(body)

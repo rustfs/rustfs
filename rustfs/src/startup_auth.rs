@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use rustfs_iam::{
-    federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
-    get_oidc, init_oidc_sys_with_extra_root_ca_provider,
-    oidc::{OidcExtraRootCaMaterial, OidcExtraRootCaProvider, OidcSys},
+    build_oidc_sys_with_extra_root_ca_provider,
+    federation::{CoreFederatedAuthorizationMapper, FederatedIdentityService},
+    oidc::{OidcConfigQuery, OidcExtraRootCaMaterial, OidcExtraRootCaProvider, OidcSys, StandardOidcAdapter},
 };
 use std::{
     collections::hash_map::DefaultHasher,
@@ -53,11 +53,10 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
         }
     }
 
-    match init_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
-        Ok(()) => {
-            if let Some(oidc) = get_oidc() {
-                crate::runtime_sources::publish_federated_identity_service(standard_oidc_service(oidc));
-            }
+    match build_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
+        Ok(oidc) => {
+            let (service, oidc_config_query) = standard_oidc_runtime(oidc);
+            crate::runtime_sources::publish_federated_identity_runtime(service, oidc_config_query);
         }
         Err(e) => {
             warn!(
@@ -73,10 +72,11 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
     Ok(())
 }
 
-fn standard_oidc_service(oidc: Arc<OidcSys>) -> Arc<FederatedIdentityService> {
+fn standard_oidc_runtime(oidc: Arc<OidcSys>) -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
     let adapter = Arc::new(StandardOidcAdapter::new(oidc));
-    let registry = FederatedIdentityRegistry::new(adapter);
-    Arc::new(FederatedIdentityService::new(registry))
+    let oidc_config_query = adapter.clone();
+    let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+    (Arc::new(adapter.into_service(mapper)), oidc_config_query)
 }
 
 pub(crate) fn oidc_extra_root_ca_provider() -> OidcExtraRootCaProvider {
@@ -121,14 +121,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_oidc_service_retains_one_oidc_arc() {
+    fn standard_oidc_runtime_retains_one_oidc_arc() {
         let oidc = Arc::new(OidcSys::empty().expect("empty OIDC configuration should be valid"));
         let retained = Arc::clone(&oidc);
 
-        let service = standard_oidc_service(oidc);
+        let (service, oidc_config_query) = standard_oidc_runtime(oidc);
 
-        assert_eq!(Arc::strong_count(&retained), 2, "the service should retain one OIDC Arc");
+        assert_eq!(Arc::strong_count(&retained), 2, "the runtime should retain one OIDC Arc");
         drop(service);
-        assert_eq!(Arc::strong_count(&retained), 1, "dropping the service should release its OIDC Arc");
+        assert_eq!(Arc::strong_count(&retained), 2, "the query should retain the shared adapter");
+        drop(oidc_config_query);
+        assert_eq!(Arc::strong_count(&retained), 1, "dropping the runtime should release its OIDC Arc");
     }
 }
