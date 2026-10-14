@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.
+
 For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
 see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
 
