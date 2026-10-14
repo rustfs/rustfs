@@ -328,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "archive-trait"
-version = "0.0.14"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6080ea14ccf9019d7ce572c319e581c20a805c9bdc6dbfb9b988da003cbd1a3"
+checksum = "999bf88cc483664cab77700ca2fdfb0415a73412abe284ef5bc2319d00938e00"
 dependencies = [
  "cap-std",
  "thiserror 2.0.21",
@@ -3708,9 +3708,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 dependencies = [
  "serde_core",
 ]
@@ -3800,9 +3800,9 @@ dependencies = [
 
 [[package]]
 name = "dial9"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35f95885a2167602b457c77caf898670c02eb0aaba72bef76ac5b0faef86e14"
+checksum = "734474ca4e814f893385c8fdea63688a9e6034ea19a5ec9846f8f515a69c9bed"
 dependencies = [
  "bon",
  "dial9-core",
@@ -3817,9 +3817,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-core"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f826078c782919cf9a4fb0b2b6755dab24d6c908b5181469b23cf6eb8f6fff"
+checksum = "4ff5074fab1f810a73d58336275eb163e795ab0ae923fcc8437ba58bf2994e33"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -3851,9 +3851,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-metrique"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c59e35e7b38ce255d3dc6310b48c3ea54307c42a0589eda44ea91ba24eadf67"
+checksum = "3dd61f8f3d44db27e7a5e970c216bf4c19db66ebb68b7f58db2549f010c3a02e"
 dependencies = [
  "dial9-core",
  "dial9-trace-format",
@@ -3865,9 +3865,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-perf-self-profile"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c429b209bc07612b2e60267e8bca80cd2b249f498e9a0b83f7caf514d5f5388"
+checksum = "d320bef9be4ef9c20ca9800cbfc369c319304b5e11d0a7aa931f5482aa5c1bd8"
 dependencies = [
  "blazesym",
  "bon",
@@ -3884,9 +3884,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-tokio-telemetry"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee46c0a97dd88ba151f9688c79de60c41cd7efc6855e6eb369af06326cba8f3"
+checksum = "1a98e1e673f2dd9e223811832be7a4344ddfe48282a2e7efbf1289e47e4322ce"
 dependencies = [
  "bon",
  "bytes",
@@ -4030,7 +4030,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_test"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4310,9 +4310,9 @@ dependencies = [
 
 [[package]]
 name = "equivalent"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "erased-serde"
@@ -6052,9 +6052,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lapin"
-version = "4.12.1"
+version = "4.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f6674e18d68e810f66ea962f8080f1ded75f813c1cd3fae9ed53bab760dfcfd"
+checksum = "3a585eb3060f00f09a1d231e3030afe59f2c2d63f794787ab1dd87d2f72df6a3"
 dependencies = [
  "amq-protocol",
  "async-rs",
@@ -8529,7 +8529,9 @@ dependencies = [
 
 [[package]]
 name = "pyroscope"
-version = "2.1.1"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357782a4af9b6b43bd3a9caa64dd802967498b1fce1d4e0bda552267d62de7cf"
 dependencies = [
  "aligned-vec",
  "backtrace",
@@ -8544,6 +8546,7 @@ dependencies = [
  "once_cell",
  "prost 0.14.4",
  "reqwest",
+ "ruzstd",
  "serde_json",
  "smallvec",
  "spin 0.12.3",
@@ -9519,7 +9522,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9678,7 +9681,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-audit"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "const-str",
  "futures",
@@ -9700,7 +9703,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-checksums"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -9716,7 +9719,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-common"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "hotpath",
@@ -9731,7 +9734,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-concurrency"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "insta",
@@ -9744,7 +9747,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-config"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "const-str",
  "hotpath",
@@ -9754,7 +9757,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-connect-symbol-catalog"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex-simd",
  "object 0.40.0",
@@ -9766,7 +9769,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-credentials"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -9780,7 +9783,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-crypto"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -9801,7 +9804,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-data-usage"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "rmp-serde",
@@ -9811,7 +9814,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ecstore"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -9944,7 +9947,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-extension-schema"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "serde",
@@ -9954,7 +9957,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-filemeta"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "base64-simd",
@@ -9983,7 +9986,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -10025,7 +10028,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal-contracts"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -10035,7 +10038,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-iam"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10085,7 +10088,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "hotpath",
@@ -10097,7 +10100,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-metrics"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "criterion",
  "hotpath",
@@ -10161,7 +10164,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-keystone"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "futures",
@@ -10188,7 +10191,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kms"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10238,14 +10241,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-license"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "rustfs-lifecycle"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -10267,7 +10270,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lock"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "compact_str",
@@ -10290,7 +10293,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-log-analyzer"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "flate2",
@@ -10309,7 +10312,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-madmin"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "http 1.5.0",
@@ -10347,7 +10350,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-notify"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10382,7 +10385,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-capacity"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "criterion",
  "futures",
@@ -10401,7 +10404,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-data-cache"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -10418,7 +10421,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-obs"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -10481,7 +10484,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-policy"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -10512,7 +10515,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protocols"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -10574,7 +10577,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protos"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "flatbuffers",
  "hotpath",
@@ -10599,7 +10602,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-replication"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "byteorder",
  "bytes",
@@ -10617,7 +10620,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -10661,7 +10664,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio-v2"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -10684,7 +10687,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-client"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -10728,7 +10731,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-ops"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "rustfs-s3-types",
@@ -10736,7 +10739,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-types"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "serde",
@@ -10745,7 +10748,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-api"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -10781,7 +10784,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-query"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10801,7 +10804,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10848,7 +10851,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner-metrics"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "jiff",
@@ -10863,7 +10866,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-security-governance"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "thiserror 2.0.21",
@@ -10871,7 +10874,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-signer"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -10889,7 +10892,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-storage-api"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -10904,7 +10907,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-targets"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -10958,7 +10961,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-test-utils"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hotpath",
  "rustfs-data-usage",
@@ -10974,7 +10977,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-tls-runtime"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "hotpath",
@@ -11013,7 +11016,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-trusted-proxies"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -11050,7 +11053,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-utils"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64-simd",
  "blake2",
@@ -11092,7 +11095,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-zip"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-compression",
  "futures",
@@ -11177,9 +11180,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -11207,9 +11210,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -12467,9 +12470,9 @@ dependencies = [
 
 [[package]]
 name = "tar-codec"
-version = "0.0.14"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ea42eb144d30fcbf32c26dfea8959175bb8335bfb7b18d20c6ed32edecf0551"
+checksum = "b9dad615e50d181afea4bafea23dacb8e33ed52dde06503813570634b932d467"
 dependencies = [
  "archive-trait",
  "tar-framing",
@@ -12479,9 +12482,9 @@ dependencies = [
 
 [[package]]
 name = "tar-framing"
-version = "0.0.14"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "783223a7a6590be4227cb821e7ce80372575511f67c824921aba0752d8ad5573"
+checksum = "563e8181b47c9cdcce569eae3ad431eec71543d6269dd60c7bd2350f70bcd233"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -12717,9 +12720,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -14081,18 +14084,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14175,9 +14178,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e2fc56a6707efb066c40aead2409ebb1224e6dde24a074e9fbc78ced500507b"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
  "aes 0.9.3",
  "bzip2",

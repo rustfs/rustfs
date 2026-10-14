@@ -94,7 +94,9 @@ recoverable job and configuration records remain separate objects. The worker
 performs metadata and unreferenced-object cleanup without changing the catalog
 pointer. The direct `/maintenance/metadata` endpoint, including snapshot
 expiration and compaction plan/commit, remains object-backed only. A configured
-`background-enabled` table still requires explicit scheduler and worker ticks.
+`background-enabled` table still requires explicit worker ticks. The standalone
+server has opt-in, allowlisted periodic queue admission; see the
+[scheduler runbook](../operations/s3-tables-maintenance-scheduler.md).
 
 Renamed tables retain their original metadata paths. Durable-strong scheduling
 and cleanup fail closed with a conflict if another table shares a scanned
@@ -137,7 +139,7 @@ when a rename removes its old path.
 | Compaction planning | Preview / controlled | Partition-local and sort-order-local binpack candidates for Parquet; never mixes partitions or sort orders in one group. |
 | Delete-file or row-level compaction planning | Preview / controlled | Position or equality delete files force machine-readable planning into manual review. |
 | Compaction commit | Preview / controlled | Commits a safe partition-local Parquet rewrite preserving sort order IDs. |
-| Built-in periodic scheduler | Not claimed | Ticks are operator-triggered; no continuous in-process scheduling. |
+| Built-in periodic scheduler | Preview / queue-only | Default off; allowlisted, paged admission with jitter, per-pass quotas, current-job checks, and cooperative drain. Workers and failed/expired-job recovery remain operator-triggered; no automatic execution or hard per-table I/O deadline. |
 | Delete-file or row-level compaction execution | Not claimed | Manual-review maintenance item. |
 
 ## Recovery And Strong Backing Matrix

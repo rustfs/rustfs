@@ -646,17 +646,25 @@ fn catalog_conflicts_use_operation_specific_iceberg_errors() {
 
 #[test]
 fn catalog_unavailable_errors_use_iceberg_503() {
-    let unavailable = catalog_store_error(crate::table_catalog::TableCatalogStoreError::Unavailable(
-        "failed to acquire catalog table lock: quorum required 3, achieved 1".to_string(),
-    ));
-    assert_eq!(unavailable.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
-    assert_eq!(unavailable.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-    assert_eq!(unavailable.message(), Some("table catalog is temporarily unavailable"));
-    assert!(
-        unavailable
-            .headers()
-            .is_none_or(|headers| !headers.contains_key(rustfs_utils::http::RETRY_AFTER))
-    );
+    for error in [
+        crate::table_catalog::TableCatalogStoreError::Unavailable(
+            "failed to acquire catalog table lock: quorum required 3, achieved 1".to_string(),
+        ),
+        crate::table_catalog::TableCatalogStoreError::LockUnavailable {
+            message: "private publication fence".to_string(),
+            source: Box::new(rustfs_lock::LockError::timeout("private/lock", std::time::Duration::from_secs(5))),
+        },
+    ] {
+        let unavailable = catalog_store_error(error);
+        assert_eq!(unavailable.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+        assert_eq!(unavailable.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(unavailable.message(), Some("table catalog is temporarily unavailable"));
+        assert!(
+            unavailable
+                .headers()
+                .is_none_or(|headers| !headers.contains_key(rustfs_utils::http::RETRY_AFTER))
+        );
+    }
 
     let internal = catalog_store_error(crate::table_catalog::TableCatalogStoreError::Internal(
         "commit state is unknown".to_string(),

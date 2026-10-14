@@ -1749,11 +1749,7 @@ fn table_catalog_store_for_data_plane<T>(
 }
 
 fn table_publication_guard_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    let code = match &err {
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
-        _ => S3ErrorCode::InternalError,
-    };
-    S3Error::with_message(code, format!("failed to acquire table publication guard: {err}"))
+    S3Error::from(ApiError::from(err))
 }
 
 async fn retain_table_data_plane_publication_guard<T>(
@@ -1889,8 +1885,8 @@ fn table_list_cursor_key<T>(req: &S3Request<T>) -> S3Result<[u8; 32]> {
 }
 
 fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-        S3Error::from(ApiError::service_unavailable())
+    if err.is_unavailable() {
+        S3Error::from(ApiError::from(err))
     } else {
         S3Error::from(ApiError::access_denied())
     }
@@ -2032,11 +2028,7 @@ async fn table_data_plane_resource_for_request<T>(
             error = %err,
             "failed to resolve table data-plane resource"
         );
-        if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-            S3Error::from(ApiError::service_unavailable())
-        } else {
-            s3_error!(AccessDenied, "Access Denied")
-        }
+        table_list_catalog_error(err)
     })?;
     let resource = require_owned_reserved_table_object(object, resource)?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
@@ -3827,7 +3819,7 @@ mod tests {
             "",
         ] {
             let error = TableCatalogStoreError::Unavailable(message.to_string());
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{message}");
             assert_eq!(
@@ -3835,6 +3827,8 @@ mod tests {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
@@ -3853,7 +3847,7 @@ mod tests {
             TableCatalogStoreError::AlreadyExists(message.clone()),
             TableCatalogStoreError::Conflict(message),
         ] {
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::InternalError);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::InternalError);
             assert_eq!(
@@ -3861,13 +3855,16 @@ mod tests {
                 Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
     #[tokio::test]
     #[serial]
-    async fn table_publication_guard_timeout_blocks_put_and_multipart_authorization() {
+    async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authorization() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+        use http_body_util::BodyExt as _;
         use std::time::Duration;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -3880,7 +3877,7 @@ mod tests {
             .await
             .expect("test bucket should be created");
         let policy_json = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
         );
         let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
             .await
@@ -3916,6 +3913,16 @@ mod tests {
                 .expect("multipart input should build"),
             Method::POST,
         );
+        let mut delete_req = build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .build()
+                .expect("DELETE input should build"),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut delete_req);
+        delete_req.extensions.insert(fs.server_ctx().clone());
         ensure_req_info(&mut put_req);
         ensure_req_info(&mut multipart_req);
         put_req.extensions.insert(fs.server_ctx().clone());
@@ -3929,6 +3936,12 @@ mod tests {
                     .expect_err("PUT must wait for the publication writer"),
             ),
             (
+                "DeleteObject",
+                fs.delete_object(&mut delete_req)
+                    .await
+                    .expect_err("DELETE must wait for the publication writer"),
+            ),
+            (
                 "CreateMultipartUpload",
                 fs.create_multipart_upload(&mut multipart_req)
                     .await
@@ -3936,8 +3949,24 @@ mod tests {
             ),
         ] {
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{operation}: {err}");
+            let source = err.source().expect("retain the typed publication lock failure");
+            let storage = source
+                .downcast_ref::<crate::storage_api::error::StorageError>()
+                .expect("use the canonical storage error boundary");
+            assert!(matches!(
+                storage,
+                crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
+            ));
+            let response = err.to_http_response().expect("serialize publication failure");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+            let body = response.into_body().collect().await.expect("read error XML").to_bytes();
+            let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+            assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!body.contains(&bucket));
+            assert!(!body.contains(&lock_object));
         }
-        for extensions in [&put_req.extensions, &multipart_req.extensions] {
+        for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
             assert!(extensions.get::<TableDataPlanePublicationGuards>().is_none());
         }
 
@@ -3949,7 +3978,10 @@ mod tests {
             fs.create_multipart_upload(&mut multipart_req)
                 .await
                 .expect("multipart initialization may retry after publication finishes");
-            for extensions in [&put_req.extensions, &multipart_req.extensions] {
+            fs.delete_object(&mut delete_req)
+                .await
+                .expect("DELETE may retry after publication finishes");
+            for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
                 let retained = extensions
                     .get::<TableDataPlanePublicationGuards>()
                     .expect("successful admission retains the guard");
@@ -3960,6 +3992,7 @@ mod tests {
         }
         drop(put_req);
         drop(multipart_req);
+        drop(delete_req);
         lock.get_write_lock(Duration::from_secs(1))
             .await
             .expect("dropping the request must release its publication guard");

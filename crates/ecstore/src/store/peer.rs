@@ -1697,7 +1697,9 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+        // Allow real fixture I/O to finish under load. Expire the operation
+        // with virtual time only after its physical publication is paused.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let ctx = Arc::new(InstanceContext::new());
             let store = super::super::tests::build_store_with_ctx(ctx.clone());
             let root = tempfile::tempdir().expect("root");
@@ -1731,7 +1733,7 @@ mod tests {
             .await
             .expect("bounded entry");
             tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
             tokio::time::resume();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut rename)
                 .await
