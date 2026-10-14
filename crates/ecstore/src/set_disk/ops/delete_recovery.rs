@@ -2016,6 +2016,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_partial_batch_receipt_handles_missing_versions() {
+        use crate::disk::RUSTFS_META_TMP_BUCKET;
+        use crate::set_disk::ops::object::DeleteCleanupBarrier;
+        use crate::storage_api_contracts::object::ObjectToDelete;
+
+        for include_missing in [false, true] {
+            let bucket = "recover-prepared-batch-missing-versions";
+            let (dirs, store, disks) = fixture(bucket).await;
+            metadata_sys::update_in(
+                &store.ctx,
+                bucket,
+                crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("enable supported versioned bucket");
+            let first = put(&store, bucket, &vec![81; 1024 * 1024], true)
+                .await
+                .expect("first version");
+            let second = put(&store, bucket, &vec![82; 4096], true).await.expect("retained version");
+            let missing = Uuid::new_v4();
+            let barrier = DeleteCleanupBarrier::install(bucket);
+            let deleting = store.clone();
+            let task = tokio::spawn(async move {
+                let mut versions = vec![first];
+                if include_missing {
+                    versions.push(missing);
+                }
+                deleting
+                    .delete_objects(
+                        bucket,
+                        versions
+                            .into_iter()
+                            .map(|version| ObjectToDelete {
+                                object_name: "object".into(),
+                                version_id: Some(version),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            let transactions = disks[0]
+                .discover_delete_transactions(bucket, Some("object"), None, 100)
+                .await
+                .expect("discover batch preparation")
+                .transactions;
+            assert_eq!(transactions.len(), 1);
+            let transaction = transactions[0].transaction;
+            for disk in &disks {
+                let state = disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("inspect prepared batch");
+                assert_eq!(state.state, DeleteRecoveryState::NewPrepared);
+                let journal = state.journal.expect("prepared journal");
+                assert!(journal.original_digest.is_some());
+                assert!(journal.original_versions.iter().all(|v| v.version_id != Some(missing)));
+            }
+            // Fail durable receipt staging on two participants after metadata quorum.
+            for dir in dirs.iter().skip(2) {
+                tokio::fs::rename(dir.path().join(RUSTFS_META_TMP_BUCKET), dir.path().join("saved-receipt-staging"))
+                    .await
+                    .expect("save receipt staging directory");
+                tokio::fs::write(dir.path().join(RUSTFS_META_TMP_BUCKET), b"receipt staging I/O failure")
+                    .await
+                    .expect("inject receipt staging failure");
+            }
+            barrier.release();
+            let (_, errors) = task.await.expect("batch deletion must join");
+            drop(barrier);
+            assert_eq!(errors.len(), if include_missing { 2 } else { 1 });
+            assert!(errors.iter().all(Option::is_some), "partial receipts are indeterminate: {errors:?}");
+            let mut receipts = 0;
+            let mut prepared = 0;
+            for disk in &disks {
+                match disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("partial decision")
+                    .state
+                {
+                    DeleteRecoveryState::QuorumCommitted => receipts += 1,
+                    DeleteRecoveryState::NewPrepared => prepared += 1,
+                    state => panic!("unexpected post-publication state: {state:?}"),
+                }
+            }
+            assert_eq!((receipts, prepared), (2, 2));
+            for dir in dirs.iter().skip(2) {
+                tokio::fs::remove_file(dir.path().join(RUSTFS_META_TMP_BUCKET))
+                    .await
+                    .expect("remove injected staging failure");
+                tokio::fs::rename(dir.path().join("saved-receipt-staging"), dir.path().join(RUSTFS_META_TMP_BUCKET))
+                    .await
+                    .expect("restore receipt staging");
+            }
+            store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(second.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("later version deletion succeeds");
+            store
+                .recover_delete_transactions(bucket, &HealOpts::default())
+                .await
+                .expect("certified batch must recover after later version deletion");
+            for disk in &disks {
+                assert!(
+                    disk.discover_delete_transactions(bucket, Some("object"), None, 100)
+                        .await
+                        .expect("settled transaction inventory")
+                        .transactions
+                        .is_empty()
+                );
+            }
+            store
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("settled receipts must not block removal of the empty bucket");
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_partial_receipt_converges_after_later_version_absence() {
         let bucket = "recover-partial-chained-versions";
         let (dirs, store, disks) = fixture(bucket).await;

@@ -1954,7 +1954,10 @@ impl DeleteRecoveryJournal {
             };
             match (local, remote) {
                 (Some(local), Some(remote)) => local == remote,
-                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                (None, None) => {
+                    (!(request.deleted && request.mark_deleted) && request.version_id.is_some_and(|id| !id.is_nil()))
+                        || (self.original_digest.is_none() && authority.original_digest.is_none())
+                }
                 _ => false,
             }
         })
@@ -2949,6 +2952,11 @@ mod delete_recovery_adoption_tests {
             version_id: Some(missing),
             ..Default::default()
         });
+        journal.original_digest = Some([3; 32]);
+        assert!(
+            journal.matches_prepared_authority(&journal),
+            "an explicit UUID absent from both prepared sources remains a no-op with original metadata"
+        );
         assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
         assert!(
             journal.matches_adoption_source(std::slice::from_ref(&source)),
@@ -2956,12 +2964,23 @@ mod delete_recovery_adoption_tests {
         );
         let mut unexpected = source.clone();
         unexpected.version_id = Some(missing);
+        let mut foreign_preparation = journal.clone();
+        foreign_preparation.original_versions.push(unexpected.clone());
+        assert!(
+            !journal.matches_prepared_authority(&foreign_preparation)
+                && !foreign_preparation.matches_prepared_authority(&journal),
+            "absence from only one prepared source cannot establish a generation"
+        );
         assert!(
             !journal.matches_adoption_source(&[source.clone(), unexpected]),
             "a version absent from the authority cannot be deleted locally"
         );
         for version_id in [None, Some(Uuid::nil())] {
             journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_prepared_authority(&journal),
+                "a missing null version with original metadata cannot establish its generation"
+            );
             assert!(
                 !journal.matches_adoption_source(std::slice::from_ref(&source)),
                 "a missing null version cannot establish its generation"
