@@ -79,7 +79,7 @@ where
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    let mut resp_elements = extract_resp_elements(response);
+    let mut resp_elements = extract_params_header(&response.headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
 }
@@ -347,7 +347,7 @@ impl OperationHelper {
 
             let mut final_builder = builder.api(api_details.clone());
             if let Ok(res) = result {
-                final_builder = final_builder.resp_header(extract_resp_elements(res));
+                final_builder = final_builder.resp_header(extract_params_header(&res.headers));
             }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);

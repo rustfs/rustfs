@@ -35,7 +35,8 @@ their issue closes.
 | `check_migration_gate_count.sh` | ci-gate | Migration-critical test gate with committed count floor (`.config/migration-gate-floor.txt`) | ci.yml Test and Lint; `docs/testing/README.md` |
 | `check_no_planning_docs.sh` | ci-gate | Blocks committed planning-type documents | ci.yml Quick Checks; `make pre-commit` |
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
-| `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
+| `check_s3s_footprint.sh` | ci-gate | Exact, lower-only baseline on the direct s3s surface ahead of the gateway migration (reads `.config/s3s-footprint-baseline.txt`; `s3_error_lines` leaves out lines whose file imports the macro from `rustfs-s3-types`, rule in the script header); `--mode allowlist` fails on any Rust file referencing s3s outside `.config/s3s-edge-allowlist.txt`, `--dry-run` lists them | ci.yml Quick Checks; `make pre-commit`; `make script-tests` (`--self-test`) |
+| `check_test_count_ratchet.sh` | ci-gate | Exact per-crate test-count and `#[ignore]` ratchet against `.config/test-count-baseline.txt`; no crate may lose tests or gain ignores | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
@@ -54,6 +55,7 @@ their issue closes.
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
+| `gen_bucket_config_goldens.sh` | dev-tool | One-shot generator for the 13-family persisted bucket-config XML byte goldens; refuses to overwrite without `--force` and records the generating commit | `crates/ecstore/tests/fixtures/bucket-config-goldens/README.md`; `crates/ecstore/tests/bucket_config_goldens.rs` |
 | `run.sh` | dev-tool | Local rustfs startup wrapper | `make e2e-server`; Justfile |
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
@@ -150,6 +152,7 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
+| `codemods/` | dev-tool | Scripted, idempotent source migrations for the gateway migration (rustfs/backlog#2734); `s3_error_to_s3_types.py` moves s3s error-type paths onto `rustfs-s3-types` per crate closure and refuses the s3s edge allowlist | `make script-tests` (`--self-test`); usage in each script's docstring |
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
 | `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |

@@ -338,6 +338,17 @@ fn config_input_preserves_secret_and_defaults() {
     )
     .expect("a nonempty client secret should be accepted");
     assert_eq!(raw_secret.client_secret.as_deref(), Some(" raw secret "));
+
+    let input = OidcProviderConfigInput {
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client-id".to_string(),
+        client_secret: Some("".to_string()),
+        ..Default::default()
+    };
+    let config =
+        build_upsert_provider_config("default", input, Some("existing-secret".to_string())).expect("config should build");
+    assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
+    assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
 }
 
 #[test]
@@ -365,6 +376,21 @@ fn config_input_rejects_invalid_fields() {
 
     assert!(serde_json::from_str::<OidcProviderConfigInput>(r#"{"unexpected_field":true}"#).is_err());
     assert!(serde_json::from_str::<OidcProviderValidationInput>(r#"{"unexpected_field":true}"#).is_err());
+
+    let err = serde_json::from_str::<OidcProviderConfigInput>(
+        r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+    )
+    .err()
+    .expect("unknown upsert field should fail");
+    assert!(err.to_string().contains("unknown field"));
+
+    let err = serde_json::from_str::<OidcProviderValidationInput>(
+        r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+    )
+    .err()
+    .expect("unknown validate field should fail");
+    assert!(err.to_string().contains("unknown field"));
+
     assert!(matches!(
         validate_mutable_provider_id("../escape"),
         Err(OidcConfigError::InvalidProviderId)
@@ -385,6 +411,9 @@ fn validation_input_defaults_to_default_provider() {
 
 #[test]
 fn persisted_config_codec_keeps_instance_keys_and_fields() {
+    assert_eq!(provider_instance_key("default"), "_");
+    assert_eq!(provider_instance_key("okta"), "okta");
+
     let mut config = ServerConfig::new();
     let mut provider = build_upsert_provider_config(
         "default",
@@ -424,6 +453,29 @@ fn persisted_config_codec_keeps_instance_keys_and_fields() {
         delete_persisted_provider_config(&mut config, "default"),
         Err(OidcConfigError::ProviderNotFound)
     ));
+
+    let mut named_provider = OidcProviderConfig {
+        issuer: Some("https://app.local/realms/app".to_string()),
+        hide_from_ui: true,
+        ..test_config("kubernetes")
+    };
+    upsert_persisted_provider_config(&mut config, &named_provider);
+    let kvs = config
+        .0
+        .get(IDENTITY_OPENID_SUB_SYS)
+        .and_then(|providers| providers.get("kubernetes"))
+        .expect("provider KVS should exist");
+    assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::On.to_string());
+    assert_eq!(kvs.get(OIDC_ISSUER), "https://app.local/realms/app");
+
+    named_provider.hide_from_ui = false;
+    upsert_persisted_provider_config(&mut config, &named_provider);
+    let kvs = config
+        .0
+        .get(IDENTITY_OPENID_SUB_SYS)
+        .and_then(|providers| providers.get("kubernetes"))
+        .expect("provider KVS should exist");
+    assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::Off.to_string());
 }
 
 #[test]

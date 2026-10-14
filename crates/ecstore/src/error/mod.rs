@@ -17,8 +17,8 @@
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
 use crate::storage_api_contracts::{error::StorageErrorCode, range::HTTPRangeError};
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::path::decode_dir_object;
-use s3s::S3ErrorCode;
 
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;

@@ -491,6 +491,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.bucket_creation_witness(volume).await,
+            Disk::Remote(_) => Ok(None),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         match self {
@@ -1285,6 +1292,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // NSScanner
 
     // Volume operations.
+    /// Unknown or remote backends cannot attest process-local publication history.
+    async fn bucket_creation_witness(&self, _volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        Ok(None)
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;

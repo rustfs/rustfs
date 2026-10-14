@@ -82,8 +82,9 @@ use crate::{
 use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;
 use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
-use s3s::{S3ErrorCode, dto::BucketLifecycleConfiguration};
+use s3s::dto::BucketLifecycleConfiguration;
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},

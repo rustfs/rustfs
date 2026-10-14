@@ -72,6 +72,38 @@ type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
+#[cfg(test)]
+type TestSetLockers = HashMap<usize, Vec<Arc<dyn rustfs_lock::LockClient>>>;
+
+#[cfg(test)]
+static TEST_SET_LOCKERS: std::sync::LazyLock<std::sync::Mutex<TestSetLockers>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Keep a fixture's real locker domain scoped to its owning instance.
+#[cfg(test)]
+pub(crate) struct ScopedSetLockers(Arc<InstanceContext>);
+
+#[cfg(test)]
+impl ScopedSetLockers {
+    pub(crate) fn install(ctx: Arc<InstanceContext>, lockers: Vec<Arc<dyn rustfs_lock::LockClient>>) -> Self {
+        let key = Arc::as_ptr(&ctx) as usize;
+        let mut domains = TEST_SET_LOCKERS.lock().expect("test set lockers mutex");
+        assert!(!domains.contains_key(&key), "the instance already owns a test locker domain");
+        domains.insert(key, lockers);
+        Self(ctx)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedSetLockers {
+    fn drop(&mut self) {
+        TEST_SET_LOCKERS
+            .lock()
+            .expect("test set lockers mutex")
+            .remove(&(Arc::as_ptr(&self.0) as usize));
+    }
+}
+
 fn is_idempotent_delete_prefix_error(err: &Error) -> bool {
     is_err_object_not_found(err) || is_err_strict_volume_not_found(err)
 }
@@ -272,6 +304,14 @@ impl Sets {
                     set_drive.push(None);
                 }
             }
+
+            #[cfg(test)]
+            let pool_lockers = TEST_SET_LOCKERS
+                .lock()
+                .expect("test set lockers mutex")
+                .get(&(Arc::as_ptr(&instance_ctx) as usize))
+                .cloned()
+                .unwrap_or_else(|| pool_lockers.clone());
 
             let set_disks = SetDisks::new_with_instance_ctx(
                 runtime_sources::local_node_name().await,

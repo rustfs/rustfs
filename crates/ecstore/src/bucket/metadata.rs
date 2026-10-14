@@ -439,6 +439,8 @@ pub struct BucketMetadata {
     pub bucket_incarnation_id: Uuid,
     pub(crate) bucket_incarnation_sidecar: bool,
     pub(crate) bucket_creation_committed: bool,
+    // A legacy default is not proof of an interrupted creation.
+    pub(crate) bucket_creation_commit_record_present: bool,
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -514,6 +516,7 @@ impl Default for BucketMetadata {
             bucket_incarnation_id: Uuid::nil(),
             bucket_incarnation_sidecar: false,
             bucket_creation_committed: false,
+            bucket_creation_commit_record_present: false,
             policy_config_json: Default::default(),
             notification_config_xml: Default::default(),
             lifecycle_config_xml: Default::default(),
@@ -752,7 +755,10 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
-                "BucketCreationCommitted" => self.bucket_creation_committed = read_msgp_bool(rd)?,
+                "BucketCreationCommitted" => {
+                    self.bucket_creation_committed = read_msgp_bool(rd)?;
+                    self.bucket_creation_commit_record_present = true;
+                }
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -765,8 +771,10 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (22)
-        let map_len: u32 = 47;
+        // Preserve the absence of a legacy commit record across config rewrites.
+        let commit_record_present = self.bucket_creation_commit_record_present || self.bucket_creation_committed;
+        // Map size: MinIO fields (25) + RustFS extensions (21) + optional commit record.
+        let map_len: u32 = 46 + u32::from(commit_record_present);
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -847,8 +855,10 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
-        rmp::encode::write_str(wr, "BucketCreationCommitted")?;
-        rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
+        if commit_record_present {
+            rmp::encode::write_str(wr, "BucketCreationCommitted")?;
+            rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
+        }
 
         Ok(())
     }
@@ -1691,6 +1701,13 @@ mod test {
         let mut bm = BucketMetadata::unmarshal(&body[4..]).expect("unmarshal recovered blob");
         assert_eq!(bm.name, "interop");
         assert!(!bm.bucket_creation_committed, "legacy metadata must default to uncommitted");
+        assert!(!bm.bucket_creation_commit_record_present, "legacy metadata has no creation-commit record");
+        let rewritten = BucketMetadata::unmarshal(&bm.marshal_msg().expect("rewrite legacy metadata"))
+            .expect("read rewritten legacy metadata");
+        assert!(
+            !rewritten.bucket_creation_commit_record_present,
+            "rewriting legacy metadata must not fabricate a creation intent"
+        );
         bm.parse_all_configs().expect("parse recovered configs");
         assert!(bm.lifecycle_config.is_some());
     }
@@ -1708,6 +1725,7 @@ mod test {
 
         assert_eq!(bm.name, new.name);
         assert!(new.bucket_creation_committed);
+        assert!(new.bucket_creation_commit_record_present);
         assert!(!bm.bucket_incarnation_id.is_nil());
         assert_eq!(bm.bucket_incarnation_id, new.bucket_incarnation_id);
     }

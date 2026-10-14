@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Enabled</Status>
+  <MfaDelete>Disabled</MfaDelete>
+</VersioningConfiguration>
