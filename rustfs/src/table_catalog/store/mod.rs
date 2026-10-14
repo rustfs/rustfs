@@ -36,6 +36,11 @@ pub(super) use strong::{
 };
 pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
 
+struct PeriodicTableMaintenanceQueueGuard<'a> {
+    table_id: &'a str,
+    current_job: Option<&'a TableMaintenanceSchedulerJobSummary>,
+}
+
 pub(in crate::table_catalog) fn catalog_lock_acquisition_error(
     operation: &str,
     err: rustfs_lock::LockError,
@@ -1919,6 +1924,43 @@ where
             Self::DurableStrong(store) => {
                 store
                     .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn queue_periodic_table_maintenance(
+        &self,
+        entry: &TableEntry,
+        scheduler_id: String,
+        expected_job: Option<&TableMaintenanceSchedulerJobSummary>,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        let guard = PeriodicTableMaintenanceQueueGuard {
+            table_id: &entry.table_id,
+            current_job: expected_job,
+        };
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .run_table_maintenance_scheduler_once_with_guard_at(
+                        &entry.table_bucket,
+                        &entry.namespace,
+                        &entry.table,
+                        scheduler_id,
+                        OffsetDateTime::now_utc(),
+                        Some(&guard),
+                    )
+                    .await
+            }
+            Self::DurableStrong(store) => {
+                store
+                    .run_table_maintenance_scheduler_once_with_guard(
+                        &entry.table_bucket,
+                        &entry.namespace,
+                        &entry.table,
+                        scheduler_id,
+                        Some(&guard),
+                    )
                     .await
             }
         }

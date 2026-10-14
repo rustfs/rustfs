@@ -3565,6 +3565,19 @@ where
         scheduler_id: String,
         now: OffsetDateTime,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        self.run_table_maintenance_scheduler_once_with_guard_at(table_bucket, namespace, table, scheduler_id, now, None)
+            .await
+    }
+
+    pub(super) async fn run_table_maintenance_scheduler_once_with_guard_at(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+        now: OffsetDateTime,
+        periodic_guard: Option<&PeriodicTableMaintenanceQueueGuard<'_>>,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
@@ -3583,6 +3596,19 @@ where
             let effective = self
                 .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
                 .await?;
+            if let Some(periodic_guard) = periodic_guard {
+                self.validate_periodic_table_maintenance_queue_guard(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &effective,
+                    periodic_guard,
+                )
+                .await?;
+            }
             self.table_metadata_maintenance_scheduler_preflight(
                 TableMaintenancePreflightContext {
                     table_bucket,
@@ -3629,6 +3655,19 @@ where
             let effective = self
                 .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
                 .await?;
+            if let Some(periodic_guard) = periodic_guard {
+                self.validate_periodic_table_maintenance_queue_guard(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &effective,
+                    periodic_guard,
+                )
+                .await?;
+            }
             match self
                 .table_metadata_maintenance_scheduler_preflight(
                     TableMaintenancePreflightContext {
@@ -3934,6 +3973,61 @@ where
         });
         reports.truncate(TABLE_MAINTENANCE_SCHEDULER_AUDIT_LIMIT);
         Ok(reports)
+    }
+
+    pub(super) async fn validate_periodic_table_maintenance_queue_guard(
+        &self,
+        context: TableMaintenancePreflightContext<'_>,
+        effective: &TableMaintenanceEffectiveConfig,
+        expected: &PeriodicTableMaintenanceQueueGuard<'_>,
+    ) -> TableCatalogStoreResult<()> {
+        if context.entry.table_id != expected.table_id {
+            return Err(TableCatalogStoreError::Conflict(
+                "table identity changed before periodic maintenance claim".to_string(),
+            ));
+        }
+        if !effective.config.background_enabled || effective.config.worker_paused {
+            return Err(TableCatalogStoreError::Conflict("periodic maintenance is disabled or paused".to_string()));
+        }
+        let current = self
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
+            .await?;
+        if current.as_ref().map(table_maintenance_scheduler_job_summary).as_ref() != expected.current_job
+            || current
+                .as_ref()
+                .is_some_and(|report| report.job.status != TableMetadataMaintenanceJobStatus::Successful)
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance job changed or requires explicit operator action before periodic scheduling".to_string(),
+            ));
+        }
+        let latest = self
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
+                MAINTENANCE_JOB_ALIAS_LATEST,
+            )
+            .await?;
+        // Report publication writes latest before current. A partial write must
+        // not let an automatic pass replace an unresolved job or quarantine.
+        if latest != current
+            || current
+                .as_ref()
+                .is_some_and(|report| report.job.quarantine_enabled && report.job.quarantined_object_count > 0)
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance report publication or quarantine requires recovery before periodic scheduling".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) async fn table_metadata_maintenance_scheduler_preflight(

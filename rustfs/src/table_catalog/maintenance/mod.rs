@@ -13,11 +13,14 @@
 // limitations under the License.
 
 mod config;
+mod periodic;
+mod periodic_runtime;
 mod planner;
 mod recovery;
 mod worker;
 
 pub(crate) use config::*;
+pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime};
 pub(crate) use planner::*;
 pub(crate) use recovery::*;
 pub(crate) use worker::*;
