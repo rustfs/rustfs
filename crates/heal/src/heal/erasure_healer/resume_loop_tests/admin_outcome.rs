@@ -483,3 +483,50 @@ async fn admin_erasure_checkpoint_publication_cannot_undo_acknowledged_cancel() 
     assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
     assert_eq!((outcome.counters.processed, outcome.counters.healed), (1, 1));
 }
+
+#[tokio::test]
+async fn admin_bucket_discovery_rejects_incomplete_checkpoint_and_freezes_complete_empty_scope() {
+    let env = make_env().await;
+    env.storage.bucket_discovery_incomplete.store(true, Ordering::SeqCst);
+    let result = env
+        .healer
+        .prepare_admin_checkpoint(&env.checkpoint, &[], "pool_0_set_0")
+        .await;
+    assert!(matches!(result, Err(Error::BucketDiscoveryIncomplete)));
+    assert!(env.checkpoint.get_checkpoint().await.admin.is_none());
+    let reloaded = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+        .await
+        .expect("reload checkpoint");
+    assert!(reloaded.get_checkpoint().await.admin.is_none(), "incomplete scope must not be persisted");
+    assert_eq!(
+        env.storage.bucket_discovery_scopes.lock().expect("scopes").as_slice(),
+        &[Some(crate::heal::storage_api::storage::DiskSetSelector::new(0, 0))]
+    );
+
+    env.storage.bucket_discovery_incomplete.store(false, Ordering::SeqCst);
+    assert!(
+        env.healer
+            .prepare_admin_checkpoint(&env.checkpoint, &[], "pool_0_set_0")
+            .await
+            .expect("complete empty scope")
+            .is_empty()
+    );
+    env.storage.bucket_discovery_incomplete.store(true, Ordering::SeqCst);
+    objects(&env.storage, "created-after-admission", &["object"]);
+    let reloaded = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+        .await
+        .expect("reload frozen scope");
+    assert!(
+        env.healer
+            .prepare_admin_checkpoint(&reloaded, &[], "pool_0_set_0")
+            .await
+            .expect("resume frozen scope")
+            .is_empty()
+    );
+    assert_eq!(
+        env.storage.bucket_discovery_scopes.lock().expect("scopes").len(),
+        2,
+        "resume must not rediscover or expand scope"
+    );
+    assert!(env.storage.calls().is_empty());
+}

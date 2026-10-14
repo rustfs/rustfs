@@ -260,9 +260,26 @@ mod tests {
     }
 
     #[test]
-    fn test_grafana_dashboard_deduplicates_cluster_bucket_usage() {
-        assert!(GRAFANA_DASHBOARD.contains("max by (job, bucket) (rustfs_cluster_usage_buckets_objects_count"));
-        assert!(GRAFANA_DASHBOARD.contains("max by (job, bucket) (rustfs_cluster_usage_buckets_total_bytes"));
+    fn test_grafana_dashboard_scopes_and_deduplicates_cluster_bucket_usage() {
+        let dashboard: serde_json::Value = serde_json::from_str(GRAFANA_DASHBOARD).expect("dashboard must be valid JSON");
+        for (title, metric) in [
+            ("Bucket Objects", "rustfs_cluster_usage_buckets_objects_count"),
+            ("Bucket Size", "rustfs_cluster_usage_buckets_total_bytes"),
+        ] {
+            let panel = dashboard["panels"]
+                .as_array()
+                .expect("dashboard panels")
+                .iter()
+                .find(|panel| panel["title"] == title)
+                .expect("bucket usage panel");
+            assert_eq!(
+                panel["targets"][0]["expr"],
+                format!(
+                    "max by (rustfs_cluster_id, job, bucket) ({metric}{{rustfs_cluster_id=\"$storage_cluster\", job=~\"$job\", bucket=~\"$bucket\"}})"
+                ),
+                "{title} must select one cluster and deduplicate its reporting nodes"
+            );
+        }
         assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_objects_total"));
         assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_usage_bytes"));
     }

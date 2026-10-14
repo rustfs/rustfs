@@ -59,6 +59,8 @@ fn bucket_targets_metadata_lock_shard(bucket: &str) -> usize {
 
 pub(crate) mod contract {
     pub(crate) mod admin {
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::DiskSetSelector;
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
