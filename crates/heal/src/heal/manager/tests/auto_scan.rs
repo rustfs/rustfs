@@ -14,9 +14,9 @@
 
 use super::*;
 use crate::heal::storage::HealListItem;
-use rustfs_ecstore::api::{
-    layout::{EndpointServerPools, Endpoints, PoolEndpoints},
-    storage::init_local_disks,
+use crate::heal::storage_api::{
+    EcstoreEndpointServerPools as EndpointServerPools, EcstoreEndpoints as Endpoints, EcstorePoolEndpoints as PoolEndpoints,
+    ecstore_init_local_disks as init_local_disks,
 };
 use std::{
     future::Future,
