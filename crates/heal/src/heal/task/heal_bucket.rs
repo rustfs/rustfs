@@ -169,8 +169,10 @@ impl HealTask {
             "Heal bucket stage entered"
         );
         self.check_control_flags().await?;
-        let bucket_exists = self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_some();
-        if !bucket_exists {
+        // Bound administrator repair validates existence and generation under the
+        // lifecycle fence. Ordinary read quorum can reject recoverable directory loss.
+        let bound_admin_repair = self.source == HealRequestSource::Admin && self.bucket_incarnation_id.is_some();
+        if !bound_admin_repair && self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_none() {
             warn!(
                 target: "rustfs::heal::task",
                 event = EVENT_HEAL_BUCKET_RESULT,

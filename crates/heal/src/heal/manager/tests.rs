@@ -5670,7 +5670,7 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     process_manager_queue_once(&manager).await;
     let explicit_status = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let Ok(status @ HealTaskStatus::Failed { .. }) = manager.get_task_status(&explicit_id).await {
+            if let Ok(status @ HealTaskStatus::Completed) = manager.get_task_status(&explicit_id).await {
                 break status;
             }
             tokio::task::yield_now().await;
@@ -5678,7 +5678,8 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     })
     .await
     .expect("explicit timeout request should finish without using the zero default");
-    assert!(matches!(explicit_status, HealTaskStatus::Failed { .. }));
+    // Generation-bound admin tasks reach the successful mock heal without a namespace preflight.
+    assert_eq!(explicit_status, HealTaskStatus::Completed);
 }
 
 #[tokio::test]
