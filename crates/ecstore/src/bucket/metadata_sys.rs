@@ -1293,13 +1293,33 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    get_object_lock_config_and_incarnation_from_disk_with_guard_in(ctx, bucket, None).await
+}
+
+/// Bucket deletion already owns the namespace/lifecycle fences. Reuse its
+/// live guard rather than recursively acquiring the bucket namespace lock.
+/// The caller must also hold the metadata transaction read lock.
+pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
-    match bucket_meta_sys
-        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
-        .await?
-    {
+    let authority = match guard {
+        Some(guard) => {
+            bucket_meta_sys
+                .read_authoritative_metadata_from_disk_under_guard(bucket, guard)
+                .await?
+        }
+        None => {
+            bucket_meta_sys
+                .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+                .await?
+        }
+    };
+    match authority {
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {

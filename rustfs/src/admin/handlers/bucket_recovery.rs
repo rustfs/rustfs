@@ -23,7 +23,7 @@ use crate::site_replication::{site_replication_enabled, with_site_replication_bu
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
@@ -64,23 +64,27 @@ impl Operation for RecoverOrphanedBucketHandler {
             .credentials
             .as_ref()
             .map(|credentials| credentials.secret_key.clone())
-            .ok_or_else(|| s3_error!(InvalidRequest, "authentication required"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "authentication required"))?;
         let bucket = params
             .get("bucket")
             .filter(|bucket| !bucket.is_empty())
-            .ok_or_else(|| s3_error!(InvalidRequest, "bucket name is required"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "bucket name is required"))?;
         let body = req
             .input
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "failed to read recovery request body"))?;
-        let request: RecoverOrphanedBucketRequest = serde_json::from_slice(&body)
-            .map_err(|_| s3_error!(InvalidRequest, "expected JSON with a non-nil expectedIncarnationId"))?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "failed to read recovery request body"))?;
+        let request: RecoverOrphanedBucketRequest = serde_json::from_slice(&body).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, "expected JSON with a non-nil expectedIncarnationId")
+        })?;
         if request.expected_incarnation_id.is_nil() {
-            return Err(s3_error!(InvalidRequest, "expectedIncarnationId must be non-nil").into());
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "expectedIncarnationId must be non-nil",
+            ));
         }
         let Some(store) = current_object_store_handle() else {
-            return Err(s3_error!(InternalError, "object store is not initialized").into());
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
 
         let operation_bucket = bucket.to_owned();
@@ -92,11 +96,10 @@ impl Operation for RecoverOrphanedBucketHandler {
                 let lock_bucket = operation_bucket.clone();
                 with_site_replication_bucket_mutation_lock(lock_store, &lock_bucket, move || async move {
                     if site_replication_enabled().await? {
-                        return Err(s3_error!(
-                            OperationAborted,
-                            "orphaned bucket recovery is local; reconcile every site before recreating this bucket"
-                        )
-                        .into());
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::OperationAborted,
+                            "orphaned bucket recovery is local; reconcile every site before recreating this bucket",
+                        ));
                     }
                     operation_store
                         .recover_orphaned_bucket(&operation_bucket, expected_incarnation)

@@ -273,6 +273,30 @@ where
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|b| b.name).collect();
 
+    try_migrate_bucket_metadata_for_buckets(store, &buckets).await
+}
+
+/// Migrate the already discovered startup candidates without repeating a
+/// majority-only namespace listing. Every migration write retains its quorum.
+pub async fn try_migrate_bucket_metadata_for_buckets<S>(store: Arc<S>, buckets: &[String]) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
     if buckets.is_empty() {
         debug!("No migrating bucket metadata found");
         return Ok(());

@@ -18,7 +18,8 @@ mod tests {
     use crate::server::cors;
     use crate::storage::StorageError;
     use crate::storage::ecfs::{
-        FS, parse_object_version_id, propagate_object_lock_peer_reload, validate_object_lock_configuration_input,
+        FS, object_lock_retention_from_metadata, parse_object_version_id, propagate_object_lock_peer_reload,
+        validate_object_lock_configuration_input,
     };
     use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
@@ -986,6 +987,44 @@ mod tests {
         let complex_query_without_unordered = Some("abc=123&queryType=test");
         // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
+    #[test]
+    fn retention_response_serialization_preserves_offset_metadata_instant() {
+        for value in [
+            "2035-01-02T00:00:00+23:59",
+            "2035-01-02T00:00:00-23:59",
+            "2035-01-02T00:00:00Z",
+        ] {
+            let metadata = HashMap::from([
+                (AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned()),
+                (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), value.to_owned()),
+            ]);
+            let retention = object_lock_retention_from_metadata(&metadata).expect("representable retention instant");
+            assert_eq!(retention.mode.as_ref().expect("mode").as_str(), "COMPLIANCE");
+            let mut serialized = Vec::new();
+            retention
+                .retain_until_date
+                .expect("stored retention date")
+                .format(s3s::dto::TimestampFormat::DateTime, &mut serialized)
+                .expect("serialize the response timestamp");
+            let serialized = String::from_utf8(serialized).expect("UTF-8 timestamp");
+            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
+            let stored = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
+            assert_eq!(returned.unix_timestamp(), stored.unix_timestamp(), "stored date {value}");
+        }
+    }
+
+    #[test]
+    fn retention_response_rejects_instants_outside_the_utc_wire_range() {
+        for value in ["9999-12-31T23:59:59-23:59", "0000-01-01T00:00:00+23:59"] {
+            let metadata = HashMap::from([
+                (AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned()),
+                (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), value.to_owned()),
+            ]);
+            let error = object_lock_retention_from_metadata(&metadata).expect_err("unrepresentable UTC timestamp");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        }
     }
 
     #[test]

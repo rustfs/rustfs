@@ -298,6 +298,46 @@ fn every_rule_has_a_positive_sample() {
 }
 
 #[test]
+fn heal_writer_rule_requires_all_targets_and_retains_legacy_messages() {
+    let engine = engine();
+    for (sample, expected) in [
+        (
+            Sample {
+                message: "Set disk object heal writer failures",
+                level: Some(LogLevel::Warn),
+                fields: &[("state", "writer_unavailable"), ("result", "all_targets_unavailable")],
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            Sample {
+                message: "Set disk object heal writer failures",
+                level: Some(LogLevel::Warn),
+                fields: &[("state", "writer_unavailable"), ("result", "partial_targets_unavailable")],
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            Sample {
+                message: "Set disk object heal writer failures",
+                fields: &[("result", "all_targets_unavailable")],
+                ..Default::default()
+            },
+            false,
+        ),
+        (msg("all drives had write errors, unable to heal b/o"), true),
+    ] {
+        let matched = engine
+            .matches(&event(&sample))
+            .iter()
+            .any(|&index| engine.rules()[index].id == "heal-all-writes-failed");
+        assert_eq!(matched, expected);
+    }
+}
+
+#[test]
 fn smoke_samples_hit_exact_rule_sets() {
     let engine = engine();
     let exact = |sample: &Sample, expected: &[&str]| {

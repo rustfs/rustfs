@@ -440,6 +440,17 @@ jobs:
             fi
           done
 
+      - name: Verify macOS binary has no dynamic liblzma dependency
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/rustfs"
+          if otool -L "$binary" | grep -E 'liblzma.*\.dylib'; then
+            echo "macOS release binary must not depend on a dynamic liblzma library" >&2
+            exit 1
+          fi
+          "$binary" --version
+
       - name: Generate the CPU symbol catalog
         if: endsWith(matrix.target, '-linux-gnu') && matrix.features == 'pyroscope'
         shell: bash

@@ -1086,7 +1086,11 @@ fn build_list_object_versions_metadata_output(
                         size: Some(object.size),
                         version_id: Some(version_id),
                         is_latest: Some(object.is_latest),
-                        e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                        e_tag: object
+                            .etag
+                            .as_ref()
+                            .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
+                            .map(|etag| to_s3s_etag(etag)),
                         storage_class: Some(ObjectVersionStorageClass::from(
                             object
                                 .storage_class
@@ -1173,7 +1177,11 @@ fn build_list_objects_v2_metadata_output(
                     key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                     last_modified: object.mod_time.map(Timestamp::from),
                     size: Some(object.get_actual_size_or_physical()),
-                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    e_tag: object
+                        .etag
+                        .as_ref()
+                        .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
+                        .map(|etag| to_s3s_etag(etag)),
                     storage_class: Some(ObjectStorageClass::from(
                         object
                             .storage_class
@@ -4546,6 +4554,89 @@ mod tests {
 
         let err = usecase.execute_list_object_versions_m(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn keyless_object_and_version_listings_do_not_expose_legacy_encrypted_fingerprints() {
+        let legacy_md5 = "fbfcbcc6d2f035411e6268c8b119593e";
+        let mut protected_metadata =
+            HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_owned(), "AES256".to_owned())]);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut protected_metadata,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+            "v1".to_owned(),
+        );
+        let objects = vec![
+            ObjectInfo {
+                name: "legacy-encrypted".to_owned(),
+                etag: Some(legacy_md5.to_owned()),
+                user_defined: Arc::new(HashMap::from([(
+                    "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+                    "AES256".to_owned(),
+                )])),
+                ..Default::default()
+            },
+            ObjectInfo {
+                name: "protected-encrypted".to_owned(),
+                etag: Some("0123456789abcdef0123456789abcdef".to_owned()),
+                user_defined: Arc::new(protected_metadata),
+                ..Default::default()
+            },
+            ObjectInfo {
+                name: "plain".to_owned(),
+                etag: Some("9876543210abcdef9876543210abcdef".to_owned()),
+                ..Default::default()
+            },
+        ];
+        let listings = build_list_objects_v2_metadata_output(
+            ListObjectsV2Info {
+                objects: objects.clone(),
+                ..Default::default()
+            },
+            "demo-bucket",
+            &ListObjectsV2Params {
+                prefix: String::new(),
+                max_keys: 1000,
+                delimiter: None,
+                response_start_after: None,
+                start_after_for_query: None,
+                response_continuation_token: None,
+                decoded_continuation_token: None,
+            },
+            None,
+            false,
+            &HashMap::new(),
+        );
+        assert!(listings.contents[0].object.e_tag.is_none());
+        assert!(listings.contents[1].object.e_tag.is_some());
+        assert!(listings.contents[2].object.e_tag.is_some());
+        let xml = String::from_utf8(serialize_config(&listings).expect("serialize objects")).expect("UTF-8 objects");
+        assert!(!xml.contains(legacy_md5));
+
+        let versions = build_list_object_versions_metadata_output(
+            ListObjectVersionsInfo {
+                objects,
+                ..Default::default()
+            },
+            "demo-bucket",
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                max_keys: 1000,
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+            },
+            None,
+            &HashMap::new(),
+        );
+        for (index, entry) in versions.entries.iter().enumerate() {
+            let ListObjectVersionMetadataEntry::Version(version, _) = entry else {
+                panic!("expected object version");
+            };
+            assert_eq!(version.e_tag.is_some(), index != 0);
+        }
+        let xml = String::from_utf8(serialize_config(&versions).expect("serialize versions")).expect("UTF-8 versions");
+        assert!(!xml.contains(legacy_md5));
     }
 
     #[test]

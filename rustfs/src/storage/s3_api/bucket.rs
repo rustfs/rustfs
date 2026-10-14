@@ -226,7 +226,11 @@ pub(crate) fn build_list_object_versions_output(
             size: Some(v.size),
             version_id: Some(list_versions_response_version_id(v.version_id)),
             is_latest: Some(v.is_latest),
-            e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+            e_tag: v
+                .etag
+                .as_ref()
+                .filter(|_| rustfs_utils::http::etag_can_be_listed(&v.user_defined))
+                .map(|etag| to_s3s_etag(etag)),
             storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
             ..Default::default()
         })
@@ -311,7 +315,11 @@ pub(crate) fn build_list_objects_v2_output(
                 // logical-size sentinel; never expose that internal value in
                 // an S3 response.
                 size: Some(v.get_actual_size_or_physical()),
-                e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                e_tag: v
+                    .etag
+                    .as_ref()
+                    .filter(|_| rustfs_utils::http::etag_can_be_listed(&v.user_defined))
+                    .map(|etag| to_s3s_etag(etag)),
                 storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                 ..Default::default()
             };
@@ -707,6 +715,83 @@ mod tests {
                 .and_then(|object| object.size),
             Some(128)
         );
+    }
+
+    #[test]
+    fn standard_list_responses_hide_legacy_encrypted_fingerprints() {
+        let mut protected_metadata = std::collections::HashMap::from([(
+            "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+            "AES256".to_owned(),
+        )]);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut protected_metadata,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+            "v1".to_owned(),
+        );
+        let objects: Vec<ObjectInfo> = [
+            std::collections::HashMap::from([(
+                "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+                "AES256".to_owned(),
+            )]),
+            std::collections::HashMap::from([("x-amz-server-side-encryption".to_owned(), "aws:kms".to_owned())]),
+            protected_metadata,
+            std::collections::HashMap::new(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, metadata)| ObjectInfo {
+            name: format!("object-{index}"),
+            etag: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            user_defined: std::sync::Arc::new(metadata),
+            size: 42,
+            ..Default::default()
+        })
+        .collect();
+        let v2 = build_list_objects_v2_output(
+            ListObjectsV2Info {
+                objects: objects.clone(),
+                ..Default::default()
+            },
+            false,
+            1000,
+            "bucket".to_owned(),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let v1 = build_list_objects_output(v2.clone(), None);
+        for listing in [&v1.contents, &v2.contents] {
+            let entries = listing.as_ref().expect("listed objects");
+            assert_eq!(entries.len(), 4);
+            for (index, entry) in entries.iter().enumerate() {
+                assert_eq!(entry.e_tag.is_some(), index >= 2);
+                assert_eq!(entry.key.as_deref(), Some(format!("object-{index}").as_str()));
+                assert_eq!(entry.size, Some(42));
+            }
+        }
+        let versions = build_list_object_versions_output(
+            ListObjectVersionsInfo {
+                objects,
+                ..Default::default()
+            },
+            "bucket".to_owned(),
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            },
+            None,
+        );
+        let versions = versions.versions.expect("listed versions");
+        assert_eq!(versions.len(), 4);
+        for (index, entry) in versions.iter().enumerate() {
+            assert_eq!(entry.e_tag.is_some(), index >= 2);
+            assert_eq!(entry.size, Some(42));
+        }
     }
 
     #[test]
