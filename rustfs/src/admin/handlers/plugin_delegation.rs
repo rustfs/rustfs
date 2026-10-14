@@ -38,6 +38,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/query"),
         AdminOperation(&QueryRun),
     )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/cancel"),
+        AdminOperation(&CancelRun),
+    )?;
     Ok(())
 }
 
@@ -261,6 +266,36 @@ impl Operation for QueryRun {
     }
 }
 
+struct CancelRun;
+#[async_trait::async_trait]
+impl Operation for CancelRun {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::CancelPluginRunAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "cancel body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "cancel body unavailable"))?;
+        let input: QueryRunInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid cancel request"))?;
+        if input.version != 1 || input.run_id.is_nil() {
+            return Err(s3_error!(InvalidRequest, "invalid cancel request"));
+        }
+        let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
+        let result = plugin_runner::cancel(&plugin_runner::CancelRequest {
+            version: input.version,
+            run_id: input.run_id,
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+            actual_signer_access_key: &signer,
+        })
+        .await?;
+        response(&result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +321,8 @@ mod tests {
                 Submit.call(req, Params::new()).await
             } else if operation == 3 {
                 QueryRun.call(req, Params::new()).await
+            } else if operation == 4 {
+                CancelRun.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
             };

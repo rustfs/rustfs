@@ -40,6 +40,8 @@ Manual job submission reads the active delegation before calling the Runner. A s
 
 `POST /rustfs/admin/v3/plugin-delegations/{id}/runs/query` accepts `{version:1,run_id}` and requires an ordinary IAM user with `admin:GetPluginRun` who owns the delegation in `{id}`. It reads the immutable owner record without checking expiry or revocation, then queries Runner using the record's delegation ID and revision and the authenticated access key. The result can contain only that caller's run status and committed manifest; it does not perform object reads or reauthorize object access. The Runner response must match the requested run ID and the strict status schema before RustFS returns it.
 
+`POST /rustfs/admin/v3/plugin-delegations/{id}/runs/cancel` accepts the same request and requires `admin:CancelPluginRun` plus ownership of `{id}`. Expiry and revocation do not block cancelling an existing run. Runner scopes the run to that owner; missing and other-owner runs share the same not-found response, while successful and failed runs return conflict. Success returns `{version:1,run_id,state:"CANCELLED",cleanup_pending}` and does not imply that asynchronous cleanup has finished.
+
 ## Broker profile
 
 `rustfs/src/admin/handlers/plugin_attempt.rs` implements `POST /rustfs/admin/v3/plugin-delegations/{id}/issue-attempt`. The signer must be an ordinary IAM user with `admin:IssuePluginAttempt`, independently listed in `RUSTFS_PLUGIN_BROKERS`:

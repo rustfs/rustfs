@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
 const QUERY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/query";
+const CANCEL_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/cancel";
 const MAX_RECEIPT_BYTES: usize = 4096;
 // The Runner bounds a result manifest to 1 MiB and reserves 4 KiB for its JSON envelope.
 const MAX_QUERY_RESPONSE_BYTES: usize = 1_052_672;
@@ -61,6 +62,24 @@ pub(crate) struct QueryResponse {
     pub epoch: i64,
     #[serde(deserialize_with = "required_manifest")]
     pub result_manifest: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CancelRequest<'a> {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+    pub actual_signer_access_key: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelResponse {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub state: String,
+    pub cleanup_pending: bool,
 }
 
 fn required_manifest<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
@@ -134,6 +153,47 @@ pub(crate) async fn query(request: &QueryRequest<'_>) -> S3Result<QueryResponse>
         }
         _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
     }
+}
+
+pub(crate) async fn cancel(request: &CancelRequest<'_>) -> S3Result<CancelResponse> {
+    let mut url = configured_url()?;
+    url.set_path(CANCEL_ENDPOINT_PATH);
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
+            let result: CancelResponse = serde_json::from_slice(&body)
+                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner cancel response invalid"))?;
+            if !valid_cancel_response(&result, request.run_id) {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner cancel response invalid"));
+            }
+            Ok(result)
+        }
+        status => Err(cancel_status_error(status)),
+    }
+}
+
+fn cancel_status_error(status: StatusCode) -> s3s::S3Error {
+    match status {
+        StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
+        StatusCode::CONFLICT => s3_error!(OperationAborted, "plugin run cannot be cancelled"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => s3_error!(AccessDenied, "plugin runner rejected request"),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            s3_error!(InvalidRequest, "plugin runner rejected request")
+        }
+        _ => s3_error!(ServiceUnavailable, "plugin runner unavailable"),
+    }
+}
+
+fn valid_cancel_response(response: &CancelResponse, run_id: uuid::Uuid) -> bool {
+    response.version == 1 && response.run_id == run_id && response.state == "CANCELLED"
 }
 
 fn valid_query_response(response: &QueryResponse, run_id: uuid::Uuid) -> bool {
@@ -270,6 +330,8 @@ mod tests {
         let mut query = valid;
         query.set_path(QUERY_ENDPOINT_PATH);
         assert_eq!(query.path(), QUERY_ENDPOINT_PATH);
+        query.set_path(CANCEL_ENDPOINT_PATH);
+        assert_eq!(query.path(), CANCEL_ENDPOINT_PATH);
     }
 
     #[test]
@@ -319,6 +381,44 @@ mod tests {
         assert!(bounded_len_allowed(MAX_QUERY_RESPONSE_BYTES - 1, 1, MAX_QUERY_RESPONSE_BYTES));
         assert!(!bounded_len_allowed(MAX_QUERY_RESPONSE_BYTES, 1, MAX_QUERY_RESPONSE_BYTES));
         assert!(!bounded_len_allowed(usize::MAX, 1, MAX_QUERY_RESPONSE_BYTES));
+    }
+
+    #[test]
+    fn cancel_response_is_strict_and_matches_requested_run() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let valid: CancelResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","state":"CANCELLED","cleanup_pending":true}}"#
+        ))
+        .expect("valid cancellation response");
+        assert!(valid_cancel_response(&valid, run_id));
+        assert!(!valid_cancel_response(&valid, uuid::Uuid::from_u128(2)));
+        assert!(
+            serde_json::from_str::<CancelResponse>(&format!(
+                r#"{{"version":1,"run_id":"{run_id}","state":"CANCELLED","cleanup_pending":true,"tenant":"other"}}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<CancelResponse>(&format!(r#"{{"version":1,"run_id":"{run_id}","state":"CANCELLED"}}"#))
+                .is_err()
+        );
+        let invalid: CancelResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","state":"RUNNING","cleanup_pending":false}}"#
+        ))
+        .expect("status semantics are checked after decoding");
+        assert!(!valid_cancel_response(&invalid, run_id));
+    }
+
+    #[test]
+    fn cancel_status_codes_preserve_runner_contract() {
+        assert_eq!(cancel_status_error(StatusCode::NOT_FOUND).code(), &s3s::S3ErrorCode::NoSuchKey);
+        assert_eq!(cancel_status_error(StatusCode::CONFLICT).code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(cancel_status_error(StatusCode::FORBIDDEN).code(), &s3s::S3ErrorCode::AccessDenied);
+        assert_eq!(cancel_status_error(StatusCode::BAD_REQUEST).code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            cancel_status_error(StatusCode::SERVICE_UNAVAILABLE).code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
     }
 
     #[test]
