@@ -1697,24 +1697,28 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
+        // The one-second drive deadline is the behaviour under test. It must bound
+        // only the paused rename: the fixture writes and the final read run under
+        // the default deadline, otherwise a loaded runner that takes more than a
+        // second to seed the fixture reports `Timeout` before the test starts.
+        let ctx = Arc::new(InstanceContext::new());
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let root = tempfile::tempdir().expect("root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let fi = target_file_info("destination", Uuid::new_v4(), b"timed-out-physical-commit");
+        seed_target(&disk, "target-bucket", "staged", fi.clone()).await;
+        let path = disk
+            .get_object_path_for_io_if_local("target-bucket", "destination/xl.meta")
+            .expect("local")
+            .expect("destination IO path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install(&path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let disk_ref = disk.endpoint().to_string();
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
-            let ctx = Arc::new(InstanceContext::new());
-            let store = super::super::tests::build_store_with_ctx(ctx.clone());
-            let root = tempfile::tempdir().expect("root");
-            let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
-            let fi = target_file_info("destination", Uuid::new_v4(), b"timed-out-physical-commit");
-            seed_target(&disk, "target-bucket", "staged", fi.clone()).await;
-            let path = disk
-                .get_object_path_for_io_if_local("target-bucket", "destination/xl.meta")
-                .expect("local")
-                .expect("destination IO path");
-            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            let _hook = hooks::install(&path, move || {
-                let _ = entered_tx.send(());
-                let _ = release_rx.recv();
-            });
-            let disk_ref = disk.endpoint().to_string();
             let mut rename = Box::pin(store.rename_local_data(
                 &disk_ref,
                 ("target-bucket", "staged"),
@@ -1747,22 +1751,22 @@ mod tests {
             })
             .await
             .expect("late physical owner drains");
-            let read = disk
-                .read_version(
-                    "target-bucket",
-                    "target-bucket",
-                    "destination",
-                    &fi.version_id.expect("version").to_string(),
-                    &crate::disk::ReadOptions {
-                        read_data: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("read actual timeout tail");
-            assert_eq!(read.data, fi.data);
         })
         .await;
+        let read = disk
+            .read_version(
+                "target-bucket",
+                "target-bucket",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read actual timeout tail");
+        assert_eq!(read.data, fi.data);
     }
 
     #[test]
