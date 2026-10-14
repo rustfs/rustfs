@@ -351,3 +351,27 @@ async fn scanner_tick_finishes_existing_owner_before_admitting_new_unformatted_t
     })
     .await;
 }
+
+#[tokio::test]
+async fn recovery_disk_index_keeps_first_snapshot_and_sorted_unique_endpoints() {
+    let temp = TempDir::new().expect("recovery disk index fixture");
+    let local = make_manager_resume_disk(&temp, "a-local").await;
+    let duplicate = make_manager_resume_disk(&temp, "a-local").await;
+    let survivor = make_manager_resume_disk(&temp, "z-survivor").await;
+    assert!(!Arc::ptr_eq(&local, &duplicate), "duplicate must be a different disk snapshot");
+    let local_endpoint = local.endpoint().to_string();
+    let survivor_endpoint = survivor.endpoint().to_string();
+    let mut inventory = std::collections::BTreeMap::new();
+    super::super::auto_scan::extend_replacement_recovery_disks(&mut inventory, [local.clone()]);
+    super::super::auto_scan::extend_replacement_recovery_disks(&mut inventory, [survivor.clone(), duplicate, survivor]);
+    assert_eq!(inventory.len(), 2, "each endpoint is discovered once");
+    assert!(
+        Arc::ptr_eq(inventory.get(&local_endpoint).expect("local endpoint remains indexed"), &local),
+        "later set inventories must not replace the local snapshot"
+    );
+    assert_eq!(
+        inventory.keys().collect::<Vec<_>>(),
+        vec![&local_endpoint, &survivor_endpoint],
+        "discovery order remains lexical regardless of insertion order"
+    );
+}
