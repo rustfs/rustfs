@@ -3077,7 +3077,7 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
 
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request();
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request(opts);
                 if let Some(request_payload_bytes) = request_payload_bytes {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_sent_bytes(request_payload_bytes);
                 }
@@ -3155,6 +3155,7 @@ impl DiskAPI for RemoteDisk {
         record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, encode_started);
         let request_payload_bytes = batch_read_version_attribution_enabled
             .then(|| batch_read_version_request_payload_len(&req, &batch_read_version_req, &batch_read_version_req_bin));
+        let request_opts = req.opts;
         let batch_result = self
             .execute_with_timeout_for_op(
                 "batch_read_version",
@@ -3168,7 +3169,7 @@ impl DiskAPI for RemoteDisk {
                         batch_read_version_req_bin: batch_read_version_req_bin.into(),
                     });
 
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request(&request_opts);
                     if let Some(request_payload_bytes) = request_payload_bytes {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_sent_bytes(
                             request_payload_bytes.saturating_add(disk_len),

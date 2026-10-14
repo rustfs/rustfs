@@ -370,6 +370,17 @@ impl DataUsageCache {
             }
         };
 
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let load_fut = rustfs_ecstore::api::diagnostic::with_read_version_entry(
+            rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::DataUsageCacheRead,
+            async {
+                rustfs_ecstore::api::diagnostic::observe_read_version_context_boundary(
+                    rustfs_ecstore::api::diagnostic::ReadVersionContextBoundary::ScannerCacheLoad,
+                );
+                load_fut.await
+            },
+        );
+
         match timeout(timeout_duration, load_fut).await {
             Ok(Ok((Some(cache), revision, _))) => Ok(DataUsageCacheLoadAttempt::Loaded {
                 cache: Box::new(cache),

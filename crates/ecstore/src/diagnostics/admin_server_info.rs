@@ -693,12 +693,16 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
         if erasure_set.id == 0 {
             erasure_set.id = d.set_index;
-            match load_data_usage_cache(
+            let load = load_data_usage_cache(
                 store.pools[d.pool_index as usize].disk_set[d.set_index as usize].as_ref(),
                 DATA_USAGE_CACHE_NAME,
-            )
-            .await
-            {
+            );
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            let load = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+                rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ServerInfoPools,
+                load,
+            );
+            match load.await {
                 Ok(cache) => apply_erasure_set_usage(&cache, erasure_set),
                 Err(_) => erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
             }

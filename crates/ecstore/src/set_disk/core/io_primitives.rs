@@ -6392,7 +6392,18 @@ impl SetDisks {
         // - If no_lock is false, we must have obtained the lock out side of this function
         // - If no_lock is true, we should not obtain locks
         lookup_opts.no_lock = true;
-        let oi = self.get_object_info(bucket, object, &lookup_opts).await;
+        let lookup = self.get_object_info(bucket, object, &lookup_opts);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let lookup = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::WritePreconditionRead,
+            async {
+                crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                    rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::WritePreconditionLookup,
+                );
+                lookup.await
+            },
+        );
+        let oi = lookup.await;
 
         match oi {
             Ok(oi) => {
@@ -6751,6 +6762,12 @@ pub(crate) mod disk_call_counters {
     /// Registry key: (object, kind, disk_index).
     type CountKey = (String, String, usize);
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    type ReadVersionContext = (
+        Option<&'static str>,
+        Option<rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller>,
+    );
+
     #[derive(Default)]
     struct Registry {
         /// Object names with an active observing scope. Only these accumulate,
@@ -6758,6 +6775,8 @@ pub(crate) mod disk_call_counters {
         observed: HashSet<String>,
         /// (object, kind, disk_index) -> call count.
         counts: HashMap<CountKey, u64>,
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        read_version_contexts: HashMap<(String, usize), Vec<ReadVersionContext>>,
     }
 
     fn registry() -> &'static Mutex<Registry> {
@@ -6775,6 +6794,17 @@ pub(crate) mod disk_call_counters {
         *reg.counts
             .entry((object.to_string(), kind.to_string(), disk_index))
             .or_insert(0) += 1;
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        if kind == KIND_READ_VERSION {
+            let context = (
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                crate::cluster::rpc::runtime_sources::current_read_version_request_caller(),
+            );
+            reg.read_version_contexts
+                .entry((object.to_string(), disk_index))
+                .or_default()
+                .push(context);
+        }
     }
 
     /// RAII scope that observes call counts for a single `object`. Counts recorded
@@ -6795,6 +6825,15 @@ pub(crate) mod disk_call_counters {
     }
 
     impl CallCounterScope {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        pub fn read_version_contexts_for_disk(&self, disk_index: usize) -> Vec<ReadVersionContext> {
+            let reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.read_version_contexts
+                .get(&(self.object.clone(), disk_index))
+                .cloned()
+                .unwrap_or_default()
+        }
+
         /// Total number of `kind` calls across all disks for the observed object.
         pub fn total(&self, kind: &str) -> u64 {
             let reg = registry().lock().expect("disk call-counter registry poisoned");
@@ -6820,6 +6859,8 @@ pub(crate) mod disk_call_counters {
             let mut reg = registry().lock().expect("disk call-counter registry poisoned");
             reg.observed.remove(&self.object);
             reg.counts.retain(|(obj, _, _), _| obj != &self.object);
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            reg.read_version_contexts.retain(|(obj, _), _| obj != &self.object);
         }
     }
 }
@@ -7959,6 +8000,290 @@ mod tests {
         .await;
 
         drop(dirs);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_coalescer_restores_each_item_after_delayed_and_threshold_flush() {
+        use crate::cluster::rpc::runtime_sources::{
+            ReadVersionDiagnosticContext, with_optional_read_version_request_caller, with_read_version_diagnostic_context,
+            with_read_version_entry,
+        };
+        use crate::set_disk::core::metadata_read::enqueue_coalesced_read_version;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::{
+            ReadVersionContextBoundary, ReadVersionEntrySource, ReadVersionRequestCaller,
+        };
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_isolated_s3_http_operation_context,
+        };
+        let operation = |op| {
+            let mut guard = S3HttpRequestGuard::new("GET");
+            guard.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(op);
+                current_s3_http_operation_context().expect("operation should be captured")
+            })
+        };
+        let get = operation(rustfs_s3_ops::S3Operation::GetObject);
+        let list = operation(rustfs_s3_ops::S3Operation::ListObjectsV2);
+        let foreign = operation(rustfs_s3_ops::S3Operation::DeleteObject);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        for (items, delay) in [(4, "2000"), (crate::disk::BATCH_READ_VERSION_MAX_ITEMS, "10000")] {
+            let recorder = DebuggingRecorder::new();
+            let snapshots = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                runtime.block_on(async {
+                    let bucket = "diagnostic-coalescer-context";
+                    let (_dirs, disks) = call_counter_local_disks(bucket, 1).await;
+                    let disk = disks[0].clone().expect("test disk should exist");
+                    for case in 0..4 {
+                        install_metadata_fanout_fileinfo(&disks, bucket, &format!("context-{case}"), None).await;
+                    }
+                    let mut contexts = Vec::new();
+                    for (api, caller, source) in [
+                        (Some(get), Some(ReadVersionRequestCaller::Object), ReadVersionEntrySource::ObjectRead),
+                        (None, None, ReadVersionEntrySource::ConfigRead),
+                        (
+                            Some(list),
+                            Some(ReadVersionRequestCaller::ListObjects),
+                            ReadVersionEntrySource::ListObjects,
+                        ),
+                        (None, Some(ReadVersionRequestCaller::Heal), ReadVersionEntrySource::LifecycleRecovery),
+                    ] {
+                        contexts.push(
+                            with_isolated_s3_http_operation_context(
+                                api,
+                                with_optional_read_version_request_caller(
+                                    caller,
+                                    with_read_version_entry(source, async { ReadVersionDiagnosticContext::capture() }),
+                                ),
+                            )
+                            .await,
+                        );
+                    }
+                    let opts = ReadOptions::default();
+                    let foreign_context = with_isolated_s3_http_operation_context(
+                        Some(foreign),
+                        with_optional_read_version_request_caller(
+                            Some(ReadVersionRequestCaller::Multipart),
+                            with_read_version_entry(ReadVersionEntrySource::ObjectRead, async {
+                                ReadVersionDiagnosticContext::capture()
+                            }),
+                        ),
+                    )
+                    .await;
+                    temp_env::async_with_vars([("RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS", Some(delay))], async {
+                        with_read_version_diagnostic_context(foreign_context, ReadVersionContextBoundary::Entry, async {
+                            let reads = (0..items).map(|index| {
+                                let case = index % contexts.len();
+                                let item = BatchReadVersionItem {
+                                    org_volume: String::new(),
+                                    volume: bucket.to_owned(),
+                                    path: format!("context-{case}"),
+                                    version_id: String::new(),
+                                };
+                                with_read_version_diagnostic_context(
+                                    contexts[case],
+                                    ReadVersionContextBoundary::EarlyStop,
+                                    enqueue_coalesced_read_version(disk.clone(), item, &opts),
+                                )
+                            });
+                            let results = futures::future::join_all(reads).await;
+                            for (index, result) in results.into_iter().enumerate() {
+                                assert_eq!(result.expect("fallback read should succeed").name, format!("context-{}", index % 4));
+                            }
+                            assert_eq!(
+                                current_s3_http_operation_context(),
+                                Some(foreign),
+                                "flush must restore its caller's ambient scope"
+                            );
+                        })
+                        .await;
+                    })
+                    .await;
+                    assert_eq!(current_s3_http_operation_context(), None);
+                })
+            });
+            let rows = snapshots.snapshot().into_vec();
+            let item_label = items.to_string();
+            assert!(
+                rows.iter().any(|(key, _, _, value)| {
+                    let labels = key
+                        .key()
+                        .labels()
+                        .map(|label| (label.key(), label.value()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    key.key().name() == "rustfs_get_metadata_read_version_coalescer_total"
+                        && labels.get("event") == Some(&"attempted_batch")
+                        && labels.get("item_count") == Some(&item_label.as_str())
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "all requests should flush in exactly one batch"
+            );
+            for (source, api, caller) in [
+                ("object_read", "s3:GetObject", "object"),
+                ("config_read", "unattributed", "unattributed"),
+                ("list_objects", "s3:ListObjectsV2", "list_objects"),
+                ("lifecycle_recovery", "unattributed", "heal"),
+            ] {
+                assert!(rows.iter().any(|(key, _, _, value)| {
+                    let labels = key.key().labels().map(|label| (label.key(), label.value())).collect::<std::collections::HashMap<_, _>>();
+                    key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                        && labels.get("boundary") == Some(&"unary_fallback")
+                        && labels.get("entry_source") == Some(&source)
+                        && labels.get("parent_api_operation") == Some(&api)
+                        && labels.get("child_api_operation") == Some(&api)
+                        && labels.get("parent_caller") == Some(&caller)
+                        && labels.get("child_caller") == Some(&caller)
+                        && matches!(value, DebugValue::Counter(count) if *count == u64::try_from(items / 4).expect("small item count"))
+                }), "each item must retain its own API, caller, and entry source");
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_full_wait_preserves_external_request_diagnostic_context() {
+        use crate::cluster::rpc::runtime_sources::with_read_version_request_caller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_s3_http_operation_context,
+        };
+
+        const DISKS: usize = 4;
+        let bucket = "full-wait-external-context-bucket";
+        let object = "full-wait-external-context-object";
+        let (_dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+        let calls = disk_call_counters::observe(object);
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request
+            .in_scope(|| {
+                rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+                current_s3_http_operation_context()
+            })
+            .expect("external request operation should be captured");
+        let (metadata, errors, _) = with_s3_http_operation_context(
+            Some(operation),
+            with_read_version_request_caller(
+                ReadVersionRequestCaller::Object,
+                SetDisks::read_all_fileinfo_observed(&disks, "", bucket, object, "", false, false, false, false, 2),
+            ),
+        )
+        .await
+        .expect("full-wait metadata read should complete");
+
+        assert_eq!(metadata.iter().filter(|info| info.name == object).count(), DISKS);
+        assert!(errors.iter().all(Option::is_none));
+        for disk_index in 0..DISKS {
+            assert_eq!(
+                calls.read_version_contexts_for_disk(disk_index),
+                vec![(Some("s3:GetObject"), Some(ReadVersionRequestCaller::Object))],
+                "every full-wait child must retain the external request context"
+            );
+        }
+        assert_eq!(current_s3_http_operation_context(), None);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_full_wait_keeps_internal_reads_without_s3_context() {
+        use crate::cluster::rpc::runtime_sources::with_optional_read_version_request_caller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+
+        const DISKS: usize = 4;
+        let bucket = "full-wait-internal-context-bucket";
+        let (_dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        for (case, caller) in [None, Some(ReadVersionRequestCaller::Heal)].into_iter().enumerate() {
+            let object = format!("full-wait-internal-context-object-{case}");
+            install_metadata_fanout_fileinfo(&disks, bucket, &object, None).await;
+            let calls = disk_call_counters::observe(&object);
+            let (metadata, errors, _) = with_optional_read_version_request_caller(
+                caller,
+                SetDisks::read_all_fileinfo_observed(&disks, "", bucket, &object, "", false, false, false, false, 2),
+            )
+            .await
+            .expect("internal full-wait metadata read should complete");
+
+            assert_eq!(metadata.iter().filter(|info| info.name == object).count(), DISKS);
+            assert!(errors.iter().all(Option::is_none));
+            for disk_index in 0..DISKS {
+                assert_eq!(
+                    calls.read_version_contexts_for_disk(disk_index),
+                    vec![(None, caller)],
+                    "internal reads must retain their caller without acquiring an external request context"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_early_stop_preserves_external_and_internal_diagnostic_context() {
+        use crate::cluster::rpc::runtime_sources::with_optional_read_version_request_caller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_s3_http_operation_context,
+        };
+
+        const DISKS: usize = 4;
+        let bucket = "early-stop-diagnostic-context-bucket";
+        let (_dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request
+            .in_scope(|| {
+                rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+                current_s3_http_operation_context()
+            })
+            .expect("external request operation should be captured");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                for (case, api, caller) in [
+                    (0, Some(operation), Some(ReadVersionRequestCaller::Object)),
+                    (1, None, None),
+                    (2, None, Some(ReadVersionRequestCaller::Heal)),
+                ] {
+                    let object = object_with_initial_data_shards(bucket, &format!("early-stop-context-object-{case}"), 2, 3);
+                    install_inline_metadata_fanout_fileinfo(&disks, bucket, &object, b"context probe", |_| {}).await;
+                    let calls = disk_call_counters::observe(&object);
+                    let (metadata, errors, _) = with_s3_http_operation_context(
+                        api,
+                        with_optional_read_version_request_caller(
+                            caller,
+                            SetDisks::read_all_fileinfo_observed(&disks, "", bucket, &object, "", true, false, false, true, 2),
+                        ),
+                    )
+                    .await
+                    .expect("early-stop metadata read should complete");
+
+                    assert!(metadata.iter().filter(|info| info.name == object).count() >= 2);
+                    assert!(errors.iter().all(Option::is_none));
+                    assert!(calls.total(disk_call_counters::KIND_READ_VERSION) >= 2);
+                    let expected_api = api.map(|context| context.operation_name());
+                    for disk_index in 0..DISKS {
+                        for context in calls.read_version_contexts_for_disk(disk_index) {
+                            assert_eq!(
+                                context,
+                                (expected_api, caller),
+                                "every polled early-stop child must retain its parent's diagnostic context"
+                            );
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(current_s3_http_operation_context(), None);
     }
 
     #[test]
