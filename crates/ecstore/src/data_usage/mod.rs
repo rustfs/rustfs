@@ -2529,19 +2529,17 @@ where
     use crate::object_api::ObjectOptions;
     use http::HeaderMap;
 
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            key,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, key, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::DataUsageCacheRead,
+        read,
+    );
+    match read.await {
         // A cache object that fails to decode is treated as absent rather than
         // as an error: a corrupt cache should not stall the caller, and the
         // next scanner pass rewrites it.
@@ -3064,6 +3062,8 @@ mod tests {
         transient_failures: Mutex<usize>,
         reads: Mutex<Vec<String>>,
         terminal_error: Mutex<Option<Error>>,
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        record_context: bool,
     }
 
     impl UsageCacheReadStore {
@@ -3072,6 +3072,8 @@ mod tests {
                 transient_failures: Mutex::new(n),
                 reads: Mutex::new(Vec::new()),
                 terminal_error: Mutex::new(None),
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                record_context: false,
             }
         }
 
@@ -3080,6 +3082,8 @@ mod tests {
                 transient_failures: Mutex::new(0),
                 reads: Mutex::new(Vec::new()),
                 terminal_error: Mutex::new(Some(error)),
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                record_context: false,
             }
         }
 
@@ -3106,6 +3110,12 @@ mod tests {
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            if self.record_context {
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request(
+                    &crate::disk::ReadOptions::default(),
+                );
+            }
             self.reads.lock().await.push(object.to_string());
             if let Some(error) = self.terminal_error.lock().await.clone() {
                 return Err(error);
@@ -3203,6 +3213,89 @@ mod tests {
             vec![prefixed_usage_key(name), name.to_string()],
             "the prefixed key is tried first, then the legacy one, and neither absence is retried"
         );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_usage_cache_read_preserves_api_and_earlier_entry() {
+        use crate::cluster::rpc::runtime_sources::with_read_version_entry;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_s3_http_operation_context,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("diagnostic usage cache runtime");
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut request = S3HttpRequestGuard::new("GET");
+        let get = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            current_s3_http_operation_context().expect("dispatched GET operation")
+        });
+        request.response(200);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let ambient = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture();
+                for (operation, source) in [
+                    (None, None),
+                    (Some(get), None),
+                    (None, Some(ReadVersionEntrySource::ServerInfoPools)),
+                    (Some(get), Some(ReadVersionEntrySource::StoreObjectReader)),
+                ] {
+                    let store = UsageCacheReadStore {
+                        record_context: true,
+                        ..Default::default()
+                    };
+                    with_s3_http_operation_context(operation, async {
+                        let load = load_data_usage_cache(&store, "usage-cache");
+                        let cache = match source {
+                            Some(source) => with_read_version_entry(source, load).await,
+                            None => load.await,
+                        }
+                        .expect("missing diagnostic cache is harmless");
+                        assert!(cache.cache.is_empty());
+                        assert_eq!(store.read_keys().await.len(), 2, "both prefixed and legacy cache reads are observed");
+                    })
+                    .await;
+                    assert_eq!(
+                        crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture(),
+                        ambient,
+                        "cache reads must restore the caller's complete diagnostic scope"
+                    );
+                }
+                assert_eq!(current_s3_http_operation_context(), None);
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for (source, operation, state) in [
+            ("data_usage_cache_read", "unattributed", "absent"),
+            ("data_usage_cache_read", "s3:GetObject", "preserved"),
+            ("server_info_pools", "unattributed", "absent"),
+            ("store_object_reader", "s3:GetObject", "preserved"),
+        ] {
+            assert!(
+                rows.iter().any(|(key, _, _, value)| {
+                    let labels = key
+                        .key()
+                        .labels()
+                        .map(|label| (label.key(), label.value()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                        && labels.get("entry_source") == Some(&source)
+                        && labels.get("boundary") == Some(&"remote_rpc")
+                        && labels.get("parent_api_operation") == Some(&operation)
+                        && labels.get("child_api_operation") == Some(&operation)
+                        && labels.get("api_context") == Some(&state)
+                        && matches!(value, DebugValue::Counter(2))
+                }),
+                "cache reads must retain API and the earliest observed entry: {source}/{operation}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -2451,7 +2451,13 @@ fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<Join
         return None;
     }
     Some(tokio::spawn(async move {
-        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+        let maintenance = run_recovery_disposition_maintenance_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let maintenance = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::RecoveryDispositionMaintenance,
+            maintenance,
+        );
+        maintenance.await;
     }))
 }
 
@@ -3334,7 +3340,13 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_tier_delete_journal_recovery_loop(api, cancel_token).await;
+        let recovery = run_tier_delete_journal_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 
@@ -3353,7 +3365,13 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_transition_transaction_recovery_loop(api, cancel_token).await;
+        let recovery = run_transition_transaction_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 

@@ -459,6 +459,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    #[track_caller]
     async fn read_version(
         &self,
         _org_volume: &str,
@@ -467,10 +468,20 @@ impl DiskAPI for Disk {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
-        match self {
-            Disk::Local(local_disk) => local_disk.read_version(_org_volume, volume, path, version_id, opts).await,
-            Disk::Remote(remote_disk) => remote_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+        let operation = async {
+            match self {
+                Disk::Local(local_disk) => local_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+                Disk::Remote(remote_disk) => remote_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+            }
+        };
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        if crate::cluster::rpc::runtime_sources::current_read_version_request_caller().is_none() {
+            let caller = crate::cluster::rpc::runtime_sources::read_version_request_caller_from_location(
+                std::panic::Location::caller().file(),
+            );
+            return crate::cluster::rpc::runtime_sources::with_read_version_request_caller(caller, operation).await;
         }
+        operation.await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -1162,6 +1173,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     }
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
+    #[track_caller]
     async fn read_version(
         &self,
         org_volume: &str,
@@ -1285,13 +1297,15 @@ where
 {
     validate_batch_read_version_item_count(req.items.len())?;
     let parallelism = batch_read_version_server_parallelism();
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let item_count = req.items.len();
 
     let mut responses = stream::iter(req.items.into_iter().enumerate())
         .map(|(index, item)| async move {
-            match disk
-                .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
-                .await
-            {
+            let read = disk.read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts);
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            let read = crate::cluster::rpc::runtime_sources::with_batch_read_version_item_context(index, item_count, read);
+            match read.await {
                 Ok(file_info) => BatchReadVersionResp {
                     index,
                     path: item.path,

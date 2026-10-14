@@ -14,6 +14,15 @@
 
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub mod diagnostic {
+    pub use crate::cluster::rpc::runtime_sources::{
+        current_read_version_entry_source, observe_read_version_context_boundary, with_read_version_entry,
+        with_read_version_spawn_context,
+    };
+    pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
+}
+
 pub mod admin {
     pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
 }

@@ -746,8 +746,15 @@ impl SetDisks {
             false,
             true,
             self.default_parity_count,
+        );
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let metadata_read = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::Heal,
+            metadata_read,
         )
         .await?;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let metadata_read = metadata_read.await?;
         let (parts_metadata, errs, _) = metadata_read.into_legacy();
         let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
         let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
