@@ -30,9 +30,7 @@ use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
-use rustfs_targets::{
-    extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
@@ -186,7 +184,7 @@ impl OperationHelper {
                 .user_agent(get_request_user_agent(&req.headers))
                 .req_host(get_request_host(&req.headers))
                 .req_path(req.uri.path().to_string())
-                .req_query(extract_req_params(req))
+                .req_query(extract_params_header(&req.headers))
                 .request_id(&request_id);
             if let Some(cred) = req_info
                 .and_then(|info| info.cred.as_ref())
