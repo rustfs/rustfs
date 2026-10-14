@@ -57,6 +57,9 @@ jobs:
           ref: ${{ inputs.connect_sha }}
           token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
+      - name: Set up Docker Compose
+        uses: ./.github/actions/setup-docker-compose
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -204,7 +207,7 @@ jobs:
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
           make -C connect-harness e2e-connected-dispatch-check
           (cd connect-harness && ./tests/connectivity/health-service-evidence.test.sh)
-          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+          TMPDIR="$GITHUB_WORKSPACE" RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
             CONNECT_E2E_HEALTH_SERVICE_EVIDENCE="$GITHUB_WORKSPACE/health-service-evidence.json" \
             make -C connect-harness e2e-connected E2E_SCENARIO=health-service
