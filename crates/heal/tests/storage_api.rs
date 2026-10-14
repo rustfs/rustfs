@@ -21,7 +21,8 @@ pub(crate) mod endpoint_index {
 #[allow(unused_imports)]
 pub(crate) mod integration {
     pub(crate) use rustfs_ecstore::api::disk::{
-        DiskAPI, DiskError, DiskOption, DiskStore, Endpoint, RUSTFS_META_BUCKET, ReadOptions, new_disk,
+        DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, DiskAPI, DiskError, DiskOption, DiskStore, Endpoint,
+        RUSTFS_META_BUCKET, ReadOptions, new_disk,
     };
     pub(crate) use rustfs_ecstore::api::error::StorageError as EcstoreStorageError;
     pub(crate) use rustfs_ecstore::api::object::{
