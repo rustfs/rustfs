@@ -102,6 +102,10 @@ impl HealStorageAPI for PausedTraversal {
         self.inner.admit_bucket_incarnation(bucket).await
     }
 
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.inner.heal_bucket_at_incarnation(bucket, expected, opts).await
+    }
+
     async fn heal_object_at_incarnation(
         &self,
         bucket: &str,

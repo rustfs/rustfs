@@ -404,7 +404,17 @@ impl ECStore {
         expected: uuid::Uuid,
         opts: &HealOpts,
     ) -> Result<HealResultItem> {
-        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, move |store, bucket, mut opts| async move {
+            if !opts.recreate && !opts.remove {
+                let mut missing = false;
+                for (pool, set) in store.heal_erasure_set_scopes(&opts).await? {
+                    missing |= store.pools[pool].get_disks(set).bucket_needs_reconstruction(&bucket).await?;
+                }
+                if missing {
+                    crate::bucket::metadata_sys::validate_bucket_reconstruction_in(&store.ctx, &bucket, expected).await?;
+                    opts.recreate = true;
+                }
+            }
             store.heal_bucket(&bucket, &opts).await
         })
         .await
@@ -1449,6 +1459,178 @@ mod tests {
         )
         .await
         .expect("minimal pool should build")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_recreates_missing_directories_at_current_incarnation() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "admin-bucket-recovery";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create a committed bucket generation");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("persisted generation");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove only an empty fixture bucket directory");
+        }
+        store
+            .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+            .await
+            .expect("default administrator recovery should use committed generation authority");
+        for disk in 0..4 {
+            assert!(root.path().join(format!("pool0-disk{disk}/{bucket}")).is_dir());
+        }
+        assert_eq!(
+            store
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("recovered generation"),
+            incarnation
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_missing_corrupt_uncommitted_and_retired_authority() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        for state in ["missing", "corrupt", "uncommitted", "mismatched", "retired"] {
+            let bucket = format!("recovery-authority-{state}");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create fixture generation");
+            let incarnation = store
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("fixture identity");
+            let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("committed metadata");
+            assert!(persisted && metadata.bucket_creation_committed);
+            let path = metadata.save_file_path();
+            match state {
+                "missing" => delete_config(store.clone(), &path).await.expect("remove metadata authority"),
+                "corrupt" => save_config(store.clone(), &path, b"corrupt bucket metadata".to_vec())
+                    .await
+                    .expect("corrupt authority"),
+                "uncommitted" | "mismatched" => {
+                    if state == "uncommitted" {
+                        metadata.bucket_creation_committed = false;
+                    } else {
+                        metadata.bucket_incarnation_id = Uuid::new_v4();
+                    }
+                    metadata
+                        .save_with_store_committed(store.clone())
+                        .await
+                        .expect("inject inconsistent metadata authority");
+                }
+                "retired" => {
+                    // A returning disk may retain a directory after retirement was committed.
+                    crate::bucket::retirement::commit_retirement(store.clone(), &bucket, incarnation, &ObjectOptions::default())
+                        .await
+                        .expect("persist retirement evidence");
+                }
+                _ => unreachable!("fixed fixture states"),
+            }
+            for disk in 1..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("lose fixture directories");
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(&bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err(),
+                "must reject {state}"
+            );
+            for disk in 1..4 {
+                assert!(
+                    !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                    "{state} cannot authorize reconstruction"
+                );
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_offline_disks_and_fully_missing_sets() {
+        for offline in [false, true] {
+            let (root, store, shutdown) = multi_pool_heal_store().await;
+            let bucket = "recovery-unproven-set";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("fixture bucket");
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+            let first_missing = usize::from(offline);
+            for disk in first_missing..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("remove fixture directories");
+            }
+            if offline {
+                let disk = store.pools[0].disk_set[0].disks.read().await[0]
+                    .clone()
+                    .expect("online fixture disk");
+                disk.close().await.expect("stop disk monitoring");
+                disk.force_offline_for_test();
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err()
+            );
+            for disk in first_missing..4 {
+                assert!(!root.path().join(format!("pool0-disk{disk}/{bucket}")).exists());
+            }
+            shutdown.cancel();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_dry_run_preserves_missing_directories() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "recovery-dry-run";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove fixture directories");
+        }
+        store
+            .heal_bucket_at_incarnation(
+                bucket,
+                incarnation,
+                &HealOpts {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dry run can inspect eligible recovery");
+        for disk in 1..4 {
+            assert!(
+                !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                "dry run must not reconstruct directories"
+            );
+        }
+        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -17,10 +17,11 @@
 use http::HeaderMap;
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
+    outcome::{HealExecutionOutcome, HealTraversalCoverage},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
-    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
+    task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
-use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
@@ -193,6 +194,96 @@ async fn empty_replacement_with_committed_delete(
 
 mod serial_tests {
     use super::*;
+
+    async fn bucket_directory_loss_task(cluster: bool, missing: usize, dry_run: bool, source: HealRequestSource) {
+        let temp = tempfile::tempdir().expect("isolated bucket recovery fixture");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .build()
+            .await;
+        let bucket = "task-directory-recovery";
+        env.make_bucket(bucket, false).await;
+        let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let expected = storage
+            .admit_bucket_incarnation(bucket)
+            .await
+            .expect("committed bucket generation");
+        for disk in env.disk_paths.iter().rev().take(missing) {
+            fs::remove_dir(disk.join(bucket))
+                .await
+                .expect("remove only an empty bucket directory");
+        }
+        assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).exists()).count(), 4 - missing);
+        let mut request = HealRequest::new(
+            if cluster {
+                HealType::Cluster
+            } else {
+                HealType::Bucket {
+                    bucket: bucket.to_owned(),
+                }
+            },
+            HealOptions {
+                recursive: true,
+                dry_run,
+                recreate_missing: false,
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = source;
+        if !cluster && source == HealRequestSource::Admin {
+            request.bucket_incarnation_id = Some(expected);
+        }
+        let task = HealTask::from_request(request, storage.clone());
+        let result = task.execute().await;
+        if missing == 4 || source != HealRequestSource::Admin {
+            assert!(
+                result.is_err(),
+                "unproven or unbound recovery must fail: missing={missing}, source={source:?}"
+            );
+        } else {
+            result.unwrap_or_else(|error| {
+                panic!(
+                    "administrator task must reach generation-bound reconstruction: cluster={cluster}, missing={missing}: {error}"
+                )
+            });
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+            assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        }
+        let remaining = if dry_run || missing == 4 || source != HealRequestSource::Admin {
+            4 - missing
+        } else {
+            4
+        };
+        assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).is_dir()).count(), remaining);
+        assert_eq!(storage.admit_bucket_incarnation(bucket).await.expect("retained metadata"), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_from_task_entry() {
+        for cluster in [false, true] {
+            // Two surviving directories satisfy ordinary reads; one does not.
+            for missing in [2, 3] {
+                bucket_directory_loss_task(cluster, missing, false, HealRequestSource::Admin).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_dry_run_from_task_entry() {
+        bucket_directory_loss_task(false, 3, true, HealRequestSource::Admin).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_rejects_unproven_scope() {
+        bucket_directory_loss_task(false, 4, false, HealRequestSource::Admin).await;
+        bucket_directory_loss_task(false, 3, false, HealRequestSource::Internal).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]

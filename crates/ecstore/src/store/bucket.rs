@@ -1152,7 +1152,7 @@ impl ECStore {
         let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
             let result = match quorum {
                 BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
-                BucketInfoQuorum::Write => set.get_bucket_info(bucket, opts).await,
+                BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => set.get_bucket_info(bucket, opts).await,
             };
             (pool_index, set_index, result)
         }))
@@ -1273,7 +1273,7 @@ impl ECStore {
                 ..Default::default()
             },
             SCANNER_BUCKET_LIST_SET_CONCURRENCY,
-            BucketInfoQuorum::Write,
+            BucketInfoQuorum::HealCandidates,
             selector,
         )
         .await
@@ -2283,8 +2283,11 @@ mod tests {
             .list_buckets_for_admin_heal(None)
             .await
             .expect("online disk enumeration");
-        assert!(!global.topology_complete, "a filtered sub-quorum bucket must invalidate coverage");
-        assert_eq!(global.buckets.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["healthy-bucket"]);
+        assert!(global.topology_complete, "every disk answered the candidate inventory");
+        assert_eq!(
+            global.buckets.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            ["healthy-bucket", "partial-bucket"]
+        );
         let healthy = store
             .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
             .await
@@ -2296,11 +2299,8 @@ mod tests {
             .list_buckets_for_admin_heal(Some(DiskSetSelector::new(1, 0)))
             .await
             .expect("partial scope");
-        assert!(!partial.topology_complete);
-        assert!(
-            partial.buckets.is_empty(),
-            "missing buckets cannot be mistaken for a complete empty namespace"
-        );
+        assert!(partial.topology_complete);
+        assert_eq!(partial.buckets[0].name, "partial-bucket");
         let invalid = store
             .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 1)))
             .await
