@@ -566,6 +566,8 @@ pub enum AdminAction {
     CreatePluginDelegationAction,
     #[strum(serialize = "admin:IssuePluginAttempt")]
     IssuePluginAttemptAction,
+    #[strum(serialize = "admin:SubmitPluginJob")]
+    SubmitPluginJobAction,
     #[strum(serialize = "admin:GetPluginDelegation")]
     GetPluginDelegationAction,
     #[strum(serialize = "admin:RevokePluginDelegation")]
@@ -712,6 +714,7 @@ impl AdminAction {
                 | AdminAction::SetTableLifecycleAction
                 | AdminAction::GetTableCredentialsAction
                 | AdminAction::IssuePluginAttemptAction
+                | AdminAction::SubmitPluginJobAction
                 | AdminAction::GetPluginDelegationAction
                 | AdminAction::CreatePluginDelegationAction
                 | AdminAction::RevokePluginDelegationAction
@@ -921,6 +924,7 @@ mod tests {
             ("admin:GetPluginDelegation", AdminAction::GetPluginDelegationAction),
             ("admin:CreatePluginDelegation", AdminAction::CreatePluginDelegationAction),
             ("admin:RevokePluginDelegation", AdminAction::RevokePluginDelegationAction),
+            ("admin:SubmitPluginJob", AdminAction::SubmitPluginJobAction),
         ] {
             assert_eq!(AdminAction::try_from(name).unwrap(), expected);
             assert!(expected.is_valid());
@@ -931,6 +935,7 @@ mod tests {
             AdminAction::IssuePluginAttemptAction
         );
         assert!(AdminAction::IssuePluginAttemptAction.is_valid());
+        assert!(AdminAction::SubmitPluginJobAction.is_valid());
         assert!(AdminAction::try_from("admin:IssuePluginCredentials").is_err());
     }
 

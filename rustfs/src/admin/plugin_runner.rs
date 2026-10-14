@@ -1,0 +1,249 @@
+// Copyright 2026 RustFS Team
+// SPDX-License-Identifier: Apache-2.0
+
+//! Authenticated RustFS-to-Runner ingress transport.
+
+use crate::admin::runtime_sources;
+use reqwest::{Client, StatusCode, Url};
+use rustfs_iam::delegation::Delegation;
+use s3s::{S3Result, s3_error};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
+const MAX_RECEIPT_BYTES: usize = 4096;
+
+#[derive(Serialize)]
+pub(crate) struct SubmitRequest<'a> {
+    pub version: u32,
+    pub instance_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub object: ObjectReference<'a>,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+    pub actual_signer_access_key: &'a str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ObjectReference<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Receipt {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub pool: String,
+    pub deadline_unix_micros: i64,
+}
+
+pub(crate) fn configured_deployment() -> S3Result<String> {
+    std::env::var("RUSTFS_PLUGIN_RUNNER_DEPLOYMENT")
+        .ok()
+        .filter(|value| literal(value))
+        .ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner is not configured"))
+}
+
+pub(crate) async fn submit(request: &SubmitRequest<'_>) -> S3Result<Receipt> {
+    let url = configured_url()?;
+    let tls = runtime_sources::current_outbound_tls_state().await;
+    let identity = tls
+        .mtls_identity
+        .ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner client identity unavailable"))?;
+    let mut identity_pem = Vec::with_capacity(identity.cert_pem.len() + identity.key_pem.len() + 1);
+    identity_pem.extend_from_slice(&identity.cert_pem);
+    identity_pem.push(b'\n');
+    identity_pem.extend_from_slice(&identity.key_pem);
+    let identity = reqwest::Identity::from_pem(&identity_pem)
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner client identity invalid"))?;
+
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(15))
+        .identity(identity);
+    if let Some(root_pem) = tls.root_ca_pem.filter(|pem| !pem.is_empty()) {
+        let roots = reqwest::Certificate::from_pem_bundle(&root_pem)
+            .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner trust roots invalid"))?;
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+    }
+    let client = builder
+        .build()
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner transport unavailable"))?;
+    let response = client
+        .post(url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response).await?;
+            let receipt: Receipt =
+                serde_json::from_slice(&body).map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt invalid"))?;
+            if receipt.version != 1 || receipt.run_id.is_nil() || !literal(&receipt.pool) || receipt.deadline_unix_micros <= 0 {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner receipt invalid"));
+            }
+            Ok(receipt)
+        }
+        StatusCode::CONFLICT => Err(s3_error!(InvalidRequest, "idempotency key conflicts with existing job")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+    }
+}
+
+fn configured_url() -> S3Result<Url> {
+    let raw = std::env::var("RUSTFS_PLUGIN_RUNNER_URL")
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner is not configured"))?;
+    parse_endpoint(&raw).ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner URL invalid"))
+}
+
+fn parse_endpoint(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != ENDPOINT_PATH
+    {
+        return None;
+    }
+    Some(url)
+}
+
+async fn bounded_body(mut response: reqwest::Response) -> S3Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt unavailable"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RECEIPT_BYTES {
+            return Err(s3_error!(ServiceUnavailable, "plugin runner receipt too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) fn validate_delegation_scope(
+    record: &Delegation,
+    signer: &str,
+    delegation_id: &str,
+    deployment: &str,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    now: u64,
+) -> bool {
+    record.owner_access_key == signer
+        && record.id == delegation_id
+        && record.revision == delegation_id
+        && record.restrictions.deployment == deployment
+        && record.restrictions.validate(now).is_ok()
+        && bucket == record.restrictions.bucket
+        && literal(bucket)
+        && literal(key)
+        && key.starts_with(&record.restrictions.input_prefix)
+        && literal(version_id)
+        && version_id != "null"
+}
+
+pub(crate) fn literal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && !value.contains("${")
+        && !value.chars().any(|c| c.is_control() || matches!(c, '*' | '?'))
+}
+
+pub(crate) fn valid_idempotency_key(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1024 && !value.contains('\0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_endpoint_must_be_https_and_exact_path() {
+        for raw in [
+            "http://runner.example/v1/ingress/manual/jobs",
+            "https://runner.example/other",
+            "https://user@runner.example/v1/ingress/manual/jobs",
+            "https://runner.example/v1/ingress/manual/jobs?token=x",
+            "https://runner.example/v1/ingress/manual/jobs#fragment",
+        ] {
+            assert!(parse_endpoint(raw).is_none(), "accepted invalid endpoint: {raw}");
+        }
+        let valid = parse_endpoint("https://runner.example/v1/ingress/manual/jobs").unwrap();
+        assert_eq!(valid.path(), ENDPOINT_PATH);
+    }
+
+    #[test]
+    fn receipt_rejects_extra_fields_and_invalid_semantics() {
+        assert!(serde_json::from_str::<Receipt>(
+            r#"{"version":1,"run_id":"00000000-0000-0000-0000-000000000001","pool":"p","deadline_unix_micros":1,"tenant":"fake"}"#
+        )
+        .is_err());
+        let receipt: Receipt = serde_json::from_str(
+            r#"{"version":1,"run_id":"00000000-0000-0000-0000-000000000001","pool":"p","deadline_unix_micros":1}"#,
+        )
+        .unwrap();
+        assert_eq!(receipt.version, 1);
+    }
+
+    #[test]
+    fn literal_values_reject_policy_syntax_and_controls() {
+        for value in ["", "x\0y", "x\ny", "a*", "a?", "${tenant}"] {
+            assert!(!literal(value));
+        }
+        assert!(literal("images/a.png"));
+    }
+
+    #[test]
+    fn idempotency_key_bounds_match_ingress_contract() {
+        assert!(!valid_idempotency_key(""));
+        assert!(!valid_idempotency_key("a\0b"));
+        assert!(!valid_idempotency_key(&"x".repeat(1025)));
+        assert!(valid_idempotency_key("retry-key"));
+        assert!(valid_idempotency_key(&"x".repeat(1024)));
+    }
+
+    #[test]
+    fn delegation_scope_rejects_wrong_identity_revision_deployment_and_expiry() {
+        let record = Delegation {
+            version: 1,
+            id: "a".repeat(32),
+            revision: "a".repeat(32),
+            owner_access_key: "owner".into(),
+            created_at_unix_seconds: 1,
+            restrictions: rustfs_iam::delegation::Restrictions {
+                deployment: "prod".into(),
+                bucket: "images".into(),
+                input_prefix: "source/".into(),
+                output_prefix: "derived/".into(),
+                expires_at_unix_seconds: 100,
+            },
+        };
+        let valid = |signer, id, deployment, now| {
+            validate_delegation_scope(&record, signer, id, deployment, "images", "source/a.png", "v1", now)
+        };
+        assert!(valid("owner", &record.id, "prod", 2));
+        assert!(!valid("other", &record.id, "prod", 2));
+        assert!(!valid("owner", "b", "prod", 2));
+        assert!(!valid("owner", &record.id, "staging", 2));
+        assert!(!valid("owner", &record.id, "prod", 100));
+    }
+}

@@ -36,6 +36,8 @@ sequenceDiagram
 
 Revocation prevents future issuance. It does not promise immediate invalidation of credentials already delivered; those remain subject to their expiration and current parent IAM. Registration, IAM changes and issuance are not one atomic transaction. Issuance rechecks after persistence and deletes the generated STS account if authority changed. Failed persistence or invalidation acknowledgment is reported as unknown issuance, never as safe retry permission.
 
+Manual job submission reads the active delegation before calling the Runner. A submission that passed this check is in flight and may be admitted if revocation races with the outbound request; revocation prevents submissions whose authority check occurs afterward, but does not cancel an admitted job. Callers must treat a successful submit receipt as accepted work even if the delegation is revoked later. After an ambiguous timeout or service error, retry the same idempotency key while the delegation remains active; after revocation or expiry, this endpoint has no status lookup, and a rejection does not prove that the first request was not committed.
+
 ## Broker profile
 
 `rustfs/src/admin/handlers/plugin_attempt.rs` implements `POST /rustfs/admin/v3/plugin-delegations/{id}/issue-attempt`. The signer must be an ordinary IAM user with `admin:IssuePluginAttempt`, independently listed in `RUSTFS_PLUGIN_BROKERS`:

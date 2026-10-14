@@ -4,6 +4,7 @@
 //! Restriction registration only. These endpoints do not vend credentials.
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
+    plugin_runner::{self, ObjectReference, SubmitRequest},
     router::{AdminOperation, Operation, S3Router},
     runtime_sources,
 };
@@ -16,6 +17,7 @@ use matchit::Params;
 use rustfs_iam::delegation::{DelegationError, Restrictions};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -25,6 +27,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
         Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/revoke"),
         AdminOperation(&Revoke),
+    )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/submit"),
+        AdminOperation(&Submit),
     )?;
     Ok(())
 }
@@ -136,12 +143,88 @@ impl Operation for Revoke {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitInput {
+    version: u32,
+    instance_id: String,
+    idempotency_key: String,
+    object: SubmitObject,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitObject {
+    bucket: String,
+    key: String,
+    version_id: String,
+}
+
+struct Submit;
+#[async_trait::async_trait]
+impl Operation for Submit {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::SubmitPluginJobAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "submit body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "submit body unavailable"))?;
+        let input: SubmitInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid submit request"))?;
+        if input.version != 1
+            || !plugin_runner::literal(&input.instance_id)
+            || !plugin_runner::valid_idempotency_key(&input.idempotency_key)
+        {
+            return Err(s3_error!(InvalidRequest, "invalid submit request"));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .as_secs();
+        let record = iam
+            .read_active_plugin_delegation(&signer, id, now)
+            .await
+            .map_err(storage_error)?;
+        let deployment = plugin_runner::configured_deployment()?;
+        if !plugin_runner::validate_delegation_scope(
+            &record,
+            &signer,
+            id,
+            &deployment,
+            &input.object.bucket,
+            &input.object.key,
+            &input.object.version_id,
+            now,
+        ) {
+            return Err(s3_error!(AccessDenied, "submit restriction rejected"));
+        }
+        let receipt = plugin_runner::submit(&SubmitRequest {
+            version: input.version,
+            instance_id: &input.instance_id,
+            idempotency_key: &input.idempotency_key,
+            object: ObjectReference {
+                bucket: &input.object.bucket,
+                key: &input.object.key,
+                version_id: &input.object.version_id,
+            },
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+            actual_signer_access_key: &signer,
+        })
+        .await?;
+        response(&receipt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
-        for operation in 0..3 {
+        for operation in 0..4 {
             let req = S3Request {
                 input: Body::from("{}".to_owned()),
                 method: Method::POST,
@@ -157,11 +240,49 @@ mod tests {
                 Get.call(req, Params::new()).await
             } else if operation == 1 {
                 Revoke.call(req, Params::new()).await
+            } else if operation == 2 {
+                Submit.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
             };
             let error = result.expect_err("unsigned mutations must not reach persistence");
             assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
         }
+    }
+
+    #[test]
+    fn submit_dto_rejects_client_authority_fields_and_null_versions() {
+        assert!(serde_json::from_str::<SubmitInput>(
+            r#"{"version":1,"instance_id":"img","idempotency_key":"k","object":{"bucket":"b","key":"k","version_id":"v"},"actual_signer_access_key":"forged"}"#
+        )
+        .is_err());
+        let input: SubmitInput = serde_json::from_str(
+            r#"{"version":1,"instance_id":"img","idempotency_key":"k","object":{"bucket":"b","key":"a/x","version_id":"null"}}"#,
+        )
+        .unwrap();
+        let record = rustfs_iam::delegation::Delegation {
+            version: 1,
+            id: "a".repeat(32),
+            revision: "a".repeat(32),
+            owner_access_key: "owner".into(),
+            created_at_unix_seconds: 1,
+            restrictions: Restrictions {
+                deployment: "prod".into(),
+                bucket: "b".into(),
+                input_prefix: "a/".into(),
+                output_prefix: "out/".into(),
+                expires_at_unix_seconds: 100,
+            },
+        };
+        assert!(!plugin_runner::validate_delegation_scope(
+            &record,
+            "owner",
+            &record.id,
+            "prod",
+            &input.object.bucket,
+            &input.object.key,
+            &input.object.version_id,
+            2,
+        ));
     }
 }
