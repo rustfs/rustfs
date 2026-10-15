@@ -3740,7 +3740,6 @@ mod tests {
         let mut recoverable_temp_dirs = Vec::new();
         let mut recoverable_endpoints = Vec::new();
         let mut recoverable_disks = Vec::new();
-        let mut unformatted_disk = None;
         for disk_index in 0..3 {
             let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("temporary path should be UTF-8"))
@@ -3757,15 +3756,11 @@ mod tests {
             )
             .await
             .expect("temporary disk should open");
-            if disk_index < 2 {
-                let mut disk_format = recoverable_format.clone();
-                disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
-                save_format_file(&Some(disk.clone()), &Some(disk_format))
-                    .await
-                    .expect("recoverable format should be written");
-            } else {
-                unformatted_disk = Some(disk.clone());
-            }
+            let mut disk_format = recoverable_format.clone();
+            disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("recoverable format should be written before pool metadata");
             recoverable_temp_dirs.push(temp_dir);
             recoverable_endpoints.push(endpoint);
             recoverable_disks.push(Some(disk));
@@ -3814,6 +3809,36 @@ mod tests {
             .expect("pool metadata should be persisted before format heal");
         *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
 
+        let replacement_endpoint = store.pools[1].endpoints.endpoints.as_ref()[2].clone();
+        tokio::fs::remove_file(
+            recoverable_temp_dirs[2]
+                .path()
+                .join(crate::disk::RUSTFS_META_BUCKET)
+                .join(FORMAT_CONFIG_FILE),
+        )
+        .await
+        .expect("the target format must be removed only after durable pool metadata exists");
+        let replacement_disk = new_disk(
+            &replacement_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("the unformatted replacement disk must reopen");
+        assert!(matches!(
+            load_format_erasure(&replacement_disk, true).await,
+            Err(crate::disk::error::DiskError::UnformattedDisk)
+        ));
+        let replacement_set = &store.pools[1].disk_set[0];
+        let replacement_slot = replacement_set
+            .set_endpoints
+            .iter()
+            .position(|endpoint| endpoint == &replacement_endpoint)
+            .expect("the replacement must remain in its original set");
+        replacement_set.disks.write().await[replacement_slot] = Some(replacement_disk.clone());
+
         let (result, err) = store
             .handle_heal_format(false)
             .await
@@ -3823,7 +3848,7 @@ mod tests {
             "foreign format majority must not be downgraded to a successful heal: {err:?}"
         );
         assert_eq!(result.disk_count, 3, "the recoverable pool should still be inspected");
-        let healed = load_format_erasure(&unformatted_disk.expect("the unformatted disk handle should be retained"), true)
+        let healed = load_format_erasure(&replacement_disk, true)
             .await
             .expect("the later pool should be healed despite the first pool error");
         assert_eq!(healed.erasure.this, recoverable_format.erasure.sets[0][2]);

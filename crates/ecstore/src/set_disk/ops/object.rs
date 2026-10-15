@@ -5099,10 +5099,8 @@ impl SetDisks {
                 || commit_object_lock_guard.is_some()
                 || commit_decommission_object_lock_guard.is_some()
                 || commit_publication_guard.is_some();
-            // System metadata has no user-bucket repair authority. Its writer
-            // must observe the complete rename outcome before acknowledging.
-            let commit_allows_early_ack = !is_meta_bucketname(&commit_bucket)
-                && write_context.allows_early_ack(opts.write_completion)
+            let commit_write_completion = opts.write_completion;
+            let commit_allows_early_ack = write_context.allows_early_ack(commit_write_completion)
                 && !(opts.data_movement && opts.has_decommission_capacity_reservation())
                 && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
@@ -5579,8 +5577,8 @@ impl SetDisks {
                                     );
                                 })
                             },
-                            |request| async move {
-                                let _ = heal_set.submit_rename_tail_heal(request).await;
+                            move |request| async move {
+                                let _ = heal_set.submit_rename_tail_heal(request, commit_write_completion).await;
                             },
                         ));
                     }
@@ -5700,7 +5698,7 @@ impl SetDisks {
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
                     request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                    let result = commit_set.submit_rename_tail_heal(request).await;
+                    let result = commit_set.submit_rename_tail_heal(request, commit_write_completion).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT,
                         heal_submit_started,
@@ -21746,7 +21744,7 @@ mod put_object_tmp_cleanup_tests {
                 body.clone(),
                 &ObjectOptions {
                     max_parity: true,
-                    write_completion: WriteCompletion::TailDrained,
+                    write_completion: WriteCompletion::TailDrainedWithOwnerRepair,
                     ..Default::default()
                 },
             ),
@@ -21788,7 +21786,7 @@ mod put_object_tmp_cleanup_tests {
                 );
                 request.expected_bucket_incarnation_id = expected;
                 let error = set
-                    .submit_rename_tail_heal(request)
+                    .submit_rename_tail_heal(request, WriteCompletion::TailDrainedWithOwnerRepair)
                     .await
                     .expect_err("system repair must remain with its writer");
                 assert!(
@@ -21809,7 +21807,7 @@ mod put_object_tmp_cleanup_tests {
             Some(0),
         );
         request.expected_bucket_incarnation_id = Some(incarnation);
-        set.submit_rename_tail_heal(request)
+        set.submit_rename_tail_heal(request, WriteCompletion::Quorum)
             .await
             .expect("ordinary incarnation-bound fallback must remain available");
         let admitted = heals
@@ -21822,13 +21820,22 @@ mod put_object_tmp_cleanup_tests {
 
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
-    async fn system_metadata_partial_write_returns_repair_required_after_tail_drains() {
+    async fn system_metadata_partial_write_respects_completion_contract() {
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
-            for completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+            for completion in [
+                WriteCompletion::Quorum,
+                WriteCompletion::TailDrained,
+                WriteCompletion::TailDrainedWithOwnerRepair,
+            ] {
                 let (dirs, disks, set) = hermetic_set_disks(4).await;
                 let object = format!("pool.bin.identity-{completion:?}");
                 let original = b"original deployment identity".to_vec();
-                crate::config::com::save_config(Arc::clone(&set), &object, original.clone())
+                let fixture_options = ObjectOptions {
+                    max_parity: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                crate::config::com::save_config_with_opts(Arc::clone(&set), &object, original.clone(), &fixture_options)
                     .await
                     .expect("healthy system metadata write must succeed without a bucket incarnation");
                 let original_info = set
@@ -21880,22 +21887,38 @@ mod put_object_tmp_cleanup_tests {
                 })
                 .await
                 .expect("the metadata overwrite must reach quorum while the last disk is paused");
-                assert!(!write.is_finished(), "system metadata must wait for the rename tail before acknowledging");
+                if completion != WriteCompletion::Quorum {
+                    assert!(
+                        !write.is_finished(),
+                        "drained completion must wait for the rename tail before acknowledging"
+                    );
+                }
                 barrier.release();
-                let error = tokio::time::timeout(Duration::from_secs(30), write)
+                let result = tokio::time::timeout(Duration::from_secs(30), write)
                     .await
                     .expect("the metadata tail must drain")
-                    .expect("the metadata writer task must join")
-                    .expect_err("unowned system metadata repair must reach the config writer");
-                let Error::Io(error) = error else {
-                    panic!("system metadata repair must retain its typed error");
-                };
-                assert!(
-                    error
-                        .get_ref()
-                        .is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()),
-                    "the config writer must retain the exact repair-required cause: {error}"
-                );
+                    .expect("the metadata writer task must join");
+                if completion == WriteCompletion::TailDrainedWithOwnerRepair {
+                    let error = result.expect_err("the pool metadata owner must receive repair responsibility");
+                    let Error::Io(error) = error else {
+                        panic!("system metadata repair must retain its typed error");
+                    };
+                    assert!(
+                        error
+                            .get_ref()
+                            .is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()),
+                        "the config writer must retain the exact repair-required cause: {error}"
+                    );
+                } else {
+                    result.expect("ordinary system metadata must preserve quorum-success semantics");
+                }
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while tasks.running() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the committed rename tail must eventually finish for every completion mode");
                 assert_eq!(tasks.running(), 0, "repair failure must be returned after all rename tasks drain");
                 assert!(heals.try_recv().is_err(), "system metadata must never enqueue an unfenced MRF heal");
                 let mut stale_copies = 0;
@@ -21932,7 +21955,7 @@ mod put_object_tmp_cleanup_tests {
                 drop(barrier);
                 tokio::time::timeout(
                     Duration::from_secs(30),
-                    crate::config::com::save_config(Arc::clone(&set), &object, updated.clone()),
+                    crate::config::com::save_config_with_opts(Arc::clone(&set), &object, updated.clone(), &fixture_options),
                 )
                 .await
                 .expect("the reconciliation must finish after the fault and barrier are disarmed")

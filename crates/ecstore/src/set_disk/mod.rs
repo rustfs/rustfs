@@ -4902,11 +4902,16 @@ impl SetDisks {
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
         mut request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        completion: crate::object_api::WriteCompletion,
     ) -> Result<()> {
         // System metadata repair remains with the writer's deployment and
         // transaction fence; a user-bucket MRF authority cannot authorize it.
         if crate::bucket::utils::is_meta_bucketname(&request.bucket) {
-            return Err(Error::other(SystemMetadataRepairRequired));
+            return if completion == crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair {
+                Err(Error::other(SystemMetadataRepairRequired))
+            } else {
+                Ok(())
+            };
         }
         if let Some(object) = request.object_prefix.as_deref()
             && self
