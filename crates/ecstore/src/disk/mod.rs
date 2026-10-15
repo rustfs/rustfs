@@ -1721,7 +1721,7 @@ pub enum CurrentDeleteGeneration {
         delete_marker: bool,
         etag: String,
         #[serde(default)]
-        transition: Option<CurrentDeleteTransition>,
+        transition: Option<Box<CurrentDeleteTransition>>,
     },
 }
 
@@ -1749,14 +1749,16 @@ impl CurrentDeleteGeneration {
             || remote_version.is_some()
             || fi.transition_version_state != rustfs_filemeta::TransitionVersionState::Unknown
             || destination_id.is_some())
-        .then(|| CurrentDeleteTransition {
-            status: fi.transition_status.clone(),
-            tier: fi.transition_tier.clone(),
-            remote_object: fi.transitioned_objname.clone(),
-            remote_version,
-            version_state: fi.transition_version_state,
-            destination_id,
-            remote_only,
+        .then(|| {
+            Box::new(CurrentDeleteTransition {
+                status: fi.transition_status.clone(),
+                tier: fi.transition_tier.clone(),
+                remote_object: fi.transitioned_objname.clone(),
+                remote_version,
+                version_state: fi.transition_version_state,
+                destination_id,
+                remote_only,
+            })
         });
         Ok(Self::Present {
             version_id: fi.version_id.filter(|id| !id.is_nil()),
@@ -2369,14 +2371,14 @@ mod tests {
                         CurrentDeleteGeneration::from_file_info(&fi),
                         Ok(CurrentDeleteGeneration::Present {
                             data_dir: None,
-                            transition: Some(CurrentDeleteTransition {
+                            transition: Some(transition),
+                            ..
+                        }) if matches!(transition.as_ref(), CurrentDeleteTransition {
                                 remote_version: None,
                                 version_state: rustfs_filemeta::TransitionVersionState::Unknown,
                                 destination_id: None,
                                 remote_only: true,
                                 ..
-                            }),
-                            ..
                         })
                     ),
                     "legacy unversioned remote metadata remains usable"
@@ -2442,13 +2444,18 @@ mod tests {
         let decoded: GuardedDeleteVersionsPayload =
             rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode remote guarded request");
         assert_eq!(decoded.versions[0].expected_current, generation);
-        assert!(
-            matches!(generation, CurrentDeleteGeneration::Present { transition: Some(CurrentDeleteTransition {
+        let CurrentDeleteGeneration::Present {
+            transition: Some(transition),
+            ..
+        } = generation
+        else {
+            panic!("remote identity must retain its transition tuple");
+        };
+        assert!(matches!(*transition, CurrentDeleteTransition {
             status, tier, remote_object, remote_version: Some(remote_version),
             version_state: rustfs_filemeta::TransitionVersionState::Exact, destination_id: Some(identity), remote_only: true,
-        }), .. } if status == rustfs_filemeta::TRANSITION_COMPLETE && tier == "WARM" && remote_object == "opaque/object+name"
-            && remote_version == "opaque/version+id==" && identity == [0xab; 32])
-        );
+        } if status == rustfs_filemeta::TRANSITION_COMPLETE && tier == "WARM" && remote_object == "opaque/object+name"
+            && remote_version == "opaque/version+id==" && identity == [0xab; 32]));
         insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, format!("a{}", "€".repeat(21)));
         assert_eq!(
             CurrentDeleteGeneration::from_file_info(&fi),
@@ -3132,6 +3139,88 @@ mod delete_recovery_timeout_tests {
 #[cfg(test)]
 mod delete_recovery_wire_limit_tests {
     use super::*;
+
+    #[test]
+    fn boxed_current_delete_transition_preserves_existing_wire_payload() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        enum PriorGeneration {
+            Present {
+                version_id: Option<Uuid>,
+                data_dir: Option<Uuid>,
+                mod_time: OffsetDateTime,
+                delete_marker: bool,
+                etag: String,
+                #[serde(default)]
+                transition: Option<CurrentDeleteTransition>,
+            },
+        }
+
+        let version_id = Some(Uuid::from_u128(1));
+        let data_dir = Some(Uuid::from_u128(2));
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        for transition in [
+            None,
+            Some(CurrentDeleteTransition {
+                status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+                tier: "WARM".into(),
+                remote_object: "opaque/object+name".into(),
+                remote_version: Some("opaque/version+id==".into()),
+                version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                destination_id: Some([0xab; 32]),
+                remote_only: true,
+            }),
+        ] {
+            let prior = PriorGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.clone(),
+            };
+            let generation = CurrentDeleteGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.map(Box::new),
+            };
+            let prior_encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed generation shape");
+            let encoded = rmp_serde::to_vec_named(&generation).expect("encode boxed transition generation");
+            assert_eq!(encoded, prior_encoded);
+            let decoded: CurrentDeleteGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&prior_encoded).expect("decode the previous generation payload");
+            assert_eq!(decoded, generation);
+            let prior_decoded: PriorGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode boxed transition with the previous shape");
+            assert_eq!(prior_decoded, prior);
+            if matches!(generation, CurrentDeleteGeneration::Present { transition: None, .. }) {
+                #[derive(Serialize)]
+                enum GenerationWithoutTransition {
+                    Present {
+                        version_id: Option<Uuid>,
+                        data_dir: Option<Uuid>,
+                        mod_time: OffsetDateTime,
+                        delete_marker: bool,
+                        etag: String,
+                    },
+                }
+                let legacy = GenerationWithoutTransition::Present {
+                    version_id,
+                    data_dir,
+                    mod_time,
+                    delete_marker: false,
+                    etag: "opaque-etag".into(),
+                };
+                let legacy_encoded = rmp_serde::to_vec_named(&legacy).expect("encode a generation without the transition field");
+                let legacy_decoded: CurrentDeleteGeneration =
+                    rustfs_protos::decode_delete_recovery_payload(&legacy_encoded).expect("default an omitted transition field");
+                assert_eq!(legacy_decoded, generation);
+            }
+        }
+    }
 
     #[test]
     fn boxed_apply_version_preserves_existing_wire_payload() {
