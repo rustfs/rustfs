@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
 mod quota_reset_preservation;
 
@@ -7885,7 +7886,7 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
         Some(dirty_snapshot),
     )
-    .with_observational_snapshot_published(true);
+    .with_usage_update_emitted(true);
 
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved.into());
 

@@ -457,12 +457,12 @@ where
             return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         };
         let (empty_usage, publication_expectation) = candidate.prepare(status);
-        let observational_snapshot_published = if should_publish_observational_snapshot(status) {
+        let usage_update_emitted = if should_publish_observational_snapshot(status) {
             publish_observational_snapshot(&updates, empty_usage).await?
         } else {
             publish_usage_snapshot(&updates, status, empty_usage).await?
         };
-        if !observational_snapshot_published {
+        if !usage_update_emitted {
             return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
         }
         if status == ScannerCycleStatus::Complete {
@@ -484,7 +484,7 @@ where
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
-            .with_observational_snapshot_published(observational_snapshot_published)
+            .with_usage_update_emitted(usage_update_emitted)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
@@ -778,7 +778,7 @@ where
         activity_status,
     );
     let mut publication_expectation = None;
-    let observational_snapshot_published = if let Some(candidate) = completed_usage {
+    let usage_update_emitted = if let Some(candidate) = completed_usage {
         let (data_usage_info, expectation) = candidate.prepare(cycle_status);
         publication_expectation = expectation;
         if should_publish_observational_snapshot(cycle_status) {
@@ -816,7 +816,7 @@ where
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
         .with_publication_epoch(publication_epoch)
         .with_activity_digest(activity_digest)
-        .with_observational_snapshot_published(observational_snapshot_published)
+        .with_usage_update_emitted(usage_update_emitted)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)
