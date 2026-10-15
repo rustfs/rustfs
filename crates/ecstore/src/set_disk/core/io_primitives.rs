@@ -6205,12 +6205,10 @@ impl SetDisks {
     /// * The set of referenced data dirs is the UNION of `get_data_dirs()` across
     ///   every online disk's `xl.meta`, so a dir named by *any* replica is kept.
     /// * If a disk holds the object directory but its `xl.meta` is missing or
-    ///   unparsable, the object is treated as degraded and unmarked data dirs are
-    ///   never removed. A data dir carrying a committed delete-transaction marker
-    ///   remains reclaimable after a downgrade/re-upgrade cleanup interruption.
-    /// * Only subdirectories whose names parse as a UUID are ever considered;
-    ///   removal is non-recursive-safe via a recursive delete of the full stray
-    ///   data-dir path only.
+    ///   unparsable, leave its data to quorum-aware recovery and healing.
+    /// * Any outstanding delete transaction defers all candidates to recovery.
+    /// * UUID-shaped S3 prefixes are protected: only regular part files and native
+    ///   sidecars qualify. The final mutation repeats this check and never recurses.
     ///
     /// Returns the number of stray data directories removed across the set. This
     /// is best-effort maintenance: individual delete failures are logged and
@@ -6225,13 +6223,16 @@ impl SetDisks {
 
     async fn reclaim_orphan_data_dirs_inner(&self, bucket: &str, object: &str, dry_run: bool) -> disk::error::Result<usize> {
         let disks = self.get_disks_internal().await;
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            // An unavailable participant can still reference an apparent orphan.
+            return Ok(0);
+        }
 
         // Phase 1 (read-only): build the referenced-data-dir union and record the
         // physical UUID subdirectories present on each disk. Abort on any degraded
         // copy so a healable object is never stripped of a referenced data dir.
         let mut referenced: HashSet<Uuid> = HashSet::new();
-        let mut per_disk_dirs: Vec<(usize, Vec<(Uuid, bool)>)> = Vec::new();
-        let mut healthy_metas = 0usize;
+        let mut per_disk_dirs: Vec<(usize, Vec<Uuid>)> = Vec::new();
 
         for (i, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else { continue };
@@ -6264,22 +6265,6 @@ impl SetDisks {
                     if physical.is_empty() {
                         // Bare directory with no data dirs and no metadata: leave it
                         // to the orphan-dir / dangling-object heal paths.
-                        continue;
-                    }
-                    let mut committed = Vec::with_capacity(physical.len());
-                    for dir in physical {
-                        let data_dir = format!("{object}/{dir}");
-                        let committed_delete = disk.list_dir("", bucket, &data_dir, 0).await.is_ok_and(|entries| {
-                            entries.iter().any(|entry| {
-                                entry
-                                    .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
-                                    .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok())
-                            })
-                        });
-                        committed.push((dir, committed_delete));
-                    }
-                    if committed.iter().all(|(_, committed_delete)| *committed_delete) {
-                        per_disk_dirs.push((i, committed));
                         continue;
                     }
                     warn!(
@@ -6316,21 +6301,39 @@ impl SetDisks {
                 }
             }
 
-            healthy_metas += 1;
             if !physical.is_empty() {
-                per_disk_dirs.push((i, physical.into_iter().map(|dir| (dir, false)).collect()));
+                per_disk_dirs.push((i, physical));
             }
         }
 
-        // Phase 2: delete every physical data dir not referenced by the union.
+        if !per_disk_dirs
+            .iter()
+            .any(|(_, dirs)| dirs.iter().any(|dir| !referenced.contains(dir)))
+        {
+            return Ok(0);
+        }
+        // A neighboring journal can still need an unreferenced payload for
+        // rollback. Objects whose physical dirs are all referenced pay no
+        // recovery-discovery overhead.
+        for disk in disks.iter().flatten() {
+            match disk.has_delete_transaction_evidence(bucket, object).await {
+                Ok(false) => {}
+                _ => return Ok(0),
+            }
+        }
+
+        // Phase 2: classify candidates consistently for dry-run and reclamation.
         let mut removed = 0usize;
         for (i, physical) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
-            for (dir, committed_delete) in physical {
-                if referenced.contains(&dir) || (healthy_metas == 0 && !committed_delete) {
+            for dir in physical {
+                if referenced.contains(&dir) {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
+                if !disk.is_plain_orphan_data_dir(bucket, &stray).await.unwrap_or(false) {
+                    continue;
+                }
                 if dry_run {
                     removed += 1;
                     debug!(
@@ -6346,18 +6349,18 @@ impl SetDisks {
                     continue;
                 }
                 match disk
-                    .delete(
+                    .delete_data_dir(
                         bucket,
                         &stray,
                         DeleteOptions {
-                            recursive: true,
+                            orphan_data_dir: true,
                             immediate: true,
                             ..Default::default()
                         },
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(DataDirDeleteStatus::Deleted) => {
                         removed += 1;
                         info!(
                             target: "rustfs_ecstore::set_disk",
@@ -6365,7 +6368,8 @@ impl SetDisks {
                             "reclaim_orphan_data_dirs: removed orphaned data directory"
                         );
                     }
-                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                    Ok(DataDirDeleteStatus::Deferred)
+                    | Err(DiskError::FileNotFound | DiskError::VolumeNotFound | DiskError::DiskOngoingReq) => {}
                     Err(err) => {
                         warn!(
                             target: "rustfs_ecstore::set_disk",

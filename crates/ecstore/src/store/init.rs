@@ -831,6 +831,8 @@ impl ECStore {
             }
         });
 
+        super::delete_recovery_runtime::start_delete_recovery(self.clone(), rx.clone());
+
         runtime_sources::init_bucket_monitor_for_current_endpoints();
         crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
 

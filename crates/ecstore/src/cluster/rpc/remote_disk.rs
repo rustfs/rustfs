@@ -947,6 +947,16 @@ impl RemoteDisk {
         .await
     }
 
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: path.to_owned() })
+            .await?
+        {
+            DeleteRecoveryRpcReply::OrphanDataDir { plain } => Ok(plain),
+            _ => Err(Error::other("unexpected orphan data directory inspection reply")),
+        }
+    }
+
     async fn recover_delete_transaction(
         &self,
         volume: &str,
@@ -3902,6 +3912,21 @@ impl DiskAPI for RemoteDisk {
         match result {
             Ok(errors) => errors,
             Err(error) => vec![Some(error); expected_len],
+        }
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Exists {
+                    object: object.to_owned(),
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Evidence { present } => Ok(present),
+            _ => Err(Error::other("unexpected delete recovery existence reply")),
         }
     }
 

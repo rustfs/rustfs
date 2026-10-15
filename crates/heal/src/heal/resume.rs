@@ -321,6 +321,10 @@ pub struct ResumeState {
     /// the version listing. `None` means "start from the beginning".
     #[serde(default)]
     pub resume_cursor: Option<String>,
+    /// Ordinary coverage overlapped unresolved hidden delete recovery. The
+    /// scan must restart after recovery settles, even if another worker settled it.
+    #[serde(default)]
+    pub delete_recovery_rescan_pending: bool,
     /// task id
     pub task_id: String,
     /// task type
@@ -434,6 +438,7 @@ impl ResumeState {
         Self {
             schema_version: CURRENT_RESUME_SCHEMA,
             resume_cursor: None,
+            delete_recovery_rescan_pending: false,
             task_id,
             task_type,
             set_disk_id,
@@ -1046,6 +1051,30 @@ impl ResumeManager {
     /// get current state
     pub async fn get_state(&self) -> ResumeState {
         self.state.read().await.clone()
+    }
+
+    pub(crate) async fn set_delete_recovery_rescan_pending(&self, pending: bool) -> Result<()> {
+        let mut state = self.state.write().await;
+        let previous = state.delete_recovery_rescan_pending;
+        if previous == pending {
+            return Ok(());
+        }
+        state.delete_recovery_rescan_pending = pending;
+        drop(state);
+        if let Err(error) = self.save_state_strict().await {
+            self.state.write().await.delete_recovery_rescan_pending = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Keep the coverage obligation until the companion checkpoint rewind is durable.
+    pub(crate) async fn restart_scan_after_delete_recovery(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.delete_recovery_rescan_pending = true;
+        state.reset_for_retry();
+        drop(state);
+        self.save_state_strict().await
     }
 
     /// update progress

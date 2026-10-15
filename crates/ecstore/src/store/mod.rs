@@ -428,6 +428,7 @@ mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
+pub(crate) mod delete_recovery_runtime;
 mod heal;
 pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
