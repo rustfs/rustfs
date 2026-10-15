@@ -28,7 +28,7 @@ use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention,
     ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectAttributes, ObjectLockConfiguration,
     ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, PublicAccessBlockConfiguration, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, Tag, Tagging,
     VersioningConfiguration,
 };
 use http::{Method, StatusCode};
@@ -66,10 +66,11 @@ const MIXED_MULTIPART_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // probe_interval (2s) x success_threshold (3) after it comes back; 30s
 // comfortably covers that window plus CI scheduling jitter.
 const LISTING_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
-// Healed by every drive-readmission probe. The key has no `/`: rc.5 registers
-// the object heal route as `/v3/heal/{bucket}/{prefix}` and that segment does
-// not match a slash, so a nested key falls through to the S3 router.
-const DRIVE_READMISSION_PROBE_KEY: &str = "drive-readmission-probe";
+// Parity 0 for the reduced-redundancy class only. A parity-0 write on the
+// four-drive set needs all four drives (`write_quorum = data_drives`), so a
+// PUT with that class succeeds only once the serving node writes through every
+// one of its own drive handles. Standard-class objects keep the default layout.
+const ALL_DRIVES_STORAGE_CLASS_ENV: (&str, &str) = ("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
 // A peer drops a restarted node's drive to Offline after two failed
 // operations and only re-admits it through probe_interval (2s) x
 // success_threshold (3) once the node answers again. The budget covers that
@@ -597,6 +598,7 @@ async fn exercise_mixed_cluster(
 ) -> TestResult {
     let clients = cluster.create_all_clients()?;
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, phase, DRIVE_READMISSION_TIMEOUT).await?;
     let current_client = &clients[current_node];
     let previous_client = &clients[previous_node];
 
@@ -674,16 +676,51 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
     // health also accepts Returning disks whose write health is still FAULTY.
     // Probe every writer outside the asserted phase prefix; compatibility
     // writes still execute once and retain their original assertions.
+    wait_for_upgrade_writes(clients, bucket, phase, "write readiness", None, budget).await
+}
+
+/// Block until every node commits a parity-0 write, which needs all of the
+/// node's own drive handles.
+///
+/// Write readiness proves that a node accepts a standard write at quorum; it
+/// does not prove that the node has re-admitted the drives it marked Offline
+/// while a peer restarted. A writer that still excludes one drive commits at
+/// exactly three of four drives and cannot ride out any other slow drive. The
+/// cluster must run with [`ALL_DRIVES_STORAGE_CLASS_ENV`]; a write with the
+/// reduced-redundancy class then fails with 503 `ServiceUnavailable` until the
+/// serving node writes through every drive, on the previous release and on
+/// the current build alike.
+async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
+    wait_for_upgrade_writes(
+        clients,
+        bucket,
+        context,
+        "drive re-admission",
+        Some(StorageClass::ReducedRedundancy),
+        budget,
+    )
+    .await
+}
+
+async fn wait_for_upgrade_writes(
+    clients: &[Client],
+    bucket: &str,
+    phase: &str,
+    probe: &str,
+    storage_class: Option<StorageClass>,
+    budget: Duration,
+) -> TestResult {
     let deadline = Instant::now() + budget;
     for (node, client) in clients.iter().enumerate() {
         let client = upgrade_probe_client(client);
-        let key = format!(".upgrade-readiness/{phase}/node-{node}");
+        let key = match storage_class {
+            Some(_) => format!(".upgrade-readiness/{phase}/all-drives/node-{node}"),
+            None => format!(".upgrade-readiness/{phase}/node-{node}"),
+        };
         let mut last_response = "no response".to_string();
         loop {
             if Instant::now() >= deadline {
-                return Err(
-                    format!("{phase}: node {node} write readiness deadline exceeded; last response: {last_response}").into(),
-                );
+                return Err(format!("{phase}: node {node} {probe} deadline exceeded; last response: {last_response}").into());
             }
             let response = tokio::time::timeout_at(
                 deadline,
@@ -691,6 +728,7 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
                     .put_object()
                     .bucket(bucket)
                     .key(&key)
+                    .set_storage_class(storage_class.clone())
                     .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
                     .send(),
             )
@@ -701,122 +739,16 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
                     if error.raw_response().map(|response| response.status().as_u16()) != Some(503)
                         || error.as_service_error().and_then(ProvideErrorMetadata::code) != Some("ServiceUnavailable")
                     {
-                        return Err(format!("{phase}: node {node} write readiness failed: {error:?}").into());
+                        return Err(format!("{phase}: node {node} {probe} failed: {error:?}").into());
                     }
                     last_response = format!("{error:?}");
                 }
                 Err(_) => {
                     return Err(format!(
-                        "{phase}: node {node} write readiness deadline exceeded during PutObject; last response: {last_response}"
+                        "{phase}: node {node} {probe} deadline exceeded during PutObject; last response: {last_response}"
                     )
                     .into());
                 }
-            }
-            tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(500))).await;
-        }
-    }
-    Ok(())
-}
-
-/// Drive states of `key` as the node that serves a dry-run heal sees them.
-///
-/// `storageinfo` and `info` only carry each node's local drives, so a peer that
-/// still holds a restarted node's drive in Offline is invisible there. The
-/// object heal runs on the receiving node against its own drive handles and
-/// reports a short-circuited remote drive as `faulty`, which is the view a
-/// writer on that node commits against.
-async fn heal_dry_run_drive_states(
-    cluster: &RustFSTestClusterEnvironment,
-    node: usize,
-    bucket: &str,
-    key: &str,
-    deadline: Instant,
-) -> Result<Vec<(String, String)>, String> {
-    let url = format!("{}/rustfs/admin/v3/heal/{bucket}/{key}", cluster.nodes[node].url.trim_end_matches('/'));
-    let probe = async {
-        let body = r#"{"recursive":false,"dryRun":true,"remove":false,"recreate":false,"scanMode":1,"updateParity":false,"nolock":false}"#;
-        let response = signed_request(
-            Method::POST,
-            &url,
-            &cluster.access_key,
-            &cluster.secret_key,
-            Some(body.as_bytes().to_vec()),
-            Some("application/json"),
-        )
-        .await
-        .map_err(|err| format!("heal start request failed: {err}"))?;
-        let status = response.status();
-        let text = response.text().await.map_err(|err| format!("heal start body: {err}"))?;
-        if status != StatusCode::OK {
-            return Err(format!("heal start returned {status}: {text}"));
-        }
-        let start: Value = serde_json::from_str(&text).map_err(|err| format!("heal start is not JSON ({err}): {text}"))?;
-        let token = start["clientToken"]
-            .as_str()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| format!("heal start carries no clientToken: {text}"))?
-            .to_string();
-        let status_url = format!("{url}?clientToken={token}");
-        loop {
-            let response = signed_request(Method::POST, &status_url, &cluster.access_key, &cluster.secret_key, None, None)
-                .await
-                .map_err(|err| format!("heal status request failed: {err}"))?;
-            let text = response.text().await.map_err(|err| format!("heal status body: {err}"))?;
-            let status: Value = serde_json::from_str(&text).map_err(|err| format!("heal status is not JSON ({err}): {text}"))?;
-            if let Some(item) = status["items"].as_array().and_then(|items| items.first()) {
-                let drives = item["before"]["drives"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|drive| {
-                        (
-                            drive["endpoint"].as_str().unwrap_or_default().to_string(),
-                            drive["state"].as_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect();
-                return Ok(drives);
-            }
-            if matches!(status["summary"].as_str(), Some("finished") | Some("stopped")) {
-                return Err(format!("heal {} without an object result: {text}", status["summary"]));
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    tokio::time::timeout_at(deadline, probe)
-        .await
-        .unwrap_or_else(|_| Err("heal probe deadline exceeded".to_string()))
-}
-
-/// Block until every node reports every drive of the probe object as `ok`.
-///
-/// Readiness through ListBuckets or a single PUT proves that a node accepts
-/// requests at write quorum; it does not prove that the node has re-admitted
-/// the drives it marked Offline while a peer restarted. A writer that still
-/// excludes one peer commits at exactly three of four drives and cannot ride
-/// out any other slow drive, so this gate runs before the next restart of the
-/// previous-release baseline.
-///
-/// The gate needs every node on the same release: admin heal first probes the
-/// heal-control capability of every peer, and a mixed-version cluster fails
-/// that probe on both the old and the new binary.
-async fn wait_for_drive_readmission(cluster: &RustFSTestClusterEnvironment, context: &str, budget: Duration) -> TestResult {
-    let deadline = Instant::now() + budget;
-    for node in 0..cluster.nodes.len() {
-        let mut last_observation = "no observation".to_string();
-        loop {
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "{context}: node {node} did not re-admit every drive within {}s; last observation: {last_observation}",
-                    budget.as_secs()
-                )
-                .into());
-            }
-            let probe_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
-            match heal_dry_run_drive_states(cluster, node, MIXED_BUCKET, DRIVE_READMISSION_PROBE_KEY, probe_deadline).await {
-                Ok(drives) if drives.len() == cluster.nodes.len() && drives.iter().all(|(_, state)| state == "ok") => break,
-                Ok(drives) => last_observation = format!("{drives:?}"),
-                Err(error) => last_observation = error,
             }
             tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(500))).await;
         }
@@ -831,13 +763,6 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // persist data, then restart each old process once with three peers still
     // readable. This preparation ends before any current binary is started.
     wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
-    clients[0]
-        .put_object()
-        .bucket(MIXED_BUCKET)
-        .key(DRIVE_READMISSION_PROBE_KEY)
-        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
-        .send()
-        .await?;
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
     // two failures in a row and it drops that peer's drive to Offline, where
@@ -854,7 +779,7 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
             LISTING_CONVERGENCE_TIMEOUT,
         )
         .await?;
-        wait_for_drive_readmission(cluster, &context, DRIVE_READMISSION_TIMEOUT).await?;
+        wait_for_drive_readmission(&clients, MIXED_BUCKET, &context, DRIVE_READMISSION_TIMEOUT).await?;
     }
 
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
@@ -873,6 +798,52 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
             );
         }
     }
+    Ok(())
+}
+
+/// The drive re-admission gate assumes that a parity-0 write needs every
+/// drive. Prove it on the workspace build: with one node down a standard
+/// write still commits, the reduced-redundancy write fails with 503, and once
+/// the node is back the gate converges within its budget.
+#[tokio::test]
+async fn parity_zero_write_needs_every_drive() -> TestResult {
+    init_logging();
+    let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
+    cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
+    cluster.set_env(ALL_DRIVES_STORAGE_CLASS_ENV.0, ALL_DRIVES_STORAGE_CLASS_ENV.1);
+    cluster.start().await?;
+    cluster.create_test_bucket(MIXED_BUCKET).await?;
+    let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "parity-zero-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "parity-zero-healthy", DRIVE_READMISSION_TIMEOUT).await?;
+
+    cluster.stop_node(3)?;
+    let writer = upgrade_probe_client(&clients[0]);
+    writer
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key("parity-zero/standard-with-one-node-down")
+        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+        .send()
+        .await?;
+    let error = writer
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key("parity-zero/all-drives-with-one-node-down")
+        .storage_class(StorageClass::ReducedRedundancy)
+        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+        .send()
+        .await
+        .expect_err("a parity-0 write must not commit at three of four drives");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503), "{error:?}");
+    assert_eq!(
+        error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("ServiceUnavailable"),
+        "{error:?}"
+    );
+
+    cluster.start_node(3).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "parity-zero-returned", DRIVE_READMISSION_TIMEOUT).await?;
     Ok(())
 }
 
@@ -1101,7 +1072,14 @@ mod upgrade_write_readiness_tests {
         );
         assert_eq!(target.count_requests(FakeTargetOperation::HeadObject, stalled_key), MIXED_NODE_COUNT);
         assert_eq!(target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key), 1);
-        assert_eq!(snapshot["top_locks"]["observation"], "unknown", "the fake peer has no admin lock API");
+        let locks = snapshot["top_locks"]
+            .as_array()
+            .expect("failure artifact must retain every node's lock probe");
+        assert_eq!(locks.len(), MIXED_NODE_COUNT);
+        for (node, probe) in locks.iter().enumerate() {
+            assert_eq!(probe["node"], node);
+            assert_eq!(probe["observation"], "unknown", "the fake peer has no admin lock API");
+        }
 
         let locks: MixedLockSnapshot = serde_json::from_value(serde_json::json!({
             "total": 1, "truncated": true, "capability_note": "partial snapshot",
@@ -1377,6 +1355,7 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     let current_binary = rustfs_binary_path();
     let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
     cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
+    cluster.set_env(ALL_DRIVES_STORAGE_CLASS_ENV.0, ALL_DRIVES_STORAGE_CLASS_ENV.1);
     configure_cluster_logs(&mut cluster)?;
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
@@ -1394,8 +1373,10 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
 
     cluster.stop_node(3)?;
     cluster.start_node_from_binary(3, &current_binary).await?;
+    let clients = cluster.create_all_clients()?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "homogeneous-current", DRIVE_READMISSION_TIMEOUT).await?;
 
-    for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
+    for (node_idx, client) in clients.iter().enumerate() {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
             UPGRADE_READINESS_BODY,
