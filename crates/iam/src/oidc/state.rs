@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+use super::config::console_session_duration_secs;
+
 const OIDC_STATE_CAPACITY: u64 = 10_000;
 const OIDC_STATE_CAPACITY_WARNING: u64 = 9_000;
 const OIDC_STATE_CAPACITY_CRITICAL: u64 = 10_000;
@@ -57,7 +59,10 @@ impl OidcStateStore {
             .build();
         let logout_cache = Cache::builder()
             .max_capacity(OIDC_STATE_CAPACITY)
-            .time_to_live(Duration::from_secs(3600)) // 1 hour TTL to match console OIDC sessions
+            // Keep the logout token alive for as long as the credentials it belongs to: if it
+            // expired sooner, a session longer than the old hard-coded hour could no longer
+            // trigger RP-initiated logout.
+            .time_to_live(Duration::from_secs(console_session_duration_secs() as u64))
             .build();
         Self {
             cache,
@@ -140,6 +145,8 @@ impl Default for OidcStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::ENV_CONSOLE_OIDC_SESSION_DURATION;
+    use serial_test::serial;
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -301,5 +308,27 @@ mod tests {
         assert_eq!(retrieved.id_token, "jwt-token");
 
         assert!(store.take_logout("logout_abc").await.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn logout_retention_defaults_to_one_hour() {
+        temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, None::<&str>, || {
+            let ttl = OidcStateStore::new().logout_cache.policy().time_to_live();
+            assert_eq!(ttl, Some(Duration::from_secs(3600)));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn logout_retention_tracks_an_extended_session() {
+        temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, Some("7200"), || {
+            let ttl = OidcStateStore::new().logout_cache.policy().time_to_live();
+            assert_eq!(
+                ttl,
+                Some(Duration::from_secs(7200)),
+                "a two-hour session must keep its logout token for two hours"
+            );
+        });
     }
 }

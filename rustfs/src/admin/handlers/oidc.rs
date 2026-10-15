@@ -24,7 +24,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::{ENV_RUSTFS_BROWSER_REDIRECT_URL, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
-use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput};
+use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput, console_session_duration_secs};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -450,8 +450,9 @@ impl Operation for OidcCallbackHandler {
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
+        let session_duration_seconds = console_session_duration_secs();
         let login = federation
-            .complete_authorization_code(&state, &code, &redirect_uri, 3600, &DefaultFederatedSessionBinding)
+            .complete_authorization_code(&state, &code, &redirect_uri, session_duration_seconds, &DefaultFederatedSessionBinding)
             .await
             .map_err(|error| {
                 if let FederationError::CodeExchange(message) = &error {
@@ -846,6 +847,9 @@ fn is_invalid_oidc_state_error(error: &str) -> bool {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderValue, Uri};
+    use rustfs_config::{
+        CONSOLE_OIDC_SESSION_DURATION_MAX_SECS, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS, ENV_CONSOLE_OIDC_SESSION_DURATION,
+    };
     use temp_env::with_var;
 
     #[tokio::test]
@@ -1374,5 +1378,52 @@ mod tests {
                 "{handler} must keep authorizing with {action}"
             );
         }
+    }
+
+    #[test]
+    fn console_session_duration_follows_the_environment() {
+        for (configured, expected) in [
+            (None, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+            (Some("7200"), 7200),
+            (Some("604800"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+            (Some("604801"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+            (Some("999999999"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+            (Some("0"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+            (Some("-1"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+            (Some("60s"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+            (Some(""), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        ] {
+            let observed = with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, configured, console_session_duration_secs);
+            assert_eq!(
+                observed, expected,
+                "RUSTFS_CONSOLE_OIDC_SESSION_DURATION={configured:?} must resolve to {expected} seconds"
+            );
+        }
+    }
+
+    #[test]
+    fn console_callback_uses_the_configured_session_duration() {
+        let production = include_str!("oidc.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let callback = production
+            .split_once("impl Operation for OidcCallbackHandler")
+            .expect("the OIDC callback handler must exist")
+            .1;
+        let callback = callback.split_whitespace().collect::<String>();
+
+        assert!(
+            callback.contains("session_duration_seconds=console_session_duration_secs()"),
+            "the callback must resolve the Console session duration from the environment"
+        );
+        assert!(
+            callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,session_duration_seconds,"),
+            "the callback must hand the resolved session duration to the code exchange"
+        );
+        assert!(
+            !callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,3600,"),
+            "the callback must not hard-code the session duration"
+        );
     }
 }
