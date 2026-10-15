@@ -1702,11 +1702,28 @@ async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag()
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
         true
     ));
-    assert!(!scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, true));
     assert!(!scanner_cycle_uses_observational_publication(
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
         true
     ));
+    drop(pending);
+}
+
+#[tokio::test]
+#[serial]
+async fn incomplete_observation_uses_observational_lease_during_pending_namespace_commit() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let pending = ecstore_hold_namespace_commit(store.as_ref());
+    let uses_observation = scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, true);
+
+    assert!(uses_observation);
+    assert!(!scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, false));
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), uses_observation).await,
+        None,
+        "an incomplete cycle's observation must not be blocked by an ordinary namespace commit"
+    );
+
     drop(pending);
 }
 
