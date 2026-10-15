@@ -4387,6 +4387,57 @@ mod tests {
             "recovered preparation remains private"
         );
         drop(recovered);
+
+        assert_eq!(durable_disk_count, 4, "failure cases require all four owner disks to be prepared");
+        let record_dir = env.disk_paths[0]
+            .join(".rustfs.sys/native-preparations")
+            .join(preparation.to_string());
+        let intent_path = record_dir.join("intent.json");
+        let marker_path = record_dir.join("PREPARED");
+        let original_intent = std::fs::read(&intent_path).expect("read durable remote intent");
+        let original_marker = std::fs::read(&marker_path).expect("read durable remote marker");
+        let mut invalid_marker = original_marker.clone();
+        invalid_marker[0] ^= 1;
+        let mut intent: serde_json::Value = serde_json::from_slice(&original_intent).expect("decode remote intent");
+        let original_set_digest = serde_json::to_string(&intent["set_digest"]).expect("serialize retained set digest");
+        let byte = intent["set_digest"][0].as_u64().expect("set digest byte");
+        intent["set_digest"][0] = serde_json::json!(byte ^ 1);
+        let changed_set_digest = serde_json::to_string(&intent["set_digest"]).expect("serialize conflicting set digest");
+        // Preserve the typed record's canonical field order while changing its physical identity.
+        let conflicting_intent = String::from_utf8(original_intent.clone())
+            .expect("UTF-8 intent")
+            .replacen(
+                &format!("\"set_digest\":{original_set_digest}"),
+                &format!("\"set_digest\":{changed_set_digest}"),
+                1,
+            )
+            .into_bytes();
+        assert_ne!(conflicting_intent, original_intent, "inject a real physical set identity conflict");
+        let conflicting_marker = sha2::Sha256::digest(&conflicting_intent).to_vec();
+        for (intent, marker) in [
+            (&original_intent, &invalid_marker),
+            (&conflicting_intent, &conflicting_marker),
+        ] {
+            std::fs::write(&intent_path, intent).expect("inject remote intent state");
+            std::fs::write(&marker_path, marker).expect("inject remote marker state");
+            let result = restarted.recover_native_object(bucket, key, preparation).await;
+            std::fs::write(&intent_path, &original_intent).expect("restore remote intent");
+            std::fs::write(&marker_path, &original_marker).expect("restore remote marker");
+            assert!(
+                result.is_err_and(|error| matches!(error, rustfs_ecstore::api::error::StorageError::FileCorrupt)),
+                "one corrupt remote owner must fail recovery even when three healthy disks form a quorum"
+            );
+        }
+
+        let unavailable_path = root.path().join("unavailable-native-disk");
+        std::fs::rename(&env.disk_paths[0], &unavailable_path).expect("take one owner disk offline");
+        let degraded = restarted.recover_native_object(bucket, key, preparation).await;
+        std::fs::rename(&unavailable_path, &env.disk_paths[0]).expect("restore offline owner disk");
+        let degraded = degraded.expect("three healthy remote owners must retain the write quorum");
+        assert_eq!(degraded.receipt_count(), 3);
+        assert_eq!(degraded.object_digest(), expected_digest);
+        assert_eq!(degraded.object_length(), u64::try_from(body.len()).expect("bounded length"));
+        drop(degraded);
         restarted_cancel.cancel();
         shutdown.cancel();
         let _ = server.await;

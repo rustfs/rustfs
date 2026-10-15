@@ -117,6 +117,16 @@ impl ECStore {
             .map_err(Into::into)
     }
 
+    #[cfg(not(unix))]
+    pub async fn locate_native_preparation_on_disk(
+        &self,
+        _disk_id: Uuid,
+        _store_id: Uuid,
+        _preparation: Uuid,
+    ) -> Result<Option<NativePreparationDescription>> {
+        Err(Error::UnsupportedDisk)
+    }
+
     async fn validate_native_target(
         &self,
         target: &NativePreparationTarget,

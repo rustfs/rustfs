@@ -187,6 +187,14 @@ fn native_response_proof(body: std::result::Result<Vec<u8>, std::num::TryFromInt
         .map_err(|_| Error::other("native preparation response proof is invalid"))
 }
 
+fn native_response_error(error: Option<rustfs_protos::proto_gen::node_service::Error>) -> DiskError {
+    let error = DiskError::from(error.unwrap_or_default());
+    match error {
+        DiskError::FileCorrupt => DiskError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        error => error,
+    }
+}
+
 fn native_uuid_field(value: &[u8], field: &str) -> Result<Uuid> {
     let id = Uuid::from_slice(value).map_err(|_| Error::other(format!("native preparation returned invalid {field}")))?;
     if id.is_nil() {
@@ -1094,7 +1102,7 @@ impl RemoteDisk {
                     &response.response_proof,
                 )?;
                 if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
+                    return Err(native_response_error(response.error));
                 }
                 Ok(())
             },
@@ -1145,7 +1153,7 @@ impl RemoteDisk {
                     &response.response_proof,
                 )?;
                 if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
+                    return Err(native_response_error(response.error));
                 }
                 let receipt = response
                     .receipt
@@ -1213,7 +1221,7 @@ impl RemoteDisk {
                     &response.response_proof,
                 )?;
                 if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
+                    return Err(native_response_error(response.error));
                 }
                 validate_native_metadata(&response.metadata, None)?;
                 if !response.exists {
@@ -1289,7 +1297,7 @@ impl RemoteDisk {
                     &response.response_proof,
                 )?;
                 if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
+                    return Err(native_response_error(response.error));
                 }
                 let receipt = response
                     .receipt
@@ -1342,7 +1350,7 @@ impl RemoteDisk {
                     &response.response_proof,
                 )?;
                 if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
+                    return Err(native_response_error(response.error));
                 }
                 if !response.found {
                     if !response.bucket.is_empty()
