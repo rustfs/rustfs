@@ -19,8 +19,8 @@ use crate::disk::io_admission::{
 };
 use crate::disk::{
     CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint,
-    Error, FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
-    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    Error, FileInfoVersions, GuardedFileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, Result, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     health_state::{
         RuntimeDriveHealthState, classify_drive_recovery, get_drive_returning_probe_interval,
         get_drive_returning_success_threshold, get_drive_suspect_failure_threshold, record_drive_offline_duration,
@@ -2078,6 +2078,58 @@ impl LocalDiskWrapper {
         result
     }
 
+    pub(crate) async fn delete_versions_guarded_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let version_count = versions.len();
+        self.metrics.record_operation_call("delete_versions");
+        // Check if disk is faulty before proceeding
+        if self.health.is_faulty() {
+            self.metrics.record_availability_error();
+            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        }
+
+        // Check if disk is stale
+        if let Err(e) = self.check_disk_stale().await {
+            self.metrics.record_availability_error();
+            return vec![Some(e); versions.len()];
+        }
+
+        let _io_permit = match self.acquire_disk_io_permit().await {
+            Ok(permit) => permit,
+            Err(error) => return vec![Some(error); version_count],
+        };
+
+        // Record operation start
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
+        let waiting_guard = self.health.waiting_guard();
+        let metric_waiting_guard = self.metrics.waiting_guard();
+        let started = Instant::now();
+
+        // Execute the operation
+        let result = self
+            .disk
+            .delete_versions_guarded_with_namespace_owner(volume, versions, opts, namespace_owner)
+            .await;
+        self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
+
+        drop(waiting_guard);
+        drop(metric_waiting_guard);
+        let has_err = result.iter().any(|e| e.is_some());
+        if !has_err {
+            // Log success and decrement waiting counter
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
+            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
+        }
+
+        result
+    }
+
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
     }
@@ -2321,6 +2373,21 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        // The local implementation shares this binary's capability. Availability
+        // and disk identity remain mutation checks and write-quorum inputs.
+        self.disk.supports_guarded_delete_versions().await
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
+
     async fn delete_version_recoverable(
         &self,
         volume: &str,
@@ -3919,6 +3986,97 @@ mod tests {
         let snapshot = wrapper.metrics_snapshot();
         assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
         assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn local_guarded_delete_capability_is_independent_of_faulty_or_stale_mutation_rejection() {
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().expect("create local disk directory");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("create local disk"));
+            let volume = "guarded-capability";
+            let object = "object";
+            disk.make_volume(volume).await.expect("create object volume");
+            let mut info = FileInfo::new(object, 1, 0);
+            info.name = object.to_owned();
+            info.version_id = Some(Uuid::nil());
+            info.data_dir = Some(Uuid::new_v4());
+            info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            info.erasure.index = 1;
+            info.size = 8;
+            info.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: 8,
+                actual_size: 8,
+                ..Default::default()
+            }];
+            info.data = Some(Bytes::from_static(b"original"));
+            info.metadata.insert("etag".into(), "etag-a".into());
+            info.set_inline_data();
+            disk.write_metadata(volume, volume, object, info.clone())
+                .await
+                .expect("publish guarded fixture metadata");
+            let generation = crate::disk::CurrentDeleteGeneration::from_file_info(&info).expect("capture object generation");
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let expected_error = if stale {
+                let mut format_info = disk.format_info.write().await;
+                format_info.id = Some(Uuid::new_v4());
+                format_info.file_info = Some(tokio::fs::metadata(dir.path()).await.expect("local disk directory metadata"));
+                format_info.last_check = Some(::time::OffsetDateTime::now_utc());
+                drop(format_info);
+                wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+                DiskError::DiskNotFound
+            } else {
+                wrapper.force_offline_for_test();
+                DiskError::FaultyDisk
+            };
+            let object_dir = dir.path().join(volume).join(object);
+            let metadata_path = object_dir.join(crate::disk::STORAGE_FORMAT_FILE);
+            let before = tokio::fs::read(&metadata_path).await.expect("read original metadata");
+            wrapper
+                .supports_guarded_delete_versions()
+                .await
+                .expect("local binary capability is known even when the drive is unavailable");
+            assert_eq!(
+                wrapper.metrics_snapshot().total_errors_availability,
+                0,
+                "capability does not probe drive availability"
+            );
+            let transaction = Uuid::new_v4();
+            let result = wrapper
+                .delete_versions_guarded_recoverable(
+                    volume,
+                    vec![GuardedFileInfoVersions {
+                        group: FileInfoVersions {
+                            name: object.to_owned(),
+                            versions: vec![FileInfo {
+                                name: object.to_owned(),
+                                version_id: info.version_id,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        expected_current: generation,
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(result, vec![Some(expected_error)], "mutation availability checks remain enforced");
+            assert_eq!(
+                tokio::fs::read(&metadata_path)
+                    .await
+                    .expect("metadata survives rejected mutation"),
+                before
+            );
+            assert!(
+                !object_dir.join(transaction.to_string()).exists(),
+                "rejected mutation creates no recovery record"
+            );
+            assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+        }
     }
 
     #[tokio::test]

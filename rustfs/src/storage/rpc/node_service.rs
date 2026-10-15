@@ -1848,6 +1848,13 @@ impl Node for NodeService {
         self.handle_delete_version(request, true).await
     }
 
+    async fn guarded_delete_versions(
+        &self,
+        request: Request<GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        self.handle_guarded_delete_versions(request).await
+    }
+
     async fn delete_versions(&self, request: Request<DeleteVersionsRequest>) -> Result<Response<DeleteVersionsResponse>, Status> {
         self.handle_delete_versions(request).await
     }
@@ -3075,12 +3082,12 @@ mod tests {
         DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest, GetBucketInfoRequest,
         GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest, GetMetricsRequest,
         GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
-        HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
-        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
-        ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest, ReloadPoolMetaRequest,
+        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, GuardedDeleteVersionsRequest, HealBucketRequest,
+        HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
+        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
+        LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
+        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest,
+        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest, ReloadPoolMetaRequest,
         ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
         ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
         ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
@@ -3105,7 +3112,7 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 25] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 26] = [
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
@@ -3114,6 +3121,7 @@ mod tests {
         "deleteversion",
         "deleteretiredmarker",
         "deleteversions",
+        "guardeddeleteversions",
         "writemetadata",
         "updatemetadata",
         "writeall",
@@ -4699,6 +4707,16 @@ mod tests {
                 ..Default::default()
             },
             rustfs_protos::canonical_delete_request_body
+        );
+        assert_gated!(
+            guarded_delete_versions,
+            GuardedDeleteVersionsRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                payload: vec![0x80].into(),
+                probe_only: false,
+            },
+            rustfs_protos::canonical_guarded_delete_versions_request_body
         );
         assert_gated!(
             delete_versions,
@@ -6360,6 +6378,251 @@ mod tests {
             CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing
         );
         assert!(matches!(disk.read_all(volume, &path).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn guarded_delete_remote_production_handler_preserves_probe_and_typed_results() {
+        use crate::storage::storage_api::{
+            ecstore_disk::{
+                CurrentDeleteGeneration, DeleteOptions, DiskOption, FileInfoVersions, GuardedFileInfoVersions, new_disk,
+            },
+            init_local_disks_with_instance_ctx,
+        };
+        use std::{
+            collections::BTreeMap,
+            path::{Path, PathBuf},
+            sync::Mutex,
+        };
+        use tower_http::trace::TraceLayer;
+
+        fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut entries = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).expect("read fixture directory") {
+                    let entry = entry.expect("read fixture entry");
+                    let path = entry.path();
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("fixture path remains beneath root")
+                        .to_path_buf();
+                    if entry.file_type().expect("fixture entry type").is_dir() {
+                        entries.insert(relative, None);
+                        pending.push(path);
+                    } else {
+                        entries.insert(relative, Some(std::fs::read(path).expect("read fixture file")));
+                    }
+                }
+            }
+            entries
+        }
+
+        fn inline_info(object: &str, etag: &str) -> rustfs_filemeta::FileInfo {
+            let mut info = rustfs_filemeta::FileInfo::new(object, 1, 0);
+            info.name = object.to_owned();
+            info.erasure.index = 1;
+            info.version_id = Some(Uuid::nil());
+            info.data_dir = Some(Uuid::new_v4());
+            info.mod_time = Some(OffsetDateTime::now_utc());
+            info.size = 7;
+            info.parts = vec![rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                size: 7,
+                actual_size: 7,
+                ..Default::default()
+            }];
+            info.data = Some(Bytes::from_static(b"payload"));
+            info.metadata.insert("etag".into(), etag.into());
+            info.set_inline_data();
+            info
+        }
+
+        fn guarded_group(info: rustfs_filemeta::FileInfo) -> GuardedFileInfoVersions {
+            let expected_current = CurrentDeleteGeneration::from_file_info(&info).expect("capture fixture generation");
+            GuardedFileInfoVersions {
+                group: FileInfoVersions {
+                    name: info.name.clone(),
+                    versions: vec![info],
+                    ..Default::default()
+                },
+                expected_current,
+            }
+        }
+
+        let fixture = target_rpc_fixture().await;
+        let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind guarded production RPC target");
+        let address = listener.local_addr().expect("guarded RPC target address");
+        let mut endpoints = fixture.env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut remote_endpoint = Endpoint::try_from(format!("http://{address}{}", fixture.env.disk_paths[0].display()).as_str())
+            .expect("guarded RPC endpoint");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(0);
+        remote_endpoint.is_local = true;
+        endpoints[0] = remote_endpoint.clone();
+        let mut pool = fixture.env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks_with_instance_ctx(&fixture.instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register production local disk at its RPC endpoint");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let local = service
+            .find_disk(&remote_endpoint.to_string())
+            .await
+            .expect("registered production local disk");
+        let bucket = "guarded-delete-rpc";
+        local.make_volume(bucket).await.expect("create guarded fixture volume");
+        let first = inline_info("matching-first", "etag-first");
+        let stale = inline_info("stale-middle", "etag-old");
+        let last = inline_info("matching-last", "etag-last");
+        for info in [&first, &stale, &last] {
+            local
+                .write_metadata(bucket, bucket, &info.name, info.clone())
+                .await
+                .expect("write fixture object metadata");
+        }
+        for info in [&first, &stale, &last] {
+            let published = local
+                .read_version(
+                    bucket,
+                    bucket,
+                    &info.name,
+                    "",
+                    &crate::storage::storage_api::ecstore_disk::ReadOptions::default(),
+                )
+                .await
+                .expect("read published fixture generation");
+            assert_eq!(
+                CurrentDeleteGeneration::from_file_info(&published).expect("capture published fixture generation"),
+                CurrentDeleteGeneration::from_file_info(info).expect("capture original fixture generation"),
+                "the fixture must capture the exact generation published to xl.meta"
+            );
+        }
+        let mut replacement = stale.clone();
+        replacement.data_dir = Some(Uuid::new_v4());
+        replacement.mod_time = stale.mod_time.map(|time| time + time::Duration::seconds(1));
+        replacement.metadata.insert("etag".into(), "etag-replacement".into());
+        local
+            .write_metadata(bucket, bucket, &replacement.name, replacement.clone())
+            .await
+            .expect("commit a replacement generation");
+        let disk_path = local.path();
+        let volume_path = disk_path.join(bucket);
+        let before_probe = snapshot_tree(&disk_path);
+        let preserved_replacement = snapshot_tree(&volume_path.join(&stale.name));
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded_calls = Arc::clone(&calls);
+        let trace = TraceLayer::new_for_grpc().on_request(move |request: &http::Request<_>, _: &tracing::Span| {
+            recorded_calls
+                .lock()
+                .expect("RPC method recording lock")
+                .push(request.uri().path().to_owned());
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // This uses the production service and protobuf transport. Signature
+            // middleware has separate coverage; RemoteDisk still signs each body.
+            tonic::transport::Server::builder()
+                .layer(trace)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve guarded production RPC target");
+        });
+        remote_endpoint.is_local = false;
+        let remote = new_disk(
+            &remote_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("construct RemoteDisk client");
+        assert!(!remote.is_local(), "the test must exercise the RemoteDisk implementation");
+        remote
+            .supports_guarded_delete_versions()
+            .await
+            .expect("production peer supports guarded deletion");
+        assert_eq!(
+            snapshot_tree(&disk_path),
+            before_probe,
+            "capability probing creates no metadata or recovery artifacts anywhere on the target disk"
+        );
+        let transaction = Uuid::new_v4();
+        let groups = vec![
+            guarded_group(first.clone()),
+            guarded_group(stale.clone()),
+            guarded_group(last.clone()),
+        ];
+        let payload = crate::storage::storage_api::ecstore_disk::GuardedDeleteVersionsPayload {
+            versions: groups.clone(),
+            opts: DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).expect("encode guarded fixture payload");
+        let decoded: crate::storage::storage_api::ecstore_disk::GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded fixture payload");
+        for (original, decoded) in groups.iter().zip(&decoded.versions) {
+            assert_eq!(
+                decoded.expected_current, original.expected_current,
+                "guarded generation must survive its RPC codec exactly"
+            );
+        }
+        let errors = remote
+            .delete_versions_guarded_recoverable(
+                bucket,
+                groups,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            errors,
+            vec![None, Some(DiskError::ConditionalDeleteConflict), None],
+            "typed per-item results retain the original batch indices"
+        );
+        for info in [&first, &last] {
+            let object = volume_path.join(&info.name);
+            assert!(!object.join("xl.meta").exists(), "matching guarded objects are deleted");
+            assert!(
+                object.join(transaction.to_string()).join("xl.meta.bkp").is_file(),
+                "successful guarded deletion retains its recoverable receipt"
+            );
+        }
+        assert_eq!(
+            snapshot_tree(&volume_path.join(&stale.name)),
+            preserved_replacement,
+            "the stale guard preserves replacement metadata and creates no recovery artifacts"
+        );
+        let deletion_methods: Vec<_> = calls
+            .lock()
+            .expect("RPC method recording lock")
+            .iter()
+            .filter(|path| path.contains("Delete"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            deletion_methods,
+            vec!["/node_service.NodeService/GuardedDeleteVersions"; 2],
+            "probe and application use the additive protocol without legacy fallback"
+        );
+        remote.close().await.expect("close guarded RemoteDisk client");
+        let _ = shutdown.send(());
+        super::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("guarded RPC server shuts down")
+            .expect("guarded RPC server task");
     }
 
     #[cfg(not(windows))]

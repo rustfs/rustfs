@@ -2270,7 +2270,7 @@ pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, Strin
         }
         return Ok(None);
     };
-    if encoded.len() != 64 {
+    if encoded.len() != 64 || !encoded.is_ascii() {
         return Err(io::Error::other("transition tier backend identity has an invalid length"));
     }
     let mut identity = [0_u8; 32];

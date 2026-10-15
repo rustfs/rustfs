@@ -1909,6 +1909,10 @@ where
         },
     )
     .await;
+    let publication_plan = scan_result
+        .as_ref()
+        .map(ScannerCyclePublicationPlan::for_result)
+        .unwrap_or(ScannerCyclePublicationPlan::ProgressOnly);
     let publication_defer_reason = match &scan_result {
         Ok(result)
             if result
@@ -1923,7 +1927,7 @@ where
         // fence remains enforced by the usage store and the cycle is advanced
         // as partial without acknowledging dirty usage.
         Ok(result)
-            if scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot())
+            if publication_plan.is_observational()
                 && matches!(
                     result.status,
                     ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -1932,18 +1936,11 @@ where
             None
         }
         Ok(result) => {
-            final_data_usage_publication_defer_reason(
-                storeapi.as_ref(),
-                result.status,
-                scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot()),
-            )
-            .await
+            final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status, publication_plan.is_observational()).await
         }
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
-    let observational_only = scan_result
-        .as_ref()
-        .is_ok_and(|result| scanner_cycle_uses_observational_publication(result.status, result.has_observational_snapshot()));
+    let observational_only = publication_plan.is_observational();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let remote_publication_lease_targets = if publication_defer_reason.is_none() {
         scan_result
@@ -1958,16 +1955,12 @@ where
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
-        let publication_proof_ctx = cycle_budget.token();
-        let lease_result = await_scanner_publication_proof(
-            &publication_proof_ctx,
-            cycle_info.current,
-            "lease_acquire",
-            || {
+        let lease_result = publication_plan
+            .await_leases(ctx, &cycle_budget, cycle_info.current, |observational_lease| {
                 let targets = remote_publication_lease_targets.clone();
                 let notification_system = Arc::clone(&notification_system);
                 async move {
-                    if observational_only {
+                    if observational_lease {
                         notification_system
                             .acquire_observational_scanner_publication_leases(targets)
                             .await
@@ -1975,10 +1968,8 @@ where
                         notification_system.acquire_scanner_publication_leases(targets).await
                     }
                 }
-            },
-            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
-        )
-        .await;
+            })
+            .await;
         match lease_result {
             ScannerPublicationProofWait::Ready(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
@@ -1998,34 +1989,40 @@ where
     // it is never inserted into FileInfo metadata.  Keep the representation
     // bounded and require one authenticated token per remote target so a
     // partial grant can never silently fall back to an unfenced rename.
-    let remote_lease_fence = remote_publication_leases.as_ref().and_then(|(_, grants)| {
-        if grants.len() != remote_publication_lease_targets.len() || grants.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES {
-            return None;
-        }
-        let mut fence = BTreeMap::new();
-        for grant in grants {
-            if grant.host.is_empty() || grant.host.len() > 1024 {
+    let remote_lease_fence = remote_publication_leases
+        .as_ref()
+        .filter(|_| publication_plan.has_usage_update())
+        .and_then(|(_, grants)| {
+            if grants.len() != remote_publication_lease_targets.len()
+                || grants.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES
+            {
                 return None;
             }
-            if fence.insert(grant.host.clone(), grant.lease.token.to_string()).is_some() {
+            let mut fence = BTreeMap::new();
+            for grant in grants {
+                if grant.host.is_empty() || grant.host.len() > 1024 {
+                    return None;
+                }
+                if fence.insert(grant.host.clone(), grant.lease.token.to_string()).is_some() {
+                    return None;
+                }
+            }
+            if remote_publication_lease_targets
+                .iter()
+                .any(|(host, _, _)| !fence.contains_key(host))
+            {
                 return None;
             }
-        }
-        if remote_publication_lease_targets
-            .iter()
-            .any(|(host, _, _)| !fence.contains_key(host))
-        {
-            return None;
-        }
-        serde_json::to_string(&fence)
-            .ok()
-            .filter(|encoded| encoded.len() <= SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES)
-    });
-    let remote_lease_fence_defer_reason = (remote_publication_lease_fence_targets_are_required(
-        remote_publication_lease_targets.len(),
-        remote_publication_leases.is_some(),
-        remote_lease_fence.is_some(),
-    ))
+            serde_json::to_string(&fence)
+                .ok()
+                .filter(|encoded| encoded.len() <= SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES)
+        });
+    let remote_lease_fence_defer_reason = (publication_plan.has_usage_update()
+        && remote_publication_lease_fence_targets_are_required(
+            remote_publication_lease_targets.len(),
+            remote_publication_leases.is_some(),
+            remote_lease_fence.is_some(),
+        ))
     .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable);
     let publication_defer_reason = publication_defer_reason
         .or(remote_lease_defer_reason)
@@ -2051,12 +2048,17 @@ where
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
+        .filter(|_| publication_plan.has_usage_update())
         .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
     let remote_lease_release_safe = Arc::new(AtomicBool::new(true));
     let mut usage_publication_result = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
             DataUsagePublicationResult::from(DataUsagePersistOutcome::Deferred(reason))
+        }
+        None if !publication_plan.has_usage_update() => {
+            drop(receiver);
+            DataUsagePublicationResult::from(DataUsagePersistOutcome::NoUpdate)
         }
         None => {
             // ScannerIO emits its complete or observational update only after
@@ -2066,7 +2068,6 @@ where
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
             let route_probe_observational_only = observational_only;
-            let remote_lease_fence = remote_lease_fence.clone();
             let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
             let remote_lease_tokens = remote_publication_leases
                 .as_ref()
@@ -2368,7 +2369,7 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_observational_snapshot()
+    let partial_cause = if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -2747,6 +2748,7 @@ where
             Err(e) => {
                 match classify_scanner_leader_lock_failure(&e) {
                     ScannerLeaderLockFailure::Contended => {
+                        clear_scanner_transient_cycle_recovery_status();
                         record_scanner_cycle_schedule_role("follower");
                         record_scanner_leader_lock_state("contended");
                         global_metrics().record_scanner_leader_liveness("contended", false, "").await;
@@ -3605,12 +3607,76 @@ where
     }
 }
 
-fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_observational_candidate: bool) -> bool {
-    has_observational_candidate
-        && matches!(
-            status,
-            ScannerCycleStatus::Superseded | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCyclePublicationPlan {
+    ProgressOnly,
+    Observational,
+    Authoritative,
+}
+
+impl ScannerCyclePublicationPlan {
+    fn for_result(result: &ScannerCycleResult) -> Self {
+        match (result.has_usage_update(), result.status) {
+            (false, _) => Self::ProgressOnly,
+            (
+                true,
+                ScannerCycleStatus::Superseded
+                | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                | ScannerCycleStatus::Incomplete,
+            ) => Self::Observational,
+            (true, _) => Self::Authoritative,
+        }
+    }
+
+    fn has_usage_update(self) -> bool {
+        self != Self::ProgressOnly
+    }
+
+    fn is_observational(self) -> bool {
+        self == Self::Observational
+    }
+
+    fn uses_observational_lease(self) -> bool {
+        self != Self::Authoritative
+    }
+
+    async fn await_leases<T, E, F, Fut>(
+        self,
+        parent: &CancellationToken,
+        budget: &ScannerCycleBudget,
+        cycle: u64,
+        mut acquire: F,
+    ) -> ScannerPublicationProofWait<T, E>
+    where
+        E: std::fmt::Display,
+        F: FnMut(bool) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        // Exhausting the walk budget must not cancel the movement proof needed
+        // to save partial progress. No usage update means namespace stability
+        // is unnecessary, but peer session/generation and movement checks stay.
+        let proof_ctx = if self == Self::ProgressOnly {
+            parent.clone()
+        } else {
+            budget.token()
+        };
+        let proof = await_scanner_publication_proof(
+            &proof_ctx,
+            cycle,
+            "lease_acquire",
+            || acquire(self.uses_observational_lease()),
+            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+        );
+        if self == Self::ProgressOnly {
+            // Object/directory budgets can expire with no runtime deadline.
+            // Bound the control-plane drain independently of the walk budget.
+            tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, proof)
+                .await
+                .unwrap_or(ScannerPublicationProofWait::Cancelled)
+        } else {
+            proof.await
+        }
+    }
 }
 
 /// Re-prove the guardrail after every peer granted a publication lease. The
@@ -3822,7 +3888,7 @@ fn scanner_cycle_completion_outcome_for_result(
 ) -> ScannerCycleOutcome {
     let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
     let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
-    if scan_cycle_result.has_observational_snapshot()
+    if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)

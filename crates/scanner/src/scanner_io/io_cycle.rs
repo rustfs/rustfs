@@ -471,12 +471,12 @@ where
             return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         };
         let (empty_usage, publication_expectation) = candidate.prepare(status, &pending_buckets);
-        let observational_snapshot_published = if should_publish_observational_snapshot(status) {
+        let usage_update_emitted = if should_publish_observational_snapshot(status) {
             publish_observational_snapshot(&updates, empty_usage).await?
         } else {
             publish_usage_snapshot(&updates, status, &pending_buckets, empty_usage).await?
         };
-        if !observational_snapshot_published {
+        if !usage_update_emitted {
             return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
         }
         if status == ScannerCycleStatus::Complete {
@@ -500,7 +500,7 @@ where
             .with_activity_digest(activity_digest)
             .with_activity_baseline(activity_before)
             .with_pending_dirty_usage_buckets(pending_buckets.len())
-            .with_observational_snapshot_published(observational_snapshot_published)
+            .with_usage_update_emitted(usage_update_emitted)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
@@ -805,7 +805,7 @@ where
         ScannerCyclePendingBuckets::new()
     };
     let mut publication_expectation = None;
-    let observational_snapshot_published = if let Some(candidate) = completed_usage {
+    let usage_update_emitted = if let Some(candidate) = completed_usage {
         let (data_usage_info, expectation) = candidate.prepare(cycle_status, &pending_buckets);
         publication_expectation = expectation;
         if should_publish_observational_snapshot(cycle_status) {
@@ -845,7 +845,7 @@ where
         .with_activity_digest(activity_digest)
         .with_activity_baseline(activity_before)
         .with_pending_dirty_usage_buckets(pending_buckets.len())
-        .with_observational_snapshot_published(observational_snapshot_published)
+        .with_usage_update_emitted(usage_update_emitted)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)

@@ -1096,6 +1096,17 @@ pub fn canonical_delete_versions_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_guarded_delete_versions_request_body(
+    request: &proto_gen::node_service::GuardedDeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-guarded-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_bytes(&request.payload)?;
+    body.push_bool(request.probe_only);
+    Ok(body.finish())
+}
+
 pub fn canonical_write_metadata_request_body(
     request: &proto_gen::node_service::WriteMetadataRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1343,6 +1354,36 @@ mod disk_mutation_canonical_tests {
         SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
+
+    #[test]
+    fn guarded_delete_digest_binds_probe_and_payload() {
+        let request = proto_gen::node_service::GuardedDeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "bucket-a".into(),
+            payload: vec![0x80].into(),
+            probe_only: false,
+        };
+        let original = canonical_guarded_delete_versions_request_body(&request).expect("encode guarded body");
+        let mut candidates = Vec::new();
+        let mut changed = request.clone();
+        changed.disk = "disk-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.volume = "bucket-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.payload = vec![0x81].into();
+        candidates.push(changed);
+        let mut changed = request;
+        changed.probe_only = true;
+        candidates.push(changed);
+        for changed in candidates {
+            assert_ne!(
+                canonical_guarded_delete_versions_request_body(&changed).expect("encode changed body"),
+                original
+            );
+        }
+    }
 
     #[test]
     fn delete_recovery_canonical_body_binds_all_wire_fields() {

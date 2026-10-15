@@ -9,7 +9,7 @@
 - For a single-part object, the checksum the source object was uploaded with, forwarded as its `x-amz-checksum-<algorithm>` header (the value the source verified on upload). A multipart replica is rebuilt through CreateMultipartUpload/UploadPart and carries no object-level checksum header. Managed-SSE objects forward none.
 - On a PUT that carries Object Lock parameters and no forwarded checksum: `Content-MD5` derived from the source ETag, or an SDK CRC32 checksum when the ETag is not the MD5 of the wire bytes (rustfs#7082).
 - The source ETag, mtime and version id on `x-rustfs-source-*` headers (with `x-minio-source-*` twins), and the Object Lock mode, retain-until date and legal hold of the source version when present.
-- After the PUT, the target's ETag is compared with the source ETag when both are plain single-part MD5s; a mismatch fails the replication instead of reporting a corrupted replica as COMPLETED.
+- After the PUT, the target's ETag is compared with the source ETag when both are plain single-part MD5s and the source is unencrypted; a mismatch fails the replication instead of reporting a corrupted replica as COMPLETED. A managed-SSE (SSE-S3 / SSE-KMS) or SSE-C source is not audited this way: its stored ETag is a keyed fingerprint (new writes, see `docs/operations/encrypted-etags.md`) or a legacy plaintext MD5, and the target re-encrypts what it receives, so the two ETags are never comparable. The checksum header on the replication PUT remains the integrity check for those objects.
 
 ## Target classes and their known requirements
 
