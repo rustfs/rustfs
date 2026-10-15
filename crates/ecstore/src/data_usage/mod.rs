@@ -1325,6 +1325,18 @@ fn select_admin_data_usage_snapshot(
                 && authoritative.is_complete_bucket_usage_snapshot()
                 && observed_data_usage_is_newer(&observed, &authoritative) =>
         {
+            // A bucket can span several sets. Without a current or retained
+            // generation for every live set, its observed sum is only a subset,
+            // not a replacement for the last complete bucket total. Keep the
+            // baseline's timestamp and provenance until coverage is available.
+            if authoritative_format
+                && observed
+                    .usage_snapshot_set_states
+                    .iter()
+                    .any(|state| !state.tombstone && state.scanner_cycle.is_none())
+            {
+                return (authoritative, authoritative_format);
+            }
             (merge_partial_observation_for_admin(authoritative, observed), true)
         }
         Some(observed) if observed_data_usage_is_newer(&observed, &authoritative) => (observed, true),
@@ -3716,6 +3728,169 @@ mod tests {
         assert!(selected.replication_info.is_empty());
         assert!(selected.tier_stats.is_none());
         assert!(selected.unknown_tier_stats.is_none());
+    }
+
+    fn usage_snapshots_with_missing_observed_set() -> (DataUsageInfo, DataUsageInfo) {
+        let baseline_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut authoritative = data_usage_info_for_test("large-bucket", 510_000, 580_000_000_000, baseline_time);
+        authoritative.scanner_epoch = Some(4);
+        authoritative.scanner_cycle = Some(10);
+        authoritative.usage_snapshot_converged = Some(true);
+
+        let mut observed = data_usage_info_for_test("large-bucket", 3_000, 3_000_000_000, baseline_time + Duration::from_secs(1));
+        observed.scanner_epoch = Some(4);
+        observed.scanner_cycle = Some(11);
+        observed.usage_snapshot_complete = false;
+        observed.usage_snapshot_partial = true;
+        observed.usage_snapshot_converged = Some(false);
+        observed.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
+        observed.usage_snapshot_set_states = vec![
+            rustfs_data_usage::DataUsageSnapshotSetState {
+                pool_index: 0,
+                set_index: 0,
+                scanner_epoch: Some(4),
+                scanner_cycle: Some(11),
+                scan_plan_digest: Some([1; 32]),
+                complete: true,
+                ..Default::default()
+            },
+            rustfs_data_usage::DataUsageSnapshotSetState {
+                pool_index: 1,
+                set_index: 0,
+                scan_plan_digest: Some([1; 32]),
+                ..Default::default()
+            },
+        ];
+        assert!(
+            observed.is_valid_partial_snapshot(),
+            "a missing set is valid diagnostic progress, not a bucket total"
+        );
+        (authoritative, observed)
+    }
+
+    #[test]
+    fn partial_admin_observation_does_not_replace_totals_with_a_missing_set() {
+        let (authoritative, observed) = usage_snapshots_with_missing_observed_set();
+        let identity = authoritative.snapshot_identity();
+
+        let (selected, _) = select_admin_data_usage_snapshot(authoritative, true, Some(observed));
+
+        assert_eq!(selected.buckets_usage["large-bucket"].objects_count, 510_000);
+        assert_eq!(selected.buckets_usage["large-bucket"].size, 580_000_000_000);
+        assert_eq!(selected.objects_total_count, 510_000);
+        assert_eq!(selected.objects_total_size, 580_000_000_000);
+        assert_eq!(
+            selected.snapshot_identity(),
+            identity,
+            "retained counts must not gain a newer timestamp or generation"
+        );
+        assert!(selected.is_complete_bucket_usage_snapshot());
+    }
+
+    #[tokio::test]
+    async fn partial_admin_observation_does_not_promote_a_legacy_baseline() {
+        let (legacy, observed) = usage_snapshots_with_missing_observed_set();
+        let (selected, current_format) = select_admin_data_usage_snapshot(legacy, false, Some(observed));
+        let (normalized, _) = normalize_loaded_data_usage(selected, current_format).await;
+
+        assert!(normalized.is_valid_partial_snapshot());
+        assert!(!normalized.is_complete_bucket_usage_snapshot());
+        assert_eq!(normalized.usage_snapshot_converged, Some(false));
+        assert_eq!(normalized.objects_total_count, 3_000);
+        assert_eq!(normalized.objects_total_size, 3_000_000_000);
+    }
+
+    #[test]
+    fn partial_admin_observation_accepts_decreases_when_every_set_is_covered() {
+        let (authoritative, mut observed) = usage_snapshots_with_missing_observed_set();
+        // A compatible retained generation is useful even when it is not a
+        // completed scan of the current cycle. A tombstone explicitly removes
+        // a set; neither case is the same as an unavailable live set.
+        for tombstone in [false, true] {
+            observed.usage_snapshot_set_states[1].tombstone = tombstone;
+            observed.usage_snapshot_set_states[1].scanner_epoch = (!tombstone).then_some(4);
+            observed.usage_snapshot_set_states[1].scanner_cycle = (!tombstone).then_some(10);
+            let (selected, _) = select_admin_data_usage_snapshot(authoritative.clone(), true, Some(observed.clone()));
+
+            assert_eq!(selected.objects_total_count, 3_000);
+            assert_eq!(selected.objects_total_size, 3_000_000_000);
+            assert!(selected.is_valid_partial_snapshot());
+            assert!(!selected.is_complete_bucket_usage_snapshot());
+            assert_eq!(selected.usage_snapshot_converged, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn partial_admin_observation_preserves_persisted_totals_across_cache_reload() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let (authoritative, observed) = usage_snapshots_with_missing_observed_set();
+        let primary_bytes = serde_json::to_vec(&authoritative).expect("encode complete usage");
+        let observed_bytes = serde_json::to_vec(&observed).expect("encode partial observation");
+        save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), primary_bytes.clone())
+            .await
+            .expect("persist complete usage");
+        save_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), observed_bytes.clone())
+            .await
+            .expect("persist observation with a missing set");
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
+
+        for reload in [false, false, true] {
+            if reload {
+                // Recreate process-local usage state, not an OS process restart.
+                clear_usage_memory_cache_for_test().await;
+                invalidate_data_usage_snapshot_cache().await;
+            }
+            let mut displayed = load_admin_data_usage_from_backend_cached(store.clone())
+                .await
+                .expect("load admin usage through the real snapshot cache");
+            apply_bucket_usage_memory_overlay(&mut displayed).await;
+            assert_eq!(displayed.objects_total_count, 510_000);
+            assert_eq!(displayed.objects_total_size, 580_000_000_000);
+            assert_eq!(displayed.bucket_sizes["large-bucket"], 580_000_000_000);
+            assert_eq!(displayed.snapshot_identity(), authoritative.snapshot_identity());
+        }
+        let quota = load_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("load quota authority");
+        assert_eq!(quota.objects_total_size, 580_000_000_000);
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("read primary"),
+            primary_bytes
+        );
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("read diagnostic observation"),
+            observed_bytes,
+            "admin reads must not rewrite either persisted snapshot"
+        );
+
+        let mut reconciled = data_usage_info_for_test("large-bucket", 2, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(12));
+        reconciled.scanner_epoch = Some(4);
+        reconciled.scanner_cycle = Some(12);
+        reconciled.usage_snapshot_converged = Some(true);
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&reconciled).expect("encode confirmed deletion"),
+        )
+        .await
+        .expect("persist a later complete scan after deletion");
+        invalidate_data_usage_snapshot_cache().await;
+        let displayed = load_admin_data_usage_from_backend_cached(store)
+            .await
+            .expect("load confirmed decrease");
+        assert_eq!((displayed.objects_total_count, displayed.objects_total_size), (2, 42));
+        assert_eq!(displayed.snapshot_identity(), reconciled.snapshot_identity());
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
     }
 
     #[tokio::test]
