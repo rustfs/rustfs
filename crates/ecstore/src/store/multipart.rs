@@ -870,7 +870,7 @@ impl ECStore {
             }
         })
         .await
-        .map_err(|error| Error::other(format!("orphan multipart cleanup task failed: {error}")))?
+        .map_err(|error| Error::other_with_context("orphan multipart cleanup task failed", error))?
     }
 
     pub(crate) async fn abort_multipart_upload_for_data_movement(
