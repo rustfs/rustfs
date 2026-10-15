@@ -349,14 +349,20 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
             };
             let setup = request("{}");
             let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
-            let catalog = table_catalog_store_from_backend(backend.clone()).expect("strong catalog");
-            assert!(matches!(&catalog, crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(_)));
             enable_table_bucket_marker(object_store.as_ref(), "warehouse")
                 .await
                 .expect("enable table bucket");
+            // The isolated ECStore does not run catalog startup. Seed its snapshot
+            // before using the production request path, which requires it to exist.
+            let bootstrap = crate::table_catalog::StrongTableCatalogStore::new(backend.clone());
+            ensure_table_bucket_entry(&bootstrap, "warehouse", true)
+                .await
+                .expect("seed durable snapshot and bucket entry");
+            let catalog = table_catalog_store_from_backend(backend.clone()).expect("strong catalog");
+            assert!(matches!(&catalog, crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(_)));
             ensure_table_bucket_entry(&catalog, "warehouse", true)
                 .await
-                .expect("create bucket entry");
+                .expect("read bootstrapped bucket through configured catalog");
             let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
             let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table");
             create_namespace_response(
