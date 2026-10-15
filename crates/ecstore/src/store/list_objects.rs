@@ -5326,6 +5326,23 @@ async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEn
     }
 }
 
+fn listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: &'static str) -> Error {
+    const EVENT_LISTING_MERGE_REJECTED: &str = "listing_merge_rejected";
+    const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+    const LOG_SUBSYSTEM_LISTING: &str = "listing";
+    error!(
+        event = EVENT_LISTING_MERGE_REJECTED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LISTING,
+        result = "rejected",
+        object,
+        version_id = ?version_id,
+        validation,
+        "Listing version merge rejected metadata"
+    );
+    Error::FileCorrupt
+}
+
 /// Each input has already been resolved inside its own erasure set. This is a
 /// union of version histories, never a quorum vote between unrelated pools.
 fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
@@ -5334,23 +5351,26 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
     for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
         let meta = match entry.cached.take() {
             Some(meta) => meta,
-            None => FileMeta::load(&entry.metadata).map_err(|_| Error::FileCorrupt)?,
+            None => FileMeta::load(&entry.metadata).map_err(|_| listing_merge_corruption(&name, None, "metadata_decode"))?,
         };
         if meta.versions.is_empty() {
-            return Err(Error::FileCorrupt);
+            return Err(listing_merge_corruption(&name, None, "empty_version_stack"));
         }
         for version in meta.versions {
-            let parsed = version.parse_version_meta().map_err(|_| Error::FileCorrupt)?;
+            let corrupt = |validation| listing_merge_corruption(&name, version.header.version_id, validation);
+            let parsed = version.parse_version_meta().map_err(|_| corrupt("version_decode"))?;
             if !parsed.valid() || parsed.version_type != version.header.version_type {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_type_or_validity"));
             }
-            let fi = parsed.into_fileinfo("", &name, true).map_err(|_| Error::FileCorrupt)?;
+            let fi = parsed
+                .into_fileinfo("", &name, true)
+                .map_err(|_| corrupt("file_info_decode"))?;
             let version_id = fi.version_id.filter(|id| !id.is_nil());
             if version_id != version.header.version_id.filter(|id| !id.is_nil())
                 || fi.mod_time != version.header.mod_time
                 || fi.tier_free_version() != version.header.free_version()
             {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_header_mismatch"));
             }
             let info = ObjectInfo::from_file_info(&fi, "", &name, true);
             let identity = (version_id, version.header.free_version());
@@ -5374,7 +5394,7 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
                         crate::data_movement::is_equivalent_data_movement_object_identity(&info, previous_info, true, true)
                     };
                     if !equivalent {
-                        return Err(Error::FileCorrupt);
+                        return Err(corrupt("version_identity_conflict"));
                     }
                     // Equivalent migrated copies can have different coding or
                     // data directories. Choose a stable representation without
@@ -12115,6 +12135,82 @@ mod test {
         let versions = forward.file_info_versions("bucket").expect("merged metadata should decode");
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].metadata.get("etag").map(String::as_str), Some("same-etag"));
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_data_movement_accepts_inline_layout_changes() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let external = test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 2, 1)]);
+        let inline = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 5, 4)]),
+            |version| {
+                rustfs_utils::http::insert_bytes(
+                    &mut version.object.as_mut().expect("object version").meta_sys,
+                    rustfs_utils::http::SUFFIX_INLINE_DATA,
+                    b"true".to_vec(),
+                );
+            },
+        );
+        let legacy_inline = rewrite_test_version(inline.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_sys
+                .remove(&rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_INLINE_DATA));
+        });
+        let copies = [external, legacy_inline, inline];
+        let mut expected = None;
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let merged = merge_test_object_entries(order.map(|index| copies[index].clone()).to_vec())
+                .await
+                .expect("physical inline placement and legacy aliases must not change object identity");
+            assert_eq!(
+                merged
+                    .file_info_versions("bucket")
+                    .expect("decode merged history")
+                    .versions
+                    .len(),
+                1
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&merged.metadata, expected, "representation must not depend on pool order");
+            } else {
+                expected = Some(merged.metadata);
+            }
+        }
+    }
+
+    #[test]
+    fn data_movement_listing_conflict_logs_identity_without_metadata_values() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut original = test_object_meta_entry_with_erasure_versions("failing-key", &[(time, "same-etag", 2, 1)]);
+        let conflicting = rewrite_test_version(original.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_user
+                .insert("x-amz-meta-private".to_string(), "sensitive-value-must-not-be-logged".to_string());
+        });
+        assert_eq!(
+            super::merge_object_entry_versions(&mut original, std::iter::once(conflicting))
+                .expect_err("conflicting user metadata must still fail closed"),
+            StorageError::FileCorrupt
+        );
+        let output = logs.contents();
+        assert!(output.contains("listing_merge_rejected"));
+        assert!(output.contains("failing-key"));
+        assert!(output.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(output.contains("version_identity_conflict"));
+        assert!(!output.contains("sensitive-value-must-not-be-logged"));
     }
 
     #[tokio::test]
