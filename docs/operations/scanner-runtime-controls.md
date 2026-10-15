@@ -62,6 +62,16 @@ Speed presets (`crates/config/src/constants/scanner.rs`) set the base sleep mult
 
 Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`). The per-disk foreground-priority gate is independent of `idle_mode` and remains active when sleeps are disabled.
 
+### Walkers per disk
+
+The scanner walks the buckets of an erasure set with one walker per local disk by default, so a single-disk deployment walks one bucket at a time no matter how `scanner.max_concurrent_disk_scans` is set. `scanner.walkers_per_disk` (`RUSTFS_SCANNER_WALKERS_PER_DISK`) multiplies each local disk into that many walkers.
+
+- Keep the default `1` on rotational media: several walkers on one spindle compete for seeks and slow every walk down.
+- On flash, `2` to `4` is the useful range. Raise it when the scanner status shows cycles ending on the cycle budget (`metrics.pacing_pressure.last_cycle_budget_limited`) or when many buckets are never reached within a cycle, and the disk has idle I/O capacity.
+- The walkers of one disk share that disk's scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. `scanner.max_concurrent_disk_scans` still caps the resulting walker count, and the disk count stays the floor.
+- Confirm the setting took effect from `runtime_config.walkers_per_disk.value` in the admin scanner status and from the `disk_concurrency_budget` log line, which reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and the `reason` it was chosen.
+- Helm: `config.rustfs.scanner.walkers_per_disk`; Docker or systemd: the environment variable. The key is additive, so an older binary ignores it.
+
 ### Environment-only scanner knobs
 
 These have no persistent key and are read from the environment only.
