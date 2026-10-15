@@ -157,6 +157,19 @@ pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String
     rustfs_replication::is_ssec_encrypted(user_defined)
 }
 
+/// Whether the stored ETag of a replication source can be compared with the
+/// ETag a target returns for the bytes it received. Only an unencrypted source
+/// stores the MD5 of the bytes that go on the wire. A managed-SSE (SSE-S3 /
+/// SSE-KMS) or SSE-C source stores a keyed fingerprint (new writes) or a legacy
+/// plaintext MD5, and the target re-encrypts what it receives, so neither
+/// equality nor inequality of the two ETags proves anything about the replica.
+pub(crate) fn replication_source_etag_is_comparable(user_defined: &HashMap<String, String>) -> bool {
+    matches!(
+        classify_replication_source_encryption(user_defined),
+        ReplicationSourceEncryption::Plaintext
+    )
+}
+
 /// HeadObjectOutput adapter over the pure SSE-C passthrough evidence
 /// judgment owned by `rustfs-replication`: extract the echoed
 /// customer-algorithm header and let the crate-owned policy decide.
@@ -577,6 +590,22 @@ mod tests {
     use std::sync::Arc;
     use time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn replication_source_etag_is_comparable_only_for_plaintext_sources() {
+        assert!(replication_source_etag_is_comparable(&HashMap::new()));
+        for (key, value) in [
+            (metadata_keys::SERVER_SIDE_ENCRYPTION, "AES256"),
+            (metadata_keys::SERVER_SIDE_ENCRYPTION, "aws:kms"),
+            (SSEC_ALGORITHM_HEADER, "AES256"),
+        ] {
+            let metadata = HashMap::from([(key.to_string(), value.to_string())]);
+            assert!(
+                !replication_source_etag_is_comparable(&metadata),
+                "{key}={value} must not expose its stored ETag to the replica audit"
+            );
+        }
+    }
 
     /// backlog#1735 A3b SSE key-case finding. Every RustFS writer persists the
     /// SSE intent as lowercase `x-amz-server-side-encryption`
