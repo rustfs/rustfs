@@ -5183,6 +5183,179 @@ mod tests {
 
     #[test]
     #[serial_test::serial(storage_class_env)]
+    fn decommission_listing_accepts_committed_inline_layout_change() {
+        // Keep the native migration scenario off the small debug test stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("build migration listing runtime");
+                runtime.block_on(async move {
+                    use crate::config::storageclass::{
+                        INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV, lookup_config_for_pools,
+                    };
+
+                    let temp_dir = tempfile::tempdir().expect("create migration listing store");
+                    let (_ctx, store, shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-inline-listing",
+                        &[3, 9],
+                    )))
+                    .await;
+                    let _shutdown_guard = shutdown.drop_guard();
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+                    let bucket = "decommission-inline-listing";
+                    let object = "object.bin";
+                    let payload = vec![0x5a; 64 * 1024];
+                    Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                        .await
+                        .expect("create migration listing bucket");
+
+                    // A source written with inline storage disabled remains valid after
+                    // the destination starts using the default inline policy.
+                    let external_config = temp_env::with_vars(
+                        [
+                            (STANDARD_ENV, None),
+                            (RRS_ENV, None),
+                            (OPTIMIZE_ENV, None),
+                            (INLINE_BLOCK_ENV, Some("0")),
+                        ],
+                        || lookup_config_for_pools(&KVS::new(), &[3, 9]),
+                    )
+                    .expect("external storage policy");
+                    for set in &store.pools[1].disk_set {
+                        set.set_test_storage_class_config(external_config.clone());
+                    }
+                    let source = Box::pin(store.pools[1].put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(payload.clone()),
+                        &ObjectOptions::default(),
+                    ))
+                    .await
+                    .expect("write external source");
+                    assert!(!source.inlined, "fixture must use external source shards");
+                    store.pool_meta.write().await.pools[1].decommission = Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        ..Default::default()
+                    });
+
+                    let reader = Box::pin(store.pools[1].get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            data_movement: true,
+                            raw_data_movement_read: true,
+                            ..Default::default()
+                        },
+                    ))
+                    .await
+                    .expect("read migration source");
+                    let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+                    Box::pin(crate::data_movement::migrate_decommission_object(
+                        store.clone(),
+                        1,
+                        bucket.to_string(),
+                        reader,
+                        Some(incarnation),
+                        "test_decommission_inline_listing",
+                        None,
+                    ))
+                    .await
+                    .expect("commit migrated target while retaining source");
+
+                    for pool_index in [0, 1] {
+                        let mut reader = Box::pin(store.pools[pool_index].get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions::default(),
+                        ))
+                        .await
+                        .expect("both physical copies must remain readable");
+                        assert_eq!(reader.object_info.inlined, pool_index == 0);
+                        assert_eq!(reader.object_info.etag, source.etag);
+                        assert_eq!(reader.object_info.mod_time, source.mod_time);
+                        let mut actual = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut actual)
+                            .await
+                            .expect("read complete object body");
+                        assert_eq!(actual, payload);
+                    }
+
+                    Box::pin(store.pools[0].put_object(
+                        bucket,
+                        "z-sentinel",
+                        &mut PutObjReader::from_vec(b"sentinel".to_vec()),
+                        &ObjectOptions::default(),
+                    ))
+                    .await
+                    .expect("write pagination sentinel");
+                    let listing = Box::pin(
+                        store
+                            .clone()
+                            .inner_list_objects_v2(bucket, "", None, None, 1, false, None, false),
+                    )
+                    .await
+                    .expect("listing must merge committed source and target copies");
+                    assert!(listing.is_truncated);
+                    assert_eq!(listing.objects.len(), 1);
+                    assert_eq!(listing.objects[0].name, object);
+                    assert_eq!(listing.objects[0].etag, source.etag);
+                    assert_eq!(listing.objects[0].size, i64::try_from(payload.len()).expect("payload size"));
+                    let next = Box::pin(store.clone().inner_list_objects_v2(
+                        bucket,
+                        "",
+                        listing.next_continuation_token,
+                        None,
+                        1,
+                        false,
+                        None,
+                        false,
+                    ))
+                    .await
+                    .expect("continue after the merged object");
+                    assert!(!next.is_truncated);
+                    assert_eq!(next.objects.len(), 1);
+                    assert_eq!(next.objects[0].name, "z-sentinel");
+
+                    Box::pin(store.pools[1].delete_object(bucket, object, ObjectOptions::default()))
+                        .await
+                        .expect("remove the migrated source copy");
+                    let after_cleanup = Box::pin(
+                        store
+                            .clone()
+                            .inner_list_objects_v2(bucket, "", None, None, 100, false, None, false),
+                    )
+                    .await
+                    .expect("listing must remain complete after source cleanup");
+                    assert!(!after_cleanup.is_truncated);
+                    assert_eq!(
+                        after_cleanup
+                            .objects
+                            .iter()
+                            .map(|info| info.name.as_str())
+                            .collect::<Vec<_>>(),
+                        [object, "z-sentinel"]
+                    );
+                });
+            })
+            .expect("spawn migration listing test")
+            .join()
+            .expect("migration listing test must complete");
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
     fn data_movement_conflicts_and_multipart_retries_converge_safely() {
         // Run this large async scenario on a larger dedicated stack so debug
         // test threads do not overflow before the regression assertions.
