@@ -40,6 +40,11 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
     )?;
     router.insert(
         Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/history"),
+        AdminOperation(&HistoryRun),
+    )?;
+    router.insert(
+        Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-delegations/{{id}}/runs/cancel"),
         AdminOperation(&CancelRun),
     )?;
@@ -276,6 +281,47 @@ impl Operation for QueryRun {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRunInput {
+    version: u32,
+    run_id: uuid::Uuid,
+}
+
+fn valid_history_run_input(input: &HistoryRunInput) -> bool {
+    input.version == 1 && !input.run_id.is_nil()
+}
+
+struct HistoryRun;
+#[async_trait::async_trait]
+impl Operation for HistoryRun {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
+        let id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "history body unavailable"))?
+            .map_err(|_| s3_error!(InvalidRequest, "history body unavailable"))?;
+        let input: HistoryRunInput =
+            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid history request"))?;
+        if !valid_history_run_input(&input) {
+            return Err(s3_error!(InvalidRequest, "invalid history request"));
+        }
+        let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
+        let result = plugin_runner::history(&plugin_runner::HistoryRequest {
+            version: input.version,
+            run_id: input.run_id,
+            delegation_id: &record.id,
+            delegation_revision: &record.revision,
+            actual_signer_access_key: &signer,
+        })
+        .await?;
+        response(&result)
+    }
+}
+
 struct CancelRun;
 #[async_trait::async_trait]
 impl Operation for CancelRun {
@@ -410,7 +456,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
-        for operation in 0..7 {
+        for operation in 0..8 {
             let req = S3Request {
                 input: Body::from("{}".to_owned()),
                 method: Method::POST,
@@ -431,10 +477,12 @@ mod tests {
             } else if operation == 3 {
                 QueryRun.call(req, Params::new()).await
             } else if operation == 4 {
-                CancelRun.call(req, Params::new()).await
+                HistoryRun.call(req, Params::new()).await
             } else if operation == 5 {
-                PageRuns.call(req, Params::new()).await
+                CancelRun.call(req, Params::new()).await
             } else if operation == 6 {
+                PageRuns.call(req, Params::new()).await
+            } else if operation == 7 {
                 ReplayRun.call(req, Params::new()).await
             } else {
                 Create.call(req, Params::new()).await
@@ -492,6 +540,25 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn history_run_dto_is_strict_and_rejects_nil_run() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let input: HistoryRunInput =
+            serde_json::from_str(&format!(r#"{{"version":1,"run_id":"{run_id}"}}"#)).expect("valid history request");
+        assert!(valid_history_run_input(&input));
+        for raw in [
+            r#"{"version":1,"run_id":"00000000-0000-0000-0000-000000000000"}"#,
+            r#"{"version":2,"run_id":"00000000-0000-0000-0000-000000000001"}"#,
+            r#"{"version":1,"run_id":"00000000-0000-0000-0000-000000000001","actual_signer_access_key":"forged"}"#,
+        ] {
+            let rejected = match serde_json::from_str::<HistoryRunInput>(raw) {
+                Ok(input) => !valid_history_run_input(&input),
+                Err(_) => true,
+            };
+            assert!(rejected, "accepted invalid history request: {raw}");
+        }
     }
 
     #[test]

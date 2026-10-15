@@ -665,6 +665,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/history",
+        LIST_PLUGIN_RUNS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
         "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel",
         CANCEL_PLUGIN_RUN,
         RouteRiskLevel::Sensitive,
@@ -1995,6 +2001,17 @@ mod tests {
             .iter()
             .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
             .expect("plugin run query route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_history_route_uses_list_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/history";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run history route policy");
         assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
     }
 

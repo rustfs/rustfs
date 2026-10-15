@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs";
 const QUERY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/query";
+const HISTORY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/history";
 const CANCEL_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/cancel";
 const PAGE_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/page";
 const REPLAY_ENDPOINT_PATH: &str = "/v1/ingress/manual/jobs/replay";
@@ -20,6 +21,8 @@ const MAX_RECEIPT_BYTES: usize = 4096;
 const MAX_QUERY_RESPONSE_BYTES: usize = 1_052_672;
 const MAX_PAGE_REQUEST_BYTES: usize = 4096;
 const MAX_PAGE_RESPONSE_BYTES: usize = 32 * 1024;
+const MAX_HISTORY_REQUEST_BYTES: usize = 4096;
+const MAX_HISTORY_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_REPLAY_REQUEST_BYTES: usize = 16 * 1024;
 
 #[derive(Serialize)]
@@ -67,6 +70,31 @@ pub(crate) struct QueryResponse {
     pub epoch: i64,
     #[serde(deserialize_with = "required_manifest")]
     pub result_manifest: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct HistoryRequest<'a> {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub delegation_id: &'a str,
+    pub delegation_revision: &'a str,
+    pub actual_signer_access_key: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryEvent {
+    pub state: String,
+    pub created_at_unix_micros: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryResponse {
+    pub version: u32,
+    pub run_id: uuid::Uuid,
+    pub events: Vec<HistoryEvent>,
+    pub has_older: bool,
 }
 
 #[derive(Serialize)]
@@ -214,6 +242,44 @@ pub(crate) async fn query(request: &QueryRequest<'_>) -> S3Result<QueryResponse>
     }
 }
 
+pub(crate) async fn history(request: &HistoryRequest<'_>) -> S3Result<HistoryResponse> {
+    if request.version != 1 || request.run_id.is_nil() {
+        return Err(s3_error!(InvalidRequest, "invalid plugin run history request"));
+    }
+    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run history request"))?;
+    if body.len() > MAX_HISTORY_REQUEST_BYTES {
+        return Err(s3_error!(InvalidRequest, "plugin run history request too large"));
+    }
+    let mut url = configured_url()?;
+    url.set_path(HISTORY_ENDPOINT_PATH);
+    let client = configured_client().await?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = bounded_body(response, MAX_HISTORY_RESPONSE_BYTES).await?;
+            let result: HistoryResponse = serde_json::from_slice(&body)
+                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner history response invalid"))?;
+            if !valid_history_response(&result, request.run_id) {
+                return Err(s3_error!(ServiceUnavailable, "plugin runner history response invalid"));
+            }
+            Ok(result)
+        }
+        StatusCode::NOT_FOUND => Err(s3_error!(NoSuchKey, "plugin run not found")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+    }
+}
+
 pub(crate) async fn cancel(request: &CancelRequest<'_>) -> S3Result<CancelResponse> {
     let mut url = configured_url()?;
     url.set_path(CANCEL_ENDPOINT_PATH);
@@ -337,6 +403,20 @@ fn valid_query_response(response: &QueryResponse, run_id: uuid::Uuid) -> bool {
             response.state.as_str(),
             "QUEUED" | "LEASED" | "RUNNING" | "RETRY_WAIT" | "SUCCEEDED" | "FAILED" | "CANCELLED"
         )
+}
+
+fn valid_history_response(response: &HistoryResponse, run_id: uuid::Uuid) -> bool {
+    response.version == 1
+        && response.run_id == run_id
+        && !response.events.is_empty()
+        && response.events.len() <= 32
+        && (!response.has_older || response.events.len() == 32)
+        && response.events.iter().all(|event| {
+            matches!(
+                event.state.as_str(),
+                "QUEUED" | "LEASED" | "RUNNING" | "RETRY_WAIT" | "SUCCEEDED" | "FAILED" | "CANCELLED"
+            )
+        })
 }
 
 fn valid_page_response(response: &PageResponse, limit: u32) -> bool {
@@ -560,6 +640,48 @@ mod tests {
         ))
         .expect("semantics are checked after decoding");
         assert!(!valid_query_response(&invalid, run_id));
+    }
+
+    #[test]
+    fn history_response_is_strict_bounded_and_preserves_event_order() {
+        let run_id = uuid::Uuid::from_u128(1);
+        let valid: HistoryResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","events":[{{"state":"QUEUED","created_at_unix_micros":20}},{{"state":"SUCCEEDED","created_at_unix_micros":10}}],"has_older":false}}"#
+        ))
+        .expect("valid history response");
+        assert!(valid_history_response(&valid, run_id));
+        assert_eq!(valid.events[0].state, "QUEUED");
+        assert_eq!(valid.events[1].state, "SUCCEEDED");
+        assert!(!valid_history_response(&valid, uuid::Uuid::from_u128(2)));
+
+        let contradictory: HistoryResponse = serde_json::from_str(&format!(
+            r#"{{"version":1,"run_id":"{run_id}","events":[{{"state":"QUEUED","created_at_unix_micros":20}}],"has_older":true}}"#
+        ))
+        .expect("history response with inconsistent older flag");
+        assert!(!valid_history_response(&contradictory, run_id));
+
+        let extra_field = format!(
+            r#"{{"version":1,"run_id":"{run_id}","events":[{{"state":"SUCCEEDED","created_at_unix_micros":10}}],"has_older":false,"tenant":"other"}}"#
+        );
+        assert!(serde_json::from_str::<HistoryResponse>(&extra_field).is_err());
+
+        let mut oversized = valid;
+        oversized.events.resize_with(33, || HistoryEvent {
+            state: "SUCCEEDED".to_owned(),
+            created_at_unix_micros: 0,
+        });
+        assert!(!valid_history_response(&oversized, run_id));
+        oversized.events.truncate(1);
+        oversized.events[0].state = "UNKNOWN".to_owned();
+        assert!(!valid_history_response(&oversized, run_id));
+    }
+
+    #[test]
+    fn history_response_body_limit_rejects_oversize() {
+        assert_eq!(MAX_HISTORY_RESPONSE_BYTES, 8 * 1024);
+        assert!(bounded_len_allowed(MAX_HISTORY_RESPONSE_BYTES - 1, 1, MAX_HISTORY_RESPONSE_BYTES));
+        assert!(!bounded_len_allowed(MAX_HISTORY_RESPONSE_BYTES, 1, MAX_HISTORY_RESPONSE_BYTES));
+        assert!(!bounded_len_allowed(usize::MAX, 1, MAX_HISTORY_RESPONSE_BYTES));
     }
 
     #[test]
