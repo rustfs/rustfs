@@ -4161,6 +4161,233 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_stream_prepare_remote_restart() {
+        use crate::storage::rpc::node_service::make_server_for_context;
+        use crate::storage::storage_api::{
+            ECStore, InstanceContext, bootstrap_instance_ctx, ecstore_storage::init_local_disks_with_instance_ctx,
+        };
+        use rustfs_ecstore::api::{
+            error::is_err_object_not_found,
+            object::{ObjectOptions, PutObjReader},
+        };
+        use rustfs_iam::store::Store as _;
+        use rustfs_storage_api::object::{ListOperations, ObjectOperations};
+        use sha2::Digest as _;
+        use tokio_util::sync::CancellationToken;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind native preparation peer: {err}"),
+        };
+        let addr = listener.local_addr().expect("peer listener address");
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+        let _ = rustfs_credentials::set_global_rpc_secret("native-stream-remote-restart-secret".to_string());
+
+        let root = tempfile::tempdir().expect("native preparation root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .init_bucket_metadata(true)
+            .build()
+            .await;
+        let bucket = "native-remote-restart";
+        let key = "large/private-object.bin";
+        env.make_bucket(bucket, false).await;
+
+        let mut local_pool = env.endpoint_pools.as_ref()[0].clone();
+        let local_endpoints = env
+            .disk_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{addr}{}", path.display()).as_str()).expect("local peer endpoint");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(index);
+                endpoint.is_local = true;
+                endpoint
+            })
+            .collect::<Vec<_>>();
+        local_pool.endpoints = Endpoints::from(local_endpoints);
+        let owner_pools = EndpointServerPools::from(vec![local_pool]);
+        let owner_instance = bootstrap_instance_ctx();
+        init_local_disks_with_instance_ctx(&owner_instance, owner_pools)
+            .await
+            .expect("register the production local disk owners");
+
+        let object_store = rustfs_iam::store::object::ObjectStore::new(env.ecstore.clone());
+        object_store
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM metadata for the node service");
+        let iam = rustfs_iam::build_iam_sys(env.ecstore.clone())
+            .await
+            .expect("build fixture IAM");
+        let app_context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            env.ecstore.clone(),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        ));
+
+        let node = InterceptedService::new(
+            NodeServiceServer::new(make_server_for_context(Some(app_context)))
+                .max_decoding_message_size(rustfs_protos::internode_rpc_max_message_size())
+                .max_encoding_message_size(rustfs_protos::internode_rpc_max_message_size()),
+            check_auth,
+        );
+        let grpc = RpcRequestPathService::new(Routes::new(node).prepare());
+        let http =
+            InternodeRpcService::new(tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }));
+        let service = hybrid(http, grpc);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_task.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.expect("accept native preparation peer connection");
+                        let service = service.clone();
+                        tokio::spawn(async move {
+                            let _ = ConnBuilder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let mut remote_pool = env.endpoint_pools.as_ref()[0].clone();
+        let remote_endpoints = env
+            .disk_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{addr}{}", path.display()).as_str()).expect("remote peer endpoint");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(index);
+                endpoint.is_local = false;
+                endpoint
+            })
+            .collect::<Vec<_>>();
+        remote_pool.endpoints = Endpoints::from(remote_endpoints);
+        let remote_pools = EndpointServerPools::from(vec![remote_pool]);
+        let client_instance = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&client_instance, remote_pools.clone())
+            .await
+            .expect("connect production RemoteDisk clients");
+        let client_cancel = CancellationToken::new();
+        let client = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("local client address"),
+            remote_pools.clone(),
+            client_cancel.clone(),
+            client_instance,
+        )
+        .await
+        .expect("open coordinator over real RemoteDisk clients");
+        assert_eq!(client.id, env.ecstore.id, "remote coordinator must use the same deployment identity");
+
+        let preparation = uuid::Uuid::new_v4();
+        let body = (0..(5 * 1024 * 1024 + 37))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+        let expected_digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+        let prepared = client
+            .prepare_native_object(bucket, key, preparation, &mut PutObjReader::from_vec(body.clone()))
+            .await
+            .expect("authenticated TCP streaming preparation over remote disks");
+        assert_eq!(prepared.object_digest(), expected_digest);
+        assert!(prepared.receipt_count() >= 3, "remote write quorum must be distinct and durable");
+        assert_eq!(
+            prepared.disk_ids().collect::<std::collections::HashSet<_>>().len(),
+            prepared.receipt_count(),
+            "remote quorum must name distinct physical disks"
+        );
+        let expected_receipt_count = prepared.receipt_count();
+        let expected_disk_ids = prepared.disk_ids().collect::<std::collections::HashSet<_>>();
+        let mut durable_disk_count = 0;
+        for path in &env.disk_paths {
+            let record = path.join(".rustfs.sys/native-preparations").join(preparation.to_string());
+            if record.exists() {
+                assert!(record.join("PREPARED").is_file(), "owner disk persisted the prepared marker");
+                assert!(record.join(preparation.to_string()).join("part.1").is_file());
+                durable_disk_count += 1;
+            }
+        }
+        assert!(durable_disk_count >= 3, "real remote quorum must exist on owner disks");
+        drop(prepared);
+        assert!(
+            client
+                .get_object_info(bucket, key, &ObjectOptions::default())
+                .await
+                .is_err_and(|error| is_err_object_not_found(&error))
+        );
+        let listed = client
+            .clone()
+            .list_objects_v2(bucket, "large/", None, None, 100, false, None, false)
+            .await
+            .expect("ordinary LIST remains available");
+        assert!(
+            listed.objects.is_empty() && listed.prefixes.is_empty(),
+            "private preparation must stay out of ordinary LIST"
+        );
+        client_cancel.cancel();
+        drop(client);
+        tokio::task::yield_now().await;
+
+        let restarted_instance = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&restarted_instance, remote_pools.clone())
+            .await
+            .expect("reconnect RemoteDisk clients after coordinator restart");
+        let restarted_cancel = CancellationToken::new();
+        let restarted = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("restarted client address"),
+            remote_pools,
+            restarted_cancel.clone(),
+            restarted_instance,
+        )
+        .await
+        .expect("restart coordinator over durable remote disks");
+        let recovered = restarted
+            .recover_native_object(bucket, key, preparation)
+            .await
+            .expect("recover exact remote preparation after restart");
+        assert_eq!(recovered.object_digest(), expected_digest);
+        assert_eq!(recovered.object_length(), u64::try_from(body.len()).expect("bounded length"));
+        assert_eq!(recovered.receipt_count(), expected_receipt_count);
+        assert_eq!(recovered.disk_ids().collect::<std::collections::HashSet<_>>(), expected_disk_ids);
+        assert!(
+            restarted
+                .get_object_info(bucket, key, &ObjectOptions::default())
+                .await
+                .is_err_and(|error| is_err_object_not_found(&error))
+        );
+        let listed = restarted
+            .clone()
+            .list_objects_v2(bucket, "large/", None, None, 100, false, None, false)
+            .await
+            .expect("ordinary LIST remains available after restart");
+        assert!(
+            listed.objects.is_empty() && listed.prefixes.is_empty(),
+            "recovered preparation remains private"
+        );
+        drop(recovered);
+        restarted_cancel.cancel();
+        shutdown.cancel();
+        let _ = server.await;
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn peer_rest_heal_control_uses_production_auth_and_keeps_validation_errors_online() {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let listener = match TcpListener::bind("127.0.0.1:0").await {
