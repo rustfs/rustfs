@@ -4163,6 +4163,7 @@ mod tests {
     #[serial_test::serial]
     async fn native_stream_prepare_remote_restart() {
         use crate::storage::rpc::node_service::make_server_for_context;
+        use crate::storage::storage_api::ecstore_disk::DiskAPI as _;
         use crate::storage::storage_api::{
             ECStore, InstanceContext, bootstrap_instance_ctx, ecstore_storage::init_local_disks_with_instance_ctx,
         };
@@ -4213,7 +4214,7 @@ mod tests {
         local_pool.endpoints = Endpoints::from(local_endpoints);
         let owner_pools = EndpointServerPools::from(vec![local_pool]);
         let owner_instance = bootstrap_instance_ctx();
-        init_local_disks_with_instance_ctx(&owner_instance, owner_pools)
+        init_local_disks_with_instance_ctx(&owner_instance, owner_pools.clone())
             .await
             .expect("register the production local disk owners");
 
@@ -4234,8 +4235,24 @@ mod tests {
             Arc::new(rustfs_kms::KmsServiceManager::new()),
         ));
 
+        let node_service = make_server_for_context(Some(app_context));
+        for endpoint in owner_pools.as_ref()[0].endpoints.as_ref() {
+            let disk = crate::storage::storage_api::find_local_disk_by_ref(&endpoint.to_string())
+                .await
+                .expect("resolve the same registered disk used by production HTTP RPC");
+            if let Err(error) = disk
+                .make_volume(crate::storage::storage_api::ecstore_disk::RUSTFS_META_BUCKET)
+                .await
+            {
+                assert_eq!(
+                    error,
+                    crate::storage::storage_api::DiskError::VolumeExists,
+                    "create owner metadata volume"
+                );
+            }
+        }
         let node = InterceptedService::new(
-            NodeServiceServer::new(make_server_for_context(Some(app_context)))
+            NodeServiceServer::new(node_service)
                 .max_decoding_message_size(rustfs_protos::internode_rpc_max_message_size())
                 .max_encoding_message_size(rustfs_protos::internode_rpc_max_message_size()),
             check_auth,
@@ -4285,14 +4302,9 @@ mod tests {
             .await
             .expect("connect production RemoteDisk clients");
         let client_cancel = CancellationToken::new();
-        let client = ECStore::new_with_instance_ctx(
-            "127.0.0.1:0".parse().expect("local client address"),
-            remote_pools.clone(),
-            client_cancel.clone(),
-            client_instance,
-        )
-        .await
-        .expect("open coordinator over real RemoteDisk clients");
+        let client = ECStore::new_with_instance_ctx(addr, remote_pools.clone(), client_cancel.clone(), client_instance)
+            .await
+            .expect("open coordinator over real RemoteDisk clients");
         assert_eq!(client.id, env.ecstore.id, "remote coordinator must use the same deployment identity");
 
         let preparation = uuid::Uuid::new_v4();
@@ -4348,14 +4360,9 @@ mod tests {
             .await
             .expect("reconnect RemoteDisk clients after coordinator restart");
         let restarted_cancel = CancellationToken::new();
-        let restarted = ECStore::new_with_instance_ctx(
-            "127.0.0.1:0".parse().expect("restarted client address"),
-            remote_pools,
-            restarted_cancel.clone(),
-            restarted_instance,
-        )
-        .await
-        .expect("restart coordinator over durable remote disks");
+        let restarted = ECStore::new_with_instance_ctx(addr, remote_pools, restarted_cancel.clone(), restarted_instance)
+            .await
+            .expect("restart coordinator over durable remote disks");
         let recovered = restarted
             .recover_native_object(bucket, key, preparation)
             .await

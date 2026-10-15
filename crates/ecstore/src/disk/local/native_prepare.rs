@@ -120,7 +120,38 @@ pub(super) fn open_stream_part(
     data_dir: Uuid,
     part: usize,
 ) -> std::io::Result<std::fs::File> {
-    durable::open_stream_part(root, preparation, data_dir, part)
+    durable::open_stream_file(root, preparation, data_dir, format!("part.{part}"))
+}
+
+#[cfg(unix)]
+pub(super) fn open_stream_staging_file(
+    root: &std::path::Path,
+    preparation: Uuid,
+    data_dir: Uuid,
+    staging_id: Uuid,
+) -> std::io::Result<std::fs::File> {
+    durable::open_stream_file(root, preparation, data_dir, format!(".rustfs-put-{staging_id}"))
+}
+
+#[cfg(unix)]
+pub(super) fn publish_stream_part(
+    root: &std::path::Path,
+    preparation: Uuid,
+    data_dir: Uuid,
+    staging_id: Uuid,
+    part: usize,
+) -> std::io::Result<()> {
+    durable::publish_stream_part(root, preparation, data_dir, staging_id, part)
+}
+
+#[cfg(unix)]
+pub(super) fn remove_stream_staging_file(
+    root: &std::path::Path,
+    preparation: Uuid,
+    data_dir: Uuid,
+    staging_id: Uuid,
+) -> std::io::Result<()> {
+    durable::remove_stream_staging_file(root, preparation, data_dir, staging_id)
 }
 
 pub struct NativePreparationDescription {
@@ -1092,16 +1123,50 @@ pub(super) mod durable {
         Directory::open(root, preparation, true)?.check()
     }
 
-    pub(super) fn open_stream_part(root: &Path, preparation: Uuid, data_dir: Uuid, part: usize) -> io::Result<File> {
-        if preparation.is_nil() || data_dir.is_nil() || part == 0 {
+    pub(super) fn open_stream_file(root: &Path, preparation: Uuid, data_dir: Uuid, file_name: String) -> io::Result<File> {
+        if preparation.is_nil() || data_dir.is_nil() || !valid_stream_file_name(&file_name) {
             return Err(invalid("invalid native stream path"));
         }
         let dir = Directory::open(root, preparation, false)?;
+        let (data, identity) = open_stream_data_dir(&dir, data_dir, true)?;
+        // An existing candidate is immutable. Concurrent retries cannot truncate an attested shard.
+        let file = File::from(fs::openat(
+            &data,
+            file_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        dir.check()?;
+        let current = fs::statat(&dir.file, data_dir.to_string(), AtFlags::SYMLINK_NOFOLLOW)?;
+        if identity.st_dev != current.st_dev || identity.st_ino != current.st_ino {
+            return Err(invalid("native stream directory changed"));
+        }
+        Ok(file)
+    }
+
+    fn valid_stream_file_name(file_name: &str) -> bool {
+        file_name
+            .strip_prefix("part.")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|part| *part > 0)
+            .is_some_and(|part| file_name == format!("part.{part}"))
+            || file_name
+                .strip_prefix(".rustfs-put-")
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .filter(|id| !id.is_nil())
+                .is_some_and(|id| file_name == format!(".rustfs-put-{id}"))
+    }
+
+    fn open_stream_data_dir(dir: &Directory, data_dir: Uuid, create: bool) -> io::Result<(File, rustix::fs::Stat)> {
         let name = data_dir.to_string();
-        match fs::mkdirat(&dir.file, &name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
+        if create {
+            match fs::mkdirat(&dir.file, &name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            // Redo this barrier when the directory survived an earlier unknown outcome.
+            sync(&dir.file, dir.preparation, "stream:data-dir-parent")?;
         }
         let data = File::from(fs::openat(
             &dir.file,
@@ -1113,19 +1178,59 @@ pub(super) mod durable {
         if identity.st_mode & 0o077 != 0 {
             return Err(invalid("native streaming directory is not private"));
         }
-        // An existing candidate is immutable. Concurrent retries cannot truncate an attested shard.
-        let file = File::from(fs::openat(
-            &data,
-            format!("part.{part}"),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?);
-        dir.check()?;
-        let current = fs::statat(&dir.file, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if identity.st_dev != current.st_dev || identity.st_ino != current.st_ino {
-            return Err(invalid("native stream directory changed"));
+        Ok((data, identity))
+    }
+
+    pub(super) fn publish_stream_part(
+        root: &Path,
+        preparation: Uuid,
+        data_dir: Uuid,
+        staging_id: Uuid,
+        part: usize,
+    ) -> io::Result<()> {
+        if preparation.is_nil() || data_dir.is_nil() || staging_id.is_nil() || part == 0 {
+            return Err(invalid("invalid native stream publication path"));
         }
-        Ok(file)
+        let dir = Directory::open(root, preparation, false)?;
+        let (data, identity) = open_stream_data_dir(&dir, data_dir, false)?;
+        let staging_name = format!(".rustfs-put-{staging_id}");
+        let staged = File::from(fs::openat(
+            &data,
+            &staging_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let metadata = staged.metadata()?;
+        let staged_identity = fs::fstat(&staged)?;
+        if !metadata.is_file() || staged_identity.st_nlink != 1 {
+            return Err(invalid("native streaming stage is not a private file"));
+        }
+        sync(&staged, preparation, "stream:publish-file")?;
+        fs::renameat_with(&data, &staging_name, &data, format!("part.{part}"), rustix::fs::RenameFlags::NOREPLACE)?;
+        sync(&data, preparation, "stream:publish-directory")?;
+        dir.check()?;
+        let current = fs::statat(&dir.file, data_dir.to_string(), AtFlags::SYMLINK_NOFOLLOW)?;
+        if identity.st_dev != current.st_dev || identity.st_ino != current.st_ino {
+            return Err(invalid("native streaming directory changed"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_stream_staging_file(root: &Path, preparation: Uuid, data_dir: Uuid, staging_id: Uuid) -> io::Result<()> {
+        if preparation.is_nil() || data_dir.is_nil() || staging_id.is_nil() {
+            return Err(invalid("invalid native stream cleanup path"));
+        }
+        let dir = Directory::open(root, preparation, false)?;
+        let (data, identity) = open_stream_data_dir(&dir, data_dir, false)?;
+        let staging_name = format!(".rustfs-put-{staging_id}");
+        fs::unlinkat(&data, &staging_name, AtFlags::empty())?;
+        sync(&data, preparation, "stream:cleanup-directory")?;
+        dir.check()?;
+        let current = fs::statat(&dir.file, data_dir.to_string(), AtFlags::SYMLINK_NOFOLLOW)?;
+        if identity.st_dev != current.st_dev || identity.st_ino != current.st_ino {
+            return Err(invalid("native streaming directory changed"));
+        }
+        Ok(())
     }
 
     fn stream_parts(dir: &Directory, info: &FileInfo, runtime: &tokio::runtime::Handle) -> io::Result<([u8; 32], u64)> {
@@ -2014,6 +2119,43 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn native_stream_retries_data_dir_parent_barrier_after_failure() {
+        let (dirs, _store, disk, input) = fixture().await;
+        disk.prepare_native(input.clone()).await.expect("prepare durable root");
+        let data_dir = Uuid::new_v4();
+        let stage = format!(".rustfs-put-{}", Uuid::new_v4());
+        SYNC_PROBES.lock().expect("probe").insert(
+            input.preparation,
+            SyncProbe {
+                fail_before: Some("stream:data-dir-parent".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(super::durable::open_stream_file(dirs[0].path(), input.preparation, data_dir, stage.clone()).is_err());
+        let file =
+            super::durable::open_stream_file(dirs[0].path(), input.preparation, data_dir, stage).expect("redo parent barrier");
+        drop(file);
+
+        let stages = SYNC_PROBES
+            .lock()
+            .expect("probe")
+            .remove(&input.preparation)
+            .expect("recorded fsync calls")
+            .seen;
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|stage| stage.as_str() == "stream:data-dir-parent")
+                .count(),
+            2,
+            "NATIVE_STREAM_PARENT_BARRIER_RETRY_MUST_FSYNC_EXISTING_DIRECTORY"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn native_prepare_restart_recovers_exact_identity() {

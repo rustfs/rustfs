@@ -6867,6 +6867,28 @@ impl LocalDisk {
         opt: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(native_path) = crate::disk::native_prepare_rpc::parse_native_stream_path(volume, path)? {
+            return match native_path.file {
+                crate::disk::native_prepare_rpc::NativeStreamFile::Staging(staging_id) => {
+                    let root = self.io_root().to_path_buf();
+                    tokio::task::spawn_blocking(move || {
+                        native_prepare::remove_stream_staging_file(
+                            &root,
+                            native_path.preparation,
+                            native_path.data_dir,
+                            staging_id,
+                        )
+                    })
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?;
+                    Ok(())
+                }
+                crate::disk::native_prepare_rpc::NativeStreamFile::Part(_) => Err(DiskError::FileAccessDenied.into()),
+            };
+        }
+
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = cached_access(&volume_dir).await
@@ -10457,6 +10479,33 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         crate::hp_guard!("LocalDisk::rename_file");
+        #[cfg(unix)]
+        {
+            use crate::disk::native_prepare_rpc::{NativeStreamFile, parse_native_stream_path};
+
+            let src_native = parse_native_stream_path(src_volume, src_path)?;
+            let dst_native = parse_native_stream_path(dst_volume, dst_path)?;
+            if src_native.is_some() || dst_native.is_some() {
+                let (Some(src), Some(dst)) = (src_native, dst_native) else {
+                    return Err(DiskError::InvalidPath.into());
+                };
+                let (NativeStreamFile::Staging(staging_id), NativeStreamFile::Part(part)) = (src.file, dst.file) else {
+                    return Err(DiskError::InvalidPath.into());
+                };
+                if src_volume != dst_volume || src.preparation != dst.preparation || src.data_dir != dst.data_dir {
+                    return Err(DiskError::InvalidPath.into());
+                }
+                let root = self.io_root().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    native_prepare::publish_stream_part(&root, src.preparation, src.data_dir, staging_id, part)
+                })
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
+                return Ok(());
+            }
+        }
+
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -10538,32 +10587,23 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        if crate::disk::native_prepare_rpc::is_native_stream_path(volume, path)? {
+        if let Some(native_path) = crate::disk::native_prepare_rpc::parse_native_stream_path(volume, path)? {
             #[cfg(unix)]
             {
-                let segments = path.split('/').collect::<Vec<_>>();
-                if segments.len() != 4 {
-                    return Err(DiskError::InvalidPath);
-                }
-                let preparation = Uuid::parse_str(segments[1]).map_err(|_| DiskError::InvalidPath)?;
-                let data_dir = Uuid::parse_str(segments[2]).map_err(|_| DiskError::InvalidPath)?;
-                let part = segments[3]
-                    .strip_prefix("part.")
-                    .and_then(|number| number.parse::<usize>().ok())
-                    .filter(|part| *part > 0)
-                    .ok_or(DiskError::InvalidPath)?;
-                if segments[1] != preparation.to_string()
-                    || segments[2] != data_dir.to_string()
-                    || segments[3] != format!("part.{part}")
-                {
-                    return Err(DiskError::InvalidPath);
-                }
+                use crate::disk::native_prepare_rpc::NativeStreamFile;
+
                 let root = self.io_root().to_path_buf();
-                let file =
-                    tokio::task::spawn_blocking(move || native_prepare::open_stream_part(&root, preparation, data_dir, part))
-                        .await
-                        .map_err(DiskError::from)?
-                        .map_err(to_file_error)?;
+                let file = tokio::task::spawn_blocking(move || match native_path.file {
+                    NativeStreamFile::Part(part) => {
+                        native_prepare::open_stream_part(&root, native_path.preparation, native_path.data_dir, part)
+                    }
+                    NativeStreamFile::Staging(id) => {
+                        native_prepare::open_stream_staging_file(&root, native_path.preparation, native_path.data_dir, id)
+                    }
+                })
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
                 return Ok(Box::new(tokio::fs::File::from_std(file)));
             }
             #[cfg(not(unix))]
@@ -11628,6 +11668,15 @@ mod test {
                 format!("{preparation}/{preparation}/part.1"),
             ),
             (RUSTFS_META_BUCKET.to_owned(), format!("./{path}")),
+            (RUSTFS_META_BUCKET.to_owned(), format!("junk/../{path}")),
+            (
+                format!("{RUSTFS_META_BUCKET}/junk/../native-preparations/{preparation}"),
+                format!("{preparation}/part.1"),
+            ),
+            (
+                format!("junk/../{RUSTFS_META_BUCKET}"),
+                format!("native-preparations/{preparation}/{preparation}/part.1"),
+            ),
             (
                 RUSTFS_META_BUCKET.to_owned(),
                 format!("native-preparations//{preparation}/{preparation}/part.1"),
@@ -11643,6 +11692,53 @@ mod test {
                 "NATIVE_RESERVED_SPLIT_MUST_PRESERVE_ATTESTED_SHARD"
             );
         }
+
+        let staged_id = Uuid::new_v4();
+        let staged_path = format!("native-preparations/{preparation}/{preparation}/.rustfs-put-{staged_id}");
+        let mut staged = disk
+            .create_file("", RUSTFS_META_BUCKET, &staged_path, 7)
+            .await
+            .expect("create private native staging file");
+        staged.write_all(b"staged!").await.expect("write staged payload");
+        staged.shutdown().await.expect("close staged payload");
+        disk.rename_file(
+            RUSTFS_META_BUCKET,
+            &staged_path,
+            RUSTFS_META_BUCKET,
+            &format!("native-preparations/{preparation}/{preparation}/part.2"),
+        )
+        .await
+        .expect("publish private staging file without ordinary volume rename");
+        assert_eq!(
+            std::fs::read(
+                dirs[0]
+                    .path()
+                    .join(RUSTFS_META_BUCKET)
+                    .join(format!("native-preparations/{preparation}/{preparation}/part.2"))
+            )
+            .expect("read published private part"),
+            b"staged!"
+        );
+
+        let abandoned_id = Uuid::new_v4();
+        let abandoned_path = format!("native-preparations/{preparation}/{preparation}/.rustfs-put-{abandoned_id}");
+        let mut abandoned = disk
+            .create_file("", RUSTFS_META_BUCKET, &abandoned_path, 3)
+            .await
+            .expect("create private cleanup staging file");
+        abandoned.write_all(b"tmp").await.expect("write cleanup staging file");
+        abandoned.shutdown().await.expect("close cleanup staging file");
+        disk.delete(
+            RUSTFS_META_BUCKET,
+            &abandoned_path,
+            DeleteOptions {
+                immediate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delete private staging file after failed publication");
+        assert!(!dirs[0].path().join(RUSTFS_META_BUCKET).join(&abandoned_path).exists());
         assert!(store.recover_native_object(bucket, key, preparation).await.is_ok());
     }
 
