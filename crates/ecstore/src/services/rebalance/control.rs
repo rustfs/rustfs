@@ -1908,16 +1908,25 @@ mod tests {
         // The waiting request still holds its old local snapshot. Its retry must
         // recheck durable state under the activation locks before publishing.
         set_rebalance_disk_stats_override_for_test(store.id, disk_stats);
-        assert!(matches!(
-            store.init_rebalance_start(vec!["waiting-request".to_string()]).await,
-            Err(Error::RebalanceAlreadyRunning)
-        ));
-        assert!(matches!(
-            competing_store
-                .init_rebalance_start(vec!["another-request".to_string()])
-                .await,
-            Err(Error::RebalanceAlreadyRunning)
-        ));
+        let remote_conflict = store
+            .init_rebalance_start(vec!["waiting-request".to_string()])
+            .await
+            .expect_err("the waiting request must not replace a durable competing run");
+        assert!(
+            matches!(
+                crate::data_movement::data_movement_stage_source(&remote_conflict),
+                Some(Error::RebalanceAlreadyRunning)
+            ),
+            "the save-stage error must retain the typed competing-run conflict: {remote_conflict:?}"
+        );
+        let local_conflict = competing_store
+            .init_rebalance_start(vec!["another-request".to_string()])
+            .await
+            .expect_err("a local retry must not replace its active run");
+        assert!(
+            matches!(local_conflict, Error::RebalanceAlreadyRunning),
+            "the local admission check must report the competing-run conflict: {local_conflict:?}"
+        );
         persisted
             .load(store.pools[0].clone())
             .await
