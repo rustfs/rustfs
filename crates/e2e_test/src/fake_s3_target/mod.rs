@@ -537,6 +537,10 @@ struct StoreState {
     /// PutObject carrying any `x-amz-object-lock-*` header must also carry
     /// `Content-MD5` or an `x-amz-checksum-*` header.
     require_checksum_for_object_lock: bool,
+    /// Models AWS S3 and other generic S3 services: the `x-rustfs-source-etag`
+    /// / `x-minio-source-etag` replication headers are ignored and every
+    /// stored object reports the ETag computed from the bytes it received.
+    ignore_source_etags: bool,
     /// Models Wasabi (rustfs/backlog#2340): a version-addressed DELETE of a
     /// version id the target never had answers 404 `NoSuchVersion` instead of
     /// the idempotent 204 RustFS/MinIO give.
@@ -1050,6 +1054,13 @@ impl FakeS3Target {
 
     pub fn require_checksum_for_object_lock(&self, enabled: bool) {
         lock(&self.backend.store).require_checksum_for_object_lock = enabled;
+    }
+
+    /// AWS-like mode: ignore the replication source-ETag headers and report
+    /// the ETag of the received bytes, as AWS S3 does for SSE-S3 and
+    /// unencrypted objects. The default adopts the source ETag (RustFS/MinIO).
+    pub fn ignore_source_etags(&self, enabled: bool) {
+        lock(&self.backend.store).ignore_source_etags = enabled;
     }
 
     pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
@@ -2444,12 +2455,13 @@ impl S3 for FakeBackend {
             .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?;
         let headers = req.headers;
         let input = req.input;
-        let (assign_own, drop_unlisted, require_checksum, limits, versioned) = {
+        let (assign_own, drop_unlisted, require_checksum, ignore_source_etags, limits, versioned) = {
             let state = lock(&self.store);
             (
                 state.assign_own_version_ids,
                 state.drop_unlisted_replication_headers,
                 state.require_checksum_for_object_lock,
+                state.ignore_source_etags,
                 state.limits,
                 bucket_versioned(&state, &input.bucket),
             )
@@ -2489,7 +2501,7 @@ impl S3 for FakeBackend {
         } else {
             NULL_VERSION_ID.to_string()
         };
-        let e_tag = match source_etag(&headers)? {
+        let e_tag = match source_etag(&headers)?.filter(|_| !ignore_source_etags) {
             Some(value) => value,
             None => {
                 let (digest, permit) = md5_digest(body.clone(), body_permit).await?;
@@ -3112,7 +3124,10 @@ impl S3 for FakeBackend {
             .collect();
         let (body, digests, _body_permits) = assemble_multipart(assembly_parts, total_len, _body_permits).await?;
         let part_count = requested.len();
-        let e_tag = source_etag(&headers)?.unwrap_or_else(|| format!("{}-{part_count}", md5_hex(digests)));
+        let ignore_source_etags = lock(&self.store).ignore_source_etags;
+        let e_tag = source_etag(&headers)?
+            .filter(|_| !ignore_source_etags)
+            .unwrap_or_else(|| format!("{}-{part_count}", md5_hex(digests)));
         let version = ObjectVersion {
             version_id: upload.version_id.clone(),
             body,

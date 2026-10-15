@@ -31,8 +31,9 @@ Bucket and site replication forward the stored ETag on `x-rustfs-source-etag`
 reports the fingerprint for the replica; a target that computes its own ETag
 (AWS S3 and most compatible stores) reports the MD5 of the plaintext it
 received, which never equals the fingerprint. The post-PUT replica ETag audit
-therefore skips encrypted sources, and the checksum header on the replication
-PUT remains their integrity check. See
+therefore skips encrypted sources. Managed-SSE sources forward no checksum on
+the replication PUT either, so a target that transforms their payload is not
+detected. See
 `docs/operations/replication-outbound-transport.md`.
 
 ## Existing data and migration
