@@ -5184,6 +5184,90 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn repeated_abort_keeps_no_such_upload_while_a_disk_is_offline() {
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create offline-disk recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-multipart-offline", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-multipart-{}", uuid::Uuid::new_v4());
+        let object = "offline-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation");
+        let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(&bucket).await.expect("bucket guard");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create source upload");
+        drop(lifecycle_guard);
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("initial abort");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let staging_dir = |disk_index: usize| {
+            temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+        };
+        for disk_index in 0..3 {
+            let path = staging_dir(disk_index);
+            tokio::fs::create_dir_all(&path).await.expect("create late part directory");
+            tokio::fs::write(path.join("part.1"), b"late part after abort")
+                .await
+                .expect("write late part fixture");
+        }
+
+        // One offline disk means absence cannot be proven. The idempotent Abort
+        // must keep answering NoSuchUpload instead of surfacing a disk error,
+        // and must not delete anything.
+        let set = store.pools[0].get_disks_by_key(object);
+        let offline = set.disks.write().await[3].take();
+        assert!(offline.is_some(), "fixture disk must have been online");
+        assert!(
+            matches!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                    .await,
+                Err(StorageError::InvalidUploadID(_, _, _))
+            ),
+            "unprovable absence must keep NoSuchUpload while a disk is offline"
+        );
+        for disk_index in 0..3 {
+            assert!(
+                staging_dir(disk_index).join("part.1").exists(),
+                "no staging may be deleted while a disk is offline"
+            );
+        }
+
+        set.disks.write().await[3] = offline;
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("recovery resumes once every disk is observable");
+        for disk_index in 0..4 {
+            assert!(!staging_dir(disk_index).exists(), "recovered staging must be absent");
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn orphan_multipart_recovery_preserves_current_bucket_incarnation() {
         use sha2::Digest;
 
