@@ -32,6 +32,42 @@ fn data_movement_multipart_discovery_counts() -> &'static std::sync::Mutex<std::
     DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[cfg(test)]
+type OrphanMultipartCleanupPause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+
+#[cfg(test)]
+static ORPHAN_MULTIPART_CLEANUP_PAUSES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, OrphanMultipartCleanupPause>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn pause_orphan_multipart_cleanup_for_test(
+    bucket: &str,
+) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let previous = ORPHAN_MULTIPART_CLEANUP_PAUSES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("orphan cleanup pause mutex should not poison")
+        .insert(bucket.to_owned(), (arrived_tx, release_rx));
+    assert!(previous.is_none(), "each bucket has at most one orphan cleanup pause");
+    (arrived_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn pause_orphan_multipart_cleanup(bucket: &str) {
+    let pause = ORPHAN_MULTIPART_CLEANUP_PAUSES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("orphan cleanup pause mutex should not poison")
+        .remove(bucket);
+    if let Some((arrived, release)) = pause {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
+}
+
 fn decommission_multipart_target_clear_pending(opts: &ObjectOptions, target: Option<&ObjectInfo>) -> Result<bool> {
     let expected_mod_time = opts.mod_time.ok_or_else(|| Error::DecommissionCapacityBlocked {
         message: "multipart cleanup cannot prove exact target absence without a modification time".to_string(),
@@ -753,19 +789,12 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        let opts = &opts;
-
-        // TODO(backlog): defer DeleteUploadID to background for faster abort response
-
-        if self.single_pool() {
-            return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
-        }
+        let (opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         for pool_idx in self.existing_multipart_pool_order().await {
             let pool = &self.pools[pool_idx];
 
-            let err = match pool.abort_multipart_upload(bucket, object, upload_id, opts).await {
+            let err = match pool.abort_multipart_upload(bucket, object, upload_id, &opts).await {
                 Ok(_) => return Ok(()),
                 Err(err) => {
                     //
@@ -778,7 +807,70 @@ impl ECStore {
             }
         }
 
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+        self.recover_orphan_multipart_upload(bucket, object, upload_id, opts, bucket_lifecycle_guard)
+            .await
+    }
+
+    async fn recover_orphan_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: ObjectOptions,
+        bucket_lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<()> {
+        let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(invalid_upload());
+        }
+        let Some(bucket_lifecycle_guard) = bucket_lifecycle_guard else {
+            // A signal borrowed from an enclosing operation cannot keep its lock
+            // alive when the request waiter disappears during physical cleanup.
+            return Err(invalid_upload());
+        };
+        let Some(expected_incarnation) = opts.expected_bucket_incarnation_id.filter(|id| !id.is_nil()) else {
+            return Err(invalid_upload());
+        };
+        let (metadata, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+        if !persisted
+            || !metadata.bucket_creation_committed
+            || !metadata.bucket_incarnation_sidecar
+            || metadata.bucket_incarnation_id != expected_incarnation
+        {
+            return Err(invalid_upload());
+        }
+
+        // Lock order: bucket lifecycle, then upload locks in pool-index order.
+        // Prove metadata absence across every pool before deleting any staging.
+        let mut cleanup_guards = Vec::with_capacity(self.pools.len());
+        for pool in &self.pools {
+            cleanup_guards.push(
+                pool.get_disks_by_key(object)
+                    .lock_orphan_multipart_cleanup(bucket, object, upload_id, &opts)
+                    .await?,
+            );
+        }
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        let upload_id = upload_id.to_owned();
+        tokio::spawn(async move {
+            // Own both the real bucket guard and all upload guards until every
+            // disk deletion settles, including after cancellation of the waiter.
+            let _bucket_lifecycle_guard = bucket_lifecycle_guard;
+            #[cfg(test)]
+            pause_orphan_multipart_cleanup(&bucket).await;
+            let mut recovered = false;
+            for guard in &cleanup_guards {
+                recovered |= guard.delete(&bucket, &object, &opts).await?;
+            }
+            if recovered {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidUploadID(bucket, object, upload_id))
+            }
+        })
+        .await
+        .map_err(|error| Error::other(format!("orphan multipart cleanup task failed: {error}")))?
     }
 
     pub(crate) async fn abort_multipart_upload_for_data_movement(

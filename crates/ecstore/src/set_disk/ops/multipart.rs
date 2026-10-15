@@ -63,7 +63,6 @@ use crate::crash_inject::{self, CrashPoint};
 use crate::disk::DiskAPI;
 #[cfg(test)]
 use crate::disk::DiskOption;
-#[cfg(test)]
 use crate::disk::STORAGE_FORMAT_FILE;
 #[cfg(test)]
 use crate::disk::new_disk;
@@ -229,6 +228,60 @@ pub(crate) struct StaleMultipartCleanupGuard {
     upload_path: String,
     write_quorum: usize,
     lock_guard: ObjectLockDiagGuard,
+}
+
+/// Exact-key recovery is admitted only after every disk proves that the upload
+/// metadata is absent. Keep the checked disk generation and upload lock through
+/// deletion; a quorum miss is not proof that an upload is an orphan.
+/// Final object data, completion replay identity, and old-data cleanup receipts
+/// live under the destination bucket/object, never this staging path. This also
+/// permits removing an exact orphan from a previous bucket incarnation without
+/// claiming that its UploadID belongs to the current incarnation.
+pub(crate) struct OrphanMultipartCleanupGuard {
+    set: Arc<SetDisks>,
+    disks: Vec<Option<DiskStore>>,
+    upload_path: String,
+    lock_guard: ObjectLockDiagGuard,
+    exists: bool,
+}
+
+impl OrphanMultipartCleanupGuard {
+    pub(crate) async fn delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<bool> {
+        fence_commit_on_lock_loss(Some(&self.lock_guard), "orphan_multipart_cleanup", &self.upload_path)?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+        if !self.exists {
+            return Ok(false);
+        }
+
+        let results = join_all(self.disks.iter().map(|disk| async {
+            let Some(disk) = disk else {
+                return Err(DiskError::DiskNotFound);
+            };
+            match disk
+                .delete(
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    &self.upload_path,
+                    crate::disk::DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Err(DiskError::FileNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound) => Ok(()),
+                result => result,
+            }
+        }))
+        .await;
+        self.set.record_capacity_scope_if_needed(None, &self.disks);
+        let errors = results.into_iter().map(|result| result.err()).collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, self.disks.len()) {
+            return Err(to_object_err(err.into(), vec![bucket, object]));
+        }
+        fence_commit_on_lock_loss(Some(&self.lock_guard), "orphan_multipart_cleanup", &self.upload_path)?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+        Ok(true)
+    }
 }
 
 pub(crate) struct DataMovementMultipartAbortGuard {
@@ -555,6 +608,34 @@ fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result
 
 fn multipart_bucket_incarnation_matches(metadata: &HashMap<String, String>, expected: Uuid) -> bool {
     matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
+}
+
+fn orphan_multipart_upload_id_is_canonical(upload_id: &str) -> bool {
+    let Ok(decoded) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes()) else {
+        return false;
+    };
+    let Ok(decoded) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let Some((_, raw)) = decoded.split_once('.') else {
+        return false;
+    };
+    let Some((uuid, timestamp)) = raw.split_once('x') else {
+        return false;
+    };
+    let Ok(id) = Uuid::parse_str(uuid) else {
+        return false;
+    };
+    if id.is_nil() || id.to_string() != uuid {
+        return false;
+    }
+    let Ok(timestamp_ns) = timestamp.parse::<i128>() else {
+        return false;
+    };
+    if timestamp_ns.to_string() != timestamp {
+        return false;
+    }
+    OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns).is_ok()
 }
 
 fn validate_multipart_bucket_incarnation(
@@ -1243,6 +1324,75 @@ impl SetDisks {
             upload_path: upload_path.to_string(),
             write_quorum,
             lock_guard,
+        })
+    }
+
+    pub(crate) async fn lock_orphan_multipart_cleanup(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<OrphanMultipartCleanupGuard> {
+        let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
+        if opts.data_movement
+            || opts.no_lock
+            || self.local_lock_manager.is_disabled()
+            || !orphan_multipart_upload_id_is_canonical(upload_id)
+        {
+            return Err(invalid_upload());
+        }
+        // This path is derived from the caller's exact bucket/key and a canonical
+        // UUID/timestamp upload identity, never from the shared MPU directory list.
+        let upload_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let lock_guard = self
+            .acquire_write_lock_diag("orphan_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, &upload_path)
+            .await?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+        let disks = self.disks.read().await.clone();
+        if disks.len() != self.set_drive_count || disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        // Raw full fan-out cannot quorum-short-circuit or interpret an empty
+        // version list as absence of the physical metadata file.
+        let (_, errors) = Self::read_all_raw_file_info(&disks, RUSTFS_META_MULTIPART_BUCKET, &upload_path, false).await;
+        if errors.len() != disks.len() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        for error in errors {
+            match error {
+                Some(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                // Even one valid metadata copy may still be recoverable. Never
+                // convert a partial, corrupt, or unreachable upload into debris.
+                None => return Err(invalid_upload()),
+                Some(error) => return Err(to_object_err(error.into(), vec![bucket, object, upload_id])),
+            }
+        }
+        let mut exists = false;
+        for disk in &disks {
+            let Some(disk) = disk else {
+                return Err(Error::ErasureReadQuorum);
+            };
+            match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_path, -1).await {
+                Ok(entries) => {
+                    // Raw metadata reads report a directory named xl.meta as
+                    // FileNotFound. Its physical presence is unknown/corrupt
+                    // metadata, not proof that this staging can be deleted.
+                    if entries.iter().any(|entry| entry.trim_end_matches('/') == STORAGE_FORMAT_FILE) {
+                        return Err(to_object_err(DiskError::FileCorrupt.into(), vec![bucket, object, upload_id]));
+                    }
+                    exists = true;
+                }
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                Err(error) => return Err(to_object_err(error.into(), vec![bucket, object, upload_id])),
+            }
+        }
+        Ok(OrphanMultipartCleanupGuard {
+            set: self.clone(),
+            disks,
+            upload_path,
+            lock_guard,
+            exists,
         })
     }
 
@@ -4282,6 +4432,164 @@ mod tests {
     async fn make_bucket_on_all(disks: &[DiskStore], bucket: &str) {
         for disk in disks {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    #[test]
+    fn orphan_multipart_identity_requires_canonical_upload_id() {
+        let created = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
+        let id = Uuid::new_v4();
+        let timestamp = (created + time::Duration::seconds(1)).unix_timestamp_nanos();
+        let encode = |raw: &str| runtime_sources::deployment_upload_id(raw);
+        let upload_id = encode(&format!("{id}x{timestamp}"));
+        assert!(orphan_multipart_upload_id_is_canonical(&upload_id));
+        for raw in [
+            format!("{}x{timestamp}", Uuid::nil()),
+            format!("{}x{timestamp}", id.simple()),
+            format!("{id}x0{timestamp}"),
+            format!("{id}x+{timestamp}"),
+            format!("{id}x{timestamp}/../another-upload"),
+            format!("../{id}x{timestamp}"),
+            format!("{id}x{}", i128::MAX),
+        ] {
+            assert!(
+                !orphan_multipart_upload_id_is_canonical(&encode(&raw)),
+                "noncanonical upload identity must be rejected: {raw}"
+            );
+        }
+        assert!(!orphan_multipart_upload_id_is_canonical("not-base64"));
+    }
+
+    #[tokio::test]
+    async fn orphan_multipart_cleanup_requires_every_disk_to_prove_metadata_absence() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "orphan-multipart-proof";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        let metadata_path = format!("{upload_path}/{STORAGE_FORMAT_FILE}");
+        let leftover_path = format!("{upload_path}/part.late");
+        for disk in &disks {
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &leftover_path, Bytes::from_static(b"late part"))
+                .await
+                .expect("write late part fixture");
+        }
+        for disk in &disks[..3] {
+            disk.delete(RUSTFS_META_MULTIPART_BUCKET, &metadata_path, Default::default())
+                .await
+                .expect("remove majority metadata");
+        }
+        let opts = ObjectOptions::default();
+        assert!(
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+                .await
+                .is_err(),
+            "one surviving metadata copy must block orphan recovery"
+        );
+        disks[3]
+            .write_all(RUSTFS_META_MULTIPART_BUCKET, &metadata_path, Bytes::from_static(b"corrupt metadata"))
+            .await
+            .expect("corrupt final metadata copy");
+        assert!(
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+                .await
+                .is_err(),
+            "corrupt metadata must not be treated as absence"
+        );
+        disks[3]
+            .delete(RUSTFS_META_MULTIPART_BUCKET, &metadata_path, Default::default())
+            .await
+            .expect("remove final metadata copy");
+        set.disks.write().await[3] = None;
+        assert!(
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+                .await
+                .is_err(),
+            "an unreachable disk must not be hidden by absence quorum"
+        );
+        set.disks.write().await[3] = Some(disks[3].clone());
+        for disk in &disks {
+            assert_eq!(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &leftover_path)
+                    .await
+                    .expect("failed preflight must preserve every part"),
+                Bytes::from_static(b"late part")
+            );
+        }
+
+        let guard = set
+            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            .await
+            .expect("all disks now prove metadata absence");
+        assert!(guard.delete(bucket, object, &opts).await.expect("recover exact staging"));
+        drop(guard);
+        for disk in &disks {
+            assert!(matches!(
+                disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_path, -1).await,
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound)
+            ));
+        }
+        let guard = set
+            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            .await
+            .expect("already absent staging remains provably absent");
+        assert!(
+            !guard
+                .delete(bucket, object, &opts)
+                .await
+                .expect("absence does not report recovery")
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_multipart_cleanup_rejects_metadata_directory_on_one_disk() {
+        let (temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "orphan-multipart-directory";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        let metadata_path = format!("{upload_path}/{STORAGE_FORMAT_FILE}");
+        let leftover_path = format!("{upload_path}/part.late");
+        for disk in &disks {
+            disk.delete(RUSTFS_META_MULTIPART_BUCKET, &metadata_path, Default::default())
+                .await
+                .expect("remove upload metadata");
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &leftover_path, Bytes::from_static(b"late part"))
+                .await
+                .expect("write leftover part");
+        }
+        let metadata_directory = temp_dirs[3].path().join(RUSTFS_META_MULTIPART_BUCKET).join(&metadata_path);
+        tokio::fs::create_dir_all(&metadata_directory)
+            .await
+            .expect("replace one missing metadata file with a directory");
+        let (_, errors) =
+            SetDisks::read_all_raw_file_info(&set.disks.read().await, RUSTFS_META_MULTIPART_BUCKET, &upload_path, false).await;
+        assert!(
+            errors.iter().all(|error| matches!(error, Some(DiskError::FileNotFound))),
+            "raw metadata reads alone must reproduce the directory-as-absence case: {errors:?}"
+        );
+        assert!(
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "one physical metadata directory must block cleanup on every disk"
+        );
+        assert!(metadata_directory.is_dir(), "failed preflight must preserve the metadata directory");
+        for disk in &disks {
+            assert_eq!(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &leftover_path)
+                    .await
+                    .expect("failed preflight must preserve every leftover part"),
+                Bytes::from_static(b"late part")
+            );
         }
     }
 
@@ -9921,6 +10229,18 @@ mod tests {
                 "the post-commit crash must leave the upload listable for reclamation"
             );
 
+            let cleanup = set_disks
+                .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default())
+                .await
+                .expect("the committed upload has no staging metadata on any disk");
+            assert!(
+                cleanup
+                    .delete(bucket, object, &ObjectOptions::default())
+                    .await
+                    .expect("recover completed upload staging")
+            );
+            drop(cleanup);
+
             // The commit rename already consumed the upload's xl.meta, so the
             // retry cannot read staging. It must still return the committed
             // object: AWS CompleteMultipartUpload is idempotent for the same
@@ -9939,21 +10259,6 @@ mod tests {
                 !upload_is_listed(&set_disks, bucket, object, &u_new).await,
                 "the idempotent retry must reclaim staging left behind by the crash"
             );
-
-            // Reclaim the leftover exactly as the production tail does: delete_all
-            // on the upload path (abort_multipart_upload cannot — the upload's
-            // metadata is gone, so it too answers InvalidUploadID).
-            let upload_dir = SetDisks::get_upload_id_dir(bucket, object, &u_new);
-            set_disks
-                .delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_dir)
-                .await
-                .expect("sweeping the leftover upload staging should succeed");
-            assert!(
-                !upload_is_listed(&set_disks, bucket, object, &u_new).await,
-                "reclaiming the upload must drop it from the listing"
-            );
-            let (body_after, _) = read_object(&set_disks, bucket, object).await;
-            assert_eq!(body_after, new, "reclaiming the leftover upload must not disturb the committed object");
         }
 
         #[tokio::test]
@@ -9999,6 +10304,18 @@ mod tests {
                             .await
                             .expect("the failed post-commit completion should release its object guard"),
                     );
+
+                    let cleanup = set_disks
+                        .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default())
+                        .await
+                        .expect("committed staging has no upload metadata");
+                    assert!(
+                        cleanup
+                            .delete(bucket, object, &ObjectOptions::default())
+                            .await
+                            .expect("orphan recovery must only remove upload staging")
+                    );
+                    drop(cleanup);
 
                     let (body, _) = read_object(&set_disks, bucket, object).await;
                     assert_eq!(body, new, "the committed replacement must remain readable after the crash");
