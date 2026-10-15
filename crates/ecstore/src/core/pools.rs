@@ -3700,9 +3700,7 @@ fn rebalance_worker_read_lock_error(err: rustfs_lock::LockError, object: &str) -
             required,
             achieved,
         },
-        other => Error::other(format!(
-            "failed to acquire rebalance worker admission read lock on {RUSTFS_META_BUCKET}/{object}: {other}"
-        )),
+        other => Error::Lock(other),
     }
 }
 
