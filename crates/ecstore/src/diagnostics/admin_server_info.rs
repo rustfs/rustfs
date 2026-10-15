@@ -39,14 +39,14 @@ use rustfs_protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use time::OffsetDateTime;
 use tokio::time::timeout;
 use tonic::Request;
 use tracing::{error, trace, warn};
 
 const EVENT_SERVER_PING: &str = "server_ping";
+const EVENT_SERVER_INFO: &str = "server_info";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DIAGNOSTICS: &str = "diagnostics";
 
@@ -276,15 +276,9 @@ fn collect_runtime_server_stats() -> (MemStats, u64, u64) {
 }
 
 pub async fn get_server_info(get_pools: bool) -> InfoMessage {
-    let nowt: OffsetDateTime = OffsetDateTime::now_utc();
-
-    warn!("get_server_info start {:?}", nowt);
+    let started = tracing::enabled!(tracing::Level::TRACE).then(Instant::now);
 
     let local = get_local_server_property().await;
-
-    let after1 = OffsetDateTime::now_utc();
-
-    warn!("get_local_server_property end {:?}", after1 - nowt);
 
     let mut servers = {
         if let Some(sys) = runtime_sources::notification_sys() {
@@ -294,9 +288,6 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         }
     };
 
-    let after2 = OffsetDateTime::now_utc();
-
-    warn!("server_info end {:?}", after2 - after1);
     servers.push(local);
 
     let mut buckets = rustfs_madmin::Buckets::default();
@@ -331,15 +322,8 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             );
         }
 
-        let after3 = OffsetDateTime::now_utc();
-
-        warn!("load_data_usage_from_backend end {:?}", after3 - after2);
-
         let backend_info = StorageAdminApi::backend_info(store.as_ref()).await;
 
-        let after4 = OffsetDateTime::now_utc();
-
-        warn!("backend_info end {:?}", after4 - after3);
         if let Some(endpoints) = runtime_sources::endpoint_pools() {
             let (added, report) = reconcile_servers_with_endpoint_topology(&mut servers, &endpoints);
             if added > 0 || !report.is_complete() {
@@ -361,9 +345,6 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         }
         let (online_disks, offline_disks, unknown_disks) = get_online_offline_disks_stats(&all_disks);
 
-        let after5 = OffsetDateTime::now_utc();
-
-        warn!("get_online_offline_disks_stats end {:?}", after5 - after4);
         backend = rustfs_madmin::ErasureBackend {
             backend_type: rustfs_madmin::BackendType::ErasureType,
             online_disks: online_disks.sum(),
@@ -376,13 +357,23 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         };
         if get_pools {
             pools = get_pools_info(&all_disks).await.unwrap_or_default();
-            let after6 = OffsetDateTime::now_utc();
-
-            warn!("get_pools_info end {:?}", after6 - after5);
         }
     }
 
     let services = rustfs_madmin::Services::default();
+
+    if let Some(started) = started {
+        trace!(
+            event = EVENT_SERVER_INFO,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+            state = "completed",
+            mode,
+            include_pools = get_pools,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Server info collected"
+        );
+    }
 
     InfoMessage {
         mode: Some(mode.to_string()),
