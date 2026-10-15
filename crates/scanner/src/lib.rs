@@ -741,11 +741,11 @@ where
     };
     let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
     #[cfg(feature = "diagnostic-read-version-caller")]
-    let write = rustfs_ecstore::api::diagnostic::with_read_version_entry(
-        rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
         async {
-            rustfs_ecstore::api::diagnostic::observe_read_version_context_boundary(
-                rustfs_ecstore::api::diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
             );
             write.await
         },
@@ -874,11 +874,11 @@ where
     };
     let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
     #[cfg(feature = "diagnostic-read-version-caller")]
-    let write = rustfs_ecstore::api::diagnostic::with_read_version_entry(
-        rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
         async {
-            rustfs_ecstore::api::diagnostic::observe_read_version_context_boundary(
-                rustfs_ecstore::api::diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
             );
             write.await
         },

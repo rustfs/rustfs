@@ -765,12 +765,8 @@ impl SetDisks {
             }
         };
         #[cfg(feature = "diagnostic-read-version-caller")]
-        let metadata_read = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+        let metadata_read_result = crate::cluster::rpc::runtime_sources::with_read_version_caller_and_entry_if_absent(
             rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::Object,
-            metadata_read,
-        );
-        #[cfg(feature = "diagnostic-read-version-caller")]
-        let metadata_read_result = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectRead,
             metadata_read,
         )

@@ -1475,11 +1475,11 @@ pub(crate) async fn load_scanner_cycle_state_for_startup(
 ) -> ScannerCycleStateStartup {
     let load = load_scanner_cycle_state_inner(storeapi);
     #[cfg(feature = "diagnostic-read-version-caller")]
-    let load = rustfs_ecstore::api::diagnostic::with_read_version_entry(
-        rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::ScannerCycleStateRead,
+    let load = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerCycleStateRead,
         async {
-            rustfs_ecstore::api::diagnostic::observe_read_version_context_boundary(
-                rustfs_ecstore::api::diagnostic::ReadVersionContextBoundary::ScannerCycleStateLoad,
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCycleStateLoad,
             );
             load.await
         },

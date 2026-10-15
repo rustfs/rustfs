@@ -2250,9 +2250,9 @@ impl DefaultObjectUsecase {
             }
         };
         #[cfg(feature = "diagnostic-read-version-caller")]
-        let put_commit_future = rustfs_ecstore::api::diagnostic::with_read_version_spawn_context(
-            rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::AppPutOwner,
-            rustfs_ecstore::api::diagnostic::ReadVersionContextBoundary::AppPutOwner,
+        let put_commit_future = crate::app::storage_api::diagnostic::with_read_version_spawn_context(
+            crate::app::storage_api::diagnostic::ReadVersionEntrySource::AppPutOwner,
+            crate::app::storage_api::diagnostic::ReadVersionContextBoundary::AppPutOwner,
             put_commit_future,
         );
         let put_commit = spawn_traced_join(put_commit_future);
@@ -4522,7 +4522,7 @@ mod tests {
                         .await
                         .expect("S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
-                    assert_eq!(rustfs_ecstore::api::diagnostic::current_read_version_entry_source(), None);
+                    assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
                 })
             });
         });
@@ -4559,7 +4559,7 @@ mod tests {
             .expect("committed object");
         assert_eq!(info.size, i64::try_from(payload.len()).expect("payload length"));
         assert_eq!(current_s3_http_operation_name(), None);
-        assert_eq!(rustfs_ecstore::api::diagnostic::current_read_version_entry_source(), None);
+        assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
     }
 
     #[tokio::test]

@@ -153,7 +153,7 @@ struct CacheReadStore {
     legacy: Option<Vec<u8>>,
     puts: AtomicUsize,
     #[cfg(feature = "diagnostic-read-version-caller")]
-    entry_sources: Mutex<Vec<Option<rustfs_ecstore::api::diagnostic::ReadVersionEntrySource>>>,
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
 }
 
 #[derive(Debug, Default)]
@@ -218,7 +218,7 @@ impl ObjectIO for CacheReadStore {
         self.entry_sources
             .lock()
             .await
-            .push(rustfs_ecstore::api::diagnostic::current_read_version_entry_source());
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         if bucket == DATA_USAGE_BUCKET.as_str() {
             return self
                 .legacy
@@ -435,7 +435,9 @@ fn cache_revisions_map_to_compare_and_swap_preconditions() {
 #[cfg(feature = "diagnostic-read-version-caller")]
 #[tokio::test]
 async fn diagnostic_revision_readers_keep_scanner_or_earlier_entry() {
-    use rustfs_ecstore::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
     let path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
     let payload = b"scanner revision diagnostic".to_vec();
     for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
@@ -577,7 +579,9 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
 #[cfg(feature = "diagnostic-read-version-caller")]
 #[tokio::test]
 async fn diagnostic_cache_load_attempts_preserve_source_through_fallback_and_timeout() {
-    use rustfs_ecstore::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
 
     let mut cache = DataUsageCache::default();
     cache.info.name = "diagnostic-cache".to_string();

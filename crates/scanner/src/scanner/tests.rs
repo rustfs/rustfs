@@ -889,9 +889,9 @@ impl Drop for ScannerDefaultCycleGuard {
 #[derive(Debug, Default)]
 struct MemoryConfigStore {
     #[cfg(feature = "diagnostic-read-version-caller")]
-    entry_sources: Mutex<Vec<Option<rustfs_ecstore::api::diagnostic::ReadVersionEntrySource>>>,
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
     #[cfg(feature = "diagnostic-read-version-caller")]
-    write_entry_sources: Mutex<Vec<Option<rustfs_ecstore::api::diagnostic::ReadVersionEntrySource>>>,
+    write_entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
     #[cfg(feature = "diagnostic-read-version-caller")]
     pending_diagnostic_write: AtomicBool,
     objects: Mutex<HashMap<String, Vec<u8>>>,
@@ -952,7 +952,7 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         self.entry_sources
             .lock()
             .await
-            .push(rustfs_ecstore::api::diagnostic::current_read_version_entry_source());
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
         if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
@@ -1004,7 +1004,7 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             self.write_entry_sources
                 .lock()
                 .await
-                .push(rustfs_ecstore::api::diagnostic::current_read_version_entry_source());
+                .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
             if self.pending_diagnostic_write.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
@@ -1932,7 +1932,9 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
 #[tokio::test]
 #[serial]
 async fn diagnostic_scanner_config_writes_preserve_origin_for_both_helpers_and_cancellation() {
-    use rustfs_ecstore::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
 
     for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
         for shared in [false, true] {
@@ -1992,7 +1994,9 @@ async fn diagnostic_scanner_config_writes_preserve_origin_for_both_helpers_and_c
 #[tokio::test]
 #[serial]
 async fn diagnostic_cycle_state_load_preserves_entry_for_results_and_cancellation() {
-    use rustfs_ecstore::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
 
     for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
         for case in ["missing", "valid", "error", "cancelled"] {

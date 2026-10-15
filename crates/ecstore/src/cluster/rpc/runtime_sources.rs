@@ -27,48 +27,79 @@ use rustfs_io_metrics::internode_metrics::{
 use std::time::Duration;
 
 #[cfg(feature = "diagnostic-read-version-caller")]
-tokio::task_local! {
-    static CURRENT_READ_VERSION_REQUEST_CALLER: std::cell::Cell<Option<ReadVersionRequestCaller>>;
+fn is_path_separator(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\\')
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn path_byte_matches(path_byte: u8, pattern_byte: u8) -> bool {
+    path_byte == pattern_byte || (pattern_byte == b'/' && is_path_separator(path_byte))
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn path_ends_with(path: &str, suffix: &str) -> bool {
+    let path = path.as_bytes();
+    let suffix = suffix.as_bytes();
+    let Some(start) = path.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    path[start..]
+        .iter()
+        .zip(suffix)
+        .all(|(&path_byte, &pattern_byte)| path_byte_matches(path_byte, pattern_byte))
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn path_contains(path: &str, pattern: &str) -> bool {
+    let path = path.as_bytes();
+    let pattern = pattern.as_bytes();
+    !pattern.is_empty()
+        && path.len() >= pattern.len()
+        && path.windows(pattern.len()).any(|window| {
+            window
+                .iter()
+                .zip(pattern)
+                .all(|(&path_byte, &pattern_byte)| path_byte_matches(path_byte, pattern_byte))
+        })
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) fn read_version_request_caller_from_location(file: &str) -> ReadVersionRequestCaller {
-    let path = file.replace('\\', "/");
-    if path.ends_with("/store/peer.rs") {
+    if path_ends_with(file, "/store/peer.rs") {
         ReadVersionRequestCaller::Peer
-    } else if path.ends_with("/store/init.rs") {
+    } else if path_ends_with(file, "/store/init.rs") {
         ReadVersionRequestCaller::Startup
-    } else if path.ends_with("/store/heal.rs") || path.ends_with("/set_disk/ops/heal.rs") {
+    } else if path_ends_with(file, "/store/heal.rs") || path_ends_with(file, "/set_disk/ops/heal.rs") {
         ReadVersionRequestCaller::Heal
-    } else if path.ends_with("/set_disk/ops/heal_walk.rs") {
+    } else if path_ends_with(file, "/set_disk/ops/heal_walk.rs") {
         ReadVersionRequestCaller::Heal
-    } else if path.ends_with("/store/list_objects.rs") {
+    } else if path_ends_with(file, "/store/list_objects.rs") {
         ReadVersionRequestCaller::ListObjects
-    } else if path.ends_with("/store/object.rs") || path.ends_with("/set_disk/ops/object.rs") {
+    } else if path_ends_with(file, "/store/object.rs") || path_ends_with(file, "/set_disk/ops/object.rs") {
         ReadVersionRequestCaller::Object
-    } else if path.ends_with("/set_disk/core/metadata_read.rs") {
+    } else if path_ends_with(file, "/set_disk/core/metadata_read.rs") {
         ReadVersionRequestCaller::MetadataRead
-    } else if path.ends_with("/set_disk/ops/multipart.rs") {
+    } else if path_ends_with(file, "/set_disk/ops/multipart.rs") {
         ReadVersionRequestCaller::Multipart
-    } else if path.ends_with("/disk/disk_store.rs") {
+    } else if path_ends_with(file, "/disk/disk_store.rs") {
         ReadVersionRequestCaller::DiskStore
-    } else if path.ends_with("/disk/mod.rs") {
+    } else if path_ends_with(file, "/disk/mod.rs") {
         ReadVersionRequestCaller::DiskDispatch
-    } else if path.ends_with("/set_disk/read.rs") {
+    } else if path_ends_with(file, "/set_disk/read.rs") {
         ReadVersionRequestCaller::SetDiskRead
-    } else if path.ends_with("/set_disk/core/io_primitives.rs") {
+    } else if path_ends_with(file, "/set_disk/core/io_primitives.rs") {
         ReadVersionRequestCaller::SetDiskIo
-    } else if path.ends_with("/services/rebalance/worker.rs") {
+    } else if path_ends_with(file, "/services/rebalance/worker.rs") {
         ReadVersionRequestCaller::Rebalance
-    } else if path.ends_with("/core/pools.rs") {
+    } else if path_ends_with(file, "/core/pools.rs") {
         ReadVersionRequestCaller::Decommission
-    } else if path.ends_with("/tier_free_version_recovery.rs") {
+    } else if path_ends_with(file, "/tier_free_version_recovery.rs") {
         ReadVersionRequestCaller::TierRecovery
-    } else if path.contains("/bucket/lifecycle/") {
+    } else if path_contains(file, "/bucket/lifecycle/") {
         ReadVersionRequestCaller::Lifecycle
-    } else if path.contains("/cache_value/") {
+    } else if path_contains(file, "/cache_value/") {
         ReadVersionRequestCaller::CacheValue
-    } else if path.contains("/ecstore/src/") {
+    } else if path_contains(file, "/ecstore/src/") {
         ReadVersionRequestCaller::Other
     } else {
         ReadVersionRequestCaller::Unattributed
@@ -77,10 +108,7 @@ pub(crate) fn read_version_request_caller_from_location(file: &str) -> ReadVersi
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) fn current_read_version_request_caller() -> Option<ReadVersionRequestCaller> {
-    CURRENT_READ_VERSION_REQUEST_CALLER
-        .try_with(std::cell::Cell::get)
-        .ok()
-        .flatten()
+    current_read_version_task_context().and_then(|context| context.caller)
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -88,9 +116,9 @@ pub(crate) async fn with_read_version_request_caller<F>(caller: ReadVersionReque
 where
     F: std::future::Future,
 {
-    CURRENT_READ_VERSION_REQUEST_CALLER
-        .scope(std::cell::Cell::new(Some(caller)), future)
-        .await
+    let mut context = current_read_version_task_context().unwrap_or_default();
+    context.caller = Some(caller);
+    with_read_version_task_context(context, future).await
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -149,6 +177,13 @@ impl ReadVersionEntryContext {
     }
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReadVersionTaskContext {
+    caller: Option<ReadVersionRequestCaller>,
+    entry: Option<ReadVersionEntryContext>,
+}
+
 /// Capture values before spawning or enqueueing; absence is part of the value.
 #[cfg(feature = "diagnostic-read-version-caller")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,17 +195,31 @@ pub(crate) struct ReadVersionDiagnosticContext {
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 tokio::task_local! {
-    static CURRENT_READ_VERSION_ENTRY: std::cell::Cell<Option<ReadVersionEntryContext>>;
+    static CURRENT_READ_VERSION_CONTEXT: std::cell::Cell<ReadVersionTaskContext>;
     static CURRENT_READ_VERSION_BATCH_CONTEXTS: Vec<ReadVersionDiagnosticContext>;
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn current_read_version_task_context() -> Option<ReadVersionTaskContext> {
+    CURRENT_READ_VERSION_CONTEXT.try_with(std::cell::Cell::get).ok()
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn with_read_version_task_context<F>(context: ReadVersionTaskContext, future: F) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future,
+{
+    CURRENT_READ_VERSION_CONTEXT.scope(std::cell::Cell::new(context), future)
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 impl ReadVersionDiagnosticContext {
     pub(crate) fn capture() -> Self {
+        let task_context = current_read_version_task_context();
         Self {
             api_operation: current_s3_http_operation_context(),
-            caller: current_read_version_request_caller(),
-            entry: CURRENT_READ_VERSION_ENTRY.try_with(std::cell::Cell::get).ok().flatten(),
+            caller: task_context.and_then(|context| context.caller),
+            entry: task_context.and_then(|context| context.entry),
         }
     }
 
@@ -210,9 +259,50 @@ where
     let future = Box::pin(future);
     async move {
         let context = ReadVersionDiagnosticContext::capture_entry(source);
-        CURRENT_READ_VERSION_ENTRY
-            .scope(std::cell::Cell::new(context.entry), future)
-            .await
+        with_read_version_task_context(
+            ReadVersionTaskContext {
+                caller: context.caller,
+                entry: context.entry,
+            },
+            future,
+        )
+        .await
+    }
+}
+
+/// Set a missing caller and entry source in one task-local scope for the object-read boundary.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) fn with_read_version_caller_and_entry_if_absent<F>(
+    caller: ReadVersionRequestCaller,
+    source: ReadVersionEntrySource,
+    future: F,
+) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future,
+{
+    let future = Box::pin(future);
+    async move {
+        let api_operation = current_s3_http_operation_context();
+        let mut task_context = current_read_version_task_context().unwrap_or_default();
+        if task_context.caller.is_none() {
+            task_context.caller = Some(caller);
+        }
+        let new_entry = task_context.entry.is_none();
+        if new_entry {
+            task_context.entry = Some(ReadVersionEntryContext::new(source, api_operation, task_context.caller));
+        }
+        let diagnostic = ReadVersionDiagnosticContext {
+            api_operation,
+            caller: task_context.caller,
+            entry: task_context.entry,
+        };
+        let observed = async move {
+            if new_entry {
+                diagnostic.observe(ReadVersionContextBoundary::Entry);
+            }
+            future.await
+        };
+        with_read_version_task_context(task_context, observed).await
     }
 }
 
@@ -240,11 +330,7 @@ pub fn observe_read_version_context_boundary(boundary: ReadVersionContextBoundar
 /// The earliest observed storage entry, for diagnostic consumers only.
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub fn current_read_version_entry_source() -> Option<ReadVersionEntrySource> {
-    CURRENT_READ_VERSION_ENTRY
-        .try_with(std::cell::Cell::get)
-        .ok()
-        .flatten()
-        .map(|entry| entry.source)
+    current_read_version_task_context().and_then(|context| context.entry.map(|entry| entry.source))
 }
 
 /// Restore only this item's context and observe the child after restoration.
@@ -261,14 +347,17 @@ where
         context.observe(boundary);
         future.await
     };
-    let caller = CURRENT_READ_VERSION_REQUEST_CALLER.scope(std::cell::Cell::new(context.caller), observed);
     let mut forwarded_entry = context.entry;
     if let Some(entry) = &mut forwarded_entry {
         entry.parent_api_operation = context.api_operation;
         entry.parent_caller = context.caller;
     }
-    let entry = CURRENT_READ_VERSION_ENTRY.scope(std::cell::Cell::new(forwarded_entry), caller);
-    rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(context.api_operation, entry).await
+    let task_context = ReadVersionTaskContext {
+        caller: context.caller,
+        entry: forwarded_entry,
+    };
+    let scoped = with_read_version_task_context(task_context, observed);
+    rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(context.api_operation, scoped).await
 }
 
 /// A batch has item contexts, not one owner's S3 task-local operation.
@@ -278,9 +367,8 @@ where
     F: std::future::Future,
 {
     let batch = CURRENT_READ_VERSION_BATCH_CONTEXTS.scope(contexts, future);
-    let caller = CURRENT_READ_VERSION_REQUEST_CALLER.scope(std::cell::Cell::new(None), batch);
-    let entry = CURRENT_READ_VERSION_ENTRY.scope(std::cell::Cell::new(None), caller);
-    rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(None, entry).await
+    let scoped = with_read_version_task_context(ReadVersionTaskContext::default(), batch);
+    rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(None, scoped).await
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -676,6 +764,53 @@ mod tests {
     }
 
     #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn combined_caller_and_entry_scope_captures_once_and_restores() {
+        let operation = diagnostic_operation(rustfs_s3_ops::S3Operation::GetObject);
+        rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(operation), async {
+            let before = ReadVersionDiagnosticContext::capture();
+            let captured = with_read_version_caller_and_entry_if_absent(
+                ReadVersionRequestCaller::Object,
+                ReadVersionEntrySource::ObjectRead,
+                async { ReadVersionDiagnosticContext::capture() },
+            )
+            .await;
+            assert_eq!(captured.api_operation, Some(operation));
+            assert_eq!(captured.caller, Some(ReadVersionRequestCaller::Object));
+            assert_eq!(
+                captured.entry.map(|entry| (entry.source, entry.caller)),
+                Some((ReadVersionEntrySource::ObjectRead, Some(ReadVersionRequestCaller::Object)))
+            );
+            assert_eq!(ReadVersionDiagnosticContext::capture(), before);
+
+            let existing_entry = ReadVersionEntryContext::new(
+                ReadVersionEntrySource::ConfigRead,
+                Some(operation),
+                Some(ReadVersionRequestCaller::Peer),
+            );
+            let existing = ReadVersionTaskContext {
+                caller: Some(ReadVersionRequestCaller::Peer),
+                entry: Some(existing_entry),
+            };
+            let preserved = with_read_version_task_context(existing, async {
+                with_read_version_caller_and_entry_if_absent(
+                    ReadVersionRequestCaller::Object,
+                    ReadVersionEntrySource::ObjectRead,
+                    async { ReadVersionDiagnosticContext::capture() },
+                )
+                .await
+            })
+            .await;
+            assert_eq!(preserved.caller, Some(ReadVersionRequestCaller::Peer));
+            assert_eq!(
+                preserved.entry.map(|entry| (entry.source, entry.caller)),
+                Some((ReadVersionEntrySource::ConfigRead, Some(ReadVersionRequestCaller::Peer)))
+            );
+        })
+        .await;
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
     #[test]
     fn diagnostic_list_retains_background_entry_through_shared_workers() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -920,11 +1055,13 @@ mod tests {
                                         record_read_version_entry_to_rpc_context(&ReadOptions::default());
                                     })
                                     .await;
-                                    CURRENT_READ_VERSION_REQUEST_CALLER
-                                        .scope(std::cell::Cell::new(None), async {
-                                            record_read_version_entry_to_rpc_context(&ReadOptions::default());
-                                        })
-                                        .await;
+                                    let mut missing_caller =
+                                        current_read_version_task_context().expect("diagnostic scope should be active");
+                                    missing_caller.caller = None;
+                                    with_read_version_task_context(missing_caller, async {
+                                        record_read_version_entry_to_rpc_context(&ReadOptions::default());
+                                    })
+                                    .await;
                                 },
                             ))
                             .await
@@ -1141,14 +1278,18 @@ mod tests {
 
     #[cfg(feature = "diagnostic-read-version-caller")]
     #[test]
-    fn read_version_request_caller_classification_uses_bounded_module_names() {
+    fn read_version_request_caller_classification_is_separator_agnostic() {
         assert_eq!(
             read_version_request_caller_from_location("/repo/crates/ecstore/src/store/peer.rs"),
             ReadVersionRequestCaller::Peer
         );
         assert_eq!(
-            read_version_request_caller_from_location("/repo/crates/ecstore/src/set_disk/ops/heal.rs"),
-            ReadVersionRequestCaller::Heal
+            read_version_request_caller_from_location(r"C:\repo\crates\ecstore\src\store\peer.rs"),
+            ReadVersionRequestCaller::Peer
+        );
+        assert_eq!(
+            read_version_request_caller_from_location("/repo/crates/ecstore/src/notstore/peer.rs"),
+            ReadVersionRequestCaller::Other
         );
         assert_eq!(
             read_version_request_caller_from_location("/repo/crates/ecstore/src/store/object.rs"),
@@ -1159,12 +1300,20 @@ mod tests {
             ReadVersionRequestCaller::MetadataRead
         );
         assert_eq!(
+            read_version_request_caller_from_location("/repo/crates/ecstore/src/set_disk/ops/heal.rs"),
+            ReadVersionRequestCaller::Heal
+        );
+        assert_eq!(
             read_version_request_caller_from_location("/repo/crates/ecstore/src/set_disk/ops/multipart.rs"),
             ReadVersionRequestCaller::Multipart
         );
         assert_eq!(
             read_version_request_caller_from_location("/repo/crates/ecstore/src/disk/disk_store.rs"),
             ReadVersionRequestCaller::DiskStore
+        );
+        assert_eq!(
+            read_version_request_caller_from_location(r"C:\repo\crates\ecstore\src\bucket\lifecycle\worker.rs"),
+            ReadVersionRequestCaller::Lifecycle
         );
         assert_eq!(
             read_version_request_caller_from_location("/repo/crates/ecstore/src/other/module.rs"),

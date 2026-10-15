@@ -106,8 +106,8 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     };
     let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
     #[cfg(feature = "diagnostic-read-version-caller")]
-    let read = rustfs_ecstore::api::diagnostic::with_read_version_entry(
-        rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
         read,
     );
     match read.await {
@@ -174,8 +174,8 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
     };
     let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
     #[cfg(feature = "diagnostic-read-version-caller")]
-    let read = rustfs_ecstore::api::diagnostic::with_read_version_entry(
-        rustfs_ecstore::api::diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
         read,
     );
     match read.await {
