@@ -31,6 +31,71 @@ async fn fixture() -> (Vec<TempDir>, Arc<ECStore>) {
     (dirs, store)
 }
 
+async fn multi_pool_fixture() -> (Vec<TempDir>, Arc<ECStore>) {
+    let dirs = (0..8)
+        .map(|_| tempfile::tempdir().expect("real local disk directory"))
+        .collect::<Vec<_>>();
+    let pools = EndpointServerPools(
+        (0..2)
+            .map(|pool_index| {
+                let endpoints = (0..4)
+                    .map(|disk_index| {
+                        let dir = &dirs[pool_index * 4 + disk_index];
+                        let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+                        endpoint.set_pool_index(pool_index);
+                        endpoint.set_set_index(0);
+                        endpoint.set_disk_index(disk_index);
+                        endpoint
+                    })
+                    .collect::<Vec<_>>();
+                PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set: 4,
+                    endpoints: Endpoints::from(endpoints),
+                    cmd_line: "native-multi-pool-test".into(),
+                    platform: "test".into(),
+                }
+            })
+            .collect(),
+    );
+    let instance = Arc::new(InstanceContext::new());
+    init_local_disks_with_instance_ctx(&instance, pools.clone())
+        .await
+        .expect("initialize both physical pools");
+    let store =
+        ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("test address"), pools, CancellationToken::new(), instance)
+            .await
+            .expect("initialize multi-pool store");
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    store
+        .make_bucket(BUCKET, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket across both pools");
+    (dirs, store)
+}
+
+async fn prepare_stream_in_pool(store: &Arc<ECStore>, pool_index: usize, preparation: Uuid, body: Vec<u8>) {
+    let incarnation = store.bucket_incarnation_id(BUCKET).await.expect("bucket incarnation");
+    let fence = store.object_lock_config_snapshot(BUCKET).await.expect("bucket fence");
+    let owner = Arc::new(
+        store
+            .handle_new_ns_lock(BUCKET, KEY)
+            .await
+            .expect("object namespace lock")
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("object write lock"),
+    );
+    let mut reader = PutObjReader::from_vec(body);
+    let (quorum, receipts) = store.pools[pool_index]
+        .get_disks_by_key(KEY)
+        .prepare_native_stream(store.id, BUCKET, KEY, preparation, incarnation, &mut reader, fence, owner)
+        .await
+        .expect("prepare on the specified physical pool");
+    assert!(receipts.len() >= quorum, "NATIVE_CROSS_POOL_PREPARE_REQUIRES_WRITE_QUORUM");
+}
+
 async fn assert_not_published(store: &ECStore) {
     let result = store.get_object_info(BUCKET, KEY, &ObjectOptions::default()).await;
     assert!(
@@ -527,6 +592,123 @@ async fn native_stream_prepare_locator_conflict() {
         "NATIVE_STREAM_REQUIRES_SAVED_PHYSICAL_SET"
     );
     assert_not_published(&store).await;
+}
+
+#[test]
+#[serial_test::serial]
+fn native_stream_prepare_locator_conflict_across_pools_and_unknown_disk() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_stack_size(32 * 1024 * 1024)
+                .build()
+                .expect("large-stack test runtime");
+            runtime.block_on(async {
+                use crate::disk::DiskAPI as _;
+
+                let (dirs, store) = multi_pool_fixture().await;
+                let preparation = Uuid::new_v4();
+                prepare_stream_in_pool(&store, 0, preparation, vec![41; 2 * 1024 * 1024 + 3]).await;
+                prepare_stream_in_pool(&store, 1, preparation, vec![42; 2 * 1024 * 1024 + 3]).await;
+
+                let pool_zero: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(
+                        dirs[0]
+                            .path()
+                            .join(".rustfs.sys/native-preparations")
+                            .join(preparation.to_string())
+                            .join("intent.json"),
+                    )
+                    .expect("pool zero durable locator"),
+                )
+                .expect("pool zero locator JSON");
+                let pool_one: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(
+                        dirs[4]
+                            .path()
+                            .join(".rustfs.sys/native-preparations")
+                            .join(preparation.to_string())
+                            .join("intent.json"),
+                    )
+                    .expect("pool one durable locator"),
+                )
+                .expect("pool one locator JSON");
+                assert_ne!(
+                    pool_zero["object_digest"], pool_one["object_digest"],
+                    "NATIVE_CROSS_POOL_CONFLICT_FIXTURE_MUST_HAVE_DIFFERENT_CONTENT"
+                );
+                assert!(
+                    store.recover_native_object(BUCKET, KEY, preparation).await.is_err(),
+                    "NATIVE_STREAM_MUST_REJECT_PREPARATION_IN_MULTIPLE_POOLS"
+                );
+                assert_not_published(&store).await;
+
+                let unknown_preparation = Uuid::new_v4();
+                prepare_stream_in_pool(&store, 0, unknown_preparation, vec![51; 2 * 1024 * 1024 + 5]).await;
+                let unknown_disk = store.pools[0].get_disks_by_key(KEY).disks.read().await[0]
+                    .as_ref()
+                    .expect("pool zero physical disk")
+                    .get_disk_id()
+                    .await
+                    .expect("read pool zero physical identity")
+                    .expect("known pool zero physical identity");
+                let disk_root = dirs
+                    .iter()
+                    .find(|dir| {
+                        serde_json::from_slice::<crate::layout::format::FormatV3>(
+                            &std::fs::read(dir.path().join(".rustfs.sys/format.json")).expect("read physical format"),
+                        )
+                        .is_ok_and(|format| format.erasure.this == unknown_disk)
+                    })
+                    .expect("resolve pool zero physical root");
+                let prep_dir = disk_root
+                    .path()
+                    .join(".rustfs.sys/native-preparations")
+                    .join(unknown_preparation.to_string());
+                let record_path = prep_dir.join("intent.json");
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).expect("durable locator")).expect("locator JSON");
+                let unknown_identity = Uuid::new_v4();
+                assert_ne!(unknown_disk, unknown_identity);
+                record["disk"] = serde_json::Value::String(unknown_identity.to_string());
+                let bytes = crate::disk::local::native_prepare::canonical_test_record(&record);
+                std::fs::write(&record_path, &bytes).expect("install unknown disk identity");
+                std::fs::write(prep_dir.join("PREPARED"), Sha256::digest(&bytes))
+                    .expect("retain valid marker for unknown identity");
+
+                assert!(
+                    store.recover_native_object(BUCKET, KEY, unknown_preparation).await.is_err(),
+                    "NATIVE_STREAM_MUST_FAIL_CLOSED_ON_UNKNOWN_DISK_IDENTITY"
+                );
+                assert!(
+                    store
+                        .prepare_native_object(
+                            BUCKET,
+                            KEY,
+                            unknown_preparation,
+                            &mut PutObjReader::from_vec(vec![51; 2 * 1024 * 1024 + 5]),
+                        )
+                        .await
+                        .is_err(),
+                    "NATIVE_STREAM_MUST_NOT_REALLOCATE_WHEN_DISK_IDENTITY_IS_UNKNOWN"
+                );
+                assert!(
+                    dirs[4..].iter().all(|dir| !dir
+                        .path()
+                        .join(".rustfs.sys/native-preparations")
+                        .join(unknown_preparation.to_string())
+                        .exists()),
+                    "NATIVE_STREAM_UNKNOWN_DISK_MUST_NOT_RECEIVE_REASSIGNED_PREPARATION"
+                );
+                assert_not_published(&store).await;
+            });
+        })
+        .expect("spawn large-stack native preparation test")
+        .join()
+        .expect("native preparation test thread");
 }
 
 #[tokio::test]
