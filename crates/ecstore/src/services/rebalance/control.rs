@@ -1851,6 +1851,94 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn rebalance_init_missing_fleet_proof_preserves_metadata_and_rechecks_competing_run() {
+        let previous_id = "completed-before-capability-refresh";
+        let terminal = RebalanceMeta {
+            id: previous_id.to_string(),
+            stopped_at: Some(OffsetDateTime::now_utc()),
+            pool_stats: vec![RebalanceStats::default(); 2],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, competing_store) = crate::services::rebalance::test_two_pool_stores(Some(terminal.clone())).await;
+        let disk_stats = vec![
+            DiskStat {
+                total_space: 100,
+                available_space: 0,
+            },
+            DiskStat {
+                total_space: 100,
+                available_space: 100,
+            },
+        ];
+        let initial_epoch = store.ctx.data_movement_operation_epoch();
+        let proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+        set_rebalance_disk_stats_override_for_test(store.id, disk_stats.clone());
+        let err = store
+            .init_rebalance_start(vec!["waiting-request".to_string()])
+            .await
+            .expect_err("initialization must fail closed while the live proof is missing");
+        assert!(
+            err.to_string()
+                .contains("pool activation requires a live fleet capability proof")
+        );
+        assert_eq!(store.ctx.data_movement_operation_epoch(), initial_epoch);
+        {
+            let local = store.rebalance_meta.read().await;
+            let local = local.as_ref().expect("failed initialization must preserve the previous run");
+            assert_eq!(local.id, previous_id);
+            assert_eq!(local.stopped_at, terminal.stopped_at);
+            assert!(local.cancel.is_none(), "failed initialization must not start a worker");
+        }
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(store.pools[0].clone())
+            .await
+            .expect("failed initialization must leave durable metadata readable");
+        assert_eq!(persisted.id, previous_id);
+        assert_eq!(persisted.stopped_at, terminal.stopped_at);
+
+        drop(proof_guard);
+        set_rebalance_disk_stats_override_for_test(competing_store.id, disk_stats.clone());
+        let winning_id = competing_store
+            .init_rebalance_start(vec!["winning-request".to_string()])
+            .await
+            .expect("a ready request must be able to initialize one run after the failed attempt");
+        assert_ne!(winning_id, previous_id);
+
+        // The waiting request still holds its old local snapshot. Its retry must
+        // recheck durable state under the activation locks before publishing.
+        set_rebalance_disk_stats_override_for_test(store.id, disk_stats);
+        assert!(matches!(
+            store.init_rebalance_start(vec!["waiting-request".to_string()]).await,
+            Err(Error::RebalanceAlreadyRunning)
+        ));
+        assert!(matches!(
+            competing_store
+                .init_rebalance_start(vec!["another-request".to_string()])
+                .await,
+            Err(Error::RebalanceAlreadyRunning)
+        ));
+        persisted
+            .load(store.pools[0].clone())
+            .await
+            .expect("the competing run must remain durable after both rejected retries");
+        assert_eq!(persisted.id, winning_id);
+        assert_eq!(persisted.pool_stats[0].buckets, vec!["winning-request".to_string()]);
+        assert_eq!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("old local run must survive")
+                .id,
+            previous_id
+        );
+        assert_eq!(store.ctx.data_movement_operation_epoch(), initial_epoch + 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn rebalance_worker_skips_terminal_metadata_without_fleet_proof() {
         let rebalance_id = "terminal-metadata-without-proof";
         let completed = RebalanceMeta {
