@@ -1032,7 +1032,7 @@ mod tests {
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/{}?forceStart=true", env.url, bucket);
-        signed_admin_post(&heal_url, Some(heal_body), &env.access_key, &env.secret_key)
+        start_root_heal_when_control_ready(&heal_url, heal_body, &env.access_key, &env.secret_key)
             .await
             .expect("admin deep heal should be accepted");
 
