@@ -3747,6 +3747,12 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
     changed
 }
 
+struct CommittedPutOutcome {
+    // Namespace publication succeeded even if its writer must retain repair
+    // responsibility. Completion errors must not select rollback cleanup.
+    completion: Result<(ObjectInfo, Option<OldCurrentSize>)>,
+}
+
 impl SetDisks {
     /// Failure cleanup stays awaited, but shares the same execution budget as
     /// successful PUT continuations when isolation is enabled.
@@ -5093,7 +5099,8 @@ impl SetDisks {
                 || commit_object_lock_guard.is_some()
                 || commit_decommission_object_lock_guard.is_some()
                 || commit_publication_guard.is_some();
-            let commit_allows_early_ack = write_context.allows_early_ack(opts.write_completion)
+            let commit_write_completion = opts.write_completion;
+            let commit_allows_early_ack = write_context.allows_early_ack(commit_write_completion)
                 && !(opts.data_movement && opts.has_decommission_capacity_reservation())
                 && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
@@ -5570,7 +5577,9 @@ impl SetDisks {
                                     );
                                 })
                             },
-                            |request| async move { heal_set.submit_rename_tail_heal(request).await },
+                            move |request| async move {
+                                let _ = heal_set.submit_rename_tail_heal(request, commit_write_completion).await;
+                            },
                         ));
                     }
                 }
@@ -5671,7 +5680,7 @@ impl SetDisks {
                     );
                 }
 
-                if needs_immediate_heal {
+                let repair_result = if needs_immediate_heal {
                     rustfs_io_metrics::record_put_object_stage_duration(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_TRIGGERED,
                         1.0,
@@ -5689,17 +5698,19 @@ impl SetDisks {
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
                     request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                    commit_set.submit_rename_tail_heal(request).await;
+                    let result = commit_set.submit_rename_tail_heal(request, commit_write_completion).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT,
                         heal_submit_started,
                     );
+                    result
                 } else {
                     rustfs_io_metrics::record_put_object_stage_duration(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_SKIPPED,
                         1.0,
                     );
-                }
+                    Ok(())
+                };
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
                 let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
@@ -5909,6 +5920,7 @@ impl SetDisks {
                         event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = if repair_result.is_ok() { "success" } else { "repair_required" },
                         bucket = %commit_bucket,
                         object = %commit_object,
                         write_quorum,
@@ -5919,7 +5931,6 @@ impl SetDisks {
                         cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
                         cleanup_present = cleanup_stage_ms.is_some(),
                         commit_tail_ms = total_commit_tail_ms as u64,
-                        result = "success",
                         "SetDisk put_object stage summary"
                     );
                 }
@@ -5940,26 +5951,29 @@ impl SetDisks {
                     });
                 }
 
-                let object_info_build_started = rustfs_io_metrics::put_stage_timer();
-                let object_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
-                    object_info_build_started,
-                );
-                let post_object_info_to_return_started = rustfs_io_metrics::put_stage_timer();
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
-                    post_object_info_to_return_started,
-                );
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
-                    commit_after_rename_to_return_started,
-                );
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
-                    commit_closure_total_started,
-                );
-                Ok((object_info, old_current_size))
+                let completion = repair_result.map(|()| {
+                    let object_info_build_started = rustfs_io_metrics::put_stage_timer();
+                    let object_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
+                        object_info_build_started,
+                    );
+                    let post_object_info_to_return_started = rustfs_io_metrics::put_stage_timer();
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
+                        post_object_info_to_return_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
+                        commit_after_rename_to_return_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
+                        commit_closure_total_started,
+                    );
+                    (object_info, old_current_size)
+                });
+                Ok(CommittedPutOutcome { completion })
             };
 
             if let Some(handoff) = commit_cancellation_handoff_tx.take() {
@@ -6011,8 +6025,7 @@ impl SetDisks {
             }
         };
         let operation_select_wait_started = rustfs_io_metrics::put_stage_timer();
-        let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = if let Some((cancellation, mut handoff_rx)) = cancellation_wait
-        {
+        let result: Result<CommittedPutOutcome> = if let Some((cancellation, mut handoff_rx)) = cancellation_wait {
             tokio::pin!(operation);
             tokio::select! {
                 biased;
@@ -6036,27 +6049,6 @@ impl SetDisks {
             rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN,
             operation_result_return_started,
         );
-
-        if issue3031_diag_enabled()
-            && let Err(err) = &result
-        {
-            let stage_hint = if err.to_string().contains("not enough disks to write") {
-                "writer_setup_or_quorum"
-            } else {
-                "unknown"
-            };
-            warn!(
-                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                bucket = %bucket,
-                object = %object,
-                result = "error",
-                stage_hint,
-                error = %err,
-                "SetDisk put_object stage summary"
-            );
-        }
 
         if issue3031_diag_enabled() {
             warn!(
@@ -6109,6 +6101,29 @@ impl SetDisks {
                     "issue3031_put_object_tmp_cleanup_done"
                 );
             }
+        }
+
+        let result = result.and_then(|committed| committed.completion);
+
+        if issue3031_diag_enabled()
+            && let Err(err) = &result
+        {
+            let stage_hint = if err.to_string().contains("not enough disks to write") {
+                "writer_setup_or_quorum"
+            } else {
+                "unknown"
+            };
+            warn!(
+                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = "error",
+                bucket = %bucket,
+                object = %object,
+                stage_hint,
+                error = %err,
+                "SetDisk put_object stage summary"
+            );
         }
 
         result
@@ -21779,6 +21794,294 @@ mod put_object_tmp_cleanup_tests {
                 let mut body = Vec::new();
                 read.stream.read_to_end(&mut body).await.expect("successor body must drain");
                 assert_eq!(body, b"cas successor");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn system_metadata_repair_error_does_not_wait_for_committed_tmp_cleanup() {
+        const CHILD: &str = "RUSTFS_METADATA_REPAIR_CLEANUP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().expect("test executable must be available"))
+                    .args([
+                        "--exact",
+                        "set_disk::ops::object::put_object_tmp_cleanup_tests::system_metadata_repair_error_does_not_wait_for_committed_tmp_cleanup",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_MAX_PENDING", "2")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS", "1")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                    .output()
+                    .expect("the isolated cleanup regression child must run")
+            })
+            .await
+            .expect("cleanup regression child launcher must join");
+            assert!(
+                output.status.success(),
+                "cleanup regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let (dirs, _disks, set) = hermetic_set_disks(4).await;
+        let occupied = cleanup_runtime::reserve()
+            .expect("the cleanup blocker must be admitted")
+            .expect("the child must enable cleanup isolation");
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let blocker = cleanup_runtime::spawn(Some(occupied), async move {
+            ready.send(()).expect("the fixture must observe the cleanup worker");
+            let _ = released.await;
+        });
+        tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .expect("the cleanup blocker must acquire the execution worker")
+            .expect("the blocker readiness sender must stay alive");
+
+        let object = "pool.bin.identity-cleanup-owner";
+        let body = b"committed metadata with pending repair".to_vec();
+        let fault = rename_fault_injection::fail_rename_on(object, &[0]);
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::config::com::save_config_with_opts(
+                Arc::clone(&set),
+                object,
+                body.clone(),
+                &ObjectOptions {
+                    max_parity: true,
+                    write_completion: WriteCompletion::TailDrainedWithOwnerRepair,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        release.send(()).expect("the cleanup blocker must stay alive until released");
+        tokio::time::timeout(Duration::from_secs(30), blocker)
+            .await
+            .expect("the released cleanup blocker must finish")
+            .expect("the cleanup blocker task must join");
+        let error = response
+            .expect("repair-required response must not wait for the committed temporary cleanup owner")
+            .expect_err("the committed minority failure must reach the metadata writer");
+        assert!(
+            matches!(error, Error::Io(ref inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+        );
+        drop(fault);
+        wait_for_tmp_workspace_to_drain(&dirs, "the retained cleanup owner must eventually remove staged metadata").await;
+        let committed = crate::config::com::read_config(Arc::clone(&set), object)
+            .await
+            .expect("the repair-required metadata quorum must remain readable");
+        assert_eq!(committed, body);
+    }
+
+    #[tokio::test]
+    async fn rename_tail_heal_keeps_system_authority_separate_from_user_incarnation() {
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        let mut heals = set.capture_test_rename_tail_heals();
+        let incarnation = Uuid::new_v4();
+        for bucket in [RUSTFS_META_BUCKET, ".minio.sys"] {
+            for expected in [None, Some(incarnation)] {
+                let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+                    bucket.to_string(),
+                    Some("pool.bin.identity".to_string()),
+                    false,
+                    Some(HealChannelPriority::Normal),
+                    Some(0),
+                    Some(0),
+                );
+                request.expected_bucket_incarnation_id = expected;
+                let error = set
+                    .submit_rename_tail_heal(request, WriteCompletion::TailDrainedWithOwnerRepair)
+                    .await
+                    .expect_err("system repair must remain with its writer");
+                assert!(
+                    matches!(error, Error::Io(ref inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+                );
+                assert!(
+                    heals.try_recv().is_err(),
+                    "even a supplied user incarnation cannot authorize system metadata heal"
+                );
+            }
+        }
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+            "ordinary-bucket".to_string(),
+            Some("ordinary-object".to_string()),
+            false,
+            Some(HealChannelPriority::Normal),
+            Some(0),
+            Some(0),
+        );
+        request.expected_bucket_incarnation_id = Some(incarnation);
+        set.submit_rename_tail_heal(request, WriteCompletion::Quorum)
+            .await
+            .expect("ordinary incarnation-bound fallback must remain available");
+        let admitted = heals
+            .try_recv()
+            .expect("the ordinary fallback must actually reach the channel");
+        assert_eq!(admitted.expected_bucket_incarnation_id, Some(incarnation));
+        assert_eq!(admitted.source, rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf);
+        assert_eq!(admitted.object_prefix.as_deref(), Some("ordinary-object"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn system_metadata_partial_write_respects_completion_contract() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for completion in [
+                WriteCompletion::Quorum,
+                WriteCompletion::TailDrained,
+                WriteCompletion::TailDrainedWithOwnerRepair,
+            ] {
+                let (dirs, disks, set) = hermetic_set_disks(4).await;
+                let object = format!("pool.bin.identity-{completion:?}");
+                let original = b"original deployment identity".to_vec();
+                let fixture_options = ObjectOptions {
+                    max_parity: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                crate::config::com::save_config_with_opts(Arc::clone(&set), &object, original.clone(), &fixture_options)
+                    .await
+                    .expect("healthy system metadata write must succeed without a bucket incarnation");
+                let original_info = set
+                    .get_object_info(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+                    .await
+                    .expect("original metadata must be readable before the partial overwrite");
+                let original_etag = original_info.etag.expect("original metadata must have an ETag");
+                let updated = b"updated deployment identity".to_vec();
+                let mut heals = set.capture_test_rename_tail_heals();
+                let tasks = rename_fanout_barrier::observe_tasks(&object);
+                let barrier = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let fault = rename_fault_injection::fail_rename_on(&object, &[0]);
+                let writer = Arc::clone(&set);
+                let write_object = object.clone();
+                let write_body = updated.clone();
+                let write = tokio::spawn(async move {
+                    crate::config::com::save_config_with_opts(
+                        writer,
+                        &write_object,
+                        write_body,
+                        &ObjectOptions {
+                            max_parity: true,
+                            write_completion: completion,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("the metadata rename tail must reach the failure barrier");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let mut updated_copies = 0;
+                        for disk in &disks {
+                            let info = disk
+                                .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                                .await
+                                .expect("each disk must retain either the original or updated metadata");
+                            if info.metadata.get("etag").is_some_and(|etag| etag != &original_etag) {
+                                updated_copies += 1;
+                            }
+                        }
+                        if updated_copies == 3 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the metadata overwrite must reach quorum while the last disk is paused");
+                if completion != WriteCompletion::Quorum {
+                    assert!(
+                        !write.is_finished(),
+                        "drained completion must wait for the rename tail before acknowledging"
+                    );
+                }
+                barrier.release();
+                let result = tokio::time::timeout(Duration::from_secs(30), write)
+                    .await
+                    .expect("the metadata tail must drain")
+                    .expect("the metadata writer task must join");
+                if completion == WriteCompletion::TailDrainedWithOwnerRepair {
+                    let error = result.expect_err("the pool metadata owner must receive repair responsibility");
+                    let Error::Io(error) = error else {
+                        panic!("system metadata repair must retain its typed error");
+                    };
+                    assert!(
+                        error
+                            .get_ref()
+                            .is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()),
+                        "the config writer must retain the exact repair-required cause: {error}"
+                    );
+                } else {
+                    result.expect("ordinary system metadata must preserve quorum-success semantics");
+                }
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while tasks.running() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the committed rename tail must eventually finish for every completion mode");
+                assert_eq!(tasks.running(), 0, "repair failure must be returned after all rename tasks drain");
+                assert!(heals.try_recv().is_err(), "system metadata must never enqueue an unfenced MRF heal");
+                let mut stale_copies = 0;
+                let mut committed_etags = Vec::new();
+                for disk in &disks {
+                    let info = disk
+                        .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                        .await
+                        .expect("every physical disk must retain its metadata after the partial rename");
+                    let etag = info.metadata.get("etag").expect("each metadata copy must retain an ETag");
+                    if etag == &original_etag {
+                        stale_copies += 1;
+                    } else {
+                        committed_etags.push(etag.clone());
+                    }
+                }
+                assert_eq!(stale_copies, 1, "exactly the failed rename must retain the old metadata");
+                assert_eq!(committed_etags.len(), 3, "the new metadata must retain its write quorum");
+                assert!(committed_etags.iter().all(|etag| etag == &committed_etags[0]));
+                let committed =
+                    tokio::time::timeout(Duration::from_secs(30), crate::config::com::read_config(Arc::clone(&set), &object))
+                        .await
+                        .expect("the committed metadata read must finish after the rename tail drains")
+                        .expect("a repair-required result must not roll back the committed metadata quorum");
+                assert_eq!(committed, updated, "the read must see the new bytes after cache invalidation");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !non_trash_tmp_entries(&dirs).await.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("repair-required results must still schedule committed temporary-data cleanup");
+                drop(fault);
+                drop(barrier);
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    crate::config::com::save_config_with_opts(Arc::clone(&set), &object, updated.clone(), &fixture_options),
+                )
+                .await
+                .expect("the reconciliation must finish after the fault and barrier are disarmed")
+                .expect("the owning writer must be able to reconcile after the failed disk recovers");
+                for disk in &disks {
+                    let info = disk
+                        .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                        .await
+                        .expect("the reconciled metadata must exist on every disk");
+                    assert_ne!(info.metadata.get("etag"), Some(&original_etag));
+                }
             }
         })
         .await;

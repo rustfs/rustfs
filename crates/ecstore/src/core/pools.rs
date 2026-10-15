@@ -6685,12 +6685,12 @@ fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMet
     fence.ensure_held()?;
     let mut opts = ObjectOptions {
         max_parity: true,
-        write_completion: crate::object_api::WriteCompletion::TailDrained,
         no_lock: true,
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
     };
     fence.add_to_options(&mut opts, object);
+    opts.write_completion = crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair;
     Ok(opts)
 }
 
@@ -6735,7 +6735,11 @@ where
             "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&data)),
             "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
             "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
-            "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
+            "tail_drained": matches!(
+                opts.write_completion,
+                crate::object_api::WriteCompletion::TailDrained
+                    | crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair
+            ),
             "no_lock": opts.no_lock,
         })
     });
@@ -24692,7 +24696,7 @@ mod pools_tests {
                     _ => panic!("phase fixture must receive valid pool metadata"),
                 };
                 assert!(opts.max_parity && opts.no_lock);
-                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrained);
+                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair);
                 self.trace.calls.lock().expect("trace lock").push(WriteCall {
                     pool: self.pool,
                     phase,

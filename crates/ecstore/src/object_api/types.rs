@@ -898,6 +898,10 @@ pub enum WriteCompletion {
     /// Drain the rename fan-out before returning. Minority failures still heal
     /// after a successful quorum commit; this does not require every disk to succeed.
     TailDrained,
+    /// Drain the rename fan-out and return system-metadata repair to the
+    /// caller's existing deployment/transaction owner. This does not grant
+    /// write or heal authority and does not change the quorum requirement.
+    TailDrainedWithOwnerRepair,
 }
 
 /// Storage-owned write mode inherited by physical rewrites. This selects the
