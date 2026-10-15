@@ -3691,6 +3691,55 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     }
 }
 
+fn rebalance_worker_read_lock_error(err: rustfs_lock::LockError, object: &str) -> Error {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object: object.to_string(),
+            required,
+            achieved,
+        },
+        other => Error::Lock(other),
+    }
+}
+
+/// Read-only admission to an already durable rebalance run. Keeping this
+/// separate from the activation writer prevents admission from authorizing a
+/// pool or rebalance metadata write under shared namespace locks.
+pub(crate) struct PoolRebalanceWorkerFence {
+    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
+    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+}
+
+impl PoolRebalanceWorkerFence {
+    pub(crate) fn set_fleet_proof(
+        &mut self,
+        fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+    ) {
+        self.fleet_proof = fleet_proof;
+    }
+
+    pub(crate) fn ensure_held(&self) -> Result<()> {
+        if self.pool_meta_guard.is_lock_lost()
+            || self.pool_meta_guard.is_released()
+            || self.rebalance_meta_guard.is_lock_lost()
+            || self.rebalance_meta_guard.is_released()
+        {
+            return Err(Error::other("worker admission lock lost before rebalance activation"));
+        }
+        if self
+            .fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof))
+        {
+            return Err(Error::other(POOL_ACTIVATION_FLEET_PROOF_EXPIRED));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct PoolRebalanceActivationFence {
     pool_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     rebalance_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
@@ -3760,6 +3809,35 @@ impl PoolRebalanceActivationFence {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static REBALANCE_ACTIVATION_LOCK_ATTEMPT: Arc<tokio::sync::Notify>;
+}
+
+pub(crate) async fn acquire_pool_rebalance_worker_locks<S>(pool: Arc<S>) -> Result<PoolRebalanceWorkerFence>
+where
+    S: crate::storage_api_contracts::namespace::NamespaceLocking<
+            Error = Error,
+            NamespaceLock = rustfs_lock::NamespaceLockWrapper,
+        >,
+{
+    // Match activation and entry admission: rebalance.bin -> pool.bin. Joining
+    // the same durable run must coexist with entries retaining their run fence.
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    #[cfg(test)]
+    let _ = REBALANCE_ACTIVATION_LOCK_ATTEMPT.try_with(|attempted| attempted.notify_one());
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, REBAL_META_NAME))?;
+    let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+    let pool_meta_guard = pool_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, POOL_META_NAME))?;
+
+    Ok(PoolRebalanceWorkerFence {
+        pool_meta_guard,
+        rebalance_meta_guard,
+        fleet_proof: None,
+    })
 }
 
 pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
@@ -12427,6 +12505,18 @@ impl ECStore {
         write_state.observe_replicas(replica_state);
         write_state.ensure_missing_metadata_can_initialize()?;
         write_state.ensure_write_safe(operation)?;
+        Ok(pool_meta)
+    }
+
+    pub(crate) async fn load_runtime_pool_meta_under_worker_fence(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        worker_fence: &PoolRebalanceWorkerFence,
+        operation: &str,
+    ) -> Result<PoolMeta> {
+        worker_fence.ensure_held()?;
+        let pool_meta = self.load_runtime_pool_meta_observing(write_state, operation).await?;
+        worker_fence.ensure_held()?;
         Ok(pool_meta)
     }
 
