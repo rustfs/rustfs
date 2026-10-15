@@ -2063,7 +2063,6 @@ where
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
             let route_probe_observational_only = observational_only;
-            let remote_lease_fence = remote_lease_fence.clone();
             let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
             let remote_lease_tokens = remote_publication_leases
                 .as_ref()
@@ -3601,18 +3600,6 @@ where
     }
 }
 
-fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_published_snapshot: bool) -> bool {
-    // Incomplete cycles may emit only a non-authoritative snapshot. Its lease
-    // must allow ordinary namespace commits while retaining the movement fence.
-    has_published_snapshot
-        && matches!(
-            status,
-            ScannerCycleStatus::Superseded
-                | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-                | ScannerCycleStatus::Incomplete
-        )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCyclePublicationPlan {
     ProgressOnly,
@@ -3622,12 +3609,15 @@ enum ScannerCyclePublicationPlan {
 
 impl ScannerCyclePublicationPlan {
     fn for_result(result: &ScannerCycleResult) -> Self {
-        if !result.has_usage_update() {
-            Self::ProgressOnly
-        } else if scanner_cycle_uses_observational_publication(result.status, true) {
-            Self::Observational
-        } else {
-            Self::Authoritative
+        match (result.has_usage_update(), result.status) {
+            (false, _) => Self::ProgressOnly,
+            (
+                true,
+                ScannerCycleStatus::Superseded
+                | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                | ScannerCycleStatus::Incomplete,
+            ) => Self::Observational,
+            (true, _) => Self::Authoritative,
         }
     }
 
@@ -3659,7 +3649,7 @@ impl ScannerCyclePublicationPlan {
         // to save partial progress. No usage update means namespace stability
         // is unnecessary, but peer session/generation and movement checks stay.
         let proof_ctx = if self == Self::ProgressOnly {
-            parent.child_token()
+            parent.clone()
         } else {
             budget.token()
         };
