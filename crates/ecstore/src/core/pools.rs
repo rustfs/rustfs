@@ -79,12 +79,13 @@ use rand::RngExt as _;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{
     decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
 };
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -13945,7 +13946,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -14115,7 +14116,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -14223,7 +14224,7 @@ impl ECStore {
         bi: DecomBucketInfo,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -14848,7 +14849,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         attempts: &mut usize,
@@ -15005,7 +15006,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         entry_attempt: usize,
         scanner_backlog_handoff_attempt: usize,

@@ -197,7 +197,10 @@ pub(crate) mod owner {
 pub struct ScannerReplicationConfig(EcstoreReplicationConfig);
 
 impl ScannerReplicationConfig {
-    pub(crate) fn new(config: Option<s3s::dto::ReplicationConfiguration>, remotes: Option<EcstoreBucketTargets>) -> Self {
+    pub(crate) fn new(
+        config: Option<rustfs_gateway_types::persistence::PersistedReplicationConfiguration>,
+        remotes: Option<EcstoreBucketTargets>,
+    ) -> Self {
         Self(EcstoreReplicationConfig::new(config, remotes))
     }
 

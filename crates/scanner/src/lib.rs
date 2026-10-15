@@ -342,7 +342,7 @@ pub(crate) async fn get_object_lock_config(
 
 pub(crate) async fn get_replication_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedReplicationConfiguration, time::OffsetDateTime)> {
     ecstore_get_replication_config(bucket).await
 }
 
@@ -360,9 +360,9 @@ pub(crate) trait ScannerReplicationConfigExt {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
 }
 
-impl ScannerReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+impl ScannerReplicationConfigExt for rustfs_gateway_types::persistence::PersistedReplicationConfiguration {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
-        <s3s::dto::ReplicationConfiguration as EcstoreReplicationConfigurationExt>::has_active_rules(self, prefix, recursive)
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as EcstoreReplicationConfigurationExt>::has_active_rules(self, prefix, recursive)
     }
 }
 
