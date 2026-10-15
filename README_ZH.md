@@ -241,7 +241,7 @@ rustfs --help
 
 ### 7\. 使用 SwarmCLI Chart 部署到 Docker Swarm (Option 7)
 
-请按照 [SwarmCLI Chart 指南](https://docs.rustfs.com/zh/installation/cloud-native/swarmcli-chart)，使用社区维护的 [SwarmCLI `rustfs` Chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs) 在 Docker Swarm 上运行单节点 RustFS 服务，root 凭证保存在 Docker Secret 中。该 Chart 和 [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) 由 Eldara Tech 维护，并非 RustFS 项目的一部分。
+请按照 [SwarmCLI Chart 指南](https://docs.rustfs.com/zh/installation/cloud-native/swarmcli-chart)，使用社区维护的 [SwarmCLI `rustfs` Chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs) 在 Docker Swarm 上运行单节点 RustFS 服务。该 Chart 将 root 凭证保存在 Docker Secret 中并拒绝默认的 `rustfsadmin` 密钥，以带版本的发布进行升级和回滚，并可通过 Traefik 以 HTTPS 提供 S3 API。控制台默认关闭，需要时再启用。该 Chart 和 [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) 由 Eldara Tech 维护，并非 RustFS 项目的一部分。
 
 ---
 
