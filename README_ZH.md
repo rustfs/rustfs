@@ -239,6 +239,10 @@ x env use rustfs
 rustfs --help
 ```
 
+### 7\. 使用 SwarmCLI Chart 部署到 Docker Swarm (Option 7)
+
+请按照 [Docker Swarm 指南](https://docs.rustfs.com/zh/installation/container/swarm)，使用社区维护的 [SwarmCLI `rustfs` Chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs) 在 Docker Swarm 上运行单节点 RustFS 服务，root 凭证保存在 Docker Secret 中。该 Chart 和 [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) 由 Eldara Tech 维护，并非 RustFS 项目的一部分。
+
 ---
 
 ### 访问 RustFS

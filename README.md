@@ -311,6 +311,10 @@ x env use rustfs
 rustfs --help
 ```
 
+### 7\. Docker Swarm with the SwarmCLI chart (Option 7)
+
+Follow the [Docker Swarm guide](https://docs.rustfs.com/en/installation/container/swarm) to run a single-node RustFS service on Docker Swarm with the community [SwarmCLI `rustfs` chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs), which keeps the root credentials in Docker secrets. The chart and [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) are maintained by Eldara Tech, not by the RustFS project.
+
 ---
 
 ### Accessing RustFS
