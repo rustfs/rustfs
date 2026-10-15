@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from pathlib import Path
@@ -1292,9 +1293,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             ) as request:
                 if changed:
                     with self.assertRaisesRegex(RuntimeError, "warehouse identity"):
-                        pyiceberg_smoke.run_table_rename_probe(args, mock.Mock())
+                        pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
                 else:
-                    pyiceberg_smoke.run_table_rename_probe(args, mock.Mock())
+                    pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
                 renames = [call.args[4] for call in request.call_args_list if call.args[2] == "POST"]
                 self.assertEqual(renames[0]["source"], renames[1]["destination"])
                 self.assertEqual(renames[0]["destination"], renames[1]["source"])
@@ -1404,6 +1405,207 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.failure_coverage.production_failure_matrix())))
+
+
+class SmokeCleanupTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.args = SimpleNamespace(bucket="lake", namespace="sales", table="orders", rest_path="/iceberg")
+        self.original = {
+            "metadata-location": "s3://lake/original/metadata/v2.metadata.json",
+            "metadata": {"table-uuid": "original-id", "location": "s3://lake/original",
+                         "current-schema-id": 0, "schemas": [{"schema-id": 0, "type": "struct", "fields": []}],
+                         "current-snapshot-id": 7, "snapshots": [{"snapshot-id": 7}]},
+        }
+        self.pointer = {"metadata-location": self.original["metadata-location"], "version-token": "token", "generation": 4}
+        self.replacement = {"metadata": {"table-uuid": "fresh-id", "location": "s3://lake/fresh", "snapshots": []}}
+        self.entries = {"orders": copy.deepcopy(self.original)}
+        self.namespace_present = True
+        self.calls = []
+        self.backing = "object"
+        self.after_cleanup = None
+        self.after_cleanup_pointer = None
+
+    def request(self, args: object, deps: object, method: str, path: str, body: object = None) -> dict[str, object]:
+        self.calls.append((method, path, body))
+        if path.endswith("/tables/rename"):
+            source, destination = body["source"]["name"], body["destination"]["name"]
+            value = self.entries.pop(source)
+            if self.backing == "object":
+                self.entries[source] = None  # Retained inactive entry, hidden from load/list.
+            self.entries[destination] = value
+            return {}
+        if path.endswith("/metadata-location"):
+            return copy.deepcopy(self.pointer)
+        if method == "POST" and path.endswith("/tables"):
+            self.entries[body["name"]] = copy.deepcopy(self.replacement)
+            return copy.deepcopy(self.replacement)
+        name = path.rsplit("/", 1)[-1]
+        if method == "GET":
+            value = self.entries.get(name)
+            if value is None:
+                raise pyiceberg_smoke.RestRequestError(method, path, 404, "missing")
+            return copy.deepcopy(value)
+        if method == "DELETE":
+            del self.entries[name]
+            if self.after_cleanup is not None:
+                self.entries["orders"] = self.after_cleanup
+            if self.after_cleanup_pointer is not None:
+                self.pointer = self.after_cleanup_pointer
+            return {}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    def rename(self) -> None:
+        with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="owned")), mock.patch.object(
+            pyiceberg_smoke, "signed_rest_request", side_effect=self.request
+        ):
+            pyiceberg_smoke.run_table_rename_probe(self.args, mock.Mock(), self.backing)
+
+    def catalog(self) -> object:
+        catalog = mock.Mock()
+        catalog.table_exists.side_effect = lambda identifier: self.entries.get(identifier[1]) is not None
+        catalog.drop_table.side_effect = lambda identifier: self.entries.pop(identifier[1])
+        catalog.namespace_exists.side_effect = lambda namespace: self.namespace_present
+
+        def drop_namespace(namespace: str) -> None:
+            if self.entries:
+                raise RuntimeError("NamespaceNotEmptyException")
+            self.namespace_present = False
+
+        catalog.drop_namespace.side_effect = drop_namespace
+        return catalog
+
+    def test_object_rename_consumes_only_its_tombstone_before_namespace_cleanup(self) -> None:
+        self.rename()
+        creates = [call for call in self.calls if call[0] == "POST" and call[1].endswith("/tables")]
+        deletes = [call for call in self.calls if call[0] == "DELETE"]
+        self.assertEqual(creates, [("POST", "/iceberg/v1/lake/namespaces/sales/tables",
+                                   {"name": "renamed-owned", "schema": self.original["metadata"]["schemas"][0]})])
+        self.assertEqual(deletes, [("DELETE", "/iceberg/v1/lake/namespaces/sales/tables/renamed-owned", None)])
+        self.assertEqual(self.entries, {"orders": self.original})
+        self.assertEqual(self.pointer, {"metadata-location": self.original["metadata-location"],
+                                        "version-token": "token", "generation": 4})
+        pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertFalse(self.namespace_present)
+        self.assertEqual(self.entries, {})
+
+    def test_strong_rename_does_not_create_or_drop_a_cleanup_table(self) -> None:
+        self.backing = "durable-strong"
+        self.rename()
+        self.assertFalse(any(method == "DELETE" or (method == "POST" and path.endswith("/tables"))
+                             for method, path, _ in self.calls))
+        pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertFalse(self.namespace_present)
+
+    def test_rename_does_not_sweep_unrelated_inactive_entries(self) -> None:
+        self.entries["unrelated"] = None
+        self.rename()
+        self.assertIn("unrelated", self.entries)
+        with self.assertRaisesRegex(RuntimeError, "NamespaceNotEmptyException"):
+            pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertTrue(self.namespace_present)
+
+    def test_rename_rejects_unknown_backing_before_mutation(self) -> None:
+        self.backing = "unknown"
+        with self.assertRaisesRegex(RuntimeError, "known backing"):
+            self.rename()
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_identity_must_be_new_and_empty(self) -> None:
+        cases = [("table-uuid", "original-id"), ("table-uuid", ""), ("location", "s3://lake/original"),
+                 ("location", None), ("snapshots", [{"snapshot-id": 7}]), ("current-snapshot-id", 7)]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                self.replacement["metadata"][key] = value
+                with self.assertRaisesRegex(RuntimeError, "isolated empty table"):
+                    self.rename()
+                self.assertFalse(any(method == "DELETE" for method, _, _ in self.calls))
+                self.assertEqual(self.entries["orders"], self.original)
+
+    def test_missing_schema_or_commit_state_fails_before_create(self) -> None:
+        for missing in ("schemas", "metadata-location", "version-token", "generation"):
+            with self.subTest(missing=missing):
+                self.setUp()
+                if missing == "schemas":
+                    del self.entries["orders"]["metadata"][missing]
+                else:
+                    del self.pointer[missing]
+                with self.assertRaisesRegex(RuntimeError, "rename cleanup requires"):
+                    self.rename()
+                self.assertFalse(any(method == "POST" and path.endswith("/tables") for method, path, _ in self.calls))
+
+    def test_cleanup_detects_original_metadata_or_commit_change(self) -> None:
+        for changed in ("metadata", "metadata-location", "version-token", "generation"):
+            with self.subTest(changed=changed):
+                self.setUp()
+                if changed == "metadata":
+                    self.after_cleanup = copy.deepcopy(self.original)
+                    self.after_cleanup["metadata"]["table-uuid"] = "changed"
+                else:
+                    self.after_cleanup_pointer = {**self.pointer, changed: "changed"}
+                with self.assertRaisesRegex(RuntimeError, "changed the original"):
+                    self.rename()
+
+    def test_cleanup_rejects_namespace_drop_failure_and_does_not_write_evidence(self) -> None:
+        errors = [RuntimeError("NamespaceNotEmptyException"), PermissionError("403"),
+                  RuntimeError("500: object not found during namespace write"), TimeoutError("timeout")]
+        for error in errors:
+            with self.subTest(error=error):
+                catalog = mock.Mock()
+                catalog.table_exists.side_effect = [True, False]
+                catalog.namespace_exists.return_value = True
+                catalog.drop_namespace.side_effect = error
+                with mock.patch.object(pyiceberg_smoke, "parse_args", return_value=object()), mock.patch.object(
+                    pyiceberg_smoke, "printed_metadata", return_value=False
+                ), mock.patch.object(pyiceberg_smoke, "load_runtime_deps"), mock.patch.object(
+                    pyiceberg_smoke, "run_smoke",
+                    side_effect=lambda *args: pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+                ), mock.patch.object(pyiceberg_smoke, "write_live_evidence") as write, redirect_stderr(StringIO()):
+                    self.assertEqual(pyiceberg_smoke.main(), 1)
+                write.assert_not_called()
+
+    def test_cleanup_rejects_false_successful_table_or_namespace_drop(self) -> None:
+        for resource in ("table", "namespace"):
+            with self.subTest(resource=resource):
+                catalog = mock.Mock()
+                catalog.table_exists.side_effect = [True, resource == "table"]
+                catalog.namespace_exists.return_value = True
+                with self.assertRaisesRegex(RuntimeError, resource + " remains"):
+                    pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+
+    def test_cleanup_accepts_observed_already_absent_resources(self) -> None:
+        catalog = mock.Mock()
+        catalog.table_exists.return_value = False
+        catalog.namespace_exists.return_value = False
+        pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+        catalog.drop_table.assert_not_called()
+        catalog.drop_namespace.assert_not_called()
+
+    def test_cleanup_read_failures_are_not_absence(self) -> None:
+        for check in ("table_exists", "namespace_exists"):
+            with self.subTest(check=check):
+                catalog = mock.Mock()
+                catalog.table_exists.return_value = False
+                getattr(catalog, check).side_effect = TimeoutError("read failed")
+                with self.assertRaises(TimeoutError):
+                    pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+                catalog.drop_namespace.assert_not_called()
+
+    def test_rename_transport_and_drop_failure_propagate(self) -> None:
+        for method, suffix in (("POST", "/tables"), ("DELETE", "/renamed-owned")):
+            with self.subTest(method=method):
+                self.setUp()
+
+                def fail(args: object, deps: object, verb: str, path: str, body: object = None) -> dict[str, object]:
+                    if verb == method and path.endswith(suffix):
+                        raise TimeoutError("cleanup interrupted")
+                    return self.request(args, deps, verb, path, body)
+
+                with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="owned")), mock.patch.object(
+                    pyiceberg_smoke, "signed_rest_request", side_effect=fail
+                ), self.assertRaises(TimeoutError):
+                    pyiceberg_smoke.run_table_rename_probe(self.args, mock.Mock(), self.backing)
+                self.assertEqual(self.entries["orders"], self.original)
 
 
 if __name__ == "__main__":

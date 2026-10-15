@@ -1182,12 +1182,12 @@ def drop_table_if_present(catalog: Any, identifier: tuple[str, str]) -> None:
 
 def cleanup_catalog(catalog: Any, identifier: tuple[str, str]) -> None:
     drop_table_if_present(catalog, identifier)
-    try:
+    if catalog.table_exists(identifier):
+        raise RuntimeError("smoke table remains after cleanup")
+    if catalog.namespace_exists(identifier[0]):
         catalog.drop_namespace(identifier[0])
-    except Exception as error:
-        message = str(error).lower()
-        if "not found" not in message and "does not exist" not in message:
-            print(f"warning: failed to drop namespace {identifier[0]}: {error}", file=sys.stderr)
+    if catalog.namespace_exists(identifier[0]):
+        raise RuntimeError("smoke namespace remains after cleanup")
 
 
 def current_snapshot_id_from_table_response(response: dict[str, Any]) -> int:
@@ -1393,7 +1393,9 @@ def run_namespace_properties_probe(args: argparse.Namespace, deps: RuntimeDeps, 
         raise RuntimeError("rejected namespace property update changed persisted properties")
 
 
-def run_table_rename_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+def run_table_rename_probe(args: argparse.Namespace, deps: RuntimeDeps, backing: str) -> None:
+    if backing not in CATALOG_BACKINGS:
+        raise RuntimeError("table rename probe requires a known backing")
     source = {"namespace": [args.namespace], "name": args.table}
     destination = {"namespace": [args.namespace], "name": f"renamed-{uuid.uuid4().hex}"}
     rename_path = f"{args.rest_path}/v1/{urllib.parse.quote(args.bucket, safe='')}/tables/rename"
@@ -1410,8 +1412,33 @@ def run_table_rename_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     finally:
         signed_rest_request(args, deps, "POST", rename_path, {"source": destination, "destination": source})
     restored = signed_rest_request(args, deps, "GET", source_path)
-    if restored.get("metadata-location") != before["metadata-location"]:
-        raise RuntimeError("restored table rename changed the metadata pointer")
+    if any(restored.get(key) != before[key] for key in ("metadata-location", "metadata")):
+        raise RuntimeError("restored table rename changed the metadata or identity")
+    if backing == "object":
+        # Object-backed rename retains an inactive source entry. Consume only
+        # this probe's random identifier through normal create/drop APIs.
+        metadata = restored["metadata"]
+        schema = next((schema for schema in metadata.get("schemas", [])
+                       if schema.get("schema-id") == metadata.get("current-schema-id")), None)
+        if schema is None:
+            raise RuntimeError("rename cleanup requires the original table schema")
+        pointer_path = table_endpoint_path(args, "/metadata-location")
+        pointer = signed_rest_request(args, deps, "GET", pointer_path)
+        if any(key not in pointer for key in ("metadata-location", "version-token", "generation")):
+            raise RuntimeError("rename cleanup requires the original table commit state")
+        replacement = signed_rest_request(args, deps, "POST", source_path.rsplit("/", 1)[0],
+                                          {"name": destination["name"], "schema": schema})
+        fresh = replacement.get("metadata", {})
+        if (any(not isinstance(fresh.get(key), str) or not fresh[key] or fresh[key] == metadata.get(key)
+                for key in ("table-uuid", "location"))
+                or fresh.get("snapshots", []) or fresh.get("current-snapshot-id") not in (None, -1)):
+            raise RuntimeError("rename cleanup replacement is not an isolated empty table")
+        signed_rest_request(args, deps, "DELETE", destination_path)
+        signed_rest_request_expect_error(args, deps, "GET", destination_path, expected_statuses={404})
+        final = signed_rest_request(args, deps, "GET", source_path)
+        if (any(final.get(key) != restored[key] for key in ("metadata-location", "metadata"))
+                or signed_rest_request(args, deps, "GET", pointer_path) != pointer):
+            raise RuntimeError("rename cleanup changed the original table metadata or commit state")
 
 
 def run_load_table_delegation_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
@@ -1558,7 +1585,7 @@ def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps, backing:
     run_metadata_location_probe(args, deps, table_response)
     run_table_ref_probe(args, deps, snapshot_id)
     run_view_probe(args, deps)
-    run_table_rename_probe(args, deps)
+    run_table_rename_probe(args, deps, backing)
     run_load_table_delegation_probe(args, deps)
     run_maintenance_probe(args, deps, backing)
     diagnostics = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/catalog/diagnostics"))
