@@ -5124,15 +5124,19 @@ mod tests {
         let recovery_store = store.clone();
         let recovery_bucket = bucket.clone();
         let recovery_upload = upload.upload_id.clone();
-        let recovery = tokio::spawn(async move {
+        let mut recovery = tokio::spawn(async move {
             recovery_store
                 .abort_multipart_upload(&recovery_bucket, object, &recovery_upload, &ObjectOptions::default())
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(10), paused)
-            .await
-            .expect("recovery should reach physical cleanup")
-            .expect("cleanup owner announces arrival");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                paused = paused => paused.expect("cleanup owner announces arrival"),
+                result = &mut recovery => panic!("recovery returned before physical cleanup: {result:?}"),
+            }
+        })
+        .await
+        .expect("recovery should reach physical cleanup");
         recovery.abort();
         assert!(recovery.await.expect_err("request waiter is cancellable").is_cancelled());
         let upload_lock = store.pools[0]

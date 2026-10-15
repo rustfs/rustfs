@@ -844,11 +844,11 @@ impl ECStore {
         // Prove metadata absence across every pool before deleting any staging.
         let mut cleanup_guards = Vec::with_capacity(self.pools.len());
         for pool in &self.pools {
-            cleanup_guards.push(
-                pool.get_disks_by_key(object)
-                    .lock_orphan_multipart_cleanup(bucket, object, upload_id, &opts)
-                    .await?,
-            );
+            let guard = pool
+                .get_disks_by_key(object)
+                .lock_orphan_multipart_cleanup(bucket, object, upload_id, &opts, &cleanup_guards)
+                .await?;
+            cleanup_guards.push(guard);
         }
         let bucket = bucket.to_owned();
         let object = object.to_owned();

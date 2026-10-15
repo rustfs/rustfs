@@ -241,7 +241,7 @@ pub(crate) struct OrphanMultipartCleanupGuard {
     set: Arc<SetDisks>,
     disks: Vec<Option<DiskStore>>,
     upload_path: String,
-    lock_guard: ObjectLockDiagGuard,
+    lock_guard: Arc<ObjectLockDiagGuard>,
     exists: bool,
 }
 
@@ -1333,6 +1333,7 @@ impl SetDisks {
         object: &str,
         upload_id: &str,
         opts: &ObjectOptions,
+        held_guards: &[OrphanMultipartCleanupGuard],
     ) -> Result<OrphanMultipartCleanupGuard> {
         let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
         if opts.data_movement
@@ -1345,9 +1346,47 @@ impl SetDisks {
         // This path is derived from the caller's exact bucket/key and a canonical
         // UUID/timestamp upload identity, never from the shared MPU directory list.
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_id);
-        let lock_guard = self
-            .acquire_write_lock_diag("orphan_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, &upload_path)
-            .await?;
+        // Pool labels do not partition the raw ObjectKey sent to lock clients.
+        // Reuse the actual owner only for this exact path and proven backend;
+        // independent distributed domains still need their own guards.
+        let distributed = self.ctx.is_dist_erasure().await;
+        let mut lock_guard = None;
+        for held in held_guards {
+            if held.upload_path != upload_path {
+                continue;
+            }
+            let shared_domain = match (distributed, held.set.ctx.is_dist_erasure().await) {
+                (false, false) => self.shares_namespace_lock_domain(&held.set).await,
+                (true, true) => {
+                    let same = super::super::same_distributed_lock_domain(&self.lockers, &held.set.lockers);
+                    if !same
+                        && self
+                            .lockers
+                            .iter()
+                            .any(|client| held.set.lockers.iter().any(|held_client| Arc::ptr_eq(client, held_client)))
+                    {
+                        // A guard for only part of another quorum is not proof
+                        // of ownership there, and acquiring it again may wait
+                        // on ourselves. Preserve all staging in this topology.
+                        return Err(Error::other("orphan multipart cleanup cannot cover partially overlapping lock domains"));
+                    }
+                    same
+                }
+                _ => false,
+            };
+            if shared_domain {
+                lock_guard = Some(Arc::clone(&held.lock_guard));
+                break;
+            }
+        }
+        let lock_guard = match lock_guard {
+            Some(guard) => guard,
+            None => Arc::new(
+                self.acquire_write_lock_diag("orphan_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, &upload_path)
+                    .await?,
+            ),
+        };
+        fence_commit_on_lock_loss(Some(&lock_guard), "orphan_multipart_cleanup", &upload_path)?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         let disks = self.disks.read().await.clone();
         if disks.len() != self.set_drive_count || disks.is_empty() {
@@ -4485,7 +4524,7 @@ mod tests {
         }
         let opts = ObjectOptions::default();
         assert!(
-            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts, &[])
                 .await
                 .is_err(),
             "one surviving metadata copy must block orphan recovery"
@@ -4495,7 +4534,7 @@ mod tests {
             .await
             .expect("corrupt final metadata copy");
         assert!(
-            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts, &[])
                 .await
                 .is_err(),
             "corrupt metadata must not be treated as absence"
@@ -4506,7 +4545,7 @@ mod tests {
             .expect("remove final metadata copy");
         set.disks.write().await[3] = None;
         assert!(
-            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts, &[])
                 .await
                 .is_err(),
             "an unreachable disk must not be hidden by absence quorum"
@@ -4522,7 +4561,7 @@ mod tests {
         }
 
         let guard = set
-            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts, &[])
             .await
             .expect("all disks now prove metadata absence");
         assert!(guard.delete(bucket, object, &opts).await.expect("recover exact staging"));
@@ -4534,7 +4573,7 @@ mod tests {
             ));
         }
         let guard = set
-            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts)
+            .lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &opts, &[])
             .await
             .expect("already absent staging remains provably absent");
         assert!(
@@ -4577,7 +4616,7 @@ mod tests {
             "raw metadata reads alone must reproduce the directory-as-absence case: {errors:?}"
         );
         assert!(
-            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &ObjectOptions::default())
+            set.lock_orphan_multipart_cleanup(bucket, object, &upload.upload_id, &ObjectOptions::default(), &[])
                 .await
                 .is_err(),
             "one physical metadata directory must block cleanup on every disk"
@@ -4591,6 +4630,142 @@ mod tests {
                 Bytes::from_static(b"late part")
             );
         }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OrphanMultipartLockDomainCase {
+        Shared,
+        Independent,
+        PartiallyOverlapping,
+    }
+
+    async fn check_orphan_multipart_distributed_lock_owners(case: OrphanMultipartLockDomainCase) {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let first_client: Arc<dyn LockClient> =
+            Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let second_client: Arc<dyn LockClient> =
+            Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let second_clients = match case {
+            OrphanMultipartLockDomainCase::Shared => vec![first_client.clone()],
+            OrphanMultipartLockDomainCase::Independent => vec![second_client],
+            OrphanMultipartLockDomainCase::PartiallyOverlapping => vec![first_client.clone(), second_client],
+        };
+        let (first_dirs, first_disks, first_set) =
+            hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, vec![first_client], ctx.clone()).await;
+        let (second_dirs, second_disks, second_set) = hermetic_set_disks_with_lockers_and_ctx(4, 1, 2, second_clients, ctx).await;
+        let bucket = "orphan-multipart-dist-locks";
+        let object = "object";
+        make_bucket_on_all(&first_disks, bucket).await;
+        make_bucket_on_all(&second_disks, bucket).await;
+        let upload_id = runtime_sources::deployment_upload_id(&format!(
+            "{}x{}",
+            Uuid::new_v4(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        for directory in first_dirs.iter().chain(second_dirs.iter()) {
+            let staging = directory.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path);
+            tokio::fs::create_dir_all(&staging)
+                .await
+                .expect("create exact orphan staging");
+            tokio::fs::write(staging.join("part.late"), b"late part")
+                .await
+                .expect("write orphan part");
+        }
+        let opts = ObjectOptions::default();
+        let first_guard = first_set
+            .lock_orphan_multipart_cleanup(bucket, object, &upload_id, &opts, &[])
+            .await
+            .expect("first domain has an orphan");
+        let second_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            second_set.lock_orphan_multipart_cleanup(bucket, object, &upload_id, &opts, std::slice::from_ref(&first_guard)),
+        )
+        .await
+        .expect("lock-domain admission must not wait on a guard it already owns");
+        if case == OrphanMultipartLockDomainCase::PartiallyOverlapping {
+            let error = match second_result {
+                Ok(_) => panic!("one existing quorum cannot authorize a partially overlapping domain"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("partially overlapping lock domains"));
+            for directory in first_dirs.iter().chain(second_dirs.iter()) {
+                assert!(
+                    directory
+                        .path()
+                        .join(RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&upload_path)
+                        .join("part.late")
+                        .exists(),
+                    "uncertain lock coverage must preserve every physical part"
+                );
+            }
+            return;
+        }
+        let second_guard = second_result.expect("the second pool has a proven lock domain");
+        assert_eq!(
+            Arc::ptr_eq(&first_guard.lock_guard, &second_guard.lock_guard),
+            case == OrphanMultipartLockDomainCase::Shared,
+            "only the same exact backend may share a real upload guard across pool labels"
+        );
+        let second_namespace = second_set
+            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_path)
+            .await
+            .unwrap();
+        let mut second_writer = Box::pin(second_namespace.get_write_lock(Duration::from_secs(10)));
+        assert!(futures::poll!(&mut second_writer).is_pending());
+        if case == OrphanMultipartLockDomainCase::Shared {
+            drop(first_guard);
+            assert!(
+                futures::poll!(&mut second_writer).is_pending(),
+                "the second pool must retain the shared real owner after the first guard drops"
+            );
+            drop(second_guard);
+            drop(
+                tokio::time::timeout(Duration::from_secs(10), second_writer)
+                    .await
+                    .expect("the shared backend should release after the last owner")
+                    .expect("shared-domain writer resumes"),
+            );
+            return;
+        }
+        let first_namespace = first_set
+            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_path)
+            .await
+            .unwrap();
+        let mut first_writer = Box::pin(first_namespace.get_write_lock(Duration::from_secs(10)));
+        assert!(futures::poll!(&mut first_writer).is_pending());
+        drop(first_guard);
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), first_writer)
+                .await
+                .expect("first domain should release independently")
+                .expect("first writer resumes"),
+        );
+        assert!(futures::poll!(&mut second_writer).is_pending(), "the second real owner must remain held");
+        drop(second_guard);
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), second_writer)
+                .await
+                .expect("second domain should release with its owner")
+                .expect("second writer resumes"),
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_multipart_cleanup_keeps_separate_distributed_lock_owners() {
+        check_orphan_multipart_distributed_lock_owners(OrphanMultipartLockDomainCase::Independent).await;
+    }
+
+    #[tokio::test]
+    async fn orphan_multipart_cleanup_reuses_shared_distributed_owner_across_pools() {
+        check_orphan_multipart_distributed_lock_owners(OrphanMultipartLockDomainCase::Shared).await;
+    }
+
+    #[tokio::test]
+    async fn orphan_multipart_cleanup_rejects_partially_overlapping_distributed_domains() {
+        check_orphan_multipart_distributed_lock_owners(OrphanMultipartLockDomainCase::PartiallyOverlapping).await;
     }
 
     async fn stage_upload_with_create_opts(
@@ -10230,7 +10405,7 @@ mod tests {
             );
 
             let cleanup = set_disks
-                .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default())
+                .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default(), &[])
                 .await
                 .expect("the committed upload has no staging metadata on any disk");
             assert!(
@@ -10306,7 +10481,7 @@ mod tests {
                     );
 
                     let cleanup = set_disks
-                        .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default())
+                        .lock_orphan_multipart_cleanup(bucket, object, &u_new, &ObjectOptions::default(), &[])
                         .await
                         .expect("committed staging has no upload metadata");
                     assert!(
