@@ -44,7 +44,33 @@ GET /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/sc
 
 Use its current job, quarantine status, and recommended actions. An eligible queue can be consumed through the authenticated `POST .../maintenance/worker/run` endpoint. If a job failed, a queue/worker lease expired, or a previous manual invocation left a Disabled/Paused control report, resolve the underlying condition and explicitly invoke `POST .../maintenance/scheduler/run` or the recommended worker/quarantine operation. Automatic admission deliberately leaves these states unchanged.
 
-A partial current/latest publication requires recovery before periodic admission; repeated ticks do not repair or discard it. Review retained reports and use the existing controlled maintenance/recovery APIs. Do not delete catalog sidecars directly.
+A partial current/latest publication requires recovery before periodic admission; repeated ticks do not repair or discard it. A conditional worker replay can repair the narrowly defined terminal-publication case below. Review retained reports for other cases; do not delete catalog sidecars directly.
+
+## Conditional Worker Invocation
+
+An operator can bind a worker invocation to the job and attempt observed through the scheduler or job endpoint:
+
+```text
+POST /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run
+```
+
+```json
+{
+  "worker-id": "maintenance-worker-a",
+  "expected-job-id": "observed-job-id",
+  "expected-attempt": 0
+}
+```
+
+Send both expected fields or neither. Missing one, explicit `null`, invalid types, and unknown fields are rejected. Omitting both retains the existing manual worker behavior; an empty JSON object `{}` still uses the default worker ID. Authentication and the table-scoped `admin:RunTableMaintenance` permission are required in either mode.
+
+The conditional mode consumes an unexpired `QUEUED` job at attempt zero, or retries a `FAILED` job after its persisted `next-retry-after` when its persisted attempt budget allows. It keeps the same job ID, operation, original candidate lists, cleanup watermark, and total attempt budget. The first attempt is allowed even when that budget is zero; zero disables retries. Subsequent failed attempts calculate their delay from the current valid backoff configuration without replacing the saved budget.
+
+Stale job/attempt, catalog identity or pointer/generation changes, expired worker/queue leases, active quarantine, and changed recorded maintenance policy conflict without claiming another attempt. The recorded policy includes retention, quarantine settings, and configuration source; deletion must still be enabled for a delete job. The job format does not store a complete historical configuration snapshot. This endpoint does not promise detection of changes to fields that were never recorded.
+
+If the response is lost, repeat the same worker ID, expected job ID, and expected attempt. When that invocation already claimed the current attempt, the endpoint returns its persisted report without rerunning candidates or consuming another attempt. Inspect `job.status`: a returned `RUNNING` or `FAILED` report is not a successful maintenance outcome. To retry a completed failed attempt after its backoff, explicitly use its new observed attempt number.
+
+All named/current/latest reports must agree before new work starts. If a completed report was persisted but final alias publication was interrupted, the same invocation can reconcile aliases only when the reports prove the same job, attempt, lease, immutable plan, and audit transition. Incomplete claims, conflicting histories, and expired `RUNNING` jobs fail closed for operator inspection; the endpoint does not take over or cancel an abandoned worker. Catalog commits remain protected by the existing publication locks during execution and reconciliation.
 
 To pause admission for a table, set `worker-paused=true` in its effective maintenance configuration. To stop the process-wide scheduler, disable the startup flag and restart. Shutdown stops new admissions and waits for owned queueing work; if completion cannot be confirmed within the normal shutdown grace, it retains unclean-shutdown markers and logs `drain_unconfirmed`. A deadline is not proof that a mutation was cancelled.
 

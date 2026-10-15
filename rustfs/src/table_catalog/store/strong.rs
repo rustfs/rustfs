@@ -2402,6 +2402,58 @@ where
         Ok(TableMaintenanceSchedulerRunResult { report, scheduler })
     }
 
+    pub(crate) async fn run_table_metadata_maintenance_worker_once_conditionally(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+        condition: &TableMaintenanceWorkerCondition,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        self.run_table_metadata_maintenance_worker_once_conditionally_at(
+            table_bucket,
+            namespace,
+            table,
+            worker_id,
+            condition,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
+    pub(in crate::table_catalog) async fn run_table_metadata_maintenance_worker_once_conditionally_at(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+        condition: &TableMaintenanceWorkerCondition,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        validate_table_maintenance_worker_condition(&worker_id, condition)?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "conditional worker",
+        )?;
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let entry = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .run_conditional_table_maintenance_worker_for_entry(&entry, worker_id, condition, now, &publication)
+            .await
+    }
+
     pub(crate) async fn run_table_metadata_maintenance_worker_once(
         &self,
         table_bucket: &str,
