@@ -10718,7 +10718,11 @@ async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_
             assert!(!worker.is_finished(), "worker must wait for publication ownership");
             assert_eq!(clock.lock().unwrap().1, 0, "claim time must not precede publication ownership");
             assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
-            let claim_time = if expired { deadline } else { deadline - Duration::nanoseconds(1) };
+            let claim_time = if expired {
+                deadline
+            } else {
+                deadline - Duration::nanoseconds(1)
+            };
             clock.lock().unwrap().0 = claim_time;
             drop(publication_guard);
             tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, final_read.wait_started())
@@ -10740,7 +10744,13 @@ async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_
                 assert_eq!(fixture.queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
                 assert_eq!(fixture.queued.job.attempt, 0);
                 assert_eq!(fixture.delete_attempts().await, 0);
-                assert!(fixture.backend.object_exists("analytics", &fixture.old_metadata).await.unwrap());
+                assert!(
+                    fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
             } else {
                 let completed = result.expect("a queued lease remains claimable immediately before its deadline");
                 assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
@@ -10758,7 +10768,13 @@ async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_
                 );
                 assert_eq!(completed.job.deleted_metadata_file_count, 1);
                 assert_eq!(fixture.delete_attempts().await, 1);
-                assert!(!fixture.backend.object_exists("analytics", &fixture.old_metadata).await.unwrap());
+                assert!(
+                    !fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
                 fixture.assert_report_views(&completed).await;
             }
         }
