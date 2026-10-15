@@ -19,7 +19,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
+use crate::storage::storage_api::{
+    PartTransactionAction, RenameDataResp, SnapshotLeaseToken, sign_tonic_rpc_response_proof, verify_tonic_mutation_body_digest,
+};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -117,6 +119,98 @@ impl LocalMutationTarget {
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
+
+fn parse_native_uuid(bytes: &[u8], field: &str) -> std::result::Result<Uuid, String> {
+    Uuid::from_slice(bytes)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or_else(|| format!("{field} must be a non-nil UUID"))
+}
+
+fn native_target(
+    disk: &str,
+    disk_id: &[u8],
+    store_id: &[u8],
+    preparation_id: &[u8],
+    bucket: &str,
+    key: &str,
+    bucket_incarnation_id: &[u8],
+) -> std::result::Result<rustfs_ecstore::api::storage::NativePreparationTarget, String> {
+    if disk.is_empty() {
+        return Err("disk reference is required".into());
+    }
+    Ok(rustfs_ecstore::api::storage::NativePreparationTarget {
+        disk_id: parse_native_uuid(disk_id, "disk_id")?,
+        store_id: parse_native_uuid(store_id, "store_id")?,
+        preparation: parse_native_uuid(preparation_id, "preparation_id")?,
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        bucket_incarnation: parse_native_uuid(bucket_incarnation_id, "bucket_incarnation_id")?,
+    })
+}
+
+fn native_receipt(
+    receipt: rustfs_ecstore::api::storage::NativePreparationReceipt,
+) -> std::result::Result<NativePreparationReceipt, String> {
+    let (data_blocks, parity_blocks, shard_index) = receipt.erasure_geometry();
+    Ok(NativePreparationReceipt {
+        disk_id: receipt.disk_id().as_bytes().to_vec().into(),
+        store_id: receipt.deployment_id().as_bytes().to_vec().into(),
+        deployment_id: receipt.deployment_id().as_bytes().to_vec().into(),
+        preparation_id: receipt.preparation_id().as_bytes().to_vec().into(),
+        version_id: receipt.version_id().as_bytes().to_vec().into(),
+        bucket: receipt.bucket().to_owned(),
+        key: receipt.key().to_owned(),
+        bucket_incarnation_id: receipt.bucket_incarnation().as_bytes().to_vec().into(),
+        object_digest: receipt.object_digest().to_vec().into(),
+        object_length: receipt.object_length(),
+        set_digest: receipt.set_digest().to_vec().into(),
+        distribution_digest: receipt.distribution_digest().to_vec().into(),
+        metadata_digest: receipt.metadata_digest().to_vec().into(),
+        shard_digest: receipt.shard_digest().to_vec().into(),
+        shard_length: receipt.shard_length(),
+        data_blocks: u32::try_from(data_blocks).map_err(|_| "data_blocks exceeds protocol range")?,
+        parity_blocks: u32::try_from(parity_blocks).map_err(|_| "parity_blocks exceeds protocol range")?,
+        shard_index: u32::try_from(shard_index).map_err(|_| "shard_index exceeds protocol range")?,
+    })
+}
+
+fn native_error(error: impl ToString) -> Option<Error> {
+    Some(DiskError::other(error.to_string()).into())
+}
+
+fn validate_native_metadata_length(
+    metadata: &[u8],
+    bucket: &str,
+    key: &str,
+    version: Uuid,
+    object_length: u64,
+) -> std::result::Result<(), String> {
+    let mut file_meta = rustfs_filemeta::FileMeta::new();
+    let consumed = file_meta
+        .unmarshal_msg(metadata)
+        .map_err(|err| format!("decode native preparation metadata: {err}"))?;
+    if usize::try_from(consumed).map_err(|_| "native preparation metadata length is invalid")? != metadata.len() {
+        return Err("native preparation metadata has trailing bytes".into());
+    }
+    let (_, version_meta) = file_meta
+        .find_version(Some(version))
+        .map_err(|err| format!("native preparation version is absent from metadata: {err}"))?;
+    let info = version_meta
+        .into_fileinfo(bucket, key, true)
+        .map_err(|err| format!("decode native preparation file info: {err}"))?;
+    if u64::try_from(info.size).map_err(|_| "native preparation object length is invalid")? != object_length {
+        return Err("object_length does not match persisted metadata".into());
+    }
+    Ok(())
+}
+
+fn sign_native_response(body: std::result::Result<Vec<u8>, std::num::TryFromIntError>) -> std::result::Result<Bytes, Status> {
+    let body = body.map_err(|_| Status::internal("native preparation response length cannot be represented"))?;
+    sign_tonic_rpc_response_proof(&body)
+        .map(Bytes::from)
+        .map_err(|_| Status::unavailable("native preparation response proof is unavailable"))
+}
 
 fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Response<SnapshotLeaseResponse> {
     match result {
@@ -378,6 +472,325 @@ fn encode_rename_data_response_payloads(
 }
 
 impl NodeService {
+    pub(super) async fn handle_native_preparation_begin(
+        &self,
+        request: Request<NativePreparationBeginRequest>,
+    ) -> Result<Response<NativePreparationBeginResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_native_preparation_begin_request_body(request.get_ref()),
+            "native_preparation_begin",
+        )?;
+        let local_target = self.local_mutation_target();
+        let request = request.into_inner();
+        let result = async {
+            let target = native_target(
+                &request.disk,
+                &request.disk_id,
+                &request.store_id,
+                &request.preparation_id,
+                &request.bucket,
+                &request.key,
+                &request.bucket_incarnation_id,
+            )?;
+            let LocalMutationTarget::Ready(store) = local_target else {
+                return Err("native preparation requires a ready storage instance".to_owned());
+            };
+            store
+                .begin_native_preparation_on_disk(&target)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        .await;
+        let mut response = NativePreparationBeginResponse {
+            success: result.is_ok(),
+            error: result.err().and_then(native_error),
+            response_proof: Bytes::new(),
+        };
+        response.response_proof =
+            sign_native_response(rustfs_protos::canonical_native_preparation_begin_response_body(&request, &response))?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn handle_native_preparation_finalize(
+        &self,
+        request: Request<NativePreparationFinalizeRequest>,
+    ) -> Result<Response<NativePreparationFinalizeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_native_preparation_finalize_request_body(request.get_ref()),
+            "native_preparation_finalize",
+        )?;
+        let local_target = self.local_mutation_target();
+        let request = request.into_inner();
+        let result = async {
+            let target = native_target(
+                &request.disk,
+                &request.disk_id,
+                &request.store_id,
+                &request.preparation_id,
+                &request.bucket,
+                &request.key,
+                &request.bucket_incarnation_id,
+            )?;
+            let LocalMutationTarget::Ready(store) = local_target else {
+                return Err("native preparation requires a ready storage instance".to_owned());
+            };
+            if request.metadata.len() > rustfs_protos::NATIVE_PREPARATION_METADATA_MAX_BYTES {
+                return Err("native preparation metadata exceeds size limit".to_owned());
+            }
+            let object_digest: [u8; 32] = request
+                .object_digest
+                .as_ref()
+                .try_into()
+                .map_err(|_| "object_digest must contain 32 bytes".to_owned())?;
+            let version = parse_native_uuid(&request.version_id, "version_id")?;
+            validate_native_metadata_length(&request.metadata, &target.bucket, &target.key, version, request.object_length)?;
+            let receipt = store
+                .finalize_native_preparation_on_disk(rustfs_ecstore::api::storage::NativePreparationFinalizeRequest {
+                    target,
+                    version,
+                    object_digest,
+                    metadata: request.metadata.clone(),
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+            native_receipt(receipt)
+        }
+        .await;
+        let (success, receipt, error) = match result {
+            Ok(receipt) => (true, Some(receipt), None),
+            Err(error) => (false, None, native_error(error)),
+        };
+        let mut response = NativePreparationFinalizeResponse {
+            success,
+            receipt,
+            error,
+            response_proof: Bytes::new(),
+        };
+        response.response_proof =
+            sign_native_response(rustfs_protos::canonical_native_preparation_finalize_response_body(&request, &response))?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn handle_native_preparation_probe(
+        &self,
+        request: Request<NativePreparationProbeRequest>,
+    ) -> Result<Response<NativePreparationProbeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_native_preparation_probe_request_body(request.get_ref()),
+            "native_preparation_probe",
+        )?;
+        let local_target = self.local_mutation_target();
+        let request = request.into_inner();
+        let result = async {
+            let target = native_target(
+                &request.disk,
+                &request.disk_id,
+                &request.store_id,
+                &request.preparation_id,
+                &request.bucket,
+                &request.key,
+                &request.bucket_incarnation_id,
+            )?;
+            let LocalMutationTarget::Ready(store) = local_target else {
+                return Err("native preparation requires a ready storage instance".to_owned());
+            };
+            store
+                .probe_native_preparation_on_disk(&target)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        .await;
+        let (
+            success,
+            exists,
+            prepared,
+            version_id,
+            object_digest,
+            object_length,
+            set_digest,
+            distribution_digest,
+            metadata,
+            error,
+        ) = match result {
+            Ok(rustfs_ecstore::api::storage::NativePreparationProbe::Absent) => (
+                true,
+                false,
+                false,
+                Bytes::new(),
+                Bytes::new(),
+                0,
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::new(),
+                None,
+            ),
+            Ok(rustfs_ecstore::api::storage::NativePreparationProbe::Existing {
+                version,
+                prepared,
+                object_digest,
+                object_length,
+                set_digest,
+                distribution_digest,
+                metadata,
+            }) => (
+                true,
+                true,
+                prepared,
+                version.as_bytes().to_vec().into(),
+                object_digest.to_vec().into(),
+                object_length,
+                set_digest.to_vec().into(),
+                distribution_digest.to_vec().into(),
+                metadata.unwrap_or_default(),
+                None,
+            ),
+            Err(error) => (
+                false,
+                false,
+                false,
+                Bytes::new(),
+                Bytes::new(),
+                0,
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::new(),
+                native_error(error),
+            ),
+        };
+        let mut response = NativePreparationProbeResponse {
+            success,
+            exists,
+            prepared,
+            metadata,
+            error,
+            response_proof: Bytes::new(),
+            version_id,
+            object_digest,
+            object_length,
+            set_digest,
+            distribution_digest,
+        };
+        response.response_proof =
+            sign_native_response(rustfs_protos::canonical_native_preparation_probe_response_body(&request, &response))?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn handle_native_preparation_recover(
+        &self,
+        request: Request<NativePreparationRecoverRequest>,
+    ) -> Result<Response<NativePreparationRecoverResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_native_preparation_recover_request_body(request.get_ref()),
+            "native_preparation_recover",
+        )?;
+        let local_target = self.local_mutation_target();
+        let request = request.into_inner();
+        let result = async {
+            let target = native_target(
+                &request.disk,
+                &request.disk_id,
+                &request.store_id,
+                &request.preparation_id,
+                &request.bucket,
+                &request.key,
+                &request.bucket_incarnation_id,
+            )?;
+            let LocalMutationTarget::Ready(store) = local_target else {
+                return Err("native preparation requires a ready storage instance".to_owned());
+            };
+            let recovered = store
+                .recover_native_preparation_on_disk(&target)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok::<_, String>((native_receipt(recovered.receipt)?, recovered.metadata))
+        }
+        .await;
+        let (success, receipt, metadata, error) = match result {
+            Ok((receipt, metadata)) => (true, Some(receipt), metadata, None),
+            Err(error) => (false, None, Bytes::new(), native_error(error)),
+        };
+        let mut response = NativePreparationRecoverResponse {
+            success,
+            receipt,
+            metadata,
+            error,
+            response_proof: Bytes::new(),
+        };
+        response.response_proof =
+            sign_native_response(rustfs_protos::canonical_native_preparation_recover_response_body(&request, &response))?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn handle_native_preparation_locate(
+        &self,
+        request: Request<NativePreparationLocateRequest>,
+    ) -> Result<Response<NativePreparationLocateResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_native_preparation_locate_request_body(request.get_ref()),
+            "native_preparation_locate",
+        )?;
+        let local_target = self.local_mutation_target();
+        let request = request.into_inner();
+        let result = async {
+            if request.disk.is_empty() {
+                return Err("disk reference is required".to_owned());
+            }
+            let disk_id = parse_native_uuid(&request.disk_id, "disk_id")?;
+            let store_id = parse_native_uuid(&request.store_id, "store_id")?;
+            let preparation_id = parse_native_uuid(&request.preparation_id, "preparation_id")?;
+            let LocalMutationTarget::Ready(store) = local_target else {
+                return Err("native preparation requires a ready storage instance".to_owned());
+            };
+            store
+                .locate_native_preparation_on_disk(disk_id, store_id, preparation_id)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        .await;
+        let (success, found, bucket, key, incarnation, metadata, prepared, error) = match result {
+            Ok(Some(description)) => (
+                true,
+                true,
+                description.bucket,
+                description.key,
+                description.incarnation.as_bytes().to_vec().into(),
+                description.metadata,
+                description.prepared,
+                None,
+            ),
+            Ok(None) => (true, false, String::new(), String::new(), Bytes::new(), Bytes::new(), false, None),
+            Err(error) => (
+                false,
+                false,
+                String::new(),
+                String::new(),
+                Bytes::new(),
+                Bytes::new(),
+                false,
+                native_error(error),
+            ),
+        };
+        let mut response = NativePreparationLocateResponse {
+            success,
+            found,
+            bucket,
+            key,
+            bucket_incarnation_id: incarnation,
+            metadata,
+            prepared,
+            error,
+            response_proof: Bytes::new(),
+        };
+        response.response_proof =
+            sign_native_response(rustfs_protos::canonical_native_preparation_locate_response_body(&request, &response))?;
+        Ok(Response::new(response))
+    }
+
     pub(super) async fn handle_acquire_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseRequest>,

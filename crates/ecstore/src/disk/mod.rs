@@ -237,6 +237,7 @@ impl Disk {
         preparation: Uuid,
         store_id: Uuid,
         bucket: &str,
+        key: &str,
         incarnation: Uuid,
         fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
     ) -> Result<()> {
@@ -247,7 +248,11 @@ impl Disk {
                     .begin_native_stream(preparation, store_id, bucket, incarnation, fence)
                     .await
             }
-            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+            Disk::Remote(remote) => {
+                remote
+                    .native_begin_stream(preparation, store_id, bucket, key, incarnation)
+                    .await
+            }
         }
     }
 
@@ -257,6 +262,7 @@ impl Disk {
         _preparation: Uuid,
         _store_id: Uuid,
         _bucket: &str,
+        _key: &str,
         _incarnation: Uuid,
         _fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
     ) -> Result<()> {
@@ -270,7 +276,7 @@ impl Disk {
     ) -> Result<local::native_prepare::NativePreparationReceipt> {
         match self {
             Disk::Local(local) => local.get_disk().prepare_native(input).await,
-            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+            Disk::Remote(remote) => remote.native_finalize(input).await,
         }
     }
 
@@ -288,6 +294,7 @@ impl Disk {
         preparation: Uuid,
         store_id: Uuid,
         bucket: &str,
+        key: &str,
         incarnation: Uuid,
         fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
     ) -> Result<(local::native_prepare::NativePreparationReceipt, Bytes)> {
@@ -298,7 +305,7 @@ impl Disk {
                     .recover_native_with_metadata(preparation, store_id, bucket, incarnation, fence)
                     .await
             }
-            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+            Disk::Remote(remote) => remote.native_recover(preparation, store_id, bucket, key, incarnation).await,
         }
     }
 
@@ -308,6 +315,7 @@ impl Disk {
         _preparation: Uuid,
         _store_id: Uuid,
         _bucket: &str,
+        _key: &str,
         _incarnation: Uuid,
         _fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
     ) -> Result<(local::native_prepare::NativePreparationReceipt, Bytes)> {
@@ -331,7 +339,7 @@ impl Disk {
                     .probe_native(preparation, store_id, bucket, key, incarnation, fence)
                     .await
             }
-            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+            Disk::Remote(remote) => remote.native_probe(preparation, store_id, bucket, key, incarnation).await,
         }
     }
 
@@ -356,7 +364,7 @@ impl Disk {
     ) -> Result<Option<local::native_prepare::NativePreparationDescription>> {
         match self {
             Disk::Local(local) => local.get_disk().locate_native_preparation(store_id, preparation).await,
-            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+            Disk::Remote(remote) => remote.native_locate(store_id, preparation).await,
         }
     }
 

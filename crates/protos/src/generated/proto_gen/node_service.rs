@@ -156,6 +156,217 @@ pub struct CompareAndUpdateFileResponse {
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
 }
+/// Native preparation carries only bounded object metadata over the control RPC.
+/// Shard bytes use the authenticated data stream and remain private until finalized.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationReceipt {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub deployment_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub version_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "6")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub object_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "10")]
+    pub object_length: u64,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub set_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub distribution_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "13")]
+    pub metadata_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "14")]
+    pub shard_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "15")]
+    pub shard_length: u64,
+    #[prost(uint32, tag = "16")]
+    pub data_blocks: u32,
+    #[prost(uint32, tag = "17")]
+    pub parity_blocks: u32,
+    #[prost(uint32, tag = "18")]
+    pub shard_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationBeginRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "5")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationBeginResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationFinalizeRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "5")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub object_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "9")]
+    pub object_length: u64,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub version_id: ::prost::bytes::Bytes,
+    /// Exact serialized FileMeta; maximum 1 MiB. Peers reject larger values.
+    #[prost(bytes = "bytes", tag = "11")]
+    pub metadata: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationFinalizeResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub receipt: ::core::option::Option<NativePreparationReceipt>,
+    #[prost(message, optional, tag = "3")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationProbeRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "5")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationProbeResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bool, tag = "2")]
+    pub exists: bool,
+    #[prost(bool, tag = "3")]
+    pub prepared: bool,
+    /// Exact serialized FileMeta when it exists and can be read; maximum 1 MiB.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub metadata: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "6")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub response_proof: ::prost::bytes::Bytes,
+    /// Observation only; this is not a durability receipt.
+    #[prost(bytes = "bytes", tag = "8")]
+    pub version_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub object_digest: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "10")]
+    pub object_length: u64,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub set_digest: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "12")]
+    pub distribution_digest: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationRecoverRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "5")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationRecoverResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub receipt: ::core::option::Option<NativePreparationReceipt>,
+    /// Exact persisted FileMeta; maximum 1 MiB. Peers reject larger values.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub metadata: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "4")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationLocateRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub store_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preparation_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NativePreparationLocateResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bool, tag = "2")]
+    pub found: bool,
+    #[prost(string, tag = "3")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub metadata: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "7")]
+    pub prepared: bool,
+    #[prost(message, optional, tag = "8")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteRequest {
     /// indicate which one in the disks
@@ -2065,6 +2276,81 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "CompareAndUpdateFile"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn native_preparation_begin(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NativePreparationBeginRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationBeginResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NativePreparationBegin");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "NativePreparationBegin"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn native_preparation_finalize(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NativePreparationFinalizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationFinalizeResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NativePreparationFinalize");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "NativePreparationFinalize"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn native_preparation_probe(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NativePreparationProbeRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationProbeResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NativePreparationProbe");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "NativePreparationProbe"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn native_preparation_recover(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NativePreparationRecoverRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationRecoverResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NativePreparationRecover");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "NativePreparationRecover"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn native_preparation_locate(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NativePreparationLocateRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationLocateResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NativePreparationLocate");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "NativePreparationLocate"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn delete(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteRequest>,
@@ -3468,6 +3754,26 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::CompareAndUpdateFileRequest>,
         ) -> std::result::Result<tonic::Response<super::CompareAndUpdateFileResponse>, tonic::Status>;
+        async fn native_preparation_begin(
+            &self,
+            request: tonic::Request<super::NativePreparationBeginRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationBeginResponse>, tonic::Status>;
+        async fn native_preparation_finalize(
+            &self,
+            request: tonic::Request<super::NativePreparationFinalizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationFinalizeResponse>, tonic::Status>;
+        async fn native_preparation_probe(
+            &self,
+            request: tonic::Request<super::NativePreparationProbeRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationProbeResponse>, tonic::Status>;
+        async fn native_preparation_recover(
+            &self,
+            request: tonic::Request<super::NativePreparationRecoverRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationRecoverResponse>, tonic::Status>;
+        async fn native_preparation_locate(
+            &self,
+            request: tonic::Request<super::NativePreparationLocateRequest>,
+        ) -> std::result::Result<tonic::Response<super::NativePreparationLocateResponse>, tonic::Status>;
         async fn delete(
             &self,
             request: tonic::Request<super::DeleteRequest>,
@@ -4185,6 +4491,146 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CompareAndUpdateFileSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/NativePreparationBegin" => {
+                    #[allow(non_camel_case_types)]
+                    struct NativePreparationBeginSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::NativePreparationBeginRequest> for NativePreparationBeginSvc<T> {
+                        type Response = super::NativePreparationBeginResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::NativePreparationBeginRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::native_preparation_begin(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NativePreparationBeginSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/NativePreparationFinalize" => {
+                    #[allow(non_camel_case_types)]
+                    struct NativePreparationFinalizeSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::NativePreparationFinalizeRequest> for NativePreparationFinalizeSvc<T> {
+                        type Response = super::NativePreparationFinalizeResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::NativePreparationFinalizeRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::native_preparation_finalize(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NativePreparationFinalizeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/NativePreparationProbe" => {
+                    #[allow(non_camel_case_types)]
+                    struct NativePreparationProbeSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::NativePreparationProbeRequest> for NativePreparationProbeSvc<T> {
+                        type Response = super::NativePreparationProbeResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::NativePreparationProbeRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::native_preparation_probe(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NativePreparationProbeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/NativePreparationRecover" => {
+                    #[allow(non_camel_case_types)]
+                    struct NativePreparationRecoverSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::NativePreparationRecoverRequest> for NativePreparationRecoverSvc<T> {
+                        type Response = super::NativePreparationRecoverResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::NativePreparationRecoverRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::native_preparation_recover(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NativePreparationRecoverSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/NativePreparationLocate" => {
+                    #[allow(non_camel_case_types)]
+                    struct NativePreparationLocateSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::NativePreparationLocateRequest> for NativePreparationLocateSvc<T> {
+                        type Response = super::NativePreparationLocateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::NativePreparationLocateRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::native_preparation_locate(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NativePreparationLocateSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

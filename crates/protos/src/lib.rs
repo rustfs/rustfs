@@ -1099,6 +1099,198 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+pub const NATIVE_PREPARATION_METADATA_MAX_BYTES: usize = 1024 * 1024;
+
+pub fn canonical_native_preparation_begin_request_body(
+    request: &proto_gen::node_service::NativePreparationBeginRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-begin-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.disk_id)?;
+    body.push_bytes(&request.store_id)?;
+    body.push_bytes(&request.preparation_id)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.key)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_finalize_request_body(
+    request: &proto_gen::node_service::NativePreparationFinalizeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-finalize-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.disk_id)?;
+    body.push_bytes(&request.store_id)?;
+    body.push_bytes(&request.preparation_id)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.key)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    body.push_bytes(&request.object_digest)?;
+    body.push_u64(request.object_length);
+    body.push_bytes(&request.version_id)?;
+    body.push_bytes(&request.metadata)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_probe_request_body(
+    request: &proto_gen::node_service::NativePreparationProbeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-probe-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.disk_id)?;
+    body.push_bytes(&request.store_id)?;
+    body.push_bytes(&request.preparation_id)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.key)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_recover_request_body(
+    request: &proto_gen::node_service::NativePreparationRecoverRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-recover-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.disk_id)?;
+    body.push_bytes(&request.store_id)?;
+    body.push_bytes(&request.preparation_id)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.key)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_locate_request_body(
+    request: &proto_gen::node_service::NativePreparationLocateRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-locate-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.disk_id)?;
+    body.push_bytes(&request.store_id)?;
+    body.push_bytes(&request.preparation_id)?;
+    Ok(body.finish())
+}
+
+fn push_native_preparation_error(
+    body: &mut CanonicalBodyBuilder,
+    error: Option<&proto_gen::node_service::Error>,
+) -> Result<(), std::num::TryFromIntError> {
+    body.push_bool(error.is_some());
+    if let Some(error) = error {
+        body.push_u32(error.code);
+        body.push_str(&error.error_info)?;
+    }
+    Ok(())
+}
+
+fn push_native_preparation_receipt(
+    body: &mut CanonicalBodyBuilder,
+    receipt: Option<&proto_gen::node_service::NativePreparationReceipt>,
+) -> Result<(), std::num::TryFromIntError> {
+    body.push_bool(receipt.is_some());
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+
+    body.push_bytes(&receipt.disk_id)?;
+    body.push_bytes(&receipt.store_id)?;
+    body.push_bytes(&receipt.deployment_id)?;
+    body.push_bytes(&receipt.preparation_id)?;
+    body.push_bytes(&receipt.version_id)?;
+    body.push_str(&receipt.bucket)?;
+    body.push_str(&receipt.key)?;
+    body.push_bytes(&receipt.bucket_incarnation_id)?;
+    body.push_bytes(&receipt.object_digest)?;
+    body.push_u64(receipt.object_length);
+    body.push_bytes(&receipt.set_digest)?;
+    body.push_bytes(&receipt.distribution_digest)?;
+    body.push_bytes(&receipt.metadata_digest)?;
+    body.push_bytes(&receipt.shard_digest)?;
+    body.push_u64(receipt.shard_length);
+    body.push_u32(receipt.data_blocks);
+    body.push_u32(receipt.parity_blocks);
+    body.push_u32(receipt.shard_index);
+    Ok(())
+}
+
+pub fn canonical_native_preparation_begin_response_body(
+    request: &proto_gen::node_service::NativePreparationBeginRequest,
+    response: &proto_gen::node_service::NativePreparationBeginResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let request_body = canonical_native_preparation_begin_request_body(request)?;
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-begin-response-v1\0");
+    body.push_bytes(&request_body)?;
+    body.push_bool(response.success);
+    push_native_preparation_error(&mut body, response.error.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_finalize_response_body(
+    request: &proto_gen::node_service::NativePreparationFinalizeRequest,
+    response: &proto_gen::node_service::NativePreparationFinalizeResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let request_body = canonical_native_preparation_finalize_request_body(request)?;
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-finalize-response-v1\0");
+    body.push_bytes(&request_body)?;
+    body.push_bool(response.success);
+    push_native_preparation_receipt(&mut body, response.receipt.as_ref())?;
+    push_native_preparation_error(&mut body, response.error.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_probe_response_body(
+    request: &proto_gen::node_service::NativePreparationProbeRequest,
+    response: &proto_gen::node_service::NativePreparationProbeResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let request_body = canonical_native_preparation_probe_request_body(request)?;
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-probe-response-v1\0");
+    body.push_bytes(&request_body)?;
+    body.push_bool(response.success);
+    body.push_bool(response.exists);
+    body.push_bool(response.prepared);
+    body.push_bytes(&response.metadata)?;
+    push_native_preparation_error(&mut body, response.error.as_ref())?;
+    body.push_bytes(&response.version_id)?;
+    body.push_bytes(&response.object_digest)?;
+    body.push_u64(response.object_length);
+    body.push_bytes(&response.set_digest)?;
+    body.push_bytes(&response.distribution_digest)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_recover_response_body(
+    request: &proto_gen::node_service::NativePreparationRecoverRequest,
+    response: &proto_gen::node_service::NativePreparationRecoverResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let request_body = canonical_native_preparation_recover_request_body(request)?;
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-recover-response-v1\0");
+    body.push_bytes(&request_body)?;
+    body.push_bool(response.success);
+    push_native_preparation_receipt(&mut body, response.receipt.as_ref())?;
+    body.push_bytes(&response.metadata)?;
+    push_native_preparation_error(&mut body, response.error.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_native_preparation_locate_response_body(
+    request: &proto_gen::node_service::NativePreparationLocateRequest,
+    response: &proto_gen::node_service::NativePreparationLocateResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let request_body = canonical_native_preparation_locate_request_body(request)?;
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-native-preparation-locate-response-v1\0");
+    body.push_bytes(&request_body)?;
+    body.push_bool(response.success);
+    body.push_bool(response.found);
+    body.push_str(&response.bucket)?;
+    body.push_str(&response.key)?;
+    body.push_bytes(&response.bucket_incarnation_id)?;
+    body.push_bytes(&response.metadata)?;
+    body.push_bool(response.prepared);
+    push_native_preparation_error(&mut body, response.error.as_ref())?;
+    Ok(body.finish())
+}
+
 pub fn canonical_compare_and_update_file_request_body(
     request: &proto_gen::node_service::CompareAndUpdateFileRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1269,7 +1461,10 @@ pub fn canonical_make_volumes_request_body(
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
         CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
-        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, NativePreparationBeginRequest,
+        NativePreparationFinalizeRequest, NativePreparationFinalizeResponse, NativePreparationLocateRequest,
+        NativePreparationLocateResponse, NativePreparationProbeRequest, NativePreparationProbeResponse, NativePreparationReceipt,
+        NativePreparationRecoverRequest, NativePreparationRecoverResponse, PreparePartTransactionRequest, RenameDataRequest,
         RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
         SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
@@ -1316,6 +1511,500 @@ mod disk_mutation_canonical_tests {
             bodies.push(canonical_rename_data_request_body(&request).unwrap());
         }
         assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn native_preparation_begin_body_binds_every_field() {
+        let baseline = NativePreparationBeginRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let mut bodies = vec![canonical_native_preparation_begin_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut NativePreparationBeginRequest| r.disk = "node-b".into(),
+            |r: &mut NativePreparationBeginRequest| r.disk_id = vec![5; 16].into(),
+            |r: &mut NativePreparationBeginRequest| r.store_id = vec![5; 16].into(),
+            |r: &mut NativePreparationBeginRequest| r.preparation_id = vec![5; 16].into(),
+            |r: &mut NativePreparationBeginRequest| r.bucket = "other".into(),
+            |r: &mut NativePreparationBeginRequest| r.key = "other.jpg".into(),
+            |r: &mut NativePreparationBeginRequest| r.bucket_incarnation_id = vec![5; 16].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_native_preparation_begin_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn native_preparation_finalize_body_binds_every_field() {
+        let baseline = NativePreparationFinalizeRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+            object_digest: vec![5; 32].into(),
+            object_length: 1234,
+            version_id: vec![6; 16].into(),
+            metadata: vec![7, 8, 9].into(),
+        };
+        let mut bodies = vec![canonical_native_preparation_finalize_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut NativePreparationFinalizeRequest| r.disk = "node-b".into(),
+            |r: &mut NativePreparationFinalizeRequest| r.disk_id = vec![9; 16].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.store_id = vec![9; 16].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.preparation_id = vec![9; 16].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.bucket = "other".into(),
+            |r: &mut NativePreparationFinalizeRequest| r.key = "other.jpg".into(),
+            |r: &mut NativePreparationFinalizeRequest| r.bucket_incarnation_id = vec![9; 16].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.object_digest = vec![9; 32].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.object_length = 4321,
+            |r: &mut NativePreparationFinalizeRequest| r.version_id = vec![9; 16].into(),
+            |r: &mut NativePreparationFinalizeRequest| r.metadata = vec![7, 8, 10].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_native_preparation_finalize_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn native_preparation_probe_body_binds_every_field() {
+        let baseline = NativePreparationProbeRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let mut bodies = vec![canonical_native_preparation_probe_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut NativePreparationProbeRequest| r.disk = "node-b".into(),
+            |r: &mut NativePreparationProbeRequest| r.disk_id = vec![5; 16].into(),
+            |r: &mut NativePreparationProbeRequest| r.store_id = vec![5; 16].into(),
+            |r: &mut NativePreparationProbeRequest| r.preparation_id = vec![5; 16].into(),
+            |r: &mut NativePreparationProbeRequest| r.bucket = "other".into(),
+            |r: &mut NativePreparationProbeRequest| r.key = "other.jpg".into(),
+            |r: &mut NativePreparationProbeRequest| r.bucket_incarnation_id = vec![5; 16].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_native_preparation_probe_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn native_preparation_recover_body_binds_every_field() {
+        let baseline = NativePreparationRecoverRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let mut bodies = vec![canonical_native_preparation_recover_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut NativePreparationRecoverRequest| r.disk = "node-b".into(),
+            |r: &mut NativePreparationRecoverRequest| r.disk_id = vec![5; 16].into(),
+            |r: &mut NativePreparationRecoverRequest| r.store_id = vec![5; 16].into(),
+            |r: &mut NativePreparationRecoverRequest| r.preparation_id = vec![5; 16].into(),
+            |r: &mut NativePreparationRecoverRequest| r.bucket = "other".into(),
+            |r: &mut NativePreparationRecoverRequest| r.key = "other.jpg".into(),
+            |r: &mut NativePreparationRecoverRequest| r.bucket_incarnation_id = vec![5; 16].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_native_preparation_recover_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    fn native_preparation_receipt() -> NativePreparationReceipt {
+        NativePreparationReceipt {
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            deployment_id: vec![3; 16].into(),
+            preparation_id: vec![4; 16].into(),
+            version_id: vec![5; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![6; 16].into(),
+            object_digest: vec![7; 32].into(),
+            object_length: 1234,
+            set_digest: vec![8; 32].into(),
+            distribution_digest: vec![9; 32].into(),
+            metadata_digest: vec![10; 32].into(),
+            shard_digest: vec![11; 32].into(),
+            shard_length: 512,
+            data_blocks: 4,
+            parity_blocks: 2,
+            shard_index: 3,
+        }
+    }
+
+    #[test]
+    fn native_preparation_begin_response_binds_request_status_and_error() {
+        use super::proto_gen::node_service::{Error, NativePreparationBeginResponse};
+
+        let request = NativePreparationBeginRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let response = NativePreparationBeginResponse {
+            success: true,
+            error: None,
+            response_proof: vec![1; 32].into(),
+        };
+        let baseline = canonical_native_preparation_begin_response_body(&request, &response).unwrap();
+
+        let failed = NativePreparationBeginResponse {
+            success: false,
+            error: Some(Error {
+                code: 17,
+                error_info: "disk unavailable".into(),
+            }),
+            ..response.clone()
+        };
+        assert_ne!(baseline, canonical_native_preparation_begin_response_body(&request, &failed).unwrap());
+
+        let mut changed_request = request.clone();
+        changed_request.disk_id = vec![9; 16].into();
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_begin_response_body(&changed_request, &response).unwrap()
+        );
+
+        let mut proof_only = response.clone();
+        proof_only.response_proof = vec![2; 32].into();
+        assert_eq!(baseline, canonical_native_preparation_begin_response_body(&request, &proof_only).unwrap());
+    }
+
+    #[test]
+    fn native_preparation_finalize_response_binds_request_status_error_and_receipt() {
+        use super::proto_gen::node_service::Error;
+
+        let request = NativePreparationFinalizeRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+            object_digest: vec![5; 32].into(),
+            object_length: 1234,
+            version_id: vec![6; 16].into(),
+            metadata: vec![7, 8].into(),
+        };
+        let response = NativePreparationFinalizeResponse {
+            success: true,
+            receipt: Some(native_preparation_receipt()),
+            error: None,
+            response_proof: vec![1; 32].into(),
+        };
+        let baseline = canonical_native_preparation_finalize_response_body(&request, &response).unwrap();
+        let mut bodies = vec![baseline.clone()];
+        for mutate in [
+            |r: &mut NativePreparationReceipt| r.disk_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.store_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.deployment_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.preparation_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.version_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.bucket = "other".into(),
+            |r: &mut NativePreparationReceipt| r.key = "other.jpg".into(),
+            |r: &mut NativePreparationReceipt| r.bucket_incarnation_id = vec![12; 16].into(),
+            |r: &mut NativePreparationReceipt| r.object_digest = vec![12; 32].into(),
+            |r: &mut NativePreparationReceipt| r.object_length = 4321,
+            |r: &mut NativePreparationReceipt| r.set_digest = vec![12; 32].into(),
+            |r: &mut NativePreparationReceipt| r.distribution_digest = vec![12; 32].into(),
+            |r: &mut NativePreparationReceipt| r.metadata_digest = vec![12; 32].into(),
+            |r: &mut NativePreparationReceipt| r.shard_digest = vec![12; 32].into(),
+            |r: &mut NativePreparationReceipt| r.shard_length = 1024,
+            |r: &mut NativePreparationReceipt| r.data_blocks = 8,
+            |r: &mut NativePreparationReceipt| r.parity_blocks = 4,
+            |r: &mut NativePreparationReceipt| r.shard_index = 5,
+        ] {
+            let mut changed = response.clone();
+            mutate(changed.receipt.as_mut().unwrap());
+            bodies.push(canonical_native_preparation_finalize_response_body(&request, &changed).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let failed = NativePreparationFinalizeResponse {
+            success: false,
+            error: Some(Error {
+                code: 19,
+                error_info: "finalize failed".into(),
+            }),
+            ..response.clone()
+        };
+        assert_ne!(baseline, canonical_native_preparation_finalize_response_body(&request, &failed).unwrap());
+
+        let mut changed_request = request.clone();
+        changed_request.metadata = vec![7, 9].into();
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_finalize_response_body(&changed_request, &response).unwrap()
+        );
+
+        let mut proof_only = response.clone();
+        proof_only.response_proof = vec![2; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_native_preparation_finalize_response_body(&request, &proof_only).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_preparation_probe_response_binds_state_receipt_metadata_and_error() {
+        use super::proto_gen::node_service::Error;
+
+        let request = NativePreparationProbeRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let response = NativePreparationProbeResponse {
+            success: true,
+            exists: true,
+            prepared: true,
+            metadata: vec![1, 2, 3].into(),
+            error: None,
+            response_proof: vec![1; 32].into(),
+            version_id: vec![4; 16].into(),
+            object_digest: vec![5; 32].into(),
+            object_length: 4096,
+            set_digest: vec![6; 32].into(),
+            distribution_digest: vec![7; 32].into(),
+        };
+        let baseline = canonical_native_preparation_probe_response_body(&request, &response).unwrap();
+        let mut bodies = vec![baseline.clone()];
+        for (exists, prepared) in [(false, true), (true, false), (false, false)] {
+            let changed = NativePreparationProbeResponse {
+                exists,
+                prepared,
+                ..response.clone()
+            };
+            bodies.push(canonical_native_preparation_probe_response_body(&request, &changed).unwrap());
+        }
+        let metadata_changed = NativePreparationProbeResponse {
+            metadata: vec![1, 2, 4].into(),
+            ..response.clone()
+        };
+        bodies.push(canonical_native_preparation_probe_response_body(&request, &metadata_changed).unwrap());
+        for changed in [
+            NativePreparationProbeResponse {
+                version_id: vec![8; 16].into(),
+                ..response.clone()
+            },
+            NativePreparationProbeResponse {
+                object_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            NativePreparationProbeResponse {
+                object_length: 8192,
+                ..response.clone()
+            },
+            NativePreparationProbeResponse {
+                set_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            NativePreparationProbeResponse {
+                distribution_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+        ] {
+            bodies.push(canonical_native_preparation_probe_response_body(&request, &changed).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let failed = NativePreparationProbeResponse {
+            success: false,
+            error: Some(Error {
+                code: 21,
+                error_info: "probe failed".into(),
+            }),
+            ..response.clone()
+        };
+        assert_ne!(baseline, canonical_native_preparation_probe_response_body(&request, &failed).unwrap());
+
+        let mut changed_request = request.clone();
+        changed_request.preparation_id = vec![9; 16].into();
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_probe_response_body(&changed_request, &response).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_preparation_recover_response_binds_request_receipt_metadata_and_error() {
+        use super::proto_gen::node_service::Error;
+
+        let request = NativePreparationRecoverRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+        };
+        let response = NativePreparationRecoverResponse {
+            success: true,
+            receipt: Some(native_preparation_receipt()),
+            metadata: vec![1, 2, 3].into(),
+            error: None,
+            response_proof: vec![1; 32].into(),
+        };
+        let baseline = canonical_native_preparation_recover_response_body(&request, &response).unwrap();
+
+        let metadata_changed = NativePreparationRecoverResponse {
+            metadata: vec![1, 2, 4].into(),
+            ..response.clone()
+        };
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_recover_response_body(&request, &metadata_changed).unwrap()
+        );
+
+        let failed = NativePreparationRecoverResponse {
+            success: false,
+            error: Some(Error {
+                code: 23,
+                error_info: "recover failed".into(),
+            }),
+            ..response.clone()
+        };
+        assert_ne!(baseline, canonical_native_preparation_recover_response_body(&request, &failed).unwrap());
+
+        let mut changed_request = request.clone();
+        changed_request.key = "other.jpg".into();
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_recover_response_body(&changed_request, &response).unwrap()
+        );
+
+        let mut proof_only = response.clone();
+        proof_only.response_proof = vec![2; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_native_preparation_recover_response_body(&request, &proof_only).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_preparation_locate_bodies_bind_route_and_description() {
+        use super::proto_gen::node_service::Error;
+
+        let request = NativePreparationLocateRequest {
+            disk: "node-a".into(),
+            disk_id: vec![1; 16].into(),
+            store_id: vec![2; 16].into(),
+            preparation_id: vec![3; 16].into(),
+        };
+        let response = NativePreparationLocateResponse {
+            success: true,
+            found: true,
+            bucket: "photos".into(),
+            key: "image.jpg".into(),
+            bucket_incarnation_id: vec![4; 16].into(),
+            metadata: vec![5, 6, 7].into(),
+            prepared: true,
+            error: None,
+            response_proof: vec![1; 32].into(),
+        };
+        let baseline = canonical_native_preparation_locate_response_body(&request, &response).unwrap();
+        let mut bodies = vec![baseline.clone()];
+        for changed in [
+            NativePreparationLocateResponse {
+                success: false,
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                found: false,
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                bucket: "other".into(),
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                key: "other.jpg".into(),
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                bucket_incarnation_id: vec![8; 16].into(),
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                metadata: vec![5, 6, 8].into(),
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                prepared: false,
+                ..response.clone()
+            },
+            NativePreparationLocateResponse {
+                error: Some(Error {
+                    code: 25,
+                    error_info: "locate failed".into(),
+                }),
+                ..response.clone()
+            },
+        ] {
+            bodies.push(canonical_native_preparation_locate_response_body(&request, &changed).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let mut changed_request = request.clone();
+        changed_request.store_id = vec![9; 16].into();
+        assert_ne!(
+            baseline,
+            canonical_native_preparation_locate_response_body(&changed_request, &response).unwrap()
+        );
+
+        let mut proof_only = response.clone();
+        proof_only.response_proof = vec![2; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_native_preparation_locate_response_body(&request, &proof_only).unwrap()
+        );
+
+        let mut request_bodies = vec![canonical_native_preparation_locate_request_body(&request).unwrap()];
+        for mutate in [
+            |r: &mut NativePreparationLocateRequest| r.disk = "node-b".into(),
+            |r: &mut NativePreparationLocateRequest| r.disk_id = vec![9; 16].into(),
+            |r: &mut NativePreparationLocateRequest| r.store_id = vec![9; 16].into(),
+            |r: &mut NativePreparationLocateRequest| r.preparation_id = vec![9; 16].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            request_bodies.push(canonical_native_preparation_locate_request_body(&changed).unwrap());
+        }
+        assert_all_distinct(&request_bodies);
     }
 
     #[test]

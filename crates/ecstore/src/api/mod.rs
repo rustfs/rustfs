@@ -644,7 +644,13 @@ pub mod store_list {
 
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
+    pub use crate::disk::local::native_prepare::{
+        NativePreparationDescription, NativePreparationProbe, NativePreparationReceipt,
+    };
     pub use crate::store::HealWalkVersion;
+    pub use crate::store::native_prepare::{
+        NativePreparationFinalizeRequest, NativePreparationRecovery, NativePreparationTarget,
+    };
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
         all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,

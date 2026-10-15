@@ -1741,6 +1741,36 @@ impl Node for NodeService {
     async fn delete_paths(&self, request: Request<DeletePathsRequest>) -> Result<Response<DeletePathsResponse>, Status> {
         self.handle_delete_paths(request).await
     }
+    async fn native_preparation_begin(
+        &self,
+        request: Request<NativePreparationBeginRequest>,
+    ) -> Result<Response<NativePreparationBeginResponse>, Status> {
+        self.handle_native_preparation_begin(request).await
+    }
+    async fn native_preparation_finalize(
+        &self,
+        request: Request<NativePreparationFinalizeRequest>,
+    ) -> Result<Response<NativePreparationFinalizeResponse>, Status> {
+        self.handle_native_preparation_finalize(request).await
+    }
+    async fn native_preparation_probe(
+        &self,
+        request: Request<NativePreparationProbeRequest>,
+    ) -> Result<Response<NativePreparationProbeResponse>, Status> {
+        self.handle_native_preparation_probe(request).await
+    }
+    async fn native_preparation_recover(
+        &self,
+        request: Request<NativePreparationRecoverRequest>,
+    ) -> Result<Response<NativePreparationRecoverResponse>, Status> {
+        self.handle_native_preparation_recover(request).await
+    }
+    async fn native_preparation_locate(
+        &self,
+        request: Request<NativePreparationLocateRequest>,
+    ) -> Result<Response<NativePreparationLocateResponse>, Status> {
+        self.handle_native_preparation_locate(request).await
+    }
     async fn acquire_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseRequest>,
@@ -3097,7 +3127,7 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 24] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 29] = [
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
@@ -3122,6 +3152,11 @@ mod tests {
         "acquiresnapshotlease",
         "renewsnapshotlease",
         "releasesnapshotlease",
+        "nativepreparationbegin",
+        "nativepreparationfinalize",
+        "nativepreparationprobe",
+        "nativepreparationrecover",
+        "nativepreparationlocate",
     ];
 
     fn normalized_rpc_method(method: &str) -> String {

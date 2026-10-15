@@ -58,13 +58,15 @@ use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
     CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
     DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
-    MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
-    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    MakeVolumesRequest, NativePreparationBeginRequest, NativePreparationFinalizeRequest, NativePreparationLocateRequest,
+    NativePreparationProbeRequest, NativePreparationRecoverRequest, PreparePartTransactionRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
+    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+    WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::{
     future::Future,
     io::Cursor,
@@ -174,6 +176,164 @@ fn attach_mutation_body_digest<T>(
 ) -> Result<()> {
     let canonical_body = canonical_body.map_err(|_| Error::other(format!("{op} request length cannot be represented")))?;
     crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
+}
+
+fn native_response_proof(body: std::result::Result<Vec<u8>, std::num::TryFromIntError>, proof: &[u8]) -> Result<()> {
+    let body = body.map_err(|_| Error::other("native preparation response is too large to authenticate"))?;
+    if proof.len() != 32 {
+        return Err(Error::other("native preparation response proof has invalid length"));
+    }
+    crate::cluster::rpc::verify_tonic_rpc_response_proof(&body, proof)
+        .map_err(|_| Error::other("native preparation response proof is invalid"))
+}
+
+fn native_uuid_field(value: &[u8], field: &str) -> Result<Uuid> {
+    let id = Uuid::from_slice(value).map_err(|_| Error::other(format!("native preparation returned invalid {field}")))?;
+    if id.is_nil() {
+        return Err(Error::other(format!("native preparation returned nil {field}")));
+    }
+    Ok(id)
+}
+
+fn native_version_field(value: &[u8]) -> Result<Uuid> {
+    Uuid::from_slice(value).map_err(|_| Error::other("native preparation returned invalid version id"))
+}
+
+fn native_object_length_from_metadata(input: &crate::disk::local::native_prepare::NativePrepareInput) -> Result<u64> {
+    let raw = rustfs_filemeta::FileMeta::load(&input.metadata).map_err(Error::other)?;
+    if raw.versions.len() != 1 {
+        return Err(Error::other("native preparation metadata must have one version"));
+    }
+    let info = rustfs_filemeta::get_file_info(
+        &input.metadata,
+        &input.bucket,
+        &input.key,
+        &input.version.to_string(),
+        rustfs_filemeta::FileInfoOpts {
+            data: true,
+            include_free_versions: false,
+            include_part_checksums: true,
+        },
+    )
+    .map_err(Error::other)?;
+    if info.version_id != Some(input.version) || info.deleted || info.mark_deleted || info.size < 0 {
+        return Err(Error::other("native preparation metadata identity mismatch"));
+    }
+    u64::try_from(info.size).map_err(Error::other)
+}
+
+fn validate_native_metadata_for_version(
+    metadata: &[u8],
+    expected_digest: Option<&[u8; 32]>,
+    bucket: &str,
+    key: &str,
+    version: Uuid,
+) -> Result<()> {
+    validate_native_metadata(metadata, expected_digest)?;
+    let raw = rustfs_filemeta::FileMeta::load(metadata).map_err(Error::other)?;
+    if raw.versions.len() != 1 {
+        return Err(Error::other("native preparation metadata must have one version"));
+    }
+    let info = rustfs_filemeta::get_file_info(
+        metadata,
+        bucket,
+        key,
+        &version.to_string(),
+        rustfs_filemeta::FileInfoOpts {
+            data: true,
+            include_free_versions: false,
+            include_part_checksums: true,
+        },
+    )
+    .map_err(Error::other)?;
+    if info.version_id != Some(version) || info.deleted || info.mark_deleted || info.size < 0 {
+        return Err(Error::other("native preparation metadata identity mismatch"));
+    }
+    Ok(())
+}
+
+fn native_digest_field(value: &[u8], field: &str) -> Result<[u8; 32]> {
+    value
+        .try_into()
+        .map_err(|_| Error::other(format!("native preparation returned invalid {field}")))
+}
+
+fn native_receipt_from_wire(
+    receipt: rustfs_protos::proto_gen::node_service::NativePreparationReceipt,
+    expected_disk: Uuid,
+    expected_store: Uuid,
+    expected_preparation: Uuid,
+    expected_bucket: &str,
+    expected_key: &str,
+    expected_incarnation: Uuid,
+    expected_object: Option<(&[u8], u64)>,
+    expected_version: Option<Uuid>,
+) -> Result<crate::disk::local::native_prepare::NativePreparationReceipt> {
+    let disk = native_uuid_field(&receipt.disk_id, "disk id")?;
+    let store = native_uuid_field(&receipt.store_id, "store id")?;
+    let deployment = native_uuid_field(&receipt.deployment_id, "deployment id")?;
+    let preparation = native_uuid_field(&receipt.preparation_id, "preparation id")?;
+    let version = native_version_field(&receipt.version_id)?;
+    let incarnation = native_uuid_field(&receipt.bucket_incarnation_id, "bucket incarnation")?;
+    if disk != expected_disk
+        || store != expected_store
+        || deployment != expected_store
+        || preparation != expected_preparation
+        || incarnation != expected_incarnation
+        || receipt.bucket != expected_bucket
+        || receipt.key != expected_key
+        || expected_version.is_some_and(|expected| version != expected)
+    {
+        return Err(Error::other("native preparation receipt identity mismatch"));
+    }
+    let object_digest = native_digest_field(&receipt.object_digest, "object digest")?;
+    if expected_object.is_some_and(|(digest, length)| digest != object_digest.as_slice() || length != receipt.object_length) {
+        return Err(Error::other("native preparation receipt object mismatch"));
+    }
+    let set_digest = native_digest_field(&receipt.set_digest, "set digest")?;
+    let distribution_digest = native_digest_field(&receipt.distribution_digest, "distribution digest")?;
+    let metadata_digest = native_digest_field(&receipt.metadata_digest, "metadata digest")?;
+    let shard_digest = native_digest_field(&receipt.shard_digest, "shard digest")?;
+    let data_blocks = usize::try_from(receipt.data_blocks).map_err(Error::other)?;
+    let parity_blocks = usize::try_from(receipt.parity_blocks).map_err(Error::other)?;
+    let shard_index = usize::try_from(receipt.shard_index).map_err(Error::other)?;
+    if data_blocks == 0
+        || parity_blocks == 0
+        || data_blocks
+            .checked_add(parity_blocks)
+            .is_none_or(|total| shard_index == 0 || shard_index > total)
+    {
+        return Err(Error::other("native preparation receipt has invalid erasure geometry"));
+    }
+    Ok(crate::disk::local::native_prepare::NativePreparationReceipt {
+        preparation,
+        version,
+        disk,
+        set_digest,
+        distribution_digest,
+        metadata_digest,
+        shard_digest,
+        shard_length: receipt.shard_length,
+        bucket: receipt.bucket,
+        key: receipt.key,
+        deployment,
+        incarnation,
+        object_digest,
+        object_length: receipt.object_length,
+        data_blocks,
+        parity_blocks,
+        shard_index,
+    })
+}
+
+fn validate_native_metadata(metadata: &[u8], expected_digest: Option<&[u8; 32]>) -> Result<()> {
+    if metadata.len() > rustfs_protos::NATIVE_PREPARATION_METADATA_MAX_BYTES {
+        return Err(Error::other("native preparation metadata exceeds the protocol limit"));
+    }
+    if expected_digest.is_some_and(|expected| Sha256::digest(metadata).as_slice() != expected.as_slice()) {
+        return Err(Error::other("native preparation metadata digest mismatch"));
+    }
+    Ok(())
 }
 
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
@@ -890,6 +1050,339 @@ impl RemoteDisk {
                     return Err(DiskError::MethodNotAllowed);
                 }
                 Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn native_begin_stream(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+    ) -> Result<()> {
+        let disk_id = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        if preparation.is_nil() || store_id.is_nil() || incarnation.is_nil() || bucket.is_empty() || key.is_empty() {
+            return Err(DiskError::InvalidPath);
+        }
+        self.execute_with_timeout_for_op(
+            "native_preparation_begin",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(NativePreparationBeginRequest {
+                    disk: self.disk_ref().await,
+                    disk_id: disk_id.as_bytes().to_vec().into(),
+                    store_id: store_id.as_bytes().to_vec().into(),
+                    preparation_id: preparation.as_bytes().to_vec().into(),
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_native_preparation_begin_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical, "native_preparation_begin")?;
+                let canonical_request = request.get_ref().clone();
+                let response = client.native_preparation_begin(request).await?.into_inner();
+                native_response_proof(
+                    rustfs_protos::canonical_native_preparation_begin_response_body(&canonical_request, &response),
+                    &response.response_proof,
+                )?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn native_finalize(
+        &self,
+        input: crate::disk::local::native_prepare::NativePrepareInput,
+    ) -> Result<crate::disk::local::native_prepare::NativePreparationReceipt> {
+        let disk_id = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        if input.preparation.is_nil() || input.store_id.is_nil() || input.bucket_incarnation.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        validate_native_metadata(&input.metadata, None)?;
+        let expected_object_digest = input.object_digest;
+        let expected_object_length = native_object_length_from_metadata(&input)?;
+        let expected_version = input.version;
+        self.execute_with_timeout_for_op(
+            "native_preparation_finalize",
+            || async move {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(NativePreparationFinalizeRequest {
+                    disk: self.disk_ref().await,
+                    disk_id: disk_id.as_bytes().to_vec().into(),
+                    store_id: input.store_id.as_bytes().to_vec().into(),
+                    preparation_id: input.preparation.as_bytes().to_vec().into(),
+                    bucket: input.bucket.clone(),
+                    key: input.key.clone(),
+                    bucket_incarnation_id: input.bucket_incarnation.as_bytes().to_vec().into(),
+                    object_digest: expected_object_digest.to_vec().into(),
+                    object_length: expected_object_length,
+                    version_id: expected_version.as_bytes().to_vec().into(),
+                    metadata: input.metadata.clone(),
+                });
+                let canonical = rustfs_protos::canonical_native_preparation_finalize_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical, "native_preparation_finalize")?;
+                let canonical_request = request.get_ref().clone();
+                let response = client.native_preparation_finalize(request).await?.into_inner();
+                native_response_proof(
+                    rustfs_protos::canonical_native_preparation_finalize_response_body(&canonical_request, &response),
+                    &response.response_proof,
+                )?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                let receipt = response
+                    .receipt
+                    .ok_or_else(|| Error::other("native finalize response omitted its receipt"))?;
+                let receipt = native_receipt_from_wire(
+                    receipt,
+                    disk_id,
+                    input.store_id,
+                    input.preparation,
+                    &input.bucket,
+                    &input.key,
+                    input.bucket_incarnation,
+                    Some((&expected_object_digest, expected_object_length)),
+                    Some(expected_version),
+                )?;
+                validate_native_metadata_for_version(
+                    &input.metadata,
+                    Some(&receipt.metadata_digest),
+                    &input.bucket,
+                    &input.key,
+                    expected_version,
+                )?;
+                Ok(receipt)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn native_probe(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+    ) -> Result<crate::disk::local::native_prepare::NativePreparationProbe> {
+        let disk_id = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        if preparation.is_nil() || store_id.is_nil() || incarnation.is_nil() || bucket.is_empty() || key.is_empty() {
+            return Err(DiskError::InvalidPath);
+        }
+        self.execute_with_timeout_for_op(
+            "native_preparation_probe",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(NativePreparationProbeRequest {
+                    disk: self.disk_ref().await,
+                    disk_id: disk_id.as_bytes().to_vec().into(),
+                    store_id: store_id.as_bytes().to_vec().into(),
+                    preparation_id: preparation.as_bytes().to_vec().into(),
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_native_preparation_probe_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical, "native_preparation_probe")?;
+                let canonical_request = request.get_ref().clone();
+                let response = client.native_preparation_probe(request).await?.into_inner();
+                native_response_proof(
+                    rustfs_protos::canonical_native_preparation_probe_response_body(&canonical_request, &response),
+                    &response.response_proof,
+                )?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                validate_native_metadata(&response.metadata, None)?;
+                if !response.exists {
+                    if response.prepared
+                        || !response.metadata.is_empty()
+                        || !response.version_id.is_empty()
+                        || !response.object_digest.is_empty()
+                        || response.object_length != 0
+                        || !response.set_digest.is_empty()
+                        || !response.distribution_digest.is_empty()
+                    {
+                        return Err(Error::other("native probe absent response carries object state"));
+                    }
+                    return Ok(crate::disk::local::native_prepare::NativePreparationProbe::Absent);
+                }
+                let version = native_version_field(&response.version_id)?;
+                let object_digest = native_digest_field(&response.object_digest, "object digest")?;
+                let set_digest = native_digest_field(&response.set_digest, "set digest")?;
+                let distribution_digest = native_digest_field(&response.distribution_digest, "distribution digest")?;
+                if !response.metadata.is_empty() {
+                    validate_native_metadata_for_version(&response.metadata, None, bucket, key, version)?;
+                }
+                Ok(crate::disk::local::native_prepare::NativePreparationProbe::Existing {
+                    version,
+                    prepared: response.prepared,
+                    object_digest,
+                    object_length: response.object_length,
+                    set_digest,
+                    distribution_digest,
+                    metadata: (!response.metadata.is_empty()).then_some(response.metadata),
+                })
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn native_recover(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+    ) -> Result<(crate::disk::local::native_prepare::NativePreparationReceipt, Bytes)> {
+        let disk_id = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        if preparation.is_nil() || store_id.is_nil() || incarnation.is_nil() || bucket.is_empty() || key.is_empty() {
+            return Err(DiskError::InvalidPath);
+        }
+        self.execute_with_timeout_for_op(
+            "native_preparation_recover",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(NativePreparationRecoverRequest {
+                    disk: self.disk_ref().await,
+                    disk_id: disk_id.as_bytes().to_vec().into(),
+                    store_id: store_id.as_bytes().to_vec().into(),
+                    preparation_id: preparation.as_bytes().to_vec().into(),
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_native_preparation_recover_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical, "native_preparation_recover")?;
+                let canonical_request = request.get_ref().clone();
+                let response = client.native_preparation_recover(request).await?.into_inner();
+                native_response_proof(
+                    rustfs_protos::canonical_native_preparation_recover_response_body(&canonical_request, &response),
+                    &response.response_proof,
+                )?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                let receipt = response
+                    .receipt
+                    .ok_or_else(|| Error::other("native recover response omitted its receipt"))?;
+                let receipt =
+                    native_receipt_from_wire(receipt, disk_id, store_id, preparation, bucket, key, incarnation, None, None)?;
+                validate_native_metadata_for_version(
+                    &response.metadata,
+                    Some(&receipt.metadata_digest),
+                    bucket,
+                    key,
+                    receipt.version,
+                )?;
+                Ok((receipt, response.metadata))
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn native_locate(
+        &self,
+        store_id: Uuid,
+        preparation: Uuid,
+    ) -> Result<Option<crate::disk::local::native_prepare::NativePreparationDescription>> {
+        let disk_id = self
+            .get_disk_id()
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::InvalidPath)?;
+        if preparation.is_nil() || store_id.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        self.execute_with_timeout_for_op(
+            "native_preparation_locate",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(NativePreparationLocateRequest {
+                    disk: self.disk_ref().await,
+                    disk_id: disk_id.as_bytes().to_vec().into(),
+                    store_id: store_id.as_bytes().to_vec().into(),
+                    preparation_id: preparation.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_native_preparation_locate_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical, "native_preparation_locate")?;
+                let canonical_request = request.get_ref().clone();
+                let response = client.native_preparation_locate(request).await?.into_inner();
+                native_response_proof(
+                    rustfs_protos::canonical_native_preparation_locate_response_body(&canonical_request, &response),
+                    &response.response_proof,
+                )?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                if !response.found {
+                    if !response.bucket.is_empty()
+                        || !response.key.is_empty()
+                        || !response.bucket_incarnation_id.is_empty()
+                        || !response.metadata.is_empty()
+                        || response.prepared
+                    {
+                        return Err(Error::other("native locate absent response carries preparation state"));
+                    }
+                    return Ok(None);
+                }
+                if response.bucket.is_empty()
+                    || response.bucket.len() > 255
+                    || response.key.is_empty()
+                    || response.key.len() > 4096
+                    || preparation.is_nil()
+                {
+                    return Err(Error::other("native locate response has invalid description"));
+                }
+                let incarnation = native_uuid_field(&response.bucket_incarnation_id, "bucket incarnation")?;
+                validate_native_metadata(&response.metadata, None)?;
+                if response.metadata.is_empty() {
+                    return Err(Error::other("native locate response omitted metadata"));
+                }
+                let raw_metadata = rustfs_filemeta::FileMeta::load(&response.metadata)
+                    .map_err(|_| Error::other("native locate response metadata is invalid"))?;
+                if raw_metadata.versions.len() != 1 {
+                    return Err(Error::other("native locate metadata must have one version"));
+                }
+                let version = raw_metadata.versions[0].header.version_id.unwrap_or_else(Uuid::nil);
+                Ok(Some(crate::disk::local::native_prepare::NativePreparationDescription {
+                    preparation,
+                    bucket: response.bucket,
+                    key: response.key,
+                    incarnation,
+                    version,
+                    metadata: response.metadata,
+                    prepared: response.prepared,
+                }))
             },
             get_max_timeout_duration(),
         )

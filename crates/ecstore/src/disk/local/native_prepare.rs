@@ -93,7 +93,7 @@ impl NativePreparationReceipt {
     }
 }
 /// A routing observation, never a durability or publication receipt.
-pub(crate) enum NativePreparationProbe {
+pub enum NativePreparationProbe {
     Absent,
     Existing {
         version: Uuid,
@@ -123,7 +123,7 @@ pub(super) fn open_stream_part(
     durable::open_stream_part(root, preparation, data_dir, part)
 }
 
-pub(crate) struct NativePreparationDescription {
+pub struct NativePreparationDescription {
     pub preparation: Uuid,
     pub bucket: String,
     pub key: String,

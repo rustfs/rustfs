@@ -261,7 +261,7 @@ impl SetDisks {
             let result = match disk {
                 Some(disk) => {
                     if let Err(error) = disk
-                        .native_begin_stream(preparation, store_id, bucket, incarnation, fence.clone())
+                        .native_begin_stream(preparation, store_id, bucket, key, incarnation, fence.clone())
                         .await
                     {
                         if matches!(&error, DiskError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData) {
@@ -578,7 +578,7 @@ impl SetDisks {
             }
             let disk = disk.ok_or_else(|| Error::other("prepared native disk unavailable"))?;
             let (receipt, metadata) = match disk
-                .native_recover(preparation, store_id, bucket, incarnation, fence.clone())
+                .native_recover(preparation, store_id, bucket, key, incarnation, fence.clone())
                 .await
             {
                 Ok(value) => value,

@@ -142,6 +142,132 @@ message CompareAndUpdateFileResponse {
   optional Error error = 3;
 }
 
+// Native preparation carries only bounded object metadata over the control RPC.
+// Shard bytes use the authenticated data stream and remain private until finalized.
+message NativePreparationReceipt {
+  bytes disk_id = 1; // 16-byte UUID.
+  bytes store_id = 2; // 16-byte UUID.
+  bytes deployment_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+  bytes version_id = 5; // 16-byte UUID.
+  string bucket = 6;
+  string key = 7;
+  bytes bucket_incarnation_id = 8; // 16-byte UUID.
+  bytes object_digest = 9; // 32-byte SHA-256.
+  uint64 object_length = 10;
+  bytes set_digest = 11;
+  bytes distribution_digest = 12;
+  bytes metadata_digest = 13;
+  bytes shard_digest = 14;
+  uint64 shard_length = 15;
+  uint32 data_blocks = 16;
+  uint32 parity_blocks = 17;
+  uint32 shard_index = 18;
+  reserved 19, 20;
+}
+
+message NativePreparationBeginRequest {
+  string disk = 1;
+  bytes disk_id = 2; // 16-byte UUID.
+  bytes store_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+  string bucket = 5;
+  string key = 6;
+  bytes bucket_incarnation_id = 7; // 16-byte UUID.
+}
+
+message NativePreparationBeginResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes response_proof = 3;
+}
+
+message NativePreparationFinalizeRequest {
+  string disk = 1;
+  bytes disk_id = 2; // 16-byte UUID.
+  bytes store_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+  string bucket = 5;
+  string key = 6;
+  bytes bucket_incarnation_id = 7; // 16-byte UUID.
+  bytes object_digest = 8; // 32-byte SHA-256.
+  uint64 object_length = 9;
+  bytes version_id = 10; // 16-byte UUID.
+  // Exact serialized FileMeta; maximum 1 MiB. Peers reject larger values.
+  bytes metadata = 11;
+}
+
+message NativePreparationFinalizeResponse {
+  bool success = 1;
+  NativePreparationReceipt receipt = 2;
+  optional Error error = 3;
+  bytes response_proof = 4;
+}
+
+message NativePreparationProbeRequest {
+  string disk = 1;
+  bytes disk_id = 2; // 16-byte UUID.
+  bytes store_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+  string bucket = 5;
+  string key = 6;
+  bytes bucket_incarnation_id = 7; // 16-byte UUID.
+}
+
+message NativePreparationProbeResponse {
+  bool success = 1;
+  bool exists = 2;
+  bool prepared = 3;
+  reserved 4;
+  // Exact serialized FileMeta when it exists and can be read; maximum 1 MiB.
+  bytes metadata = 5;
+  optional Error error = 6;
+  bytes response_proof = 7;
+  bytes version_id = 8; // 16-byte UUID; observation only, not a durability receipt.
+  bytes object_digest = 9; // 32-byte SHA-256.
+  uint64 object_length = 10;
+  bytes set_digest = 11;
+  bytes distribution_digest = 12;
+}
+
+message NativePreparationRecoverRequest {
+  string disk = 1;
+  bytes disk_id = 2; // 16-byte UUID.
+  bytes store_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+  string bucket = 5;
+  string key = 6;
+  bytes bucket_incarnation_id = 7; // 16-byte UUID.
+}
+
+message NativePreparationRecoverResponse {
+  bool success = 1;
+  NativePreparationReceipt receipt = 2;
+  // Exact persisted FileMeta; maximum 1 MiB. Peers reject larger values.
+  bytes metadata = 3;
+  optional Error error = 4;
+  bytes response_proof = 5;
+}
+
+message NativePreparationLocateRequest {
+  string disk = 1;
+  bytes disk_id = 2; // 16-byte UUID.
+  bytes store_id = 3; // 16-byte UUID.
+  bytes preparation_id = 4; // 16-byte UUID.
+}
+
+message NativePreparationLocateResponse {
+  bool success = 1;
+  bool found = 2;
+  string bucket = 3;
+  string key = 4;
+  bytes bucket_incarnation_id = 5; // 16-byte UUID.
+  bytes metadata = 6; // Exact serialized FileMeta; maximum 1 MiB.
+  bool prepared = 7;
+  optional Error error = 8;
+  bytes response_proof = 9;
+}
+
 message DeleteRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
@@ -1216,6 +1342,11 @@ service NodeService {
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
   rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
+  rpc NativePreparationBegin(NativePreparationBeginRequest) returns (NativePreparationBeginResponse) {}; // auth-policy: body-bound
+  rpc NativePreparationFinalize(NativePreparationFinalizeRequest) returns (NativePreparationFinalizeResponse) {}; // auth-policy: body-bound
+  rpc NativePreparationProbe(NativePreparationProbeRequest) returns (NativePreparationProbeResponse) {}; // auth-policy: body-bound
+  rpc NativePreparationRecover(NativePreparationRecoverRequest) returns (NativePreparationRecoverResponse) {}; // auth-policy: body-bound
+  rpc NativePreparationLocate(NativePreparationLocateRequest) returns (NativePreparationLocateResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
