@@ -10490,25 +10490,25 @@ impl ConditionalMaintenanceFixture {
         match &self.store {
             ConfiguredTableCatalogStore::ObjectBacked(store) => {
                 store
-                    .run_table_metadata_maintenance_worker_once_conditionally_at(
+                    .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
                         "analytics",
                         "sales",
                         "orders",
                         worker.to_string(),
                         &condition,
-                        now,
+                        || now,
                     )
                     .await
             }
             ConfiguredTableCatalogStore::DurableStrong(store) => {
                 store
-                    .run_table_metadata_maintenance_worker_once_conditionally_at(
+                    .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
                         "analytics",
                         "sales",
                         "orders",
                         worker.to_string(),
                         &condition,
-                        now,
+                        || now,
                     )
                     .await
             }
@@ -10630,6 +10630,138 @@ async fn conditional_maintenance_worker_claims_queued_job_and_replays_without_wr
                 .count(),
             1
         );
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_report_reads() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for expired in [false, true] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let config = fixture
+                .store
+                .get_table_maintenance_config("analytics", "sales", "orders")
+                .await
+                .unwrap();
+            let deadline = fixture.now;
+            let lease_timeout = Duration::seconds(i64::try_from(config.worker_lease_timeout_seconds).unwrap());
+            fixture.queued.job.scheduled_at = Some(maintenance_timestamp(deadline - lease_timeout));
+            fixture.seed_report(&fixture.queued).await;
+            let fixture = Arc::new(fixture);
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            let publication_path = default_table_bucket_publication_lock_path();
+            let publication_guard = fixture
+                .backend
+                .acquire_write_lock("analytics", &publication_path)
+                .await
+                .unwrap();
+            let attempts = fixture
+                .backend
+                .write_lock_acquisition_count("analytics", &publication_path)
+                .await;
+            let final_read = fixture
+                .backend
+                .pause_next_read(RUSTFS_META_BUCKET, &fixture.report_paths()[2])
+                .await;
+            let clock = Arc::new(std::sync::Mutex::new((deadline - Duration::seconds(2), 0_usize)));
+            let worker_clock = Arc::clone(&clock);
+            let worker_fixture = Arc::clone(&fixture);
+            let worker = tokio::spawn(async move {
+                let condition = TableMaintenanceWorkerCondition {
+                    expected_job_id: worker_fixture.queued.job.job_id.clone(),
+                    expected_attempt: 0,
+                };
+                let clock = move || {
+                    let mut state = worker_clock.lock().unwrap();
+                    state.1 += 1;
+                    state.0
+                };
+                match &worker_fixture.store {
+                    ConfiguredTableCatalogStore::ObjectBacked(store) => {
+                        store
+                            .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                                "analytics",
+                                "sales",
+                                "orders",
+                                "worker-a".to_string(),
+                                &condition,
+                                clock,
+                            )
+                            .await
+                    }
+                    ConfiguredTableCatalogStore::DurableStrong(store) => {
+                        store
+                            .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                                "analytics",
+                                "sales",
+                                "orders",
+                                "worker-a".to_string(),
+                                &condition,
+                                clock,
+                            )
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+                while fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await
+                    == attempts
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conditional worker must reach publication lock contention");
+            assert!(!worker.is_finished(), "worker must wait for publication ownership");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must not precede publication ownership");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            let claim_time = if expired { deadline } else { deadline - Duration::nanoseconds(1) };
+            clock.lock().unwrap().0 = claim_time;
+            drop(publication_guard);
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, final_read.wait_started())
+                .await
+                .expect("conditional worker must read its final persisted report");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must follow every persisted report read");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            final_read.release();
+            let result = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker)
+                .await
+                .expect("conditional worker must finish after publication and report reads")
+                .unwrap();
+            assert_eq!(clock.lock().unwrap().1, 1, "claim validation must sample the clock once");
+            if expired {
+                assert_matches!(result, Err(TableCatalogStoreError::Conflict(reason))
+                    if reason == "maintenance job is not eligible for a conditional claim; inspect its status and persisted attempt budget");
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                fixture.assert_report_views(&fixture.queued).await;
+                assert_eq!(fixture.queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+                assert_eq!(fixture.queued.job.attempt, 0);
+                assert_eq!(fixture.delete_attempts().await, 0);
+                assert!(fixture.backend.object_exists("analytics", &fixture.old_metadata).await.unwrap());
+            } else {
+                let completed = result.expect("a queued lease remains claimable immediately before its deadline");
+                assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                assert_eq!(completed.job.attempt, 1);
+                assert_eq!(completed.job.started_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(completed.job.heartbeat_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(
+                    completed
+                        .audit_events
+                        .iter()
+                        .filter(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                        .map(|event| event.timestamp.clone())
+                        .collect::<Vec<_>>(),
+                    vec![maintenance_timestamp(claim_time)],
+                );
+                assert_eq!(completed.job.deleted_metadata_file_count, 1);
+                assert_eq!(fixture.delete_attempts().await, 1);
+                assert!(!fixture.backend.object_exists("analytics", &fixture.old_metadata).await.unwrap());
+                fixture.assert_report_views(&completed).await;
+            }
+        }
     }
 }
 

@@ -2410,25 +2410,25 @@ where
         worker_id: String,
         condition: &TableMaintenanceWorkerCondition,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        self.run_table_metadata_maintenance_worker_once_conditionally_at(
+        self.run_table_metadata_maintenance_worker_once_conditionally_with_clock(
             table_bucket,
             namespace,
             table,
             worker_id,
             condition,
-            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc,
         )
         .await
     }
 
-    pub(in crate::table_catalog) async fn run_table_metadata_maintenance_worker_once_conditionally_at(
+    pub(in crate::table_catalog) async fn run_table_metadata_maintenance_worker_once_conditionally_with_clock(
         &self,
         table_bucket: &str,
         namespace: &str,
         table: &str,
         worker_id: String,
         condition: &TableMaintenanceWorkerCondition,
-        now: OffsetDateTime,
+        clock: impl FnOnce() -> OffsetDateTime + Send,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         validate_table_maintenance_worker_condition(&worker_id, condition)?;
         let namespace = parse_namespace_for_store(namespace)?;
@@ -2450,7 +2450,7 @@ where
             .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
             .await?;
         ObjectTableCatalogStore::new(self.object_backend.clone())
-            .run_conditional_table_maintenance_worker_for_entry(&entry, worker_id, condition, now, &publication)
+            .run_conditional_table_maintenance_worker_for_entry(&entry, worker_id, condition, clock, &publication)
             .await
     }
 
