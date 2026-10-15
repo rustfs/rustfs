@@ -427,9 +427,9 @@ jobs:
           import os
           from pathlib import Path
           run = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "failed-run.json").read_text())
-          if (run["status"] != "completed" or run["conclusion"] != "failure"
+          if (run["status"] != "completed" or run["conclusion"] not in {"failure", "cancelled"}
               or run["workflowName"] != "RustFS Functional Chain" or run["headBranch"] != os.environ["GITHUB_REF_NAME"]):
-              raise ValueError("cleanup source must be a completed failed Functional Chain run")
+              raise ValueError("cleanup source must be a completed failed or cancelled Functional Chain run")
           PY
           gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
             --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"

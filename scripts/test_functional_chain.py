@@ -53,6 +53,31 @@ sys.exit(42 if os.environ['COLLECTOR_MODE'] == sys.argv[1] + '-failure' else 0)
                     for call in calls: self.assertEqual(call[-2:], ['--testing-commit', 'b' * 40])
 
 
+class InterruptedCleanupGuardTests(unittest.TestCase):
+    def test_actual_workflow_guard_rejects_live_success_and_unrelated_runs(self):
+        source = (candidate.ROOT / ".github/workflows/rustfs-functional-chain.yml").read_text()
+        step = source[source.index('      - name: Audit and finalize retained validation environment'):]
+        guard = step.split("          python3 - <<'PY'", 1)[1].split("          PY", 1)[0]
+        guard = "\n".join(line[10:] for line in guard.splitlines())
+        for state, conclusion, branch, workflow, accepted in (
+            ("completed", "failure", "topic", "RustFS Functional Chain", True),
+            ("completed", "cancelled", "topic", "RustFS Functional Chain", True),
+            ("in_progress", "cancelled", "topic", "RustFS Functional Chain", False),
+            ("completed", "success", "topic", "RustFS Functional Chain", False),
+            ("completed", "cancelled", "other", "RustFS Functional Chain", False),
+            ("completed", "cancelled", "topic", "Other Workflow", False),
+        ):
+            with self.subTest(state=state, conclusion=conclusion, branch=branch, workflow=workflow), tempfile.TemporaryDirectory() as temp:
+                Path(temp, "failed-run.json").write_text(json.dumps({"status": state, "conclusion": conclusion,
+                    "headBranch": branch, "workflowName": workflow}))
+                with mock.patch.dict(os.environ, VALIDATION_ROOT=temp, GITHUB_REF_NAME="topic"):
+                    if accepted:
+                        exec(compile(guard, "workflow-cleanup-guard", "exec"), {})
+                    else:
+                        with self.assertRaises(ValueError):
+                            exec(compile(guard, "workflow-cleanup-guard", "exec"), {})
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.run = {"id": 123, "run_attempt": 2, "head_sha": "a" * 40}
