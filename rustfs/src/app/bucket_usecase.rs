@@ -4623,7 +4623,7 @@ mod tests {
         assert!(listings.contents[0].object.e_tag.is_none());
         assert!(listings.contents[1].object.e_tag.is_some());
         assert!(listings.contents[2].object.e_tag.is_some());
-        let xml = String::from_utf8(serialize_config(&listings).expect("serialize objects")).expect("UTF-8 objects");
+        let xml = String::from_utf8(serialize_s3s_response(&listings)).expect("UTF-8 objects");
         assert!(!xml.contains(legacy_md5));
 
         let versions = build_list_object_versions_metadata_output(
@@ -4648,7 +4648,7 @@ mod tests {
             };
             assert_eq!(version.e_tag.is_some(), index != 0);
         }
-        let xml = String::from_utf8(serialize_config(&versions).expect("serialize versions")).expect("UTF-8 versions");
+        let xml = String::from_utf8(serialize_s3s_response(&versions)).expect("UTF-8 versions");
         assert!(!xml.contains(legacy_md5));
     }
 
