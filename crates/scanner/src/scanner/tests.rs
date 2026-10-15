@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
 mod quota_reset_preservation;
 
@@ -1689,7 +1690,11 @@ async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag()
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let pending = ecstore_hold_namespace_commit(store.as_ref());
 
-    let complete_uses_observation = scanner_cycle_uses_observational_publication(ScannerCycleStatus::Complete, true);
+    let uses_observation = |status| {
+        ScannerCyclePublicationPlan::for_result(&ScannerCycleResult::new(status, None).with_usage_update_emitted(true))
+            .is_observational()
+    };
+    let complete_uses_observation = uses_observation(ScannerCycleStatus::Complete);
     assert!(!complete_uses_observation, "a converged Complete snapshot is authoritative");
     assert_eq!(
         scanner_local_publication_defer_reason(store.as_ref(), complete_uses_observation).await,
@@ -1697,15 +1702,11 @@ async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag()
         "a Complete cycle must remain fenced while an ordinary namespace commit is pending"
     );
 
-    assert!(scanner_cycle_uses_observational_publication(ScannerCycleStatus::Superseded, true));
-    assert!(scanner_cycle_uses_observational_publication(
-        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
-        true
-    ));
-    assert!(!scanner_cycle_uses_observational_publication(
-        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
-        true
-    ));
+    assert!(uses_observation(ScannerCycleStatus::Superseded));
+    assert!(uses_observation(ScannerCycleStatus::Deferred(
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    )));
+    assert!(!uses_observation(ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement)));
     drop(pending);
 }
 
@@ -1714,10 +1715,11 @@ async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag()
 async fn incomplete_observation_uses_observational_lease_during_pending_namespace_commit() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let pending = ecstore_hold_namespace_commit(store.as_ref());
-    let uses_observation = scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, true);
+    let result = ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None);
+    assert!(!ScannerCyclePublicationPlan::for_result(&result).is_observational());
+    let uses_observation = ScannerCyclePublicationPlan::for_result(&result.with_usage_update_emitted(true)).is_observational();
 
     assert!(uses_observation);
-    assert!(!scanner_cycle_uses_observational_publication(ScannerCycleStatus::Incomplete, false));
     assert_eq!(
         scanner_local_publication_defer_reason(store.as_ref(), uses_observation).await,
         None,
@@ -7885,7 +7887,7 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
         Some(dirty_snapshot),
     )
-    .with_observational_snapshot_published(true);
+    .with_usage_update_emitted(true);
 
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved.into());
 
