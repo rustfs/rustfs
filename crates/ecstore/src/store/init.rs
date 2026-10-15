@@ -18591,6 +18591,70 @@ mod tests {
         assert_eq!(body, b"new-generation");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn cancelled_ecstore_put_part_keeps_bucket_lifecycle_lock_through_commit() {
+        for pause in [
+            crate::set_disk::MultipartCommitPause::PutPartAfterCapacityAdmission,
+            crate::set_disk::MultipartCommitPause::PutPartAfterRename,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create cancelled multipart lifecycle store dir");
+            let (_ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "cancelled-multipart-lifecycle", &[4, 4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = format!("cancelled-part-lifecycle-{}", Uuid::new_v4());
+            let object = "part.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket for multipart lifecycle cancellation");
+            let upload = store
+                .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("create upload through the owning ECStore");
+            let barrier = crate::set_disk::MultipartCommitBarrier::install(&bucket, object, pause);
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put_upload_id = upload.upload_id.clone();
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![0x45; 4096]);
+                put_store
+                    .put_object_part(&put_bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await
+                    .expect_err("the ECStore request waiter must remain cancellable")
+                    .is_cancelled()
+            );
+
+            let mut writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut writer).await.is_err(),
+                "canceling UploadPart at {pause:?} must not release its bucket lifecycle owner before the commit drains"
+            );
+            barrier.release();
+            let lifecycle_guard = tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("the bucket lifecycle writer must resume after the part commit drains")
+                .expect("acquire the bucket lifecycle write lock after cancellation");
+            drop(lifecycle_guard);
+
+            let parts = store
+                .list_object_parts(&bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+                .await
+                .expect("the cancelled request's owned part commit must finish successfully");
+            assert_eq!(parts.parts.len(), 1, "the commit must publish exactly the uploaded part at {pause:?}");
+            assert_eq!(parts.parts[0].part_num, 1);
+            assert_eq!(parts.parts[0].size, 4096);
+            shutdown.cancel();
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn pre_upgrade_multipart_upload_can_complete_and_abort_in_the_same_bucket_lifetime() {

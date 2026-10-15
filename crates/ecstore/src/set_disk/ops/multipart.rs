@@ -1678,6 +1678,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             drop(admission_guard);
         }
 
+        let mut commit_owns_cleanup = false;
         let result: Result<PartInfo> = async {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
@@ -1881,120 +1882,171 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .await?;
                 (Some(upload_guard), Some(part_guard))
             };
-            let (commit_fi, _) = self
-                .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
-                .await?;
-            let commit_size_limit = multipart_size_limit_from_metadata(&commit_fi.metadata)?;
-            if commit_size_limit != multipart_size_limit {
-                return Err(Error::InvalidArgument(
-                    "multipart upload".to_string(),
-                    SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
-                    "size limit metadata changed or is missing".to_string(),
-                ));
-            }
-            ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
-            ensure_multipart_bucket_incarnation(
-                &self.ctx,
-                &commit_fi,
-                bucket,
-                object,
-                upload_id,
-                opts.expected_bucket_incarnation_id,
-            )
-            .await?;
-            #[cfg(test)]
-            pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
-            fence_commit_on_lock_loss(_upload_commit_guard.as_ref(), "put_object_part_commit", &upload_id_path)?;
-            fence_commit_on_lock_loss(_part_commit_guard.as_ref(), "put_object_part_commit", &part_lock_path)?;
-            if opts
-                .namespace_lock_fence
-                .as_ref()
-                .is_some_and(NamespaceLockFence::is_lock_lost)
-            {
-                return Err(StorageError::NamespaceLockQuorumUnavailable {
-                    mode: "put_object_part_outer_lock",
-                    bucket: bucket.to_string(),
-                    object: object.to_string(),
-                    required: 1,
-                    achieved: 0,
-                });
-            }
-            ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
-
-            if let Some(limit) = commit_size_limit {
-                let current_size = self
-                    .current_multipart_logical_size(bucket, object, upload_id, &upload_id_path, &commit_fi, part_id)
-                    .await?;
-                let candidate_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
-                admitted_multipart_size(current_size, candidate_size, limit)?;
-            }
-
-            let decommission_capacity_guard = if let Some(store) = opts.decommission_capacity_admission.as_ref() {
-                Some(
-                    store
-                        .acquire_external_decommission_capacity_fence(
-                            &[self.pool_index],
-                            DecommissionCapacityAdmission::ExistingMultipart,
-                        )
-                        .await?,
-                )
-            } else {
-                None
-            };
-            #[cfg(test)]
-            pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterCapacityAdmission).await;
-            if decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
-                return Err(StorageError::NamespaceLockQuorumUnavailable {
-                    mode: "put_object_part_decommission_capacity",
-                    bucket: bucket.to_string(),
-                    object: object.to_string(),
-                    required: 1,
-                    achieved: 0,
-                });
-            }
-            let rename_result = self
-                .rename_part(
-                    &shuffle_disks,
-                    RUSTFS_META_TMP_BUCKET,
-                    &tmp_part_path,
-                    RUSTFS_META_MULTIPART_BUCKET,
-                    &part_path,
-                    part_info_buff.into(),
-                    write_quorum,
-                    Some(MultipartWriteQuorumContext {
-                        stage: MULTIPART_WRITE_QUORUM_RENAME_PART,
+            // Only guards owned by this operation may outlive its caller. Internal
+            // data-movement and borrowed-lock callers retain their synchronous
+            // lifetime; a fence by itself cannot transfer the outer lock lease.
+            let detach_commit_owner = _upload_commit_guard.is_some()
+                && opts.namespace_lock_fence.is_none()
+                && (opts.bucket_lifecycle_lock_fence.is_none() || opts.bucket_lifecycle_lock_owner.is_some());
+            let commit_set = self.clone();
+            let commit_bucket = bucket.to_owned();
+            let commit_object = object.to_owned();
+            let commit_upload_id = upload_id.to_owned();
+            let commit_upload_id_path = upload_id_path.clone();
+            let commit_tmp_part = tmp_part.clone();
+            let commit_opts = opts.clone();
+            commit_owns_cleanup = true;
+            // The body is already staged. Keep every commit guard through the
+            // prepare, publish, settlement/rollback and temporary cleanup I/O,
+            // even when the HTTP request stops awaiting this task.
+            let commit = async move {
+                let _upload_commit_guard = _upload_commit_guard;
+                let _part_commit_guard = _part_commit_guard;
+                let _capped_staging_guard = _capped_staging_guard;
+                let bucket = commit_bucket.as_str();
+                let object = commit_object.as_str();
+                let upload_id = commit_upload_id.as_str();
+                let upload_id_path = commit_upload_id_path;
+                let opts = &commit_opts;
+                let result: Result<PartInfo> = async {
+                    let (commit_fi, _) = commit_set
+                        .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
+                        .await?;
+                    let commit_size_limit = multipart_size_limit_from_metadata(&commit_fi.metadata)?;
+                    if commit_size_limit != multipart_size_limit {
+                        return Err(Error::InvalidArgument(
+                            "multipart upload".to_string(),
+                            SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+                            "size limit metadata changed or is missing".to_string(),
+                        ));
+                    }
+                    ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
+                    ensure_multipart_bucket_incarnation(
+                        &commit_set.ctx,
+                        &commit_fi,
                         bucket,
                         object,
                         upload_id,
-                        part_number: Some(part_id),
-                    }),
-                )
+                        opts.expected_bucket_incarnation_id,
+                    )
+                    .await?;
+                    #[cfg(test)]
+                    pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
+                    fence_commit_on_lock_loss(_upload_commit_guard.as_ref(), "put_object_part_commit", &upload_id_path)?;
+                    fence_commit_on_lock_loss(_part_commit_guard.as_ref(), "put_object_part_commit", &part_lock_path)?;
+                    if opts
+                        .namespace_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    {
+                        return Err(StorageError::NamespaceLockQuorumUnavailable {
+                            mode: "put_object_part_outer_lock",
+                            bucket: bucket.to_string(),
+                            object: object.to_string(),
+                            required: 1,
+                            achieved: 0,
+                        });
+                    }
+                    ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+
+                    if let Some(limit) = commit_size_limit {
+                        let current_size = commit_set
+                            .current_multipart_logical_size(bucket, object, upload_id, &upload_id_path, &commit_fi, part_id)
+                            .await?;
+                        let candidate_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                        admitted_multipart_size(current_size, candidate_size, limit)?;
+                    }
+
+                    let decommission_capacity_guard = if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                        Some(
+                            store
+                                .acquire_external_decommission_capacity_fence(
+                                    &[commit_set.pool_index],
+                                    DecommissionCapacityAdmission::ExistingMultipart,
+                                )
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    #[cfg(test)]
+                    pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterCapacityAdmission).await;
+                    if decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                        return Err(StorageError::NamespaceLockQuorumUnavailable {
+                            mode: "put_object_part_decommission_capacity",
+                            bucket: bucket.to_string(),
+                            object: object.to_string(),
+                            required: 1,
+                            achieved: 0,
+                        });
+                    }
+                    let rename_result = commit_set
+                        .rename_part(
+                            &shuffle_disks,
+                            RUSTFS_META_TMP_BUCKET,
+                            &tmp_part_path,
+                            RUSTFS_META_MULTIPART_BUCKET,
+                            &part_path,
+                            part_info_buff.into(),
+                            write_quorum,
+                            Some(MultipartWriteQuorumContext {
+                                stage: MULTIPART_WRITE_QUORUM_RENAME_PART,
+                                bucket,
+                                object,
+                                upload_id,
+                                part_number: Some(part_id),
+                            }),
+                        )
+                        .await;
+                    drop(decommission_capacity_guard);
+                    let _ = rename_result?;
+                    #[cfg(test)]
+                    observe_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
+
+                    #[cfg(test)]
+                    pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterRename).await;
+
+                    let ret: PartInfo = PartInfo {
+                        etag: Some(etag.clone()),
+                        part_num: part_id,
+                        last_mod: Some(OffsetDateTime::now_utc()),
+                        size: w_size,
+                        actual_size,
+                    };
+
+                    // error!("put_object_part ret {:?}", &ret);
+
+                    Ok(ret)
+                }
                 .await;
-            drop(decommission_capacity_guard);
-            let _ = rename_result?;
-            #[cfg(test)]
-            observe_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
-
-            #[cfg(test)]
-            pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterRename).await;
-            drop(_part_commit_guard);
-            drop(_upload_commit_guard);
-
-            let ret: PartInfo = PartInfo {
-                etag: Some(etag.clone()),
-                part_num: part_id,
-                last_mod: Some(OffsetDateTime::now_utc()),
-                size: w_size,
-                actual_size,
+                if result.is_err()
+                    && let Err(err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_part).await
+                {
+                    warn!(
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = "cleanup_failed",
+                        bucket,
+                        object,
+                        error = ?err,
+                        "failed to clean multipart commit staging"
+                    );
+                }
+                result
             };
-
-            // error!("put_object_part ret {:?}", &ret);
-
-            Ok(ret)
+            if detach_commit_owner {
+                tokio::spawn(commit)
+                    .await
+                    .map_err(|err| Error::other(format!("put_object_part commit task failed: {err}")))?
+            } else {
+                commit.await
+            }
         }
         .await;
 
-        if result.is_err()
+        if !commit_owns_cleanup
+            && result.is_err()
             && let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_part).await
         {
             warn!(tmp_part = %tmp_part, error = ?err, "failed to cleanup multipart temporary data");
@@ -6368,6 +6420,76 @@ mod tests {
             .await
             .expect("abort task should not panic")
             .expect("abort should delete the upload after UploadPart releases the lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn cancelled_put_object_part_keeps_upload_lock_through_commit() {
+        for pause in [
+            MultipartCommitPause::PutPartAfterCapacityAdmission,
+            MultipartCommitPause::PutPartAfterRename,
+        ] {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+            let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+            let bucket = "multipart-cancelled-part-commit-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            let upload_id = upload.upload_id;
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+            signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_path.clone()));
+            let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+            let barrier = MultipartCommitBarrier::install(bucket, object, pause);
+
+            let put_store = set_disks.clone();
+            let put_upload_id = upload_id.clone();
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![0x45; 4096]);
+                put_store
+                    .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await
+                    .expect_err("the request waiter should remain cancellable")
+                    .is_cancelled()
+            );
+
+            let abort_store = set_disks.clone();
+            let abort_upload_id = upload_id.clone();
+            let mut abort = tokio::spawn(async move {
+                abort_store
+                    .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
+                    .await
+            });
+            signaling.wait_for_attempts(2).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut abort).await.is_err(),
+                "Abort must not acquire the upload lock while a cancelled request's commit is paused at {pause:?}"
+            );
+            barrier.release();
+            tokio::time::timeout(Duration::from_secs(10), abort)
+                .await
+                .expect("Abort should finish after the commit drains")
+                .expect("Abort task should not panic")
+                .expect("Abort should delete the committed part staging");
+            for disk in &disk_stores {
+                assert!(
+                    matches!(
+                        disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_path, -1).await,
+                        Err(DiskError::FileNotFound)
+                    ),
+                    "the upload directory must be absent after the commit and Abort finish"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
