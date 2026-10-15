@@ -1735,7 +1735,7 @@ pub enum CurrentDeleteGeneration {
         delete_marker: bool,
         etag: String,
         #[serde(default)]
-        transition: Option<CurrentDeleteTransition>,
+        transition: Option<Box<CurrentDeleteTransition>>,
     },
 }
 
@@ -1763,14 +1763,16 @@ impl CurrentDeleteGeneration {
             || remote_version.is_some()
             || fi.transition_version_state != rustfs_filemeta::TransitionVersionState::Unknown
             || destination_id.is_some())
-        .then(|| CurrentDeleteTransition {
-            status: fi.transition_status.clone(),
-            tier: fi.transition_tier.clone(),
-            remote_object: fi.transitioned_objname.clone(),
-            remote_version,
-            version_state: fi.transition_version_state,
-            destination_id,
-            remote_only,
+        .then(|| {
+            Box::new(CurrentDeleteTransition {
+                status: fi.transition_status.clone(),
+                tier: fi.transition_tier.clone(),
+                remote_object: fi.transitioned_objname.clone(),
+                remote_version,
+                version_state: fi.transition_version_state,
+                destination_id,
+                remote_only,
+            })
         });
         Ok(Self::Present {
             version_id: fi.version_id.filter(|id| !id.is_nil()),
@@ -2383,15 +2385,12 @@ mod tests {
                         CurrentDeleteGeneration::from_file_info(&fi),
                         Ok(CurrentDeleteGeneration::Present {
                             data_dir: None,
-                            transition: Some(CurrentDeleteTransition {
-                                remote_version: None,
-                                version_state: rustfs_filemeta::TransitionVersionState::Unknown,
-                                destination_id: None,
-                                remote_only: true,
-                                ..
-                            }),
+                            transition: Some(transition),
                             ..
-                        })
+                        }) if transition.remote_version.is_none()
+                            && transition.version_state == rustfs_filemeta::TransitionVersionState::Unknown
+                            && transition.destination_id.is_none()
+                            && transition.remote_only
                     ),
                     "legacy unversioned remote metadata remains usable"
                 );
@@ -2457,11 +2456,14 @@ mod tests {
             rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode remote guarded request");
         assert_eq!(decoded.versions[0].expected_current, generation);
         assert!(
-            matches!(generation, CurrentDeleteGeneration::Present { transition: Some(CurrentDeleteTransition {
-            status, tier, remote_object, remote_version: Some(remote_version),
-            version_state: rustfs_filemeta::TransitionVersionState::Exact, destination_id: Some(identity), remote_only: true,
-        }), .. } if status == rustfs_filemeta::TRANSITION_COMPLETE && tier == "WARM" && remote_object == "opaque/object+name"
-            && remote_version == "opaque/version+id==" && identity == [0xab; 32])
+            matches!(&generation, CurrentDeleteGeneration::Present { transition: Some(transition), .. }
+                if transition.status == rustfs_filemeta::TRANSITION_COMPLETE
+                    && transition.tier == "WARM"
+                    && transition.remote_object == "opaque/object+name"
+                    && transition.remote_version.as_deref() == Some("opaque/version+id==")
+                    && transition.version_state == rustfs_filemeta::TransitionVersionState::Exact
+                    && transition.destination_id == Some([0xab; 32])
+                    && transition.remote_only)
         );
         insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, format!("a{}", "€".repeat(21)));
         assert_eq!(
