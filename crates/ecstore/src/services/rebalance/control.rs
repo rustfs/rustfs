@@ -1881,6 +1881,10 @@ mod tests {
             err.to_string()
                 .contains("pool activation requires a live fleet capability proof")
         );
+        assert!(
+            crate::core::pools::is_pool_activation_fleet_proof_error(&err),
+            "the admin handler retries init only on this error shape: {err}"
+        );
         assert_eq!(store.ctx.data_movement_operation_epoch(), initial_epoch);
         {
             let local = store.rebalance_meta.read().await;
