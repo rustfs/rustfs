@@ -147,6 +147,30 @@ fn issuance_error(code: &'static str, issued: bool, unknown: bool) -> S3Result<S
     answer.output.0 = StatusCode::SERVICE_UNAVAILABLE;
     Ok(answer)
 }
+fn same_parent_authority(before_names: &[String], before_policy: &Policy, after_names: &[String], after_policy: &Policy) -> bool {
+    fn names(names: &[String]) -> Vec<&str> {
+        let mut names: Vec<_> = names.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+    fn statements(policy: &Policy) -> Option<Vec<Vec<u8>>> {
+        let mut statements = policy
+            .statements
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        statements.sort_unstable();
+        Some(statements)
+    }
+
+    names(before_names) == names(after_names)
+        && matches!(
+            (statements(before_policy), statements(after_policy)),
+            (Some(before), Some(after)) if before == after
+        )
+}
 async fn require_builtin_authorization() -> S3Result<()> {
     rustfs_iam::sys::IamSys::<rustfs_iam::store::object::ObjectStore>::ensure_restricted_credential_vending()
         .await
@@ -269,8 +293,7 @@ impl Operation for Issue {
                 || current.is_temp()
                 || current.is_service_account()
                 || current.secret_key != principal.secret_key
-                || names != policies
-                || serde_json::to_vec(&current_policy).ok() != serde_json::to_vec(&parent_policy).ok()
+                || !same_parent_authority(&policies, &parent_policy, &names, &current_policy)
             {
                 return Err(s3_error!(AccessDenied, "attempt authority changed"));
             }
@@ -301,6 +324,58 @@ impl Operation for Issue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parent_authority_recheck_ignores_policy_order_but_detects_changes() {
+        let first: Policy = serde_json::from_value(serde_json::json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/*"},
+                {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::photos/output/*"}
+            ]
+        }))
+        .unwrap();
+        let reordered: Policy = serde_json::from_value(serde_json::json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::photos/output/*"},
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/*"}
+            ]
+        }))
+        .unwrap();
+        let before_names = vec!["owner-policy".to_owned(), "bucket-policy".to_owned()];
+        let after_names = vec!["bucket-policy".to_owned(), "owner-policy".to_owned()];
+        assert!(same_parent_authority(&before_names, &first, &after_names, &reordered));
+
+        let changed: Policy = serde_json::from_value(serde_json::json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/*"},
+                {"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::photos/output/*"}
+            ]
+        }))
+        .unwrap();
+        assert!(!same_parent_authority(&before_names, &first, &after_names, &changed));
+        let changed_resource: Policy = serde_json::from_value(serde_json::json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/*"},
+                {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::photos/private/*"}
+            ]
+        }))
+        .unwrap();
+        assert!(!same_parent_authority(&before_names, &first, &after_names, &changed_resource));
+        let added_deny: Policy = serde_json::from_value(serde_json::json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/private/*"},
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/input/*"},
+                {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::photos/output/*"}
+            ]
+        }))
+        .unwrap();
+        assert!(!same_parent_authority(&before_names, &first, &after_names, &added_deny));
+        assert!(!same_parent_authority(&before_names, &first, &["other-policy".to_owned()], &first));
+    }
     #[tokio::test]
     async fn attempt_policy_keeps_exact_version_and_narrow_output() {
         let record = Delegation {
