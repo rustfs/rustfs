@@ -130,6 +130,7 @@ The request must be authenticated with an admin identity that has `ServerInfoAdm
 |---|---|
 | `runtime_config` | Effective runtime controls and their value sources. |
 | `cycle_schedule` | Current effective cycle interval and clean-idle backoff state. |
+| `cycle_recovery` | This node's cycle-state recovery observation, retry budget, and reason. |
 | `metrics` | Scanner work, pressure, checkpoint, lifecycle, replication, heal, bitrot, and alert counters. |
 | `data_movement_pause` | Global-pause policy, current movement reason, operation epoch, start time, duration, and estimated movement work items. |
 | `pause_backlog` | Replicated durable pause ledger, post-pause catch-up phase, rate window, retry state, thresholds, and active alert reasons. |
@@ -189,6 +190,12 @@ A resumed walk retains its previous durable coverage while initial enumeration h
 Shared compacted accumulators defer periodic emission until the owning subtree completes; replay inside that compacted subtree remains possible after an interruption. When bucket checkpoint preparation returns `Reset` for existing resume state, it logs `checkpoint_reset` with the validation reason. The `scan_checkpoint_used` counter includes validated coverage adoption by the forward sweep.
 
 A confirmed periodic save does not prove restart resumability. Adoption still validates bucket/set identity and, for non-empty caches, connected cache scope. Skipping completed subtrees additionally requires a validated coverage frontier; raw enumeration state alone does not prove completed subtree coverage.
+
+### Cycle recovery on followers
+
+Cycle recovery status is local to each node. A transient cycle-state read failure can exhaust the short retry budget and enter `paused`; the enabled scanner then retries leadership every five minutes or when recovery is explicitly woken. If the next lock attempt is contended or times out waiting for `leader.lock`, the node records a follower iteration and clears only its unclassified `transient` or `paused` observation. Normal follower retry cadence resumes without restarting the process.
+
+This clears local retry bookkeeping, not persisted cycle state or recovery markers. Classified recovery states, cleanup-pending resets, and usage-floor failures remain unchanged. Any later leadership claim revalidates durable cycle state before scanning. A healthy follower recovery status does not prove that leader-dispatched scans are progressing; inspect the work counters separately.
 
 ## Usage State Reset
 
