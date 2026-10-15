@@ -519,6 +519,10 @@ impl SetDisks {
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
         let opts = *opts;
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let api_operation = rustfs_io_metrics::get_stage_metrics_enabled()
+            .then(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context)
+            .flatten();
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -530,8 +534,27 @@ impl SetDisks {
                     let object = object.clone();
                     let version_id = version_id.clone();
                     let task_opts = opts;
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    let api_operation = api_operation;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
+                    async move {
+                        let read_version =
+                            async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await };
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        let read_version = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+                            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::SetDiskRead,
+                            read_version,
+                        );
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        if let Some(api_operation) = api_operation {
+                            rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), read_version)
+                                .await
+                        } else {
+                            read_version.await
+                        }
+                        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                        read_version.await
+                    }
                 })
             })
             .collect();
@@ -711,34 +734,49 @@ impl SetDisks {
         let allow_read_version_coalescing = purpose == MetadataReadPurpose::GetObjectReader
             && !crate::bucket::utils::is_meta_bucketname(bucket)
             && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
-        let metadata_read_result = if allow_read_version_coalescing {
-            Self::read_metadata_for_get_object(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await
-        } else {
-            Self::read_metadata_observed(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                false,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await
+        let metadata_read = async {
+            if allow_read_version_coalescing {
+                Self::read_metadata_for_get_object(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            } else {
+                Self::read_metadata_observed(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    false,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            }
         };
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let metadata_read = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::Object,
+            metadata_read,
+        );
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let metadata_read_result = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectRead,
+            metadata_read,
+        )
+        .await;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let metadata_read_result = metadata_read.await;
         let metadata_read = match metadata_read_result {
             Ok(metadata_read) => metadata_read,
             Err(err) => {

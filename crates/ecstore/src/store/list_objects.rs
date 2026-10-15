@@ -56,7 +56,7 @@ use rustfs_filemeta::{
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation, ListObjectsIndexPageObservation,
+    ListObjectsGatherCaller, ListObjectsGatherObservation, ListObjectsIndexPageObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::cmp::Reverse;
@@ -109,6 +109,7 @@ fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOpt
         incl_deleted: true,
         recursive: true,
         versioned: true,
+        caller: ListObjectsGatherCaller::S3ListVersions,
         walkdir_timeout: opts.walkdir_timeout,
         walkdir_stall_timeout: opts.walkdir_stall_timeout,
         ..Default::default()
@@ -274,6 +275,7 @@ fn log_list_path_finished(
 
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
+    pub caller: ListObjectsGatherCaller,
     pub id: Option<String>,
 
     // Bucket of the listing.
@@ -4116,6 +4118,7 @@ impl ECStore {
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: ListObjectsGatherCaller::S3List,
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             // Always request max_keys + 1 to detect if there are more results
@@ -4289,6 +4292,11 @@ impl ECStore {
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: if include_version_purge {
+                ListObjectsGatherCaller::Lifecycle
+            } else {
+                ListObjectsGatherCaller::S3ListVersions
+            },
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             limit: effective_max_keys,
@@ -4993,11 +5001,45 @@ where
     let _cancel_guard = cancel.clone().drop_guard();
     let (result_tx, mut result_rx) = mpsc::channel(1);
     let mut workers = JoinSet::new();
-    workers.spawn(async move { producer.await.map(|()| None) }.instrument(tracing::Span::current()));
-    let gather_cancel = cancel.clone();
-    workers.spawn(
-        async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) }.instrument(tracing::Span::current()),
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let mut diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ListObjects,
     );
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let request_caller = diagnostic_context.caller.or_else(|| {
+        use rustfs_io_metrics::ListObjectsGatherCaller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+
+        match opts.caller {
+            ListObjectsGatherCaller::S3List | ListObjectsGatherCaller::S3ListVersions => {
+                Some(ReadVersionRequestCaller::ListObjects)
+            }
+            ListObjectsGatherCaller::Lifecycle => Some(ReadVersionRequestCaller::Lifecycle),
+            ListObjectsGatherCaller::Other => Some(ReadVersionRequestCaller::Other),
+            ListObjectsGatherCaller::Unattributed => None,
+        }
+    });
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    {
+        diagnostic_context.caller = request_caller;
+    }
+    let producer = async move { producer.await.map(|()| None) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let producer = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListProducer,
+        producer,
+    );
+    workers.spawn(producer.instrument(tracing::Span::current()));
+    let gather_cancel = cancel.clone();
+    let gather = async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let gather = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListGather,
+        gather,
+    );
+    workers.spawn(gather.instrument(tracing::Span::current()));
 
     let mut failure = None;
     let mut stopping = false;
@@ -5133,6 +5175,7 @@ async fn gather_results(
                 let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
                 rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
                     source: LIST_OBJECTS_SOURCE_WALKER,
+                    caller: opts.caller,
                     outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
                     limit: opts.limit,
                     scanned_entries,
@@ -5195,6 +5238,7 @@ async fn gather_results(
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
             source: LIST_OBJECTS_SOURCE_WALKER,
+            caller: opts.caller,
             outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
             limit: opts.limit,
             scanned_entries,
@@ -12292,6 +12336,44 @@ mod test {
                 .to_string()
                 .contains("listing worker panicked")
         );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn list_path_producer_worker_preserves_s3_and_caller_context() {
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("GET");
+        let api_operation = request
+            .in_scope(|| {
+                rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context()
+            })
+            .expect("dispatched list operation should be captured");
+        request.response(200);
+
+        let (sender, recv) = mpsc::channel(1);
+        let opts = ListPathOptions {
+            caller: rustfs_io_metrics::ListObjectsGatherCaller::S3List,
+            ..Default::default()
+        };
+        let result = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), async move {
+            collect_list_path_results(CancellationToken::new(), opts, recv, async move {
+                assert_eq!(
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    Some("s3:ListObjectsV2")
+                );
+                assert_eq!(
+                    crate::cluster::rpc::runtime_sources::current_read_version_request_caller(),
+                    Some(rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::ListObjects)
+                );
+                drop(sender);
+                Ok(())
+            })
+            .await
+        })
+        .await;
+
+        assert!(result.err.is_some(), "the empty page channel remains an error");
+        assert_eq!(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(), None);
     }
 
     #[tokio::test]
