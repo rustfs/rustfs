@@ -18,8 +18,8 @@ use super::{
     encode_rebalance_stop_propagation_record,
 };
 use crate::core::pools::{
-    PoolMeta, PoolRebalanceActivationFence, acquire_pool_activation_fleet_proof, acquire_pool_rebalance_activation_locks,
-    pool_meta_has_active_decommission,
+    PoolMeta, PoolRebalanceActivationFence, PoolRebalanceWorkerFence, acquire_pool_activation_fleet_proof,
+    acquire_pool_rebalance_activation_locks, acquire_pool_rebalance_worker_locks, pool_meta_has_active_decommission,
 };
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
@@ -77,8 +77,31 @@ fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> 
 }
 
 pub(super) enum RebalanceWorkerActivationFence {
-    Ready(Box<PoolRebalanceActivationFence>),
+    Ready(Box<PoolRebalanceWorkerFence>),
     NotStartedTerminal,
+}
+
+async fn persisted_rebalance_requires_worker_activation<S>(pool: Arc<S>, expected_id: &str) -> Result<bool>
+where
+    S: EcstoreObjectIO,
+{
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load_with_opts(
+            pool,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    if persisted.id != expected_id {
+        return Err(Error::other(format!(
+            "rebalance metadata changed before worker activation: expected {expected_id}, found {}",
+            persisted.id
+        )));
+    }
+    Ok(crate::services::rebalance::rebalance_requires_worker_activation(&persisted))
 }
 
 pub(super) struct RebalanceRunGuard {
@@ -577,48 +600,58 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
-        // Lock order: pool_meta_save_gate -> rebalance.bin -> pool.bin.
+        // Lock order: pool_meta_save_gate -> rebalance.bin -> pool.bin. These
+        // shared fences admit a peer without waiting for the run's own entries.
         let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
         pool_meta_guard.ensure_write_safe("rebalance worker activation")?;
-        // Classify the durable rebalance record while holding both namespace
-        // fences. A terminal record is a no-op and must not depend on the
-        // notification subsystem having published a fleet proof yet.
-        let mut activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), None).await?;
+        let mut worker_fence = acquire_pool_rebalance_worker_locks(pool.clone()).await?;
         let pool_meta = self
-            .load_runtime_pool_meta_under_activation_fence(&mut pool_meta_guard, &activation_fence, "rebalance worker activation")
+            .load_runtime_pool_meta_under_worker_fence(&mut pool_meta_guard, &worker_fence, "rebalance worker activation")
             .await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
-
-        let mut persisted = RebalanceMeta::new();
-        persisted
-            .load_with_opts(
-                pool,
-                ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        if persisted.id != expected_id {
-            return Err(Error::other(format!(
-                "rebalance metadata changed before worker activation: expected {expected_id}, found {}",
-                persisted.id
-            )));
-        }
-
-        activation_fence.ensure_held()?;
-        if !crate::services::rebalance::rebalance_requires_worker_activation(&persisted) {
+        let needs_activation = persisted_rebalance_requires_worker_activation(pool, expected_id).await?;
+        worker_fence.ensure_held()?;
+        if !needs_activation {
             return Ok(RebalanceWorkerActivationFence::NotStartedTerminal);
         }
 
-        // Active worker admission still requires the fail-closed fleet proof.
-        // Attach it immediately before the final fence validation so expiry or
-        // topology changes are checked again at every later commit boundary.
+        let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        worker_fence.set_fleet_proof(fleet_proof);
+        worker_fence.ensure_held()?;
+        Ok(RebalanceWorkerActivationFence::Ready(Box::new(worker_fence)))
+    }
+
+    pub(super) async fn fence_rebalance_worker_metadata_update<S>(
+        &self,
+        pool: Arc<S>,
+        expected_id: &str,
+    ) -> Result<Option<Box<PoolRebalanceActivationFence>>>
+    where
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
+        // The admission read fences must already be dropped. Reacquire in the
+        // original order and revalidate every durable boundary across that gap.
+        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        pool_meta_guard.ensure_write_safe("rebalance worker metadata update")?;
+        let mut activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), None).await?;
+        let pool_meta = self
+            .load_runtime_pool_meta_under_activation_fence(
+                &mut pool_meta_guard,
+                &activation_fence,
+                "rebalance worker metadata update",
+            )
+            .await?;
+        ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
+        let needs_activation = persisted_rebalance_requires_worker_activation(pool, expected_id).await?;
+        activation_fence.ensure_held()?;
+        if !needs_activation {
+            return Ok(None);
+        }
+
         let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
         activation_fence.set_fleet_proof(fleet_proof);
         activation_fence.ensure_held()?;
-
-        Ok(RebalanceWorkerActivationFence::Ready(Box::new(activation_fence)))
+        Ok(Some(Box::new(activation_fence)))
     }
 
     #[tracing::instrument(skip_all)]
@@ -1872,6 +1905,128 @@ mod tests {
             err.to_string()
                 .contains("pool activation requires a live fleet capability proof")
         );
+    }
+
+    async fn assert_worker_write_upgrade_revalidates_durable_state(change: &str) {
+        let rebalance_id = "rebalance-worker-write-upgrade";
+        let active = RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats::default(),
+            ],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, peer) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(Some(active.clone())).await;
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker = Arc::clone(&store);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(
+            super::super::runtime::REBALANCE_WORKER_WRITE_UPGRADE_BARRIER
+                .scope((Arc::clone(&arrived), Arc::clone(&release)), async move {
+                    worker.start_rebalance_for_id(rebalance_id).await
+                }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), arrived.notified())
+            .await
+            .expect("empty-queue activation must release its read fences before requesting write authority");
+
+        let mut changed = active.clone();
+        match change {
+            "stopped" => {
+                changed.stopped_at = Some(OffsetDateTime::now_utc());
+                changed.pool_stats[0].info.status = RebalStatus::Stopped;
+            }
+            "replaced" => changed.id = "replacement-rebalance-run".to_string(),
+            "decommission" => {
+                let mut pool_meta = peer.pool_meta.read().await.clone();
+                pool_meta.pools[0].decommission = Some(crate::core::pools::PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                });
+                pool_meta
+                    .save(peer.pools.clone())
+                    .await
+                    .expect("a competing pool metadata writer must acquire the released pool fence");
+            }
+            _ => panic!("unknown durable state transition"),
+        }
+        changed
+            .save_with_opts(
+                peer.pools[0].clone(),
+                ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a competing run writer must acquire the released rebalance fence");
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), tasks.join_next())
+            .await
+            .expect("activation must finish after the durable transition")
+            .expect("activation task must be tracked")
+            .expect("activation must not panic");
+        match change {
+            "stopped" => result.expect("a durably stopped run must become an activation no-op"),
+            "replaced" => assert!(
+                result
+                    .expect_err("a replaced run must reject stale activation")
+                    .to_string()
+                    .contains("expected"),
+            ),
+            "decommission" => assert!(matches!(result, Err(Error::DecommissionAlreadyRunning))),
+            _ => unreachable!(),
+        }
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(peer.pools[0].clone())
+            .await
+            .expect("the competing durable state must remain readable");
+        assert_eq!(persisted.id, changed.id, "activation must not overwrite the run identity");
+        assert_eq!(persisted.stopped_at, changed.stopped_at, "activation must not overwrite the stop marker");
+        assert_eq!(persisted.pool_stats[0].info.status, changed.pool_stats[0].info.status);
+        assert!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("local metadata must remain present")
+                .cancel
+                .is_none(),
+            "rejected activation must not install a worker token",
+        );
+        assert_activation_locks_released(&store).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_write_upgrade_rechecks_stop() {
+        assert_worker_write_upgrade_revalidates_durable_state("stopped").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_write_upgrade_rechecks_run_identity() {
+        assert_worker_write_upgrade_revalidates_durable_state("replaced").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_write_upgrade_rechecks_decommission() {
+        assert_worker_write_upgrade_revalidates_durable_state("decommission").await;
     }
 
     #[tokio::test]
