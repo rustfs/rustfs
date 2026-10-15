@@ -2038,7 +2038,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             if detach_commit_owner {
                 tokio::spawn(commit)
                     .await
-                    .map_err(|err| Error::other(format!("put_object_part commit task failed: {err}")))?
+                .map_err(|err| Error::other_with_context("put_object_part commit task failed", err))?
             } else {
                 commit.await
             }
