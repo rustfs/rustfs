@@ -3150,6 +3150,88 @@ mod delete_recovery_wire_limit_tests {
     use super::*;
 
     #[test]
+    fn boxed_current_delete_transition_preserves_existing_wire_payload() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        enum PriorGeneration {
+            Present {
+                version_id: Option<Uuid>,
+                data_dir: Option<Uuid>,
+                mod_time: OffsetDateTime,
+                delete_marker: bool,
+                etag: String,
+                #[serde(default)]
+                transition: Option<CurrentDeleteTransition>,
+            },
+        }
+
+        let version_id = Some(Uuid::from_u128(1));
+        let data_dir = Some(Uuid::from_u128(2));
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        for transition in [
+            None,
+            Some(CurrentDeleteTransition {
+                status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+                tier: "WARM".into(),
+                remote_object: "opaque/object+name".into(),
+                remote_version: Some("opaque/version+id==".into()),
+                version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                destination_id: Some([0xab; 32]),
+                remote_only: true,
+            }),
+        ] {
+            let prior = PriorGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.clone(),
+            };
+            let generation = CurrentDeleteGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.map(Box::new),
+            };
+            let prior_encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed generation shape");
+            let encoded = rmp_serde::to_vec_named(&generation).expect("encode boxed transition generation");
+            assert_eq!(encoded, prior_encoded);
+            let decoded: CurrentDeleteGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&prior_encoded).expect("decode the previous generation payload");
+            assert_eq!(decoded, generation);
+            let prior_decoded: PriorGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode boxed transition with the previous shape");
+            assert_eq!(prior_decoded, prior);
+            if matches!(generation, CurrentDeleteGeneration::Present { transition: None, .. }) {
+                #[derive(Serialize)]
+                enum GenerationWithoutTransition {
+                    Present {
+                        version_id: Option<Uuid>,
+                        data_dir: Option<Uuid>,
+                        mod_time: OffsetDateTime,
+                        delete_marker: bool,
+                        etag: String,
+                    },
+                }
+                let legacy = GenerationWithoutTransition::Present {
+                    version_id,
+                    data_dir,
+                    mod_time,
+                    delete_marker: false,
+                    etag: "opaque-etag".into(),
+                };
+                let legacy_encoded = rmp_serde::to_vec_named(&legacy).expect("encode a generation without the transition field");
+                let legacy_decoded: CurrentDeleteGeneration =
+                    rustfs_protos::decode_delete_recovery_payload(&legacy_encoded).expect("default an omitted transition field");
+                assert_eq!(legacy_decoded, generation);
+            }
+        }
+    }
+
+    #[test]
     fn boxed_apply_version_preserves_existing_wire_payload() {
         #[derive(Serialize)]
         enum PriorOperation<'a> {

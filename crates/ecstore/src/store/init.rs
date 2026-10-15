@@ -5032,6 +5032,339 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn repeated_abort_recovers_exact_orphan_before_decommission_drains() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create orphan recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-multipart-drain", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-multipart-{}", uuid::Uuid::new_v4());
+        let object = "exact-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation");
+        let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(&bucket).await.expect("bucket guard");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create source upload");
+        drop(lifecycle_guard);
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("initial abort");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let staging_dir = |pool_index: usize, disk_index: usize| {
+            temp_dir
+                .path()
+                .join(format!("pool{pool_index}/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+        };
+        for disk_index in 0..3 {
+            let path = staging_dir(0, disk_index);
+            tokio::fs::create_dir_all(&path).await.expect("create late part directory");
+            tokio::fs::write(path.join("part.1"), b"late part after abort")
+                .await
+                .expect("write late part fixture");
+        }
+        mark_test_pool_decommissioning(&store, 0).await;
+        assert!(
+            store
+                .list_multipart_uploads(&bucket, "", None, None, None, 100)
+                .await
+                .expect("logical upload listing")
+                .uploads
+                .is_empty()
+        );
+        assert!(store.ensure_decommission_multipart_uploads_drained_for_test(0).await.is_err());
+        assert!(
+            store
+                .abort_multipart_upload(&bucket, "different-key", &upload.upload_id, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the same UploadID for a different key must not recover this path"
+        );
+
+        // A minority metadata copy in another pool blocks recovery everywhere.
+        let conflicting_metadata = staging_dir(1, 0).join(crate::disk::STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(conflicting_metadata.parent().expect("metadata parent"))
+            .await
+            .expect("create conflicting pool staging");
+        tokio::fs::write(&conflicting_metadata, b"unreadable metadata")
+            .await
+            .expect("write conflicting metadata");
+        assert!(
+            store
+                .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "no pool may be cleaned until every pool proves absence"
+        );
+        for disk_index in 0..3 {
+            assert!(staging_dir(0, disk_index).join("part.1").exists());
+        }
+        tokio::fs::remove_file(conflicting_metadata)
+            .await
+            .expect("remove conflicting fixture");
+        let (paused, release) = crate::store::multipart::pause_orphan_multipart_cleanup_for_test(&bucket);
+        let recovery_store = store.clone();
+        let recovery_bucket = bucket.clone();
+        let recovery_upload = upload.upload_id.clone();
+        let mut recovery = tokio::spawn(async move {
+            recovery_store
+                .abort_multipart_upload(&recovery_bucket, object, &recovery_upload, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                paused = paused => paused.expect("cleanup owner announces arrival"),
+                result = &mut recovery => panic!("recovery returned before physical cleanup: {result:?}"),
+            }
+        })
+        .await
+        .expect("recovery should reach physical cleanup");
+        recovery.abort();
+        assert!(recovery.await.expect_err("request waiter is cancellable").is_cancelled());
+        let upload_lock = store.pools[0]
+            .get_disks_by_key(object)
+            .new_ns_lock(crate::disk::RUSTFS_META_MULTIPART_BUCKET, &format!("{upload_sha}/{upload_uuid}"))
+            .await
+            .expect("same upload namespace");
+        let mut upload_writer = Box::pin(upload_lock.get_write_lock(Duration::from_secs(10)));
+        let mut bucket_writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+        assert!(
+            futures::poll!(&mut upload_writer).is_pending(),
+            "cancelled recovery must retain the upload lock"
+        );
+        assert!(
+            futures::poll!(&mut bucket_writer).is_pending(),
+            "cancelled recovery must retain the real bucket guard"
+        );
+        release.send(()).expect("allow physical cleanup to finish");
+        let (upload_guard, bucket_guard) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(upload_writer, bucket_writer) })
+                .await
+                .expect("both guards should release after physical cleanup");
+        drop(upload_guard.expect("upload writer resumes"));
+        drop(bucket_guard.expect("bucket writer resumes"));
+        for pool_index in 0..2 {
+            for disk_index in 0..4 {
+                assert!(!staging_dir(pool_index, disk_index).exists(), "every checked staging path must be absent");
+            }
+        }
+        store
+            .ensure_decommission_multipart_uploads_drained_for_test(0)
+            .await
+            .expect("physical decommission gate should open after recovery");
+        assert!(
+            matches!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                    .await,
+                Err(StorageError::InvalidUploadID(_, _, _))
+            ),
+            "an absent upload must not claim to have recovered anything"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn repeated_abort_keeps_no_such_upload_while_a_disk_is_offline() {
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create offline-disk recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-multipart-offline", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-multipart-{}", uuid::Uuid::new_v4());
+        let object = "offline-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation");
+        let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(&bucket).await.expect("bucket guard");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create source upload");
+        drop(lifecycle_guard);
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("initial abort");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let staging_dir = |disk_index: usize| {
+            temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+        };
+        for disk_index in 0..3 {
+            let path = staging_dir(disk_index);
+            tokio::fs::create_dir_all(&path).await.expect("create late part directory");
+            tokio::fs::write(path.join("part.1"), b"late part after abort")
+                .await
+                .expect("write late part fixture");
+        }
+
+        // One offline disk means absence cannot be proven. The idempotent Abort
+        // must keep answering NoSuchUpload instead of surfacing a disk error,
+        // and must not delete anything.
+        let set = store.pools[0].get_disks_by_key(object);
+        let offline = set.disks.write().await[3].take();
+        assert!(offline.is_some(), "fixture disk must have been online");
+        assert!(
+            matches!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                    .await,
+                Err(StorageError::InvalidUploadID(_, _, _))
+            ),
+            "unprovable absence must keep NoSuchUpload while a disk is offline"
+        );
+        for disk_index in 0..3 {
+            assert!(
+                staging_dir(disk_index).join("part.1").exists(),
+                "no staging may be deleted while a disk is offline"
+            );
+        }
+
+        set.disks.write().await[3] = offline;
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("recovery resumes once every disk is observable");
+        for disk_index in 0..4 {
+            assert!(!staging_dir(disk_index).exists(), "recovered staging must be absent");
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn orphan_multipart_recovery_preserves_current_bucket_incarnation() {
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create bucket lifetime recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-bucket-lifetime", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-lifetime-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create original bucket");
+        let original_incarnation = store.bucket_incarnation_id(&bucket).await.expect("original incarnation");
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create original upload");
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("abort original upload");
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete original bucket");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        assert_ne!(store.bucket_incarnation_id(&bucket).await.expect("new incarnation"), original_incarnation);
+        let mut reader = PutObjReader::from_vec(b"current bucket object".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("write current bucket object");
+        let current_upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create current incarnation upload for the same key");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let leftover = temp_dir
+            .path()
+            .join("pool0/set0/disk0")
+            .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+            .join(upload_sha)
+            .join(upload_uuid)
+            .join("part.1");
+        tokio::fs::create_dir_all(leftover.parent().expect("staging parent"))
+            .await
+            .expect("create old incarnation staging");
+        tokio::fs::write(&leftover, b"previous bucket lifetime")
+            .await
+            .expect("write previous incarnation fixture");
+        for opts in [
+            ObjectOptions {
+                expected_bucket_incarnation_id: Some(original_incarnation),
+                ..Default::default()
+            },
+            ObjectOptions {
+                expected_bucket_incarnation_id: Some(uuid::Uuid::nil()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &opts)
+                    .await
+                    .is_err(),
+                "a stale or nil current-bucket identity must fail closed"
+            );
+            assert!(leftover.exists(), "failed bucket lifetime proof must preserve the path");
+        }
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("exact metadata-less staging from an old incarnation is unreferenced");
+        assert!(!leftover.exists());
+        store
+            .get_multipart_info(&bucket, object, &current_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("recovery must preserve the current incarnation's active upload");
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("current object must remain readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("read current object");
+        assert_eq!(body, b"current bucket object");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn active_multipart_upload_routes_before_faulted_suspended_source() {
         use sha2::Digest;
 
@@ -18762,6 +19095,70 @@ mod tests {
         let mut body = Vec::new();
         reader.stream.read_to_end(&mut body).await.expect("read replacement object");
         assert_eq!(body, b"new-generation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn cancelled_ecstore_put_part_keeps_bucket_lifecycle_lock_through_commit() {
+        for pause in [
+            crate::set_disk::MultipartCommitPause::PutPartAfterCapacityAdmission,
+            crate::set_disk::MultipartCommitPause::PutPartAfterRename,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create cancelled multipart lifecycle store dir");
+            let (_ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "cancelled-multipart-lifecycle", &[4, 4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = format!("cancelled-part-lifecycle-{}", Uuid::new_v4());
+            let object = "part.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket for multipart lifecycle cancellation");
+            let upload = store
+                .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("create upload through the owning ECStore");
+            let barrier = crate::set_disk::MultipartCommitBarrier::install(&bucket, object, pause);
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put_upload_id = upload.upload_id.clone();
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![0x45; 4096]);
+                put_store
+                    .put_object_part(&put_bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await
+                    .expect_err("the ECStore request waiter must remain cancellable")
+                    .is_cancelled()
+            );
+
+            let mut writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut writer).await.is_err(),
+                "canceling UploadPart at {pause:?} must not release its bucket lifecycle owner before the commit drains"
+            );
+            barrier.release();
+            let lifecycle_guard = tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("the bucket lifecycle writer must resume after the part commit drains")
+                .expect("acquire the bucket lifecycle write lock after cancellation");
+            drop(lifecycle_guard);
+
+            let parts = store
+                .list_object_parts(&bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+                .await
+                .expect("the cancelled request's owned part commit must finish successfully");
+            assert_eq!(parts.parts.len(), 1, "the commit must publish exactly the uploaded part at {pause:?}");
+            assert_eq!(parts.parts[0].part_num, 1);
+            assert_eq!(parts.parts[0].size, 4096);
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]
