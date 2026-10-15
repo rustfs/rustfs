@@ -457,7 +457,18 @@ async fn native_stream_prepare_large_restart() {
             serde_json::from_slice(&std::fs::read(path.join("intent.json")).expect("durable locator"))
                 .expect("strict streaming intent JSON");
         assert_eq!(record["format"], 3);
-        assert_eq!(record["set_disks"].as_array().expect("persistent disk set").len(), 4);
+        let disk_format: crate::layout::format::FormatV3 =
+            serde_json::from_slice(&std::fs::read(disk.path().join(".rustfs.sys/format.json")).expect("actual disk format"))
+                .expect("typed disk format");
+        let disk_id: Uuid = serde_json::from_value(record["disk"].clone()).expect("record disk identity");
+        let expected_set = disk_format
+            .erasure
+            .sets
+            .iter()
+            .find(|set| set.contains(&disk_id))
+            .expect("disk belongs to one ordered set");
+        let saved_set: Vec<Uuid> = serde_json::from_value(record["set_disks"].clone()).expect("persistent disk set");
+        assert_eq!(&saved_set, expected_set, "persist the full ordered physical set");
         assert_eq!(record["data_dir"], preparation.to_string());
         assert!(
             std::fs::metadata(path.join(preparation.to_string()).join("part.1"))
