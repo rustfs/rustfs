@@ -24,6 +24,7 @@ pub mod fs;
 pub mod health_state;
 mod io_admission;
 pub mod local;
+pub(crate) mod native_prepare_rpc;
 pub mod os;
 
 #[cfg(test)]
@@ -230,6 +231,144 @@ pub enum Disk {
 }
 
 impl Disk {
+    #[cfg(unix)]
+    pub(crate) async fn native_begin_stream(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local) => {
+                local
+                    .get_disk()
+                    .begin_native_stream(preparation, store_id, bucket, incarnation, fence)
+                    .await
+            }
+            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn native_begin_stream(
+        &self,
+        _preparation: Uuid,
+        _store_id: Uuid,
+        _bucket: &str,
+        _incarnation: Uuid,
+        _fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<()> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn native_finalize(
+        &self,
+        input: local::native_prepare::NativePrepareInput,
+    ) -> Result<local::native_prepare::NativePreparationReceipt> {
+        match self {
+            Disk::Local(local) => local.get_disk().prepare_native(input).await,
+            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn native_finalize(
+        &self,
+        _input: local::native_prepare::NativePrepareInput,
+    ) -> Result<local::native_prepare::NativePreparationReceipt> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn native_recover(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<(local::native_prepare::NativePreparationReceipt, Bytes)> {
+        match self {
+            Disk::Local(local) => {
+                local
+                    .get_disk()
+                    .recover_native_with_metadata(preparation, store_id, bucket, incarnation, fence)
+                    .await
+            }
+            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn native_recover(
+        &self,
+        _preparation: Uuid,
+        _store_id: Uuid,
+        _bucket: &str,
+        _incarnation: Uuid,
+        _fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<(local::native_prepare::NativePreparationReceipt, Bytes)> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn native_probe(
+        &self,
+        preparation: Uuid,
+        store_id: Uuid,
+        bucket: &str,
+        key: &str,
+        incarnation: Uuid,
+        fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<local::native_prepare::NativePreparationProbe> {
+        match self {
+            Disk::Local(local) => {
+                local
+                    .get_disk()
+                    .probe_native(preparation, store_id, bucket, key, incarnation, fence)
+                    .await
+            }
+            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn native_probe(
+        &self,
+        _preparation: Uuid,
+        _store_id: Uuid,
+        _bucket: &str,
+        _key: &str,
+        _incarnation: Uuid,
+        _fence: Arc<crate::object_api::ObjectLockConfigSnapshot>,
+    ) -> Result<local::native_prepare::NativePreparationProbe> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn native_locate(
+        &self,
+        store_id: Uuid,
+        preparation: Uuid,
+    ) -> Result<Option<local::native_prepare::NativePreparationDescription>> {
+        match self {
+            Disk::Local(local) => local.get_disk().locate_native_preparation(store_id, preparation).await,
+            Disk::Remote(_) => Err(DiskError::UnsupportedDisk),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn native_locate(
+        &self,
+        _store_id: Uuid,
+        _preparation: Uuid,
+    ) -> Result<Option<local::native_prepare::NativePreparationDescription>> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
     pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => {
