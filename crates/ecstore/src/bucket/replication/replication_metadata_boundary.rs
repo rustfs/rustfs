@@ -17,8 +17,8 @@ use std::sync::Arc;
 use crate::bucket::{metadata::BucketMetadata, metadata_sys};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::runtime::instance::InstanceContext;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
 
 use super::replication_error_boundary::{Error, Result};
@@ -36,11 +36,11 @@ impl ReplicationMetadataStore {
     pub(crate) const FORCE_DELETE_REPLICATION_FILE: &'static str = "config/replication/force-delete.bin";
     pub(crate) const FORCE_DELETE_REPLICATION_TRANSACTION_LOCK: &'static str = "config/replication/force-delete.bin.transaction";
 
-    pub(crate) async fn replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+    pub(crate) async fn replication_config(bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
         metadata_sys::get_replication_config(bucket).await
     }
 
-    pub(crate) async fn optional_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
+    pub(crate) async fn optional_replication_config(bucket: &str) -> Result<Option<PersistedReplicationConfiguration>> {
         let config = match Self::replication_config(bucket).await {
             Ok((config, _)) => Some(config),
             Err(err) => {

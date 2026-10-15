@@ -18,7 +18,6 @@ use crate::admin::handlers::mfa::verify_for_session as mfa_verify_for_session;
 use crate::admin::runtime_sources::object_store_from_req;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::session_policy::populate_session_policy;
-use crate::admin::storage_api::bucket::utils::serialize;
 use crate::{
     admin::runtime_sources::{current_action_credentials, current_federated_identity_service, current_token_signing_key},
     admin::{
@@ -335,10 +334,18 @@ async fn handle_assume_role(
     };
 
     // getAssumeRoleCredentials
-    let output = serialize::<AssumeRoleOutput>(&resp)
+    let output = serialize_assume_role_output(&resp)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
 
     Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+}
+
+/// The STS answer is an s3s response body, so the s3s encoder writes it; it
+/// is not a bucket configuration and never goes through the bucket-config codec.
+fn serialize_assume_role_output(output: &AssumeRoleOutput) -> s3s::xml::SerResult<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    s3s::xml::Serialize::serialize(output, &mut s3s::xml::Serializer::new(&mut buf))?;
+    Ok(buf)
 }
 
 /// Session claim marking a session that presented a second factor.
