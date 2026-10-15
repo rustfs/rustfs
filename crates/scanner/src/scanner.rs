@@ -3598,11 +3598,15 @@ where
     }
 }
 
-fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_observational_candidate: bool) -> bool {
-    has_observational_candidate
+fn scanner_cycle_uses_observational_publication(status: ScannerCycleStatus, has_published_snapshot: bool) -> bool {
+    // Incomplete cycles may emit only a non-authoritative snapshot. Its lease
+    // must allow ordinary namespace commits while retaining the movement fence.
+    has_published_snapshot
         && matches!(
             status,
-            ScannerCycleStatus::Superseded | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+            ScannerCycleStatus::Superseded
+                | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                | ScannerCycleStatus::Incomplete
         )
 }
 
