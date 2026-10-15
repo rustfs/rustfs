@@ -2810,6 +2810,7 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    #[track_caller]
     async fn read_version(
         &self,
         org_volume: &str,
@@ -2818,7 +2819,7 @@ impl DiskAPI for LocalDiskWrapper {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
-        self.track_disk_health_with_op_timeout_action_and_mutation_with_io_permit(
+        let operation = self.track_disk_health_with_op_timeout_action_and_mutation_with_io_permit(
             "read_version",
             |io_permit| async move {
                 with_disk_io_permit(io_permit, self.disk.read_version(org_volume, volume, path, version_id, opts)).await
@@ -2826,8 +2827,20 @@ impl DiskAPI for LocalDiskWrapper {
             get_max_timeout_duration(),
             TimeoutHealthAction::MarkFailure,
             DiskMetricMutation::None,
-        )
-        .await
+        );
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        {
+            if crate::cluster::rpc::runtime_sources::current_read_version_request_caller().is_some() {
+                operation.await
+            } else {
+                let caller = crate::cluster::rpc::runtime_sources::read_version_request_caller_from_location(
+                    std::panic::Location::caller().file(),
+                );
+                crate::cluster::rpc::runtime_sources::with_read_version_request_caller(caller, operation).await
+            }
+        }
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        operation.await
     }
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {

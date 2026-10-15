@@ -65,9 +65,9 @@ use super::replication_target_boundary::{
     SsecPassthroughGate, TargetClient, VersionIdentityCapability, is_replication_target_offline_error,
     replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
     replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
-    replication_put_object_header_size, replication_put_object_options, replication_target_head_is_newer_null_version,
-    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
-    version_identity_drifted,
+    replication_put_object_header_size, replication_put_object_options, replication_source_etag_is_comparable,
+    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
+    ssec_passthrough_gate, version_identity_capability_from_put, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -349,15 +349,23 @@ fn replica_etag_verification_enabled() -> bool {
 /// target that stores a transformed payload (e.g. undecoded `aws-chunked`
 /// frames, #6853) returns the ETag of what it actually wrote. Reporting
 /// COMPLETED over such a replica is silent corruption, so a decidable
-/// mismatch fails the replication instead. An SSE-C ciphertext passthrough
-/// transfer is exempt: the wire bytes are ciphertext while the source ETag is
-/// the plaintext MD5, and that path has its own HEAD-back audit.
+/// mismatch fails the replication instead. Encrypted sources are exempt: an
+/// SSE-C ciphertext passthrough sends ciphertext while the source ETag is the
+/// plaintext MD5 (that path has its own HEAD-back audit), and a managed-SSE
+/// (SSE-S3 / SSE-KMS) source stores a keyed fingerprint, or a legacy plaintext
+/// MD5, that the ETag of the target's re-encrypted replica can neither confirm
+/// nor refute. A managed-SSE source forwards no checksum either
+/// (`replication_put_object_options`), so its replica has no post-PUT
+/// content audit.
 fn verify_single_part_replica(
     object_info: &ObjectInfo,
     response: &RemotePutObjectResponse,
     ciphertext_passthrough: bool,
 ) -> std::result::Result<(), std::io::Error> {
-    if ciphertext_passthrough || !replica_etag_verification_enabled() {
+    if ciphertext_passthrough
+        || !replication_source_etag_is_comparable(&object_info.user_defined)
+        || !replica_etag_verification_enabled()
+    {
         return Ok(());
     }
     if single_part_replica_etag_mismatch(object_info.etag.as_deref(), response.etag.as_deref()) {
@@ -5869,6 +5877,57 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
     use super::super::replication_object_decision_boundary::ReplicationMultipartPlanError;
+
+    #[test]
+    fn verify_single_part_replica_exempts_managed_sse_sources() {
+        // A new encrypted write stores a keyed fingerprint; a target that
+        // computes its own ETag answers with the MD5 of the plaintext it
+        // received. Both are 32 hex characters, so without the exemption the
+        // audit would fail every SSE-S3 / SSE-KMS replica (rustfs/backlog).
+        let fingerprint = "00112233445566778899aabbccddeeff";
+        let replica_md5 = "ffeeddccbbaa99887766554433221100";
+        let response = RemotePutObjectResponse {
+            version_id: None,
+            etag: Some(replica_md5.to_string()),
+        };
+        for sse in ["AES256", "aws:kms"] {
+            let object_info = ObjectInfo {
+                bucket: "source".to_string(),
+                name: "encrypted".to_string(),
+                etag: Some(fingerprint.to_string()),
+                user_defined: HashMap::from([("x-amz-server-side-encryption".to_string(), sse.to_string())]).into(),
+                ..Default::default()
+            };
+            verify_single_part_replica(&object_info, &response, false)
+                .unwrap_or_else(|err| panic!("{sse}: a managed-SSE source must not be audited against the replica MD5: {err}"));
+        }
+    }
+
+    #[test]
+    fn verify_single_part_replica_still_fails_plaintext_mismatch() {
+        if !replica_etag_verification_enabled() {
+            return;
+        }
+        let object_info = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "plain".to_string(),
+            etag: Some("00112233445566778899aabbccddeeff".to_string()),
+            ..Default::default()
+        };
+        let mismatch = RemotePutObjectResponse {
+            version_id: None,
+            etag: Some("ffeeddccbbaa99887766554433221100".to_string()),
+        };
+        let err = verify_single_part_replica(&object_info, &mismatch, false)
+            .expect_err("a plaintext source whose replica MD5 differs must fail the replication");
+        assert_eq!(err.to_string(), REPLICA_ETAG_MISMATCH_ERROR);
+
+        let matching = RemotePutObjectResponse {
+            version_id: None,
+            etag: object_info.etag.clone(),
+        };
+        verify_single_part_replica(&object_info, &matching, false).expect("matching plaintext MD5s pass the audit");
+    }
 
     #[test]
     fn multipart_read_plan_preserves_legacy_plain_part_ranges() {

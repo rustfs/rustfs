@@ -113,6 +113,18 @@ impl BackupFallbackStore {
 enum CacheReadBody {
     Bytes(Vec<u8>),
     PrefixThenError(Vec<u8>),
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    Pending,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+struct PendingCacheReader;
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl AsyncRead for PendingCacheReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
 }
 
 #[derive(Debug)]
@@ -138,7 +150,10 @@ impl AsyncRead for PrefixThenErrorReader {
 struct CacheReadStore {
     main: CacheReadBody,
     backup: Option<Vec<u8>>,
+    legacy: Option<Vec<u8>>,
     puts: AtomicUsize,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
 }
 
 #[derive(Debug, Default)]
@@ -152,7 +167,10 @@ impl CacheReadStore {
         Self {
             main,
             backup,
+            legacy: None,
             puts: AtomicUsize::new(0),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            entry_sources: Mutex::new(Vec::new()),
         }
     }
 
@@ -163,6 +181,8 @@ impl CacheReadStore {
                 prefix: Cursor::new(prefix),
                 failed: false,
             }),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            CacheReadBody::Pending => Box::new(PendingCacheReader),
         };
         ScannerGetObjectReader {
             stream,
@@ -194,6 +214,18 @@ impl ObjectIO for CacheReadStore {
         _h: Self::HeaderMap,
         _opts: &Self::ObjectOptions,
     ) -> StorageResult<Self::GetObjectReader> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        self.entry_sources
+            .lock()
+            .await
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
+        if bucket == DATA_USAGE_BUCKET.as_str() {
+            return self
+                .legacy
+                .clone()
+                .map(|data| Self::reader(CacheReadBody::Bytes(data), "legacy-etag"))
+                .ok_or(Error::FileNotFound);
+        }
         if bucket != RUSTFS_META_BUCKET {
             return Err(Error::FileNotFound);
         }
@@ -400,6 +432,53 @@ fn cache_revisions_map_to_compare_and_swap_preconditions() {
     assert!(existing.if_none_match_value().is_none());
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_revision_readers_keep_scanner_or_earlier_entry() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+    let path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+    let payload = b"scanner revision diagnostic".to_vec();
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(payload.clone()), None));
+        let read = async {
+            let (body, revision) = read_config_with_revision(store.clone(), &path)
+                .await
+                .expect("revision and body read");
+            assert_eq!(body, Some(payload.clone()));
+            assert_eq!(revision, DataUsageCacheRevision::Etag("main-etag".to_string()));
+            assert_eq!(
+                read_config_revision(store.clone(), &path).await.expect("revision-only read"),
+                DataUsageCacheRevision::Etag("main-etag".to_string())
+            );
+            let missing = format!("{path}.missing");
+            assert_eq!(
+                read_config_with_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing body is harmless"),
+                (None, DataUsageCacheRevision::Missing)
+            );
+            assert_eq!(
+                read_config_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing revision is harmless"),
+                DataUsageCacheRevision::Missing
+            );
+        };
+        match earlier {
+            Some(source) => with_read_version_entry(source, read).await,
+            None => read.await,
+        }
+        assert_eq!(
+            *store.entry_sources.lock().await,
+            vec![Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerRevisionRead)); 4],
+            "both readers and missing paths preserve the earliest diagnostic source"
+        );
+        assert_eq!(current_read_version_entry_source(), None, "reader scopes must not leak to the caller");
+    }
+}
+
 #[tokio::test]
 async fn backup_cache_load_recovers_main_revision_before_cas_save() {
     let mut expected = DataUsageCache::default();
@@ -495,6 +574,71 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
             .name,
         "bucket"
     );
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_cache_load_attempts_preserve_source_through_fallback_and_timeout() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "diagnostic-cache".to_string();
+    let bytes = cache.marshal_msg().expect("cache fixture should serialize");
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for case in ["primary", "legacy", "missing", "body_error", "timeout"] {
+            let body = match case {
+                "body_error" => CacheReadBody::PrefixThenError(vec![0x81, 0xa4, b'n', b'a']),
+                "timeout" => CacheReadBody::Pending,
+                _ => CacheReadBody::Bytes(bytes.clone()),
+            };
+            let mut fixture = CacheReadStore::new(body, None);
+            if case == "legacy" {
+                fixture.legacy = Some(bytes.clone());
+            }
+            let store = Arc::new(fixture);
+            let name = if matches!(case, "legacy" | "missing") {
+                "diagnostic-legacy-cache"
+            } else {
+                DATA_USAGE_CACHE_NAME
+            };
+            let timeout = if case == "timeout" {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            let load = DataUsageCache::try_load_inner(store.clone(), name, timeout);
+            let attempt = match earlier {
+                Some(source) => with_read_version_entry(source, load).await,
+                None => load.await,
+            }
+            .expect("diagnostic wrapper must preserve load-attempt results");
+            match (case, attempt) {
+                ("primary", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Etag("main-etag".to_string())));
+                }
+                ("legacy", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("missing", DataUsageCacheLoadAttempt::Missing { revision }) => {
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("body_error" | "timeout", DataUsageCacheLoadAttempt::Retryable(_)) => {}
+                _ => panic!("unexpected load-attempt outcome for {case}"),
+            }
+            let calls = if matches!(case, "legacy" | "missing") { 2 } else { 1 };
+            assert_eq!(
+                *store.entry_sources.lock().await,
+                vec![Some(earlier.unwrap_or(ReadVersionEntrySource::DataUsageCacheRead)); calls],
+                "primary and legacy reads must retain this attempt's entry source: {case}"
+            );
+            assert_eq!(store.puts.load(Ordering::SeqCst), 0, "load attempts must not save: {case}");
+            assert_eq!(current_read_version_entry_source(), None, "scope must restore even after timeout: {case}");
+        }
+    }
 }
 
 #[tokio::test]

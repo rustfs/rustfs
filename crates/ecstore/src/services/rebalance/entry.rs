@@ -1440,7 +1440,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn real_rebalance_entry_progresses_while_peer_activation_waits_for_run_fence() {
+    async fn real_rebalance_peer_activates_while_entry_retains_run_fence() {
         const REBALANCE_ID: &str = "rebalance-peer-activation-lock-order";
         let (_temp_dirs, store, peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(Some(
             active_rebalance_meta(REBALANCE_ID),
@@ -1456,7 +1456,7 @@ mod tests {
         let bucket = crate::disk::RUSTFS_META_BUCKET;
         let object = "rebalance-peer-activation-object";
         let version_id = uuid::Uuid::new_v4();
-        let payload = b"entry must drain before peer activation takes the pool fence".repeat(1024);
+        let payload = b"peer activation must not wait for this entry to drain".repeat(1024);
         let source_set = store.pools[0].get_disks_by_key(object);
         let target_set = store.pools[1].get_disks_by_key(object);
         let opts = ObjectOptions {
@@ -1516,7 +1516,12 @@ mod tests {
         );
         tokio::time::timeout(StdDuration::from_secs(30), attempted.notified())
             .await
-            .expect("peer activation must attempt the persisted rebalance write fence");
+            .expect("peer activation must attempt the persisted rebalance fence");
+        tokio::time::timeout(StdDuration::from_secs(30), activation_result)
+            .await
+            .expect("peer activation must finish while the entry remains paused")
+            .expect("peer activation result should be sent")
+            .expect("joining the same run must not require its active entry to release the run fence");
         release.notify_one();
 
         tokio::time::timeout(StdDuration::from_secs(30), async {
@@ -1531,10 +1536,6 @@ mod tests {
         })
         .await
         .expect("entry and peer activation must both make progress");
-        activation_result
-            .await
-            .expect("peer activation result should be sent")
-            .expect("peer activation must not time out behind the entry it blocks");
 
         let mut reader = target_set
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
