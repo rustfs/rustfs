@@ -831,7 +831,20 @@ impl ECStore {
         let Some(expected_incarnation) = opts.expected_bucket_incarnation_id.filter(|id| !id.is_nil()) else {
             return Err(invalid_upload());
         };
-        let (metadata, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+        // Recovery is a side path of an idempotent Abort. Until the first
+        // deletion is issued, anything that stops staging absence from being
+        // proven (an offline disk, lock contention, partially overlapping lock
+        // domains, unreadable bucket metadata) keeps the upload reported as
+        // gone, exactly as before recovery existed; only failures inside the
+        // deletion task are request failures, because a retry can finish them.
+        let (metadata, persisted) =
+            match crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    debug!(bucket, object, upload_id, %error, "orphan multipart cleanup skipped: bucket metadata unavailable");
+                    return Err(invalid_upload());
+                }
+            };
         if !persisted
             || !metadata.bucket_creation_committed
             || !metadata.bucket_incarnation_sidecar
@@ -844,10 +857,19 @@ impl ECStore {
         // Prove metadata absence across every pool before deleting any staging.
         let mut cleanup_guards = Vec::with_capacity(self.pools.len());
         for pool in &self.pools {
-            let guard = pool
+            let guard = match pool
                 .get_disks_by_key(object)
                 .lock_orphan_multipart_cleanup(bucket, object, upload_id, &opts, &cleanup_guards)
-                .await?;
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    if !is_err_invalid_upload_id(&error) {
+                        debug!(bucket, object, upload_id, %error, "orphan multipart cleanup skipped: staging absence not proven");
+                    }
+                    return Err(invalid_upload());
+                }
+            };
             cleanup_guards.push(guard);
         }
         let bucket = bucket.to_owned();
