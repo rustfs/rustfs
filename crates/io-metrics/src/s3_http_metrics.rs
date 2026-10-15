@@ -18,6 +18,7 @@
 
 use rustfs_s3_ops::S3Operation;
 use std::cell::Cell;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
@@ -37,6 +38,81 @@ const OUTCOMES: [&str; 8] = ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown", "serv
 const UNKNOWN_OPERATION: usize = S3Operation::ALL.len();
 static COUNTERS: LazyLock<HttpOutcomeCounters> = LazyLock::new(HttpOutcomeCounters::new);
 static COMPLETION_OBSERVER: OnceLock<(S3HttpCompletionObserverEnabled, S3HttpCompletionObserver)> = OnceLock::new();
+
+/// A bounded S3 operation captured from the current external-request context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct S3HttpOperationContext(S3Operation);
+
+impl S3HttpOperationContext {
+    /// Return the stable operation index used for bounded metric-handle lookup.
+    pub fn operation_index(self) -> usize {
+        self.0.metric_index()
+    }
+
+    /// Return the stable S3 operation label associated with this context.
+    pub fn operation_name(self) -> &'static str {
+        self.0.as_str()
+    }
+}
+
+/// Return the current S3 operation, when the task is inside a dispatched S3 request.
+pub fn current_s3_http_operation_context() -> Option<S3HttpOperationContext> {
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    if let Ok(index) = ISOLATED_OPERATION.try_with(Cell::get) {
+        return S3Operation::ALL.get(index).copied().map(S3HttpOperationContext);
+    }
+    CURRENT_OPERATION
+        .try_with(|current| {
+            let index = current.get();
+            S3Operation::ALL.get(index).copied().map(S3HttpOperationContext)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Return the current S3 operation label, or `None` for internal/non-S3 work.
+pub fn current_s3_http_operation_name() -> Option<&'static str> {
+    current_s3_http_operation_context().map(S3HttpOperationContext::operation_name)
+}
+
+/// Reapply a captured S3 operation while polling work on a child Tokio task.
+pub async fn with_s3_http_operation_context<F>(context: Option<S3HttpOperationContext>, future: F) -> F::Output
+where
+    F: Future,
+{
+    match context {
+        Some(context) => {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            return with_isolated_s3_http_operation_context(Some(context), future).await;
+            #[cfg(not(feature = "diagnostic-read-version-caller"))]
+            CURRENT_OPERATION.scope(Cell::new(context.operation_index()), future).await
+        }
+        None => future.await,
+    }
+}
+
+/// Restore an item's operation, including explicit absence, without changing
+/// the ambient HTTP request guard or borrowing the request that flushed a batch.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub async fn with_isolated_s3_http_operation_context<F>(context: Option<S3HttpOperationContext>, future: F) -> F::Output
+where
+    F: Future,
+{
+    let index = context.map_or(UNKNOWN_OPERATION, S3HttpOperationContext::operation_index);
+    ISOLATED_OPERATION
+        .scope(Cell::new(index), async {
+            match context {
+                Some(context) => CURRENT_OPERATION.scope(Cell::new(context.operation_index()), future).await,
+                None => future.await,
+            }
+        })
+        .await
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+tokio::task_local! {
+    static ISOLATED_OPERATION: Cell<usize>;
+}
 
 tokio::task_local! {
     static CURRENT_OPERATION: Cell<usize>;
@@ -240,6 +316,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn captured_operation_context_can_be_reapplied_to_child_task() {
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request
+            .in_scope(|| {
+                observe_s3_http_operation(S3Operation::GetObject);
+                current_s3_http_operation_context()
+            })
+            .expect("dispatched S3 operation should be captured");
+
+        let child_operation = tokio::spawn(with_s3_http_operation_context(Some(operation), async {
+            current_s3_http_operation_name()
+        }))
+        .await
+        .expect("child task should finish");
+
+        assert_eq!(child_operation, Some("s3:GetObject"));
+    }
+
     #[test]
     fn outcome_counters_distinguish_partial_and_complete_write_failure() {
         let counters = HttpOutcomeCounters::new();
@@ -277,6 +372,39 @@ mod tests {
             let labels: Vec<_> = key.key().labels().map(|label| label.key()).collect();
             assert_eq!(labels, ["method", "op", "outcome"]);
         }
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn isolated_absent_operation_does_not_inherit_the_flush_request() {
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::GetObject);
+            current_s3_http_operation_context().expect("GetObject operation should be captured")
+        });
+        with_s3_http_operation_context(Some(operation), async {
+            assert!(S3HttpRequestGuard::is_active());
+            with_isolated_s3_http_operation_context(None, async {
+                assert_eq!(current_s3_http_operation_context(), None);
+                assert!(
+                    S3HttpRequestGuard::is_active(),
+                    "isolating an item must leave ambient HTTP accounting intact"
+                );
+                tokio::task::yield_now().await;
+                assert_eq!(current_s3_http_operation_context(), None);
+            })
+            .await;
+            assert_eq!(current_s3_http_operation_context(), Some(operation));
+        })
+        .await;
+        assert_eq!(current_s3_http_operation_context(), None);
+        with_isolated_s3_http_operation_context(None, async {
+            assert!(
+                !S3HttpRequestGuard::is_active(),
+                "absent operation must not fabricate an HTTP request guard"
+            );
+        })
+        .await;
     }
 
     #[test]

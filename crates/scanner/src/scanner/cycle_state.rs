@@ -1473,6 +1473,23 @@ async fn mark_cycle_recovery_cleanup_pending(
 pub(crate) async fn load_scanner_cycle_state_for_startup(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> ScannerCycleStateStartup {
+    let load = load_scanner_cycle_state_inner(storeapi);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let load = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerCycleStateRead,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCycleStateLoad,
+            );
+            load.await
+        },
+    );
+    load.await
+}
+
+async fn load_scanner_cycle_state_inner(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> ScannerCycleStateStartup {
     let marker = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
         Ok((None, _)) => None,
         Ok((Some(data), marker_revision)) => match serde_json::from_slice::<ScannerCycleRecoveryMarker>(&data) {

@@ -22,7 +22,31 @@ pub const LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED: &str = "limit_reached";
 pub const LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED: &str = "input_closed";
 pub const LIST_OBJECTS_MERGE_OUTCOME_STARTED: &str = "started";
 
+/// Bounded caller class for a ListObjects walker gather.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ListObjectsGatherCaller {
+    #[default]
+    Unattributed,
+    S3List,
+    S3ListVersions,
+    Lifecycle,
+    Other,
+}
+
+impl ListObjectsGatherCaller {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::S3List => "s3_list",
+            Self::S3ListVersions => "s3_list_versions",
+            Self::Lifecycle => "lifecycle",
+            Self::Other => "other",
+        }
+    }
+}
+
 const LIST_OBJECTS_GATHER_TOTAL: &str = "rustfs_s3_list_objects_gather_total";
+const LIST_OBJECTS_GATHER_CALLER_TOTAL: &str = "rustfs_s3_list_objects_gather_caller_total";
 const LIST_OBJECTS_GATHER_DURATION_MS: &str = "rustfs_s3_list_objects_gather_duration_ms";
 const LIST_OBJECTS_GATHER_SCANNED_ENTRIES: &str = "rustfs_s3_list_objects_gather_scanned_entries";
 const LIST_OBJECTS_GATHER_RETURNED_ENTRIES: &str = "rustfs_s3_list_objects_gather_returned_entries";
@@ -53,6 +77,7 @@ pub const LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR: &str = "error";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ListObjectsGatherObservation {
     pub source: &'static str,
+    pub caller: ListObjectsGatherCaller,
     pub outcome: &'static str,
     pub limit: i32,
     pub scanned_entries: usize,
@@ -213,6 +238,7 @@ pub fn record_list_objects_gather(observation: ListObjectsGatherObservation) {
     } else {
         count_as_f64(observation.scanned_entries) / count_as_f64(observation.returned_entries)
     };
+    let api_operation = crate::s3_http_metrics::current_s3_http_operation_name().unwrap_or("unattributed");
 
     counter!(
         LIST_OBJECTS_GATHER_TOTAL,
@@ -221,6 +247,14 @@ pub fn record_list_objects_gather(observation: ListObjectsGatherObservation) {
         "has_prefix" => bool_label(observation.has_prefix),
         "has_delimiter" => bool_label(observation.has_delimiter),
         "has_marker" => bool_label(observation.has_marker),
+    )
+    .increment(1);
+    counter!(
+        LIST_OBJECTS_GATHER_CALLER_TOTAL,
+        "api_operation" => api_operation,
+        "caller" => observation.caller.as_str(),
+        "source" => observation.source,
+        "outcome" => observation.outcome,
     )
     .increment(1);
     histogram!(
@@ -432,6 +466,7 @@ mod tests {
         let rows = recorded(|| {
             record_list_objects_gather(ListObjectsGatherObservation {
                 source: LIST_OBJECTS_SOURCE_WALKER,
+                caller: ListObjectsGatherCaller::Unattributed,
                 outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
                 limit: 1001,
                 scanned_entries: 42,
@@ -444,12 +479,61 @@ mod tests {
         });
 
         assert_eq!(counter_total(&rows, LIST_OBJECTS_GATHER_TOTAL), Some(1));
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_GATHER_CALLER_TOTAL), Some(1));
+        let caller_labels = rows
+            .iter()
+            .find(|(composite, _, _, _)| composite.key().name() == LIST_OBJECTS_GATHER_CALLER_TOTAL)
+            .expect("internal caller counter should be emitted")
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(caller_labels.get("api_operation").map(String::as_str), Some("unattributed"));
         // Zero returned entries must not divide: the amplification reports the
         // scan count itself rather than an infinity or a NaN.
         assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_SCAN_AMPLIFICATION), vec![42.0]);
         assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_FILTERED_ENTRIES), vec![42.0]);
         assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_RETURNED_ENTRIES), vec![0.0]);
         assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_DURATION_MS), vec![3.5]);
+    }
+
+    #[test]
+    fn gather_caller_metric_attributes_the_s3_api_operation() {
+        use rustfs_s3_ops::S3Operation;
+
+        let rows = recorded(|| {
+            let mut request = crate::s3_http_metrics::S3HttpRequestGuard::new("GET");
+            request.in_scope(|| {
+                crate::s3_http_metrics::observe_s3_http_operation(S3Operation::ListObjectsV2);
+                record_list_objects_gather(ListObjectsGatherObservation {
+                    source: LIST_OBJECTS_SOURCE_WALKER,
+                    caller: ListObjectsGatherCaller::S3List,
+                    outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
+                    limit: 1000,
+                    scanned_entries: 1,
+                    returned_entries: 1,
+                    duration_ms: 1.0,
+                    has_prefix: false,
+                    has_delimiter: false,
+                    has_marker: false,
+                });
+            });
+        });
+
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_GATHER_CALLER_TOTAL), Some(1));
+        let labels = rows
+            .iter()
+            .find(|(composite, _, _, _)| composite.key().name() == LIST_OBJECTS_GATHER_CALLER_TOTAL)
+            .expect("caller counter should be emitted")
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(labels.get("api_operation").map(String::as_str), Some("s3:ListObjectsV2"));
+        assert_eq!(labels.get("caller").map(String::as_str), Some("s3_list"));
+        assert_eq!(labels.get("source").map(String::as_str), Some(LIST_OBJECTS_SOURCE_WALKER));
     }
 
     #[test]

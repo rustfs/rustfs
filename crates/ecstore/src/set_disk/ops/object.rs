@@ -5356,6 +5356,10 @@ impl SetDisks {
                     && !tier_free_version_source_lookup_counterfactual_skip_enabled()
                     && !reuse_rename_data_source_for_tier_free_version
                 {
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::TierFreeVersionSourceLookup,
+                    );
                     match commit_set
                         .get_object_info(
                             &commit_bucket,
@@ -5993,12 +5997,24 @@ impl SetDisks {
                 let child_token = cancellation.child_token();
                 let commit_task_wait_started = rustfs_io_metrics::put_stage_timer();
                 let commit_submit_to_closure_enter_started = rustfs_io_metrics::put_stage_timer();
-                let result =
-                    tokio::spawn(
-                        async move { Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token))).await },
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+                    rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::PutCommitOwner,
+                );
+                let result = tokio::spawn(async move {
+                    let commit = Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token)));
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+                        diagnostic_context,
+                        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::PutCommitOwner,
+                        commit,
                     )
-                    .await
-                    .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
+                    .await;
+                    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                    commit.await
+                })
+                .await
+                .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT,
                     commit_task_wait_started,
@@ -10841,10 +10857,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
-        let snapshot = self
-            .get_object_fileinfo(bucket, object, opts, true, false)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+        let read = self.get_object_fileinfo(bucket, object, opts, true, false);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
+            async {
+                crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                    rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ObjectInfoRead,
+                );
+                read.await
+            },
+        );
+        let snapshot = read.await.map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
 
@@ -12183,6 +12207,232 @@ mod object_encryption_resolver_wiring_tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(None)
         }
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_put_owner_preserves_parent_context_at_tier_free_version_lookup() {
+        use crate::cluster::rpc::runtime_sources::{current_read_version_entry_source, with_read_version_entry};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_context};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (_dirs, disks, set) = runtime.block_on(crate::set_disk::hermetic_set_disks_isolated(4));
+        let bucket = "diagnostic-put-owner";
+        runtime.block_on(async {
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("make test bucket volume");
+            }
+            for index in 0..4 {
+                set.put_object(
+                    bucket,
+                    &format!("object-{index}"),
+                    &mut PutObjReader::from_vec(b"old body".to_vec()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed source object");
+            }
+        });
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let put = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PutObject")
+        });
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let mut index = 0;
+                for earlier in [None, Some(ReadVersionEntrySource::ScannerConfigWrite)] {
+                    for api in [None, Some(put)] {
+                        let object = format!("object-{index}");
+                        index += 1;
+                        let write = async {
+                            let mut reader = PutObjReader::from_vec(b"new body".to_vec());
+                            let info = set
+                                .put_object(
+                                    bucket,
+                                    &object,
+                                    &mut reader,
+                                    &ObjectOptions {
+                                        tier_free_version_receipt_sink: Some(crate::object_api::TierFreeVersionReceiptSink::new()),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("replace source object");
+                            assert_eq!(info.size, 8);
+                        };
+                        rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(api, async {
+                            match earlier {
+                                Some(source) => with_read_version_entry(source, write).await,
+                                None => write.await,
+                            }
+                        })
+                        .await;
+                        assert_eq!(current_read_version_entry_source(), None);
+                        assert_eq!(current_s3_http_operation_context(), None);
+                    }
+                }
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for source in ["scanner_config_write", "put_commit_owner"] {
+            for boundary in ["put_commit_owner", "tier_free_version_source_lookup"] {
+                for (api, state) in [("unattributed", "absent"), ("s3:PutObject", "preserved")] {
+                    assert!(
+                        rows.iter().any(|(key, _, _, value)| {
+                            let labels = key
+                                .key()
+                                .labels()
+                                .map(|label| (label.key(), label.value()))
+                                .collect::<HashMap<_, _>>();
+                            key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                                && labels.get("entry_source") == Some(&source)
+                                && labels.get("boundary") == Some(&boundary)
+                                && labels.get("parent_api_operation") == Some(&api)
+                                && labels.get("child_api_operation") == Some(&api)
+                                && labels.get("api_context") == Some(&state)
+                                && matches!(value, DebugValue::Counter(count) if *count > 0)
+                        }),
+                        "actual detached owner and lookup must retain context: {source}/{boundary}/{api}"
+                    );
+                }
+            }
+        }
+        runtime.block_on(async {
+            for index in 0..4 {
+                let mut reader = set
+                    .get_object_reader(bucket, &format!("object-{index}"), None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("committed object remains readable");
+                let mut body = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut reader.stream, &mut body)
+                    .await
+                    .expect("read committed body");
+                assert_eq!(body, b"new body");
+            }
+        });
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_write_precondition_and_object_info_keep_origin_and_api() {
+        use crate::cluster::rpc::runtime_sources::{current_read_version_entry_source, with_read_version_entry};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_context};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut guard = S3HttpRequestGuard::new("PUT");
+        let put = guard.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PutObject")
+        });
+        let (_dirs, disks, set) = runtime.block_on(crate::set_disk::hermetic_set_disks_isolated(4));
+        let bucket = "diagnostic-precondition";
+        let object = "object";
+        let original = runtime.block_on(async {
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create test bucket volume");
+            }
+            set.put_object(bucket, object, &mut PutObjReader::from_vec(b"body".to_vec()), &ObjectOptions::default())
+                .await
+                .expect("seed object")
+        });
+        let etag = original.etag.expect("seed ETag");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for earlier in [None, Some(ReadVersionEntrySource::ConfigWrite)] {
+                    for api in [None, Some(put)] {
+                        let read = async {
+                            assert_eq!(
+                                set.get_object_info(bucket, object, &ObjectOptions::default())
+                                    .await
+                                    .expect("read object info")
+                                    .etag,
+                                Some(etag.clone())
+                            );
+                            for (expected, condition) in [(false, etag.clone()), (true, "other-etag".to_string())] {
+                                let result = set
+                                    .check_write_precondition(
+                                        bucket,
+                                        object,
+                                        &ObjectOptions {
+                                            http_preconditions: Some(HTTPPreconditions {
+                                                if_match: Some(condition),
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                assert_eq!(result, expected.then_some(Error::PreconditionFailed));
+                                assert_eq!(current_s3_http_operation_context(), api);
+                            }
+                        };
+                        rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(api, async {
+                            match earlier {
+                                Some(source) => with_read_version_entry(source, read).await,
+                                None => read.await,
+                            }
+                        })
+                        .await;
+                        assert_eq!(current_read_version_entry_source(), None);
+                        assert_eq!(current_s3_http_operation_context(), None);
+                    }
+                }
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for (source, boundary) in [
+            ("write_precondition_read", "write_precondition_lookup"),
+            ("write_precondition_read", "object_info_read"),
+            ("write_precondition_read", "full_wait"),
+            ("object_info_read", "object_info_read"),
+            ("config_write", "write_precondition_lookup"),
+            ("config_write", "object_info_read"),
+            ("config_write", "full_wait"),
+        ] {
+            for (api, state) in [("unattributed", "absent"), ("s3:PutObject", "preserved")] {
+                assert!(
+                    rows.iter().any(|(key, _, _, value)| {
+                        let labels = key
+                            .key()
+                            .labels()
+                            .map(|label| (label.key(), label.value()))
+                            .collect::<HashMap<_, _>>();
+                        key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                            && labels.get("entry_source") == Some(&source)
+                            && labels.get("boundary") == Some(&boundary)
+                            && labels.get("parent_api_operation") == Some(&api)
+                            && labels.get("child_api_operation") == Some(&api)
+                            && labels.get("api_context") == Some(&state)
+                            && matches!(value, DebugValue::Counter(count) if *count > 0)
+                    }),
+                    "actual lookup must preserve origin and API: {source}/{boundary}/{api}"
+                );
+            }
+        }
+        assert_eq!(
+            runtime
+                .block_on(set.get_object_info(bucket, object, &ObjectOptions::default()))
+                .expect("object retained")
+                .etag,
+            Some(etag)
+        );
     }
 
     #[tokio::test]

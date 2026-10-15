@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::s3_http_metrics::S3HttpOperationContext;
 use metrics::{counter, gauge};
+#[cfg(not(test))]
+use rustfs_s3_ops::S3Operation;
 use std::collections::HashMap;
 use std::sync::{
     Arc, LazyLock, OnceLock, RwLock,
@@ -64,6 +67,340 @@ pub const INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP: &str = "batch_read_v
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE: &str = "batch_read_version_response_decode";
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT: &str = "batch_read_version_coalescer_wait";
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP: &str = "batch_read_version_response_map";
+
+const INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL: &str =
+    "rustfs_system_network_internode_read_version_requests_by_caller_total";
+
+/// An attribution dimension is absent, common to all items, or heterogeneous.
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionAttribution<T> {
+    Absent,
+    Common(T),
+    Mixed,
+}
+
+/// Storage entry names describe call paths, not proof of an external request.
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionEntrySource {
+    Unclassified,
+    ConfigRead,
+    ConfigWrite,
+    ScannerConfigWrite,
+    WritePreconditionRead,
+    ObjectInfoRead,
+    AppPutOwner,
+    PutCommitOwner,
+    LifecycleRecovery,
+    RecoveryDispositionMaintenance,
+    StoreObjectReader,
+    DataUsageCacheRead,
+    ServerInfoPools,
+    ScannerBacklogRead,
+    ScannerRevisionRead,
+    ScannerCycleStateRead,
+    TierConfigReload,
+    ObjectRead,
+    ListObjects,
+    MetadataRead,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl ReadVersionEntrySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::ConfigRead => "config_read",
+            Self::ConfigWrite => "config_write",
+            Self::ScannerConfigWrite => "scanner_config_write",
+            Self::WritePreconditionRead => "write_precondition_read",
+            Self::ObjectInfoRead => "object_info_read",
+            Self::AppPutOwner => "app_put_owner",
+            Self::PutCommitOwner => "put_commit_owner",
+            Self::LifecycleRecovery => "lifecycle_recovery",
+            Self::RecoveryDispositionMaintenance => "recovery_disposition_maintenance",
+            Self::StoreObjectReader => "store_object_reader",
+            Self::DataUsageCacheRead => "data_usage_cache_read",
+            Self::ServerInfoPools => "server_info_pools",
+            Self::ScannerBacklogRead => "scanner_backlog_read",
+            Self::ScannerRevisionRead => "scanner_revision_read",
+            Self::ScannerCycleStateRead => "scanner_cycle_state_read",
+            Self::TierConfigReload => "tier_config_reload",
+            Self::ObjectRead => "object_read",
+            Self::ListObjects => "list_objects",
+            Self::MetadataRead => "metadata_read",
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug)]
+pub enum ReadVersionContextBoundary {
+    Entry,
+    FullWait,
+    EarlyStop,
+    ListProducer,
+    ListGather,
+    CoalescerEnqueue,
+    UnaryFallback,
+    EntryToRpc,
+    RemoteRpc,
+    ScannerCacheLoad,
+    ScannerCycleStateLoad,
+    ConfigWrite,
+    ScannerConfigWrite,
+    WritePreconditionLookup,
+    ObjectInfoRead,
+    AppPutOwner,
+    PutCommitOwner,
+    TierFreeVersionSourceLookup,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl ReadVersionContextBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::FullWait => "full_wait",
+            Self::EarlyStop => "early_stop",
+            Self::ListProducer => "list_producer",
+            Self::ListGather => "list_gather",
+            Self::CoalescerEnqueue => "coalescer_enqueue",
+            Self::UnaryFallback => "unary_fallback",
+            Self::EntryToRpc => "entry_to_rpc",
+            Self::RemoteRpc => "remote_rpc",
+            Self::ScannerCacheLoad => "scanner_cache_load",
+            Self::ScannerCycleStateLoad => "scanner_cycle_state_load",
+            Self::ConfigWrite => "config_write",
+            Self::ScannerConfigWrite => "scanner_config_write",
+            Self::WritePreconditionLookup => "write_precondition_lookup",
+            Self::ObjectInfoRead => "object_info_read",
+            Self::AppPutOwner => "app_put_owner",
+            Self::PutCommitOwner => "put_commit_owner",
+            Self::TierFreeVersionSourceLookup => "tier_free_version_source_lookup",
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn context_transition<T: Eq>(parent: Option<T>, child: Option<T>) -> &'static str {
+    match (parent, child) {
+        (None, None) => "absent",
+        (Some(_), None) => "lost",
+        (None, Some(_)) => "gained",
+        (Some(parent), Some(child)) if parent == child => "preserved",
+        (Some(_), Some(_)) => "changed",
+    }
+}
+
+/// Count observations separately from RPCs, using only bounded context labels.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub fn record_read_version_context_transition(
+    source: ReadVersionEntrySource,
+    boundary: ReadVersionContextBoundary,
+    parent_api: Option<S3HttpOperationContext>,
+    child_api: Option<S3HttpOperationContext>,
+    parent_caller: Option<ReadVersionRequestCaller>,
+    child_caller: Option<ReadVersionRequestCaller>,
+    mode: Option<ReadVersionRequestMode>,
+) {
+    if !crate::get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_storage_diagnostic_context_transitions_total",
+        "entry_source" => source.as_str(),
+        "boundary" => boundary.as_str(),
+        "parent_api_operation" => parent_api.map(S3HttpOperationContext::operation_name).unwrap_or("unattributed"),
+        "child_api_operation" => child_api.map(S3HttpOperationContext::operation_name).unwrap_or("unattributed"),
+        "parent_caller" => parent_caller.map(ReadVersionRequestCaller::as_str).unwrap_or("unattributed"),
+        "child_caller" => child_caller.map(ReadVersionRequestCaller::as_str).unwrap_or("unattributed"),
+        "mode" => mode.map(ReadVersionRequestMode::as_str).unwrap_or("not_applicable"),
+        "api_context" => if source == ReadVersionEntrySource::Unclassified && matches!(boundary, ReadVersionContextBoundary::RemoteRpc) {
+            "unobserved"
+        } else { context_transition(parent_api, child_api) },
+        "caller_context" => if source == ReadVersionEntrySource::Unclassified && matches!(boundary, ReadVersionContextBoundary::RemoteRpc) {
+            "unobserved"
+        } else { context_transition(parent_caller, child_caller) },
+    )
+    .increment(1);
+}
+
+/// Count a native batch RPC once; item observations and unary fallback are separate.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub fn record_batch_read_version_request_by_caller(
+    operation: ReadVersionAttribution<S3HttpOperationContext>,
+    caller: ReadVersionAttribution<ReadVersionRequestCaller>,
+    source: ReadVersionAttribution<ReadVersionEntrySource>,
+    mode: ReadVersionRequestMode,
+) {
+    let api_label = match operation {
+        ReadVersionAttribution::Absent => "unattributed",
+        ReadVersionAttribution::Common(operation) => operation.operation_name(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    let caller_label = match caller {
+        ReadVersionAttribution::Absent => "unattributed",
+        ReadVersionAttribution::Common(caller) => caller.as_str(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    let source_label = match source {
+        ReadVersionAttribution::Absent => "unclassified",
+        ReadVersionAttribution::Common(source) => source.as_str(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    counter!(
+        "rustfs_system_network_internode_batch_read_version_requests_by_caller_total",
+        "api_operation" => api_label,
+        "caller" => caller_label,
+        "entry_source" => source_label,
+        "mode" => mode.as_str(),
+    )
+    .increment(1);
+}
+#[cfg(not(test))]
+const READ_VERSION_REQUEST_MODE_COUNT: usize = 5;
+const READ_VERSION_REQUEST_CALLER_COUNT: usize = 18;
+
+#[cfg(not(test))]
+static READ_VERSION_CALLER_COUNTERS: LazyLock<Box<[OnceLock<metrics::Counter>]>> = LazyLock::new(|| {
+    std::iter::repeat_with(OnceLock::new)
+        .take((S3Operation::ALL.len() + 1) * READ_VERSION_REQUEST_MODE_COUNT * READ_VERSION_REQUEST_CALLER_COUNT)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+});
+
+/// Coarse read mode for diagnostic attribution of remote metadata reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionRequestMode {
+    MetadataOnly,
+    Data,
+    Healing,
+    IncludeFreeVersions,
+    Combined,
+}
+
+/// Bounded internal call-site class for an outgoing ReadVersion RPC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(usize)]
+pub enum ReadVersionRequestCaller {
+    #[default]
+    Unattributed,
+    Peer,
+    Startup,
+    Heal,
+    ListObjects,
+    Object,
+    MetadataRead,
+    Multipart,
+    DiskStore,
+    DiskDispatch,
+    SetDiskRead,
+    SetDiskIo,
+    Rebalance,
+    Decommission,
+    Lifecycle,
+    TierRecovery,
+    CacheValue,
+    Other,
+}
+
+impl ReadVersionRequestCaller {
+    pub const ALL: [Self; READ_VERSION_REQUEST_CALLER_COUNT] = [
+        Self::Unattributed,
+        Self::Peer,
+        Self::Startup,
+        Self::Heal,
+        Self::ListObjects,
+        Self::Object,
+        Self::MetadataRead,
+        Self::Multipart,
+        Self::DiskStore,
+        Self::DiskDispatch,
+        Self::SetDiskRead,
+        Self::SetDiskIo,
+        Self::Rebalance,
+        Self::Decommission,
+        Self::Lifecycle,
+        Self::TierRecovery,
+        Self::CacheValue,
+        Self::Other,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::Peer => "peer",
+            Self::Startup => "startup",
+            Self::Heal => "heal",
+            Self::ListObjects => "list_objects",
+            Self::Object => "object",
+            Self::MetadataRead => "metadata_read",
+            Self::Multipart => "multipart",
+            Self::DiskStore => "disk_store",
+            Self::DiskDispatch => "disk_dispatch",
+            Self::SetDiskRead => "set_disk_read",
+            Self::SetDiskIo => "set_disk_io",
+            Self::Rebalance => "rebalance",
+            Self::Decommission => "decommission",
+            Self::Lifecycle => "lifecycle",
+            Self::TierRecovery => "tier_recovery",
+            Self::CacheValue => "cache_value",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl ReadVersionRequestMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataOnly => "metadata_only",
+            Self::Data => "data",
+            Self::Healing => "healing",
+            Self::IncludeFreeVersions => "include_free_versions",
+            Self::Combined => "combined",
+        }
+    }
+}
+
+/// Record a bounded diagnostic caller class for one outgoing ReadVersion RPC.
+/// The caller label is either a fixed S3 operation name or `unattributed`.
+pub fn record_read_version_request_by_caller(
+    operation: Option<S3HttpOperationContext>,
+    caller: ReadVersionRequestCaller,
+    mode: ReadVersionRequestMode,
+) {
+    let api_operation = operation
+        .map(S3HttpOperationContext::operation_name)
+        .unwrap_or("unattributed");
+
+    #[cfg(test)]
+    counter!(
+        INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL,
+        "api_operation" => api_operation,
+        "caller" => caller.as_str(),
+        "mode" => mode.as_str(),
+    )
+    .increment(1);
+
+    #[cfg(not(test))]
+    {
+        let caller_index = operation.map_or(S3Operation::ALL.len(), |context| context.operation_index());
+        let counter_index = (caller_index * READ_VERSION_REQUEST_MODE_COUNT + mode as usize) * READ_VERSION_REQUEST_CALLER_COUNT
+            + caller as usize;
+        READ_VERSION_CALLER_COUNTERS[counter_index]
+            .get_or_init(|| {
+                counter!(
+                    INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL,
+                    "api_operation" => api_operation,
+                    "caller" => caller.as_str(),
+                    "mode" => mode.as_str(),
+                )
+            })
+            .increment(1);
+    }
+}
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -1229,6 +1566,61 @@ mod tests {
         assert_eq!(snapshot.replay_cache_entries, 64);
         assert_eq!(snapshot.replay_cache_capacity, 1024);
         assert_eq!(snapshot.replay_cache_evictions_total, 3);
+    }
+
+    #[test]
+    fn read_version_caller_metric_uses_only_bounded_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        with_local_recorder(&recorder, || {
+            let mut request = crate::s3_http_metrics::S3HttpRequestGuard::new("GET");
+            let operation = request
+                .in_scope(|| {
+                    crate::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::GetObject);
+                    crate::s3_http_metrics::current_s3_http_operation_context()
+                })
+                .expect("S3 request should expose its dispatched operation");
+            record_read_version_request_by_caller(
+                Some(operation),
+                ReadVersionRequestCaller::SetDiskRead,
+                ReadVersionRequestMode::Data,
+            );
+            record_read_version_request_by_caller(None, ReadVersionRequestCaller::Peer, ReadVersionRequestMode::MetadataOnly);
+        });
+
+        let rows = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        let labels = rows
+            .iter()
+            .map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|labels| {
+            labels.get("api_operation").map(String::as_str) == Some("s3:GetObject")
+                && labels.get("caller").map(String::as_str) == Some("set_disk_read")
+                && labels.get("mode").map(String::as_str) == Some("data")
+        }));
+        assert!(labels.iter().any(|labels| {
+            labels.get("api_operation").map(String::as_str) == Some("unattributed")
+                && labels.get("mode").map(String::as_str) == Some("metadata_only")
+                && labels.get("caller").map(String::as_str) == Some("peer")
+        }));
+        assert!(labels.iter().all(|labels| {
+            labels.len() == 3
+                && labels
+                    .keys()
+                    .all(|key| key == "api_operation" || key == "caller" || key == "mode")
+        }));
     }
 
     #[test]
