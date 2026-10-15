@@ -66,6 +66,15 @@ const MIXED_MULTIPART_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // probe_interval (2s) x success_threshold (3) after it comes back; 30s
 // comfortably covers that window plus CI scheduling jitter.
 const LISTING_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+// Healed by every drive-readmission probe. The key has no `/`: rc.5 registers
+// the object heal route as `/v3/heal/{bucket}/{prefix}` and that segment does
+// not match a slash, so a nested key falls through to the S3 router.
+const DRIVE_READMISSION_PROBE_KEY: &str = "drive-readmission-probe";
+// A peer drops a restarted node's drive to Offline after two failed
+// operations and only re-admits it through probe_interval (2s) x
+// success_threshold (3) once the node answers again. The budget covers that
+// for every node after the slowest restart in the sequence, plus CI jitter.
+const DRIVE_READMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Bucket-configuration upgrade/rollback scenarios (rustfs#7172, #7183, #7089).
 const CONFIG_PLAIN_BUCKET: &str = "upgrade-config-plain";
@@ -509,6 +518,9 @@ async fn observe_mixed_multipart_failure(
         let network_deadline = started + Duration::from_secs(4);
         let path = format!("/{MIXED_BUCKET}/{}", failure.key);
         let _ = tokio::time::timeout_at(deadline, async {
+            // Every node keeps its own lock table, and the writer that stalls is
+            // usually a previous-release node; the current node's snapshot alone
+            // cannot show which holder blocks the upload.
             let (heads, locks) = tokio::join!(
                 futures::future::join_all((0..cluster.nodes.len()).map(|node| probe_mixed_multipart_failure(
                     cluster,
@@ -517,7 +529,13 @@ async fn observe_mixed_multipart_failure(
                     true,
                     network_deadline
                 ))),
-                probe_mixed_multipart_failure(cluster, 0, "/rustfs/admin/v3/top/locks?count=1000", false, network_deadline),
+                futures::future::join_all((0..cluster.nodes.len()).map(|node| probe_mixed_multipart_failure(
+                    cluster,
+                    node,
+                    "/rustfs/admin/v3/top/locks?count=1000",
+                    false,
+                    network_deadline
+                ))),
             );
             let snapshot = serde_json::json!({
                 "phase": phase, "bucket": MIXED_BUCKET, "key": failure.key,
@@ -700,6 +718,112 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
     Ok(())
 }
 
+/// Drive states of `key` as the node that serves a dry-run heal sees them.
+///
+/// `storageinfo` and `info` only carry each node's local drives, so a peer that
+/// still holds a restarted node's drive in Offline is invisible there. The
+/// object heal runs on the receiving node against its own drive handles and
+/// reports a short-circuited remote drive as `faulty`, which is the view a
+/// writer on that node commits against.
+async fn heal_dry_run_drive_states(
+    cluster: &RustFSTestClusterEnvironment,
+    node: usize,
+    bucket: &str,
+    key: &str,
+    deadline: Instant,
+) -> Result<Vec<(String, String)>, String> {
+    let url = format!("{}/rustfs/admin/v3/heal/{bucket}/{key}", cluster.nodes[node].url.trim_end_matches('/'));
+    let probe = async {
+        let body = r#"{"recursive":false,"dryRun":true,"remove":false,"recreate":false,"scanMode":1,"updateParity":false,"nolock":false}"#;
+        let response = signed_request(
+            Method::POST,
+            &url,
+            &cluster.access_key,
+            &cluster.secret_key,
+            Some(body.as_bytes().to_vec()),
+            Some("application/json"),
+        )
+        .await
+        .map_err(|err| format!("heal start request failed: {err}"))?;
+        let status = response.status();
+        let text = response.text().await.map_err(|err| format!("heal start body: {err}"))?;
+        if status != StatusCode::OK {
+            return Err(format!("heal start returned {status}: {text}"));
+        }
+        let start: Value = serde_json::from_str(&text).map_err(|err| format!("heal start is not JSON ({err}): {text}"))?;
+        let token = start["clientToken"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| format!("heal start carries no clientToken: {text}"))?
+            .to_string();
+        let status_url = format!("{url}?clientToken={token}");
+        loop {
+            let response = signed_request(Method::POST, &status_url, &cluster.access_key, &cluster.secret_key, None, None)
+                .await
+                .map_err(|err| format!("heal status request failed: {err}"))?;
+            let text = response.text().await.map_err(|err| format!("heal status body: {err}"))?;
+            let status: Value = serde_json::from_str(&text).map_err(|err| format!("heal status is not JSON ({err}): {text}"))?;
+            if let Some(item) = status["items"].as_array().and_then(|items| items.first()) {
+                let drives = item["before"]["drives"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|drive| {
+                        (
+                            drive["endpoint"].as_str().unwrap_or_default().to_string(),
+                            drive["state"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                return Ok(drives);
+            }
+            if matches!(status["summary"].as_str(), Some("finished") | Some("stopped")) {
+                return Err(format!("heal {} without an object result: {text}", status["summary"]));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout_at(deadline, probe)
+        .await
+        .unwrap_or_else(|_| Err("heal probe deadline exceeded".to_string()))
+}
+
+/// Block until every node reports every drive of the probe object as `ok`.
+///
+/// Readiness through ListBuckets or a single PUT proves that a node accepts
+/// requests at write quorum; it does not prove that the node has re-admitted
+/// the drives it marked Offline while a peer restarted. A writer that still
+/// excludes one peer commits at exactly three of four drives and cannot ride
+/// out any other slow drive, so this gate runs before the next restart of the
+/// previous-release baseline.
+///
+/// The gate needs every node on the same release: admin heal first probes the
+/// heal-control capability of every peer, and a mixed-version cluster fails
+/// that probe on both the old and the new binary.
+async fn wait_for_drive_readmission(cluster: &RustFSTestClusterEnvironment, context: &str, budget: Duration) -> TestResult {
+    let deadline = Instant::now() + budget;
+    for node in 0..cluster.nodes.len() {
+        let mut last_observation = "no observation".to_string();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{context}: node {node} did not re-admit every drive within {}s; last observation: {last_observation}",
+                    budget.as_secs()
+                )
+                .into());
+            }
+            let probe_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+            match heal_dry_run_drive_states(cluster, node, MIXED_BUCKET, DRIVE_READMISSION_PROBE_KEY, probe_deadline).await {
+                Ok(drives) if drives.len() == cluster.nodes.len() && drives.iter().all(|(_, state)| state == "ok") => break,
+                Ok(drives) => last_observation = format!("{drives:?}"),
+                Err(error) => last_observation = error,
+            }
+            tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(500))).await;
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
@@ -707,16 +831,30 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // persist data, then restart each old process once with three peers still
     // readable. This preparation ends before any current binary is started.
     wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    clients[0]
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key(DRIVE_READMISSION_PROBE_KEY)
+        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+        .send()
+        .await?;
+    // A node that just came back is still replaying its startup traffic against
+    // every peer. Killing the next node during that burst gives the fresh node
+    // two failures in a row and it drops that peer's drive to Offline, where
+    // only the slow recovery probe can bring it back. Let every node re-admit
+    // every drive before the next kill and before any current binary starts.
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
+        let context = format!("previous-restart-{node}");
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
             MIXED_BUCKET,
-            &format!("previous-restart-{node}"),
+            &context,
             LISTING_CONVERGENCE_TIMEOUT,
         )
         .await?;
+        wait_for_drive_readmission(cluster, &context, DRIVE_READMISSION_TIMEOUT).await?;
     }
 
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
