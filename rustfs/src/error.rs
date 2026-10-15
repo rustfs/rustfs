@@ -23,6 +23,13 @@ const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
 const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
 const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
+/// Public message for `StorageError::UnsupportedDisk` on a request path. The
+/// only request-time producer is the delete-transaction protocol when a
+/// participant answers Unimplemented (a peer still on a release without the
+/// recovery RPC, or a protocol-version mismatch); the variant's Display text
+/// ("drive does not support O_DIRECT") describes the startup drive probe and
+/// would send an operator mid-upgrade after the wrong cause.
+const UNSUPPORTED_PARTICIPANT_MESSAGE: &str = "A storage participant does not support this operation's protocol version. If the cluster is being upgraded, finish upgrading every node and retry.";
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
 pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
@@ -739,6 +746,9 @@ impl From<StorageError> for ApiError {
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            // Retryable on an upgraded node (or once the cluster upgrade
+            // completes); see UNSUPPORTED_PARTICIPANT_MESSAGE.
+            StorageError::UnsupportedDisk => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
@@ -782,6 +792,8 @@ impl From<StorageError> for ApiError {
 
         let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
             err.to_string()
+        } else if matches!(&err, StorageError::UnsupportedDisk) {
+            UNSUPPORTED_PARTICIPANT_MESSAGE.to_string()
         } else if matches!(&err, StorageError::MaxVersionsExceeded)
             || (code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)))
         {
@@ -958,6 +970,40 @@ mod tests {
         assert!(body.contains("<Code>ServiceUnavailable</Code>"));
         assert!(!body.contains("private-bucket"));
         assert!(!body.contains("private-key"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_participant_is_retryable_with_an_actionable_message() {
+        use http_body_util::BodyExt as _;
+
+        let error = S3Error::from(ApiError::from(StorageError::UnsupportedDisk));
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.message(), Some(UNSUPPORTED_PARTICIPANT_MESSAGE));
+        assert!(matches!(
+            error.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::UnsupportedDisk)
+        ));
+
+        let response = error
+            .to_http_response()
+            .expect("unsupported participant error must serialize");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !response.headers().contains_key(http::header::RETRY_AFTER),
+            "retrying the same node does not help until it or its peers are upgraded"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("error XML must be readable")
+            .to_bytes();
+        let xml = std::str::from_utf8(&body).expect("error XML must be UTF-8");
+        assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(
+            !xml.contains("O_DIRECT"),
+            "the drive-probe Display text must not leak as the public message"
+        );
     }
 
     #[test]
@@ -1853,6 +1899,7 @@ mod tests {
             ),
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
+            (StorageError::UnsupportedDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
             (StorageError::FaultyDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
