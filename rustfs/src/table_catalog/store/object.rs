@@ -4741,7 +4741,30 @@ where
             ));
         }
 
-        let Some(current_metadata) = read_table_metadata_value(metadata_backend, table_bucket, &entry.metadata_location).await?
+        self.plan_table_snapshot_expiration_for_entry_with_backend(metadata_backend, &entry, config)
+            .await
+    }
+
+    pub(super) async fn plan_table_snapshot_expiration_for_entry_with_backend<P>(
+        &self,
+        metadata_backend: &P,
+        entry: &TableEntry,
+        config: TableSnapshotExpirationConfig,
+    ) -> TableCatalogStoreResult<TableSnapshotExpirationReport>
+    where
+        P: TableCatalogObjectBackend,
+    {
+        validate_table_snapshot_expiration_config(&config)?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        if !is_valid_table_metadata_location_for_entry(entry, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata) =
+            read_table_metadata_value(metadata_backend, &entry.table_bucket, &entry.metadata_location).await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
@@ -4750,10 +4773,10 @@ where
         };
 
         Ok(table_snapshot_expiration_report(
-            table_bucket,
+            &entry.table_bucket,
             &namespace,
             &table,
-            &entry,
+            entry,
             &current_metadata,
             config,
             OffsetDateTime::now_utc(),
@@ -4784,7 +4807,25 @@ where
             ));
         }
 
-        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        self.plan_table_compaction_for_entry(&entry, config).await
+    }
+
+    pub(super) async fn plan_table_compaction_for_entry(
+        &self,
+        entry: &TableEntry,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
+        validate_table_compaction_planning_config(&config)?;
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        if !is_valid_table_metadata_location_for_entry(entry, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata) =
+            read_table_metadata_value(&self.backend, &entry.table_bucket, &entry.metadata_location).await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
@@ -4792,7 +4833,8 @@ where
             )));
         };
 
-        table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
+        table_compaction_planning_report(&self.backend, &entry.table_bucket, &namespace, &table, entry, &current_metadata, config)
+            .await
     }
 
     #[allow(
