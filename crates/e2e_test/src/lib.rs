@@ -180,6 +180,9 @@ mod compression_test;
 mod delete_objects_versioning_test;
 
 #[cfg(test)]
+mod conditional_delete_objects_test;
+
+#[cfg(test)]
 mod delete_authorization_test;
 
 // Regression test for signed DELETE Object?versionId requests without Content-Length.

@@ -26,8 +26,9 @@ use crate::disk::{
     BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION,
     DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection,
     DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload, GuardedFileInfoVersions,
+    PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -59,12 +60,12 @@ use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
     CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
-    DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
-    MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
-    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
-    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-    WriteMetadataRequest, node_service_client::NodeServiceClient,
+    DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, GuardedDeleteVersionsRequest, ListDirRequest,
+    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
+    RecoverDeleteTransactionRequest, RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest,
+    SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest,
+    UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -899,6 +900,53 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn guarded_delete_versions_rpc(
+        &self,
+        volume: &str,
+        payload: Vec<u8>,
+        probe_only: bool,
+    ) -> Result<DeleteVersionsResponse> {
+        if payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(DiskError::FileCorrupt);
+        }
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(GuardedDeleteVersionsRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_owned(),
+                    payload: payload.into(),
+                    probe_only,
+                });
+                let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+                    .map_err(|_| DiskError::FileCorrupt)?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                // The additive method is mandatory: an old peer cannot safely delete
+                // a guarded request through any legacy batch method.
+                let response = client
+                    .guarded_delete_versions(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::GuardedDeleteUnsupported
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.ok_or(DiskError::FileCorrupt)?.into());
+                }
+                if response.error.is_some() {
+                    return Err(DiskError::FileCorrupt);
+                }
+                Ok(response)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn recover_delete_transaction(
         &self,
         volume: &str,
@@ -2448,6 +2496,39 @@ impl RemoteDisk {
 
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        let response = self.guarded_delete_versions_rpc("", Vec::new(), true).await?;
+        if !response.errors.is_empty() || !response.item_errors.is_empty() {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(())
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        let count = versions.len();
+        let payload = GuardedDeleteVersionsPayload { versions, opts };
+        if let Err(error) = payload.validate() {
+            return vec![Some(error); count];
+        }
+        let encoded = match rmp_serde::to_vec_named(&payload) {
+            Ok(encoded) => encoded,
+            Err(error) => return vec![Some(error.into()); count],
+        };
+        match self.guarded_delete_versions_rpc(volume, encoded, false).await {
+            Ok(response) => {
+                // New guarded peers must return typed errors, never lossy strings.
+                if response.item_errors.len() != count {
+                    return vec![Some(DiskError::FileCorrupt); count];
+                }
+                decode_delete_versions_errors(response, count)
+            }
+            Err(error) => vec![Some(error); count],
+        }
+    }
     #[tracing::instrument(level = "trace", skip_all)]
     fn to_string(&self) -> String {
         self.endpoint.to_string()
@@ -4322,6 +4403,47 @@ mod tests {
 
     static INIT: Once = Once::new();
 
+    #[tokio::test]
+    async fn guarded_delete_old_peer_rejects_without_legacy_fallback() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        assert_eq!(remote.supports_guarded_delete_versions().await, Err(DiskError::GuardedDeleteUnsupported));
+        let group = GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: "object".into(),
+                versions: vec![FileInfo::default()],
+                ..Default::default()
+            },
+            expected_current: crate::disk::CurrentDeleteGeneration::Absent,
+        };
+        let errors = remote
+            .delete_versions_guarded_recoverable(
+                "bucket",
+                vec![group],
+                DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors, vec![Some(DiskError::GuardedDeleteUnsupported)]);
+        let methods = peer
+            .peer
+            .unsupported_methods
+            .lock()
+            .expect("unsupported method list lock")
+            .clone();
+        assert_eq!(
+            methods,
+            vec!["/node_service.NodeService/GuardedDeleteVersions"; 2],
+            "neither capability failure nor guarded application may call a legacy deletion method"
+        );
+        peer.stop().await;
+    }
+
     #[test]
     fn recoverable_batch_delete_rejects_invalid_error_codes_and_length() {
         let errors = decode_delete_recovery_batch_errors(vec![None, Some(DiskError::FileNotFound.to_u32())], 2)
@@ -4710,6 +4832,7 @@ mod tests {
         format_data: Bytes,
         read_all_data: Bytes,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+        unsupported_methods: Arc<StdMutex<Vec<String>>>,
     }
 
     #[derive(Debug, Default)]
@@ -4728,6 +4851,7 @@ mod tests {
                 format_data,
                 read_all_data,
                 next_format_read_gate: Arc::default(),
+                unsupported_methods: Arc::default(),
             }
         }
 
@@ -4874,13 +4998,20 @@ mod tests {
                         Ok(grpc.unary(method, request).await)
                     })
                 }
-                _ => Box::pin(async move {
-                    let mut response = http::Response::new(tonic::body::Body::default());
-                    let headers = response.headers_mut();
-                    headers.insert(tonic::Status::GRPC_STATUS, (tonic::Code::Unimplemented as i32).into());
-                    headers.insert(http::header::CONTENT_TYPE, tonic::metadata::GRPC_CONTENT_TYPE);
-                    Ok(response)
-                }),
+                _ => {
+                    self.peer
+                        .unsupported_methods
+                        .lock()
+                        .expect("unsupported method list lock")
+                        .push(request.uri().path().to_owned());
+                    Box::pin(async move {
+                        let mut response = http::Response::new(tonic::body::Body::default());
+                        let headers = response.headers_mut();
+                        headers.insert(tonic::Status::GRPC_STATUS, (tonic::Code::Unimplemented as i32).into());
+                        headers.insert(http::header::CONTENT_TYPE, tonic::metadata::GRPC_CONTENT_TYPE);
+                        Ok(response)
+                    })
+                }
             }
         }
     }

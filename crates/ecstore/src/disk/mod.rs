@@ -347,6 +347,25 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn delete_versions_guarded_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<DiskError>> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_guarded_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions_guarded_recoverable(volume, versions, opts).await
+            }
+        }
+    }
+
     pub(crate) async fn cached_disk_id(&self) -> Option<Uuid> {
         match self {
             Disk::Local(local_disk) => local_disk.get_current_disk_id().await,
@@ -357,6 +376,21 @@ impl Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.supports_guarded_delete_versions().await,
+            Self::Remote(disk) => disk.supports_guarded_delete_versions().await,
+        }
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_recoverable_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
     async fn delete_version_recoverable(
         &self,
         volume: &str,
@@ -1419,6 +1453,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<DeleteRecoveryPage> {
         Err(DiskError::MethodNotAllowed)
     }
+    /// A read-only capability check; unsupported implementations must fail closed.
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        Err(DiskError::GuardedDeleteUnsupported)
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        _volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        vec![Some(DiskError::GuardedDeleteUnsupported); versions.len()]
+    }
     async fn delete_version_recoverable(
         &self,
         _volume: &str,
@@ -1647,6 +1693,115 @@ pub struct FileInfoVersions {
 
     pub versions: Vec<FileInfo>,
     pub free_versions: Vec<FileInfo>,
+}
+
+/// The durable remote location and restore state of the observed generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentDeleteTransition {
+    pub status: String,
+    pub tier: String,
+    pub remote_object: String,
+    pub remote_version: Option<String>,
+    pub version_state: rustfs_filemeta::TransitionVersionState,
+    pub destination_id: Option<[u8; 32]>,
+    pub remote_only: bool,
+}
+
+/// The current object generation observed before a guarded batch delete.
+/// This transient value is never persisted in object metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CurrentDeleteGeneration {
+    Absent,
+    Present {
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        mod_time: OffsetDateTime,
+        delete_marker: bool,
+        etag: String,
+        #[serde(default)]
+        transition: Option<CurrentDeleteTransition>,
+    },
+}
+
+impl CurrentDeleteGeneration {
+    pub fn from_file_info(fi: &FileInfo) -> Result<Self> {
+        let mod_time = fi.mod_time.ok_or(DiskError::FileCorrupt)?;
+        let etag = fi.get_etag().unwrap_or_default();
+        let data_dir = fi.data_dir.filter(|id| !id.is_nil());
+        let remote_only = fi.is_remote();
+        if !fi.deleted && (etag.is_empty() || (data_dir.is_none() && !remote_only)) {
+            return Err(DiskError::FileCorrupt);
+        }
+        if remote_only && (fi.transition_tier.is_empty() || fi.transitioned_objname.is_empty()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        let destination_id =
+            crate::services::tier::tier::tier_destination_id_from_metadata(&fi.metadata).map_err(|_| DiskError::FileCorrupt)?;
+        let remote_version = match fi.transition_version.as_deref() {
+            Some(value) => (!value.is_empty() && !Uuid::parse_str(value).is_ok_and(|id| id.is_nil())).then(|| value.to_owned()),
+            None => fi.transition_version_id.filter(|id| !id.is_nil()).map(|id| id.to_string()),
+        };
+        let transition = (!fi.transition_status.is_empty()
+            || !fi.transition_tier.is_empty()
+            || !fi.transitioned_objname.is_empty()
+            || remote_version.is_some()
+            || fi.transition_version_state != rustfs_filemeta::TransitionVersionState::Unknown
+            || destination_id.is_some())
+        .then(|| CurrentDeleteTransition {
+            status: fi.transition_status.clone(),
+            tier: fi.transition_tier.clone(),
+            remote_object: fi.transitioned_objname.clone(),
+            remote_version,
+            version_state: fi.transition_version_state,
+            destination_id,
+            remote_only,
+        });
+        Ok(Self::Present {
+            version_id: fi.version_id.filter(|id| !id.is_nil()),
+            data_dir,
+            mod_time,
+            delete_marker: fi.deleted,
+            etag,
+            transition,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedFileInfoVersions {
+    pub group: FileInfoVersions,
+    pub expected_current: CurrentDeleteGeneration,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedDeleteVersionsPayload {
+    pub versions: Vec<GuardedFileInfoVersions>,
+    pub opts: DeleteOptions,
+}
+
+impl GuardedDeleteVersionsPayload {
+    pub fn validate(&self) -> Result<()> {
+        validate_delete_recovery_options(&self.opts)?;
+        if self.versions.is_empty()
+            || self.versions.len() > 1000
+            || self
+                .versions
+                .iter()
+                .try_fold(0_usize, |count, version| count.checked_add(version.group.versions.len()))
+                .is_none_or(|count| count > 1000)
+            || self
+                .versions
+                .iter()
+                .any(|version| version.group.name.starts_with('/') || version.group.versions.is_empty())
+        {
+            return Err(DiskError::InvalidPath);
+        }
+        Ok(())
+    }
 }
 
 impl FileInfoVersions {
@@ -2177,6 +2332,177 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_delete_generation_requires_reliable_current_identity() {
+        let mut fi = FileInfo::default();
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        fi.data_dir = Some(Uuid::new_v4());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        fi.version_id = Some(Uuid::nil());
+        assert!(matches!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Ok(CurrentDeleteGeneration::Present { version_id: None, .. })
+        ));
+        fi.data_dir = Some(Uuid::nil());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn guarded_delete_generation_accepts_remote_only_and_legacy_unversioned_identity() {
+        let mut fi = FileInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+            transition_tier: "WARM".into(),
+            transitioned_objname: "remote/object".into(),
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        for version in [None, Some(String::new()), Some(Uuid::nil().to_string())] {
+            fi.transition_version = version;
+            for data_dir in [None, Some(Uuid::nil())] {
+                fi.data_dir = data_dir;
+                assert!(
+                    matches!(
+                        CurrentDeleteGeneration::from_file_info(&fi),
+                        Ok(CurrentDeleteGeneration::Present {
+                            data_dir: None,
+                            transition: Some(CurrentDeleteTransition {
+                                remote_version: None,
+                                version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+                                destination_id: None,
+                                remote_only: true,
+                                ..
+                            }),
+                            ..
+                        })
+                    ),
+                    "legacy unversioned remote metadata remains usable"
+                );
+            }
+        }
+        fi.transition_version = None;
+        fi.transition_version_id = Some(Uuid::nil());
+        CurrentDeleteGeneration::from_file_info(&fi).expect("nil legacy remote UUID means no remote version");
+        fi.transition_status.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "local payload metadata still requires a data directory"
+        );
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+        fi.transition_tier.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "remote-only identity requires its tier"
+        );
+        fi.transition_tier = "WARM".into();
+        fi.transitioned_objname.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "remote-only identity requires its remote object"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_remote_transition_tuple_survives_rpc_codec() {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITION_TIER_DESTINATION_ID, insert_str};
+        let mut fi = FileInfo {
+            name: "object".into(),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+            transition_tier: "WARM".into(),
+            transitioned_objname: "opaque/object+name".into(),
+            transition_version: Some("opaque/version+id==".into()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+        let generation = CurrentDeleteGeneration::from_file_info(&fi).expect("capture complete remote identity");
+        let payload = GuardedDeleteVersionsPayload {
+            versions: vec![GuardedFileInfoVersions {
+                group: FileInfoVersions {
+                    name: "object".into(),
+                    versions: vec![fi.clone()],
+                    ..Default::default()
+                },
+                expected_current: generation.clone(),
+            }],
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).expect("encode remote guarded request");
+        let decoded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode remote guarded request");
+        assert_eq!(decoded.versions[0].expected_current, generation);
+        assert!(
+            matches!(generation, CurrentDeleteGeneration::Present { transition: Some(CurrentDeleteTransition {
+            status, tier, remote_object, remote_version: Some(remote_version),
+            version_state: rustfs_filemeta::TransitionVersionState::Exact, destination_id: Some(identity), remote_only: true,
+        }), .. } if status == rustfs_filemeta::TRANSITION_COMPLETE && tier == "WARM" && remote_object == "opaque/object+name"
+            && remote_version == "opaque/version+id==" && identity == [0xab; 32])
+        );
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, format!("a{}", "€".repeat(21)));
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "64-byte non-ASCII backend identities are rejected without panicking"
+        );
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+        fi.metadata
+            .insert(format!("x-minio-internal-{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"), "cd".repeat(32));
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "conflicting backend identities fail closed"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_payload_rejects_malformed_or_unbounded_batches() {
+        let group = GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: "object".into(),
+                versions: vec![FileInfo::default()],
+                ..Default::default()
+            },
+            expected_current: CurrentDeleteGeneration::Absent,
+        };
+        let mut payload = GuardedDeleteVersionsPayload {
+            versions: vec![group],
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        payload.validate().expect("valid guarded batch");
+        let encoded = rmp_serde::to_vec_named(&payload).expect("serialize guarded batch");
+        let decoded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded batch");
+        decoded.validate().expect("round-trip guarded batch remains valid");
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<GuardedDeleteVersionsPayload>(&trailing).is_err());
+        let mut unknown = serde_json::to_value(&payload).expect("serialize guarded batch to map");
+        unknown
+            .as_object_mut()
+            .expect("payload is a map")
+            .insert("unrecognized".into(), true.into());
+        assert!(serde_json::from_value::<GuardedDeleteVersionsPayload>(unknown).is_err());
+        payload.versions[0].group.versions.resize_with(1001, FileInfo::default);
+        assert_eq!(payload.validate(), Err(DiskError::InvalidPath));
+        payload.versions[0].group.versions.truncate(1);
+        payload.opts.undo_delete = true;
+        assert_eq!(payload.validate(), Err(DiskError::FileCorrupt));
+    }
+
     use endpoint::Endpoint;
     use local::LocalDisk;
     use tokio::fs;

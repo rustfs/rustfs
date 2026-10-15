@@ -942,6 +942,11 @@ pub struct ObjectOptions {
     /// serialized or copied into object metadata.
     #[doc(hidden)]
     pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
+    /// Pool-local generations for admitted current-object conditional actions.
+    /// Ordinary actions execute in a separate phase without this transient map.
+    /// This must never be populated from client metadata.
+    #[doc(hidden)]
+    pub conditional_delete_generations: Option<Arc<HashMap<String, crate::disk::CurrentDeleteGeneration>>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
@@ -1163,6 +1168,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("delete_replication", &self.delete_replication.is_some())
             .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
             .field("delete_mutation_owner", &self.delete_mutation_owner.is_some())
+            .field("conditional_delete_generations", &self.conditional_delete_generations.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
             .field("replication_request", &self.replication_request)
