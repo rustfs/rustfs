@@ -3365,6 +3365,25 @@ impl SetDisks {
         absence: &mut Option<HealedObjectAbsence>,
         proof: AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        crate::bucket::artifact::with_artifact_repair_scope(
+            &self.ctx,
+            bucket,
+            object,
+            opts,
+            self.heal_object_with_retirement_inner(bucket, object, version_id, opts, absence, proof),
+        )
+        .await
+    }
+
+    async fn heal_object_with_retirement_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<HealedObjectAbsence>,
+        proof: AbsenceProofRequest<'_>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
         *absence = None;
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self

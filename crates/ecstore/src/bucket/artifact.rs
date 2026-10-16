@@ -137,6 +137,124 @@ impl ArtifactPutGuard {
     }
 }
 
+/// One object repair owns the same attempt barrier as ordinary publication.
+/// The disk mutation lease retains this owner after an async waiter is dropped.
+pub(crate) struct ArtifactRepairScope {
+    store_id: Uuid,
+    bucket: String,
+    object: String,
+    attempt: Option<WriteCommitGuard>,
+    lifecycle: Option<BucketIncarnationFenceGuard>,
+    bucket_heal: Option<Arc<crate::store::BucketHealScope>>,
+}
+
+impl ArtifactRepairScope {
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.attempt.is_lock_lost() || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost) {
+            return Err(Error::other("artifact repair fence was lost"));
+        }
+        if let Some(scope) = &self.bucket_heal {
+            scope.check().map_err(Error::from)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lifecycle_guard(&self) -> Option<&rustfs_lock::NamespaceLockGuard> {
+        self.lifecycle
+            .as_ref()
+            .and_then(BucketIncarnationFenceGuard::namespace_lock_guard)
+            .or_else(|| self.bucket_heal.as_ref().and_then(|scope| scope.lifecycle_guard()))
+    }
+}
+
+tokio::task_local! {
+    static ARTIFACT_REPAIR_SCOPE: Arc<ArtifactRepairScope>;
+}
+
+pub(crate) fn artifact_repair_scope(bucket: &str, object: &str) -> Option<Arc<ArtifactRepairScope>> {
+    let object = rustfs_utils::path::encode_dir_object(object);
+    ARTIFACT_REPAIR_SCOPE
+        .try_with(|scope| (scope.bucket == bucket && scope.object == object).then(|| Arc::clone(scope)))
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn with_artifact_repair_scope<T>(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    object: &str,
+    opts: &rustfs_heal_contracts::heal_channel::HealOpts,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if super::utils::is_meta_bucketname(bucket) {
+        return operation.await;
+    }
+    let store = metadata_sys::object_store_in(ctx).await?;
+    if let Some(scope) = artifact_repair_scope(bucket, object) {
+        if scope.store_id != store.id {
+            return Err(Error::other("artifact repair owner belongs to another store"));
+        }
+        scope.check()?;
+        return operation.await;
+    }
+    let metadata = metadata_sys::get_bucket_incarnation_metadata_in(ctx, bucket).await?;
+    if opts.no_lock {
+        return Err(Error::other("repair requires an owned bucket lifecycle fence"));
+    }
+    let record = match metadata.artifact_base_prefix.as_deref() {
+        Some(base_prefix) => {
+            require_local_put_seal_topology(&store).await?;
+            if ctx.lock_manager().is_disabled() {
+                return Err(Error::other("artifact repair requires namespace locking"));
+            }
+            Some(PutSealRecord::new(&metadata, attempt_prefix(base_prefix, object)?)?)
+        }
+        None => None,
+    };
+    let bucket_heal = crate::store::bucket_heal_scope(bucket);
+    let lifecycle = if let Some(scope) = &bucket_heal {
+        if scope.store.id != store.id || scope.incarnation != metadata.bucket_incarnation_id {
+            return Err(Error::other("artifact repair bucket incarnation mismatch"));
+        }
+        scope.check().map_err(Error::from)?;
+        None
+    } else {
+        Some(
+            store
+                .acquire_bucket_incarnation_fence(bucket, metadata.bucket_incarnation_id)
+                .await?,
+        )
+    };
+    // Lifecycle -> attempt -> capacity/object -> physical mutation lease.
+    let attempt = if let Some(record) = &record {
+        let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &record.path()).await?;
+        Some(WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?)
+    } else {
+        None
+    };
+    let scope = Arc::new(ArtifactRepairScope {
+        store_id: store.id,
+        bucket: bucket.to_owned(),
+        object: rustfs_utils::path::encode_dir_object(object),
+        attempt,
+        lifecycle,
+        bucket_heal,
+    });
+    scope.check()?;
+    // A seal freezes logical publication, not repair of an existing version.
+    // Still validate any persisted record; unreadable or mismatched records fail closed.
+    if let (Some(record), Some(attempt)) = (&record, &scope.attempt) {
+        record.exists(store, attempt).await?;
+    }
+    ARTIFACT_REPAIR_SCOPE
+        .scope(Arc::clone(&scope), async move {
+            let result = operation.await;
+            scope.check()?;
+            result
+        })
+        .await
+}
+
 fn local_put_seal_endpoints(endpoints: &[crate::layout::endpoint::Endpoint]) -> bool {
     !endpoints.is_empty() && endpoints.iter().all(|endpoint| endpoint.is_local)
 }

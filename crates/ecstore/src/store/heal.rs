@@ -39,6 +39,10 @@ pub(crate) struct BucketHealScope {
 }
 
 impl BucketHealScope {
+    pub(crate) fn lifecycle_guard(&self) -> Option<&NamespaceLockGuard> {
+        self.fence.namespace_lock_guard()
+    }
+
     pub(crate) fn check(&self) -> disk::error::Result<()> {
         if self.fence.is_lock_lost() {
             return Err(DiskError::other("bucket heal incarnation fence was lost"));
@@ -813,17 +817,20 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.handle_heal_object_with_absence(
-            bucket,
-            object,
-            version_id,
-            opts,
-            &mut None,
-            crate::set_disk::AbsenceProofRequest {
-                retirement: None,
-                allow_unversioned: false,
-            },
-        )
+        crate::bucket::artifact::with_artifact_repair_scope(&self.ctx, bucket, object, opts, async {
+            self.handle_heal_object_with_absence(
+                bucket,
+                object,
+                version_id,
+                opts,
+                &mut None,
+                crate::set_disk::AbsenceProofRequest {
+                    retirement: None,
+                    allow_unversioned: false,
+                },
+            )
+            .await
+        })
         .await
     }
 
@@ -857,6 +864,24 @@ impl ECStore {
         opts: &HealOpts,
         allow_unversioned_absence: bool,
     ) -> Result<HealObjectStorageResult> {
+        crate::bucket::artifact::with_artifact_repair_scope(
+            &self.ctx,
+            bucket,
+            object,
+            opts,
+            self.heal_object_with_absence_proof_inner(bucket, object, version_id, opts, allow_unversioned_absence),
+        )
+        .await
+    }
+
+    async fn heal_object_with_absence_proof_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        allow_unversioned_absence: bool,
+    ) -> Result<HealObjectStorageResult> {
         // Object heal may recreate a missing bucket volume before committing a
         // shard. Keep the current bucket generation fenced for the whole
         // operation, including the ordinary unversioned path.
@@ -874,7 +899,11 @@ impl ECStore {
         // Reuse the admission's owner: reacquiring a read lock behind a queued
         // lifecycle writer would deadlock with the read lock we already hold.
         let scope = bucket_heal_scope(bucket).filter(|scope| std::ptr::eq(scope.store.as_ref(), self));
-        let guard = if let Some(scope) = &scope {
+        let repair = crate::bucket::artifact::artifact_repair_scope(bucket, object);
+        let guard = if let Some(repair) = &repair {
+            repair.check()?;
+            None
+        } else if let Some(scope) = &scope {
             scope.check().map_err(Error::from)?;
             None
         } else {
@@ -882,11 +911,13 @@ impl ECStore {
         };
         let fence_is_lost = || {
             scope.as_ref().is_some_and(|scope| scope.fence.is_lock_lost())
+                || repair.as_ref().is_some_and(|scope| scope.check().is_err())
                 || guard.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
         };
         let lifecycle_guard = scope
             .as_ref()
             .and_then(|scope| scope.fence.namespace_lock_guard())
+            .or_else(|| repair.as_ref().and_then(|scope| scope.lifecycle_guard()))
             .or(guard.as_ref())
             .ok_or_else(|| Error::other("bucket heal requires a held lifecycle guard"))?;
         let retirement = crate::bucket::retirement::MarkerRetirementContext {

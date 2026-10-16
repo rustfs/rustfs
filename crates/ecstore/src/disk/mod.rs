@@ -831,13 +831,17 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
-            return self
-                .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
-                .await;
-        };
-        scope.check()?;
-        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, Some(scope))
+        let bucket_scope = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path);
+        let repair_scope = crate::bucket::artifact::artifact_repair_scope(dst_volume, dst_path);
+        if let Some(scope) = &bucket_scope {
+            scope.check()?;
+        }
+        if let Some(scope) = &repair_scope {
+            scope.check().map_err(DiskError::other)?;
+        }
+        let owner: Option<Arc<dyn Send + Sync>> = (bucket_scope.is_some() || repair_scope.is_some())
+            .then(|| Arc::new((bucket_scope, repair_scope)) as Arc<dyn Send + Sync>);
+        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, owner)
             .await
     }
 

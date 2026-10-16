@@ -11092,7 +11092,12 @@ impl DiskAPI for LocalDisk {
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let object_path = self.get_object_path(volume, path)?;
-        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
+        let repair_scope = crate::bucket::artifact::artifact_repair_scope(volume, path);
+        if let Some(scope) = &repair_scope {
+            scope.check().map_err(Error::other)?;
+        }
+        let owner = repair_scope.map(|scope| scope as Arc<dyn Send + Sync>);
+        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, owner).await);
         self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner)
             .await
     }
