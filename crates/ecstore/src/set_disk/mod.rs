@@ -8135,6 +8135,78 @@ mod tests {
         assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
     }
 
+    /// Spellings that a Windows disk resolves to the xl.meta of `a/b`.
+    const BACKSLASH_SPELLINGS_OF_A_B: [&str; 4] = ["a\\b", "a\\\\b", "\\a\\b", "a\\b\\"];
+
+    async fn ns_write_lock_free_while_held(set: &SetDisks, held: &str, contender: &str) -> bool {
+        let _held = set
+            .new_ns_lock("bucket", held)
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("holder write lock should be acquired");
+        set.new_ns_lock("bucket", contender)
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_millis(100))
+            .await
+            .is_ok()
+    }
+
+    async fn ns_lock_test_sets() -> [Arc<SetDisks>; 2] {
+        let local_ctx = Arc::new(InstanceContext::new());
+        local_ctx.update_erasure_type(SetupType::Erasure).await;
+        let dist_ctx = Arc::new(InstanceContext::new());
+        dist_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let locker: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        [
+            make_test_set_disks_with_ctx(Vec::new(), local_ctx).await,
+            make_test_set_disks_with_ctx(vec![locker], dist_ctx).await,
+        ]
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_ns_lock_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        for set in ns_lock_test_sets().await {
+            assert!(
+                !ns_write_lock_free_while_held(&set, "a/b", "a/b").await,
+                "baseline: one key must conflict"
+            );
+            for spelling in BACKSLASH_SPELLINGS_OF_A_B {
+                assert!(
+                    ns_write_lock_free_while_held(&set, "a/b", spelling).await,
+                    "off Windows {spelling:?} is a different object and must not wait on `a/b`"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windows_new_ns_lock_serializes_backslash_spellings_of_one_object() {
+        // Local and distributed lock domains: the distributed key is folded by
+        // the requester before it reaches the lock client.
+        for set in ns_lock_test_sets().await {
+            for spelling in BACKSLASH_SPELLINGS_OF_A_B {
+                assert!(
+                    !ns_write_lock_free_while_held(&set, "a/b", spelling).await,
+                    "{spelling:?} addresses the xl.meta of `a/b` and must wait on its lock"
+                );
+                assert!(
+                    !ns_write_lock_free_while_held(&set, spelling, "a/b").await,
+                    "`a/b` must wait on the lock held through {spelling:?}"
+                );
+            }
+            assert!(
+                ns_write_lock_free_while_held(&set, "a/b", "a/b/c").await,
+                "folding must not merge distinct objects"
+            );
+        }
+    }
+
     fn put_object_commit_namespace_lock_wait_sample_count(snapshotter: &metrics_util::debugging::Snapshotter) -> usize {
         snapshotter
             .snapshot()
