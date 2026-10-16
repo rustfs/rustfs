@@ -3425,6 +3425,38 @@ async fn test_retry_request_rescans_batch_when_all_exhausted_objects_are_retryab
 }
 
 #[tokio::test]
+async fn admin_exhausted_batches_do_not_restart_the_traversal() {
+    for heal_type in [
+        HealType::Bucket {
+            bucket: "bucket".to_owned(),
+        },
+        HealType::Prefix {
+            bucket: "bucket".to_owned(),
+            prefix: "prefix/".to_owned(),
+        },
+        HealType::Cluster,
+    ] {
+        let mut request = HealRequest::new(heal_type, HealOptions::default(), HealPriority::Normal);
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, Arc::new(MockStorage));
+        let result = Err(task
+            .record_batch_failure(BatchHealFailure {
+                scope: "completed-admin-traversal".to_owned(),
+                failed: 1,
+                retryable: 1,
+                permanent: 0,
+                first_object: "exhausted-object".to_owned(),
+                first_error: Error::Storage(EcstoreError::SlowDown).to_string(),
+            })
+            .await);
+        assert!(
+            retry_request_for_result_with_budget(&task, &result).await.is_none(),
+            "the exhausted admin batch must retain its original object receipts"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_retry_request_does_not_rescan_cancelled_or_timed_out_retryable_batch() {
     for terminal_error in [Error::TaskCancelled, Error::TaskTimeout] {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
