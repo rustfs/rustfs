@@ -9355,7 +9355,7 @@ mod tests {
             mod_time,
             delete_marker: false,
             etag: etag.to_owned(),
-            transition: Box::new(None),
+            transition: None,
         };
         (info, generation)
     }
