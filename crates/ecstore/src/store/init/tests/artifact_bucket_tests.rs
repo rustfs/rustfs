@@ -1,27 +1,60 @@
 use super::{build_isolated_test_store, without_storage_class_env};
 use crate::{
     bucket::{
-        metadata::{BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, BucketMetadata, load_bucket_metadata_parse_with_presence},
+        metadata::{
+            BUCKET_INCARNATION_FILE, BUCKET_METADATA_FILE, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, BucketMetadata,
+            load_bucket_metadata_parse_with_presence,
+        },
         metadata_sys,
         versioning::VersioningApi,
     },
+    disk::{BUCKET_META_PREFIX, DiskAPI as _, RUSTFS_META_BUCKET},
     runtime::instance::InstanceContext,
-    storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions},
+    storage_api_contracts::{
+        bucket::{BucketOperations as _, MakeBucketOptions},
+        namespace::NamespaceLocking as _,
+    },
     store::ECStore,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const PREFIX: &str = "outputs/";
 const ENABLED: &[u8] = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
 const SUSPENDED: &[u8] = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+const EXCLUDED_PREFIX: &[u8] = b"<VersioningConfiguration><Status>Enabled</Status><ExcludedPrefixes><Prefix>outputs/</Prefix></ExcludedPrefixes></VersioningConfiguration>";
+const EXCLUDED_FOLDERS: &[u8] =
+    b"<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders></VersioningConfiguration>";
 const TAGGING: &[u8] = b"<Tagging><TagSet><Tag><Key>purpose</Key><Value>artifact-test</Value></Tag></TagSet></Tagging>";
 
 async fn open_store(root: &std::path::Path) -> (Arc<InstanceContext>, Arc<ECStore>, CancellationToken) {
     let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(root, "artifact-bucket", &[4])).await;
     metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
     (ctx, store, shutdown)
+}
+
+async fn drain_before_reopen(store: &ECStore, shutdown: &CancellationToken, bucket: &str) {
+    shutdown.cancel();
+    assert!(
+        store.ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+        "ARTIFACT_PREVIOUS_STORE_MUTATIONS_DRAINED"
+    );
+    // Internal metadata PUTs can acknowledge quorum before their disk tails finish.
+    // Acquire each key separately to wait for its actual writer to release the lock.
+    for file in [BUCKET_METADATA_FILE, BUCKET_INCARNATION_FILE] {
+        let key = format!("{BUCKET_META_PREFIX}/{bucket}/{file}");
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &key)
+            .await
+            .expect("resolve persisted identity namespace");
+        drop(
+            namespace
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("identity write tail drained"),
+        );
+    }
 }
 
 async fn dedicated_bucket(store: &ECStore, bucket: &str) {
@@ -76,7 +109,7 @@ async fn artifact_bucket_creation_enables_versioning_and_survives_store_reopen()
     assert!(!incarnation.is_nil(), "ARTIFACT_INCARNATION_REQUIRED");
     assert!(created.bucket_creation_committed, "ARTIFACT_CREATION_COMMITTED");
     assert_namespace(&created, incarnation);
-    shutdown.cancel();
+    drain_before_reopen(&store, &shutdown, bucket).await;
     drop(store);
     drop(ctx);
 
@@ -113,6 +146,17 @@ async fn artifact_bucket_ordinary_configuration_update_preserves_namespace() {
     let changed = persisted(&store, bucket).await;
     assert_eq!(changed.tagging_config_xml, TAGGING, "ARTIFACT_ORDINARY_CONFIG_UPDATED");
     assert_persisted_and_cached(&store, bucket, incarnation).await;
+    let sys = store.ctx.bucket_metadata_sys().expect("instance metadata system");
+    let sys = sys.read().await.clone();
+    let suspended = crate::bucket::utils::deserialize(SUSPENDED).expect("valid suspended versioning XML");
+    for stale_typed_config in [None, Some(suspended)] {
+        let mut replacement = changed.clone();
+        replacement.versioning_config = stale_typed_config;
+        sys.set_validated(replacement)
+            .await
+            .expect("validated cache setter reparses authoritative XML");
+        assert_persisted_and_cached(&store, bucket, incarnation).await;
+    }
     shutdown.cancel();
 }
 
@@ -181,14 +225,14 @@ async fn artifact_bucket_full_metadata_replacement_cannot_change_namespace() {
     let incarnation = original.bucket_incarnation_id;
     let sys = store.ctx.bucket_metadata_sys().expect("instance metadata system");
     let sys = sys.read().await.clone();
-    for direct in [false, true] {
+    for route in 0..3 {
         for prefix in [None, Some("replacement/".to_owned())] {
             let mut replacement = original.clone();
             replacement.artifact_base_prefix = prefix;
-            let result = if direct {
-                sys.persist_and_set(replacement).await
-            } else {
-                metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await
+            let result = match route {
+                0 => metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await,
+                1 => sys.persist_and_set(replacement).await,
+                _ => sys.set_validated(replacement).await,
             };
             assert!(
                 result.is_err(),
@@ -200,10 +244,10 @@ async fn artifact_bucket_full_metadata_replacement_cannot_change_namespace() {
         let ordinary_incarnation = replacement.bucket_incarnation_id;
         replacement.artifact_base_prefix = Some(PREFIX.to_owned());
         replacement.versioning_config_xml = ENABLED.to_vec();
-        let result = if direct {
-            sys.persist_and_set(replacement).await
-        } else {
-            metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await
+        let result = match route {
+            0 => metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await,
+            1 => sys.persist_and_set(replacement).await,
+            _ => sys.set_validated(replacement).await,
         };
         assert!(
             result.is_err(),
@@ -227,21 +271,21 @@ async fn artifact_bucket_versioning_cannot_be_suspended_or_removed() {
     let incarnation = original.bucket_incarnation_id;
     let sys = store.ctx.bucket_metadata_sys().expect("instance metadata system");
     let sys = sys.read().await.clone();
-    for xml in [SUSPENDED, b"".as_slice()] {
+    for xml in [SUSPENDED, b"".as_slice(), EXCLUDED_PREFIX, EXCLUDED_FOLDERS] {
         let result = metadata_sys::update_in(&store.ctx, bucket, BUCKET_VERSIONING_CONFIG, xml.to_vec()).await;
         assert!(
             result.is_err(),
             "ARTIFACT_VERSIONING_REQUIRED: configuration update cannot disable versioning"
         );
         assert_persisted_and_cached(&store, bucket, incarnation).await;
-        for direct in [false, true] {
+        for route in 0..3 {
             let mut replacement = original.clone();
             replacement.versioning_config_xml = xml.to_vec();
             replacement.versioning_config = None;
-            let result = if direct {
-                sys.persist_and_set(replacement).await
-            } else {
-                metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await
+            let result = match route {
+                0 => metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await,
+                1 => sys.persist_and_set(replacement).await,
+                _ => sys.set_validated(replacement).await,
             };
             assert!(
                 result.is_err(),
@@ -276,7 +320,7 @@ async fn artifact_bucket_pending_creation_reopen_retry_preserves_namespace() {
             "ARTIFACT_PHYSICAL_BUCKET_NOT_CREATED"
         );
     }
-    shutdown.cancel();
+    drain_before_reopen(&store, &shutdown, bucket).await;
     drop(store);
     drop(ctx);
 
@@ -305,6 +349,46 @@ async fn artifact_bucket_pending_creation_reopen_retry_preserves_namespace() {
         assert!(
             root.path().join(format!("pool0/set0/disk{disk}/{bucket}")).is_dir(),
             "ARTIFACT_PHYSICAL_BUCKET_CREATED"
+        );
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_partial_volume_retry_preserves_pending_identity() {
+    let root = tempfile::tempdir().expect("artifact partial volume store directory");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-partial-volume";
+    let mut intent = BucketMetadata::new_with_default_durability(bucket);
+    intent.artifact_base_prefix = Some(PREFIX.to_owned());
+    intent.versioning_config_xml = ENABLED.to_vec();
+    let incarnation = intent.bucket_incarnation_id;
+    metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
+        .await
+        .expect("persist real creation intent before a partial physical creation");
+    let disks = store.pools[0].disk_set[0].disk_inventory().await;
+    disks[0]
+        .as_ref()
+        .expect("first real disk")
+        .make_volume(bucket)
+        .await
+        .expect("create only one physical volume");
+    assert!(root.path().join(format!("pool0/set0/disk0/{bucket}")).is_dir());
+    for disk in 1..4 {
+        assert!(!root.path().join(format!("pool0/set0/disk{disk}/{bucket}")).exists());
+    }
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect_err("partial physical creation requires explicit recovery");
+    let pending = persisted(&store, bucket).await;
+    assert_namespace(&pending, incarnation);
+    assert!(!pending.bucket_creation_committed, "ARTIFACT_PARTIAL_CREATION_STAYS_PENDING");
+    for disk in 1..4 {
+        assert!(
+            !root.path().join(format!("pool0/set0/disk{disk}/{bucket}")).exists(),
+            "ARTIFACT_PARTIAL_CREATION_NOT_SILENTLY_COMPLETED"
         );
     }
     shutdown.cancel();
