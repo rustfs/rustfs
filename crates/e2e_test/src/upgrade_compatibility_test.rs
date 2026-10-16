@@ -756,6 +756,18 @@ async fn wait_for_upgrade_writes(
     Ok(())
 }
 
+fn previous_baseline_writers(clients: &[Client], restarted_node: usize) -> &[Client] {
+    // Node 0 has persisted the seed. With restart order [1, 2, 3, 0], only
+    // this prefix has also cleared rc.5's startup write fence. Every RRS
+    // probe still needs all drives, including those of not-yet-restarted peers.
+    let ready_end = if restarted_node == 0 {
+        clients.len()
+    } else {
+        restarted_node + 1
+    };
+    &clients[..ready_end]
+}
+
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
@@ -766,8 +778,9 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
     // two failures in a row and it drops that peer's drive to Offline, where
-    // only the slow recovery probe can bring it back. Let every node re-admit
-    // every drive before the next kill and before any current binary starts.
+    // only the slow recovery probe can bring it back. Let every writable node
+    // re-admit every drive before the next kill. Nodes still awaiting their
+    // restart may retain the startup write fence and cannot coordinate a PUT.
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
@@ -779,7 +792,13 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
             LISTING_CONVERGENCE_TIMEOUT,
         )
         .await?;
-        wait_for_drive_readmission(&clients, MIXED_BUCKET, &context, DRIVE_READMISSION_TIMEOUT).await?;
+        wait_for_drive_readmission(
+            previous_baseline_writers(&clients, node),
+            MIXED_BUCKET,
+            &context,
+            DRIVE_READMISSION_TIMEOUT,
+        )
+        .await?;
     }
 
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
@@ -851,6 +870,112 @@ async fn parity_zero_write_needs_every_drive() -> TestResult {
 mod upgrade_write_readiness_tests {
     use super::*;
     use crate::fake_s3_target::FaultAction;
+    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+
+    #[derive(Debug)]
+    struct RequireAllDrivesProbe;
+
+    impl Intercept for RequireAllDrivesProbe {
+        fn name(&self) -> &'static str {
+            "require-all-drives-probe"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), BoxError> {
+            assert_eq!(context.request().method(), "PUT");
+            assert_eq!(
+                context.request().headers().get("x-amz-storage-class"),
+                Some("REDUCED_REDUNDANCY"),
+                "every admitted coordinator must use the all-drive storage class"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn previous_baseline_probes_only_writable_coordinators_until_all_restart() -> TestResult {
+        let mut targets = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..MIXED_NODE_COUNT {
+            let target = FakeS3Target::start().await?;
+            target.create_bucket(MIXED_BUCKET);
+            clients.push(Client::from_conf(
+                fake_source_client(&target)
+                    .config()
+                    .to_builder()
+                    .interceptor(RequireAllDrivesProbe)
+                    .build(),
+            ));
+            targets.push(target);
+        }
+        for target in &targets[2..] {
+            target.inject(FakeTargetOperation::PutObject, FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR), 10);
+        }
+
+        // Reproduce the original all-coordinator gate: node 0 and restarted
+        // node 1 can write, but unrestarted node 2 still returns a latched 500.
+        let error = wait_for_drive_readmission(&clients, MIXED_BUCKET, "premature", Duration::from_secs(5))
+            .await
+            .expect_err("an unrestarted coordinator must retain its startup write failure");
+        assert!(error.to_string().contains("node 2 drive re-admission failed"), "{error}");
+        let failed = targets[2].requests();
+        assert_eq!(failed.len(), 1, "the startup 500 must fail without retrying");
+        assert_eq!(failed[0].fault, Some(FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR)));
+        for target in &targets {
+            target.take_requests();
+        }
+
+        for (restarted_node, expected_writers) in [(1, 2), (2, 3), (3, 4), (0, 4)] {
+            // A restart clears only this process's startup write fence.
+            targets[restarted_node].clear_faults();
+            let phase = format!("previous-restart-{restarted_node}");
+            wait_for_drive_readmission(
+                previous_baseline_writers(&clients, restarted_node),
+                MIXED_BUCKET,
+                &phase,
+                Duration::from_secs(5),
+            )
+            .await?;
+            for (node, target) in targets.iter().enumerate() {
+                let key = format!(".upgrade-readiness/{phase}/all-drives/node-{node}");
+                let admitted = node < expected_writers;
+                assert_eq!(
+                    target.count_requests(FakeTargetOperation::PutObject, &key),
+                    usize::from(admitted),
+                    "{phase}: only writable node {node} may coordinate an all-drive probe"
+                );
+                assert_eq!(target.has_object(MIXED_BUCKET, &key), admitted);
+                assert_eq!(target.take_requests().len(), usize::from(admitted));
+            }
+        }
+
+        // Once every node is admitted, its permanent errors must still fail
+        // the full gate immediately rather than being skipped or retried.
+        let phase = "previous-ready-error";
+        let key = format!(".upgrade-readiness/{phase}/all-drives/node-3");
+        targets[3].inject_for_key(
+            FakeTargetOperation::PutObject,
+            &key,
+            FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR),
+            1,
+        );
+        let error =
+            wait_for_drive_readmission(previous_baseline_writers(&clients, 0), MIXED_BUCKET, phase, Duration::from_secs(5))
+                .await
+                .expect_err("a recovered coordinator's 500 must still fail the final gate");
+        assert!(error.to_string().contains("node 3 drive re-admission failed"), "{error}");
+        assert_eq!(targets[3].count_requests(FakeTargetOperation::PutObject, &key), 1);
+        assert!(!targets[3].has_object(MIXED_BUCKET, &key));
+        for target in targets {
+            target.shutdown().await;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
