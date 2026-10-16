@@ -335,9 +335,27 @@ async fn artifact_put_seal_does_not_change_ordinary_bucket_puts() {
 }
 
 #[cfg(not(windows))]
-#[tokio::test]
+#[test]
 #[serial_test::serial(storage_class_env)]
-async fn artifact_put_seal_lock_survives_physical_publication_timeout() {
+fn artifact_put_seal_lock_survives_physical_publication_timeout() {
+    // Match large ECStore fixtures while retaining the current-thread clock required by pause/advance.
+    std::thread::Builder::new()
+        .name("artifact-put-physical-timeout".to_owned())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("physical timeout test runtime should build");
+            runtime.block_on(artifact_put_physical_timeout_case());
+        })
+        .expect("physical timeout test thread should spawn")
+        .join()
+        .expect("physical timeout test thread should complete");
+}
+
+#[cfg(not(windows))]
+async fn artifact_put_physical_timeout_case() {
     use crate::disk::{Disk, ReadOptions, STORAGE_FORMAT_FILE, os};
 
     temp_env::async_with_vars(
@@ -456,13 +474,14 @@ async fn artifact_put_seal_lock_survives_physical_publication_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(storage_class_env)]
-async fn artifact_put_seal_rejects_distributed_topology_without_changing_ordinary_puts() {
+async fn artifact_put_seal_rejects_distributed_topology_and_preserves_ordinary_local_puts() {
     use crate::layout::endpoints::SetupType;
 
     const LOCAL_ONLY_ERROR: &str =
         "artifact PUT sealing requires local-only storage; distributed or remote endpoints are unsupported";
     let root = tempfile::tempdir().expect("artifact distributed topology directory");
     let (ctx, store, shutdown) = open_store(root.path()).await;
+    ctx.update_erasure_type(SetupType::Erasure).await;
     let bucket = "artifact-put-distributed";
     let incarnation = create_bucket(&store, bucket).await;
     let ordinary = "artifact-put-distributed-ordinary";
@@ -511,10 +530,12 @@ async fn artifact_put_seal_rejects_distributed_topology_without_changing_ordinar
         .await
         .expect_err("distributed topology cannot claim a durable PUT seal");
     assert!(rejected.to_string().contains(LOCAL_ONLY_ERROR), "ARTIFACT_PUT_LOCAL_ONLY: {rejected}");
+    // This local fixture has no distributed lock clients; ordinary PUT retains its local regression check.
+    ctx.update_erasure_type(SetupType::Erasure).await;
     let second = put(&store, ordinary, &object).await;
     assert_ne!(
         first.version_id, second.version_id,
-        "ordinary PUT stays available under the same topology"
+        "ordinary local PUT stays available after artifact rejection"
     );
     assert_eq!(
         store
