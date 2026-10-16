@@ -348,6 +348,10 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
             (crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false")),
         ],
         async {
+            if matches!(kind, RepairKind::Metadata) && !cancel {
+                metadata_repair_disk_timeout_case().await;
+                return;
+            }
             let root = tempfile::tempdir().expect("physical repair fixture directory");
             let (ctx, store, shutdown) = open_store(root.path()).await;
             let bucket = "artifact-repair-physical";
@@ -456,6 +460,113 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
         },
     )
     .await;
+}
+
+async fn metadata_repair_disk_timeout_case() {
+    use crate::storage_api_contracts::heal::HealOperations;
+
+    let root = tempfile::tempdir().expect("metadata timeout fixture directory");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-repair-meta-timeout";
+    let incarnation = create_bucket(&store, bucket, true).await;
+    let prefix = attempt_prefix();
+    let object = format!("{prefix}image.png");
+    let version = put_payload(&store, bucket, &object, RepairKind::Metadata).await;
+    damage_for_repair(&store, bucket, &object, version, RepairKind::Metadata).await;
+    let disks = disks(&store).await;
+    let mut hooks = Vec::new();
+    let mut entered = Vec::new();
+    let mut releases = Vec::new();
+    let mut timeout_counts = Vec::new();
+    for disk in &disks[1..] {
+        let destination = object_path(disk, bucket, &object).join(STORAGE_FORMAT_FILE);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        hooks.push(os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::Rename,
+            &destination,
+            move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            },
+        ));
+        entered.push(entered_rx);
+        releases.push(release_tx);
+        timeout_counts.push(disk.metrics_snapshot().expect("local disk metrics").total_errors_timeout);
+    }
+    let set = store.pools[0].disk_set[0].clone();
+    let heal_object = object.clone();
+    // The public set entrypoint owns a real repair scope, without the Store's
+    // BucketHealScope that deliberately disables write_metadata wrapper deadlines.
+    let mut repair = tokio::spawn(async move {
+        HealOperations::heal_object(set.as_ref(), bucket, &heal_object, &version.to_string(), &heal_options()).await
+    });
+    // Regeneration visits disks serially. Timeout every missing metadata writer;
+    // allowing a later writer to succeed would retry repair against the paused disk.
+    for signal in entered {
+        tokio::time::timeout(DEADLINE, async {
+            tokio::select! {
+                entered = signal => entered.expect("metadata worker reaches the real rename syscall"),
+                result = &mut repair => panic!("repair returned before every metadata worker was paused: {result:?}"),
+            }
+        })
+        .await
+        .expect("next physical metadata publication starts");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+    }
+    let result = tokio::time::timeout(DEADLINE, repair)
+        .await
+        .expect("repair waiter returns after real metadata wrapper timeouts")
+        .expect("repair task joins");
+    assert!(
+        result.is_err() || result.as_ref().is_ok_and(|(_, error)| error.is_some()),
+        "three timed-out metadata writers cannot restore metadata quorum"
+    );
+    let timed_out = disks[1..]
+        .iter()
+        .zip(&timeout_counts)
+        .all(|(disk, before)| disk.metrics_snapshot().expect("local timeout metrics").total_errors_timeout > *before);
+    let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
+    let lock = store
+        .new_ns_lock(RUSTFS_META_BUCKET, &record)
+        .await
+        .expect("actual repair/seal lock");
+    let retained = lock.get_write_lock(Duration::from_secs(1)).await.is_err();
+    let seal_store = store.clone();
+    let mut seal = tokio::spawn(async move { seal_store.seal_artifact_attempt_puts(bucket, incarnation, &prefix).await });
+    let blocked = tokio::time::timeout(Duration::from_millis(200), &mut seal).await.is_err();
+
+    drop(releases);
+    for disk in &disks[1..] {
+        let path = object_path(disk, bucket, &object).join(STORAGE_FORMAT_FILE);
+        tokio::time::timeout(DEADLINE, os::prepared_publication_test_hooks::drain_namespace_key(&path))
+            .await
+            .expect("timed-out physical metadata worker drains");
+    }
+    if blocked {
+        tokio::time::timeout(DEADLINE, seal)
+            .await
+            .expect("seal resumes after physical metadata writers drain")
+            .expect("seal task joins")
+            .expect("seal persists");
+    }
+    assert!(
+        timed_out,
+        "actual disk wrapper timeout metrics increase for all three paused metadata writers"
+    );
+    assert!(
+        retained,
+        "ARTIFACT_REPAIR_TAIL_BARRIER: physical metadata workers retain the attempt after real disk timeouts"
+    );
+    assert!(
+        blocked,
+        "ARTIFACT_REPAIR_TAIL_BARRIER: seal waits for the timed-out physical metadata workers"
+    );
+    assert_exact_payload(&store, bucket, &object, version).await;
+    shutdown.cancel();
+    assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
 }
 
 #[test]
