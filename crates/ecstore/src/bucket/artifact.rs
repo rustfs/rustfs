@@ -176,6 +176,16 @@ impl ECStore {
         }
         // The classification and subsequent commit must refer to the same generation.
         opts.expected_bucket_incarnation_id = Some(metadata.bucket_incarnation_id);
+        // A loss signal cannot authorize skipping the downstream generation lock.
+        // Keep a matching owner in opts, including for ordinary PUT and Copy.
+        if let Some(snapshot) = opts.object_lock_config_snapshot.clone() {
+            if !snapshot.owns_bucket_lifecycle_fence(self.id, bucket, metadata.bucket_incarnation_id) {
+                return Err(Error::other("write requires an owned bucket lifecycle fence"));
+            }
+            snapshot.add_lock_fences(opts);
+        } else if opts.bucket_lifecycle_lock_fence.is_some() {
+            return Err(Error::other("write requires an owned bucket lifecycle fence"));
+        }
         Ok(Some(metadata))
     }
 
@@ -190,16 +200,9 @@ impl ECStore {
         };
         reject_unsupported_artifact_write(&metadata)?;
         // Lifecycle read -> metadata transaction read -> downstream object lock.
-        // A loss signal is not ownership. Retain only a matching snapshot that
-        // owns the actual guard; reacquiring behind a queued writer would deadlock.
-        let guard = if let Some(snapshot) = opts.object_lock_config_snapshot.clone() {
-            if !snapshot.owns_bucket_lifecycle_fence(self.id, bucket, metadata.bucket_incarnation_id) {
-                return Err(Error::other("write requires an owned bucket lifecycle fence"));
-            }
-            snapshot.add_lock_fences(&mut opts);
+        // Binding above verified and retained any supplied snapshot's actual owner.
+        let guard = if opts.object_lock_config_snapshot.is_some() {
             None
-        } else if opts.bucket_lifecycle_lock_fence.is_some() {
-            return Err(Error::other("write requires an owned bucket lifecycle fence"));
         } else {
             Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
         };
