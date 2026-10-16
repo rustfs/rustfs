@@ -241,9 +241,13 @@ async fn artifact_put_seal_survives_reopen_and_is_attempt_scoped() {
     shutdown.cancel();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[serial_test::serial(storage_class_env)]
-async fn artifact_put_seal_rejects_corrupt_and_wrong_incarnation_records() {
+fn artifact_put_seal_rejects_corrupt_and_wrong_incarnation_records() {
+    super::run_large_stack_async_test("artifact-put-corrupt", artifact_put_corrupt_record_case);
+}
+
+async fn artifact_put_corrupt_record_case() {
     let root = tempfile::tempdir().expect("artifact invalid seal record directory");
     let (_ctx, store, shutdown) = open_store(root.path()).await;
     let bucket = "artifact-put-corrupt";
