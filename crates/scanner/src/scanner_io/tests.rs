@@ -4542,21 +4542,21 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
             .expect("load complete bucket cache");
         assert!(cache.info.snapshot_complete);
         // Keep an accounting context with no remote work in this local fixture.
-        let replication: ReplicationConfiguration = serde_json::from_value(serde_json::json!({
-            "role": "",
-            "rules": [{
-                "destination": { "bucket": "arn:test" },
-                "id": "status",
-                "prefix": "",
-                "priority": 1,
-                "status": "Enabled"
-            }]
+        let replication: ReplicationConfig = serde_json::from_value(serde_json::json!({
+            "config": {
+                "role": "",
+                "rules": [{
+                    "destination": { "bucket": "arn:test" },
+                    "id": "status",
+                    "prefix": "",
+                    "priority": 1,
+                    "status": "Enabled"
+                }]
+            },
+            "remotes": crate::storage_api::EcstoreBucketTargets::default(),
         }))
         .expect("decode the local replication accounting fixture");
-        cache.info.replication = Some(Arc::new(ReplicationConfig::new(
-            Some(replication),
-            Some(crate::storage_api::EcstoreBucketTargets::default()),
-        )));
+        cache.info.replication = Some(Arc::new(replication));
         // A complete compacted prefix is eligible for normal usage sampling.
         let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
         compacted.children.clear();

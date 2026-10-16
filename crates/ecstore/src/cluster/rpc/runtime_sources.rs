@@ -752,6 +752,7 @@ pub(crate) fn internode_msgpack_json_decode_error_total_for_test() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-read-version-caller")]
     use super::*;
 
     #[cfg(feature = "diagnostic-read-version-caller")]
