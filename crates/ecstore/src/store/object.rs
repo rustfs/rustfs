@@ -4283,18 +4283,18 @@ impl ECStore {
         let object = encode_dir_object(object);
         let mut opts = opts.clone();
         opts.artifact_put_target = None;
-        if !is_meta_bucketname(bucket) && !opts.no_lock && !opts.data_movement {
-            let metadata = crate::bucket::metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
-            if opts
-                .expected_bucket_incarnation_id
-                .is_some_and(|expected| expected != metadata.bucket_incarnation_id)
+        if let Some(metadata) = self.bind_artifact_write_metadata(bucket, &mut opts).await? {
+            if opts.no_lock
+                || opts.data_movement
+                || opts.replication_request
+                || opts.preserve_ciphertext
+                || opts.metadata_chg
+                || opts.replication_status_writeback.is_some()
             {
-                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+                crate::bucket::artifact::reject_unsupported_artifact_write(&metadata)?;
+            } else {
+                opts.artifact_put_target = crate::bucket::artifact::ArtifactPutTarget::from_metadata(&metadata, &object)?;
             }
-            opts.expected_bucket_incarnation_id = Some(metadata.bucket_incarnation_id);
-            opts.artifact_put_target = crate::bucket::artifact::ArtifactPutTarget::from_metadata(&metadata, &object)?;
-        } else if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
-            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
         }
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
@@ -4518,8 +4518,8 @@ impl ECStore {
 
         let mut dst_opts = dst_opts.clone();
         dst_opts.inherit_shard_integrity(src_info);
-        if !is_meta_bucketname(dst_bucket) && dst_opts.expected_bucket_incarnation_id.is_none() {
-            dst_opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(dst_bucket).await?);
+        if let Some(metadata) = self.bind_artifact_write_metadata(dst_bucket, &mut dst_opts).await? {
+            crate::bucket::artifact::reject_unsupported_artifact_write(&metadata)?;
         }
         let _bucket_lifecycle_guard = if is_meta_bucketname(dst_bucket) || dst_opts.bucket_lifecycle_lock_fence.is_some() {
             None
@@ -5791,11 +5791,12 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let object = encode_dir_object(object);
+        let (opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         if self.single_pool() {
-            return self.pools[0].transition_object(bucket, &object, opts).await;
+            return self.pools[0].transition_object(bucket, &object, &opts).await;
         }
 
-        let opts = transition_restore_pool_opts(opts);
+        let opts = transition_restore_pool_opts(&opts);
         let (_, idx) = self
             .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
             .await?;
@@ -5811,24 +5812,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let object = encode_dir_object(object);
-        let mut opts = transition_restore_pool_opts(opts);
-        if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
-            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
-        }
-        let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-        };
-        if let Some(guard) = bucket_lifecycle_guard.as_ref() {
-            opts.add_bucket_lifecycle_lock_guard(guard);
-        }
-        if !is_meta_bucketname(bucket) {
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-            if opts.expected_bucket_incarnation_id != Some(current_incarnation_id) {
-                return Err(StorageError::BucketNotFound(bucket.to_string()));
-            }
-        }
+        let opts = transition_restore_pool_opts(opts);
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, &opts).await?;
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
@@ -5891,26 +5876,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
-        let mut opts = opts.clone();
+        let (mut opts, bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         opts.metadata_chg = true;
-        let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else {
-            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-            if opts
-                .expected_bucket_incarnation_id
-                .is_some_and(|expected| expected != current_incarnation_id)
-            {
-                return Err(StorageError::BucketNotFound(bucket.to_string()));
-            }
-            opts.expected_bucket_incarnation_id = Some(current_incarnation_id);
-            opts.add_bucket_lifecycle_lock_guard(&guard);
-            if guard.is_lock_lost() {
-                return Err(Error::other("bucket lifecycle lock was lost before the metadata update"));
-            }
-            Some(guard)
-        };
 
         if self.single_pool() {
             let pool = self.pools[0].clone();
@@ -5970,6 +5937,8 @@ impl ECStore {
         let object = encode_dir_object(object);
         let object_name = object.as_str();
 
+        let (opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
+
         if self.single_pool() {
             return self
                 .run_external_decommission_capacity_object_mutation(
@@ -5977,24 +5946,19 @@ impl ECStore {
                     bucket,
                     object_name,
                     object_name,
-                    opts.clone(),
+                    opts,
                     |opts| async move { self.pools[0].put_object_tags(bucket, object_name, tags, &opts).await },
                 )
                 .await;
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object_name, &writer_pool_lookup_opts(opts, opts.no_lock))
+            .get_latest_accessible_object_info_with_idx(bucket, object_name, &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
-        self.run_external_decommission_capacity_object_mutation(
-            idx,
-            bucket,
-            object_name,
-            object_name,
-            opts.clone(),
-            |opts| async move { self.pools[idx].put_object_tags(bucket, object_name, tags, &opts).await },
-        )
+        self.run_external_decommission_capacity_object_mutation(idx, bucket, object_name, object_name, opts, |opts| async move {
+            self.pools[idx].put_object_tags(bucket, object_name, tags, &opts).await
+        })
         .await
     }
 
@@ -6023,6 +5987,8 @@ impl ECStore {
         let object = encode_dir_object(object);
         let object_name = object.as_str();
 
+        let (opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
+
         if self.single_pool() {
             return self
                 .run_external_decommission_capacity_object_mutation(
@@ -6030,24 +5996,19 @@ impl ECStore {
                     bucket,
                     object_name,
                     object_name,
-                    opts.clone(),
+                    opts,
                     |opts| async move { self.pools[0].delete_object_tags(bucket, object_name, &opts).await },
                 )
                 .await;
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object_name, &writer_pool_lookup_opts(opts, opts.no_lock))
+            .get_latest_accessible_object_info_with_idx(bucket, object_name, &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
-        self.run_external_decommission_capacity_object_mutation(
-            idx,
-            bucket,
-            object_name,
-            object_name,
-            opts.clone(),
-            |opts| async move { self.pools[idx].delete_object_tags(bucket, object_name, &opts).await },
-        )
+        self.run_external_decommission_capacity_object_mutation(idx, bucket, object_name, object_name, opts, |opts| async move {
+            self.pools[idx].delete_object_tags(bucket, object_name, &opts).await
+        })
         .await
     }
 

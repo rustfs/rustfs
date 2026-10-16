@@ -521,7 +521,7 @@ impl ECStore {
         mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
         check_new_multipart_args(bucket, object)?;
-        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
 
         if self.single_pool() {
             self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
@@ -654,7 +654,7 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;
-        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
@@ -688,7 +688,7 @@ impl ECStore {
         if !opts.data_movement {
             return Err(Error::other("targeted multipart upload requires data_movement options"));
         }
-        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
         let pool = self.pools.get(target_pool_idx).ok_or_else(|| {
             Error::InvalidArgument("data-movement".to_string(), "target-pool".to_string(), target_pool_idx.to_string())
@@ -980,7 +980,7 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
-        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
@@ -1075,7 +1075,7 @@ impl ECStore {
         if !opts.data_movement {
             return Err(Error::other("targeted multipart completion requires data_movement options"));
         }
-        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.prepare_unsupported_artifact_write(bucket, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts

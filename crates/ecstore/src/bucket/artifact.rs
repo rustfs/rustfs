@@ -158,6 +158,69 @@ async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
     Ok(())
 }
 
+impl ECStore {
+    pub(crate) async fn bind_artifact_write_metadata(
+        &self,
+        bucket: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<Arc<BucketMetadata>>> {
+        if super::utils::is_meta_bucketname(bucket) {
+            return Ok(None);
+        }
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if opts
+            .expected_bucket_incarnation_id
+            .is_some_and(|expected| expected != metadata.bucket_incarnation_id)
+        {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        // The classification and subsequent commit must refer to the same generation.
+        opts.expected_bucket_incarnation_id = Some(metadata.bucket_incarnation_id);
+        Ok(Some(metadata))
+    }
+
+    pub(crate) async fn prepare_unsupported_artifact_write(
+        &self,
+        bucket: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectOptions, Option<rustfs_lock::NamespaceLockGuard>)> {
+        let mut opts = opts.clone();
+        let Some(metadata) = self.bind_artifact_write_metadata(bucket, &mut opts).await? else {
+            return Ok((opts, None));
+        };
+        reject_unsupported_artifact_write(&metadata)?;
+        // Lifecycle read -> metadata transaction read -> downstream object lock.
+        // An existing owner is reused so a queued writer cannot deadlock a recursive read.
+        let guard = if opts.bucket_lifecycle_lock_fence.is_some() {
+            None
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
+        if let Some(guard) = guard.as_ref() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+        let current = metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+        if opts.expected_bucket_incarnation_id != Some(current) {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(Error::other("bucket lifecycle lock was lost before the write"));
+        }
+        Ok((opts, guard))
+    }
+}
+
+pub(crate) fn reject_unsupported_artifact_write(metadata: &BucketMetadata) -> Result<()> {
+    if metadata.artifact_base_prefix.is_some() {
+        return Err(Error::other("artifact bucket does not support this write operation"));
+    }
+    Ok(())
+}
+
 impl PutSealRecord {
     fn new(metadata: &BucketMetadata, attempt_prefix: &str) -> Result<Self> {
         let base_prefix = metadata
