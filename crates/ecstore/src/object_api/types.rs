@@ -266,6 +266,11 @@ impl ObjectLockConfigSnapshot {
                 .is_some_and(|guard| !guard.is_lock_lost())
     }
 
+    pub(crate) fn owns_bucket_lifecycle_fence(&self, store_id: Uuid, bucket: &str, bucket_incarnation_id: Uuid) -> bool {
+        self.is_valid_for_destructive_put(store_id, bucket, bucket_incarnation_id)
+            && self._lifecycle_guard.as_ref().is_some_and(|guard| !guard.is_lock_lost())
+    }
+
     /// Share the held transaction lock without queuing another reader behind
     /// a metadata writer that is itself waiting for this snapshot to drop.
     pub(crate) fn metadata_transaction_guard_for(

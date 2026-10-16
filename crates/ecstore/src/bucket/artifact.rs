@@ -87,7 +87,7 @@ impl ArtifactPutTarget {
             let snapshot = opts
                 .object_lock_config_snapshot
                 .as_ref()
-                .filter(|snapshot| snapshot.is_valid_for_destructive_put(store.id, bucket, self.record.incarnation_id))
+                .filter(|snapshot| snapshot.owns_bucket_lifecycle_fence(store.id, bucket, self.record.incarnation_id))
                 .ok_or_else(|| Error::other("artifact PUT requires an owned lifecycle fence"))?;
             (None, Some(Arc::clone(snapshot)))
         } else {
@@ -190,9 +190,16 @@ impl ECStore {
         };
         reject_unsupported_artifact_write(&metadata)?;
         // Lifecycle read -> metadata transaction read -> downstream object lock.
-        // An existing owner is reused so a queued writer cannot deadlock a recursive read.
-        let guard = if opts.bucket_lifecycle_lock_fence.is_some() {
+        // A loss signal is not ownership. Retain only a matching snapshot that
+        // owns the actual guard; reacquiring behind a queued writer would deadlock.
+        let guard = if let Some(snapshot) = opts.object_lock_config_snapshot.clone() {
+            if !snapshot.owns_bucket_lifecycle_fence(self.id, bucket, metadata.bucket_incarnation_id) {
+                return Err(Error::other("write requires an owned bucket lifecycle fence"));
+            }
+            snapshot.add_lock_fences(&mut opts);
             None
+        } else if opts.bucket_lifecycle_lock_fence.is_some() {
+            return Err(Error::other("write requires an owned bucket lifecycle fence"));
         } else {
             Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
         };
