@@ -11,7 +11,7 @@ use crate::{
     disk::{BUCKET_META_PREFIX, DiskAPI as _, RUSTFS_META_BUCKET},
     runtime::instance::InstanceContext,
     storage_api_contracts::{
-        bucket::{BucketOperations as _, MakeBucketOptions},
+        bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions},
         namespace::NamespaceLocking as _,
     },
     store::ECStore,
@@ -390,6 +390,86 @@ async fn artifact_bucket_partial_volume_retry_preserves_pending_identity() {
             !root.path().join(format!("pool0/set0/disk{disk}/{bucket}")).exists(),
             "ARTIFACT_PARTIAL_CREATION_NOT_SILENTLY_COMPLETED"
         );
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_metadata_replacement_cannot_spoof_incarnation() {
+    let root = tempfile::tempdir().expect("artifact spoofed incarnation store directory");
+    let (_ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-spoofed-incarnation";
+    dedicated_bucket(&store, bucket).await;
+    let original = persisted(&store, bucket).await;
+    let incarnation = original.bucket_incarnation_id;
+    let sys = store.ctx.bucket_metadata_sys().expect("instance metadata system");
+    let sys = sys.read().await.clone();
+    for route in 0..4 {
+        for spoofed in [Uuid::nil(), Uuid::new_v4()] {
+            for (prefix, xml) in [
+                (None, b"".as_slice()),
+                (None, SUSPENDED),
+                (Some("replacement/"), ENABLED),
+                (Some(PREFIX), ENABLED),
+            ] {
+                let mut replacement = original.clone();
+                replacement.bucket_incarnation_id = spoofed;
+                replacement.artifact_base_prefix = prefix.map(str::to_owned);
+                replacement.versioning_config_xml = xml.to_vec();
+                replacement.versioning_config = None;
+                let result = match route {
+                    0 => metadata_sys::set_bucket_metadata_in(&store.ctx, replacement).await,
+                    1 => sys.persist_and_set(replacement).await,
+                    2 => sys.set_validated(replacement).await,
+                    _ => replacement.save_with_store(store.clone()).await,
+                };
+                assert!(
+                    result.is_err(),
+                    "ARTIFACT_INCARNATION_IMMUTABLE: route={route}, spoofed={spoofed}, prefix={prefix:?}"
+                );
+                assert_persisted_and_cached(&store, bucket, incarnation).await;
+            }
+        }
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_real_delete_recreate_allows_new_namespace_and_incarnation() {
+    let root = tempfile::tempdir().expect("artifact genuine recreation store directory");
+    let (_ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-genuine-recreation";
+    dedicated_bucket(&store, bucket).await;
+    let mut incarnation = persisted(&store, bucket).await.bucket_incarnation_id;
+    for prefix in [Some("replacement/"), None] {
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the empty bucket through production storage");
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    artifact_base_prefix: prefix.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("genuine recreation may choose a new bucket namespace");
+        let recreated = persisted(&store, bucket).await;
+        assert!(!recreated.bucket_incarnation_id.is_nil(), "ARTIFACT_INCARNATION_REQUIRED");
+        assert_ne!(recreated.bucket_incarnation_id, incarnation, "ARTIFACT_RECREATION_NEW_INCARNATION");
+        assert_eq!(recreated.artifact_base_prefix.as_deref(), prefix, "ARTIFACT_RECREATION_NEW_NAMESPACE");
+        assert_eq!(recreated.versioning_config.as_ref().is_some_and(VersioningApi::enabled), prefix.is_some());
+        assert!(recreated.bucket_creation_committed, "ARTIFACT_CREATION_COMMITTED");
+        let cached = metadata_sys::get_in(&store.ctx, bucket)
+            .await
+            .expect("recreated identity cached");
+        assert_eq!(cached.bucket_incarnation_id, recreated.bucket_incarnation_id);
+        assert_eq!(cached.artifact_base_prefix.as_deref(), prefix);
+        incarnation = recreated.bucket_incarnation_id;
     }
     shutdown.cancel();
 }
