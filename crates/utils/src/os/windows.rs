@@ -15,13 +15,22 @@
 use crate::os::{DiskInfo, IOStats};
 use std::io::{Error, ErrorKind};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, Prefix};
-use windows::Win32::Foundation::MAX_PATH;
-use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
+use windows::Win32::Foundation::{HANDLE, MAX_PATH};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_REMOTE_PROTOCOL_INFO, FileRemoteProtocolInfo, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+};
 use windows::core::PCWSTR;
 
 /// Documented maximum for the `GetVolumeInformationW` name buffers.
 const VOLUME_INFORMATION_BUFFER_LEN: usize = MAX_PATH as usize + 1;
+
+/// `GetDriveTypeW` result for network drives; defined locally because the
+/// binding lives behind the unrelated `Win32_System_WindowsProgramming` feature.
+const DRIVE_REMOTE: u32 = 4;
 
 const BACKSLASH: u16 = b'\\' as u16;
 const SLASH: u16 = b'/' as u16;
@@ -154,6 +163,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         fstype: get_volume_information(&volume)
             .map(|info| info.file_system_name)
             .unwrap_or_default(),
+        remote: is_remote_directory(p.as_ref()) || is_remote_volume(&volume)?,
         ..Default::default()
     })
 }
@@ -192,6 +202,54 @@ fn get_volume_information(volume: &WidePath) -> std::io::Result<VolumeInformatio
         serial_number,
         file_system_name: utf16_to_string(&file_system_name),
     })
+}
+
+/// Reports whether `path` is served by a network redirector, following
+/// symlinks and junctions to their target.
+///
+/// `FileRemoteProtocolInfo` only succeeds on handles opened through a network
+/// redirector (e.g. SMB, including a loopback `\\localhost\C$`) and fails
+/// with `ERROR_INVALID_PARAMETER` on local volumes. Any failure,
+/// including opening the directory, is reported as not remote so the drive
+/// type of the volume root decides.
+// SAFETY: `GetFileInformationByHandleEx` receives a handle owned by `directory`
+// for the whole call and a pointer/size pair describing `info`.
+#[allow(unsafe_code)]
+fn is_remote_directory(path: &Path) -> bool {
+    let Ok(directory) = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut info = FILE_REMOTE_PROTOCOL_INFO::default();
+    // SAFETY:
+    // 1. The handle stays open until `directory` is dropped after the call.
+    // 2. `info` is a writable, initialized `FILE_REMOTE_PROTOCOL_INFO` and its
+    //    exact size is passed as the buffer size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(directory.as_raw_handle()),
+            FileRemoteProtocolInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u32,
+        )
+    }
+    .is_ok()
+}
+
+/// Reports whether `volume`, a root returned by [`get_volume_path`], is a
+/// network drive such as a mapped drive letter or a UNC share root.
+// SAFETY: `GetDriveTypeW` receives a NUL-terminated volume root.
+#[allow(unsafe_code)]
+fn is_remote_volume(volume: &WidePath) -> std::io::Result<bool> {
+    // `GetDriveTypeW` documents the conventional `C:\` and `\\server\share\`
+    // root forms, so the extended-length prefix is removed first.
+    let root = WidePath::new(simplify_extended(volume.units()).into_owned())?;
+    // SAFETY: `root` is a NUL-terminated UTF-16 string owned for the whole call.
+    let drive_type = unsafe { GetDriveTypeW(root.as_pcwstr()) };
+    Ok(drive_type == DRIVE_REMOTE)
 }
 
 /// Returns the NUL-terminated root of the volume that contains `path`, e.g.
@@ -384,6 +442,7 @@ mod tests {
         let info = get_info(temp_dir.path()).unwrap();
         assert!(info.total > 0);
         assert!(!info.fstype.is_empty(), "GetVolumeInformationW must name the filesystem");
+        assert!(!info.remote, "the temp dir is on a local volume");
 
         let ids = get_physical_device_ids(temp_dir.path().to_str().unwrap()).unwrap();
         assert_eq!(ids.len(), 1);
@@ -431,10 +490,68 @@ mod tests {
         let share_info = get_info(&share).unwrap();
         assert!(share_info.total > 0);
         assert!(!share_info.fstype.is_empty());
+        // The share reports the server's filesystem, so only the drive type
+        // reveals that it is reached over SMB.
+        assert!(share_info.remote, "{share} is a network share: {share_info:?}");
 
         let long = long_directory(&PathBuf::from(format!(r"{share}\{rest}")));
         let long_info = get_info(&long).unwrap();
         assert!(!long_info.fstype.is_empty());
+        assert!(long_info.remote, "{long:?} is below a network share");
         assert!(same_disk(&share, long.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn windows_get_info_follows_directory_symlink_to_network_share() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let absolute = std::path::absolute(temp_dir.path()).unwrap();
+        let Some((drive, rest)) = absolute.to_str().unwrap().split_once(":\\") else {
+            eprintln!("skipping: temp dir {absolute:?} is not on a drive letter");
+            return;
+        };
+        let target = PathBuf::from(format!(r"\\localhost\{drive}$\{rest}"));
+        if !target.is_dir() {
+            eprintln!("skipping: administrative share path {target:?} is not reachable");
+            return;
+        }
+        let link = temp_dir.path().join("share-link");
+        if let Err(err) = std::os::windows::fs::symlink_dir(&target, &link) {
+            eprintln!("skipping: cannot create directory symlinks: {err}");
+            return;
+        }
+
+        // The link itself lives on a local volume, so its volume root alone
+        // need not reveal that the target is a share.
+        let info = get_info(&link).unwrap();
+        assert!(info.remote, "{link:?} -> {target:?} resolves to a network share: {info:?}");
+    }
+
+    /// Set by the Windows filesystem workflow after mapping a drive letter to
+    /// the administrative share of the temp dir's drive with `net use`.
+    const MAPPED_DRIVE_ENV: &str = "RUSTFS_TEST_WINDOWS_MAPPED_DRIVE";
+
+    #[test]
+    fn windows_get_info_reports_mapped_network_drive_as_remote() {
+        let Ok(drive) = std::env::var(MAPPED_DRIVE_ENV) else {
+            eprintln!("skipping: {MAPPED_DRIVE_ENV} is not set");
+            return;
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let absolute = std::path::absolute(temp_dir.path()).unwrap();
+        let Some((_, rest)) = absolute.to_str().unwrap().split_once(":\\") else {
+            eprintln!("skipping: temp dir {absolute:?} is not on a drive letter");
+            return;
+        };
+        let root = format!(r"{}\", drive.trim_end_matches('\\'));
+        let mapped = PathBuf::from(format!("{root}{rest}"));
+        if !mapped.is_dir() {
+            eprintln!("skipping: {mapped:?} is not reachable through the mapped drive");
+            return;
+        }
+
+        for path in [Path::new(&root), mapped.as_path()] {
+            let info = get_info(path).unwrap();
+            assert!(info.remote, "{path:?} is on a mapped network drive: {info:?}");
+        }
     }
 }
