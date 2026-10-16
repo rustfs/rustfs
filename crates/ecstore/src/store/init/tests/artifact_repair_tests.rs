@@ -325,7 +325,7 @@ fn artifact_repair_rejects_previous_bucket_incarnation() {
 }
 
 fn run_physical_repair_case(kind: RepairKind, cancel: bool) {
-    // Retain the large fixture stack and the current-thread clock needed to expire disk wrappers.
+    // Retain the large fixture stack and the current-thread clock needed to expire deadlines.
     std::thread::Builder::new()
         .name(format!("artifact-repair-{kind:?}-{cancel}"))
         .stack_size(32 * 1024 * 1024)
@@ -376,9 +376,13 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
             let heal_store = store.clone();
             let heal_object = object.clone();
             let mut repair = tokio::spawn(async move {
-                heal_store
-                    .heal_object_with_proof(bucket, &heal_object, &version.to_string(), &heal_options())
-                    .await
+                // Timeout the heal future itself, so Elapsed drops its repair scope.
+                // Timing out only a JoinHandle would leave the entire coordinator alive.
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    heal_store.heal_object_with_proof(bucket, &heal_object, &version.to_string(), &heal_options()),
+                )
+                .await
             });
             tokio::time::timeout(DEADLINE, async {
                 tokio::select! {
@@ -396,12 +400,13 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
                 tokio::time::pause();
                 tokio::time::advance(Duration::from_secs(61)).await;
                 tokio::time::resume();
-                // The disk wrapper may fail while another disk restores quorum. Either result
-                // must retain the physical owner's lock until this publisher actually exits.
-                let _ = tokio::time::timeout(DEADLINE, repair)
+                // Guarded rename deliberately has no disk-wrapper deadline. Expire the
+                // caller future while its owned physical publication is still blocked.
+                let result = tokio::time::timeout(DEADLINE, repair)
                     .await
-                    .expect("repair waiter returns after disk timeout")
+                    .expect("repair waiter returns after its caller deadline")
                     .expect("repair task joins");
+                assert!(result.is_err(), "the caller deadline must drop the pending heal future");
             }
             let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
             let lock = store
@@ -577,7 +582,7 @@ fn artifact_repair_rename_owner_survives_cancellation() {
 
 #[test]
 #[serial_test::serial(storage_class_env)]
-fn artifact_repair_rename_owner_survives_disk_timeout() {
+fn artifact_repair_rename_owner_survives_caller_deadline() {
     run_physical_repair_case(RepairKind::Rename, false);
 }
 
