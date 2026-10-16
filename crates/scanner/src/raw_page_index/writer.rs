@@ -112,8 +112,10 @@ impl RawEnumerationPageWriter {
                 terminal: false,
             });
             self.indexed.insert(entry.clone());
-            building.entries.push(entry);
-            building.entries.sort();
+            // The building page is normalized (strictly increasing) on every
+            // path that reaches here, so a positional insert keeps it so.
+            let position = building.entries.binary_search(&entry).unwrap_or_else(|position| position);
+            building.entries.insert(position, entry);
             building.terminal = false;
             self.inner.generation = self.inner.generation.saturating_add(1);
         }

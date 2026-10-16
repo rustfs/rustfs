@@ -59,6 +59,9 @@ pub const SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "max_concurrent_set_scans";
 /// Scanner config key capping concurrent scanner disk bucket walks per set.
 pub const SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "max_concurrent_disk_scans";
 
+/// Scanner config key setting how many bucket walkers each local disk runs.
+pub const SCANNER_WALKERS_PER_DISK: &str = "walkers_per_disk";
+
 /// Scanner config key controlling how often object loops yield.
 pub const SCANNER_YIELD_EVERY_N_OBJECTS: &str = "yield_every_n_objects";
 
@@ -86,6 +89,7 @@ pub const SCANNER_KEYS: &[&str] = &[
     SCANNER_CACHE_SAVE_TIMEOUT,
     SCANNER_MAX_CONCURRENT_SET_SCANS,
     SCANNER_MAX_CONCURRENT_DISK_SCANS,
+    SCANNER_WALKERS_PER_DISK,
     SCANNER_YIELD_EVERY_N_OBJECTS,
     SCANNER_ALERT_EXCESS_VERSIONS,
     SCANNER_ALERT_EXCESS_VERSION_SIZE,
@@ -214,6 +218,14 @@ pub const ENV_SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCU
 /// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS=1`
 pub const ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS";
 
+/// Environment variable that sets how many bucket walkers each local disk runs.
+/// The walkers of one disk share its scanner admission, so a peer still sees one
+/// scan session per physical disk. Remote disks keep one walker. The product of
+/// local disks and this factor is what `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS`
+/// caps; the disk count stays the floor. Valid range is `1` through `16`.
+/// - Example: `export RUSTFS_SCANNER_WALKERS_PER_DISK=4`
+pub const ENV_SCANNER_WALKERS_PER_DISK: &str = "RUSTFS_SCANNER_WALKERS_PER_DISK";
+
 /// Environment variable that controls how often scanner object loops yield to the async runtime.
 /// A value of `0` disables this extra object-count yield.
 /// - Example: `export RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS=32`
@@ -227,6 +239,18 @@ pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 4;
 
 /// Default disk scan concurrency budget.
 pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 4;
+
+/// Default bucket walkers per local disk.
+///
+/// One walker per disk keeps today's I/O profile, which is what rotational
+/// media needs. Flash is meant to default higher once a local disk can report
+/// its media type; `rustfs_utils::os::Info::rotational` is never populated
+/// today, so every deployment starts from one walker.
+pub const DEFAULT_SCANNER_WALKERS_PER_DISK: usize = 1;
+
+/// Upper bound for `walkers_per_disk`; a larger factor only multiplies
+/// contention on one spindle or NVMe queue without more disks to spread it.
+pub const MAX_SCANNER_WALKERS_PER_DISK: usize = 16;
 
 /// Default object interval for cooperative scanner yields.
 pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;
