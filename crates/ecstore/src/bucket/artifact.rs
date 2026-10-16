@@ -62,6 +62,30 @@ impl ArtifactPutTarget {
         })))
     }
 
+    pub(crate) async fn validate_for_put(
+        ctx: &crate::runtime::instance::InstanceContext,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<Uuid>> {
+        if super::utils::is_meta_bucketname(bucket) {
+            return Ok(None);
+        }
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(ctx, bucket).await?;
+        if opts
+            .expected_bucket_incarnation_id
+            .is_some_and(|expected| expected != metadata.bucket_incarnation_id)
+        {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        match (Self::from_metadata(&metadata, object)?, opts.artifact_put_target.as_deref()) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if expected.record == actual.record && expected.object == actual.object => {}
+            _ => return Err(Error::other("artifact PUT requires its matching managed target")),
+        }
+        Ok(Some(metadata.bucket_incarnation_id))
+    }
+
     pub(crate) async fn acquire(
         &self,
         store: Arc<ECStore>,

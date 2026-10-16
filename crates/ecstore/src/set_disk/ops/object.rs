@@ -3511,13 +3511,8 @@ impl SetDisks {
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         let write_context = WriteCommitContext::from_options(opts, bucket, object, publication_fence.is_some())?;
         let protect_write = opts.shard_integrity_write_enabled();
-        let source_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
-            Some(incarnation_id) => Some(incarnation_id),
-            // Internal metadata writes may already hold the pool metadata
-            // lock; resolving a user bucket identity would re-enter it.
-            None if !is_meta_bucketname(bucket) => self.bucket_incarnation_id_from_disk(bucket).await.ok(),
-            None => None,
-        };
+        let source_bucket_incarnation_id =
+            crate::bucket::artifact::ArtifactPutTarget::validate_for_put(&self.ctx, bucket, object, opts).await?;
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
