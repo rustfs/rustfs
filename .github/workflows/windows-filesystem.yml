@@ -21,6 +21,7 @@ on:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
       - "crates/ecstore/Cargo.toml"
+      - "crates/utils/src/dunce.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
@@ -31,6 +32,7 @@ on:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
       - "crates/ecstore/Cargo.toml"
+      - "crates/utils/src/dunce.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
@@ -76,6 +78,10 @@ jobs:
       - name: Test guarded rename publication
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
+
+      - name: Test extended-length path conversion
+        shell: pwsh
+        run: cargo test -p rustfs-utils --no-default-features --features path --lib extended_length_path -- --nocapture
 
       - name: Test Windows handle guards
         shell: pwsh
