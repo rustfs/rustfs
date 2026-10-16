@@ -354,6 +354,11 @@ async fn write_delete_rollback_file(
         std::fs::create_dir_all(&staging_root)?;
         #[cfg(test)]
         run_owned_file_write_before_open(&path);
+        // tempfile's Windows `persist` hands both the staged and the final path
+        // straight to `MoveFileExW`, bypassing std's long-path handling, so a
+        // deep object key failed every delete at MAX_PATH (rustfs#8545).
+        let staging_root = rustfs_utils::extended_length_path(&staging_root)?;
+        let destination = rustfs_utils::extended_length_path(&path)?;
         // Private directory staging is reclaimed by existing tmp cleanup after
         // a crash and cannot leave a regular artifact in the user's bucket.
         let staging_dir = tempfile::Builder::new()
@@ -364,7 +369,7 @@ async fn write_delete_rollback_file(
         if sync {
             staged.as_file().sync_all()?;
         }
-        staged.persist(path).map_err(|err| err.error)?;
+        staged.persist(&destination).map_err(|err| err.error)?;
         if sync {
             os::fsync_dir_std(&backup_dir)?;
             if let Some(parent) = backup_dir.parent() {
@@ -19415,6 +19420,62 @@ mod test {
                 .exists()
         );
         assert!(!logs.contents().contains("reliable_rename failed"));
+    }
+
+    // rustfs#8545: the rollback backup is staged through tempfile, whose Windows
+    // `persist` calls `MoveFileExW` with the raw path; past MAX_PATH every
+    // delete of such a key failed with 500 while PUT and GET still worked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_and_unix_delete_backs_up_metadata_beyond_max_path() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let deep_prefix = format!("dir/{}", "a".repeat(200));
+        let version_id = Uuid::parse_str("37373737-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("38383838-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("39393939-1111-2222-3333-444444444444").expect("rollback dir should parse");
+        let opts = DeleteOptions {
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+
+        for batch in [false, true] {
+            let object = format!("{deep_prefix}/{}", if batch { "batch" } else { "single" });
+            let object_dir = dir.path().join(bucket).join(&object);
+            let backup = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            assert!(
+                backup.to_str().expect("temp dir should be utf8").encode_utf16().count() > 260,
+                "regression path must cross the traditional Windows MAX_PATH boundary: {backup:?}"
+            );
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            let fi = test_file_info(&object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+            let meta = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &meta)
+                .await
+                .expect("inline metadata should be written");
+
+            if batch {
+                disk.delete_versions_internal(bucket, &object, &[fi], &opts, None)
+                    .await
+                    .expect("batch delete of a deep key should succeed");
+            } else {
+                disk.delete_version(bucket, &object, fi, false, opts.clone())
+                    .await
+                    .expect("delete of a deep key should succeed");
+            }
+
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists(), "{object}: metadata should be deleted");
+            assert_eq!(
+                fs::read(&backup).await.expect("rollback backup should be published"),
+                meta,
+                "{object}: backup should hold the pre-delete metadata"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
