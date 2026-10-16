@@ -857,6 +857,9 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-util")]
+    mod artifact_bucket_tests;
+
     use super::{
         LOCAL_DECOMMISSION_RESUME_RETRY_DELAY, LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY, PoolMetaWriteState,
         establish_pool_meta_bootstrap_identity_if_proven, load_pool_meta_for_startup, local_decommission_watchdog_retry_delay,
