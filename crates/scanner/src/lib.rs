@@ -103,9 +103,9 @@ pub use scanner_io::{
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_bucket_generation,
-    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
-    set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
+    record_status_class_mutation, replay_durable_dirty_usage_producer_record, scanner_activity_epoch,
+    scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 pub use segment_invalidation::SegmentInvalidationProducerIdentity;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
@@ -734,17 +734,23 @@ where
     S: ScannerObjectIO,
 {
     let mut reader = ScannerPutObjReader::from_vec(data);
-    api.put_object(
-        RUSTFS_META_BUCKET,
-        file,
-        &mut reader,
-        &ScannerObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(preconditions),
-            ..Default::default()
+    let opts = ScannerObjectOptions {
+        max_parity: true,
+        http_preconditions: Some(preconditions),
+        ..Default::default()
+    };
+    let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            );
+            write.await
         },
-    )
-    .await
+    );
+    write.await
 }
 
 pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
@@ -859,19 +865,25 @@ where
             fence.to_string(),
         );
     }
-    api.put_object(
-        RUSTFS_META_BUCKET,
-        file,
-        &mut reader,
-        &ScannerObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(preconditions),
-            scanner_publication_commit_scope,
-            user_defined,
-            ..Default::default()
+    let opts = ScannerObjectOptions {
+        max_parity: true,
+        http_preconditions: Some(preconditions),
+        scanner_publication_commit_scope,
+        user_defined,
+        ..Default::default()
+    };
+    let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            );
+            write.await
         },
-    )
-    .await
+    );
+    write.await
 }
 
 pub(crate) async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> std::result::Result<(), DiskError> {

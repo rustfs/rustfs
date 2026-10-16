@@ -1400,6 +1400,15 @@ impl ErasureSetHealer {
                 None => self.storage.heal_bucket(bucket, &bucket_opts).await?,
             };
             task.record_result_item(result).await;
+            // Keep recovery in the checkpoint's admitted incarnation and repair
+            // the publication bucket before adopting a survivor's delete proof.
+            if let Some(result) = self
+                .storage
+                .recover_delete_transactions(bucket, None, incarnation, &self.heal_opts)
+                .await?
+            {
+                task.record_result_item(result).await;
+            }
         }
 
         // 1. get bucket info
@@ -2390,6 +2399,8 @@ mod resume_loop_tests {
     #[derive(Default)]
     struct FakeStorage {
         admin_disk: Mutex<Option<DiskStore>>,
+        bucket_discovery_incomplete: AtomicBool,
+        bucket_discovery_scopes: Mutex<Vec<Option<crate::heal::storage_api::storage::DiskSetSelector>>>,
         bucket_pages: Mutex<HashMap<String, Page>>,
         incarnations: Mutex<HashMap<String, uuid::Uuid>>,
         receipts: Mutex<HashMap<String, Option<crate::heal::outcome::HealObjectDisposition>>>,
@@ -2469,6 +2480,17 @@ mod resume_loop_tests {
                 ..Default::default()
             }))
         }
+        async fn list_buckets_for_admin_heal(
+            &self,
+            selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+        ) -> Result<Vec<BucketInfo>> {
+            self.bucket_discovery_scopes.lock().expect("discovery scopes").push(selector);
+            if self.bucket_discovery_incomplete.load(Ordering::SeqCst) {
+                return Err(Error::BucketDiscoveryIncomplete);
+            }
+            self.list_buckets().await
+        }
+
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
             Ok(self
                 .bucket_pages

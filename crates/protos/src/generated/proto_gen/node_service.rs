@@ -527,6 +527,29 @@ pub struct DeletePathsResponse {
     #[prost(message, optional, tag = "2")]
     pub error: ::core::option::Option<Error>,
 }
+/// Protocol 1 is additive and has no fallback to generic file mutation RPCs.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecoverDeleteTransactionRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "3")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub operation: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecoverDeleteTransactionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub result: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "4")]
+    pub error: ::core::option::Option<Error>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SnapshotLeaseRequest {
     #[prost(string, tag = "1")]
@@ -761,6 +784,18 @@ pub struct DeleteVersionsRequest {
     pub versions_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
     #[prost(bytes = "bytes", tag = "6")]
     pub opts_bin: ::prost::bytes::Bytes,
+}
+/// Additive, fail-closed conditional batch protocol. Probe requests never mutate disk state.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GuardedDeleteVersionsRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub payload: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "4")]
+    pub probe_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteVersionsResponse {
@@ -2082,6 +2117,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "DeleteAtIncarnation"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn recover_delete_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RecoverDeleteTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecoverDeleteTransactionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/RecoverDeleteTransaction");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RecoverDeleteTransaction"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn acquire_snapshot_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::SnapshotLeaseRequest>,
@@ -2576,6 +2626,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "DeleteVersions"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn guarded_delete_versions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GuardedDeleteVersionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GuardedDeleteVersions");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GuardedDeleteVersions"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn read_multiple(
@@ -3463,6 +3528,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::DeleteRequest>,
         ) -> std::result::Result<tonic::Response<super::DeleteResponse>, tonic::Status>;
+        async fn recover_delete_transaction(
+            &self,
+            request: tonic::Request<super::RecoverDeleteTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecoverDeleteTransactionResponse>, tonic::Status>;
         async fn acquire_snapshot_lease(
             &self,
             request: tonic::Request<super::SnapshotLeaseRequest>,
@@ -3607,6 +3676,10 @@ pub mod node_service_server {
         async fn delete_versions(
             &self,
             request: tonic::Request<super::DeleteVersionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status>;
+        async fn guarded_delete_versions(
+            &self,
+            request: tonic::Request<super::GuardedDeleteVersionsRequest>,
         ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status>;
         async fn read_multiple(
             &self,
@@ -4228,6 +4301,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteAtIncarnationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RecoverDeleteTransaction" => {
+                    #[allow(non_camel_case_types)]
+                    struct RecoverDeleteTransactionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::RecoverDeleteTransactionRequest> for RecoverDeleteTransactionSvc<T> {
+                        type Response = super::RecoverDeleteTransactionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RecoverDeleteTransactionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::recover_delete_transaction(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RecoverDeleteTransactionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -5155,6 +5256,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteVersionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GuardedDeleteVersions" => {
+                    #[allow(non_camel_case_types)]
+                    struct GuardedDeleteVersionsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GuardedDeleteVersionsRequest> for GuardedDeleteVersionsSvc<T> {
+                        type Response = super::DeleteVersionsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GuardedDeleteVersionsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::guarded_delete_versions(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GuardedDeleteVersionsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

@@ -90,7 +90,20 @@ where
                         rest_body: RestBody::from(Bytes::new()),
                     },
                 ),
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)

@@ -319,6 +319,24 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         // an older registry cannot be reused under the new cycle generation.
         cache.info.scan_plan_digest = None;
     }
+    if cache.info.name == name
+        && cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.snapshot_complete
+        && cache
+            .info
+            .replication
+            .as_ref()
+            .is_some_and(|config| config.has_active_rules("", true))
+    {
+        // Replication writebacks leave namespace generations unchanged. A
+        // completed cache must start a fresh coverage sweep, even on retry.
+        cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+            started_plan: scan_plan_digest,
+            requested_plan: scan_plan_digest,
+        });
+        cache.info.scan_plan_digest = None;
+    }
     match current_cache_root_entry_with_generation(
         cache,
         name,
@@ -354,6 +372,72 @@ pub(super) fn cache_snapshot_is_current(
         current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
+}
+
+/// Replication statistics are observational and may change within one
+/// namespace execution. Bind them without relaxing same-execution reuse.
+pub(super) fn scanner_replication_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    cache: &DataUsageCache,
+) -> DataUsageScanPlanDigest {
+    let mut entries = cache
+        .cache
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .replication_stats
+                .as_ref()
+                .filter(|stats| stats.replica_size != 0 || stats.replica_count != 0 || !stats.targets.is_empty())
+                .map(|stats| (key, stats))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return execution_digest;
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-replication-execution-v1");
+    hasher.update(execution_digest.0);
+    for (key, stats) in entries {
+        hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(stats.replica_size.to_be_bytes());
+        hasher.update(stats.replica_count.to_be_bytes());
+        let mut targets = stats.targets.iter().collect::<Vec<_>>();
+        targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        hasher.update(u64::try_from(targets.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (arn, target) in targets {
+            hasher.update(u64::try_from(arn.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(arn.as_bytes());
+            let rustfs_data_usage::ReplicationTargetUsage {
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            } = target;
+            for value in [
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            ] {
+                hasher.update(value.to_be_bytes());
+            }
+        }
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

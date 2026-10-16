@@ -8,6 +8,13 @@ collection:
 
 ## Operations
 
+- [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.
+
+For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
+see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
+
+- [External certificate issuance and TLS rotation](operations/tls-certificate-rotation.md) — publication, native reload, trust separation and failure handling.
+
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
 
@@ -45,6 +52,9 @@ For concurrent bucket creation and deletion, see
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
+For interrupted object deletions and returning drives, see
+[Delete transaction recovery](operations/delete-transaction-recovery.md).
+
 For disk replacement across VM restarts and schema 5/6 maintenance migration,
 see [Replacement generation recovery](operations/replacement-generation-recovery.md).
 
@@ -57,6 +67,9 @@ procedure is required.
 
 For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
 drive ownership, snapshot freshness, counter queries, and rolling upgrades.
+
+For per-bucket capacity and object counts, see [Bucket usage metrics](operations/bucket-usage-metrics.md):
+OTLP export, cluster deduplication, accounting semantics, and scanner freshness.
 
 For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
 activation, legacy repair results, multipart mode changes, and rollback limits.

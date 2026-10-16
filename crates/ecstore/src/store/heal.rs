@@ -270,13 +270,151 @@ impl ECStore {
         .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
     }
 
+    /// Recover hidden delete journals through the lifecycle-owned heal boundary.
+    pub async fn recover_delete_transactions(self: &Arc<Self>, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        Ok(self
+            .recover_delete_transactions_at_incarnation(bucket, None, None, opts)
+            .await?
+            .unwrap_or_else(|| HealResultItem {
+                heal_item_type: HealItemType::Bucket.to_string(),
+                bucket: bucket.to_owned(),
+                detail: "delete recovery: discovered=0".to_owned(),
+                ..Default::default()
+            }))
+    }
+
+    pub async fn recover_delete_transactions_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.recover_delete_transactions_in_scope(bucket, object, None, expected, opts)
+            .await
+    }
+
+    pub async fn recover_delete_prefix_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.recover_delete_transactions_in_scope(bucket, None, Some(prefix), expected, opts)
+            .await
+    }
+
+    async fn recover_delete_transactions_in_scope(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: Option<&str>,
+        prefix: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        if opts.no_lock && !opts.dry_run {
+            return Err(StorageError::InvalidArgument(
+                "heal".to_string(),
+                "no_lock".to_string(),
+                "delete recovery requires namespace locking".to_string(),
+            ));
+        }
+        let expected = match expected {
+            Some(expected) => expected,
+            None => self.bucket_incarnation_id_from_disk(bucket).await?,
+        };
+        let object = object.map(str::to_owned);
+        let prefix = prefix.map(str::to_owned);
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
+            let explicit_delete = opts.remove
+                && metadata_sys::has_authoritative_never_versioned_state_in(&store.ctx, &bucket).await?
+                && matches!(
+                    metadata_sys::get_object_lock_config_state_in(&store.ctx, &bucket).await?,
+                    metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+                );
+            let movement_gate = store.ctx.data_movement_operation_gate();
+            let _movement_guard = movement_gate.read().await;
+            let can_commit = || scope.check().is_ok();
+            let recovery_context = crate::set_disk::DeleteRecoveryContext {
+                dry_run: opts.dry_run,
+                explicit_delete,
+                namespace_owner: (!opts.dry_run)
+                    .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit())) as Arc<dyn Send + Sync>),
+                ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &can_commit)
+            };
+            let mut summary = crate::set_disk::DeleteRecoverySummary::default();
+            for pool in store.get_pools_for_heal_object(&opts)? {
+                if store.is_suspended(pool.pool_idx).await || store.is_pool_rebalancing(pool.pool_idx).await {
+                    return Err(StorageError::SlowDown);
+                }
+                for (set_index, set) in pool.disk_set.iter().enumerate() {
+                    if opts.set.is_some_and(|requested| requested != set_index) {
+                        continue;
+                    }
+                    if let Some(object) = &object {
+                        if !Arc::ptr_eq(set, &pool.get_disks_by_key(object)) {
+                            continue;
+                        }
+                        summary.add(set.recover_delete_object(&bucket, object, recovery_context.clone()).await?);
+                    } else if let Some(prefix) = &prefix {
+                        summary.add(set.recover_delete_prefix(&bucket, prefix, recovery_context.clone()).await?);
+                    } else {
+                        summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
+                    }
+                }
+            }
+            if summary.pending > 0 {
+                return Err(StorageError::ErasureReadQuorum);
+            }
+            if object.is_some() && !opts.dry_run && summary.blocked > 0 {
+                return Err(StorageError::SlowDown);
+            }
+            if summary.discovered == 0 {
+                return Ok(None);
+            }
+            Ok(Some(HealResultItem {
+                heal_item_type: if object.is_some() {
+                    HealItemType::Object
+                } else {
+                    HealItemType::Bucket
+                }
+                .to_string(),
+                object: object.or(prefix).unwrap_or_default(),
+                bucket,
+                detail: format!(
+                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}",
+                    if opts.dry_run { " (dry run)" } else { "" },
+                    summary.discovered,
+                    summary.committed,
+                    summary.rolled_back,
+                    summary.reclaimed,
+                    summary.blocked
+                ),
+                ..Default::default()
+            }))
+        })
+        .await
+    }
+
     pub async fn heal_bucket_at_incarnation(
         self: &Arc<Self>,
         bucket: &str,
         expected: uuid::Uuid,
         opts: &HealOpts,
     ) -> Result<HealResultItem> {
-        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, move |store, bucket, mut opts| async move {
+            if !opts.recreate && !opts.remove {
+                let mut missing = false;
+                for (pool, set) in store.heal_erasure_set_scopes(&opts).await? {
+                    missing |= store.pools[pool].get_disks(set).bucket_needs_reconstruction(&bucket).await?;
+                }
+                if missing {
+                    crate::bucket::metadata_sys::validate_bucket_reconstruction_in(&store.ctx, &bucket, expected).await?;
+                    opts.recreate = true;
+                }
+            }
             store.heal_bucket(&bucket, &opts).await
         })
         .await
@@ -1321,6 +1459,178 @@ mod tests {
         )
         .await
         .expect("minimal pool should build")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_recreates_missing_directories_at_current_incarnation() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "admin-bucket-recovery";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create a committed bucket generation");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("persisted generation");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove only an empty fixture bucket directory");
+        }
+        store
+            .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+            .await
+            .expect("default administrator recovery should use committed generation authority");
+        for disk in 0..4 {
+            assert!(root.path().join(format!("pool0-disk{disk}/{bucket}")).is_dir());
+        }
+        assert_eq!(
+            store
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("recovered generation"),
+            incarnation
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_missing_corrupt_uncommitted_and_retired_authority() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        for state in ["missing", "corrupt", "uncommitted", "mismatched", "retired"] {
+            let bucket = format!("recovery-authority-{state}");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create fixture generation");
+            let incarnation = store
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("fixture identity");
+            let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("committed metadata");
+            assert!(persisted && metadata.bucket_creation_committed);
+            let path = metadata.save_file_path();
+            match state {
+                "missing" => delete_config(store.clone(), &path).await.expect("remove metadata authority"),
+                "corrupt" => save_config(store.clone(), &path, b"corrupt bucket metadata".to_vec())
+                    .await
+                    .expect("corrupt authority"),
+                "uncommitted" | "mismatched" => {
+                    if state == "uncommitted" {
+                        metadata.bucket_creation_committed = false;
+                    } else {
+                        metadata.bucket_incarnation_id = Uuid::new_v4();
+                    }
+                    metadata
+                        .save_with_store_committed(store.clone())
+                        .await
+                        .expect("inject inconsistent metadata authority");
+                }
+                "retired" => {
+                    // A returning disk may retain a directory after retirement was committed.
+                    crate::bucket::retirement::commit_retirement(store.clone(), &bucket, incarnation, &ObjectOptions::default())
+                        .await
+                        .expect("persist retirement evidence");
+                }
+                _ => unreachable!("fixed fixture states"),
+            }
+            for disk in 1..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("lose fixture directories");
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(&bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err(),
+                "must reject {state}"
+            );
+            for disk in 1..4 {
+                assert!(
+                    !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                    "{state} cannot authorize reconstruction"
+                );
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_offline_disks_and_fully_missing_sets() {
+        for offline in [false, true] {
+            let (root, store, shutdown) = multi_pool_heal_store().await;
+            let bucket = "recovery-unproven-set";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("fixture bucket");
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+            let first_missing = usize::from(offline);
+            for disk in first_missing..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("remove fixture directories");
+            }
+            if offline {
+                let disk = store.pools[0].disk_set[0].disks.read().await[0]
+                    .clone()
+                    .expect("online fixture disk");
+                disk.close().await.expect("stop disk monitoring");
+                disk.force_offline_for_test();
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err()
+            );
+            for disk in first_missing..4 {
+                assert!(!root.path().join(format!("pool0-disk{disk}/{bucket}")).exists());
+            }
+            shutdown.cancel();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_dry_run_preserves_missing_directories() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "recovery-dry-run";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove fixture directories");
+        }
+        store
+            .heal_bucket_at_incarnation(
+                bucket,
+                incarnation,
+                &HealOpts {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dry run can inspect eligible recovery");
+        for disk in 1..4 {
+            assert!(
+                !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                "dry run must not reconstruct directories"
+            );
+        }
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -3430,7 +3740,6 @@ mod tests {
         let mut recoverable_temp_dirs = Vec::new();
         let mut recoverable_endpoints = Vec::new();
         let mut recoverable_disks = Vec::new();
-        let mut unformatted_disk = None;
         for disk_index in 0..3 {
             let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("temporary path should be UTF-8"))
@@ -3447,15 +3756,11 @@ mod tests {
             )
             .await
             .expect("temporary disk should open");
-            if disk_index < 2 {
-                let mut disk_format = recoverable_format.clone();
-                disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
-                save_format_file(&Some(disk.clone()), &Some(disk_format))
-                    .await
-                    .expect("recoverable format should be written");
-            } else {
-                unformatted_disk = Some(disk.clone());
-            }
+            let mut disk_format = recoverable_format.clone();
+            disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("recoverable format should be written before pool metadata");
             recoverable_temp_dirs.push(temp_dir);
             recoverable_endpoints.push(endpoint);
             recoverable_disks.push(Some(disk));
@@ -3504,6 +3809,36 @@ mod tests {
             .expect("pool metadata should be persisted before format heal");
         *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
 
+        let replacement_endpoint = store.pools[1].endpoints.endpoints.as_ref()[2].clone();
+        tokio::fs::remove_file(
+            recoverable_temp_dirs[2]
+                .path()
+                .join(crate::disk::RUSTFS_META_BUCKET)
+                .join(FORMAT_CONFIG_FILE),
+        )
+        .await
+        .expect("the target format must be removed only after durable pool metadata exists");
+        let replacement_disk = new_disk(
+            &replacement_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("the unformatted replacement disk must reopen");
+        assert!(matches!(
+            load_format_erasure(&replacement_disk, true).await,
+            Err(crate::disk::error::DiskError::UnformattedDisk)
+        ));
+        let replacement_set = &store.pools[1].disk_set[0];
+        let replacement_slot = replacement_set
+            .set_endpoints
+            .iter()
+            .position(|endpoint| endpoint == &replacement_endpoint)
+            .expect("the replacement must remain in its original set");
+        replacement_set.disks.write().await[replacement_slot] = Some(replacement_disk.clone());
+
         let (result, err) = store
             .handle_heal_format(false)
             .await
@@ -3513,7 +3848,7 @@ mod tests {
             "foreign format majority must not be downgraded to a successful heal: {err:?}"
         );
         assert_eq!(result.disk_count, 3, "the recoverable pool should still be inspected");
-        let healed = load_format_erasure(&unformatted_disk.expect("the unformatted disk handle should be retained"), true)
+        let healed = load_format_erasure(&replacement_disk, true)
             .await
             .expect("the later pool should be healed despite the first pool error");
         assert_eq!(healed.erasure.this, recoverable_format.erasure.sets[0][2]);

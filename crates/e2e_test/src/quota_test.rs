@@ -851,13 +851,20 @@ mod integration_tests {
             .delete(
                 aws_sdk_s3::types::Delete::builder()
                     .set_objects(Some(objects))
-                    .quiet(true)
+                    // Quiet mode hides successful entries, so the batch must be
+                    // verbose for the assertion on the deleted list below.
+                    .quiet(false)
                     .build()
                     .unwrap(),
             )
             .send()
             .await?;
 
+        assert!(
+            delete_result.errors().is_empty(),
+            "batch delete must not report errors: {:?}",
+            delete_result.errors()
+        );
         assert_eq!(delete_result.deleted().len(), 2);
 
         // Now should be able to upload again (quota freed up)

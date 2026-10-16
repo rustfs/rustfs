@@ -24,6 +24,15 @@ pub(crate) fn EndpointServerPools(
     crate::storage::storage_api::EndpointServerPools::from(pools)
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod diagnostic {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_read_version_entry_source;
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+    };
+}
+
 /// S3 wire types for app-layer modules, funneled here so new files stay off
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
@@ -1192,6 +1201,7 @@ pub(crate) mod bucket_usecase {
 
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
+    pub(crate) use super::storage_contracts::object::DeleteObjectCondition;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 
     pub(crate) mod object_cache {
@@ -1200,8 +1210,10 @@ pub(crate) mod object_usecase {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::lookup_get_object_body_cache_hook;
         pub(crate) use crate::storage::storage_api::ecstore_object::{
-            GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len,
+            GetObjectBodyCacheHookLookup, GetObjectReadCondition, GetObjectReadMetadata, get_object_body_cache_plaintext_len,
+            with_get_object_read_condition,
         };
+        pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
     pub(crate) mod contract {
@@ -1338,8 +1350,8 @@ pub(crate) mod test {
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
-            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
-            fail_next_quota_ledger_save_for_test,
+            ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
+            PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
         };
     }
 

@@ -38,6 +38,7 @@ pub(super) const LONG_VERSION: &str = concat!(
     concat!("build time   : ", build::BUILD_TIME, "\n"),
     concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
     concat!("build os     : ", build::BUILD_OS, "\n"),
+    concat!("build target : ", build::BUILD_TARGET, "\n"),
     concat!("rust version : ", build::RUST_VERSION, "\n"),
     concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
     concat!("git branch   : ", build::BRANCH, "\n"),

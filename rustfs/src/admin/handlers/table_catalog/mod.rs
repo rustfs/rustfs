@@ -1862,6 +1862,16 @@ where
             .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
     }
 
+    fn table_commit_object_mutation_fence(&self) -> Option<crate::table_catalog::TableCatalogObjectMutationFence> {
+        let publication = self.publication.lock();
+        Some(crate::table_catalog::TableCatalogObjectMutationFence::from_signals(
+            publication
+                .guards
+                .iter()
+                .map(crate::table_catalog::TableCatalogLockGuard::lock_lost_signal),
+        ))
+    }
+
     fn complete_table_commit_publication(&self) {
         self.complete_publication();
     }
@@ -5497,7 +5507,8 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         crate::table_catalog::TableCatalogStoreError::Unsupported(message) => {
             iceberg_rest_error(ICEBERG_ERROR_UNSUPPORTED_OPERATION, StatusCode::NOT_ACCEPTABLE, message)
         }
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => iceberg_rest_error(
+        crate::table_catalog::TableCatalogStoreError::Unavailable(_)
+        | crate::table_catalog::TableCatalogStoreError::LockUnavailable { .. } => iceberg_rest_error(
             ICEBERG_ERROR_REST,
             StatusCode::SERVICE_UNAVAILABLE,
             "table catalog is temporarily unavailable",

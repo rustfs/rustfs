@@ -2271,7 +2271,7 @@ pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, Strin
         }
         return Ok(None);
     };
-    if encoded.len() != 64 {
+    if encoded.len() != 64 || !encoded.is_ascii() {
         return Err(io::Error::other("transition tier backend identity has an invalid length"));
     }
     let mut identity = [0_u8; 32];
@@ -4716,6 +4716,23 @@ impl TierConfigMgr {
     }
 
     async fn reload_handle_with<S>(handle: &Arc<RwLock<Self>>, api: Arc<S>) -> io::Result<()>
+    where
+        S: EcstoreObjectIO
+            + EcstoreObjectOperations
+            + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+            + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+    {
+        // Periodic and committed-mutation refreshes call this shared entry directly.
+        let reload = Self::reload_handle_inner(handle, api);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let reload = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::TierConfigReload,
+            reload,
+        );
+        reload.await
+    }
+
+    async fn reload_handle_inner<S>(handle: &Arc<RwLock<Self>>, api: Arc<S>) -> io::Result<()>
     where
         S: EcstoreObjectIO
             + EcstoreObjectOperations
@@ -12534,6 +12551,51 @@ mod tests {
         assert!(reloaded.iter().any(|intent| intent.mutation_id == prepared_id));
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_reload_shared_entry_preserves_source_and_api() {
+        use crate::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_isolated_s3_http_operation_context,
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        empty_mgr()
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("empty tier config fixture should persist");
+        let mut request = S3HttpRequestGuard::new("GET");
+        let get = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            current_s3_http_operation_context().expect("GetObject context should be captured")
+        });
+
+        for (earlier, api) in [(None, None), (Some(ReadVersionEntrySource::ConfigRead), Some(get))] {
+            store.reload_contexts.lock().expect("context recorder").clear();
+            let handle = TierConfigMgr::new();
+            with_isolated_s3_http_operation_context(api, async {
+                let reload = TierConfigMgr::reload_handle_with(&handle, store.clone());
+                if let Some(source) = earlier {
+                    with_read_version_entry(source, reload).await
+                } else {
+                    reload.await
+                }
+            })
+            .await
+            .expect("shared reload entry should load config and scan intents");
+
+            let observed = store.reload_contexts.lock().expect("context recorder");
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "reader"));
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "list"));
+            let expected = earlier.unwrap_or(ReadVersionEntrySource::TierConfigReload);
+            assert!(observed.iter().all(|(_, source, operation)| {
+                *source == Some(expected) && *operation == api.map(|context| context.operation_name())
+            }));
+            assert_eq!(current_read_version_entry_source(), None);
+            assert_eq!(current_s3_http_operation_context(), None);
+        }
+    }
+
     #[tokio::test]
     async fn reload_handle_keeps_committed_block_until_publish_swaps_generation() {
         let store = Arc::new(CasConfigStore::default());
@@ -14726,8 +14788,17 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    type ReloadDiagnosticObservation = (
+        &'static str,
+        Option<rustfs_io_metrics::internode_metrics::ReadVersionEntrySource>,
+        Option<&'static str>,
+    );
+
     #[derive(Debug)]
     struct CasConfigStore {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        reload_contexts: Mutex<Vec<ReloadDiagnosticObservation>>,
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
@@ -14751,6 +14822,8 @@ mod tests {
     impl Default for CasConfigStore {
         fn default() -> Self {
             Self {
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                reload_contexts: Mutex::new(Vec::new()),
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
                 if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -14905,6 +14978,12 @@ mod tests {
             _headers: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "reader",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
             let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
             let (data, etag) = if object == legacy_config_path {
                 let state = self.legacy_state.lock().await;
@@ -15260,6 +15339,12 @@ mod tests {
             _start_after: Option<String>,
             _incl_deleted: bool,
         ) -> Result<Self::ListObjectsV2Info> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "list",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
             if matches!(
                 prefix,
                 crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX

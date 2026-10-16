@@ -46,10 +46,10 @@ impl Clone for PoolObjInfo {
     }
 }
 
-pub(super) struct LatestObjectInfoCandidate {
-    pub(super) info: Option<ObjectInfo>,
-    pub(super) idx: usize,
-    pub(super) err: Option<Error>,
+pub(in crate::store) struct LatestObjectInfoCandidate {
+    pub(in crate::store) info: Option<ObjectInfo>,
+    pub(in crate::store) idx: usize,
+    pub(in crate::store) err: Option<Error>,
 }
 
 pub(super) struct RebalanceDeletePoolResult {
@@ -295,7 +295,7 @@ pub(super) fn resolve_latest_object_info_candidates(
     resolve_latest_object_info_candidates_with_pool_state(candidates, &[], bucket, object, opts)
 }
 
-pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
+pub(in crate::store) fn resolve_latest_object_info_candidates_with_pool_state(
     candidates: Vec<LatestObjectInfoCandidate>,
     suspended_pools: &[bool],
     bucket: &str,

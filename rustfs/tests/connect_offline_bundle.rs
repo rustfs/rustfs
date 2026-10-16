@@ -155,7 +155,7 @@ fn connect_offline_bundle_is_deterministic_bounded_and_signed_over_exact_manifes
     assert_eq!(archive.len(), PATHS.len());
     for (index, expected_path) in PATHS.into_iter().enumerate() {
         let file = archive.by_index(index).expect("archive member");
-        assert_eq!(file.name(), expected_path);
+        assert_eq!(file.name().expect("archive entry name"), expected_path);
         assert_eq!(file.compression(), CompressionMethod::Stored);
         assert_eq!(file.last_modified(), Some(zip::DateTime::DEFAULT));
         assert_eq!(file.unix_mode().map(|mode| mode & 0o777), Some(0o600));

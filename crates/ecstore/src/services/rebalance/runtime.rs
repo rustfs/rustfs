@@ -27,6 +27,11 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_WORKER_WRITE_UPGRADE_BARRIER: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
 pub(super) fn should_fail_repeated_rebalance_bucket_defer(
     deferred_buckets: &mut HashSet<String>,
     bucket: &str,
@@ -213,6 +218,22 @@ impl ECStore {
         }
 
         if must_persist {
+            // Shared admission grants no write authority. Release it before
+            // taking the exclusive metadata fences, then recheck stop/run/pool
+            // state before publishing the locally staged terminal candidate.
+            drop(activation_fence);
+            #[cfg(test)]
+            if let Ok((arrived, release)) = REBALANCE_WORKER_WRITE_UPGRADE_BARRIER.try_with(Clone::clone) {
+                arrived.notify_one();
+                release.notified().await;
+            }
+            let Some(activation_fence) = self
+                .fence_rebalance_worker_metadata_update(pool.clone(), expected_id.as_ref())
+                .await?
+            else {
+                cancel_tx.cancel();
+                return Ok(false);
+            };
             let save_result = resolve_rebalance_meta_save_result(
                 self.save_rebalance_meta_under_activation_fence(
                     pool,
@@ -242,13 +263,14 @@ impl ECStore {
                 cancel_tx.cancel();
                 return Err(err);
             }
+        } else {
+            if let Err(err) = activation_fence.ensure_held() {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
+                return Err(err);
+            }
+            drop(activation_fence);
         }
-        if !must_persist && let Err(err) = activation_fence.ensure_held() {
-            let mut rebalance_meta = self.rebalance_meta.write().await;
-            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
-            return Err(err);
-        }
-        drop(activation_fence);
 
         if activation_outcome != RebalanceLocalActivationOutcome::Started {
             return Ok(must_persist);

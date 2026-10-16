@@ -1051,10 +1051,12 @@ mod tests {
                 .uri(format!("{CONSOLE_PREFIX}/index.html"))
                 .body(Body::empty())
                 .expect("failed to build request");
-            request.extensions_mut().insert(crate::server::RemoteAddr(SocketAddr::new(
-                IpAddr::from([198, 51, 100, last_octet]),
-                50000,
-            )));
+            request
+                .extensions_mut()
+                .insert(Some(crate::server::RemoteAddr(SocketAddr::new(
+                    IpAddr::from([198, 51, 100, last_octet]),
+                    50000,
+                ))));
             request
         };
 

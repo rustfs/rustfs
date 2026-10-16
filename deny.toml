@@ -19,9 +19,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `paste 1.0.15` — unmaintained. No direct dependency.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive only; tracked for upgrade" },
     # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
     # `openidconnect` (transitive) and historically used directly. No upstream
     # fix is available yet. Tracked separately for follow-up; remove this
