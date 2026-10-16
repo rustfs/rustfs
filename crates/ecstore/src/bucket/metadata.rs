@@ -1198,10 +1198,12 @@ impl BucketMetadata {
                 Self::check_header(&data)?;
                 let previous = Self::unmarshal(&data[4..])?;
                 previous.validate_artifact_configuration()?;
-                if (previous.bucket_incarnation_id == self.bucket_incarnation_id || previous.bucket_incarnation_id.is_nil())
-                    && previous.artifact_base_prefix != self.artifact_base_prefix
+                // Deletion removes this record before recreation. A caller-supplied
+                // incarnation cannot turn an existing bucket into a new generation.
+                if previous.artifact_base_prefix != self.artifact_base_prefix
+                    || (previous.artifact_base_prefix.is_some() && previous.bucket_incarnation_id != self.bucket_incarnation_id)
                 {
-                    return Err(Error::other("artifact namespace is immutable"));
+                    return Err(Error::other("artifact bucket identity is immutable"));
                 }
             }
             Err(Error::ConfigNotFound) => {}
