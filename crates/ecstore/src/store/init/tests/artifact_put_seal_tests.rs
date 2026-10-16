@@ -2,12 +2,13 @@ use super::{build_isolated_test_store, without_storage_class_env};
 use crate::{
     bucket::{artifact::artifact_put_seal_record_path, metadata_sys},
     config::com,
-    disk::DiskAPI as _,
+    disk::{DiskAPI as _, RUSTFS_META_BUCKET},
     object_api::{ObjectInfo, ObjectOptions, PutObjReader, WriteCompletion},
     runtime::instance::InstanceContext,
     set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, rename_fanout_barrier},
     storage_api_contracts::{
         bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions},
+        namespace::NamespaceLocking as _,
         object::ObjectIO as _,
     },
     store::ECStore,
@@ -146,6 +147,15 @@ async fn tail_barrier_case(cancel_put_waiter: bool) {
                 .expect("PUT quorum ACK succeeds before tail completion");
         }
         assert!(tracker.running() > 0, "real rename tail must still be live");
+        let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
+        let attempt_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &record)
+            .await
+            .expect("resolve the actual PUT and seal coordination namespace");
+        assert!(
+            attempt_lock.get_write_lock(Duration::from_secs(1)).await.is_err(),
+            "ARTIFACT_PUT_TAIL_BARRIER: the real commit owner retains the attempt lock until its disk tail drains"
+        );
         let seal_store = store.clone();
         let seal_prefix = prefix.clone();
         let mut seal =
@@ -265,7 +275,7 @@ async fn artifact_put_seal_rejects_corrupt_and_wrong_incarnation_records() {
     put(&store, bucket, &object).await;
     let before = disk_metadata(&store, bucket, &object).await;
     let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
-    for invalid_record in [old_record, b"not-json".to_vec()] {
+    for invalid_record in [old_record, Vec::new(), b"not-json".to_vec()] {
         com::save_config_with_opts(
             store.clone(),
             &record,
