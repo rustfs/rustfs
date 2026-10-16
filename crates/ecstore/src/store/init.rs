@@ -17003,11 +17003,10 @@ mod tests {
             .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
             .await
             .expect_err("one post-commit error plus one offline disk must miss delete quorum");
-        assert!(matches!(err, StorageError::Io(_)), "unexpected local delete failure: {err:?}");
-        assert!(
-            err.to_string()
-                .contains("Storage resources are insufficient for the write operation"),
-            "the caller must observe the wrapped quorum failure: {err}"
+        assert_eq!(
+            err,
+            StorageError::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned()),
+            "the caller must observe the typed quorum failure with its object identity"
         );
         set.disks.write().await[1] = Some(saved_disk);
 
