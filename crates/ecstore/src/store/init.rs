@@ -2753,7 +2753,7 @@ mod tests {
         let too_long = vec!["s".repeat(210); 5].join("/");
         let mut rejected = vec![too_long];
         if cfg!(target_os = "windows") {
-            rejected.extend(["a:b", "NUL.txt", "tab\tname"].map(str::to_owned));
+            rejected.extend(["a:b", "a\\b", "NUL.txt", "tab\tname"].map(str::to_owned));
         }
         for dst_object in &rejected {
             let put_err = store

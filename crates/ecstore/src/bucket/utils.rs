@@ -189,11 +189,18 @@ pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str = "object key contains charac
 )]
 pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1/CONIN$)";
 
+/// Client-facing reason for keys containing `\`: Windows hosts treat it as a
+/// path separator, so `a\b` would land on the same file as `a/b`.
+pub const WINDOWS_BACKSLASH_REASON: &str =
+    "object key contains '\\', which Windows hosts treat as a path separator (it would alias the same key spelled with '/')";
+
 /// Returns the client-facing reason when `object` cannot round-trip through
 /// the Win32 path layer, or `None` when it can.
 ///
 /// Each segment is checked with [`rustfs_utils::check_windows_file_name`].
-/// `\` splits segments here, like on a Windows disk.
+/// `\` splits segments here, like on a Windows disk, so this check never
+/// rejects it: an existing `a\b` key must stay readable and deletable. New
+/// writes reject `\` separately in [`check_new_object_args`].
 #[allow(
     dead_code,
     reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
@@ -244,8 +251,23 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
 /// Admission check for every request that introduces `object` into the
 /// namespace: PutObject, a CopyObject destination, and CreateMultipartUpload.
 /// Sharing one entry keeps their rejections (and S3 error codes) identical.
-pub fn check_new_object_args(bucket: &str, object: &str) -> Result<()> {
-    check_put_object_args(bucket, object)
+///
+/// `data_movement` writes (decommission, rebalance) relocate keys that already
+/// exist, so they skip the new-key-only rules and stay able to move old data.
+/// Internal meta buckets are exempt too: their keys are produced by RustFS
+/// itself and resolve to the same path either way.
+pub fn check_new_object_args(bucket: &str, object: &str, data_movement: bool) -> Result<()> {
+    check_put_object_args(bucket, object)?;
+
+    if cfg!(target_os = "windows") && !data_movement && !is_meta_bucketname(bucket) && object.contains('\\') {
+        return Err(StorageError::InvalidArgument(
+            bucket.to_owned(),
+            object.to_owned(),
+            WINDOWS_BACKSLASH_REASON.to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
@@ -658,6 +680,20 @@ mod tests {
         assert_eq!(windows_object_key_violation("baddir./a:b"), characters);
     }
 
+    /// Existing `a\b` keys must stay readable, deletable and abortable, so the
+    /// shared name check never rejects `\` (only new writes do, on Windows).
+    #[test]
+    fn test_backslash_passes_the_shared_name_check() {
+        assert_eq!(windows_object_key_violation("a\\b"), None);
+        assert_eq!(windows_object_key_violation("dir\\sub\\file.txt"), None);
+        assert!(check_object_name_for_length_and_slash("test-bucket", "a\\b").is_ok());
+        assert!(check_object_args("test-bucket", "a\\b").is_ok());
+        assert!(check_bucket_and_object_names("test-bucket", "a\\b").is_ok());
+        // Data movement relocates keys that already exist.
+        assert!(check_new_object_args("test-bucket", "a\\b", true).is_ok());
+        assert!(check_new_object_args(RUSTFS_META_BUCKET, "config\\a", false).is_ok());
+    }
+
     #[test]
     fn test_check_new_object_args_matches_put_object_args() {
         for object in [
@@ -673,13 +709,13 @@ mod tests {
             "NUL.txt",
         ] {
             assert_eq!(
-                format!("{:?}", check_new_object_args("test-bucket", object)),
+                format!("{:?}", check_new_object_args("test-bucket", object, false)),
                 format!("{:?}", check_put_object_args("test-bucket", object)),
                 "{object:?}"
             );
         }
         assert!(matches!(
-            check_new_object_args("Bad_Bucket", "file.txt"),
+            check_new_object_args("Bad_Bucket", "file.txt", false),
             Err(StorageError::BucketNameInvalid(_))
         ));
     }
@@ -687,9 +723,30 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn test_check_new_object_args_keeps_full_key_set_off_windows() {
-        for object in ["a:b", "baddir.", "NUL", "CONIN$", "tab\tname"] {
-            assert!(check_new_object_args("test-bucket", object).is_ok(), "{object:?}");
+        for object in ["a\\b", "a:b", "baddir.", "NUL", "CONIN$", "tab\tname"] {
+            assert!(check_new_object_args("test-bucket", object, false).is_ok(), "{object:?}");
         }
+    }
+
+    /// `a\b` and `a/b` resolve to the same file on a Windows disk, so a new
+    /// `a\b` would overwrite (or be overwritten by) `a/b`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_new_object_key_rejects_backslash_alias() {
+        assert!(check_new_object_args("test-bucket", "a/b", false).is_ok());
+        for object in ["a\\b", "dir\\", "dir/sub\\file"] {
+            assert!(
+                matches!(
+                    &check_new_object_args("test-bucket", object, false),
+                    Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_BACKSLASH_REASON
+                ),
+                "{object:?}"
+            );
+        }
+        // Reads, deletes and in-flight multipart uploads of existing keys keep working.
+        assert!(check_object_args("test-bucket", "a\\b").is_ok());
+        assert!(check_del_obj_args("test-bucket", "a\\b").is_ok());
+        assert!(check_new_object_args("test-bucket", "a\\b", true).is_ok());
     }
 
     #[test]
@@ -707,7 +764,7 @@ mod tests {
             for result in [
                 check_object_name_for_length_and_slash("test-bucket", object),
                 check_put_object_args("test-bucket", object),
-                check_new_object_args("test-bucket", object),
+                check_new_object_args("test-bucket", object, false),
                 check_object_args("test-bucket", object),
             ] {
                 assert!(
