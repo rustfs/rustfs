@@ -6722,10 +6722,7 @@ mod heal_result_report_tests {
         let bucket = "bucket-no-parity-bitrot";
         let object = "bad-object.bin";
         let payload = (0..(BLOCK_SIZE_V2 + 17)).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
-        let opts = ObjectOptions {
-            no_lock: true,
-            ..Default::default()
-        };
+        let opts = ObjectOptions::default();
 
         set.make_bucket(bucket, &MakeBucketOptions::default())
             .await

@@ -212,11 +212,22 @@ async fn object_mutations_case() {
         .await
         .expect("ordinary replication PUT stays supported");
     {
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(ordinary)
+            .await
+            .expect("ordinary incarnation");
+        let lifecycle = std::sync::Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(ordinary, incarnation)
+                .await
+                .expect("ordinary lifecycle owner"),
+        );
         let lock = store.new_ns_lock(ordinary, &object).await.expect("ordinary target namespace");
         let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
             .await
             .expect("ordinary borrowed owner");
         let mut opts = options();
+        lifecycle.attach_owner(&mut opts);
         opts.add_write_commit_guard(&guard);
         store
             .put_object(ordinary, &object, &mut body(), &opts)

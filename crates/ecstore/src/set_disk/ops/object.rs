@@ -22537,7 +22537,7 @@ mod delete_objects_lock_gating_tests {
     async fn delete_objects_dist_gate_uses_set_instance_context() {
         let dist_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         dist_ctx
-            .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
             .await;
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, Vec::new(), dist_ctx).await;
         let bucket = "dist-gate-ctx-bucket";
@@ -22545,21 +22545,17 @@ mod delete_objects_lock_gating_tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
-        // The put must bypass locking: with a DistErasure context and no
-        // lockers, every namespace lock acquisition fails closed by design.
+        // Seed with real local lifecycle and object locks before switching
+        // this instance to the distributed delete gate under test.
         let mut reader = PutObjReader::from_vec(vec![5u8; 256]);
         set_disks
-            .put_object(
-                bucket,
-                "obj",
-                &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
+            .put_object(bucket, "obj", &mut reader, &ObjectOptions::default())
             .await
-            .expect("object should be written without locks");
+            .expect("object should be written under real local locks");
+        set_disks
+            .ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+            .await;
 
         let objects = vec![ObjectToDelete {
             object_name: "obj".to_string(),
