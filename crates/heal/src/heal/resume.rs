@@ -364,6 +364,11 @@ pub struct ResumeState {
     /// and may receive one bounded compatibility re-arm.
     #[serde(default)]
     pub replacement_legacy_retry_compatibility_done: bool,
+    /// New generations cannot consume the one-shot compatibility handoff for
+    /// a pre-format intent stranded by historical rebalance topology. Missing
+    /// fields in older schema-seven snapshots remain eligible for validation.
+    #[serde(default)]
+    pub replacement_preformat_handoff_retry_done: bool,
     /// The current pass was rewound because the replacement mount was not
     /// ready.  Task-level error persistence must not turn this readiness wait
     /// back into a consumed retry attempt.
@@ -450,6 +455,7 @@ impl ResumeState {
             replacement_legacy_import: None,
             replacement_legacy_successor: None,
             replacement_legacy_retry_compatibility_done: false,
+            replacement_preformat_handoff_retry_done: false,
             replacement_retry_waiting_for_target: false,
             dangling_delete_retry_not_before: None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
@@ -495,6 +501,7 @@ impl ResumeState {
         // New generations already use readiness-aware persistence and must
         // never enter the one-shot compatibility path for legacy snapshots.
         state.replacement_legacy_retry_compatibility_done = true;
+        state.replacement_preformat_handoff_retry_done = true;
         state
     }
 
@@ -1242,6 +1249,9 @@ impl ResumeManager {
         }
         if state.max_retries == 0 {
             return Ok(false);
+        }
+        if self.rearm_preformat_handoff_retry_if_needed(storage).await? {
+            return Ok(true);
         }
         let legacy_rearm = replacement_retry_is_legacy_transient_skip(&state);
         let ready = storage

@@ -38,6 +38,7 @@ mod uring_read_chunks;
 #[path = "uring_result_budget.rs"]
 mod uring_result_budget;
 pub use replacement_lease::ReplacementExecutionLease;
+pub(crate) use replacement_lease::is_blank_target as is_blank_replacement_target;
 
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
