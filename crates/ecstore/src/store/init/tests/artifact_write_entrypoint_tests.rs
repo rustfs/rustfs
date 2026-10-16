@@ -12,7 +12,7 @@ use crate::{
     },
     store::ECStore,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use uuid::Uuid;
 
 fn object_key() -> String {
