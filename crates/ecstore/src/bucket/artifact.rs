@@ -176,8 +176,8 @@ impl PutSealRecord {
 }
 
 pub(crate) fn artifact_put_seal_record_path(bucket: &str, incarnation: Uuid, attempt_prefix: &str) -> String {
-    let digest = Sha256::digest(attempt_prefix.as_bytes());
-    format!("{BUCKET_META_PREFIX}/{bucket}/artifact-put-seals/{incarnation}/{digest:x}.json")
+    let digest = hex_simd::encode_to_string(Sha256::digest(attempt_prefix.as_bytes()), hex_simd::AsciiCase::Lower);
+    format!("{BUCKET_META_PREFIX}/{bucket}/artifact-put-seals/{incarnation}/{digest}.json")
 }
 
 fn attempt_prefix<'a>(base_prefix: &str, object: &'a str) -> Result<&'a str> {
