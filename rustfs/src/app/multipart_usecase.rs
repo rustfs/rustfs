@@ -1729,9 +1729,9 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_owner(&mut dst_opts);
 
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)

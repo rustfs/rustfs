@@ -111,33 +111,26 @@ where
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
-pub(crate) async fn acquire_copy_bucket_lifecycle_lock<S>(store: &S, bucket: &str) -> S3Result<NamespaceLockGuard>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
-    let lock = store
-        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
+pub(crate) async fn acquire_copy_bucket_lifecycle_lock(
+    store: &ECStore,
+    bucket: &str,
+) -> S3Result<Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>> {
+    let expected = store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?;
+    store
+        .acquire_bucket_incarnation_fence(bucket, expected)
         .await
-        .map_err(ApiError::from)?;
-    lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
-        ApiError::from(copy_namespace_lock_error(
-            bucket,
-            BUCKET_LIFECYCLE_LOCK_OBJECT,
-            "bucket_lifecycle_read",
-            err,
-        ))
-        .into()
-    })
+        .map(Arc::new)
+        .map_err(|err| ApiError::from(err).into())
 }
 
-pub(crate) async fn acquire_copy_bucket_lifecycle_locks<S>(
-    store: &S,
+pub(crate) async fn acquire_copy_bucket_lifecycle_locks(
+    store: &ECStore,
     source_bucket: &str,
     destination_bucket: &str,
-) -> S3Result<(NamespaceLockGuard, Option<NamespaceLockGuard>)>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
+) -> S3Result<(
+    Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>,
+    Option<Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>>,
+)> {
     if source_bucket == destination_bucket {
         return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
     }
@@ -391,9 +384,9 @@ impl DefaultObjectUsecase {
         src_get_opts.expected_bucket_incarnation_id = Some(current_source_incarnation_id);
         dst_opts.expected_bucket_incarnation_id = Some(current_destination_incarnation_id);
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_owner(&mut dst_opts);
 
         // Bucket metadata uses the bucket name as its namespace-lock key. Load
         // every copy-time bucket snapshot before a same-object key can collide

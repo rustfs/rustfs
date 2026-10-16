@@ -398,7 +398,7 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
             if let Some(guard) = restore_bucket_lifecycle_guard.as_ref() {
-                restore_dst_opts.add_bucket_lifecycle_lock_guard(guard);
+                guard.attach_owner(&mut restore_dst_opts);
             }
             if let Some(guard) = accept_guard.as_ref() {
                 guard.add_namespace_lock_fence(&mut restore_dst_opts);

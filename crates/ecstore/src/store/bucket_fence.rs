@@ -166,7 +166,8 @@ impl BucketIncarnationFenceGuard {
             && !self.is_lock_lost()
     }
 
-    pub(crate) fn attach_owner(self: &Arc<Self>, opts: &mut crate::object_api::ObjectOptions) {
+    /// Retain this validated lifecycle owner through the storage write tail.
+    pub fn attach_owner(self: &Arc<Self>, opts: &mut crate::object_api::ObjectOptions) {
         self.attach_to_object_options(opts);
         opts.bucket_incarnation_fence = Some(Arc::clone(self));
     }
@@ -179,7 +180,7 @@ impl BucketIncarnationFenceGuard {
         }
     }
 
-    pub(crate) fn is_lock_lost(&self) -> bool {
+    pub fn is_lock_lost(&self) -> bool {
         self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
     }
 
