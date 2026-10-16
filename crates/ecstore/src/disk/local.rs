@@ -11656,6 +11656,8 @@ impl DiskAPI for LocalDisk {
     // TODO(backlog): support io.writer cancellation and early termination in walk_dir
     #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(&opts.bucket, None);
         self.wait_for_startup_cleanup().await;
 
         // Callers that do not pin a stall budget inherit the configured default, so
@@ -12225,6 +12227,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(volume, Some(path));
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.io_get_object_path(volume, path)?;
         let file_dir = self.io_get_bucket_path(volume)?;

@@ -24,6 +24,8 @@ pub mod format;
 pub mod fs;
 pub mod health_state;
 mod io_admission;
+#[cfg(test)]
+pub(crate) mod lifecycle_test_io;
 pub mod local;
 pub mod os;
 
