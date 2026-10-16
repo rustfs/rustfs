@@ -4659,7 +4659,11 @@ impl SetDisks {
                     .with_namespace_commit_guard((!is_meta_bucketname(&commit_bucket)).then(|| {
                         // Disk workers and rollback retain this owner even if
                         // the rename coordinator itself fails or is cancelled.
-                        Arc::new((commit_set.ctx.begin_namespace_commit(), _artifact_put_guard.clone())) as Arc<dyn Send + Sync>
+                        let namespace_owner = commit_set.ctx.begin_namespace_commit();
+                        match _artifact_put_guard.clone() {
+                            Some(artifact_owner) => Arc::new((namespace_owner, artifact_owner)) as Arc<dyn Send + Sync>,
+                            None => namespace_owner as Arc<dyn Send + Sync>,
+                        }
                     })),
                 )
                 .await;

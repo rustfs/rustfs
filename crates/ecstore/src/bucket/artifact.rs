@@ -218,7 +218,7 @@ impl ECStore {
             return Err(Error::other("artifact PUT sealing requires namespace locking"));
         }
         let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
-        if expected_incarnation.is_nil() || metadata.bucket_incarnation_id != expected_incarnation {
+        if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation {
             return Err(Error::other("artifact PUT seal bucket incarnation mismatch"));
         }
         let record = PutSealRecord::new(&metadata, attempt_prefix)?;
