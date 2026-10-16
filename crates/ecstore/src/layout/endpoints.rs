@@ -1729,10 +1729,20 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
 
     Err(Error::other(format!(
         "local erasure endpoints must use distinct physical disks; detected shared devices [{details}]. \
-validation diagnostics: [{diagnostics_summary}]. \
+validation diagnostics: [{diagnostics_summary}]. {SHARED_DEVICE_PLATFORM_HINT}\
 Set {ENV_UNSAFE_BYPASS_DISK_CHECK}=true only for local testing or CI to bypass this safety check"
     )))
 }
+
+/// Windows reports the volume mount point (for example `C:\`) as the device
+/// identity, so every directory on one drive letter or mounted volume counts
+/// as the same physical disk.
+#[cfg(windows)]
+const SHARED_DEVICE_PLATFORM_HINT: &str = "On Windows the device identity is the volume mount point, so directories on the same \
+drive letter or mounted volume (for example C:\\data1 and C:\\data2) count as one disk; place each endpoint on its own \
+volume. ";
+#[cfg(not(windows))]
+const SHARED_DEVICE_PLATFORM_HINT: &str = "";
 
 fn validate_local_cross_device_mounts(local_paths: &[String]) -> Result<()> {
     rustfs_utils::os::check_cross_device_mounts(local_paths)
@@ -3579,6 +3589,38 @@ mod test {
                 panic!("Test {}: expected failure but passed instead", i + 1);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[serial]
+    #[tokio::test]
+    async fn windows_url_endpoints_on_one_volume_resolve_and_report_shared_volume() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, None::<&str>)], async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut endpoints = Vec::new();
+            for name in ["disk1", "disk2"] {
+                let disk = dir.path().join(name);
+                std::fs::create_dir_all(&disk).unwrap();
+                let drive_path = disk.to_string_lossy().replace('\\', "/");
+                let mut endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).unwrap();
+                endpoint.is_local = true;
+                endpoints.push(endpoint);
+            }
+
+            let err = validate_local_physical_disk_independence(&[Endpoints::from(endpoints)]).unwrap_err();
+
+            // Before the drive-path fix, `/C:/...` failed canonicalization here
+            // with "failed to resolve local endpoint path".
+            let err_text = err.to_string();
+            assert!(
+                !err_text.contains("failed to resolve local endpoint path"),
+                "unexpected error: {err_text}"
+            );
+            assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
+            assert!(err_text.contains("same drive letter or mounted volume"), "unexpected error: {err_text}");
+            assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+        })
+        .await;
     }
 
     #[cfg(target_os = "linux")]

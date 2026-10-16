@@ -19,6 +19,7 @@ on:
     branches: [ main ]
     paths:
       - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
@@ -30,6 +31,7 @@ on:
     branches: [ main ]
     paths:
       - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
@@ -86,6 +88,10 @@ jobs:
       - name: Test Windows handle guards
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
+
+      - name: Test endpoint path parsing
+        shell: pwsh
+        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
 
       - name: Test startup temporary-directory cleanup
         shell: pwsh
