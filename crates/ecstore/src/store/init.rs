@@ -2716,6 +2716,106 @@ mod tests {
         (instance_ctx, store, shutdown)
     }
 
+    /// CopyObject destinations and CreateMultipartUpload create keys, so they
+    /// must reject exactly the keys PutObject rejects, with the same error.
+    /// The copy path reaches the pools' put_object directly and used to admit
+    /// keys PutObject refused (e.g. over 1024 bytes, or Windows-unaddressable).
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn copy_destination_and_multipart_create_share_put_object_admission() {
+        let temp_dir = tempfile::tempdir().expect("create key-admission store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "key-admission", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("key-admission-{}", Uuid::new_v4());
+        let source_object = "source.bin";
+        let payload = b"key admission source".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("key-admission bucket should be created");
+        store
+            .put_object(
+                &bucket,
+                source_object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source object should be written");
+        let source_info = store
+            .get_object_info(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("source metadata should be readable");
+
+        // Every segment fits NAME_MAX, but the key exceeds S3's 1024 bytes.
+        let too_long = vec!["s".repeat(210); 5].join("/");
+        let mut rejected = vec![too_long];
+        if cfg!(target_os = "windows") {
+            rejected.extend(["a:b", "NUL.txt", "tab\tname"].map(str::to_owned));
+        }
+        for dst_object in &rejected {
+            let put_err = store
+                .put_object(
+                    &bucket,
+                    dst_object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect_err("PutObject must reject the key");
+            let mut copy_source = source_info.clone();
+            copy_source.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+            let copy_err = store
+                .copy_object(
+                    &bucket,
+                    source_object,
+                    &bucket,
+                    dst_object,
+                    &mut copy_source,
+                    &ObjectOptions::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect_err("CopyObject must reject the destination key");
+            assert_eq!(format!("{copy_err:?}"), format!("{put_err:?}"), "{dst_object:?}");
+            let multipart_err = store
+                .new_multipart_upload(&bucket, dst_object, &ObjectOptions::default())
+                .await
+                .expect_err("CreateMultipartUpload must reject the key");
+            assert_eq!(format!("{multipart_err:?}"), format!("{put_err:?}"), "{dst_object:?}");
+        }
+
+        // A segment over NAME_MAX used to be admitted by CreateMultipartUpload
+        // and only fail at completion with ENAMETOOLONG (rustfs#5785).
+        let oversized_segment = "m".repeat(256);
+        assert!(matches!(
+            store
+                .new_multipart_upload(&bucket, &oversized_segment, &ObjectOptions::default())
+                .await,
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+
+        // In-place copies rewrite an existing key and keep the copy-only check.
+        let mut in_place = source_info.clone();
+        in_place.metadata_only = true;
+        store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                source_object,
+                &mut in_place,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("in-place copy of an existing key should succeed");
+
+        shutdown.cancel();
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]

@@ -556,7 +556,7 @@ impl ECStore {
         opts: &ObjectOptions,
         mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
-        check_new_multipart_args(bucket, object)?;
+        check_new_object_args(bucket, object)?;
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         if self.single_pool() {

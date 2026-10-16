@@ -4562,7 +4562,7 @@ impl ECStore {
     }
 
     async fn prepare_put_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(String, ObjectOptions)> {
-        check_put_object_args(bucket, object)?;
+        check_new_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
         let mut opts = opts.clone();
@@ -4782,7 +4782,17 @@ impl ECStore {
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_copy_obj_args(src_bucket, src_object)?;
-        check_copy_obj_args(dst_bucket, dst_object)?;
+        if src_bucket == dst_bucket && src_object == dst_object {
+            // In-place copies (metadata replace, restore) rewrite a key that
+            // already exists, so they must keep working for keys that new
+            // writes would no longer accept.
+            check_copy_obj_args(dst_bucket, dst_object)?;
+        } else {
+            // A copy onto another key creates that key: it must be admitted
+            // exactly like PutObject, since the copy reaches the pools' own
+            // put_object without passing through prepare_put_object.
+            check_new_object_args(dst_bucket, dst_object)?;
+        }
 
         let src_object = encode_dir_object(src_object);
         let dst_object = encode_dir_object(dst_object);
