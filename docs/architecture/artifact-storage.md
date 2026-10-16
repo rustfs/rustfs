@@ -75,10 +75,18 @@ A failed or cancelled seal request may still leave a record for its original
 incarnation. Retry idempotently to confirm success; an error is not proof that
 the attempt remains writable or that all metadata writes have been cleaned up.
 
-This operation does not yet prove that every write path is sealed. Borrowed-lock
-writes, multipart completion, copy, replication, data movement, repair, and
-restore require separate enforcement and verification. Runner must not consume
-this PUT-only operation as a permanent all-writes seal.
+The managed ECStore entry points reject unsupported writes into an artifact
+bucket: borrowed-lock and special-purpose PUTs, copy destinations, multipart
+creation/parts/completion, data movement, restore, transition, metadata rewrites,
+and tag changes. Copying from an artifact bucket to an ordinary bucket remains
+allowed. Listing and aborting existing multipart uploads remain available for
+cleanup. Classification is bound to the authoritative bucket incarnation, so an
+old ordinary-bucket request cannot publish into a recreated artifact bucket.
+
+This operation does not yet prove that every write path is sealed. Direct
+lower-level writes, repair, remote physical completion, and a controlled external
+seal interface still require enforcement and verification. Runner must not
+consume this PUT-only operation as a permanent all-writes seal.
 
 Before Runner can rely on a seal, storage must fence every supported write path
 for the exact bucket incarnation and attempt namespace, retain the fence through
@@ -101,12 +109,18 @@ updates, metadata replacement, and versioning rejection. Run:
 cargo test --locked -p rustfs-storage-api --lib artifact
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_write_entrypoint -- --test-threads=1
 ```
 
 `crates/ecstore/src/store/init/tests/artifact_put_seal_tests.rs` pauses real
 rename work to check the PUT barrier, including a cancelled request waiter, and
 compares on-disk object metadata after rejected writes. It also checks restart,
 record corruption, generation mismatch, and ordinary bucket behavior.
+
+`crates/ecstore/src/store/init/tests/artifact_write_entrypoint_tests.rs` checks
+unsupported entry points against real four-disk state, ordinary-bucket success
+controls, cleanup of preexisting multipart uploads, and deletion/recreation
+between request classification and publication.
 
 These checks establish bucket identity, versioning, and ordinary PUT sealing.
 They do not certify all-writes sealing, backup retention, or safe artifact
