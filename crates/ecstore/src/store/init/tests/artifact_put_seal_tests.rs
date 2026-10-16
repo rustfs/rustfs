@@ -333,3 +333,123 @@ async fn artifact_put_seal_does_not_change_ordinary_bucket_puts() {
     assert_ne!(first.version_id, second.version_id, "ordinary versioned PUT creates another version");
     shutdown.cancel();
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_put_seal_lock_survives_physical_publication_timeout() {
+    use crate::disk::{Disk, ReadOptions, STORAGE_FORMAT_FILE, os};
+
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60")),
+            (crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false")),
+        ],
+        async {
+            let root = tempfile::tempdir().expect("artifact physical timeout directory");
+            let (_ctx, store, shutdown) = open_store(root.path()).await;
+            let bucket = "artifact-put-physical-timeout";
+            let incarnation = create_bucket(&store, bucket).await;
+            let prefix = attempt_prefix();
+            let object = format!("{prefix}image.png");
+            put(&store, bucket, &object).await;
+            let disks = store.pools[0].disk_set[0].disk_inventory().await;
+            let mut hooks = Vec::new();
+            let mut entered = Vec::new();
+            let mut releases = Vec::new();
+            let mut destinations = Vec::new();
+            for disk in disks.iter().flatten() {
+                let Disk::Local(local) = disk.as_ref() else {
+                    panic!("physical timeout fixture requires local disks");
+                };
+                // Resolve through the mount lease; Linux may use an FD-based path.
+                let destination = local
+                    .get_disk()
+                    .get_object_path_for_io(bucket, &object)
+                    .expect("real publication path");
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                hooks.push(os::prepared_publication_test_hooks::install(
+                    &destination.join(STORAGE_FORMAT_FILE),
+                    move || {
+                        let _ = entered_tx.send(());
+                        // Dropping the sender also releases the syscall during panic unwinding.
+                        let _ = release_rx.recv();
+                    },
+                ));
+                entered.push(entered_rx);
+                releases.push(release_tx);
+                destinations.push(destination);
+            }
+            assert_eq!(entered.len(), 4, "all four real disks must be online");
+            let version = Uuid::new_v4();
+            let put_store = store.clone();
+            let put_object = object.clone();
+            let mut replacement = tokio::spawn(async move {
+                put_store
+                    .put_object(
+                        bucket,
+                        &put_object,
+                        &mut PutObjReader::from_vec(vec![0xCC; 379]),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(DEADLINE, async {
+                tokio::select! {
+                    signals = futures::future::join_all(entered) => assert!(signals.into_iter().all(|signal| signal.is_ok())),
+                    _ = &mut replacement => panic!("PUT cannot finish before its physical publishers are paused"),
+                }
+            })
+            .await
+            .expect("all physical xl.meta publications reach the blocking syscall");
+            // All disk wrapper timers exist, but their physical closures stay blocked.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(61)).await;
+            tokio::time::resume();
+            let result = tokio::time::timeout(DEADLINE, replacement)
+                .await
+                .expect("PUT returns after disk wrapper timeouts")
+                .expect("PUT task joins");
+            assert!(result.is_err(), "four timed-out publishers cannot satisfy write quorum");
+            let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
+            let attempt_lock = store
+                .new_ns_lock(RUSTFS_META_BUCKET, &record)
+                .await
+                .expect("actual attempt coordination namespace");
+            let physical_owner_kept_lock = attempt_lock.get_write_lock(Duration::from_secs(1)).await.is_err();
+
+            // Drain physical syscalls before the regression assertion, including a RED run.
+            drop(releases);
+            for (disk, destination) in disks.iter().flatten().zip(&destinations) {
+                drop(
+                    tokio::time::timeout(DEADLINE, os::acquire_rename_data_mutation_lease(&disk.path(), bucket, destination))
+                        .await
+                        .expect("released physical publisher drains"),
+                );
+                let published = disk
+                    .read_version("", bucket, &object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("timed-out physical writer actually publishes the exact new version");
+                assert_eq!(published.size, 379);
+            }
+            assert!(
+                physical_owner_kept_lock,
+                "ARTIFACT_PUT_TAIL_BARRIER: disk workers retain the attempt lock after the PUT coordinator returns its timeout"
+            );
+            tokio::time::timeout(DEADLINE, store.clone().seal_artifact_attempt_puts(bucket, incarnation, &prefix))
+                .await
+                .expect("seal resumes after physical owners drain")
+                .expect("seal persists after timeout recovery");
+            let before = disk_metadata(&store, bucket, &object).await;
+            assert_rejected_without_new_version(&store, bucket, &object, &before).await;
+            shutdown.cancel();
+        },
+    )
+    .await;
+}
