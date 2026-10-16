@@ -59,6 +59,7 @@ use uuid::Uuid;
 
 pub mod data_usage_define;
 pub mod error;
+mod lifecycle_cache;
 pub mod prefix_usage;
 pub mod raw_page_index;
 mod remote_scanner;
@@ -330,7 +331,7 @@ pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<Disk
 
 pub(crate) async fn get_lifecycle_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::BucketLifecycleConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedLifecycleConfiguration, time::OffsetDateTime)> {
     ecstore_get_lifecycle_config(bucket).await
 }
 
@@ -350,9 +351,9 @@ pub(crate) trait ScannerLifecycleConfigExt {
     fn has_active_rules(&self, prefix: &str) -> bool;
 }
 
-impl ScannerLifecycleConfigExt for s3s::dto::BucketLifecycleConfiguration {
+impl ScannerLifecycleConfigExt for rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
     fn has_active_rules(&self, prefix: &str) -> bool {
-        <s3s::dto::BucketLifecycleConfiguration as EcstoreLifecycle>::has_active_rules(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as EcstoreLifecycle>::has_active_rules(self, prefix)
     }
 }
 

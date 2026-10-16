@@ -39,20 +39,19 @@ mod storage_api;
 
 use rustfs_gateway_types::dto::{Status, StorageClass};
 use rustfs_gateway_types::persistence::{
-    PersistedOptionalReplicationStatus, PersistedReplicationAnd, PersistedReplicationConfiguration,
-    PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus,
-    PersistedReplicationTag, PersistedSourceSelectionCriteria,
+    PersistedAbortIncompleteMultipartUpload, PersistedDelMarkerExpiration, PersistedLifecycleAnd,
+    PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleFilter, PersistedLifecycleRule,
+    PersistedLifecycleTag, PersistedNoncurrentVersionExpiration, PersistedOptionalReplicationStatus, PersistedReplicationAnd,
+    PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule,
+    PersistedReplicationStatus, PersistedReplicationTag, PersistedSourceSelectionCriteria, PersistedTransition,
 };
 use s3s::dto::{
-    AbortIncompleteMultipartUpload, AccelerateConfiguration, BucketAccelerateStatus, BucketLifecycleConfiguration,
-    BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule, Condition, DefaultRetention, DelMarkerExpiration,
-    ErrorDocument, Event, ExcludedPrefix, ExpirationStatus, FilterRule, FilterRuleName, IndexDocument, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter, LoggingEnabled, NoncurrentVersionExpiration,
+    AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule,
+    Condition, DefaultRetention, ErrorDocument, Event, ExcludedPrefix, FilterRule, FilterRuleName, IndexDocument, LoggingEnabled,
     NotificationConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
     ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration, QueueConfiguration, Redirect,
     RequestPaymentConfiguration, RoutingRule, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, Transition, TransitionStorageClass,
-    VersioningConfiguration, WebsiteConfiguration,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use std::path::{Path, PathBuf};
 use storage_api::bucket_config_codec::{BucketConfigXml, deserialize, serialize};
@@ -193,40 +192,43 @@ mod rustfs_values {
         }
     }
 
-    pub(super) fn lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    pub(super) fn lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             rules: vec![
-                LifecycleRule {
-                    abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
+                PersistedLifecycleRule {
+                    abort_incomplete_multipart_upload: Some(PersistedAbortIncompleteMultipartUpload {
                         days_after_initiation: Some(3),
                     }),
-                    del_marker_expiration: Some(DelMarkerExpiration { days: Some(7) }),
-                    expiration: Some(LifecycleExpiration {
+                    del_marker_expiration: Some(PersistedDelMarkerExpiration { days: Some(7) }),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(30),
                         ..Default::default()
                     }),
-                    filter: Some(LifecycleRuleFilter {
+                    filter: Some(PersistedLifecycleFilter {
                         prefix: Some("tmp/".to_owned()),
                         ..Default::default()
                     }),
                     id: Some("expire-tmp".to_owned()),
-                    noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                         newer_noncurrent_versions: Some(2),
                         noncurrent_days: Some(7),
                     }),
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    status: "Enabled".to_owned(),
                     transitions: None,
                 },
-                LifecycleRule {
+                PersistedLifecycleRule {
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     expiration: None,
-                    filter: Some(LifecycleRuleFilter {
-                        and: Some(LifecycleRuleAndOperator {
+                    filter: Some(PersistedLifecycleFilter {
+                        and: Some(PersistedLifecycleAnd {
                             prefix: Some("archive/".to_owned()),
-                            tags: Some(vec![tag("tier", "cold")]),
+                            tags: Some(vec![PersistedLifecycleTag {
+                                key: Some("tier".to_owned()),
+                                value: Some("cold".to_owned()),
+                            }]),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -235,10 +237,10 @@ mod rustfs_values {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    transitions: Some(vec![Transition {
+                    status: "Enabled".to_owned(),
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(90),
-                        storage_class: Some(TransitionStorageClass::from_static("COLDTIER")),
+                        storage_class: Some("COLDTIER".to_owned()),
                         ..Default::default()
                     }]),
                 },
@@ -431,8 +433,8 @@ mod bucket_config_goldens {
     golden!(notification_minio, "notification", "minio", NotificationConfiguration);
     golden!(notification_rustfs, "notification", rustfs = rustfs_values::notification());
 
-    golden!(lifecycle_aws, "lifecycle", "aws", BucketLifecycleConfiguration);
-    golden!(lifecycle_minio, "lifecycle", "minio", BucketLifecycleConfiguration);
+    golden!(lifecycle_aws, "lifecycle", "aws", PersistedLifecycleConfiguration);
+    golden!(lifecycle_minio, "lifecycle", "minio", PersistedLifecycleConfiguration);
     golden!(lifecycle_rustfs, "lifecycle", rustfs = rustfs_values::lifecycle());
 
     golden!(object_lock_aws, "object_lock", "aws", ObjectLockConfiguration);
@@ -501,4 +503,92 @@ mod bucket_config_goldens {
         "public_access_block",
         rustfs = rustfs_values::public_access_block()
     );
+}
+
+mod bucket_config_lifecycle_date_compat {
+    use super::*;
+    use rustfs_lifecycle::core::format_lifecycle_date;
+    use time::OffsetDateTime;
+
+    const DATES: [&str; 3] = [
+        "2023-11-14T22:13:20.123456789Z",
+        "2023-11-14T22:13:20.123456789+05:30",
+        "2025-01-02T00:00:00+02:00",
+    ];
+
+    fn document(date: &str) -> Vec<u8> {
+        format!(
+            "<LifecycleConfiguration><ExpiryUpdatedAt>{date}</ExpiryUpdatedAt><Rule><ID>date-compat</ID><Status>Enabled</Status><Expiration><Date>{date}</Date></Expiration><Transition><Date>{date}</Date><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"
+        )
+        .into_bytes()
+    }
+
+    fn legacy_read(input: &[u8]) -> s3s::dto::BucketLifecycleConfiguration {
+        let mut reader = s3s::xml::Deserializer::new(input);
+        let value = s3s::xml::Deserialize::deserialize(&mut reader).expect("the actual old lifecycle reader accepts the date");
+        reader.expect_eof().expect("the old reader consumes the entire date fixture");
+        value
+    }
+
+    #[test]
+    fn lifecycle_xml_reader_preserves_legacy_date_precision_and_offset() {
+        for date in DATES {
+            let input = document(date);
+            let old = legacy_read(&input);
+            let new: PersistedLifecycleConfiguration = deserialize(&input).expect("read persisted lifecycle date");
+            let old_date = |value: &s3s::dto::Timestamp| {
+                format_lifecycle_date(OffsetDateTime::from(value.clone())).expect("format the original old-reader date")
+            };
+            assert_eq!(
+                [
+                    new.expiry_updated_at.clone(),
+                    new.rules[0].expiration.as_ref().and_then(|value| value.date.clone()),
+                    new.rules[0].transitions.as_ref().unwrap()[0].date.clone(),
+                ],
+                [
+                    Some(old_date(old.expiry_updated_at.as_ref().unwrap())),
+                    Some(old_date(old.rules[0].expiration.as_ref().unwrap().date.as_ref().unwrap())),
+                    Some(old_date(old.rules[0].transitions.as_ref().unwrap()[0].date.as_ref().unwrap())),
+                ],
+                "the lifecycle reader must retain the old date representation for {date}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_xml_writer_preserves_legacy_date_bytes() {
+        for date in DATES {
+            let old = legacy_read(&document(date));
+            let mut old_xml = Vec::new();
+            s3s::xml::Serialize::serialize(&old, &mut s3s::xml::Serializer::new(&mut old_xml))
+                .expect("the actual old lifecycle writer emits the date");
+            let new = PersistedLifecycleConfiguration {
+                expiry_updated_at: Some(date.to_owned()),
+                rules: vec![PersistedLifecycleRule {
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    expiration: Some(PersistedLifecycleExpiration {
+                        date: Some(date.to_owned()),
+                        ..Default::default()
+                    }),
+                    filter: None,
+                    id: Some("date-compat".to_owned()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    status: "Enabled".to_owned(),
+                    transitions: Some(vec![PersistedTransition {
+                        date: Some(date.to_owned()),
+                        days: None,
+                        storage_class: Some("GLACIER".to_owned()),
+                    }]),
+                }],
+            };
+            assert_eq!(
+                serialize(&new).expect("write persisted lifecycle date"),
+                old_xml,
+                "legacy date bytes for {date}"
+            );
+        }
+    }
 }

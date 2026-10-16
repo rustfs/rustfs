@@ -996,7 +996,9 @@ mod tests {
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
-    use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleRule,
+    };
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
@@ -1039,12 +1041,12 @@ mod tests {
         }
     }
 
-    fn expired_delete_marker_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn expired_delete_marker_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),

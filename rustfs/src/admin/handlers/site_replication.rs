@@ -48,6 +48,7 @@ use crate::site_replication::identity::{
     site_identity_key,
 };
 use crate::storage::storage_api::{lock_bucket_targets_metadata, with_config_object_write_lock};
+use crate::storage_api::site_replication::{format_lifecycle_date, parse_lifecycle_date};
 use base64_simd::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use http::Uri;
@@ -4785,13 +4786,13 @@ fn prune_removed_site_replication_bucket_targets(
 /// site-local fields always survive; a delete (`incoming == None`) therefore
 /// merges with the empty set instead of dropping the whole config.
 fn merge_incoming_lifecycle_config(
-    incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
-    local: Option<s3s::dto::BucketLifecycleConfiguration>,
+    incoming: Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
+    local: Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
     updated_at: Option<OffsetDateTime>,
-) -> Option<s3s::dto::BucketLifecycleConfiguration> {
+) -> std::io::Result<Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>> {
     // Incoming rules reduced to their traveling expiry side. Rules with no
     // expiry semantics after the strip are not installed.
-    let mut incoming_by_id: HashMap<String, s3s::dto::LifecycleRule> = HashMap::new();
+    let mut incoming_by_id: HashMap<String, rustfs_gateway_types::persistence::PersistedLifecycleRule> = HashMap::new();
     let mut incoming_order: Vec<String> = Vec::new();
     for mut rule in incoming.into_iter().flat_map(|config| config.rules) {
         strip_site_local_lifecycle_fields(&mut rule);
@@ -4808,7 +4809,7 @@ fn merge_incoming_lifecycle_config(
     // document is byte-stable, so bucket metadata is written once, not on
     // every broadcast.
     let local_expiry_updated_at = local.as_ref().and_then(|config| config.expiry_updated_at.clone());
-    let mut rules: Vec<s3s::dto::LifecycleRule> = Vec::new();
+    let mut rules: Vec<rustfs_gateway_types::persistence::PersistedLifecycleRule> = Vec::new();
     for mut rule in local.into_iter().flat_map(|config| config.rules) {
         let id = rule.id.clone().unwrap_or_default();
         if let Some(mut incoming_rule) = incoming_by_id.remove(&id) {
@@ -4845,19 +4846,19 @@ fn merge_incoming_lifecycle_config(
     }
 
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(s3s::dto::BucketLifecycleConfiguration {
+    Ok(Some(rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
         rules,
         // Record the expiry axis the staleness guard compares on. (The PUT
         // path stamps `expiry_updated_at` only when the expiry subset
         // changes, so this axis is not inflated by transition-only edits.)
-        expiry_updated_at: updated_at.map(s3s::dto::Timestamp::from).or(local_expiry_updated_at),
-    })
+        expiry_updated_at: updated_at.map(format_lifecycle_date).transpose()?.or(local_expiry_updated_at),
+    }))
 }
 
-fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
+fn lifecycle_rule_has_transition(rule: &rustfs_gateway_types::persistence::PersistedLifecycleRule) -> bool {
     rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty())
         || rule
             .noncurrent_version_transitions
@@ -4877,17 +4878,17 @@ fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
 ///   bucket metadata as the deletion's lower bound, so a delayed stale
 ///   broadcast cannot resurrect deleted expiry rules.
 fn local_lifecycle_staleness_axis(
-    local: Option<&s3s::dto::BucketLifecycleConfiguration>,
+    local: Option<&rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
     whole_config_axis: OffsetDateTime,
-) -> OffsetDateTime {
-    match local {
+) -> std::io::Result<OffsetDateTime> {
+    Ok(match local {
         Some(config) => match config.expiry_updated_at.clone() {
-            Some(axis) => OffsetDateTime::from(axis),
+            Some(axis) => parse_lifecycle_date(&axis)?,
             None if config.rules.iter().any(lifecycle_rule_has_expiry) => whole_config_axis,
             None => OffsetDateTime::UNIX_EPOCH,
         },
         None => whole_config_axis,
-    }
+    })
 }
 
 /// Recognize MinIO's zero-rule lifecycle tombstone (its delete /
@@ -4903,7 +4904,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         #[serde(rename = "@xmlns")]
         _xmlns: Option<String>,
         #[serde(rename = "ExpiryUpdatedAt")]
-        _expiry_updated_at: Option<s3s::dto::Timestamp>,
+        expiry_updated_at: Option<String>,
     }
 
     let mut reader = quick_xml::Reader::from_reader(raw);
@@ -4962,7 +4963,16 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         }
     };
 
-    well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
+    if !well_formed_document {
+        return false;
+    }
+    let Ok(tombstone) = quick_xml::de::from_reader::<_, Tombstone>(raw) else {
+        return false;
+    };
+    tombstone
+        .expiry_updated_at
+        .as_deref()
+        .is_none_or(|value| parse_lifecycle_date(value).is_ok())
 }
 
 fn replication_rule_deployment_id(rule: &PersistedReplicationRule) -> Option<String> {
@@ -6014,7 +6024,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         let incoming = match item.expiry_lc_config.as_ref() {
             Some(raw) => {
                 let data = decode_bucket_meta_wire_value(raw);
-                match deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data) {
+                match deserialize::<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>(&data) {
                     Ok(config) => Some(config),
                     // MinIO's delete tombstone / transition-only state is a
                     // zero-rule document the strict deserializer rejects; it
@@ -6038,17 +6048,22 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             None
         } else {
             Some(
-                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&local_metadata.lifecycle_config_xml).map_err(|e| {
-                    S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}"))
-                })?,
+                deserialize::<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>(
+                    &local_metadata.lifecycle_config_xml,
+                )
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}")))?,
             )
         };
         let whole_config_axis = local_metadata.lifecycle_config_updated_at;
-        if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
+        let local_axis = local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}")))?;
+        if is_stale_update(local_axis, incoming_updated_at) {
             return Ok(());
         }
         let local_absent = local.is_none();
-        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
+        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?
+        {
             Some(config) => Some(
                 serialize(&config)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?,
@@ -13215,19 +13230,23 @@ mod tests {
         );
     }
 
-    fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
-        s3s::dto::LifecycleRule {
+    fn lc_rule(
+        id: &str,
+        expiry_days: Option<i32>,
+        transition_days: Option<i32>,
+    ) -> rustfs_gateway_types::persistence::PersistedLifecycleRule {
+        rustfs_gateway_types::persistence::PersistedLifecycleRule {
             id: Some(id.to_string()),
-            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            status: "Enabled".to_owned(),
             prefix: Some(String::new()),
-            expiration: expiry_days.map(|days| s3s::dto::LifecycleExpiration {
+            expiration: expiry_days.map(|days| rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
                 days: Some(days),
                 ..Default::default()
             }),
             transitions: transition_days.map(|days| {
-                vec![s3s::dto::Transition {
+                vec![rustfs_gateway_types::persistence::PersistedTransition {
                     days: Some(days),
-                    storage_class: Some(s3s::dto::TransitionStorageClass::from_static(s3s::dto::TransitionStorageClass::GLACIER)),
+                    storage_class: Some("GLACIER".to_owned()),
                     date: None,
                 }]
             }),
@@ -13239,14 +13258,16 @@ mod tests {
         }
     }
 
-    fn lc_config(rules: Vec<s3s::dto::LifecycleRule>) -> s3s::dto::BucketLifecycleConfiguration {
-        s3s::dto::BucketLifecycleConfiguration {
+    fn lc_config(
+        rules: Vec<rustfs_gateway_types::persistence::PersistedLifecycleRule>,
+    ) -> rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
+        rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
             rules,
             expiry_updated_at: None,
         }
     }
 
-    fn rule_ids(config: &s3s::dto::BucketLifecycleConfiguration) -> Vec<&str> {
+    fn rule_ids(config: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration) -> Vec<&str> {
         config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
     }
 
@@ -13260,6 +13281,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13278,6 +13300,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("r1", Some(1), Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         assert_eq!(merged.rules.len(), 1);
@@ -13298,6 +13321,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let r1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("r1")).unwrap();
@@ -13319,6 +13343,7 @@ mod tests {
             ])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13342,12 +13367,15 @@ mod tests {
             ])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("transition rules must survive a peer lifecycle delete");
         assert_eq!(rule_ids(&merged), vec!["mixed"]);
         assert!(merged.rules[0].expiration.is_none());
 
         assert!(
-            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None).is_none(),
+            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None)
+                .expect("expiry timestamp must remain encodable")
+                .is_none(),
             "an all-expiry config deletes cleanly"
         );
     }
@@ -13357,13 +13385,14 @@ mod tests {
     #[test]
     fn test_merge_incoming_lifecycle_keeps_disabled_transition_rule() {
         let mut disabled = lc_rule("t-disabled", None, Some(30));
-        disabled.status = s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::DISABLED);
+        disabled.status = "Disabled".to_owned();
 
         let merged = merge_incoming_lifecycle_config(
             Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
             Some(lc_config(vec![disabled])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13376,11 +13405,11 @@ mod tests {
     /// MinIO's sender-side filter).
     #[test]
     fn test_merge_incoming_lifecycle_abort_mpu_rules_stay_local() {
-        let abort_only = |id: &str| s3s::dto::LifecycleRule {
+        let abort_only = |id: &str| rustfs_gateway_types::persistence::PersistedLifecycleRule {
             id: Some(id.to_string()),
-            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            status: "Enabled".to_owned(),
             prefix: Some(String::new()),
-            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+            abort_incomplete_multipart_upload: Some(rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
                 days_after_initiation: Some(3),
             }),
             del_marker_expiration: None,
@@ -13396,6 +13425,7 @@ mod tests {
             Some(lc_config(vec![abort_only("local-abort")])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13414,8 +13444,12 @@ mod tests {
         let incoming = || Some(lc_config(vec![lc_rule("e1", Some(7), None), lc_rule("e2", Some(9), None)]));
         let local = Some(lc_config(vec![lc_rule("t1", None, Some(30))]));
 
-        let once = merge_incoming_lifecycle_config(incoming(), local, None).expect("first merge");
-        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None).expect("second merge");
+        let once = merge_incoming_lifecycle_config(incoming(), local, None)
+            .expect("expiry timestamp must remain encodable")
+            .expect("first merge");
+        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None)
+            .expect("expiry timestamp must remain encodable")
+            .expect("second merge");
 
         assert_eq!(
             serialize(&once).expect("serialize once"),
@@ -13431,10 +13465,16 @@ mod tests {
     fn test_merge_incoming_lifecycle_stamps_expiry_updated_at() {
         let updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
         let merged = merge_incoming_lifecycle_config(Some(lc_config(vec![lc_rule("e1", Some(7), None)])), None, Some(updated_at))
+            .expect("expiry timestamp must remain encodable")
             .expect("merge should keep rules");
 
         let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
-        assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
+        assert_eq!(
+            parse_lifecycle_date(&stamped)
+                .expect("read stamped expiry axis")
+                .unix_timestamp(),
+            updated_at.unix_timestamp()
+        );
     }
 
     /// MinIO's sender never emits del-marker-expiration rules
@@ -13445,7 +13485,7 @@ mod tests {
     fn test_merge_incoming_lifecycle_del_marker_rules_stay_local() {
         let del_marker_only = |id: &str| {
             let mut rule = lc_rule(id, None, None);
-            rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+            rule.del_marker_expiration = Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(3) });
             rule
         };
 
@@ -13456,6 +13496,7 @@ mod tests {
             Some(lc_config(vec![del_marker_only("dm-local")])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
         let mut ids = rule_ids(&merged);
         ids.sort_unstable();
@@ -13465,15 +13506,19 @@ mod tests {
         // abort-mpu side is authoritative and an incoming del-marker field is
         // discarded at the trust boundary.
         let mut local_mixed = lc_rule("r1", Some(1), None);
-        local_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
-        local_mixed.abort_incomplete_multipart_upload = Some(s3s::dto::AbortIncompleteMultipartUpload {
-            days_after_initiation: Some(5),
-        });
+        local_mixed.del_marker_expiration =
+            Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(3) });
+        local_mixed.abort_incomplete_multipart_upload =
+            Some(rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                days_after_initiation: Some(5),
+            });
         let mut incoming_mixed = lc_rule("r1", Some(7), None);
-        incoming_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(9) });
+        incoming_mixed.del_marker_expiration =
+            Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(9) });
 
         let merged =
             merge_incoming_lifecycle_config(Some(lc_config(vec![incoming_mixed])), Some(lc_config(vec![local_mixed])), None)
+                .expect("expiry timestamp must remain encodable")
                 .expect("merge should keep rules");
         let r1 = &merged.rules[0];
         assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7));
@@ -13494,6 +13539,9 @@ mod tests {
     fn test_zero_rule_lifecycle_tombstone_recognition() {
         assert!(is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00.123456Z</ExpiryUpdatedAt></LifecycleConfiguration>"
         ));
         assert!(is_zero_rule_lifecycle_tombstone(
             b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LifecycleConfiguration>"
@@ -13527,6 +13575,9 @@ mod tests {
         ));
         assert!(!is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><ExpiryUpdatedAt>&bogus;</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>not-a-date</ExpiryUpdatedAt></LifecycleConfiguration>"
         ));
         assert!(!is_zero_rule_lifecycle_tombstone(b"<evil:LifecycleConfiguration/>"));
         assert!(!is_zero_rule_lifecycle_tombstone(
@@ -13568,20 +13619,52 @@ mod tests {
         let axis_ts = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
 
         let mut with_axis = lc_config(vec![lc_rule("e1", Some(7), None)]);
-        with_axis.expiry_updated_at = Some(s3s::dto::Timestamp::from(axis_ts));
-        assert_eq!(local_lifecycle_staleness_axis(Some(&with_axis), whole), axis_ts);
+        with_axis.expiry_updated_at = Some(format_lifecycle_date(axis_ts).expect("format expiry axis"));
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&with_axis), whole).expect("expiry axis must remain readable"),
+            axis_ts
+        );
 
         let legacy_with_expiry = lc_config(vec![lc_rule("e1", Some(7), None)]);
-        assert_eq!(local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole), whole);
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole).expect("expiry axis must remain readable"),
+            whole
+        );
 
         let transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
         assert_eq!(
-            local_lifecycle_staleness_axis(Some(&transition_only), whole),
+            local_lifecycle_staleness_axis(Some(&transition_only), whole).expect("expiry axis must remain readable"),
             OffsetDateTime::UNIX_EPOCH,
             "a transition-only config has no expiry state to protect"
         );
 
-        assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
+        assert_eq!(
+            local_lifecycle_staleness_axis(None, whole).expect("expiry axis must remain readable"),
+            whole,
+            "deletion lower bound"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_staleness_preserves_legacy_submillisecond_axis() {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/ecstore/tests/fixtures/bucket-config-goldens/lifecycle/minio.in.xml"
+        ));
+        let mut old_reader = s3s::xml::Deserializer::new(raw);
+        let old: s3s::dto::BucketLifecycleConfiguration =
+            s3s::xml::Deserialize::deserialize(&mut old_reader).expect("read the actual old lifecycle expiry axis");
+        old_reader.expect_eof().expect("the old expiry reader consumes the document");
+        let old_axis = OffsetDateTime::from(old.expiry_updated_at.expect("the old config contains its expiry axis"));
+        let new = deserialize(raw).expect("read the persisted lifecycle expiry axis");
+        let new_axis = local_lifecycle_staleness_axis(Some(&new), OffsetDateTime::UNIX_EPOCH)
+            .expect("the parsed lifecycle axis is readable");
+        let incoming = parse_lifecycle_date("2026-07-07T15:58:57.337100Z").expect("the incoming expiry axis is valid");
+        assert_eq!(
+            is_stale_update(new_axis, Some(incoming)),
+            is_stale_update(old_axis, Some(incoming)),
+            "a peer update older than the full-precision local axis must remain stale"
+        );
     }
 
     #[test]

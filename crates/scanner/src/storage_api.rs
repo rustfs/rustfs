@@ -23,12 +23,15 @@ use tokio::sync::Notify;
 
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
 
+#[cfg(test)]
+pub(crate) use rustfs_gateway_types::persistence::PersistedLifecycleRule as EcstoreLifecycleRule;
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedLifecycleConfiguration as EcstoreBucketLifecycleConfiguration,
+    PersistedLifecycleFilter as EcstoreLifecycleRuleFilter,
+};
 pub(crate) use s3s::dto::{
-    BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
 };
-#[cfg(test)]
-pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -199,9 +202,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
-        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
-        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus,
+        EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 

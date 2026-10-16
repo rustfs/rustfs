@@ -62,6 +62,8 @@ pub mod bucket {
         }
 
         pub mod bucket_lifecycle_ops {
+            pub use rustfs_lifecycle::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
+
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
@@ -133,7 +135,7 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::lifecycle::{
                 Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
                 ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
-                object_opts_from_object_info,
+                format_lifecycle_date, object_opts_from_object_info, parse_lifecycle_date,
             };
         }
 

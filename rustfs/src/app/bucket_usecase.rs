@@ -84,7 +84,7 @@ use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -100,13 +100,13 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::dto::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
-    CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
-    DeleteBucketInput, DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
+    BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput,
+    DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
     DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
     DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
     ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-    GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketLifecycleConfigurationInput, GetBucketLocationInput, GetBucketLocationOutput,
     GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
     GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
     GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
@@ -1333,9 +1333,9 @@ fn lifecycle_validation_error(err: &std::io::Error) -> S3Error {
     s3_error!(InvalidArgument, "{err}")
 }
 
-fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_transition_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.transitions.as_ref().is_some_and(|transitions| {
                 transitions.iter().any(|transition| {
                     transition
@@ -1354,9 +1354,9 @@ fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool
     })
 }
 
-fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_expiry_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
 }
@@ -1367,18 +1367,18 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
 /// filters on ENABLED for scanner scheduling — editing a Disabled expiry rule
 /// must still advance the replication axis. Del-marker expiration and
 /// abort-multipart are site-local and never travel.
-fn lifecycle_rules_have_expiry(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_rules_have_expiry(config: &PersistedLifecycleConfiguration) -> bool {
     config
         .rules
         .iter()
         .any(|rule| rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some())
 }
 
-fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
-    config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
-            && rule.abort_incomplete_multipart_upload.is_some()
-    })
+fn lifecycle_has_abort_multipart_rules(config: &PersistedLifecycleConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status == "Enabled" && rule.abort_incomplete_multipart_upload.is_some())
 }
 
 #[derive(Clone, Default)]
@@ -2060,7 +2060,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+    ) -> S3Result<PersistedLifecycleConfiguration> {
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2072,8 +2072,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => cfg.rules,
+        let config = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
             Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
@@ -2081,10 +2081,7 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
 
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules: Some(rules),
-            ..Default::default()
-        }))
+        Ok(config)
     }
 
     pub async fn execute_get_bucket_notification_configuration(
@@ -2457,6 +2454,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
+        prepared_configuration: std::io::Result<Option<PersistedLifecycleConfiguration>>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -2466,9 +2464,9 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(mut input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
-        assign_lifecycle_rule_ids(&mut input_cfg.rules);
-        if let Err(err) = validate_lifecycle_rule_status(&input_cfg.rules) {
+        let Some(mut wire_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        assign_lifecycle_rule_ids(&mut wire_cfg.rules);
+        if let Err(err) = validate_lifecycle_rule_status(&wire_cfg.rules) {
             return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
         }
 
@@ -2488,6 +2486,20 @@ impl DefaultBucketUsecase {
             }
         };
 
+        // Keep conversion failures behind the request-boundary status and Object Lock checks.
+        let Some(mut input_cfg) = prepared_configuration.map_err(to_internal_error)? else {
+            return Err(rustfs_s3_types::s3_error!(InvalidArgument).into());
+        };
+        if input_cfg.rules.len() != wire_cfg.rules.len() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "lifecycle conversion changed the rule count",
+            ));
+        }
+        for (rule, wire_rule) in input_cfg.rules.iter_mut().zip(&wire_cfg.rules) {
+            rule.id.clone_from(&wire_rule.id);
+        }
+
         if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
             return Err(lifecycle_validation_error(&err));
         }
@@ -2504,14 +2516,28 @@ impl DefaultBucketUsecase {
         let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((previous, _)) => {
                 if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
-                    Some(Timestamp::from(time::OffsetDateTime::now_utc()))
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
                 } else {
                     previous.expiry_updated_at
                 }
             }
             // No previous config (or unreadable): stamping is the
             // conservative pre-existing behavior.
-            Err(_) => lifecycle_rules_have_expiry(&input_cfg).then(|| Timestamp::from(time::OffsetDateTime::now_utc())),
+            Err(_) => {
+                if lifecycle_rules_have_expiry(&input_cfg) {
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
+                } else {
+                    None
+                }
+            }
         };
         input_cfg.expiry_updated_at = previous_expiry_updated_at;
         let data = serialize_config(&input_cfg)?;
@@ -2529,8 +2555,10 @@ impl DefaultBucketUsecase {
         // out-rank newer peer expiry state at the receivers.
         item.expiry_updated_at = input_cfg
             .expiry_updated_at
-            .clone()
-            .map(time::OffsetDateTime::from)
+            .as_deref()
+            .map(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339))
+            .transpose()
+            .map_err(to_internal_error)?
             .or(Some(time::OffsetDateTime::UNIX_EPOCH));
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
@@ -3289,8 +3317,8 @@ mod tests {
         PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
     };
     use s3s::dto::{
-        BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
-        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
+        BucketLifecycleConfiguration, BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName,
+        LifecycleExpiration, NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
         ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
         TransitionStorageClass,
     };
@@ -4632,18 +4660,18 @@ mod tests {
         // the real validator here, so the mapping cannot drift from it
         // (backlog#2201).
         let malformed = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
                         days: Some(1),
                         ..Default::default()
                     }),
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
-                    filter: Some(s3s::dto::LifecycleRuleFilter {
-                        and: Some(s3s::dto::LifecycleRuleAndOperator {
+                    filter: Some(rustfs_gateway_types::persistence::PersistedLifecycleFilter {
+                        and: Some(rustfs_gateway_types::persistence::PersistedLifecycleAnd {
                             prefix: Some("logs/".to_string()),
                             ..Default::default()
                         }),
@@ -4663,19 +4691,21 @@ mod tests {
         assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
 
         let invalid_value = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     filter: None,
                     id: Some("negative-count".to_string()),
-                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
-                        noncurrent_days: Some(30),
-                        newer_noncurrent_versions: Some(-1),
-                    }),
+                    noncurrent_version_expiration: Some(
+                        rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
+                            noncurrent_days: Some(30),
+                            newer_noncurrent_versions: Some(-1),
+                        },
+                    ),
                     noncurrent_version_transitions: None,
                     prefix: None,
                     transitions: None,
@@ -4731,7 +4761,9 @@ mod tests {
             }],
         };
 
-        assert!(!lifecycle_has_transition_rules(&config));
+        assert!(!lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -4756,7 +4788,9 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_transition_rules(&config));
+        assert!(lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -4779,8 +4813,12 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_abort_multipart_rules(&config));
-        assert!(!lifecycle_has_expiry_rules(&config));
+        assert!(lifecycle_has_abort_multipart_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config.clone()).unwrap()
+        ));
+        assert!(!lifecycle_has_expiry_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -5374,7 +5412,16 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_lifecycle_configuration(req).await.unwrap_err();
+        let prepared = req
+            .input
+            .lifecycle_configuration
+            .clone()
+            .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+            .transpose();
+        let err = usecase
+            .execute_put_bucket_lifecycle_configuration(req, prepared)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 

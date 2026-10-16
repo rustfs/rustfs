@@ -27,6 +27,7 @@ use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutati
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
+use crate::storage::s3_compat::lifecycle::{lifecycle_configuration_from_s3s, lifecycle_configuration_to_s3s};
 use crate::storage::s3_compat::replication::{replication_configuration_from_s3s, replication_configuration_to_s3s};
 use crate::storage::storage_api::ecfs_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
@@ -840,7 +841,13 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
         record_s3_op(S3Operation::GetBucketLifecycleConfiguration);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_lifecycle_configuration(req).await
+        let config = usecase.execute_get_bucket_lifecycle_configuration(req).await?;
+        let config = lifecycle_configuration_to_s3s(config)
+            .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, error.to_string()))?;
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+            rules: Some(config.rules),
+            ..Default::default()
+        }))
     }
 
     /// Get bucket location
@@ -1443,7 +1450,13 @@ impl S3 for FS {
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_lifecycle_configuration(req).await
+        let prepared = req
+            .input
+            .lifecycle_configuration
+            .clone()
+            .map(lifecycle_configuration_from_s3s)
+            .transpose();
+        usecase.execute_put_bucket_lifecycle_configuration(req, prepared).await
     }
 
     async fn put_bucket_notification_configuration(

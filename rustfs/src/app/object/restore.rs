@@ -15,6 +15,7 @@
 //! RestoreObject path.
 
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
 use rustfs_filemeta::RestoreStatus;
 
 // RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.
@@ -193,6 +194,8 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        let rreq = restore_request_from_wire(rreq);
 
         // Validate the request shape before taking any lock or reading the
         // object: a malformed request or an illegal `Days` value is a client

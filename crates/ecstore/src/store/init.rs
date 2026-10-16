@@ -13497,7 +13497,7 @@ mod tests {
                     object,
                     &ObjectOptions {
                         transition: TransitionOptions {
-                            restore_request: s3s::dto::RestoreRequest {
+                            restore_request: rustfs_lifecycle::RestoreRequest {
                                 days: Some(1),
                                 ..Default::default()
                             },

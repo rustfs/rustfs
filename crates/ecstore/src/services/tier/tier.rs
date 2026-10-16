@@ -80,11 +80,11 @@ use crate::{
     store::ECStore,
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_rio::HashReader;
 use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
-use s3s::dto::BucketLifecycleConfiguration;
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
@@ -1037,7 +1037,7 @@ trait TierReferenceProofStore:
         .await
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>>;
 
     async fn authoritative_bucket_tier_reference(
         self: Arc<Self>,
@@ -1077,7 +1077,7 @@ impl TierReferenceProofStore for ECStore {
         Ok(buckets.into_values().collect())
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
         match get_lifecycle_config(bucket).await {
             Ok((config, _updated_at)) => Ok(Some(config)),
             Err(Error::ConfigNotFound) => Ok(None),
@@ -1339,7 +1339,7 @@ struct TierLifecycleReference<'a> {
 }
 
 fn lifecycle_config_target_reference<'a>(
-    config: &'a BucketLifecycleConfiguration,
+    config: &'a PersistedLifecycleConfiguration,
     targets: &[TierMutationIntentTarget],
 ) -> Option<TierLifecycleReference<'a>> {
     for rule in &config.rules {
@@ -6925,9 +6925,8 @@ mod tests {
         endpoints::{Endpoints, PoolEndpoints, SetupType},
     };
     use crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, NoncurrentVersionTransition, Transition,
-        TransitionStorageClass,
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedNoncurrentVersionTransition, PersistedTransition,
     };
 
     #[test]
@@ -7754,7 +7753,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for LockingTierConfigStore {
-        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             Ok(None)
         }
     }
@@ -14853,7 +14852,7 @@ mod tests {
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
-        lifecycle_configs: Mutex<HashMap<String, BucketLifecycleConfiguration>>,
+        lifecycle_configs: Mutex<HashMap<String, PersistedLifecycleConfiguration>>,
     }
 
     impl Default for CasConfigStore {
@@ -14913,7 +14912,7 @@ mod tests {
                 .retain(|version| version.bucket != bucket || version.name != object);
         }
 
-        fn add_lifecycle_config(&self, bucket: &str, config: BucketLifecycleConfiguration) {
+        fn add_lifecycle_config(&self, bucket: &str, config: PersistedLifecycleConfiguration) {
             self.lifecycle_configs
                 .lock()
                 .expect("tier reference fixture should not poison")
@@ -15616,7 +15615,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for CasConfigStore {
-        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             Ok(self
                 .lifecycle_configs
                 .lock()
@@ -15748,10 +15747,10 @@ mod tests {
         });
         store.add_lifecycle_config(
             "photos",
-            BucketLifecycleConfiguration {
+            PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -15760,10 +15759,10 @@ mod tests {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    transitions: Some(vec![Transition {
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(1),
                         date: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                        storage_class: Some("COLD-A".to_owned()),
                     }]),
                 }],
             },
@@ -16358,10 +16357,10 @@ mod tests {
             .save_tiering_config_if_current(store.clone(), None)
             .await
             .expect("reference proof fixture should persist");
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16370,10 +16369,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -16530,10 +16529,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16542,10 +16541,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -16575,20 +16574,20 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("move-noncurrent".to_string()),
                 noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -16624,10 +16623,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16636,10 +16635,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };

@@ -44,9 +44,9 @@ use crate::{
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_lock::client::LockClient;
-use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -371,7 +371,7 @@ pub fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
     get_global_tier_config_mgr()
 }
 
-pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<BucketLifecycleConfiguration> {
+pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<PersistedLifecycleConfiguration> {
     GLOBAL_LIFECYCLE_SYS.get(bucket).await
 }
 

@@ -25,12 +25,12 @@ use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration,
-    NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration, RequestPaymentConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, NotificationConfiguration,
+    ObjectLockConfiguration, PublicAccessBlockConfiguration, RequestPaymentConfiguration, ServerSideEncryptionConfiguration,
+    Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
 use sha2::{Digest, Sha256};
@@ -490,7 +490,7 @@ pub struct BucketMetadata {
 
     pub policy_config: Option<BucketPolicy>,
     pub notification_config: Option<NotificationConfiguration>,
-    pub lifecycle_config: Option<BucketLifecycleConfiguration>,
+    pub lifecycle_config: Option<PersistedLifecycleConfiguration>,
     pub object_lock_config: Option<ObjectLockConfiguration>,
     pub versioning_config: Option<VersioningConfiguration>,
     pub sse_config: Option<ServerSideEncryptionConfiguration>,
@@ -1238,8 +1238,8 @@ impl BucketMetadata {
         }
         self.lifecycle_config = None;
         if !self.lifecycle_config_xml.is_empty()
-            && let Err(e) =
-                deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
+            && let Err(e) = deserialize::<PersistedLifecycleConfiguration>(&self.lifecycle_config_xml)
+                .map(|c| self.lifecycle_config = Some(c))
         {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",

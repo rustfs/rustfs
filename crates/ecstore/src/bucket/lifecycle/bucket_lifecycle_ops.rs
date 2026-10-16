@@ -87,12 +87,14 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
     is_restored_object_on_disk,
 };
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+use rustfs_lifecycle::{RestoreRequest, RestoreS3Location};
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
-use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType};
+use s3s::dto::ObjectLockConfiguration;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -298,7 +300,7 @@ impl LifecycleSys {
         Arc::new(Self)
     }
 
-    pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
+    pub async fn get(&self, bucket: &str) -> Option<PersistedLifecycleConfiguration> {
         match metadata_boundary::get_lifecycle_config(bucket).await {
             Ok((lc, _)) => Some(lc),
             Err(Error::ConfigNotFound) => None,
@@ -3878,7 +3880,7 @@ pub fn init_background_stale_multipart_upload_cleanup(api: Arc<ECStore>) {
     });
 }
 
-pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Result<(), std::io::Error> {
+pub async fn validate_transition_tier(lc: &PersistedLifecycleConfiguration) -> Result<(), std::io::Error> {
     for rule in &lc.rules {
         if let Some(transitions) = &rule.transitions {
             for transition in transitions {
@@ -4011,8 +4013,12 @@ pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo,
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
     let lock_config = configs.object_lock;
+    let evaluator_lock_config = lock_config
+        .as_deref()
+        .map(object_lock_boundary::lifecycle_object_lock_config)
+        .map(Arc::new);
     let events = match Evaluator::new(lifecycle)
-        .with_lock_retention(lock_config.clone())
+        .with_lock_retention(evaluator_lock_config)
         .eval(&object_opts)
         .await
     {
@@ -4492,19 +4498,26 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     }
 }
 
-fn lifecycle_rule_has_date_expiration(lc: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
+fn lifecycle_rule_has_date_expiration(lc: &PersistedLifecycleConfiguration, rule_id: &str) -> bool {
     lc.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && rule.id.as_deref() == Some(rule_id)
             && rule.expiration.as_ref().is_some_and(|expiration| expiration.date.is_some())
     })
 }
 
-fn should_defer_date_expiry_for_recent_config_update(lc: &BucketLifecycleConfiguration, now: OffsetDateTime) -> bool {
-    lc.expiry_updated_at.as_ref().is_some_and(|updated_at| {
-        let updated_at = OffsetDateTime::from(updated_at.clone());
-        now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) < DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS
-    })
+fn should_defer_date_expiry_for_recent_config_update(lc: &PersistedLifecycleConfiguration, now: OffsetDateTime) -> bool {
+    lc.expiry_updated_at
+        .as_ref()
+        .is_some_and(|updated_at| match rustfs_lifecycle::parse_lifecycle_date(updated_at) {
+            Ok(updated_at) => {
+                now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) < DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS
+            }
+            Err(error) => {
+                warn!(error = %error, "Deferring date expiry with an unreadable update timestamp");
+                true
+            }
+        })
 }
 
 async fn apply_existing_object_expiry(
@@ -4524,7 +4537,7 @@ async fn apply_existing_object_expiry(
 struct ExistingObjectExpiryContext<'a> {
     api: Arc<ECStore>,
     bucket: &'a str,
-    lc: Arc<BucketLifecycleConfiguration>,
+    lc: Arc<PersistedLifecycleConfiguration>,
     lock_config: Option<Arc<ObjectLockConfiguration>>,
     bucket_incarnation_id: Uuid,
     src: &'a LcEventSrc,
@@ -4544,8 +4557,13 @@ async fn enqueue_expiry_for_existing_object_group(
         .iter()
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
+    let evaluator_lock_config = context
+        .lock_config
+        .as_deref()
+        .map(object_lock_boundary::lifecycle_object_lock_config)
+        .map(Arc::new);
     let events = match Evaluator::new(context.lc.clone())
-        .with_lock_retention(context.lock_config.clone())
+        .with_lock_retention(evaluator_lock_config)
         .eval(&object_opts)
         .await
     {
@@ -4739,7 +4757,7 @@ fn manual_transition_version_marker(oi: &ObjectInfo) -> String {
 async fn enqueue_transition_with_lifecycle_report(
     api: Option<Arc<ECStore>>,
     oi: &ObjectInfo,
-    lc: &BucketLifecycleConfiguration,
+    lc: &PersistedLifecycleConfiguration,
     src: &LcEventSrc,
     options: &ManualTransitionRunOptions,
     report: &mut ManualTransitionRunReport,
@@ -4805,7 +4823,7 @@ async fn enqueue_transition_with_lifecycle_report(
     false
 }
 
-async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) -> bool {
+async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &PersistedLifecycleConfiguration, src: &LcEventSrc) -> bool {
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
     match event.action {
         IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
@@ -5311,12 +5329,8 @@ pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> 
     })
 }
 
-fn select_restore_s3_location(rreq: &RestoreRequest) -> Result<Option<&s3s::dto::S3Location>, std::io::Error> {
-    if rreq
-        .type_
-        .as_ref()
-        .is_none_or(|type_| type_.as_str() != RestoreRequestType::SELECT)
-    {
+fn select_restore_s3_location(rreq: &RestoreRequest) -> Result<Option<&RestoreS3Location>, std::io::Error> {
+    if rreq.type_.as_ref().is_none_or(|type_| type_.as_str() != "SELECT") {
         return Ok(None);
     }
     let output_location = rreq
@@ -5358,11 +5372,7 @@ pub async fn put_restore_opts(
     // the OutputLocation metadata instead of a write to `OutputLocation.S3`
     // (backlog#1341). RestoreObject rejects SELECT at the API boundary; this
     // is the fail-closed backstop for any other caller.
-    if rreq
-        .type_
-        .as_ref()
-        .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
-    {
+    if rreq.type_.as_ref().is_some_and(|type_| type_.as_str() == "SELECT") {
         return Err(std::io::Error::other("SELECT restore requests are not supported"));
     }
     for (k, v) in oi.user_defined.iter() {
@@ -5422,25 +5432,25 @@ pub trait RestoreRequestOps {
 impl RestoreRequestOps for RestoreRequest {
     fn validate(&self, _api: Arc<ECStore>) -> Result<(), std::io::Error> {
         // SELECT type requires select_parameters, and vice versa
-        if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.select_parameters.is_some() {
+        if self.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") && self.select_parameters.is_some() {
             return Err(std::io::Error::other("Select parameters can only be specified with SELECT request type"));
         }
         if let Some(type_) = &self.type_
-            && type_.as_str() == RestoreRequestType::SELECT
+            && type_.as_str() == "SELECT"
             && self.select_parameters.is_none()
         {
             return Err(std::io::Error::other("SELECT restore request requires select parameters to be specified"));
         }
 
         // OutputLocation is only valid for SELECT requests
-        if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.output_location.is_some() {
+        if self.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") && self.output_location.is_some() {
             return Err(std::io::Error::other("OutputLocation can only be specified with SELECT request type"));
         }
         select_restore_s3_location(self)?;
 
         // Days must not be specified with SELECT requests
         if let Some(type_) = &self.type_
-            && type_.as_str() == RestoreRequestType::SELECT
+            && type_.as_str() == "SELECT"
             && self.days.is_some_and(|d| d > 0)
         {
             return Err(std::io::Error::other("Days cannot be specified with SELECT restore request"));
@@ -5482,7 +5492,7 @@ pub fn lifecycle_version_delete_target(oi: &ObjectInfo) -> Option<ObjectToDelete
 }
 
 pub async fn eval_action_from_lifecycle(
-    lc: &BucketLifecycleConfiguration,
+    lc: &PersistedLifecycleConfiguration,
     lock_config: Option<&ObjectLockConfiguration>,
     oi: &ObjectInfo,
 ) -> lifecycle::Event {
@@ -6089,6 +6099,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::expiry_worker_count;
     use super::lifecycle_transition_publication_guard;
+    use super::object_lock_boundary;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -6182,14 +6193,16 @@ mod tests {
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::metadata_keys;
     use rustfs_filemeta::{FileInfo, FileMeta};
+    use rustfs_gateway_types::dto::MetadataEntry;
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleRule,
+        PersistedNoncurrentVersionExpiration, PersistedTransition,
+    };
+    use rustfs_lifecycle::{RestoreOutputLocation as OutputLocation, RestoreRequest, RestoreS3Location as S3Location};
     #[cfg(feature = "test-util")]
     use rustfs_s3_client::transition_api::ReaderImpl;
     use rustfs_scanner_metrics::metrics::{IlmAction, global_metrics};
-    use s3s::dto::{
-        BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
-        NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
-        OutputLocation, RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
-    };
+    use s3s::dto::{DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -9196,7 +9209,7 @@ mod tests {
             output_location,
             select_parameters: None,
             tier: None,
-            type_: Some(RestoreRequestType::from_static(RestoreRequestType::SELECT)),
+            type_: Some("SELECT".to_owned()),
         }
     }
 
@@ -9513,12 +9526,12 @@ mod tests {
 
     #[test]
     fn lifecycle_rule_has_date_expiration_detects_enabled_date_rule() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    date: Some(lifecycle::format_lifecycle_date(OffsetDateTime::now_utc()).unwrap()),
                     ..Default::default()
                 }),
                 id: Some("rule-date".to_string()),
@@ -10035,14 +10048,15 @@ mod tests {
     #[test]
     fn should_defer_date_expiry_for_recent_config_update_respects_grace_window() {
         let now = OffsetDateTime::now_utc();
-        let recent = BucketLifecycleConfiguration {
-            expiry_updated_at: Some(Timestamp::from(now - time::Duration::seconds(1))),
+        let recent = PersistedLifecycleConfiguration {
+            expiry_updated_at: Some(lifecycle::format_lifecycle_date(now - time::Duration::seconds(1)).unwrap()),
             rules: Vec::new(),
         };
-        let stale = BucketLifecycleConfiguration {
-            expiry_updated_at: Some(Timestamp::from(
-                now - time::Duration::seconds(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS + 1),
-            )),
+        let stale = PersistedLifecycleConfiguration {
+            expiry_updated_at: Some(
+                lifecycle::format_lifecycle_date(now - time::Duration::seconds(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS + 1))
+                    .unwrap(),
+            ),
             rules: Vec::new(),
         };
 
@@ -10170,12 +10184,12 @@ mod tests {
         assert_eq!(deleted.version_id, None);
     }
 
-    fn expired_delete_marker_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn expired_delete_marker_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -10191,12 +10205,12 @@ mod tests {
         }
     }
 
-    fn latest_expiration_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn latest_expiration_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -10212,12 +10226,12 @@ mod tests {
         }
     }
 
-    fn current_and_noncurrent_expiration_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn current_and_noncurrent_expiration_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -10225,7 +10239,7 @@ mod tests {
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("expire-current-and-noncurrent".to_string()),
-                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -10236,12 +10250,12 @@ mod tests {
         }
     }
 
-    fn all_versions_expiration_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn all_versions_expiration_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -10278,11 +10292,11 @@ mod tests {
         }
     }
 
-    fn latest_transition_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn latest_transition_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -10291,10 +10305,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]),
             }],
         }
@@ -12837,8 +12851,12 @@ mod tests {
 
         for (name, object, lock_config, expected) in cases {
             let object_opts = lifecycle::object_opts_from_object_info(&object);
+            let evaluator_lock_config = lock_config
+                .as_ref()
+                .map(object_lock_boundary::lifecycle_object_lock_config)
+                .map(Arc::new);
             let batch_event = Evaluator::new(Arc::new(lifecycle.clone()))
-                .with_lock_retention(lock_config.clone().map(Arc::new))
+                .with_lock_retention(evaluator_lock_config)
                 .eval(&[object_opts])
                 .await
                 .expect("batch lifecycle evaluation should succeed")
@@ -13916,7 +13934,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_copy_expiry_is_not_blocked_by_retention() {
-        let lifecycle = BucketLifecycleConfiguration {
+        let lifecycle = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: Vec::new(),
         };

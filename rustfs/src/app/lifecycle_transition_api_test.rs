@@ -1996,8 +1996,14 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
             .unwrap(),
         Method::PUT,
     );
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     bucket_usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect("Failed to update lifecycle configuration for delete marker cleanup");
 
@@ -2034,8 +2040,14 @@ async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
         Method::PUT,
     );
 
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect("Failed to update lifecycle configuration");
 
@@ -2067,8 +2079,14 @@ async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_obje
         Method::PUT,
     );
 
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect("ExpiredObjectDeleteMarker should be accepted on object-lock bucket");
 }
@@ -2095,8 +2113,14 @@ async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_obj
         Method::PUT,
     );
 
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     let err = usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect_err("DelMarkerExpiration must be rejected on object-lock bucket");
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
@@ -2131,8 +2155,14 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
         Method::PUT,
     );
 
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     let err = usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket");
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
@@ -2188,8 +2218,14 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
         Method::PUT,
     );
 
+    let prepared = req
+        .input
+        .lifecycle_configuration
+        .clone()
+        .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+        .transpose();
     let err = usecase
-        .execute_put_bucket_lifecycle_configuration(req)
+        .execute_put_bucket_lifecycle_configuration(req, prepared)
         .await
         .expect_err("zero-day expiration must be rejected with InvalidArgument");
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);

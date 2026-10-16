@@ -1251,7 +1251,7 @@ fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after()
         next_cycle: u64,
         last_update: Option<SystemTime>,
         skip_healing: bool,
-        lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
         replication: Option<Arc<ReplicationConfig>>,
         failed_objects: HashMap<String, u64>,
     }
@@ -1295,13 +1295,13 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
         next_cycle: u64,
         last_update: Option<SystemTime>,
         skip_healing: bool,
-        lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
         replication: Option<Arc<ReplicationConfig>>,
         failed_objects: HashMap<String, u64>,
         scan_resume_after: Option<String>,
         scan_checkpoint: Option<DataUsageScanCheckpoint>,
         pending_heals: Vec<PendingScannerHeal>,
-        object_lock: Option<Arc<ObjectLockConfiguration>>,
+        object_lock: Option<Arc<s3s::dto::ObjectLockConfiguration>>,
     }
 
     #[derive(Deserialize)]
@@ -2984,4 +2984,694 @@ async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
 
     assert!(result.is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
+}
+
+// Captured from legacy scanner baseline raw SHA256
+// e697a4127257e09fa30e06a8c8f0a576b93d2dd45500d5c43df376ddccf66ea7.
+// These bytes precede the lifecycle family migration; do not regenerate them.
+
+const LEGACY_LIFECYCLE_NONE_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0xc0, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_NONE_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74,
+    0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x80, 0xb1,
+    0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xc0, 0xaf, 0x73, 0x63,
+    0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e,
+    0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63, 0x6b, 0xc0,
+    0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63, 0x6f, 0x6d,
+    0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69, 0x67, 0x65,
+    0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_NONE_PAYLOAD: &[u8] = &[0xc0];
+
+const LEGACY_LIFECYCLE_EMPTY_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0x92, 0xc0, 0x90, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_EMPTY_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x92, 0xc0, 0x90, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63,
+    0x61, 0x74, 0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73,
+    0x80, 0xb1, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xc0, 0xaf,
+    0x73, 0x63, 0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64,
+    0x69, 0x6e, 0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63,
+    0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63,
+    0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69,
+    0x67, 0x65, 0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61,
+    0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_EMPTY_PAYLOAD: &[u8] = &[0x92, 0xc0, 0x90];
+
+const LEGACY_LIFECYCLE_NONEMPTY_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32,
+    0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32, 0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91, 0xff, 0x94, 0xb8, 0x32,
+    0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x2e, 0x31, 0x32,
+    0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94, 0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92, 0xc0, 0xb1, 0x76, 0x61,
+    0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1, 0x6b, 0x65, 0x79, 0x2d,
+    0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd, 0x20, 0x00, 0xa0, 0x92,
+    0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61, 0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74,
+    0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92, 0x93, 0xff, 0x00, 0xb4,
+    0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93,
+    0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x2f, 0xb3, 0x4c, 0x65,
+    0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x93, 0x93, 0xb8, 0x32,
+    0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x31, 0x2e, 0x39, 0x38,
+    0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c,
+    0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0, 0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94, 0xc0, 0x00, 0xc0, 0xc0,
+    0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80, 0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0, 0x90, 0xa0, 0xa8, 0x44,
+    0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64, 0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0xc0, 0x80, 0xc0, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_NONEMPTY_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32, 0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91,
+    0xff, 0x94, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+    0x30, 0x2e, 0x31, 0x32, 0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94, 0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92,
+    0xc0, 0xb1, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1,
+    0x6b, 0x65, 0x79, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd,
+    0x20, 0x00, 0xa0, 0x92, 0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61, 0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d,
+    0x70, 0x6c, 0x65, 0x74, 0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92,
+    0x93, 0xff, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c,
+    0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78,
+    0x2f, 0xb3, 0x4c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73,
+    0x93, 0x93, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+    0x31, 0x2e, 0x39, 0x38, 0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57,
+    0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0, 0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94,
+    0xc0, 0x00, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80, 0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0,
+    0x90, 0xa0, 0xa8, 0x44, 0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64, 0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0,
+    0xc0, 0x80, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c,
+    0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63,
+    0x74, 0x73, 0x80, 0xb1, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72,
+    0xc0, 0xaf, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65,
+    0x6e, 0x64, 0x69, 0x6e, 0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c,
+    0x6f, 0x63, 0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74,
+    0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f,
+    0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72,
+    0x6d, 0x61, 0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD: &[u8] = &[
+    0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32,
+    0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91, 0xff, 0x94, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x2e, 0x31, 0x32, 0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94,
+    0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92, 0xc0, 0xb1, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74,
+    0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1, 0x6b, 0x65, 0x79, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74,
+    0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd, 0x20, 0x00, 0xa0, 0x92, 0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61,
+    0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63,
+    0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92, 0x93, 0xff, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f,
+    0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67,
+    0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x2f, 0xb3, 0x4c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b,
+    0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x93, 0x93, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x31, 0x2e, 0x39, 0x38, 0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47,
+    0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0,
+    0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94, 0xc0, 0x00, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80,
+    0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0, 0x90, 0xa0, 0xa8, 0x44, 0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64,
+    0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0xc0, 0x80, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7,
+    0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61,
+    0x62, 0x6c, 0x65, 0x64, 0xc0,
+];
+
+// Keep the old tuple carrier and payload explicit when the production field changes type.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyLifecycleCacheInfo {
+    name: String,
+    next_cycle: u64,
+    last_update: Option<SystemTime>,
+    skip_healing: bool,
+    lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+    replication: Option<Arc<ReplicationConfig>>,
+    failed_objects: HashMap<String, u64>,
+}
+
+struct LifecycleCacheOracleCase {
+    label: &'static str,
+    old_tuple: Vec<u8>,
+    old_payload: Vec<u8>,
+    current: DataUsageCacheInfo,
+    current_map: Vec<u8>,
+    frozen_tuple: &'static [u8],
+    frozen_map: &'static [u8],
+    frozen_payload: &'static [u8],
+}
+
+fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
+    use s3s::dto as legacy;
+    use time::OffsetDateTime;
+    let expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
+        .expect("the legacy expiration fixture has an exact timestamp");
+    let transition_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_001_987_654_321)
+        .expect("the legacy transition fixture has an exact timestamp");
+    let expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_789_123)
+        .expect("the legacy expiry update fixture has an exact timestamp");
+
+    let absent = legacy::LifecycleRule {
+        abort_incomplete_multipart_upload: None,
+        del_marker_expiration: None,
+        expiration: None,
+        filter: None,
+        id: None,
+        noncurrent_version_expiration: None,
+        noncurrent_version_transitions: None,
+        prefix: None,
+        status: legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::ENABLED),
+        transitions: None,
+    };
+    let mut empty = absent.clone();
+    empty.id = Some(String::new());
+    empty.prefix = Some(String::new());
+    empty.status = legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::DISABLED);
+    empty.abort_incomplete_multipart_upload = Some(legacy::AbortIncompleteMultipartUpload {
+        days_after_initiation: None,
+    });
+    empty.del_marker_expiration = Some(legacy::DelMarkerExpiration { days: None });
+    empty.expiration = Some(legacy::LifecycleExpiration {
+        days: Some(0),
+        ..Default::default()
+    });
+    empty.filter = Some(legacy::LifecycleRuleFilter {
+        and: Some(legacy::LifecycleRuleAndOperator {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        }),
+        tag: Some(legacy::Tag { key: None, value: None }),
+        ..Default::default()
+    });
+    empty.noncurrent_version_expiration = Some(legacy::NoncurrentVersionExpiration {
+        noncurrent_days: None,
+        newer_noncurrent_versions: Some(-2),
+    });
+    empty.noncurrent_version_transitions = Some(Vec::new());
+    empty.transitions = Some(Vec::new());
+    let mut absent_tags = absent.clone();
+    absent_tags.filter = Some(legacy::LifecycleRuleFilter {
+        and: Some(legacy::LifecycleRuleAndOperator::default()),
+        ..Default::default()
+    });
+    // Cached values must survive independently of lifecycle policy validation.
+    let complete = legacy::BucketLifecycleConfiguration {
+        expiry_updated_at: Some(expiry_updated_at.into()),
+        rules: vec![
+            legacy::LifecycleRule {
+                abort_incomplete_multipart_upload: Some(legacy::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: Some(legacy::DelMarkerExpiration { days: Some(-1) }),
+                expiration: Some(legacy::LifecycleExpiration {
+                    date: Some(expiration_date.into()),
+                    days: Some(-3),
+                    expired_object_delete_marker: Some(false),
+                    expired_object_all_versions: Some(false),
+                }),
+                filter: Some(legacy::LifecycleRuleFilter {
+                    cached_tags: Default::default(),
+                    and: Some(legacy::LifecycleRuleAndOperator {
+                        prefix: Some(String::new()),
+                        tags: Some(vec![
+                            legacy::Tag {
+                                key: Some(String::new()),
+                                value: Some(String::new()),
+                            },
+                            legacy::Tag {
+                                key: None,
+                                value: Some("value-without-key".to_string()),
+                            },
+                            legacy::Tag {
+                                key: Some("key-without-value".to_string()),
+                                value: None,
+                            },
+                        ]),
+                        object_size_greater_than: Some(-1),
+                        object_size_less_than: Some(4096),
+                    }),
+                    prefix: Some(String::new()),
+                    tag: Some(legacy::Tag {
+                        key: Some("kind".to_string()),
+                        value: Some("archive".to_string()),
+                    }),
+                    object_size_greater_than: Some(0),
+                    object_size_less_than: Some(8192),
+                }),
+                id: Some("complete-legacy-rule".to_string()),
+                noncurrent_version_expiration: Some(legacy::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(-7),
+                    newer_noncurrent_versions: Some(0),
+                }),
+                noncurrent_version_transitions: Some(vec![
+                    legacy::NoncurrentVersionTransition {
+                        noncurrent_days: Some(0),
+                        newer_noncurrent_versions: Some(-1),
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
+                    },
+                    legacy::NoncurrentVersionTransition {
+                        noncurrent_days: None,
+                        newer_noncurrent_versions: None,
+                        storage_class: None,
+                    },
+                ]),
+                prefix: Some("legacy-prefix/".to_string()),
+                status: legacy::ExpirationStatus::from_static("LegacyUnknownStatus"),
+                transitions: Some(vec![
+                    legacy::Transition {
+                        date: Some(transition_date.into()),
+                        days: Some(0),
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
+                    },
+                    legacy::Transition {
+                        date: None,
+                        days: None,
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("")),
+                    },
+                    legacy::Transition {
+                        date: None,
+                        days: None,
+                        storage_class: None,
+                    },
+                ]),
+            },
+            empty,
+            absent_tags,
+            absent,
+        ],
+    };
+
+    use rustfs_gateway_types::persistence as persisted;
+    let domain_absent = persisted::PersistedLifecycleRule {
+        abort_incomplete_multipart_upload: None,
+        del_marker_expiration: None,
+        expiration: None,
+        filter: None,
+        id: None,
+        noncurrent_version_expiration: None,
+        noncurrent_version_transitions: None,
+        prefix: None,
+        status: "Enabled".to_owned(),
+        transitions: None,
+    };
+    let mut domain_empty = domain_absent.clone();
+    domain_empty.id = Some(String::new());
+    domain_empty.prefix = Some(String::new());
+    domain_empty.status = "Disabled".to_owned();
+    domain_empty.abort_incomplete_multipart_upload = Some(persisted::PersistedAbortIncompleteMultipartUpload {
+        days_after_initiation: None,
+    });
+    domain_empty.del_marker_expiration = Some(persisted::PersistedDelMarkerExpiration { days: None });
+    domain_empty.expiration = Some(persisted::PersistedLifecycleExpiration {
+        days: Some(0),
+        ..Default::default()
+    });
+    domain_empty.filter = Some(persisted::PersistedLifecycleFilter {
+        and: Some(persisted::PersistedLifecycleAnd {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        }),
+        tag: Some(persisted::PersistedLifecycleTag { key: None, value: None }),
+        ..Default::default()
+    });
+    domain_empty.noncurrent_version_expiration = Some(persisted::PersistedNoncurrentVersionExpiration {
+        noncurrent_days: None,
+        newer_noncurrent_versions: Some(-2),
+    });
+    domain_empty.noncurrent_version_transitions = Some(Vec::new());
+    domain_empty.transitions = Some(Vec::new());
+    let mut domain_absent_tags = domain_absent.clone();
+    domain_absent_tags.filter = Some(persisted::PersistedLifecycleFilter {
+        and: Some(persisted::PersistedLifecycleAnd::default()),
+        ..Default::default()
+    });
+    // Cached values must survive independently of lifecycle policy validation.
+    let domain_complete = persisted::PersistedLifecycleConfiguration {
+        expiry_updated_at: Some(
+            expiry_updated_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("fixture date has an exact RFC3339 representation"),
+        ),
+        rules: vec![
+            persisted::PersistedLifecycleRule {
+                abort_incomplete_multipart_upload: Some(persisted::PersistedAbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: Some(persisted::PersistedDelMarkerExpiration { days: Some(-1) }),
+                expiration: Some(persisted::PersistedLifecycleExpiration {
+                    date: Some(
+                        expiration_date
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .expect("fixture date has an exact RFC3339 representation"),
+                    ),
+                    days: Some(-3),
+                    expired_object_delete_marker: Some(false),
+                    expired_object_all_versions: Some(false),
+                }),
+                filter: Some(persisted::PersistedLifecycleFilter {
+                    and: Some(persisted::PersistedLifecycleAnd {
+                        prefix: Some(String::new()),
+                        tags: Some(vec![
+                            persisted::PersistedLifecycleTag {
+                                key: Some(String::new()),
+                                value: Some(String::new()),
+                            },
+                            persisted::PersistedLifecycleTag {
+                                key: None,
+                                value: Some("value-without-key".to_string()),
+                            },
+                            persisted::PersistedLifecycleTag {
+                                key: Some("key-without-value".to_string()),
+                                value: None,
+                            },
+                        ]),
+                        object_size_greater_than: Some(-1),
+                        object_size_less_than: Some(4096),
+                    }),
+                    prefix: Some(String::new()),
+                    tag: Some(persisted::PersistedLifecycleTag {
+                        key: Some("kind".to_string()),
+                        value: Some("archive".to_string()),
+                    }),
+                    object_size_greater_than: Some(0),
+                    object_size_less_than: Some(8192),
+                }),
+                id: Some("complete-legacy-rule".to_string()),
+                noncurrent_version_expiration: Some(persisted::PersistedNoncurrentVersionExpiration {
+                    noncurrent_days: Some(-7),
+                    newer_noncurrent_versions: Some(0),
+                }),
+                noncurrent_version_transitions: Some(vec![
+                    persisted::PersistedNoncurrentVersionTransition {
+                        noncurrent_days: Some(0),
+                        newer_noncurrent_versions: Some(-1),
+                        storage_class: Some("LEGACY_UNKNOWN_CLASS".to_owned()),
+                    },
+                    persisted::PersistedNoncurrentVersionTransition {
+                        noncurrent_days: None,
+                        newer_noncurrent_versions: None,
+                        storage_class: None,
+                    },
+                ]),
+                prefix: Some("legacy-prefix/".to_string()),
+                status: "LegacyUnknownStatus".to_owned(),
+                transitions: Some(vec![
+                    persisted::PersistedTransition {
+                        date: Some(
+                            transition_date
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .expect("fixture date has an exact RFC3339 representation"),
+                        ),
+                        days: Some(0),
+                        storage_class: Some("LEGACY_UNKNOWN_CLASS".to_owned()),
+                    },
+                    persisted::PersistedTransition {
+                        date: None,
+                        days: None,
+                        storage_class: Some("".to_owned()),
+                    },
+                    persisted::PersistedTransition {
+                        date: None,
+                        days: None,
+                        storage_class: None,
+                    },
+                ]),
+            },
+            domain_empty,
+            domain_absent_tags,
+            domain_absent,
+        ],
+    };
+
+    let cases = [
+        (
+            "none",
+            None,
+            None,
+            LEGACY_LIFECYCLE_NONE_TUPLE,
+            LEGACY_LIFECYCLE_NONE_MAP,
+            LEGACY_LIFECYCLE_NONE_PAYLOAD,
+        ),
+        (
+            "empty",
+            Some(Arc::new(legacy::BucketLifecycleConfiguration {
+                rules: Vec::new(),
+                expiry_updated_at: None,
+            })),
+            Some(Arc::new(persisted::PersistedLifecycleConfiguration {
+                rules: Vec::new(),
+                expiry_updated_at: None,
+            })),
+            LEGACY_LIFECYCLE_EMPTY_TUPLE,
+            LEGACY_LIFECYCLE_EMPTY_MAP,
+            LEGACY_LIFECYCLE_EMPTY_PAYLOAD,
+        ),
+        (
+            "nonempty",
+            Some(Arc::new(complete)),
+            Some(Arc::new(domain_complete)),
+            LEGACY_LIFECYCLE_NONEMPTY_TUPLE,
+            LEGACY_LIFECYCLE_NONEMPTY_MAP,
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD,
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(label, lifecycle, domain, frozen_tuple, frozen_map, frozen_payload)| {
+            let old = LegacyLifecycleCacheInfo {
+                name: "legacy-lifecycle-bucket".to_string(),
+                next_cycle: 7,
+                last_update: None,
+                skip_healing: true,
+                lifecycle,
+                replication: None,
+                failed_objects: HashMap::new(),
+            };
+            let mut old_tuple = Vec::new();
+            old.serialize(&mut rmp_serde::Serializer::new(&mut old_tuple))
+                .expect("the real old tuple carrier must encode");
+            let old_payload = rmp_serde::to_vec(&old.lifecycle).expect("the real old lifecycle payload must encode");
+            let current = DataUsageCacheInfo {
+                name: old.name.clone(),
+                next_cycle: old.next_cycle,
+                last_update: old.last_update,
+                skip_healing: old.skip_healing,
+                lifecycle: domain,
+                replication: None,
+                failed_objects: old.failed_objects,
+                ..Default::default()
+            };
+            let current_map = rmp_serde::to_vec(&current).expect("the actual production map writer must encode the fixture");
+            LifecycleCacheOracleCase {
+                label,
+                old_tuple,
+                old_payload,
+                current,
+                current_map,
+                frozen_tuple,
+                frozen_map,
+                frozen_payload,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn test_lifecycle_cache_legacy_msgpack_oracle() {
+    use time::OffsetDateTime;
+
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let old_tuple = case.old_tuple;
+        let old_payload = case.old_payload;
+        let current = case.current;
+        let current_map = case.current_map;
+        let frozen_tuple = case.frozen_tuple;
+        let frozen_map = case.frozen_map;
+        let frozen_payload = case.frozen_payload;
+        println!("legacy_lifecycle_cache {label}: tuple={old_tuple:02x?}; map={current_map:02x?}; payload={old_payload:02x?}");
+        let old_from_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
+        if label == "nonempty" {
+            let lifecycle = old_from_current
+                .lifecycle
+                .as_ref()
+                .expect("the old reader must retain the nonempty lifecycle");
+            let expiration = lifecycle.rules[0]
+                .expiration
+                .as_ref()
+                .expect("the complete rule has expiration");
+            let transition = &lifecycle.rules[0]
+                .transitions
+                .as_ref()
+                .expect("the complete rule has transitions")[0];
+            let expected_expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_000_000)
+                .expect("the legacy millisecond expiration date is representable");
+            let expected_transition_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_001_987_000_000)
+                .expect("the legacy millisecond transition date is representable");
+            let expected_expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_000_000)
+                .expect("the legacy millisecond expiry update is representable");
+            assert_eq!(
+                (
+                    expiration.date.clone().map(OffsetDateTime::from),
+                    transition.date.clone().map(OffsetDateTime::from),
+                    lifecycle.expiry_updated_at.clone().map(OffsetDateTime::from),
+                ),
+                (
+                    Some(expected_expiration_date),
+                    Some(expected_transition_date),
+                    Some(expected_expiry_updated_at),
+                ),
+                "cache serialization must retain the fixed legacy millisecond precision for Date and ExpiryUpdatedAt"
+            );
+        }
+        let frozen_tuple_read: DataUsageCacheInfo =
+            rmp_serde::from_slice(frozen_tuple).expect("the production reader must accept the fixed legacy tuple bytes");
+        let frozen_map_read: DataUsageCacheInfo =
+            rmp_serde::from_slice(frozen_map).expect("the production reader must accept the fixed legacy map bytes");
+        assert_eq!(
+            [
+                rmp_serde::to_vec(&frozen_tuple_read).expect("encode the fixed legacy tuple after production read"),
+                rmp_serde::to_vec(&frozen_map_read).expect("encode the fixed legacy map after production read"),
+                current_map.clone(),
+                rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&current.lifecycle))
+                    .expect("encode the independent domain lifecycle payload"),
+            ],
+            [
+                frozen_map.to_vec(),
+                frozen_map.to_vec(),
+                frozen_map.to_vec(),
+                frozen_payload.to_vec()
+            ],
+            "fixed old bytes must be retained by both production reads and the independent production writer for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_legacy_carrier_round_trips() {
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let old_tuple = case.old_tuple;
+        let current_map = case.current_map;
+        let from_old: DataUsageCacheInfo =
+            rmp_serde::from_slice(&old_tuple).expect("the production reader must read the old tuple");
+        let from_old_map = rmp_serde::to_vec(&from_old).expect("the production writer must retain the old tuple payload");
+        let old_via_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&from_old_map).expect("the old reader must read the production map after an old-tuple load");
+        let old_from_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
+        assert_eq!(
+            [
+                rmp_serde::to_vec(&old_via_current).expect("encode the old reader's complete tuple after production reload"),
+                rmp_serde::to_vec(&old_from_current).expect("encode the old reader's complete tuple after production write"),
+            ],
+            [old_tuple.clone(), old_tuple],
+            "both cache directions must preserve the full old carrier for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_current_map_round_trip() {
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let current_map = case.current_map;
+        let round_trip: DataUsageCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the production reader must read its nonempty lifecycle map");
+        assert_eq!(
+            rmp_serde::to_vec(&round_trip).expect("the production writer must preserve the reloaded map"),
+            current_map,
+            "the complete production map must survive reload for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_strict_cached_tags_contract() {
+    use s3s::dto as legacy;
+    type LegacyPayload = Option<Arc<legacy::BucketLifecycleConfiguration>>;
+
+    let old: LegacyPayload = rmp_serde::from_slice(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD)
+        .expect("the frozen payload must initialize the real old configuration");
+    let filter = old.as_ref().expect("nonempty old payload").rules[0]
+        .filter
+        .as_ref()
+        .expect("first old rule has a filter");
+    let object_tags = [(String::new(), String::new()), ("kind".to_owned(), "archive".to_owned())]
+        .into_iter()
+        .collect();
+    // The real old inherent method initializes its OnceLock even if matching fails.
+    let _ = filter.test_tags(&object_tags);
+    let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD))
+        .expect("the production reader must accept the fixed payload");
+    assert_eq!(
+        [
+            rmp_serde::to_vec(&old).expect("encode the initialized old cache"),
+            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("encode the new cache")
+        ],
+        [
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
+        ],
+        "an initialized old CachedTags must still write the same empty map as the new carrier"
+    );
+
+    let slot = LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD
+        .iter()
+        .position(|byte| *byte == 0x80)
+        .expect("the first map in the fixed payload is the first filter's CachedTags slot");
+    let input_with_cache = |replacement: &[u8]| {
+        let mut bytes = LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD[..slot].to_vec();
+        bytes.extend_from_slice(replacement);
+        bytes.extend_from_slice(&LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD[slot + 1..]);
+        bytes
+    };
+    // A historical String/String map is consumed by both real readers, then
+    // rewritten empty. The original populated input is deliberately not the oracle.
+    let populated = input_with_cache(&[0x81, 0xa3, b'e', b'n', b'v', 0xa4, b'p', b'r', b'o', b'd']);
+    let old: LegacyPayload = rmp_serde::from_slice(&populated).expect("old reader accepts String/String cached tags");
+    let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(populated.as_slice()))
+        .expect("new reader accepts String/String cached tags");
+    assert_eq!(
+        [
+            rmp_serde::to_vec(&old).expect("rewrite the old populated cache"),
+            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("rewrite the new populated cache")
+        ],
+        [
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
+        ],
+        "both readers discard populated cached tags and both writers emit an empty map"
+    );
+
+    for (label, replacement) in [
+        ("nil", &[0xc0][..]),
+        ("array", &[0x90][..]),
+        ("scalar", &[0x01][..]),
+        ("nonstring-key", &[0x81, 0x01, 0xa1, b'v'][..]),
+        ("nonstring-value", &[0x81, 0xa1, b'k', 0x01][..]),
+    ] {
+        let input = input_with_cache(replacement);
+        let old = rmp_serde::from_slice::<LegacyPayload>(&input);
+        let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(input.as_slice()));
+        assert_eq!(
+            [old.is_err(), new.is_err()],
+            [true, true],
+            "both real readers must reject {label} cached tags"
+        );
+    }
 }

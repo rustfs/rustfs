@@ -146,7 +146,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.2" }
 # engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "772d3385421626aca5735e5581c5dff13a7aebff", version = "0.32.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "e88c711213b4ea8dffd9e51fb84d20c5c899a996", version = "0.32.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

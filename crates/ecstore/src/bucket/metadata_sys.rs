@@ -30,13 +30,13 @@ use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::{ECStore, await_bucket_namespace_operation};
 use futures::future::join_all;
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, PublicAccessBlockConfiguration,
-    RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockRetentionMode, PublicAccessBlockConfiguration, RequestPaymentConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1313,7 +1313,7 @@ pub async fn get_public_access_block_config(bucket: &str) -> Result<(PublicAcces
     bucket_meta_sys.get_public_access_block_config(bucket).await
 }
 
-pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+pub async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -3034,7 +3034,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         match ConfigState::of(&bm.lifecycle_config_xml, &bm.lifecycle_config).require(bucket, BUCKET_LIFECYCLE_CONFIG)? {

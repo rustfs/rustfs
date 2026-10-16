@@ -14,7 +14,8 @@
 
 use std::sync::Arc;
 
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+use s3s::dto::ObjectLockConfiguration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -24,7 +25,7 @@ use crate::error::{Error, Result};
 
 #[derive(Debug)]
 pub(crate) struct LifecycleExpiryConfigs {
-    pub(crate) lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+    pub(crate) lifecycle: Option<Arc<PersistedLifecycleConfiguration>>,
     pub(crate) object_lock: Option<Arc<ObjectLockConfiguration>>,
     pub(crate) bucket_incarnation_id: Uuid,
     pub(crate) table_bucket_enabled: bool,
@@ -100,7 +101,7 @@ pub(crate) async fn get_expiry_configs_for_options(
     })
 }
 
-pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
     metadata_sys::get_lifecycle_config(bucket).await
 }
 
@@ -110,15 +111,15 @@ mod tests {
     use crate::bucket::metadata::BucketMetadata;
     use crate::bucket::metadata_sys::{self, test_support::isolated_store_over_temp_disks};
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
-    use s3s::dto::{ExpirationStatus, LifecycleExpiration, LifecycleRule};
+    use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedLifecycleRule};
     use serial_test::serial;
 
-    fn lifecycle_config() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn lifecycle_config() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),

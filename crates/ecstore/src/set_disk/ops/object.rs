@@ -15708,7 +15708,7 @@ mod transition_commit_failure_tests {
     use crate::services::tier::tier::TierConfigMgr;
     use http::HeaderMap;
     use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
-    use s3s::dto::RestoreRequest;
+    use rustfs_lifecycle::RestoreRequest;
     use tokio::io::AsyncReadExt;
 
     pub(super) fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
@@ -18282,7 +18282,7 @@ mod transition_upload_integrity_tests {
         ObjectOptions {
             user_defined: restore_operation_id_metadata(operation_id),
             transition: TransitionOptions {
-                restore_request: s3s::dto::RestoreRequest {
+                restore_request: rustfs_lifecycle::RestoreRequest {
                     days: Some(1),
                     ..Default::default()
                 },
@@ -18947,7 +18947,7 @@ mod transition_upload_integrity_tests {
             no_lock: true,
             part_number: Some(1),
             transition: TransitionOptions {
-                restore_request: s3s::dto::RestoreRequest {
+                restore_request: rustfs_lifecycle::RestoreRequest {
                     days: Some(1),
                     ..Default::default()
                 },

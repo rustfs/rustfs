@@ -39,7 +39,7 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     BucketPolicy,
@@ -48,10 +48,7 @@ use rustfs_policy::policy::{
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
-    dto::{
-        BucketLifecycleConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging,
-        VersioningConfiguration,
-    },
+    dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration},
     header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -184,8 +181,11 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
                 .lifecycle_config
                 .as_ref()
                 .ok_or_else(|| ExportConfigError::unreadable("persisted bucket lifecycle configuration is invalid"))?;
-            let config_xml =
-                checked_raw_xml(config, metadata.lifecycle_config_xml.clone(), deserialize::<BucketLifecycleConfiguration>)?;
+            let config_xml = checked_raw_xml(
+                config,
+                metadata.lifecycle_config_xml.clone(),
+                deserialize::<PersistedLifecycleConfiguration>,
+            )?;
             Ok(Some(config_xml))
         }
         BUCKET_TAGGING_CONFIG => {
@@ -872,7 +872,7 @@ fn apply_imported_bucket_config(
         ),
         BUCKET_LIFECYCLE_CONFIG => {
             validated_config!(
-                deserialize::<BucketLifecycleConfiguration>,
+                deserialize::<PersistedLifecycleConfiguration>,
                 lifecycle_config_xml,
                 lifecycle_config_updated_at
             )

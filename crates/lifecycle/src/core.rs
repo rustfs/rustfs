@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use rustfs_config::{DEFAULT_ILM_DAY_SECS, ENV_ILM_DEBUG_DAY_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
-use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::{
+    PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleFilter, PersistedLifecycleRule,
+    PersistedNoncurrentVersionTransition, PersistedTransition,
 };
+use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::macros::offset;
@@ -90,6 +91,29 @@ pub const LIFECYCLE_MALFORMED_XML_ERROR_KIND: std::io::ErrorKind = std::io::Erro
 /// no action for the rule.
 pub const LIFECYCLE_CORRUPT_RULE_ERROR_KIND: std::io::ErrorKind = std::io::ErrorKind::InvalidData;
 
+/// Parses a lifecycle date without truncating its precision or offset.
+pub fn parse_lifecycle_date(value: &str) -> Result<OffsetDateTime, std::io::Error> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|error| std::io::Error::new(LIFECYCLE_CORRUPT_RULE_ERROR_KIND, error))
+}
+
+/// Keeps the original date precision until the persistence or wire encoder runs.
+pub fn format_lifecycle_date(value: OffsetDateTime) -> Result<String, std::io::Error> {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| std::io::Error::new(LIFECYCLE_CORRUPT_RULE_ERROR_KIND, error))
+}
+
+fn evaluation_date(value: &str) -> Option<OffsetDateTime> {
+    match parse_lifecycle_date(value) {
+        Ok(date) => Some(date),
+        Err(error) => {
+            warn!(event = "lifecycle_invalid_date", error = %error, "Refusing an unreadable lifecycle date");
+            None
+        }
+    }
+}
+
 fn malformed_xml_error(message: &'static str) -> std::io::Error {
     std::io::Error::new(LIFECYCLE_MALFORMED_XML_ERROR_KIND, message)
 }
@@ -105,11 +129,11 @@ pub fn retained_noncurrent_versions(count: i32) -> Option<usize> {
 }
 
 /// Does any rule carry a retention count that validation would have rejected?
-pub fn lifecycle_has_corrupt_retention_count(lc: &BucketLifecycleConfiguration) -> bool {
+pub fn lifecycle_has_corrupt_retention_count(lc: &PersistedLifecycleConfiguration) -> bool {
     lc.rules.iter().any(rule_has_corrupt_retention_count)
 }
 
-fn rule_has_corrupt_retention_count(rule: &LifecycleRule) -> bool {
+fn rule_has_corrupt_retention_count(rule: &PersistedLifecycleRule) -> bool {
     let expiration_count = rule
         .noncurrent_version_expiration
         .as_ref()
@@ -133,7 +157,7 @@ pub trait RuleValidate {
 }
 
 #[async_trait::async_trait]
-impl RuleValidate for LifecycleRule {
+impl RuleValidate for PersistedLifecycleRule {
     /*fn validate_id(&self) -> Result<()> {
         if self.id.len() > 255 {
             return errInvalidRuleID;
@@ -278,9 +302,9 @@ impl RuleValidate for LifecycleRule {
     }
 }
 
-/// Structural validation for `LifecycleRuleFilter`.
+/// Structural validation for `PersistedLifecycleFilter`.
 ///
-/// The generated DTO is all-`Option`, so the S3 schema constraints have to be
+/// The optional persistence fields still need the S3 schema constraints to be
 /// checked here: at most one top-level predicate, an `And` that actually
 /// combines at least two, no repeated tag key, tag key/value limits, and a
 /// coherent non-negative size range (backlog#2201).
@@ -288,7 +312,7 @@ impl RuleValidate for LifecycleRule {
 /// A filter with no predicate at all stays valid: AWS documents an empty
 /// `Filter` as "applies to every object in the bucket", and rejecting it would
 /// break the most common way to write an unconditional rule.
-fn validate_lifecycle_filter(filter: &LifecycleRuleFilter) -> Result<(), std::io::Error> {
+fn validate_lifecycle_filter(filter: &PersistedLifecycleFilter) -> Result<(), std::io::Error> {
     let top_level_predicates = usize::from(filter.prefix.is_some())
         + usize::from(filter.tag.is_some())
         + usize::from(filter.object_size_greater_than.is_some())
@@ -330,7 +354,7 @@ fn validate_lifecycle_filter(filter: &LifecycleRuleFilter) -> Result<(), std::io
 /// S3 requires a tag to carry a key and value; both are length-bounded.
 /// The DTO makes both optional, so incomplete tags have to be rejected here
 /// rather than silently matching nothing.
-fn validate_lifecycle_tag(tag: &s3s::dto::Tag) -> Result<(), std::io::Error> {
+fn validate_lifecycle_tag(tag: &rustfs_gateway_types::persistence::PersistedLifecycleTag) -> Result<(), std::io::Error> {
     let key = tag.key.as_deref().unwrap_or_default();
     let Some(value) = tag.value.as_deref() else {
         return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_INVALID_TAG));
@@ -353,7 +377,7 @@ fn validate_lifecycle_size_bounds(greater_than: Option<i64>, less_than: Option<i
     Ok(())
 }
 
-fn lifecycle_rule_prefix(rule: &LifecycleRule) -> Option<&str> {
+fn lifecycle_rule_prefix(rule: &PersistedLifecycleRule) -> Option<&str> {
     // Prefer a non-empty legacy prefix; treat an empty legacy prefix as if it were not set
     if let Some(p) = rule.prefix.as_deref()
         && !p.is_empty()
@@ -391,7 +415,7 @@ pub trait Lifecycle {
     fn has_expiry(&self) -> bool;
     fn has_active_rules(&self, prefix: &str) -> bool;
     async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error>;
-    async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>>;
+    async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<PersistedLifecycleRule>>;
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn predict_expiration(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, newer_noncurrent_versions: usize) -> Event;
@@ -400,7 +424,7 @@ pub trait Lifecycle {
 }
 
 #[async_trait::async_trait]
-impl Lifecycle for BucketLifecycleConfiguration {
+impl Lifecycle for PersistedLifecycleConfiguration {
     async fn has_transition(&self) -> bool {
         for rule in self.rules.iter() {
             if rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty()) {
@@ -424,7 +448,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
             return false;
         }
         for rule in self.rules.iter() {
-            if rule.status.as_str() == ExpirationStatus::DISABLED {
+            if rule.status.as_str() == "Disabled" {
                 continue;
             }
 
@@ -469,13 +493,17 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 return true;
             }
             if let Some(rule_expiration) = &rule.expiration {
-                if let Some(date1) = rule_expiration.date.clone()
-                    && OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp()
+                if let Some(date1) = rule_expiration.date.as_deref()
+                    && evaluation_date(date1)
+                        .is_some_and(|date| date.unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp())
                 {
                     return true;
                 }
-                if rule_expiration.date.is_some() {
-                    return true;
+                if let Some(date) = rule_expiration.date.as_deref() {
+                    if evaluation_date(date).is_some() {
+                        return true;
+                    }
+                    continue;
                 }
                 if rule_expiration.days.is_some() {
                     return true;
@@ -487,10 +515,10 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
             }
             if let Some(rule_transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first()) {
-                if let Some(date1) = rule_transition.date.clone()
-                    && OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp()
+                if let Some(date) = rule_transition.date.as_deref()
+                    && evaluation_date(date).is_none()
                 {
-                    return true;
+                    continue;
                 }
                 return true;
             }
@@ -507,9 +535,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         for r in &self.rules {
-            if r.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
-                && r.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
-            {
+            if r.status != "Enabled" && r.status != "Disabled" {
                 return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_STATUS));
             }
 
@@ -526,7 +552,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     ));
                 }
                 if let Some(expiration_date) = &expiration.date {
-                    let date = OffsetDateTime::from(expiration_date.clone());
+                    let date = parse_lifecycle_date(expiration_date)?;
                     if date.hour() != 0 || date.minute() != 0 || date.second() != 0 || date.nanosecond() != 0 {
                         return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT));
                     }
@@ -586,7 +612,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
             }
             r.validate()?;
             if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref()
-                && object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED
+                && object_lock_enabled == "Enabled"
             {
                 if let Some(expiration) = r.expiration.as_ref() {
                     // Object Lock + ExpiredObjectAllVersions conflict (MinIO extension)
@@ -616,13 +642,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
         Ok(())
     }
 
-    async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>> {
+    async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<PersistedLifecycleRule>> {
         if obj.name.is_empty() {
             return None;
         }
-        let mut rules = Vec::<LifecycleRule>::new();
+        let mut rules = Vec::<PersistedLifecycleRule>::new();
         for rule in self.rules.iter() {
-            if rule.status.as_str() == ExpirationStatus::DISABLED {
+            if rule.status.as_str() == "Disabled" {
                 continue;
             }
             if let Some(rule_prefix) = lifecycle_rule_prefix(rule)
@@ -631,11 +657,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 continue;
             }
             if let Some(filter) = rule.filter.as_ref() {
-                if !<LifecycleRuleFilter as Filter>::test_tags(filter, &obj.user_tags) {
+                if !<PersistedLifecycleFilter as Filter>::test_tags(filter, &obj.user_tags) {
                     continue;
                 }
                 if !obj.delete_marker
-                    && !<LifecycleRuleFilter as Filter>::by_size(filter, i64::try_from(obj.size).unwrap_or(i64::MAX))
+                    && !<PersistedLifecycleFilter as Filter>::by_size(filter, i64::try_from(obj.size).unwrap_or(i64::MAX))
                 {
                     continue;
                 }
@@ -673,7 +699,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 continue;
             }
             let Some(due) = (match (&expiration.date, expiration.days) {
-                (Some(date), _) => Some(OffsetDateTime::from(date.clone())),
+                (Some(date), _) => evaluation_date(date),
                 (None, Some(days)) => Some(expected_expiry_time(mod_time, days)),
                 _ => None,
             }) else {
@@ -867,7 +893,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     debug!("eval_inner: entering expiration check");
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
-                            let date0 = OffsetDateTime::from(date.clone());
+                            let Some(date0) = evaluation_date(date) else {
+                                continue;
+                            };
                             if date0.unix_timestamp() != 0 && (now.unix_timestamp() >= date0.unix_timestamp()) {
                                 debug!("eval_inner: expiration by date - date0={:?}", date0);
                                 events.push(Event {
@@ -1008,7 +1036,7 @@ pub trait LifecycleCalculate {
 }
 
 #[async_trait::async_trait]
-impl LifecycleCalculate for LifecycleExpiration {
+impl LifecycleCalculate for PersistedLifecycleExpiration {
     fn next_due(&self, obj: &ObjectOpts) -> Option<OffsetDateTime> {
         if !obj.is_latest || !obj.delete_marker {
             return None;
@@ -1016,7 +1044,7 @@ impl LifecycleCalculate for LifecycleExpiration {
         // Check date first (date-based expiration takes priority over days).
         // A zero unix timestamp means "not set" (default value) and is skipped.
         if let Some(ref date) = self.date {
-            let expiry_date = OffsetDateTime::from(date.clone());
+            let expiry_date = evaluation_date(date)?;
             if expiry_date.unix_timestamp() != 0 {
                 return Some(expiry_date);
             }
@@ -1029,7 +1057,7 @@ impl LifecycleCalculate for LifecycleExpiration {
 }
 
 #[async_trait::async_trait]
-impl LifecycleCalculate for NoncurrentVersionTransition {
+impl LifecycleCalculate for PersistedNoncurrentVersionTransition {
     fn next_due(&self, obj: &ObjectOpts) -> Option<OffsetDateTime> {
         if obj.is_latest || self.storage_class.is_none() {
             return None;
@@ -1048,14 +1076,14 @@ impl LifecycleCalculate for NoncurrentVersionTransition {
 }
 
 #[async_trait::async_trait]
-impl LifecycleCalculate for Transition {
+impl LifecycleCalculate for PersistedTransition {
     fn next_due(&self, obj: &ObjectOpts) -> Option<OffsetDateTime> {
         if !obj.is_latest {
             return None;
         }
 
         if let Some(date) = self.date.clone() {
-            return Some(date.into());
+            return evaluation_date(&date);
         }
 
         match (self.days, obj.mod_time) {
@@ -1185,7 +1213,7 @@ fn parse_ilm_day_secs(raw: &str) -> u32 {
 }
 
 pub async fn abort_incomplete_multipart_upload_due(
-    lc: &BucketLifecycleConfiguration,
+    lc: &PersistedLifecycleConfiguration,
     obj: &ObjectOpts,
 ) -> Option<(OffsetDateTime, String)> {
     let initiated = obj.mod_time?;
@@ -1309,6 +1337,48 @@ impl Default for Event {
 
 pub use rustfs_storage_api::ExpirationOptions;
 
+/// Restore inputs retain values that the storage validator decides whether to accept.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreRequest {
+    pub days: Option<i32>,
+    pub description: Option<String>,
+    pub glacier_job_parameters: Option<rustfs_gateway_types::dto::GlacierJobParameters>,
+    pub output_location: Option<RestoreOutputLocation>,
+    pub select_parameters: Option<rustfs_gateway_types::dto::SelectParameters>,
+    pub tier: Option<rustfs_gateway_types::dto::Tier>,
+    pub type_: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RestoreOutputLocation {
+    pub s3: Option<RestoreS3Location>,
+}
+
+/// Output bucket names remain unvalidated until a supported restore path consumes them.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreS3Location {
+    pub access_control_list: Option<Vec<rustfs_gateway_types::dto::Grant>>,
+    pub bucket_name: String,
+    pub canned_acl: Option<rustfs_gateway_types::dto::CannedAcl>,
+    pub encryption: Option<rustfs_gateway_types::dto::Encryption>,
+    pub prefix: String,
+    pub storage_class: Option<rustfs_gateway_types::dto::StorageClass>,
+    pub tagging: Option<RestoreTagging>,
+    pub user_metadata: Option<Vec<rustfs_gateway_types::dto::MetadataEntry>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RestoreTagging {
+    pub tag_set: Vec<RestoreTag>,
+}
+
+/// Missing tag members must stay distinct from explicitly empty members.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreTag {
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {
     pub status: String,
@@ -1340,14 +1410,18 @@ impl Default for TransitionOptions {
 
 #[cfg(test)]
 mod tests {
+    fn date_text(value: OffsetDateTime) -> String {
+        format_lifecycle_date(value).expect("fixed lifecycle date is representable")
+    }
+
     use super::*;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use s3s::dto::{
-        LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, NoncurrentVersionTransition,
-        TransitionStorageClass,
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleAnd, PersistedLifecycleFilter, PersistedNoncurrentVersionExpiration,
+        PersistedNoncurrentVersionTransition,
     };
-    use s3s::xml::{Deserialize as XmlDeserialize, SerializeContent as XmlSerializeContent};
+
     use serial_test::serial;
     use std::sync::Arc;
     use time::macros::datetime;
@@ -1363,12 +1437,12 @@ mod tests {
     }
 
     fn enabled_rule(
-        expiration: Option<LifecycleExpiration>,
-        del_marker_expiration: Option<s3s::dto::DelMarkerExpiration>,
+        expiration: Option<PersistedLifecycleExpiration>,
+        del_marker_expiration: Option<rustfs_gateway_types::persistence::PersistedDelMarkerExpiration>,
         id: Option<&str>,
-    ) -> LifecycleRule {
-        LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+    ) -> PersistedLifecycleRule {
+        PersistedLifecycleRule {
+            status: "Enabled".to_owned(),
             expiration,
             abort_incomplete_multipart_upload: None,
             del_marker_expiration,
@@ -1383,11 +1457,11 @@ mod tests {
 
     #[test]
     fn eval_inner_reports_invalid_mod_time_without_expiring_object() {
-        let lifecycle = BucketLifecycleConfiguration {
+        let lifecycle = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -1480,11 +1554,11 @@ mod tests {
         // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
         // InvalidArgument. The PutBucketLifecycleConfiguration path maps this io::Error
         // to an InvalidArgument S3 error (see execute_put_bucket_lifecycle_configuration).
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(0),
                     ..Default::default()
                 }),
@@ -1509,11 +1583,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_negative_expiration_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(-1),
                     ..Default::default()
                 }),
@@ -1538,11 +1612,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_accepts_positive_expiration_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -1567,21 +1641,23 @@ mod tests {
         // Pin the exact >= 1 boundary: a value of 1 is the smallest legal positive
         // integer and must be accepted for every day-count field tightened for S3
         // compatibility. This catches an off-by-one that would reject Days == 1.
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(1),
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(1),
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("one-day-boundary".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -1598,11 +1674,11 @@ mod tests {
 
     #[tokio::test]
     async fn has_active_rules_accepts_zero_day_expiration() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(0),
                     ..Default::default()
                 }),
@@ -1622,9 +1698,13 @@ mod tests {
 
     #[test]
     fn has_active_rules_requires_valid_del_marker_expiration_days() {
-        let lifecycle = |days| BucketLifecycleConfiguration {
+        let lifecycle = |days| PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![enabled_rule(None, Some(s3s::dto::DelMarkerExpiration { days }), None)],
+            rules: vec![enabled_rule(
+                None,
+                Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days }),
+                None,
+            )],
         };
 
         assert!(lifecycle(Some(1)).has_active_rules(""));
@@ -1636,16 +1716,16 @@ mod tests {
     async fn validate_rejects_zero_noncurrent_expiration_days() {
         // S3 compatibility: NoncurrentVersionExpiration.NoncurrentDays must be a positive
         // integer (>= 1); AWS rejects 0 with InvalidArgument.
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: None,
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(0),
                     newer_noncurrent_versions: None,
                 }),
@@ -1665,16 +1745,16 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_negative_noncurrent_expiration_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: None,
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(-1),
                     newer_noncurrent_versions: None,
                 }),
@@ -1694,14 +1774,16 @@ mod tests {
 
     #[tokio::test]
     async fn validate_accepts_abort_incomplete_multipart_upload_only_rule() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(2),
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(2),
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("abort-only".to_string()),
@@ -1721,14 +1803,16 @@ mod tests {
     async fn validate_rejects_zero_abort_incomplete_multipart_upload_days() {
         // S3 compatibility: AbortIncompleteMultipartUpload.DaysAfterInitiation must be a
         // positive integer (>= 1); AWS rejects 0 with InvalidArgument.
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(0),
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(0),
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("abort-zero".to_string()),
@@ -1749,14 +1833,16 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_missing_abort_incomplete_multipart_upload_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: None,
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: None,
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("abort-missing".to_string()),
@@ -1774,14 +1860,16 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_negative_abort_incomplete_multipart_upload_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(-1),
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(-1),
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("abort-negative".to_string()),
@@ -1801,14 +1889,16 @@ mod tests {
     #[serial]
     async fn abort_incomplete_multipart_upload_due_accepts_zero_days() {
         let initiated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(0),
-                }),
+                abort_incomplete_multipart_upload: Some(
+                    rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                        days_after_initiation: Some(0),
+                    },
+                ),
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("abort-zero".to_string()),
@@ -1834,12 +1924,12 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_non_midnight_expiration_date() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    date: Some(OffsetDateTime::from_unix_timestamp(20_000_101).unwrap().into()),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    date: Some(date_text(OffsetDateTime::from_unix_timestamp(20_000_101).unwrap())),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
@@ -1862,12 +1952,12 @@ mod tests {
     #[serial]
     async fn predict_expiration_selects_closest_expiry_for_put_object() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(30),
                         ..Default::default()
                     }),
@@ -1880,10 +1970,10 @@ mod tests {
                     prefix: None,
                     transitions: None,
                 },
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
-                        date: Some((base_time + Duration::days(1)).into()),
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
+                        date: Some(date_text(base_time + Duration::days(1))),
                         ..Default::default()
                     }),
                     abort_incomplete_multipart_upload: None,
@@ -1915,12 +2005,12 @@ mod tests {
 
     #[tokio::test]
     async fn validate_accepts_multiple_rules_without_ids() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(30),
                         ..Default::default()
                     }),
@@ -1933,9 +2023,9 @@ mod tests {
                     prefix: None,
                     transitions: None,
                 },
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(31),
                         ..Default::default()
                     }),
@@ -1958,11 +2048,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_rule_id_too_long() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -1984,12 +2074,12 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_duplicate_rule_ids() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(1),
                         ..Default::default()
                     }),
@@ -2002,9 +2092,9 @@ mod tests {
                     prefix: None,
                     transitions: None,
                 },
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(2),
                         ..Default::default()
                     }),
@@ -2026,10 +2116,10 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_transition_without_storage_class() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -2038,7 +2128,7 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
                     storage_class: None,
@@ -2053,10 +2143,10 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_transition_without_date_or_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -2065,10 +2155,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: None,
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]),
             }],
         };
@@ -2080,20 +2170,20 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_noncurrent_transition_without_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-transition-no-days".to_string()),
                 noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: None,
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    storage_class: Some("COLD".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -2108,10 +2198,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn empty_transition_vectors_are_not_active_or_due() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -2139,11 +2229,11 @@ mod tests {
     #[serial]
     async fn eval_inner_expires_latest_object_after_days_due() {
         let base_time = datetime!(2025-01-15 10:30:45 UTC);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -2175,11 +2265,11 @@ mod tests {
     #[serial]
     async fn eval_inner_keeps_latest_object_before_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(2),
                     ..Default::default()
                 }),
@@ -2209,10 +2299,10 @@ mod tests {
     #[serial]
     async fn eval_inner_transitions_latest_object_after_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -2221,10 +2311,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLDTIER44")),
+                    storage_class: Some("COLDTIER44".to_owned()),
                 }]),
             }],
         };
@@ -2248,10 +2338,10 @@ mod tests {
     async fn eval_inner_transitions_latest_object_after_date_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let transition_date = base_time - Duration::days(1);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -2260,10 +2350,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: None,
-                    date: Some(transition_date.into()),
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    date: Some(date_text(transition_date)),
+                    storage_class: Some("WARM".to_owned()),
                 }]),
             }],
         };
@@ -2290,12 +2380,12 @@ mod tests {
         // Two enabled rules both yield a past-due DeleteAction and a third yields a
         // past-due TransitionAction. The rule with the shortest expiration (earliest
         // `due`) must win deterministically.
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(5),
                         ..Default::default()
                     }),
@@ -2308,9 +2398,9 @@ mod tests {
                     prefix: None,
                     transitions: None,
                 },
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(1),
                         ..Default::default()
                     }),
@@ -2323,8 +2413,8 @@ mod tests {
                     prefix: None,
                     transitions: None,
                 },
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -2333,10 +2423,10 @@ mod tests {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    transitions: Some(vec![Transition {
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(3),
                         date: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLDTIER")),
+                        storage_class: Some("COLDTIER".to_owned()),
                     }]),
                 },
             ],
@@ -2363,10 +2453,10 @@ mod tests {
         // The previous hand-written comparator was not a strict weak ordering and
         // panicked on the repository toolchain; the total-order selection must not
         // panic and must return a deterministic winner (the first rule).
-        let rules: Vec<LifecycleRule> = (0..25)
-            .map(|i| LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+        let rules: Vec<PersistedLifecycleRule> = (0..25)
+            .map(|i| PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -2380,7 +2470,7 @@ mod tests {
                 transitions: None,
             })
             .collect();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules,
         };
@@ -2401,16 +2491,16 @@ mod tests {
     #[serial]
     async fn eval_inner_expires_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-expire".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -2439,16 +2529,16 @@ mod tests {
     #[serial]
     async fn eval_inner_skips_noncurrent_expiration_without_successor() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-expire".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -2475,23 +2565,23 @@ mod tests {
     #[serial]
     async fn eval_inner_missing_successor_does_not_skip_noncurrent_transition() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-expire-and-transition".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLDTIER44")),
+                    storage_class: Some("COLDTIER44".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -2519,16 +2609,16 @@ mod tests {
     async fn eval_inner_noncurrent_expiration_one_day_respects_due_boundary() {
         let successor_time = datetime!(2025-06-15 12:00:00 UTC);
         let due = expected_expiry_time(successor_time, 1);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-one-day".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -2560,16 +2650,16 @@ mod tests {
     #[serial]
     async fn eval_inner_expires_noncurrent_version_immediately_when_zero_days() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-expire-immediate".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(0),
                     newer_noncurrent_versions: None,
                 }),
@@ -2598,20 +2688,20 @@ mod tests {
     #[serial]
     async fn eval_inner_transitions_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-transition".to_string()),
                 noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLDTIER44")),
+                    storage_class: Some("COLDTIER44".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -2636,16 +2726,16 @@ mod tests {
 
     #[tokio::test]
     async fn noncurrent_versions_expiration_limit_returns_configured_limits() {
-        let lc = Arc::new(BucketLifecycleConfiguration {
+        let lc = Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-limit".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(7),
                     newer_noncurrent_versions: Some(3),
                 }),
@@ -2674,16 +2764,16 @@ mod tests {
     #[serial]
     async fn evaluator_honors_newer_noncurrent_versions_retention_count() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = Arc::new(BucketLifecycleConfiguration {
+        let lc = Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("retain-two-noncurrent".to_string()),
-                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: Some(2),
                 }),
@@ -2726,11 +2816,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_invalid_status_case_sensitive() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static("enabled"),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -2752,15 +2842,15 @@ mod tests {
 
     #[tokio::test]
     async fn filter_rules_respects_filter_prefix() {
-        let filter = LifecycleRuleFilter {
+        let filter = PersistedLifecycleFilter {
             prefix: Some("prefix".to_string()),
             ..Default::default()
         };
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -2796,20 +2886,20 @@ mod tests {
 
     #[tokio::test]
     async fn filter_rules_respects_filter_and_prefix() {
-        let and = s3s::dto::LifecycleRuleAndOperator {
+        let and = rustfs_gateway_types::persistence::PersistedLifecycleAnd {
             prefix: Some("prefix".to_string()),
             ..Default::default()
         };
-        let filter = LifecycleRuleFilter {
+        let filter = PersistedLifecycleFilter {
             and: Some(and),
             ..Default::default()
         };
 
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -2845,18 +2935,18 @@ mod tests {
 
     #[tokio::test]
     async fn filter_rules_respects_filter_tag() {
-        let filter = LifecycleRuleFilter {
-            tag: Some(s3s::dto::Tag {
+        let filter = PersistedLifecycleFilter {
+            tag: Some(rustfs_gateway_types::persistence::PersistedLifecycleTag {
                 key: Some("env".to_string()),
                 value: Some("prod".to_string()),
             }),
             ..Default::default()
         };
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -2898,14 +2988,14 @@ mod tests {
 
     #[tokio::test]
     async fn filter_rules_respects_filter_and_tags() {
-        let filter = LifecycleRuleFilter {
-            and: Some(s3s::dto::LifecycleRuleAndOperator {
+        let filter = PersistedLifecycleFilter {
+            and: Some(rustfs_gateway_types::persistence::PersistedLifecycleAnd {
                 tags: Some(vec![
-                    s3s::dto::Tag {
+                    rustfs_gateway_types::persistence::PersistedLifecycleTag {
                         key: Some("env".to_string()),
                         value: Some("prod".to_string()),
                     },
-                    s3s::dto::Tag {
+                    rustfs_gateway_types::persistence::PersistedLifecycleTag {
                         key: Some("team".to_string()),
                         value: Some("storage".to_string()),
                     },
@@ -2915,11 +3005,11 @@ mod tests {
             ..Default::default()
         };
 
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -2963,11 +3053,11 @@ mod tests {
     #[serial]
     async fn expired_object_delete_marker_ignores_marker_with_noncurrent_versions_present() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3001,11 +3091,11 @@ mod tests {
     #[tokio::test]
     async fn expired_object_delete_marker_ignores_unknown_version_count() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3040,11 +3130,11 @@ mod tests {
     #[serial]
     async fn expired_object_delete_marker_deletes_only_delete_marker_immediately() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3079,11 +3169,11 @@ mod tests {
     #[tokio::test]
     async fn expired_object_delete_marker_without_date_or_days_deletes_immediately() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3118,11 +3208,11 @@ mod tests {
     #[serial]
     async fn expiration_days_deletes_only_expired_delete_marker_when_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(3),
                     ..Default::default()
                 }),
@@ -3169,9 +3259,9 @@ mod tests {
     #[serial]
     async fn expiration_days_uses_earliest_due_rule_for_expired_delete_marker() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let make_rule = |id: &str, days| LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            expiration: Some(LifecycleExpiration {
+        let make_rule = |id: &str, days| PersistedLifecycleRule {
+            status: "Enabled".to_owned(),
+            expiration: Some(PersistedLifecycleExpiration {
                 days: Some(days),
                 ..Default::default()
             }),
@@ -3184,7 +3274,7 @@ mod tests {
             transitions: None,
             del_marker_expiration: None,
         };
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![make_rule("rule-30-days", 30), make_rule("rule-3-days", 3)],
         };
@@ -3208,12 +3298,12 @@ mod tests {
     #[tokio::test]
     async fn validate_rejects_expired_object_delete_marker_with_date() {
         let future_date = OffsetDateTime::from_unix_timestamp(86_400 * 10).expect("valid midnight UTC test timestamp");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    date: Some(future_date.into()),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    date: Some(date_text(future_date)),
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3235,11 +3325,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_expired_object_delete_marker_with_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
@@ -3263,12 +3353,12 @@ mod tests {
     #[tokio::test]
     async fn validate_rejects_false_expired_object_delete_marker_with_date() {
         let date = OffsetDateTime::from_unix_timestamp(86_400 * 10).expect("valid midnight UTC test timestamp");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    date: Some(date.into()),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    date: Some(date_text(date)),
                     expired_object_delete_marker: Some(false),
                     ..Default::default()
                 }),
@@ -3290,11 +3380,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_false_expired_object_delete_marker_with_days() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_delete_marker: Some(false),
                     ..Default::default()
@@ -3317,17 +3407,17 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_expired_object_delete_marker_with_tag_filter() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
-                filter: Some(LifecycleRuleFilter {
-                    tag: Some(s3s::dto::Tag {
+                filter: Some(PersistedLifecycleFilter {
+                    tag: Some(rustfs_gateway_types::persistence::PersistedLifecycleTag {
                         key: Some("env".to_string()),
                         value: Some("prod".to_string()),
                     }),
@@ -3351,11 +3441,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_expired_object_delete_marker_on_locked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3371,7 +3461,7 @@ mod tests {
         };
 
         let locked_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
 
@@ -3382,11 +3472,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_expired_object_delete_marker_on_unlocked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -3409,11 +3499,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_non_delete_marker_expiration_on_locked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -3429,7 +3519,7 @@ mod tests {
         };
 
         let locked_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
 
@@ -3441,16 +3531,16 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_del_marker_expiration_on_locked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
-                del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(1) }),
+                del_marker_expiration: Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(1) }),
                 filter: None,
                 id: Some("test-rule".to_string()),
                 noncurrent_version_expiration: None,
@@ -3461,7 +3551,7 @@ mod tests {
         };
 
         let locked_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
 
@@ -3472,16 +3562,16 @@ mod tests {
     #[tokio::test]
     async fn validate_rejects_invalid_del_marker_expiration_days_even_with_another_action() {
         for days in [None, Some(0), Some(-1)] {
-            let lc = BucketLifecycleConfiguration {
+            let lc = PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                rules: vec![PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(30),
                         ..Default::default()
                     }),
                     abort_incomplete_multipart_upload: None,
-                    del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days }),
+                    del_marker_expiration: Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days }),
                     filter: None,
                     id: Some("test-rule".to_string()),
                     noncurrent_version_expiration: None,
@@ -3500,11 +3590,11 @@ mod tests {
     #[serial]
     async fn del_marker_expiration_deletes_marker_and_older_versions_when_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![enabled_rule(
                 None,
-                Some(s3s::dto::DelMarkerExpiration { days: Some(3) }),
+                Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(3) }),
                 Some("delete-marker-history"),
             )],
         };
@@ -3757,14 +3847,14 @@ mod tests {
     #[test]
     #[serial]
     fn abort_incomplete_multipart_due_scales_with_debug_day_secs() {
-        use s3s::dto::AbortIncompleteMultipartUpload;
+        use rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload;
         let initiated = datetime!(2025-01-15 10:30:45 UTC);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: Some(PersistedAbortIncompleteMultipartUpload {
                     days_after_initiation: Some(3),
                 }),
                 del_marker_expiration: None,
@@ -3802,11 +3892,11 @@ mod tests {
     #[test]
     #[serial]
     fn eval_inner_expires_days_one_rule_under_debug_day_secs() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -3852,12 +3942,12 @@ mod tests {
     #[serial]
     fn eval_inner_date_rule_ignores_debug_day_secs() {
         let expiry_date = datetime!(2025-06-01 00:00:00 UTC);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    date: Some(expiry_date.into()),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    date: Some(date_text(expiry_date)),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
@@ -3889,17 +3979,17 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_prefix_and_filter_both_present() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
-                filter: Some(LifecycleRuleFilter {
+                filter: Some(PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
                     ..Default::default()
                 }),
@@ -3917,11 +4007,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_prefix_without_filter() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -3943,17 +4033,17 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_filter_without_prefix() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
-                filter: Some(LifecycleRuleFilter {
+                filter: Some(PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
                     ..Default::default()
                 }),
@@ -3973,17 +4063,17 @@ mod tests {
     #[tokio::test]
     async fn validate_allows_empty_prefix_with_filter() {
         // Empty prefix should be treated as "not set"
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
-                filter: Some(LifecycleRuleFilter {
+                filter: Some(PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
                     ..Default::default()
                 }),
@@ -4002,11 +4092,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_empty_rule_id() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -4029,11 +4119,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_expired_object_all_versions_on_locked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -4050,7 +4140,7 @@ mod tests {
         };
 
         let locked_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
 
@@ -4060,11 +4150,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_allows_expired_object_all_versions_on_unlocked_bucket() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -4089,12 +4179,12 @@ mod tests {
     async fn validate_rejects_expired_object_all_versions_without_days_or_with_date() {
         let expiration_date = datetime!(2025-01-01 00:00:00 UTC);
         let invalid_expirations = [
-            LifecycleExpiration {
+            PersistedLifecycleExpiration {
                 expired_object_all_versions: Some(true),
                 ..Default::default()
             },
-            LifecycleExpiration {
-                date: Some(expiration_date.into()),
+            PersistedLifecycleExpiration {
+                date: Some(date_text(expiration_date)),
                 days: Some(1),
                 expired_object_all_versions: Some(true),
                 ..Default::default()
@@ -4102,7 +4192,7 @@ mod tests {
         ];
 
         for expiration in invalid_expirations {
-            let lc = BucketLifecycleConfiguration {
+            let lc = PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
                 rules: vec![enabled_rule(Some(expiration), None, None)],
             };
@@ -4114,11 +4204,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_false_expired_object_all_versions_with_date() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![enabled_rule(
-                Some(LifecycleExpiration {
-                    date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+                Some(PersistedLifecycleExpiration {
+                    date: Some(date_text(datetime!(2025-01-01 00:00:00 UTC))),
                     expired_object_all_versions: Some(false),
                     ..Default::default()
                 }),
@@ -4135,11 +4225,11 @@ mod tests {
     #[serial]
     async fn eval_inner_triggers_delete_all_versions_when_expired_object_all_versions_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -4174,10 +4264,10 @@ mod tests {
     #[serial]
     async fn expired_object_all_versions_does_not_apply_to_current_delete_marker() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![enabled_rule(
-                Some(LifecycleExpiration {
+                Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -4204,11 +4294,11 @@ mod tests {
     #[serial]
     async fn eval_inner_uses_delete_action_when_all_versions_not_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: None, // not set
                     ..Default::default()
@@ -4241,10 +4331,10 @@ mod tests {
     #[tokio::test]
     async fn current_expiration_requires_latest_even_for_null_version_identity() {
         let base_time = datetime!(2025-01-01 00:00:00 UTC);
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![enabled_rule(
-                Some(LifecycleExpiration {
+                Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -4315,7 +4405,7 @@ mod tests {
     /// configured rules.
     #[tokio::test]
     async fn eval_inner_emits_delete_restored_action_when_restore_expired() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![],
         };
@@ -4350,7 +4440,7 @@ mod tests {
     /// scheduled for cleanup.
     #[tokio::test]
     async fn eval_inner_keeps_unexpired_restore_copy() {
-        let lc = BucketLifecycleConfiguration {
+        let lc = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![],
         };
@@ -4370,9 +4460,9 @@ mod tests {
 
     // ---- backlog#2201: retention-count and Filter invariants -----------------
 
-    fn rule_with_noncurrent_expiration(expiration: NoncurrentVersionExpiration) -> LifecycleRule {
-        LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+    fn rule_with_noncurrent_expiration(expiration: PersistedNoncurrentVersionExpiration) -> PersistedLifecycleRule {
+        PersistedLifecycleRule {
+            status: "Enabled".to_owned(),
             expiration: None,
             abort_incomplete_multipart_upload: None,
             del_marker_expiration: None,
@@ -4385,10 +4475,10 @@ mod tests {
         }
     }
 
-    fn rule_with_filter(filter: LifecycleRuleFilter) -> LifecycleRule {
-        LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            expiration: Some(LifecycleExpiration {
+    fn rule_with_filter(filter: PersistedLifecycleFilter) -> PersistedLifecycleRule {
+        PersistedLifecycleRule {
+            status: "Enabled".to_owned(),
+            expiration: Some(PersistedLifecycleExpiration {
                 days: Some(1),
                 ..Default::default()
             }),
@@ -4403,15 +4493,15 @@ mod tests {
         }
     }
 
-    fn config_with_rules(rules: Vec<LifecycleRule>) -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn config_with_rules(rules: Vec<PersistedLifecycleRule>) -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
             rules,
         }
     }
 
-    fn tag(key: &str, value: &str) -> s3s::dto::Tag {
-        s3s::dto::Tag {
+    fn tag(key: &str, value: &str) -> rustfs_gateway_types::persistence::PersistedLifecycleTag {
+        rustfs_gateway_types::persistence::PersistedLifecycleTag {
             key: Some(key.to_string()),
             value: Some(value.to_string()),
         }
@@ -4422,7 +4512,7 @@ mod tests {
         // A negative retention count used to be accepted and then read as
         // usize::MAX during evaluation, so the rule silently stopped deleting
         // versions (backlog#2201).
-        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(30),
             newer_noncurrent_versions: Some(-1),
         })]);
@@ -4438,14 +4528,14 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_negative_newer_noncurrent_versions_on_transition() {
-        let mut rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let mut rule = rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(30),
             newer_noncurrent_versions: None,
         });
-        rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+        rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
             newer_noncurrent_versions: Some(-3),
             noncurrent_days: Some(1),
-            storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+            storage_class: Some("GLACIER".to_owned()),
         }]);
 
         // The transition validator already refuses a negative count, and it runs
@@ -4459,8 +4549,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_empty_expiration_action() {
-        let mut rule = rule_with_filter(LifecycleRuleFilter::default());
-        rule.expiration = Some(LifecycleExpiration::default());
+        let mut rule = rule_with_filter(PersistedLifecycleFilter::default());
+        rule.expiration = Some(PersistedLifecycleExpiration::default());
 
         let err = config_with_rules(vec![rule])
             .validate(&ObjectLockConfiguration::default())
@@ -4475,7 +4565,7 @@ mod tests {
         // Zero carries no constraint, matching how the batch limit path has
         // always read it. Alongside an age condition the rule is valid; on its
         // own it says nothing, so the rule has no action.
-        config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(30),
             newer_noncurrent_versions: Some(0),
         })])
@@ -4483,7 +4573,7 @@ mod tests {
         .await
         .expect("zero count alongside NoncurrentDays is valid");
 
-        let err = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let err = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: None,
             newer_noncurrent_versions: Some(0),
         })])
@@ -4497,7 +4587,7 @@ mod tests {
     async fn validate_accepts_count_only_noncurrent_expiration() {
         // MinIO extension: NewerNoncurrentVersions with no NoncurrentDays. It
         // used to be rejected as an actionless rule (backlog#2201).
-        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: None,
             newer_noncurrent_versions: Some(2),
         })]);
@@ -4511,7 +4601,7 @@ mod tests {
     async fn eval_inner_expires_versions_beyond_count_only_retention() {
         // Count-only rules have no age condition: everything past the retained
         // count is due as soon as it became noncurrent.
-        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: None,
             newer_noncurrent_versions: Some(2),
         })]);
@@ -4540,7 +4630,7 @@ mod tests {
         // With both set, the count gates which versions are candidates and the
         // age condition still decides when they are due.
         with_default_ilm_process_time(|| {});
-        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(10),
             newer_noncurrent_versions: Some(1),
         })]);
@@ -4564,7 +4654,7 @@ mod tests {
     async fn eval_inner_takes_no_action_for_a_corrupt_retention_count() {
         // Reachable only from older persistence or an import; it must not be
         // read as "retain everything", and it must not delete either.
-        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: Some(-1),
         })]);
@@ -4584,11 +4674,11 @@ mod tests {
 
     #[tokio::test]
     async fn eval_inner_does_not_expire_latest_object_for_a_corrupt_retention_rule() {
-        let mut rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let mut rule = rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: Some(-1),
         });
-        rule.expiration = Some(LifecycleExpiration {
+        rule.expiration = Some(PersistedLifecycleExpiration {
             days: Some(1),
             ..Default::default()
         });
@@ -4607,20 +4697,21 @@ mod tests {
 
     #[tokio::test]
     async fn eval_inner_does_not_delete_latest_marker_for_a_corrupt_retention_rule() {
-        let mut expired_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let mut expired_marker_rule = rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: Some(-1),
         });
-        expired_marker_rule.expiration = Some(LifecycleExpiration {
+        expired_marker_rule.expiration = Some(PersistedLifecycleExpiration {
             expired_object_delete_marker: Some(true),
             ..Default::default()
         });
 
-        let mut aged_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let mut aged_marker_rule = rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: Some(-1),
         });
-        aged_marker_rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(1) });
+        aged_marker_rule.del_marker_expiration =
+            Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(1) });
 
         for rule in [expired_marker_rule, aged_marker_rule] {
             let lc = config_with_rules(vec![rule]);
@@ -4642,25 +4733,25 @@ mod tests {
 
     #[test]
     fn corrupt_retention_count_is_detected_on_either_action() {
-        let mut transition_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let mut transition_rule = rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: Some(0),
         });
-        transition_rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+        transition_rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
             newer_noncurrent_versions: Some(-1),
             noncurrent_days: Some(1),
-            storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+            storage_class: Some("GLACIER".to_owned()),
         }]);
 
         assert!(lifecycle_has_corrupt_retention_count(&config_with_rules(vec![
-            rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
                 noncurrent_days: Some(1),
                 newer_noncurrent_versions: Some(-1),
             })
         ])));
         assert!(lifecycle_has_corrupt_retention_count(&config_with_rules(vec![transition_rule])));
         assert!(!lifecycle_has_corrupt_retention_count(&config_with_rules(vec![
-            rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
                 noncurrent_days: Some(1),
                 newer_noncurrent_versions: Some(3),
             })
@@ -4669,13 +4760,13 @@ mod tests {
 
     #[test]
     fn count_only_rules_are_active_only_for_a_positive_count() {
-        let positive = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let positive = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: None,
             newer_noncurrent_versions: Some(2),
         })]);
         assert!(positive.has_active_rules(""));
 
-        let corrupt = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+        let corrupt = config_with_rules(vec![rule_with_noncurrent_expiration(PersistedNoncurrentVersionExpiration {
             noncurrent_days: None,
             newer_noncurrent_versions: Some(-1),
         })]);
@@ -4685,10 +4776,12 @@ mod tests {
     #[tokio::test]
     async fn noncurrent_versions_expiration_limit_ignores_a_corrupt_count() {
         // The batch path must not read a negative count as "retain everything".
-        let lc = Arc::new(config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
-            noncurrent_days: Some(1),
-            newer_noncurrent_versions: Some(-1),
-        })]));
+        let lc = Arc::new(config_with_rules(vec![rule_with_noncurrent_expiration(
+            PersistedNoncurrentVersionExpiration {
+                noncurrent_days: Some(1),
+                newer_noncurrent_versions: Some(-1),
+            },
+        )]));
         let opts = ObjectOpts {
             name: "obj".to_string(),
             mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
@@ -4706,7 +4799,7 @@ mod tests {
     async fn validate_covers_filter_invariants() {
         struct Case {
             name: &'static str,
-            filter: LifecycleRuleFilter,
+            filter: PersistedLifecycleFilter,
             expected: Option<(&'static str, std::io::ErrorKind)>,
         }
 
@@ -4714,12 +4807,12 @@ mod tests {
             Case {
                 // AWS documents an empty Filter as "every object in the bucket".
                 name: "empty filter applies to all objects",
-                filter: LifecycleRuleFilter::default(),
+                filter: PersistedLifecycleFilter::default(),
                 expected: None,
             },
             Case {
                 name: "single prefix predicate",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
                     ..Default::default()
                 },
@@ -4727,7 +4820,7 @@ mod tests {
             },
             Case {
                 name: "two top-level predicates",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
                     tag: Some(tag("env", "prod")),
                     ..Default::default()
@@ -4736,9 +4829,9 @@ mod tests {
             },
             Case {
                 name: "prefix alongside And",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     prefix: Some("logs/".to_string()),
-                    and: Some(LifecycleRuleAndOperator {
+                    and: Some(PersistedLifecycleAnd {
                         prefix: Some("logs/".to_string()),
                         tags: Some(vec![tag("env", "prod")]),
                         ..Default::default()
@@ -4749,8 +4842,8 @@ mod tests {
             },
             Case {
                 name: "And with a single member",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         prefix: Some("logs/".to_string()),
                         ..Default::default()
                     }),
@@ -4760,8 +4853,8 @@ mod tests {
             },
             Case {
                 name: "And with two members",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         prefix: Some("logs/".to_string()),
                         tags: Some(vec![tag("env", "prod")]),
                         ..Default::default()
@@ -4772,8 +4865,8 @@ mod tests {
             },
             Case {
                 name: "And with two tags",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         tags: Some(vec![tag("env", "prod"), tag("team", "storage")]),
                         ..Default::default()
                     }),
@@ -4783,8 +4876,8 @@ mod tests {
             },
             Case {
                 name: "And repeating a tag key",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         tags: Some(vec![tag("env", "prod"), tag("env", "dev")]),
                         ..Default::default()
                     }),
@@ -4794,7 +4887,7 @@ mod tests {
             },
             Case {
                 name: "empty tag key",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     tag: Some(tag("", "prod")),
                     ..Default::default()
                 },
@@ -4802,8 +4895,8 @@ mod tests {
             },
             Case {
                 name: "missing tag key",
-                filter: LifecycleRuleFilter {
-                    tag: Some(s3s::dto::Tag {
+                filter: PersistedLifecycleFilter {
+                    tag: Some(rustfs_gateway_types::persistence::PersistedLifecycleTag {
                         key: None,
                         value: Some("prod".to_string()),
                     }),
@@ -4813,8 +4906,8 @@ mod tests {
             },
             Case {
                 name: "missing tag value",
-                filter: LifecycleRuleFilter {
-                    tag: Some(s3s::dto::Tag {
+                filter: PersistedLifecycleFilter {
+                    tag: Some(rustfs_gateway_types::persistence::PersistedLifecycleTag {
                         key: Some("env".to_string()),
                         value: None,
                     }),
@@ -4824,7 +4917,7 @@ mod tests {
             },
             Case {
                 name: "empty tag value",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     tag: Some(tag("env", "")),
                     ..Default::default()
                 },
@@ -4832,7 +4925,7 @@ mod tests {
             },
             Case {
                 name: "tag key at the limit",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     tag: Some(tag(&"k".repeat(MAX_TAG_KEY_LEN), "prod")),
                     ..Default::default()
                 },
@@ -4840,7 +4933,7 @@ mod tests {
             },
             Case {
                 name: "tag key past the limit",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     tag: Some(tag(&"k".repeat(MAX_TAG_KEY_LEN + 1), "prod")),
                     ..Default::default()
                 },
@@ -4848,7 +4941,7 @@ mod tests {
             },
             Case {
                 name: "tag value past the limit",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     tag: Some(tag("env", &"v".repeat(MAX_TAG_VALUE_LEN + 1))),
                     ..Default::default()
                 },
@@ -4856,7 +4949,7 @@ mod tests {
             },
             Case {
                 name: "negative ObjectSizeGreaterThan",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     object_size_greater_than: Some(-1),
                     ..Default::default()
                 },
@@ -4864,7 +4957,7 @@ mod tests {
             },
             Case {
                 name: "negative ObjectSizeLessThan",
-                filter: LifecycleRuleFilter {
+                filter: PersistedLifecycleFilter {
                     object_size_less_than: Some(-5),
                     ..Default::default()
                 },
@@ -4872,8 +4965,8 @@ mod tests {
             },
             Case {
                 name: "inverted size range inside And",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         object_size_greater_than: Some(100),
                         object_size_less_than: Some(100),
                         ..Default::default()
@@ -4884,8 +4977,8 @@ mod tests {
             },
             Case {
                 name: "valid size range inside And",
-                filter: LifecycleRuleFilter {
-                    and: Some(LifecycleRuleAndOperator {
+                filter: PersistedLifecycleFilter {
+                    and: Some(PersistedLifecycleAnd {
                         object_size_greater_than: Some(1),
                         object_size_less_than: Some(2),
                         ..Default::default()
@@ -4914,7 +5007,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_keeps_legacy_prefix_and_filter_mutually_exclusive() {
-        let mut rule = rule_with_filter(LifecycleRuleFilter {
+        let mut rule = rule_with_filter(PersistedLifecycleFilter {
             prefix: Some("logs/".to_string()),
             ..Default::default()
         });
@@ -4933,9 +5026,7 @@ mod tests {
         // The MinIO count-only form has to survive the wire codec, or the rule
         // this PR now accepts could not be persisted and read back.
         let xml = br#"<LifecycleConfiguration><Rule><ID>count-only</ID><Status>Enabled</Status><Filter></Filter><NoncurrentVersionExpiration><NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#;
-        let mut deserializer = s3s::xml::Deserializer::new(xml);
-        let parsed =
-            <BucketLifecycleConfiguration as XmlDeserialize>::deserialize(&mut deserializer).expect("count-only XML parses");
+        let parsed = rustfs_gateway_types::persistence::parse_lifecycle(xml).expect("count-only XML parses");
 
         let expiration = parsed.rules[0]
             .noncurrent_version_expiration
@@ -4944,9 +5035,7 @@ mod tests {
         assert_eq!(expiration.newer_noncurrent_versions, Some(2));
         assert_eq!(expiration.noncurrent_days, None);
 
-        let mut buf = Vec::new();
-        let mut serializer = s3s::xml::Serializer::new(&mut buf);
-        XmlSerializeContent::serialize_content(&parsed, &mut serializer).expect("count-only config serializes");
+        let buf = rustfs_gateway_types::persistence::serialize_lifecycle(&parsed).expect("count-only config serializes");
         let serialized = String::from_utf8(buf).expect("serialized XML is UTF-8");
         assert!(
             serialized.contains("<NewerNoncurrentVersions>2</NewerNoncurrentVersions>"),
@@ -4960,7 +5049,7 @@ mod tests {
 
     mod adversarial_regressions {
         use super::*;
-        use s3s::dto::NoncurrentVersionExpiration;
+        use rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration;
 
         fn run(test: impl std::future::Future<Output = ()>) {
             with_default_ilm_process_time(|| {
@@ -4987,13 +5076,13 @@ mod tests {
         fn noncurrent_transition_retains_the_requested_newer_versions() {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("retain-two-hot-versions"));
-                rule.filter = Some(LifecycleRuleFilter::default());
-                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                rule.filter = Some(PersistedLifecycleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: Some(2),
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]);
-                let lc = Arc::new(BucketLifecycleConfiguration {
+                let lc = Arc::new(PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 });
@@ -5035,13 +5124,13 @@ mod tests {
         fn noncurrent_transition_checks_count_age_and_single_object_context() {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("retain-two"));
-                rule.filter = Some(LifecycleRuleFilter::default());
-                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                rule.filter = Some(PersistedLifecycleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(3),
                     newer_noncurrent_versions: Some(2),
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]);
-                let mut lc = BucketLifecycleConfiguration {
+                let mut lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
@@ -5089,17 +5178,17 @@ mod tests {
         fn noncurrent_expiration_and_transition_have_independent_retention_counts() {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("independent-counts"));
-                rule.filter = Some(LifecycleRuleFilter::default());
-                rule.noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+                rule.filter = Some(PersistedLifecycleFilter::default());
+                rule.noncurrent_version_expiration = Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(90),
                     newer_noncurrent_versions: Some(4),
                 });
-                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(30),
                     newer_noncurrent_versions: Some(2),
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]);
-                let lc = BucketLifecycleConfiguration {
+                let lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
@@ -5124,13 +5213,13 @@ mod tests {
         fn expiration_retention_does_not_skip_an_independent_transition() {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("transition-then-expire"));
-                rule.filter = Some(LifecycleRuleFilter::default());
-                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                rule.filter = Some(PersistedLifecycleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]);
-                let mut lc = BucketLifecycleConfiguration {
+                let mut lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
@@ -5139,7 +5228,7 @@ mod tests {
                 let transition_only = lc.eval_inner(&object, now, 0).await;
                 assert_eq!(transition_only.action, IlmAction::TransitionVersionAction);
 
-                lc.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+                lc.rules[0].noncurrent_version_expiration = Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(90),
                     newer_noncurrent_versions: Some(2),
                 });
@@ -5158,18 +5247,18 @@ mod tests {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("two-current-transitions"));
                 rule.transitions = Some(vec![
-                    Transition {
-                        date: Some(datetime!(2020-03-01 00:00:00 UTC).into()),
+                    PersistedTransition {
+                        date: Some(date_text(datetime!(2020-03-01 00:00:00 UTC))),
                         days: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                        storage_class: Some("COLD".to_owned()),
                     },
-                    Transition {
-                        date: Some(datetime!(2020-01-03 00:00:00 UTC).into()),
+                    PersistedTransition {
+                        date: Some(date_text(datetime!(2020-01-03 00:00:00 UTC))),
                         days: None,
-                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                        storage_class: Some("WARM".to_owned()),
                     },
                 ]);
-                let mut lc = BucketLifecycleConfiguration {
+                let mut lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
@@ -5178,8 +5267,8 @@ mod tests {
                     ..noncurrent_object()
                 };
                 let now = datetime!(2020-01-10 00:00:00 UTC);
-                for status in [ExpirationStatus::ENABLED, ExpirationStatus::DISABLED] {
-                    lc.rules[0].status = ExpirationStatus::from_static(status);
+                for status in ["Enabled", "Disabled"] {
+                    lc.rules[0].status = (status).to_owned();
                     for _ in 0..2 {
                         let err = lc
                             .validate(&ObjectLockConfiguration::default())
@@ -5204,7 +5293,7 @@ mod tests {
                     .as_mut()
                     .expect("transition array is present")
                     .remove(0);
-                lc.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::ENABLED);
+                lc.rules[0].status = "Enabled".to_owned();
                 lc.validate(&ObjectLockConfiguration::default())
                     .await
                     .expect("one stage is supported");
@@ -5220,25 +5309,25 @@ mod tests {
             run(async {
                 let mut rule = enabled_rule(None, None, Some("two-noncurrent-transitions"));
                 rule.noncurrent_version_transitions = Some(vec![
-                    NoncurrentVersionTransition {
+                    PersistedNoncurrentVersionTransition {
                         noncurrent_days: Some(30),
                         newer_noncurrent_versions: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                        storage_class: Some("COLD".to_owned()),
                     },
-                    NoncurrentVersionTransition {
+                    PersistedNoncurrentVersionTransition {
                         noncurrent_days: Some(1),
                         newer_noncurrent_versions: None,
-                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                        storage_class: Some("WARM".to_owned()),
                     },
                 ]);
-                let mut lc = BucketLifecycleConfiguration {
+                let mut lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
                 let object = noncurrent_object();
                 let now = datetime!(2020-01-10 00:00:00 UTC);
-                for status in [ExpirationStatus::ENABLED, ExpirationStatus::DISABLED] {
-                    lc.rules[0].status = ExpirationStatus::from_static(status);
+                for status in ["Enabled", "Disabled"] {
+                    lc.rules[0].status = (status).to_owned();
                     for _ in 0..2 {
                         let err = lc
                             .validate(&ObjectLockConfiguration::default())
@@ -5263,7 +5352,7 @@ mod tests {
                     .as_mut()
                     .expect("transition array is present")
                     .remove(0);
-                lc.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::ENABLED);
+                lc.rules[0].status = "Enabled".to_owned();
                 lc.validate(&ObjectLockConfiguration::default())
                     .await
                     .expect("one stage is supported");
@@ -5277,9 +5366,9 @@ mod tests {
         #[serial]
         fn expiration_rejects_simultaneous_days_and_date() {
             run(async {
-                let mut lc = BucketLifecycleConfiguration {
+                let mut lc = PersistedLifecycleConfiguration {
                     rules: vec![enabled_rule(
-                        Some(LifecycleExpiration {
+                        Some(PersistedLifecycleExpiration {
                             days: Some(1),
                             ..Default::default()
                         }),
@@ -5292,7 +5381,7 @@ mod tests {
                     .await
                     .expect("a single Days expiration is valid");
                 lc.rules[0].expiration.as_mut().expect("expiration is present").date =
-                    Some(datetime!(2099-01-01 00:00:00 UTC).into());
+                    Some(date_text(datetime!(2099-01-01 00:00:00 UTC)));
                 let err = lc
                     .validate(&ObjectLockConfiguration::default())
                     .await
@@ -5307,19 +5396,19 @@ mod tests {
         fn overdue_transition_does_not_starve_permanent_expiration() {
             run(async {
                 let mut rule = enabled_rule(
-                    Some(LifecycleExpiration {
+                    Some(PersistedLifecycleExpiration {
                         days: Some(90),
                         ..Default::default()
                     }),
                     None,
                     Some("archive-then-delete"),
                 );
-                rule.transitions = Some(vec![Transition {
+                rule.transitions = Some(vec![PersistedTransition {
                     days: Some(30),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]);
-                let lc = BucketLifecycleConfiguration {
+                let lc = PersistedLifecycleConfiguration {
                     rules: vec![rule],
                     expiry_updated_at: None,
                 };
@@ -5365,7 +5454,8 @@ mod tests {
     mod proptests {
         use super::*;
         use proptest::prelude::*;
-        use s3s::dto::{NoncurrentVersionExpiration, Tag};
+        use rustfs_gateway_types::persistence::{PersistedLifecycleTag, PersistedNoncurrentVersionExpiration};
+
         use serial_test::serial;
 
         const DAY_SECS: i64 = 86400;
@@ -5485,21 +5575,21 @@ mod tests {
             ]
         }
 
-        fn arb_filter() -> impl Strategy<Value = Option<LifecycleRuleFilter>> {
+        fn arb_filter() -> impl Strategy<Value = Option<PersistedLifecycleFilter>> {
             prop_oneof![
                 4 => Just(None),
-                1 => Just(Some(LifecycleRuleFilter {
+                1 => Just(Some(PersistedLifecycleFilter {
                     prefix: Some("docs/".to_string()),
                     ..Default::default()
                 })),
-                1 => Just(Some(LifecycleRuleFilter {
-                    tag: Some(Tag {
+                1 => Just(Some(PersistedLifecycleFilter {
+                    tag: Some(PersistedLifecycleTag {
                         key: Some("env".to_string()),
                         value: Some("prod".to_string()),
                     }),
                     ..Default::default()
                 })),
-                1 => (0i64..2048).prop_map(|gt| Some(LifecycleRuleFilter {
+                1 => (0i64..2048).prop_map(|gt| Some(PersistedLifecycleFilter {
                     object_size_greater_than: Some(gt),
                     ..Default::default()
                 })),
@@ -5512,9 +5602,9 @@ mod tests {
                 days in prop::option::of(0i32..4),
                 delete_marker_flag in prop::option::of(any::<bool>()),
                 all_versions in prop::option::of(any::<bool>()),
-            ) -> LifecycleExpiration {
-                LifecycleExpiration {
-                    date: date_off.map(|s| ts(s).into()),
+            ) -> PersistedLifecycleExpiration {
+                PersistedLifecycleExpiration {
+                    date: date_off.map(|s| date_text(ts(s))),
                     days,
                     expired_object_delete_marker: delete_marker_flag,
                     expired_object_all_versions: all_versions,
@@ -5528,12 +5618,12 @@ mod tests {
                 days in prop::option::of(0i32..4),
                 storage_class in prop_oneof![
                     Just(None),
-                    Just(Some(TransitionStorageClass::from_static(""))),
-                    Just(Some(TransitionStorageClass::from_static("COLD"))),
+                    Just(Some("".to_owned())),
+                    Just(Some("COLD".to_owned())),
                 ],
-            ) -> Transition {
-                Transition {
-                    date: date_off.map(|s| ts(s).into()),
+            ) -> PersistedTransition {
+                PersistedTransition {
+                    date: date_off.map(|s| date_text(ts(s))),
                     days,
                     storage_class,
                 }
@@ -5555,12 +5645,12 @@ mod tests {
                 nc_tr in prop::option::of((prop::option::of(0i32..4), any::<bool>())),
                 dme_days in prop::option::of(0i32..3),
                 abort_days in prop::option::of(0i32..3),
-            ) -> LifecycleRule {
-                LifecycleRule {
+            ) -> PersistedLifecycleRule {
+                PersistedLifecycleRule {
                     status: if enabled {
-                        ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+                        "Enabled".to_owned()
                     } else {
-                        ExpirationStatus::from_static(ExpirationStatus::DISABLED)
+                        "Disabled".to_owned()
                     },
                     id,
                     prefix,
@@ -5568,21 +5658,21 @@ mod tests {
                     expiration,
                     transitions,
                     noncurrent_version_expiration: nc_exp.map(|(noncurrent_days, newer_noncurrent_versions)| {
-                        NoncurrentVersionExpiration {
+                        PersistedNoncurrentVersionExpiration {
                             noncurrent_days,
                             newer_noncurrent_versions,
                         }
                     }),
                     noncurrent_version_transitions: nc_tr.map(|(noncurrent_days, has_sc)| {
-                        vec![NoncurrentVersionTransition {
+                        vec![PersistedNoncurrentVersionTransition {
                             noncurrent_days,
                             newer_noncurrent_versions: None,
-                            storage_class: has_sc.then(|| TransitionStorageClass::from_static("COLD")),
+                            storage_class: has_sc.then(|| "COLD".to_owned()),
                         }]
                     }),
-                    del_marker_expiration: dme_days.map(|days| s3s::dto::DelMarkerExpiration { days: Some(days) }),
+                    del_marker_expiration: dme_days.map(|days| rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(days) }),
                     abort_incomplete_multipart_upload: abort_days.map(|days| {
-                        s3s::dto::AbortIncompleteMultipartUpload {
+                        rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
                             days_after_initiation: Some(days),
                         }
                     }),
@@ -5604,7 +5694,7 @@ mod tests {
                 now_off in (-4 * DAY_SECS)..(8 * DAY_SECS),
                 newer_noncurrent in 0usize..4,
             ) {
-                let lc = BucketLifecycleConfiguration {
+                let lc = PersistedLifecycleConfiguration {
                     expiry_updated_at: None,
                     rules,
                 };
@@ -5645,7 +5735,7 @@ mod tests {
         /// fires when `now >= due`, transition when `now > due` and the object
         /// has not already transitioned. Eligible expiration wins over transition;
         /// the earliest deadline wins within the selected action class.
-        fn oracle_candidates(lc: &BucketLifecycleConfiguration, obj: &ObjectOpts, now: OffsetDateTime) -> Vec<Candidate> {
+        fn oracle_candidates(lc: &PersistedLifecycleConfiguration, obj: &ObjectOpts, now: OffsetDateTime) -> Vec<Candidate> {
             let mod_time = obj.mod_time.expect("selection strategy always sets mod_time");
             let mut candidates = Vec::new();
             for rule in &lc.rules {
@@ -5654,7 +5744,7 @@ mod tests {
                     // non-zero date and fires when `now >= date`; a Days-based
                     // expiry fires when `now >= expected_expiry_time`.
                     if let Some(date) = &expiration.date {
-                        let due = OffsetDateTime::from(date.clone());
+                        let due = parse_lifecycle_date(date).expect("oracle fixture date parses");
                         if due.unix_timestamp() != 0 && now.unix_timestamp() >= due.unix_timestamp() {
                             candidates.push((due.unix_timestamp(), 0));
                         }
@@ -5670,7 +5760,7 @@ mod tests {
                     && transition.storage_class.as_ref().is_some_and(|sc| !sc.as_str().is_empty())
                 {
                     let due = if let Some(date) = &transition.date {
-                        Some(OffsetDateTime::from(date.clone()))
+                        Some(parse_lifecycle_date(date).expect("oracle fixture date parses"))
                     } else {
                         transition.days.map(|days| expected_expiry_time(mod_time, days))
                     };
@@ -5698,22 +5788,22 @@ mod tests {
                 tr_date_off in (-2 * DAY_SECS)..(2 * DAY_SECS),
                 tr_days in 0i32..4,
                 id in "[a-z]{1,6}",
-            ) -> LifecycleRule {
-                let expiration = (kind != 1).then(|| LifecycleExpiration {
-                    date: exp_by_date.then(|| ts(exp_date_off).into()),
+            ) -> PersistedLifecycleRule {
+                let expiration = (kind != 1).then(|| PersistedLifecycleExpiration {
+                    date: exp_by_date.then(|| date_text(ts(exp_date_off))),
                     days: (!exp_by_date).then_some(exp_days),
                     expired_object_delete_marker: None,
                     expired_object_all_versions: all_versions.then_some(true),
                 });
                 let transitions = (kind != 0).then(|| {
-                    vec![Transition {
-                        date: tr_by_date.then(|| ts(tr_date_off).into()),
+                    vec![PersistedTransition {
+                        date: tr_by_date.then(|| date_text(ts(tr_date_off))),
                         days: (!tr_by_date).then_some(tr_days),
-                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                        storage_class: Some("COLD".to_owned()),
                     }]
                 });
-                LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     id: Some(id),
                     prefix: None,
                     filter: None,
@@ -5744,7 +5834,7 @@ mod tests {
                 now_off in (-DAY_SECS)..(6 * DAY_SECS),
                 already_transitioned in any::<bool>(),
             ) {
-                let lc = BucketLifecycleConfiguration {
+                let lc = PersistedLifecycleConfiguration {
                     expiry_updated_at: None,
                     rules,
                 };
