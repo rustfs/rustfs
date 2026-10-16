@@ -5166,7 +5166,6 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
                     let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
@@ -5241,7 +5240,6 @@ impl SetDisks {
                     }
                     let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard

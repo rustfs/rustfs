@@ -25631,6 +25631,44 @@ mod test {
     }
 
     #[tokio::test]
+    async fn quota_mutation_fence_token_is_bound_to_resource_and_disk_process() {
+        let root_dir = tempfile::tempdir().expect("create quota fence disk");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("open initial disk process");
+        let bucket = "quota-fence-volume";
+        let object = "object";
+        let fence_path = quota_mutation_fence_path(bucket, object);
+        let token = disk
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("acquire initial quota token");
+        drop(
+            disk.claim_quota_mutation_fence(bucket, object, token)
+                .await
+                .expect("claim matching token"),
+        );
+        assert!(disk.claim_quota_mutation_fence(bucket, "other", token).await.is_err());
+        assert!(disk.claim_quota_mutation_fence("other-bucket", object, token).await.is_err());
+        drop(disk);
+
+        let reopened = LocalDisk::new(&endpoint, false).await.expect("reopen the same disk");
+        let successor = reopened
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("acquire successor process token");
+        assert!(
+            reopened.claim_quota_mutation_fence(bucket, object, token).await.is_err(),
+            "a token issued before restart must not authorize a later process"
+        );
+        drop(
+            reopened
+                .claim_quota_mutation_fence(bucket, object, successor)
+                .await
+                .expect("claim successor token"),
+        );
+    }
+
+    #[tokio::test]
     async fn quota_mutation_fence_revoke_waits_for_active_claim_and_rejects_late_claims() {
         use tempfile::tempdir;
 
