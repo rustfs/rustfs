@@ -1787,6 +1787,7 @@ impl NodeService {
                     || opts.undo_write
                     || opts.recursive
                     || opts.immediate
+                    || opts.orphan_data_dir
                     || opts.expected_delete_marker.is_some()
                     || opts
                         .delete_recovery_bucket_incarnation
@@ -1808,6 +1809,14 @@ impl NodeService {
         }
         let result = if let Some(disk) = self.find_disk(&request.disk).await {
             match operation {
+                DeleteRecoveryRpcOperation::Exists { object } => disk
+                    .has_delete_transaction_evidence(&request.volume, &object)
+                    .await
+                    .map(|present| DeleteRecoveryRpcReply::Evidence { present }),
+                DeleteRecoveryRpcOperation::InspectOrphanDataDir { path } => disk
+                    .is_plain_orphan_data_dir(&request.volume, &path)
+                    .await
+                    .map(|plain| DeleteRecoveryRpcReply::OrphanDataDir { plain }),
                 DeleteRecoveryRpcOperation::ApplyVersion {
                     object,
                     file_info,

@@ -38,6 +38,7 @@ mod uring_read_chunks;
 #[path = "uring_result_budget.rs"]
 mod uring_result_budget;
 pub use replacement_lease::ReplacementExecutionLease;
+pub(crate) use replacement_lease::is_blank_target as is_blank_replacement_target;
 
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
@@ -172,6 +173,24 @@ fn delete_recovery_part_file(entry: &str) -> bool {
         || entry.split_once(".integrity.").is_some_and(|(part, generation)| {
             metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
         })
+}
+
+/// Classify the entire leaf before unlinking anything. UUID-shaped S3 prefixes
+/// and transaction witnesses share this namespace with erasure data dirs.
+fn orphan_data_dir_parts(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let protected = || std::io::Error::new(ErrorKind::InvalidData, "orphan data directory contains protected entries");
+    if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(protected());
+    }
+    let mut parts = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !entry.file_name().to_str().is_some_and(delete_recovery_part_file) {
+            return Err(protected());
+        }
+        parts.push(entry.path());
+    }
+    Ok(parts)
 }
 
 fn delete_transaction_marker_id(entry: &str, prefix: &str) -> Option<Uuid> {
@@ -6570,6 +6589,18 @@ impl LocalDisk {
         result.map(|()| DataDirDeleteStatus::Deleted)
     }
 
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        let path = self.io_get_object_path(volume, path)?;
+        let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+        spawn_blocking_with_disk_io_permit(permit, move || match orphan_data_dir_parts(&path) {
+            Ok(_) => Ok(true),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => Ok(false),
+            Err(err) => Err(to_file_error(err).into()),
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
     pub(crate) async fn delete_versions_with_namespace_owner(
         &self,
         volume: &str,
@@ -7203,6 +7234,15 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
         crate::hp_guard!("LocalDisk::delete");
+        if opt.orphan_data_dir {
+            return self
+                .delete_data_dir_with_namespace_owner(volume, path, opt, namespace_owner)
+                .await
+                .and_then(|status| match status {
+                    DataDirDeleteStatus::Deleted => Ok(()),
+                    DataDirDeleteStatus::Deferred => Err(DiskError::DiskOngoingReq),
+                });
+        }
         let mut opt = opt;
         let mut namespace_owner = namespace_owner;
         let handled_version_delete = if opt.recursive
@@ -7356,6 +7396,69 @@ impl LocalDisk {
 
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
+        if opt.orphan_data_dir {
+            if opt.recursive || opt.old_data_dir.is_some() || opt.recoverable_delete {
+                return Err(DiskError::FileCorrupt);
+            }
+            let (object, data_dir) = path.rsplit_once('/').ok_or(DiskError::InvalidPath)?;
+            let data_dir = Uuid::parse_str(data_dir).map_err(|_| DiskError::InvalidPath)?;
+            if data_dir.is_nil() {
+                return Err(DiskError::InvalidPath);
+            }
+            // A snapshot may postpone this mutation until after the caller's
+            // object lock is released. Recheck metadata and recovery obligations
+            // under the same metadata -> namespace order as normal publication.
+            let owner = os::acquire_metadata_mutation_lease(&self.get_object_path(volume, object)?, namespace_owner).await;
+            if self.has_delete_transaction_evidence(volume, object).await? {
+                return Err(DiskError::DiskOngoingReq);
+            }
+            let metadata_path = self.io_get_object_path(volume, &format!("{object}/{STORAGE_FORMAT_FILE}"))?;
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, Some(owner)).await;
+            let sync = effective_durability(volume).syncs_commit_metadata();
+            let result = os::run_blocking_namespace_operation(lease, move || {
+                let bytes = std::fs::read(metadata_path)?;
+                let metadata = FileMeta::load(&bytes).map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
+                if metadata
+                    .get_data_dirs()
+                    .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?
+                    .into_iter()
+                    .flatten()
+                    .any(|referenced| referenced == data_dir)
+                {
+                    return Err(std::io::Error::from(ErrorKind::InvalidData));
+                }
+                let parts = orphan_data_dir_parts(&file_path)?;
+                for part in parts {
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &part);
+                    // A descendant may be published after preflight. Unlinking
+                    // only the classified files and using rmdir never removes it.
+                    match std::fs::remove_file(part) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                if sync {
+                    os::fsync_dir_std(&file_path)?;
+                }
+                std::fs::remove_dir(&file_path)?;
+                if sync && let Some(parent) = file_path.parent() {
+                    os::fsync_dir_std(parent)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|err| {
+                if err.kind() == ErrorKind::InvalidData {
+                    DiskError::FileCorrupt
+                } else {
+                    to_file_error(err).into()
+                }
+            });
+            self.io_backend.invalidate_cached_fds_under(volume, path);
+            return result;
+        }
         let mut recursive = opt.recursive;
         if recursive
             && let Some(transaction) = opt.old_data_dir
@@ -7391,7 +7494,13 @@ impl LocalDisk {
                     if !entry.file_type()?.is_file() {
                         return Err(corrupt());
                     }
-                    if delete_recovery_part_file(name) {
+                    if delete_recovery_part_file(name)
+                        || (name != reserved && is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
+                    {
+                        // An interrupted legacy delete can reserve a still-live
+                        // data dir. Only this transaction's commit marker below
+                        // authorizes reclaiming it; remove the old reservation
+                        // with the payload before dropping that proof.
                         parts.push(entry.path());
                     } else if name == committed || name == recovery_committed || name == reserved {
                         has_committed_marker |= name == committed || name == recovery_committed;
@@ -10408,6 +10517,9 @@ impl DiskAPI for LocalDisk {
         opts.recoverable_delete = true;
         self.delete_versions(volume, versions, opts).await
     }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        self.delete_recovery_has_evidence(volume, object).await
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -11545,6 +11657,8 @@ impl DiskAPI for LocalDisk {
     // TODO(backlog): support io.writer cancellation and early termination in walk_dir
     #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(&opts.bucket, None);
         self.wait_for_startup_cleanup().await;
 
         // Callers that do not pin a stall budget inherit the configured default, so
@@ -12114,6 +12228,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(volume, Some(path));
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.io_get_object_path(volume, path)?;
         let file_dir = self.io_get_bucket_path(volume)?;
@@ -24090,6 +24206,7 @@ mod test {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            orphan_data_dir: false,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await
@@ -25067,6 +25184,303 @@ mod test {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+
+    async fn write_orphan_test_parent_metadata(disk: &LocalDisk, data_dir: Uuid) {
+        let mut info = FileInfo::new("object", 1, 1);
+        info.data_dir = Some(data_dir);
+        info.mod_time = Some(OffsetDateTime::now_utc());
+        info.size = 1;
+        let mut metadata = FileMeta::default();
+        metadata.add_version(info).expect("add parent version");
+        disk.write_all("orphan", "object/xl.meta", metadata.marshal_msg().expect("encode parent metadata").into())
+            .await
+            .expect("publish parent metadata");
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_protected_entries() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        for protected in [
+            "xl.meta".to_owned(),
+            "unknown".to_owned(),
+            STORAGE_FORMAT_FILE_BACKUP.to_owned(),
+            DELETE_QUORUM_COMMITTED_FILE.to_owned(),
+            delete_recovery::PREPARED.to_owned(),
+            format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4()),
+        ] {
+            let path = format!("object/{}", Uuid::new_v4());
+            disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+                .await
+                .expect("write payload");
+            disk.write_all("orphan", &format!("{path}/{protected}"), Bytes::from_static(b"witness"))
+                .await
+                .expect("write protected entry");
+            assert!(!disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+            assert!(
+                disk.delete_data_dir(
+                    "orphan",
+                    &path,
+                    DeleteOptions {
+                        orphan_data_dir: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                disk.read_all("orphan", &format!("{path}/part.1"))
+                    .await
+                    .expect("read payload"),
+                b"payload"[..]
+            );
+            assert_eq!(
+                disk.read_all("orphan", &format!("{path}/{protected}"))
+                    .await
+                    .expect("read witness"),
+                b"witness"[..]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_rejects_symlinks() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+            .await
+            .expect("write payload");
+        let directory = disk.io_get_object_path("orphan", &path).expect("resolve leaf");
+        std::os::unix::fs::symlink(directory.join("part.1"), directory.join("part.2")).expect("create symlink");
+        assert!(!disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(directory.join("part.1")).expect("read payload"), b"payload");
+        assert!(
+            std::fs::symlink_metadata(directory.join("part.2"))
+                .expect("stat symlink")
+                .is_symlink()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_child_created_after_preflight() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("write orphan payload");
+        let directory = disk.io_get_object_path("orphan", &path).expect("resolve leaf");
+        let child = directory.join("child");
+        let published_child = child.clone();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &directory.join("part.1"), move || {
+            std::fs::create_dir_all(&published_child).expect("publish concurrent child");
+            std::fs::write(published_child.join("xl.meta"), b"child metadata").expect("publish child metadata");
+            std::fs::write(published_child.join("part.1"), b"child payload").expect("publish child payload");
+        });
+        assert!(disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(child.join("xl.meta")).expect("read child metadata"), b"child metadata");
+        assert_eq!(std::fs::read(child.join("part.1")).expect("read child payload"), b"child payload");
+        assert!(!directory.join("part.1").exists(), "classified orphan part was removed without recursing");
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_rechecks_snapshot_deferred_leaf() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        disk.write_all("orphan", &format!("{path}/child/xl.meta"), Bytes::from_static(b"child metadata"))
+            .await
+            .expect("publish child while snapshot is retained");
+        assert!(disk.release_snapshot_lease("orphan", &path, token).await.is_err());
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/part.1"))
+                .await
+                .expect("read protected part"),
+            b"payload"[..]
+        );
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/child/xl.meta"))
+                .await
+                .expect("read child metadata"),
+            b"child metadata"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_referenced_payload_after_snapshot_deferral() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let data_dir = Uuid::new_v4();
+        let path = format!("object/{data_dir}");
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"restored payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        write_orphan_test_parent_metadata(&disk, data_dir).await;
+        assert!(disk.release_snapshot_lease("orphan", &path, token).await.is_err());
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/part.1"))
+                .await
+                .expect("read newly referenced payload"),
+            b"restored payload"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_journal_created_after_snapshot_deferral() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        let part = format!("{path}/part.1");
+        disk.write_all("orphan", &part, Bytes::from_static(b"rollback payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        let record = format!("object/{}/{}", Uuid::new_v4(), delete_recovery::PREPARED);
+        disk.write_all("orphan", &record, Bytes::from_static(b"malformed prepared record"))
+            .await
+            .expect("publish recovery record after cleanup was deferred");
+        assert_eq!(disk.release_snapshot_lease("orphan", &path, token).await, Err(DiskError::DiskOngoingReq));
+        assert_eq!(
+            disk.read_all("orphan", &part).await.expect("read retained rollback payload"),
+            b"rollback payload"[..]
+        );
+        assert_eq!(
+            disk.read_all("orphan", &record).await.expect("read retained recovery record"),
+            b"malformed prepared record"[..]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_propagates_parent_directory_sync_failure() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("write orphan payload");
+        let parent = disk.io_get_object_path("orphan", "object").expect("resolve parent directory");
+        os::fsync_dir_recorder::set_failure(&parent, ErrorKind::Other);
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err(),
+            "a failed parent sync cannot report durable reclamation"
+        );
+        assert!(
+            !disk
+                .io_get_object_path("orphan", &path)
+                .expect("resolve data directory")
+                .exists()
+        );
+        assert!(
+            os::fsync_dir_recorder::take_failure(&parent).is_none(),
+            "the rmdir must attempt parent synchronization"
+        );
     }
 
     #[tokio::test]

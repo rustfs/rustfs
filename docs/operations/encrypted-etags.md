@@ -24,6 +24,18 @@ Clients that require an ETag for these older or multipart objects must issue an
 authorized HeadObject request, including the SSE-C key when required. GET,
 HEAD, and conditional requests continue to use the object's stored ETag.
 
+## Replication
+
+Bucket and site replication forward the stored ETag on `x-rustfs-source-etag`
+(with its `x-minio-source-*` twin). A target that adopts it (RustFS, MinIO)
+reports the fingerprint for the replica; a target that computes its own ETag
+(AWS S3 and most compatible stores) reports the MD5 of the plaintext it
+received, which never equals the fingerprint. The post-PUT replica ETag audit
+therefore skips encrypted sources. Managed-SSE sources forward no checksum on
+the replication PUT either, so a target that transforms their payload is not
+detected. See
+`docs/operations/replication-outbound-transport.md`.
+
 ## Existing data and migration
 
 The upgrade does not rewrite existing object metadata or erase fingerprints

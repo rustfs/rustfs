@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the consolidated upgrade lane without building RustFS."""
+"""Exercise both pinned upgrade sources without building RustFS."""
 
 from __future__ import annotations
 
@@ -27,12 +27,17 @@ class UpgradeWorkflowTests(unittest.TestCase):
         self.step = self.steps["Run upgrade compatibility tests"]
         # Explicit bash enables pipefail in Actions, so tee cannot hide a failure.
         self.assertIn("        shell: bash", self.step)
-        self.assertNotIn("    strategy:", self.job)
+        self.assertIn("      fail-fast: false", self.job)
+        self.assertEqual(re.findall(r"- version: ([^\s]+)", "\n".join(self.job)), ["1.0.0-rc.5", "1.0.1"])
         rust = (ROOT / "crates/e2e_test/src/upgrade_compatibility_test.rs").read_text()
         self.expected = set(re.findall(r'#\[ignore[^\n]*\]\s*async fn (\w+)\(', rust))
         self.assertTrue(self.expected)
 
-    def run_cases(self, failed_test="", fail_tee=False):
+    def run_cases(self, version, failed_test="", fail_tee=False):
+        excluded = ("stable_upgrade_deletes_foreign_reservations_without_losing_live_objects"
+                    if version == "1.0.0-rc.5" else "rc5_rollback_requires_restoring_odm_configuration")
+        expected = self.expected - {excluded}
+        self.assertEqual(len(expected), 7)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             commands = root / "commands.jsonl"
@@ -59,12 +64,12 @@ sys.exit(17 if test == os.environ["FAILED_TEST"] else 0)
                 tee.chmod(0o755)
             env = dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
                        RUNNER_TEMP=str(root), COMMANDS=str(commands), FAILED_TEST=failed_test,
-                       NO_PROXY="127.0.0.1,localhost,::1")
+                       NO_PROXY="127.0.0.1,localhost,::1", UPGRADE_SOURCE_VERSION=version)
             result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", shell_body(self.step)],
                                     cwd=root, env=env, capture_output=True, text=True)
             calls = [json.loads(line) for line in commands.read_text().splitlines()]
-            self.assertEqual({call["test"] for call in calls}, self.expected)
-            self.assertEqual(len(calls), len(self.expected))
+            self.assertEqual({call["test"] for call in calls}, expected)
+            self.assertEqual(len(calls), len(expected))
             for field in ("logs", "evidence"):
                 self.assertEqual(len({call[field] for call in calls}), len(calls))
                 self.assertTrue(all(Path(call[field]).is_dir() for call in calls))
@@ -74,18 +79,23 @@ sys.exit(17 if test == os.environ["FAILED_TEST"] else 0)
             return result
 
     def test_all_ignored_upgrade_cases_run_once_with_separate_evidence(self):
-        result = self.run_cases()
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for version in ("1.0.0-rc.5", "1.0.1"):
+            with self.subTest(version=version):
+                result = self.run_cases(version)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_early_or_late_failure_does_not_hide_remaining_cases(self):
-        for name in ("direct_upgrade_from_rc2_preserves_object_contracts", "rc5_baseline_replicates_multipart_layouts"):
-            with self.subTest(name=name):
-                result = self.run_cases(failed_test=name)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn(f"::error::Upgrade compatibility failed: {name}", result.stdout)
+        for version, last in (("1.0.0-rc.5", "rc5_rollback_requires_restoring_odm_configuration"),
+                              ("1.0.1", "stable_upgrade_deletes_foreign_reservations_without_losing_live_objects")):
+            for name in ("direct_upgrade_from_previous_release_preserves_object_contracts", last):
+                with self.subTest(version=version, name=name):
+                    result = self.run_cases(version, failed_test=name)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(f"::error::Upgrade compatibility failed: {name}", result.stdout)
 
     def test_log_write_failure_fails_the_job(self):
-        self.assertNotEqual(self.run_cases(fail_tee=True).returncode, 0)
+        for version in ("1.0.0-rc.5", "1.0.1"):
+            self.assertNotEqual(self.run_cases(version, fail_tee=True).returncode, 0)
 
     def test_reports_are_uploaded_even_after_failure(self):
         for name, directory in (("Upload scanner/heal G09 evidence", "rustfs-upgrade-g09-evidence"),
@@ -93,6 +103,7 @@ sys.exit(17 if test == os.environ["FAILED_TEST"] else 0)
             step = self.steps[name]
             self.assertIn("        if: always()", step)
             self.assertIn("          path: ${{ runner.temp }}/" + directory, step)
+            self.assertTrue(any("name:" in line and "matrix.source.version" in line for line in step))
 
 
 if __name__ == "__main__":

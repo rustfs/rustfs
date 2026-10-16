@@ -4513,6 +4513,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphan_data_dir_probe_requires_body_bound_authentication() {
+        let service = make_server();
+        let operation = crate::storage::storage_api::DeleteRecoveryRpcOperation::InspectOrphanDataDir {
+            path: format!("object/{}", uuid::Uuid::new_v4()),
+        };
+        let message = RecoverDeleteTransactionRequest {
+            disk: "unknown".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&operation).expect("encode orphan probe").into(),
+        };
+        let error = service
+            .recover_delete_transaction(Request::new(message.clone()))
+            .await
+            .expect_err("unsigned probe must fail");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let mut tampered = Request::new(message.clone());
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(tampered.get_ref()).expect("canonical probe");
+        set_tonic_canonical_body_digest(&mut tampered, &body).expect("probe digest");
+        mark_v2_authenticated(&mut tampered);
+        tampered.get_mut().volume = "other-bucket".into();
+        let error = service
+            .recover_delete_transaction(tampered)
+            .await
+            .expect_err("bucket scope must be body-bound");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let mut signed = Request::new(message);
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("probe digest");
+        mark_v2_authenticated(&mut signed);
+        let result = service
+            .recover_delete_transaction(signed)
+            .await
+            .expect("signed probe reaches disk lookup")
+            .into_inner();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_exists_requires_body_bound_authentication() {
+        use crate::storage::storage_api::DeleteRecoveryRpcOperation;
+        let service = make_server();
+        let operation = DeleteRecoveryRpcOperation::Exists {
+            object: "object".to_owned(),
+        };
+        let message = RecoverDeleteTransactionRequest {
+            disk: "unknown".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&operation).expect("encode existence probe").into(),
+        };
+        let error = service
+            .recover_delete_transaction(Request::new(message.clone()))
+            .await
+            .expect_err("unsigned existence probe must fail");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        for change_object in [false, true] {
+            let mut request = Request::new(message.clone());
+            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                .expect("canonical existence probe");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+            mark_v2_authenticated(&mut request);
+            if change_object {
+                request.get_mut().operation = rmp_serde::to_vec_named(&DeleteRecoveryRpcOperation::Exists {
+                    object: "other-object".to_owned(),
+                })
+                .expect("encode changed key")
+                .into();
+            } else {
+                request.get_mut().volume = "other-bucket".into();
+            }
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("bucket and exact-key scopes must be body-bound");
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        }
+        let mut request = Request::new(message);
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+            .expect("canonical existence probe");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+        mark_v2_authenticated(&mut request);
+        let result = service
+            .recover_delete_transaction(request)
+            .await
+            .expect("signed probe reaches disk lookup")
+            .into_inner();
+        assert!(!result.success, "an unavailable disk cannot establish absence");
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
     async fn delete_recovery_requires_digest_and_valid_protocol_payload() {
         let service = make_server();
         let operation = crate::storage::storage_api::DeleteRecoveryRpcOperation::Discover {
@@ -6267,6 +6359,124 @@ mod tests {
         set_tonic_canonical_body_digest(&mut request, &body).expect("compare-and-update digest");
         mark_v2_authenticated(&mut request);
         request
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_exists_rpc_reports_exact_key_evidence_without_mutation() {
+        use crate::storage::storage_api::{DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply};
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let configured = set.disks.read().await.iter().find_map(Clone::clone).expect("configured disk");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let disk = service
+            .find_disk(&configured.endpoint().to_string())
+            .await
+            .expect("RPC target disk");
+        let volume = "evidence-rpc";
+        disk.make_volume(volume).await.expect("create evidence bucket");
+        let record = format!("object/{}/delete-prepared", Uuid::new_v4());
+        disk.write_all(volume, &record, Bytes::from_static(b"unresolved recovery record"))
+            .await
+            .expect("write evidence");
+        for (object, expected) in [("object", true), ("other", false)] {
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: configured.endpoint().to_string(),
+                volume: volume.to_owned(),
+                protocol_version: 1,
+                operation: rmp_serde::to_vec_named(&DeleteRecoveryRpcOperation::Exists {
+                    object: object.to_owned(),
+                })
+                .expect("encode existence probe")
+                .into(),
+            });
+            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                .expect("canonical existence probe");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+            mark_v2_authenticated(&mut request);
+            let response = service
+                .recover_delete_transaction(request)
+                .await
+                .expect("existence RPC response")
+                .into_inner();
+            assert!(response.success, "existence RPC failed: {:?}", response.error);
+            assert!(matches!(
+                rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&response.result).expect("decode evidence reply"),
+                DeleteRecoveryRpcReply::Evidence { present } if present == expected
+            ));
+        }
+        assert_eq!(
+            disk.read_all(volume, &record).await.expect("read retained evidence"),
+            b"unresolved recovery record"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_delete_rpc_reports_snapshot_deferral_as_pending() {
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let configured = set.disks.read().await.iter().find_map(Clone::clone).expect("configured disk");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let disk = service
+            .find_disk(&configured.endpoint().to_string())
+            .await
+            .expect("RPC target disk");
+        let volume = "orphan-rpc";
+        disk.make_volume(volume).await.expect("create orphan bucket");
+        let mut info = rustfs_filemeta::FileInfo::new("object", 1, 1);
+        info.data_dir = Some(Uuid::new_v4());
+        info.mod_time = Some(OffsetDateTime::now_utc());
+        info.size = 1;
+        let mut metadata = rustfs_filemeta::FileMeta::default();
+        metadata.add_version(info).expect("add parent version");
+        disk.write_all(volume, "object/xl.meta", metadata.marshal_msg().expect("encode parent metadata").into())
+            .await
+            .expect("write parent metadata");
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all(volume, &format!("{path}/part.1"), Bytes::from_static(b"snapshot payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease(volume, &path).await.expect("acquire snapshot");
+        let mut request = Request::new(DeleteRequest {
+            disk: configured.endpoint().to_string(),
+            volume: volume.into(),
+            path: path.clone(),
+            options: serde_json::to_string(&crate::storage::storage_api::DeleteOptions {
+                orphan_data_dir: true,
+                immediate: true,
+                ..Default::default()
+            })
+            .expect("encode orphan options"),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_request_body(request.get_ref()).expect("canonical orphan delete");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("delete digest");
+        mark_v2_authenticated(&mut request);
+        let reply = service.delete(request).await.expect("run delete handler").into_inner();
+        assert!(!reply.success, "the legacy RPC must not report deferred reclamation as completed");
+        let error: DiskError = reply.error.expect("pending error code").into();
+        assert_eq!(error, DiskError::DiskOngoingReq);
+        assert_eq!(
+            disk.read_all(volume, &format!("{path}/part.1"))
+                .await
+                .expect("read retained snapshot"),
+            b"snapshot payload"[..]
+        );
+        disk.release_snapshot_lease(volume, &path, token)
+            .await
+            .expect("release completes safe cleanup");
+        assert!(matches!(disk.list_dir("", volume, &path, 1).await, Err(DiskError::FileNotFound)));
     }
 
     #[tokio::test]

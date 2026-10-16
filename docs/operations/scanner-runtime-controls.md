@@ -43,7 +43,8 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` (`DEFAULT_SCANNER_IDLE_MODE`) | Enables preset scanner sleeps and foreground-read backoff. `false` disables those sleeps; per-disk foreground-priority admission remains active. |
 | `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `14` (`DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS`) | Timeout for saving scanner cache; runtime enforces a minimum of `1` and keeps the default persistence budget within the distributed publication lease. |
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS`) | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
-| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
+| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps walker-count-derived concurrency. |
+| `scanner.walkers_per_disk` | `RUSTFS_SCANNER_WALKERS_PER_DISK` | count | `1` (`DEFAULT_SCANNER_WALKERS_PER_DISK`) | Bucket walkers spawned per local disk of a set. The walkers of one disk share its scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. The resulting walker count is what `scanner.max_concurrent_disk_scans` caps, and the disk count stays the floor. Valid range is `1` through `16` (`MAX_SCANNER_WALKERS_PER_DISK`); `1` keeps today's I/O profile and is the right value for rotational media. The `disk_concurrency_budget` log line reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and its `reason` (`available_walkers`, `configured_cap`, or `count_budget`). |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` (`DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS`) | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
 | `scanner.alert_excess_versions` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS` | versions | `100` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS`) | Version count threshold for scanner alerts. |
 | `scanner.alert_excess_version_size` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE` | bytes | `1099511627776` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE`) | Retained version byte threshold for scanner alerts. |
@@ -60,6 +61,16 @@ Speed presets (`crates/config/src/constants/scanner.rs`) set the base sleep mult
 | `slowest` | 100x | 15s | 30m |
 
 Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`). The per-disk foreground-priority gate is independent of `idle_mode` and remains active when sleeps are disabled.
+
+### Walkers per disk
+
+The scanner walks the buckets of an erasure set with one walker per local disk by default, so a single-disk deployment walks one bucket at a time no matter how `scanner.max_concurrent_disk_scans` is set. `scanner.walkers_per_disk` (`RUSTFS_SCANNER_WALKERS_PER_DISK`) multiplies each local disk into that many walkers.
+
+- Keep the default `1` on rotational media: several walkers on one spindle compete for seeks and slow every walk down.
+- On flash, `2` to `4` is the useful range. Raise it when the scanner status shows cycles ending on the cycle budget (`metrics.pacing_pressure.last_cycle_budget_limited`) or when many buckets are never reached within a cycle, and the disk has idle I/O capacity.
+- The walkers of one disk share that disk's scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. `scanner.max_concurrent_disk_scans` still caps the resulting walker count, and the disk count stays the floor.
+- Confirm the setting took effect from `runtime_config.walkers_per_disk.value` in the admin scanner status and from the `disk_concurrency_budget` log line, which reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and the `reason` it was chosen.
+- Helm: `config.rustfs.scanner.walkers_per_disk`; Docker or systemd: the environment variable. The key is additive, so an older binary ignores it.
 
 ### Environment-only scanner knobs
 
@@ -144,6 +155,7 @@ runtime_config.delay.value
 runtime_config.max_wait_seconds.value
 runtime_config.cycle_interval_seconds.value
 runtime_config.bitrot_cycle_seconds.value
+runtime_config.walkers_per_disk.value
 cycle_schedule.effective_interval_seconds
 cycle_schedule.clean_idle_backoff_enabled
 cycle_schedule.clean_idle_backoff_multiplier

@@ -947,6 +947,16 @@ impl RemoteDisk {
         .await
     }
 
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: path.to_owned() })
+            .await?
+        {
+            DeleteRecoveryRpcReply::OrphanDataDir { plain } => Ok(plain),
+            _ => Err(Error::other("unexpected orphan data directory inspection reply")),
+        }
+    }
+
     async fn recover_delete_transaction(
         &self,
         volume: &str,
@@ -3274,7 +3284,7 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
 
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request();
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request(opts);
                 if let Some(request_payload_bytes) = request_payload_bytes {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_sent_bytes(request_payload_bytes);
                 }
@@ -3352,6 +3362,7 @@ impl DiskAPI for RemoteDisk {
         record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, encode_started);
         let request_payload_bytes = batch_read_version_attribution_enabled
             .then(|| batch_read_version_request_payload_len(&req, &batch_read_version_req, &batch_read_version_req_bin));
+        let request_opts = req.opts;
         let batch_result = self
             .execute_with_timeout_for_op(
                 "batch_read_version",
@@ -3365,7 +3376,7 @@ impl DiskAPI for RemoteDisk {
                         batch_read_version_req_bin: batch_read_version_req_bin.into(),
                     });
 
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request(&request_opts);
                     if let Some(request_payload_bytes) = request_payload_bytes {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_sent_bytes(
                             request_payload_bytes.saturating_add(disk_len),
@@ -3901,6 +3912,21 @@ impl DiskAPI for RemoteDisk {
         match result {
             Ok(errors) => errors,
             Err(error) => vec![Some(error); expected_len],
+        }
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Exists {
+                    object: object.to_owned(),
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Evidence { present } => Ok(present),
+            _ => Err(Error::other("unexpected delete recovery existence reply")),
         }
     }
 

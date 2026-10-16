@@ -3457,7 +3457,7 @@ impl ECStore {
         Ok(guards)
     }
 
-    async fn acquire_object_read_lock_if_needed(
+    pub(super) async fn acquire_object_read_lock_if_needed(
         &self,
         op: &'static str,
         bucket: &str,
