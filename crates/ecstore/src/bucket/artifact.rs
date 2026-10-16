@@ -69,6 +69,7 @@ impl ArtifactPutTarget {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<ArtifactPutGuard> {
+        require_local_put_seal_topology(&store).await?;
         if store.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact PUT requires namespace locking"));
         }
@@ -134,6 +135,27 @@ impl ArtifactPutGuard {
             || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost)
             || self.lifecycle_fence.as_ref().is_some_and(NamespaceLockFence::is_lock_lost)
     }
+}
+
+fn local_put_seal_endpoints(endpoints: &[crate::layout::endpoint::Endpoint]) -> bool {
+    !endpoints.is_empty() && endpoints.iter().all(|endpoint| endpoint.is_local)
+}
+
+async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
+    // Use the configured endpoints retained by every pool, including offline
+    // members. Online disk snapshots cannot prove absence of remote writers.
+    if store.pools.is_empty()
+        || store
+            .pools
+            .iter()
+            .any(|pool| !local_put_seal_endpoints(pool.endpoints.endpoints.as_ref()))
+        || store.ctx.is_dist_erasure().await
+    {
+        return Err(Error::other(
+            "artifact PUT sealing requires local-only storage; distributed or remote endpoints are unsupported",
+        ));
+    }
+    Ok(())
 }
 
 impl PutSealRecord {
@@ -214,6 +236,7 @@ impl ECStore {
         expected_incarnation: Uuid,
         attempt_prefix: &str,
     ) -> Result<()> {
+        require_local_put_seal_topology(&self).await?;
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact PUT sealing requires namespace locking"));
         }
@@ -245,6 +268,19 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_put_seal_topology_requires_configured_local_endpoints() {
+        use crate::layout::endpoint::Endpoint;
+
+        let local = Endpoint::try_from("/tmp/artifact-local-disk").unwrap();
+        // No remote Disk or online connection exists: the configuration alone
+        // must reject this member rather than losing it in an online snapshot.
+        let remote = Endpoint::try_from("http://192.0.2.1:9000/artifact-remote-disk").unwrap();
+        assert!(local_put_seal_endpoints(std::slice::from_ref(&local)));
+        assert!(!local_put_seal_endpoints(&[]), "ARTIFACT_PUT_LOCAL_TOPOLOGY_REQUIRED");
+        assert!(!local_put_seal_endpoints(&[local, remote]), "ARTIFACT_PUT_LOCAL_TOPOLOGY_REQUIRED");
+    }
 
     #[test]
     fn artifact_put_seal_attempt_identity_requires_canonical_components() {
