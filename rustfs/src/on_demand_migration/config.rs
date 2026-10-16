@@ -1568,7 +1568,8 @@ mod tests {
         let sys = BucketMetadataSys::new(ecstore);
         let bucket = "odm-accessor";
 
-        sys.set(bucket.to_string(), Arc::new(BucketMetadata::new(bucket))).await;
+        sys.set_for_test(bucket.to_string(), Arc::new(BucketMetadata::new(bucket)))
+            .await;
         assert_eq!(
             decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap()).unwrap(),
             None
@@ -1576,7 +1577,7 @@ mod tests {
 
         let mut corrupt = BucketMetadata::new(bucket);
         corrupt.on_demand_migration_config_json = br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec();
-        sys.set(bucket.to_string(), Arc::new(corrupt)).await;
+        sys.set_for_test(bucket.to_string(), Arc::new(corrupt)).await;
         let err = decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap())
             .expect_err("corrupt config must not read as a default");
         assert_ne!(err, Error::ConfigNotFound, "corruption must not be reported as absence");
@@ -1596,7 +1597,7 @@ mod tests {
             .update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
             .unwrap();
         let stamped = valid.on_demand_migration_config_updated_at;
-        sys.set(bucket.to_string(), Arc::new(valid)).await;
+        sys.set_for_test(bucket.to_string(), Arc::new(valid)).await;
         let (config, updated_at) = decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap())
             .unwrap()
             .expect("stored config is returned");

@@ -24,6 +24,9 @@ pub const BUCKET_LIFECYCLE_LOCK_OBJECT: &str = "";
 /// Options for creating a new bucket.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
+    /// Immutable output namespace, set only when a dedicated artifact bucket is created.
+    #[serde(default)]
+    pub artifact_base_prefix: Option<String>,
     /// Enable object lock for the bucket.
     pub lock_enabled: bool,
     /// Enable versioning for the bucket.
@@ -34,6 +37,16 @@ pub struct MakeBucketOptions {
     pub created_at: Option<OffsetDateTime>,
     /// Skip acquiring namespace lock.
     pub no_lock: bool,
+}
+
+/// Match the plugin runner's fixed artifact-store prefix encoding.
+pub fn valid_artifact_base_prefix(prefix: &str) -> bool {
+    prefix.ends_with('/')
+        && prefix.len() <= 1024
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+        && !prefix.split('/').any(|part| matches!(part, "." | ".."))
 }
 
 /// Operation to perform on a bucket during site replication delete.
@@ -103,6 +116,32 @@ pub trait BucketOperations: Send + Sync + Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_creation_option_survives_serialization() {
+        let mut request = serde_json::to_value(MakeBucketOptions::default()).expect("encode creation options");
+        request["artifact_base_prefix"] = "artifacts/".into();
+        let options: MakeBucketOptions = serde_json::from_value(request).expect("decode artifact creation");
+        assert_eq!(
+            serde_json::to_value(options).expect("encode artifact creation")["artifact_base_prefix"],
+            "artifacts/",
+            "ARTIFACT_CREATION_OPTION"
+        );
+    }
+
+    #[test]
+    fn artifact_prefix_matches_runner_encoding() {
+        for prefix in ["outputs/", "artifacts/v1._-/", "/", "nested//"] {
+            assert!(valid_artifact_base_prefix(prefix), "ARTIFACT_PREFIX_VALID: {prefix}");
+        }
+        for prefix in ["", "outputs", "../", "a/./", "a/../", "空/", "a b/", "a%2f/"] {
+            assert!(!valid_artifact_base_prefix(prefix), "ARTIFACT_PREFIX_INVALID: {prefix}");
+        }
+        assert!(!valid_artifact_base_prefix(&format!("{}/", "a".repeat(1024))));
+        let legacy = serde_json::json!({"lock_enabled":false,"versioning_enabled":false,"force_create":false,"created_at":null,"no_lock":false});
+        let options: MakeBucketOptions = serde_json::from_value(legacy).expect("decode legacy creation options");
+        assert_eq!(options.artifact_base_prefix, None, "ARTIFACT_LEGACY_CREATION");
+    }
 
     #[test]
     fn bucket_info_serializes_with_existing_fields() {

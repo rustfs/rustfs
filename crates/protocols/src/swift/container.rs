@@ -308,6 +308,7 @@ pub async fn create_container(account: &str, container: &str, credentials: &Cred
         .make_bucket(
             &bucket_name,
             &MakeBucketOptions {
+                artifact_base_prefix: None,
                 force_create: false,
                 lock_enabled: false,
                 versioning_enabled: false,

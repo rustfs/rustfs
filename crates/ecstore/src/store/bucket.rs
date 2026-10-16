@@ -845,6 +845,11 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        if opts.artifact_base_prefix.as_deref().is_some_and(|prefix| {
+            is_meta_bucketname(bucket) || opts.no_lock || !rustfs_storage_api::bucket::valid_artifact_base_prefix(prefix)
+        }) {
+            return Err(Error::other("invalid artifact bucket creation options"));
+        }
         if !is_meta_bucketname(bucket)
             && let Err(err) = check_valid_bucket_name_strict(bucket)
         {
@@ -940,7 +945,8 @@ impl ECStore {
         }
         let existing_metadata = if let Some(metadata) = pending_creation_metadata {
             Some(metadata)
-        } else if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
+        } else if (opts.force_create || opts.artifact_base_prefix.is_some()) && !confirmed_missing && !is_meta_bucketname(bucket)
+        {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {
                 metadata = BucketMetadata::new(bucket);
@@ -971,6 +977,7 @@ impl ECStore {
             None
         };
 
+        let has_creation_identity = existing_metadata.is_some();
         let mut meta = existing_metadata.unwrap_or_else(|| {
             if confirmed_missing && !is_meta_bucketname(bucket) {
                 BucketMetadata::new_with_default_durability(bucket)
@@ -978,11 +985,22 @@ impl ECStore {
                 BucketMetadata::new(bucket)
             }
         });
+        if let Some(prefix) = &opts.artifact_base_prefix {
+            if has_creation_identity {
+                if meta.artifact_base_prefix.as_ref() != Some(prefix) {
+                    return Err(Error::other("artifact namespace is immutable"));
+                }
+            } else if confirmed_missing {
+                meta.artifact_base_prefix = Some(prefix.clone());
+            } else {
+                return Err(Error::other("artifact namespace requires a new bucket"));
+            }
+        }
         let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
         if confirmed_missing || is_meta_bucketname(bucket) {
             meta.set_created(opts.created_at);
 
-            if opts.versioning_enabled {
+            if opts.versioning_enabled || meta.artifact_base_prefix.is_some() {
                 meta.versioning_config_xml =
                     crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
             }
@@ -1001,7 +1019,8 @@ impl ECStore {
             meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
-        let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
+        let metadata_persisted_before_physical =
+            confirmed_missing && !is_meta_bucketname(bucket) && (opts.lock_enabled || meta.artifact_base_prefix.is_some());
         if metadata_persisted_before_physical {
             metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
             if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())

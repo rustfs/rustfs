@@ -286,8 +286,10 @@ pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>
 pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.write().await;
-    lock.set(bucket, Arc::new(bm)).await;
-    Ok(())
+    if bucket != bm.name {
+        return Err(Error::other("bucket metadata identity mismatch"));
+    }
+    lock.set_validated(bm).await
 }
 
 pub async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<()> {
@@ -1982,7 +1984,16 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
+    pub(crate) async fn set_validated(&self, mut bm: BucketMetadata) -> Result<()> {
+        if bm.artifact_base_prefix.is_some() {
+            bm.parse_all_configs()?;
+        }
+        bm.validate_artifact_update(self.object_store()).await?;
+        self.set(bm.name.clone(), Arc::new(bm)).await;
+        Ok(())
+    }
+
+    async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
         if !is_meta_bucketname(&bucket) {
             let publish_lock = self.metadata_publish_lock(&bucket);
             let _publish_guard = publish_lock.lock().await;
@@ -1995,6 +2006,11 @@ impl BucketMetadataSys {
             sync_bucket_durability(&bucket, &bm);
             sync_on_demand_migration(&bucket, &bm);
         }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn set_for_test(&self, bucket: String, bm: Arc<BucketMetadata>) {
+        self.set(bucket, bm).await;
     }
 
     /// Remove a bucket's cached metadata from the in-memory map.
@@ -2826,7 +2842,8 @@ impl BucketMetadataSys {
             load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
-        if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
+        if persisted && (metadata.lock_enabled || metadata.artifact_base_prefix.is_some()) && !metadata.bucket_creation_committed
+        {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {

@@ -437,6 +437,7 @@ pub struct BucketMetadata {
     pub created: OffsetDateTime,
     pub lock_enabled: bool, // While marked as unused, it may need to be retained
     pub bucket_incarnation_id: Uuid,
+    pub artifact_base_prefix: Option<String>,
     pub(crate) bucket_incarnation_sidecar: bool,
     pub(crate) bucket_creation_committed: bool,
     pub policy_config_json: Vec<u8>,
@@ -512,6 +513,7 @@ impl Default for BucketMetadata {
             created: OffsetDateTime::UNIX_EPOCH,
             lock_enabled: Default::default(),
             bucket_incarnation_id: Uuid::nil(),
+            artifact_base_prefix: None,
             bucket_incarnation_sidecar: false,
             bucket_creation_committed: false,
             policy_config_json: Default::default(),
@@ -607,7 +609,7 @@ impl BucketMetadata {
     /// legacy migration path, which mints the sidecar first; it must not be
     /// rewritten by this migration.
     pub(crate) fn needs_bucket_creation_commit(&self) -> bool {
-        self.lock_enabled
+        (self.lock_enabled || self.artifact_base_prefix.is_some())
             && !self.bucket_creation_committed
             && self.bucket_incarnation_sidecar
             && !self.bucket_incarnation_id.is_nil()
@@ -704,6 +706,16 @@ impl BucketMetadata {
                     self.bucket_incarnation_id =
                         Uuid::from_slice(&bytes).map_err(|err| Error::other(format!("invalid BucketIncarnationID: {err}")))?;
                 }
+                "ArtifactBasePrefix" => {
+                    if self.artifact_base_prefix.is_some() {
+                        return Err(Error::other("duplicate artifact namespace"));
+                    }
+                    let prefix = read_msgp_str(rd)?;
+                    if !rustfs_storage_api::bucket::valid_artifact_base_prefix(&prefix) {
+                        return Err(Error::other("invalid artifact namespace"));
+                    }
+                    self.artifact_base_prefix = Some(prefix);
+                }
                 "PolicyConfigJSON" | "PolicyConfigJson" => self.policy_config_json = read_msgp_bin(rd)?,
                 "NotificationConfigXML" | "NotificationConfigXml" => self.notification_config_xml = read_msgp_bin(rd)?,
                 "LifecycleConfigXML" | "LifecycleConfigXml" => self.lifecycle_config_xml = read_msgp_bin(rd)?,
@@ -766,7 +778,7 @@ impl BucketMetadata {
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
         // Map size: MinIO fields (25) + RustFS extensions (22)
-        let map_len: u32 = 47;
+        let map_len: u32 = 47 + u32::from(self.artifact_base_prefix.is_some());
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -780,6 +792,10 @@ impl BucketMetadata {
         rmp::encode::write_bool(wr, self.lock_enabled)?;
 
         write_bin_field(wr, "BucketIncarnationID", self.bucket_incarnation_id.as_bytes())?;
+        if let Some(prefix) = &self.artifact_base_prefix {
+            rmp::encode::write_str(wr, "ArtifactBasePrefix")?;
+            rmp::encode::write_str(wr, prefix)?;
+        }
 
         write_bin_field(wr, "PolicyConfigJSON", &self.policy_config_json)?;
         write_bin_field(wr, "NotificationConfigXML", &self.notification_config_xml)?;
@@ -1025,6 +1041,9 @@ impl BucketMetadata {
                     }
                     Some(config)
                 };
+                if self.artifact_base_prefix.is_some() && !config.as_ref().is_some_and(artifact_versioning_enabled) {
+                    return Err(Error::other("artifact bucket versioning must remain enabled"));
+                }
                 self.versioning_config_xml = data;
                 self.versioning_config = config;
                 self.versioning_config_updated_at = updated;
@@ -1129,6 +1148,7 @@ impl BucketMetadata {
         write_completion: WriteCompletion,
     ) -> Result<()> {
         self.parse_all_configs()?;
+        self.validate_artifact_update(store.clone()).await?;
         let mut buf: Vec<u8> = vec![0; 4];
 
         LittleEndian::write_u16(&mut buf[0..2], BUCKET_METADATA_FORMAT);
@@ -1153,6 +1173,40 @@ impl BucketMetadata {
         )
         .await?;
 
+        Ok(())
+    }
+
+    fn validate_artifact_configuration(&self) -> Result<()> {
+        if let Some(prefix) = &self.artifact_base_prefix {
+            if !rustfs_storage_api::bucket::valid_artifact_base_prefix(prefix) || self.bucket_incarnation_id.is_nil() {
+                return Err(Error::other("invalid artifact bucket identity"));
+            }
+            let versioning = deserialize::<VersioningConfiguration>(&self.versioning_config_xml)?;
+            if !artifact_versioning_enabled(&versioning) {
+                return Err(Error::other("artifact bucket versioning must remain enabled"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Full metadata replacement must not change a generation's creation identity.
+    pub(crate) async fn validate_artifact_update(&self, store: Arc<ECStore>) -> Result<()> {
+        self.validate_artifact_configuration()?;
+        // An existing empty/corrupt metadata object is not permission to create an identity.
+        match read_config_preserve_empty(store, &self.save_file_path()).await {
+            Ok(data) => {
+                Self::check_header(&data)?;
+                let previous = Self::unmarshal(&data[4..])?;
+                previous.validate_artifact_configuration()?;
+                if (previous.bucket_incarnation_id == self.bucket_incarnation_id || previous.bucket_incarnation_id.is_nil())
+                    && previous.artifact_base_prefix != self.artifact_base_prefix
+                {
+                    return Err(Error::other("artifact namespace is immutable"));
+                }
+            }
+            Err(Error::ConfigNotFound) => {}
+            Err(error) => return Err(error),
+        }
         Ok(())
     }
 
@@ -1199,6 +1253,7 @@ impl BucketMetadata {
     /// `rustfs_bucket_metadata_parse_failed_total`, reflected in
     /// `rustfs_bucket_metadata_unparsable_current`, and logged at error level.
     pub(super) fn parse_all_configs(&mut self) -> Result<()> {
+        self.validate_artifact_configuration()?;
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1464,6 +1519,10 @@ impl BucketMetadata {
     }
 }
 
+fn artifact_versioning_enabled(config: &VersioningConfiguration) -> bool {
+    config.enabled() && !config.exclude_folders.unwrap_or(false) && config.excluded_prefixes.as_ref().is_none_or(Vec::is_empty)
+}
+
 pub(crate) async fn load_bucket_incarnation(api: Arc<ECStore>, bucket: &str) -> Result<Option<Uuid>> {
     let path = format!("{BUCKET_META_PREFIX}/{bucket}/{BUCKET_INCARNATION_FILE}");
     let data = match read_config_preserve_empty(api, &path).await {
@@ -1585,6 +1644,51 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn artifact_metadata_roundtrip_and_corrupt_prefix_rejection() {
+        let mut metadata = BucketMetadata::new("artifacts");
+        metadata.artifact_base_prefix = Some("images/".to_owned());
+        let encoded = metadata.marshal_msg().expect("encode artifact metadata");
+        let decoded = BucketMetadata::unmarshal(&encoded).expect("decode artifact metadata");
+        assert_eq!(decoded.artifact_base_prefix, metadata.artifact_base_prefix, "ARTIFACT_METADATA_ROUNDTRIP");
+        assert_eq!(decoded.bucket_incarnation_id, metadata.bucket_incarnation_id);
+        let legacy = BucketMetadata::new("ordinary")
+            .marshal_msg()
+            .expect("encode ordinary metadata");
+        assert!(
+            BucketMetadata::unmarshal(&legacy)
+                .expect("decode ordinary metadata")
+                .artifact_base_prefix
+                .is_none()
+        );
+        for prefix in ["", "../", "outputs", "a b/"] {
+            let mut invalid = Vec::new();
+            rmp::encode::write_map_len(&mut invalid, 1).expect("encode map");
+            rmp::encode::write_str(&mut invalid, "ArtifactBasePrefix").expect("encode field");
+            rmp::encode::write_str(&mut invalid, prefix).expect("encode invalid prefix");
+            assert!(BucketMetadata::unmarshal(&invalid).is_err(), "ARTIFACT_CORRUPT_PREFIX");
+        }
+    }
+
+    #[test]
+    fn artifact_versioning_cannot_be_disabled_or_excluded() {
+        let mut metadata = BucketMetadata::new("artifacts");
+        metadata.artifact_base_prefix = Some("images/".to_owned());
+        for xml in [
+            "",
+            "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+            "<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders></VersioningConfiguration>",
+            "<VersioningConfiguration><Status>Enabled</Status><ExcludedPrefixes><Prefix>images/</Prefix></ExcludedPrefixes></VersioningConfiguration>",
+        ] {
+            assert!(
+                metadata
+                    .update_config(BUCKET_VERSIONING_CONFIG, xml.as_bytes().to_vec())
+                    .is_err(),
+                "ARTIFACT_VERSIONING_REQUIRED"
+            );
+        }
+    }
 
     /// rustfs/backlog#1734: `StorageError::clone` rebuilds I/O errors from
     /// their text. The unreadable-config refusal must stay typed across that
