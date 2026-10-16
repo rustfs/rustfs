@@ -700,6 +700,7 @@ where
     record_set_scans_active(0);
 
     let first_err = first_err_mutex.lock().await.take();
+    let has_set_failure = first_err.is_some();
     let results = results_mutex.lock().await.clone();
     let completed_all_sets = bucket_plan_complete && scanner_results_form_complete_snapshot(&results, &expected_sources);
     let result = finalize_nsscanner_result(&results, first_err);
@@ -731,6 +732,18 @@ where
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
     let required_cycle_floor = (observed_cycle_floor > want_cycle).then_some(observed_cycle_floor);
     let budget_elapsed = budget.budget_elapsed();
+    // A mixed-plan tail can save its checkpoint without producing a root
+    // candidate. Do not infer progress from an arbitrary missing update, or
+    // let a successful set hide another set's worker/persistence failure.
+    let partial_bucket_progress = !budget_elapsed
+        && !ctx.is_cancelled()
+        && scanner_partial_progress_is_usable(
+            bucket_plan_complete,
+            scan_scope_matches,
+            bucket_scan_status,
+            has_set_failure,
+            !namespace_not_found_buckets.is_empty(),
+        );
     let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
     let dirty_usage_current = dirty_usage_status == DirtyUsageSnapshotStatus::Current;
     let (activity_status, remote_publication_lease_targets) =
@@ -817,6 +830,7 @@ where
         .with_publication_epoch(publication_epoch)
         .with_activity_digest(activity_digest)
         .with_usage_update_emitted(usage_update_emitted)
+        .with_partial_bucket_progress(partial_bucket_progress)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)
