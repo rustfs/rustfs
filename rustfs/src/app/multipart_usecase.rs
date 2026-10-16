@@ -2966,7 +2966,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn multipart_completion_rejects_rotated_quota_capability_before_rename() {
+    async fn multipart_completion_commits_after_quota_fleet_proof_loss_before_rename() {
         use crate::app::storage_api::test::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
 
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-mpu-quota", 4096).await;
@@ -3000,27 +3000,19 @@ mod tests {
                 .await
         });
         barrier.wait_until_paused().await;
-        assert!(
-            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
-            "the gating environment must have a current fleet proof"
-        );
+        let _without_proof = crate::storage::storage_api::ecstore_notification::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none());
         barrier.release();
 
-        let err = complete
+        complete
             .await
             .expect("completion task should not panic")
-            .expect_err("a replaced fleet proof must fence multipart rename");
-        assert!(matches!(
-            err,
-            StorageError::NamespaceLockQuorumUnavailable {
-                mode: "quota_reservation",
-                ..
-            }
-        ));
-        store
-            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .expect("fleet proof loss must not invalidate multipart quota reservation and disk fences");
+        let stored = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
-            .expect("proof rotation must preserve the multipart upload for retry");
+            .expect("completed multipart object must remain readable after fleet proof loss");
+        assert_eq!(stored.size, 4096);
     }
 
     #[tokio::test]

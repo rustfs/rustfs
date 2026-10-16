@@ -115,7 +115,7 @@ impl RenameDataObservation {
 }
 
 const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
-pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
+pub const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
 
 pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -131,7 +131,7 @@ pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
     )
 }
 
-pub(crate) fn is_quota_mutation_fence_path(path: &str) -> bool {
+pub fn is_quota_mutation_fence_path(path: &str) -> bool {
     path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
         .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }

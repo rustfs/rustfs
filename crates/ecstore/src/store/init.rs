@@ -4163,6 +4163,178 @@ mod tests {
         OfflineTestDisks { disks }
     }
 
+    #[cfg(feature = "test-util")]
+    async fn durable_quota_writes_with_one_offline_disk(sharded: bool) {
+        use crate::bucket::quota::BucketQuota;
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let temp_dir = tempfile::tempdir().expect("create degraded quota store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "degraded-quota", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("degraded-quota-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create degraded quota bucket");
+        let quota = if sharded {
+            BucketQuota::new_sharded(16_384)
+        } else {
+            BucketQuota::new(Some(16_384))
+        };
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_QUOTA_CONFIG_FILE,
+            serde_json::to_vec(&quota).expect("encode durable quota"),
+        )
+        .await
+        .expect("configure durable quota before losing a disk");
+
+        let set = &store.pools[0].disk_set[0];
+        assert_eq!(set.disks.read().await.len(), 4);
+        let offline_disk = force_set_disk_range_offline_for_test(set, 0..1).await;
+        let _without_proof = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_none());
+
+        let payload = vec![0x51; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("three healthy disks must admit a quota PUT without fleet proof");
+
+        let upload = store
+            .new_multipart_upload(&bucket, "multipart", &ObjectOptions::default())
+            .await
+            .expect("create multipart upload with one disk offline");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, "multipart", &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part with one disk offline");
+        Arc::clone(&store)
+            .complete_multipart_upload(
+                &bucket,
+                "multipart",
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must complete a quota multipart upload without fleet proof");
+
+        let source = store
+            .get_object_reader(&bucket, "put", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read degraded copy source");
+        let mut copy_info = source.object_info.clone();
+        let size = copy_info.get_actual_size().expect("copy source logical size");
+        copy_info.put_object_reader = Some(PutObjReader::new(
+            rustfs_rio::HashReader::from_stream(source.stream, size, size, None, None, false)
+                .expect("construct copy source reader"),
+        ));
+        store
+            .copy_object(
+                &bucket,
+                "put",
+                &bucket,
+                "copy",
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must copy into a quota bucket without fleet proof");
+
+        // Hold the last available credit before publication so the competing
+        // writer must account for an outstanding reservation, not just objects.
+        let barrier = PutObjectCommitBarrier::install(&bucket, "reserved", PutObjectCommitPause::BeforeQuotaRename);
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x52; 4096]);
+            first_store
+                .put_object(&first_bucket, "reserved", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("the last within-limit writer must reach its commit barrier");
+        let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+        let denied = store
+            .put_object(&bucket, "over-limit", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("an outstanding reservation must prevent concurrent quota oversubscription");
+        assert!(matches!(denied, StorageError::QuotaExceeded { limit: 16_384, .. }));
+        barrier.release();
+        first
+            .await
+            .expect("reserved PUT task should not panic")
+            .expect("the reserved writer must commit while one disk is offline");
+
+        for object in ["put", "multipart", "copy", "reserved"] {
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("degraded quota writes must be readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read committed quota object");
+            let expected = if object == "reserved" {
+                vec![0x52; 4096]
+            } else {
+                payload.clone()
+            };
+            assert_eq!(body, expected, "committed body for {object}");
+        }
+        store
+            .get_object_info(&bucket, "over-limit", &ObjectOptions::default())
+            .await
+            .expect_err("the over-limit writer must not publish an object");
+
+        let second_offline_disk = force_set_disk_range_offline_for_test(set, 1..2).await;
+        let mut reader = PutObjReader::from_vec(vec![0x54; 4096]);
+        let denied = store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("a zero-growth overwrite must still fail when the actual write quorum is lost");
+        assert!(
+            matches!(
+                denied,
+                StorageError::ErasureWriteQuorum
+                    | StorageError::ErasureReadQuorum
+                    | StorageError::InsufficientWriteQuorum(_, _)
+                    | StorageError::InsufficientReadQuorum(_, _)
+            ),
+            "loss of actual disk quorum must return a storage quorum error, got {denied:?}"
+        );
+        shutdown.cancel();
+        drop(second_offline_disk);
+        drop(offline_disk);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v1_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v1", || durable_quota_writes_with_one_offline_disk(false));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v2_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v2", || durable_quota_writes_with_one_offline_disk(true));
+    }
+
     fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
         let now = OffsetDateTime::now_utc();
         let mut pool_stats = vec![RebalanceStats::default(); pool_count];
