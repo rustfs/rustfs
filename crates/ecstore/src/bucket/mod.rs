@@ -14,6 +14,7 @@
 
 // #730: bucket subsystems still contain staged ECStore migration code.
 
+pub mod artifact;
 pub mod bandwidth;
 pub mod bucket_target_sys;
 pub mod config_parse_mode;

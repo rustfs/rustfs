@@ -4282,7 +4282,18 @@ impl ECStore {
 
         let object = encode_dir_object(object);
         let mut opts = opts.clone();
-        if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
+        opts.artifact_put_target = None;
+        if !is_meta_bucketname(bucket) && !opts.no_lock && !opts.data_movement {
+            let metadata = crate::bucket::metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+            if opts
+                .expected_bucket_incarnation_id
+                .is_some_and(|expected| expected != metadata.bucket_incarnation_id)
+            {
+                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+            }
+            opts.expected_bucket_incarnation_id = Some(metadata.bucket_incarnation_id);
+            opts.artifact_put_target = crate::bucket::artifact::ArtifactPutTarget::from_metadata(&metadata, &object)?;
+        } else if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
         }
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {

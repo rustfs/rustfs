@@ -514,6 +514,15 @@ pub(crate) async fn get_cached_bucket_incarnation_id_in(
     sys.get_bucket_incarnation_id(bucket).await
 }
 
+pub(crate) async fn get_bucket_incarnation_metadata_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Arc<BucketMetadata>> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    sys.get_bucket_incarnation_metadata(bucket).await
+}
+
 pub(crate) async fn set_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
     let sys = bucket_metadata_sys_of(ctx)?;
     let lock = sys.read().await;
@@ -2517,12 +2526,16 @@ impl BucketMetadataSys {
     }
 
     async fn get_bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
+        Ok(self.get_bucket_incarnation_metadata(bucket).await?.bucket_incarnation_id)
+    }
+
+    async fn get_bucket_incarnation_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let authority = self.get_metadata_authority(bucket).await?;
         if let BucketMetadataAuthority::Authoritative(metadata) = &authority
             && metadata.bucket_incarnation_sidecar
             && !metadata.bucket_incarnation_id.is_nil()
         {
-            return Ok(metadata.bucket_incarnation_id);
+            return Ok(Arc::clone(metadata));
         }
 
         match authority {
@@ -2531,7 +2544,7 @@ impl BucketMetadataSys {
                     BucketMetadataAuthority::Authoritative(metadata)
                         if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
                     {
-                        Ok(metadata.bucket_incarnation_id)
+                        Ok(metadata)
                     }
                     BucketMetadataAuthority::Authoritative(_) | BucketMetadataAuthority::Fabricated => {
                         Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))

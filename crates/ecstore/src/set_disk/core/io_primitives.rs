@@ -2540,7 +2540,7 @@ impl RenameRollbackReceipt {
 
 struct RenameRollbackOwnership {
     receipt: Option<RenameRollbackReceipt>,
-    namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    namespace_commit_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 async fn inspect_incomplete_rename_rollback(
@@ -2657,7 +2657,7 @@ async fn rollback_failed_rename(
                         old_data_dir: rollback_dir,
                         ..Default::default()
                     },
-                    disk_namespace_commit_guard.map(|owner| owner as Arc<dyn Send + Sync>),
+                    disk_namespace_commit_guard,
                 )
                 .await
             });
@@ -2772,7 +2772,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
-    namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    namespace_commit_guard: Option<Arc<dyn Send + Sync>>,
     rollback_receipt: Option<RenameRollbackReceipt>,
 }
 
@@ -2805,7 +2805,7 @@ impl<'a> RenameDataFenceOptions<'a> {
 
     pub(in crate::set_disk) fn with_namespace_commit_guard(
         mut self,
-        namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+        namespace_commit_guard: Option<Arc<dyn Send + Sync>>,
     ) -> Self {
         self.namespace_commit_guard = namespace_commit_guard;
         self
@@ -3254,9 +3254,7 @@ impl SetDisks {
                                     &dst_object,
                                     crate::disk::RenameDataGuards {
                                         scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        namespace_owner: namespace_commit_guard.clone(),
                                         ..Default::default()
                                     },
                                 )
@@ -3657,9 +3655,7 @@ impl SetDisks {
                                     &dst_object,
                                     crate::disk::RenameDataGuards {
                                         scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        namespace_owner: namespace_commit_guard.clone(),
                                         ..Default::default()
                                     },
                                 )

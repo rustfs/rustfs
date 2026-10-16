@@ -938,6 +938,9 @@ pub struct ObjectOptions {
     /// A genuine target write guard; loss fences alone do not authorize a borrowed write.
     #[doc(hidden)]
     pub write_lock_context: Option<WriteLockContext>,
+    /// Ordinary ECStore PUT target bound to its bucket's immutable artifact namespace.
+    #[doc(hidden)]
+    pub artifact_put_target: Option<Arc<crate::bucket::artifact::ArtifactPutTarget>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace

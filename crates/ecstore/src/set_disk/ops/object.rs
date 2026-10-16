@@ -4036,6 +4036,18 @@ impl SetDisks {
                 .await?;
             }
 
+            let mut artifact_put_guard = if let Some(target) = opts.artifact_put_target.as_ref() {
+                if !write_context.acquires_namespace() || publication_fence.is_some() || opts.data_movement {
+                    return Err(Error::other("artifact PUT target requires an ordinary owned write"));
+                }
+                Some(Arc::new(
+                    target
+                        .acquire(metadata_sys::object_store_in(&self.ctx).await?, bucket, object, opts)
+                        .await?,
+                ))
+            } else {
+                None
+            };
             if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 #[cfg(test)]
                 {
@@ -4062,6 +4074,7 @@ impl SetDisks {
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = source_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
+                    && artifact_put_guard.is_none()
                 {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
@@ -4398,6 +4411,7 @@ impl SetDisks {
             let commit_decommission_object_lock_guard = decommission_object_lock_guard.take();
             let commit_publication_guard = publication_commit_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
+            let commit_artifact_put_guard = artifact_put_guard.take();
             let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
             // A scanner publication scope owns the movement permit until the
@@ -4417,6 +4431,7 @@ impl SetDisks {
             let detach_commit_owner = commit_scanner_publication_scope.is_some()
                 || commit_owns_namespace_guard
                 || commit_bucket_lifecycle_guard.is_some()
+                || commit_artifact_put_guard.is_some()
                 || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
             let commit_is_versioned = opts.versioned || opts.version_suspended;
@@ -4440,6 +4455,7 @@ impl SetDisks {
                 let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
                 let mut _publication_guard = commit_publication_guard;
                 let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                let mut _artifact_put_guard = commit_artifact_put_guard;
                 let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
@@ -4452,6 +4468,7 @@ impl SetDisks {
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
+                        || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
                             .as_ref()
@@ -4512,6 +4529,7 @@ impl SetDisks {
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
+                        || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
                             .as_ref()
@@ -4638,9 +4656,11 @@ impl SetDisks {
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
                     .with_rollback_receipt(commit_rollback_receipt.clone())
-                    .with_namespace_commit_guard(
-                        (!is_meta_bucketname(&commit_bucket)).then(|| commit_set.ctx.begin_namespace_commit()),
-                    ),
+                    .with_namespace_commit_guard((!is_meta_bucketname(&commit_bucket)).then(|| {
+                        // Disk workers and rollback retain this owner even if
+                        // the rename coordinator itself fails or is cancelled.
+                        Arc::new((commit_set.ctx.begin_namespace_commit(), _artifact_put_guard.clone())) as Arc<dyn Send + Sync>
+                    })),
                 )
                 .await;
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
@@ -4679,6 +4699,7 @@ impl SetDisks {
                         let object_lock_guard = _object_lock_guard.take();
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
+                        let artifact_put_guard = _artifact_put_guard.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
                         let decommission_capacity_guard = _decommission_capacity_guard.take();
                         let cleanup_bucket = commit_bucket.clone();
@@ -4700,6 +4721,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                artifact_put_guard,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -4721,6 +4743,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                artifact_put_guard,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -4749,6 +4772,7 @@ impl SetDisks {
                                 }
                                 drop(decommission_object_lock_guard);
                                 drop(decommission_capacity_guard);
+                                drop(artifact_put_guard);
                             },
                             |request| async move { heal_set.submit_rename_tail_heal(request).await },
                         ));
