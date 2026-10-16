@@ -365,13 +365,18 @@ impl ECStore {
                     }
                 }
             }
-            if summary.pending > 0 {
+            if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
             }
             if object.is_some() && !opts.dry_run && summary.blocked > 0 {
                 return Err(StorageError::SlowDown);
             }
-            if summary.discovered == 0 {
+            let delete_recovery = rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+                pending: summary.pending,
+                blocked: summary.blocked,
+                failed: summary.failed,
+            };
+            if summary.discovered == 0 && !delete_recovery.has_unresolved() {
                 return Ok(None);
             }
             Ok(Some(HealResultItem {
@@ -384,14 +389,17 @@ impl ECStore {
                 object: object.or(prefix).unwrap_or_default(),
                 bucket,
                 detail: format!(
-                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}",
+                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}, pending={}, failed={}",
                     if opts.dry_run { " (dry run)" } else { "" },
                     summary.discovered,
                     summary.committed,
                     summary.rolled_back,
                     summary.reclaimed,
-                    summary.blocked
+                    summary.blocked,
+                    summary.pending,
+                    summary.failed
                 ),
+                delete_recovery: Some(delete_recovery),
                 ..Default::default()
             }))
         })

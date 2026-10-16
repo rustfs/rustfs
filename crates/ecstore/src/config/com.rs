@@ -2939,7 +2939,10 @@ mod tests {
     async fn save_config_preserves_retryable_system_volume_errors() {
         let store = Arc::new(MetadataWriteStore {
             error: Some(Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())),
-            ..Default::default()
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            observations: Default::default(),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            pending: false,
         });
         let error =
             save_config_with_opts_inner(store, "buckets/example/.metadata.bin", Vec::new(), &ObjectOptions::default(), false)

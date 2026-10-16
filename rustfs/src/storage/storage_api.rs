@@ -1513,6 +1513,7 @@ pub(crate) trait StorageDiskRpcExt {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>>;
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool>;
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -1734,6 +1735,10 @@ where
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         ecstore_disk::DiskAPI::delete_versions_recoverable(self, volume, versions, opts).await
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool> {
+        ecstore_disk::DiskAPI::has_delete_transaction_evidence(self, volume, object).await
     }
 
     async fn discover_delete_transactions(
