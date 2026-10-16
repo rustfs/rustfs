@@ -10,7 +10,7 @@ use crate::{
     object_api::{ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCompletion},
     runtime::instance::InstanceContext,
     storage_api_contracts::{
-        bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions},
+        bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations as _, DeleteBucketOptions, MakeBucketOptions},
         namespace::NamespaceLocking as _,
         object::ObjectIO as _,
     },
@@ -480,4 +480,82 @@ fn artifact_repair_metadata_owner_survives_cancellation() {
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_metadata_owner_survives_disk_timeout() {
     run_physical_repair_case(RepairKind::Metadata, false);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn ordinary_repair_rename_owner_retains_lifecycle_after_cancellation() {
+    run_large_stack_async_test("ordinary-repair-lifecycle-tail", || async {
+        let root = tempfile::tempdir().expect("ordinary repair fixture directory");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        let bucket = "ordinary-repair-lifecycle-tail";
+        let incarnation = create_bucket(&store, bucket, false).await;
+        let object = "repair.bin";
+        let version = put_payload(&store, bucket, object, RepairKind::Rename).await;
+        let disk = damage_for_repair(&store, bucket, object, version, RepairKind::Rename).await;
+        let destination = object_path(&disk, bucket, object);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = os::prepared_publication_test_hooks::install(&destination.join(STORAGE_FORMAT_FILE), move || {
+            let _ = entered_tx.send(());
+            // Sender drop also releases the physical worker on assertion failure.
+            let _ = release_rx.recv();
+        });
+        let heal_store = store.clone();
+        let mut repair = tokio::spawn(async move {
+            heal_store
+                .heal_object_with_proof(bucket, object, &version.to_string(), &heal_options())
+                .await
+        });
+        tokio::time::timeout(DEADLINE, async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("ordinary repair reaches physical metadata publication"),
+                result = &mut repair => panic!("ordinary repair returned before physical publication pause: {result:?}"),
+            }
+        })
+        .await
+        .expect("ordinary repair pauses inside the real rename worker");
+        repair.abort();
+        assert!(repair.await.expect_err("ordinary repair waiter is cancelled").is_cancelled());
+
+        let lifecycle = store
+            .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("resolve the same lifecycle namespace used by bucket deletion");
+        let retained = lifecycle.get_write_lock(Duration::from_secs(1)).await.is_err();
+
+        // Drain before the regression assertion so a failing owner-retention run cannot hang.
+        drop(release_tx);
+        drop(
+            tokio::time::timeout(DEADLINE, os::acquire_rename_data_mutation_lease(&disk.path(), bucket, &destination))
+                .await
+                .expect("ordinary repair physical publication and rollback drain"),
+        );
+        let lifecycle_writer = lifecycle
+            .get_write_lock(DEADLINE)
+            .await
+            .expect("bucket lifecycle writer proceeds after the real repair worker exits");
+        drop(lifecycle_writer);
+        assert!(
+            retained,
+            "ARTIFACT_REPAIR_TAIL_BARRIER: ordinary repair retains its lifecycle owner after waiter cancellation until physical publication drains"
+        );
+        assert_eq!(
+            store
+                .bucket_incarnation_id(bucket)
+                .await
+                .expect("read unchanged ordinary incarnation"),
+            incarnation
+        );
+        // Cancellation may leave cleanup to a later repair; it must retain the original
+        // committed version and bytes rather than authorizing a replacement PUT.
+        let repaired = store
+            .heal_object_with_proof(bucket, object, &version.to_string(), &heal_options())
+            .await
+            .expect("finish any remaining repair of the original ordinary version");
+        assert!(repaired.error.is_none(), "remaining ordinary repair failed: {:?}", repaired.error);
+        assert_exact_payload(&store, bucket, object, version).await;
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+    });
 }
