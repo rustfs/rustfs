@@ -8,6 +8,7 @@ pub(crate) mod admin {
 }
 
 pub(crate) mod bucket {
+    pub(crate) use rustfs_storage_api::bucket::valid_artifact_base_prefix;
     pub(crate) use rustfs_storage_api::{
         BUCKET_LIFECYCLE_LOCK_OBJECT, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
         SRBucketDeleteOp,

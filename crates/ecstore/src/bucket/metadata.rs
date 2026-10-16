@@ -711,7 +711,7 @@ impl BucketMetadata {
                         return Err(Error::other("duplicate artifact namespace"));
                     }
                     let prefix = read_msgp_str(rd)?;
-                    if !rustfs_storage_api::bucket::valid_artifact_base_prefix(&prefix) {
+                    if !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(&prefix) {
                         return Err(Error::other("invalid artifact namespace"));
                     }
                     self.artifact_base_prefix = Some(prefix);
@@ -1178,7 +1178,7 @@ impl BucketMetadata {
 
     fn validate_artifact_configuration(&self) -> Result<()> {
         if let Some(prefix) = &self.artifact_base_prefix {
-            if !rustfs_storage_api::bucket::valid_artifact_base_prefix(prefix) || self.bucket_incarnation_id.is_nil() {
+            if !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(prefix) || self.bucket_incarnation_id.is_nil() {
                 return Err(Error::other("invalid artifact bucket identity"));
             }
             let versioning = deserialize::<VersioningConfiguration>(&self.versioning_config_xml)?;

@@ -846,7 +846,9 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if opts.artifact_base_prefix.as_deref().is_some_and(|prefix| {
-            is_meta_bucketname(bucket) || opts.no_lock || !rustfs_storage_api::bucket::valid_artifact_base_prefix(prefix)
+            is_meta_bucketname(bucket)
+                || opts.no_lock
+                || !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(prefix)
         }) {
             return Err(Error::other("invalid artifact bucket creation options"));
         }
