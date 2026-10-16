@@ -64,6 +64,10 @@ The seal takes the same attempt lock and persists its record with all metadata
 writes drained before returning. Thus it waits for admitted ordinary PUTs and
 prevents later ordinary PUT publication, including after a restart.
 
+A failed or cancelled seal request may still leave a record for its original
+incarnation. Retry idempotently to confirm success; an error is not proof that
+the attempt remains writable or that all metadata writes have been cleaned up.
+
 This operation does not yet prove that every write path is sealed. Borrowed-lock
 writes, multipart completion, copy, replication, data movement, repair, and
 restore require separate enforcement and verification. Runner must not consume
