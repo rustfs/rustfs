@@ -393,7 +393,7 @@ async fn artifact_put_seal_lock_survives_physical_publication_timeout() {
                         &mut PutObjReader::from_vec(vec![0xCC; 379]),
                         &ObjectOptions {
                             versioned: true,
-                            version_id: Some(version),
+                            version_id: Some(version.to_string()),
                             write_completion: WriteCompletion::TailDrained,
                             ..Default::default()
                         },
@@ -452,4 +452,83 @@ async fn artifact_put_seal_lock_survives_physical_publication_timeout() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_put_seal_rejects_distributed_topology_without_changing_ordinary_puts() {
+    use crate::layout::endpoints::SetupType;
+
+    const LOCAL_ONLY_ERROR: &str =
+        "artifact PUT sealing requires local-only storage; distributed or remote endpoints are unsupported";
+    let root = tempfile::tempdir().expect("artifact distributed topology directory");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-put-distributed";
+    let incarnation = create_bucket(&store, bucket).await;
+    let ordinary = "artifact-put-distributed-ordinary";
+    store
+        .make_bucket(
+            ordinary,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create ordinary versioned control bucket");
+    let ordinary_incarnation = store.bucket_incarnation_id(ordinary).await.expect("ordinary identity");
+    let prefix = attempt_prefix();
+    let object = format!("{prefix}image.png");
+    put(&store, bucket, &object).await;
+    let before = disk_metadata(&store, bucket, &object).await;
+    let first = put(&store, ordinary, &object).await;
+
+    // Keep every physical disk online: the gate must inspect configured topology.
+    ctx.update_erasure_type(SetupType::DistErasure).await;
+    assert!(ctx.is_dist_erasure().await);
+    let rejected = store
+        .put_object(
+            bucket,
+            &object,
+            &mut PutObjReader::from_vec(vec![0xDD; 379]),
+            &ObjectOptions {
+                versioned: true,
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("distributed artifact PUT must be rejected before publication");
+    assert!(rejected.to_string().contains(LOCAL_ONLY_ERROR), "ARTIFACT_PUT_LOCAL_ONLY: {rejected}");
+    assert_eq!(
+        disk_metadata(&store, bucket, &object).await,
+        before,
+        "ARTIFACT_PUT_LOCAL_ONLY: no disk gains a version"
+    );
+    let rejected = store
+        .clone()
+        .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
+        .await
+        .expect_err("distributed topology cannot claim a durable PUT seal");
+    assert!(rejected.to_string().contains(LOCAL_ONLY_ERROR), "ARTIFACT_PUT_LOCAL_ONLY: {rejected}");
+    let second = put(&store, ordinary, &object).await;
+    assert_ne!(
+        first.version_id, second.version_id,
+        "ordinary PUT stays available under the same topology"
+    );
+    assert_eq!(
+        store
+            .bucket_incarnation_id(ordinary)
+            .await
+            .expect("ordinary identity remains available"),
+        ordinary_incarnation
+    );
+    assert_eq!(
+        store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("artifact identity remains available"),
+        incarnation
+    );
+    shutdown.cancel();
 }
