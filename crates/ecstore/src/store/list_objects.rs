@@ -24,7 +24,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_ma
 use crate::bucket::metadata_sys::{
     get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
 };
-use crate::bucket::utils::check_list_objs_args;
+use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
     FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
@@ -4114,6 +4114,12 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        // Stored keys cannot contain repeated separators. Keep the query literal
+        // and avoid walking or cleaning up an aliased filesystem path.
+        if prefix.contains("//") && !has_bad_path_component(prefix) && !prefix.contains('\0') {
+            check_list_objs_args(bucket, "", &marker)?;
+            return Ok(ListObjectsInfo::default());
+        }
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let mut opts = ListPathOptions {
