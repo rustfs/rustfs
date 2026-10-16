@@ -163,6 +163,7 @@ use rustfs_utils::{
     path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, path_join_buf},
 };
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
@@ -4610,10 +4611,10 @@ struct GetObjectMetadataCacheKey {
     hash: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GetObjectMetadataCacheLookupKey<'a> {
     bucket: &'a str,
-    object: &'a str,
+    object: Cow<'a, str>,
     generation: u64,
     hash: u64,
 }
@@ -4695,11 +4696,31 @@ fn record_metadata_cache_invalidation(bucket: &str, object: &str) {
     }
 }
 
+/// Object name as the metadata cache identifies it.
+///
+/// Windows disks treat `\` as a path separator and `path_join_buf` drops the
+/// empty segments that leaves behind, so `a\b`, `a\\b`, `\a\b` and `a\b\`
+/// all address the xl.meta of `a/b`. Folding those spellings into one cache
+/// identity lets a mutation through any of them retire the others' cached
+/// metadata. Elsewhere `\` is an ordinary key byte and the name is verbatim.
+fn get_object_metadata_cache_object_name(object: &str) -> Cow<'_, str> {
+    fold_object_name_path_separators(object, cfg!(windows))
+}
+
+fn fold_object_name_path_separators(object: &str, backslash_is_separator: bool) -> Cow<'_, str> {
+    // Names without `\` already passed the `//` and leading-`/` checks.
+    if !backslash_is_separator || !object.contains('\\') {
+        return Cow::Borrowed(object);
+    }
+    let segments: Vec<&str> = object.split(['/', '\\']).filter(|segment| !segment.is_empty()).collect();
+    Cow::Owned(segments.join(SLASH_SEPARATOR))
+}
+
 impl GetObjectMetadataCacheKey {
     fn new(bucket: &str, object: &str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket: Arc::from(bucket),
-            object: Arc::from(object),
+            object: Arc::from(get_object_metadata_cache_object_name(object).as_ref()),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -4710,7 +4731,7 @@ impl<'a> GetObjectMetadataCacheLookupKey<'a> {
     fn new(bucket: &'a str, object: &'a str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket,
-            object,
+            object: get_object_metadata_cache_object_name(object),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -4727,7 +4748,7 @@ impl Hash for GetObjectMetadataCacheLookupKey<'_> {
 impl moka::Equivalent<GetObjectMetadataCacheKey> for GetObjectMetadataCacheLookupKey<'_> {
     fn equivalent(&self, key: &GetObjectMetadataCacheKey) -> bool {
         self.bucket == key.bucket.as_ref()
-            && self.object == key.object.as_ref()
+            && self.object.as_ref() == key.object.as_ref()
             && self.generation == key.generation
             && self.hash == key.hash
     }
@@ -4985,7 +5006,7 @@ impl SetDisks {
     fn get_object_metadata_cache_hash(&self, bucket: &str, object: &str) -> u64 {
         let mut hasher = self.get_object_metadata_cache_hash_builder.build_hasher();
         bucket.hash(&mut hasher);
-        object.hash(&mut hasher);
+        get_object_metadata_cache_object_name(object).hash(&mut hasher);
         hasher.finish()
     }
 

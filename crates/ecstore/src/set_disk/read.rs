@@ -2740,6 +2740,7 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 mod metadata_cache_tests {
     use super::*;
     use crate::set_disk::core::io_primitives::disk_call_counters;
+    use crate::set_disk::{fold_object_name_path_separators, get_object_metadata_cache_object_name};
     use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4096,6 +4097,79 @@ mod metadata_cache_tests {
             "per-key invalidation must physically remove the retired generation"
         );
         assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
+    }
+
+    async fn cache_valid_test_fileinfo(set: &SetDisks, object: &str) {
+        let fi = valid_test_fileinfo(object);
+        let generation = set.get_object_metadata_cache_generation("bucket", object);
+        set.cache_get_object_fileinfo(
+            ("bucket", object),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
+        assert!(set.cached_get_object_fileinfo("bucket", object).await.is_some());
+    }
+
+    #[test]
+    fn metadata_cache_object_name_folds_backslash_only_as_path_separator() {
+        assert_eq!(fold_object_name_path_separators("a\\b\\c", true), "a/b/c");
+        assert_eq!(fold_object_name_path_separators("a/b\\c", true), "a/b/c");
+        // Empty segments collapse on disk, so these address `a/b` as well.
+        assert_eq!(fold_object_name_path_separators("a\\\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("a/\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("\\a\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("a\\b\\", true), "a/b");
+        assert!(matches!(fold_object_name_path_separators("a/b", true), std::borrow::Cow::Borrowed("a/b")));
+        assert!(matches!(
+            fold_object_name_path_separators("a\\b", false),
+            std::borrow::Cow::Borrowed("a\\b")
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn metadata_cache_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        assert_eq!(get_object_metadata_cache_object_name("a\\b"), "a\\b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_some(),
+            "off Windows `a\\b` is a different object and must not retire `a/b`"
+        );
+        assert!(set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_metadata_cache_shares_backslash_and_slash_spellings() {
+        assert_eq!(get_object_metadata_cache_object_name("a\\b"), "a/b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_some(),
+            "both spellings address the same xl.meta and must share one cache entry"
+        );
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_none(),
+            "a mutation through `a\\b` must retire metadata cached for `a/b`"
+        );
+
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+        set.invalidate_get_object_metadata_cache("bucket", "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none(),
+            "a mutation through `a/b` must retire metadata cached for `a\\b`"
+        );
     }
 
     #[tokio::test]
