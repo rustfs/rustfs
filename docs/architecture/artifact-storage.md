@@ -82,6 +82,10 @@ and tag changes. Copying from an artifact bucket to an ordinary bucket remains
 allowed. Listing and aborting existing multipart uploads remain available for
 cleanup. Classification is bound to the authoritative bucket incarnation, so an
 old ordinary-bucket request cannot publish into a recreated artifact bucket.
+The guarded entry points only borrow lifecycle authority from a matching snapshot
+that retains the actual lock owner. A standalone lock-loss signal or a snapshot
+without that owner is rejected; internal callers must supply the owned snapshot
+or let the entry point acquire its own lifecycle lock.
 
 This operation does not yet prove that every write path is sealed. Direct
 lower-level writes, repair, remote physical completion, and a controlled external
