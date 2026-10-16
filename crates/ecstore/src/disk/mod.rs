@@ -1301,6 +1301,14 @@ impl Disk {
             Self::Remote(_) => Err(DiskError::other("replacement execution requires a local target")),
         }
     }
+
+    pub(crate) async fn is_blank_replacement_target(&self) -> Result<bool> {
+        let Some(root) = self.replacement_mount_lease_root() else {
+            return Ok(false);
+        };
+        let blank = local::is_blank_replacement_target(root).await?;
+        Ok(blank && self.has_replacement_mount_lease())
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {

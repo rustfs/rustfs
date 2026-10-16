@@ -736,6 +736,13 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(true)
     }
 
+    /// Admit a one-shot recovery of an old pre-format intent only when the
+    /// current format fence permits its set, rebalance has a quiescent older
+    /// topology, and every target is a blank, unformatted replacement.
+    async fn replacement_preformat_retry_is_safe(&self, _set_disk_id: &str, _targets: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         Err(Error::other("replacement execution lease acquisition is unsupported"))
     }
@@ -2108,6 +2115,14 @@ impl HealStorageAPI for ECStoreHealStorage {
 
     async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         ReplacementExecution::acquire(targets).await
+    }
+
+    async fn replacement_preformat_retry_is_safe(&self, set_disk_id: &str, targets: &[String]) -> Result<bool> {
+        let (pool_index, set_index) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        self.ecstore
+            .replacement_preformat_retry_is_safe(pool_index, set_index, targets)
+            .await
+            .map_err(Error::Storage)
     }
 }
 
