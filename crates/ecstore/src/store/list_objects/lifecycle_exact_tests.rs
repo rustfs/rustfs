@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use super::*;
+use crate::bucket::lifecycle::core::IlmAction;
+use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
 use crate::bucket::metadata_sys;
 use crate::disk::lifecycle_test_io::Observer;
@@ -195,10 +197,10 @@ async fn lifecycle_exact_matches_listing_for_complete_version_groups() {
                 assert_eq!(exact.user_defined, listed.user_defined);
                 assert_eq!(exact.version_purge_status, listed.version_purge_status);
             }
-            let policy = crate::bucket::utils::deserialize::<s3s::dto::BucketLifecycleConfiguration>(
+            let policy = crate::bucket::utils::deserialize(
                 br#"<LifecycleConfiguration><Rule><ID>history</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>30</Days></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#,
             ).expect("reference policy");
-            let evaluator = rustfs_lifecycle::Evaluator::new(Arc::new(policy));
+            let evaluator = Evaluator::new(Arc::new(policy));
             let to_opts = |objects: &[ObjectInfo]| {
                 objects
                     .iter()
@@ -433,16 +435,16 @@ async fn lifecycle_exact_keeps_pending_purges_visible_to_expiry_guards() {
         .expect("read pending purge");
     assert_eq!(exact.len(), 1);
     assert_eq!(exact[0].num_versions, 1);
-    assert_eq!(exact[0].version_purge_status, rustfs_replication::VersionPurgeStatusType::Pending);
-    let policy = crate::bucket::utils::deserialize::<s3s::dto::BucketLifecycleConfiguration>(
+    assert_eq!(exact[0].version_purge_status, crate::bucket::replication::VersionPurgeStatusType::Pending);
+    let policy = crate::bucket::utils::deserialize(
         br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#,
     ).expect("expiration policy");
     let opts = crate::bucket::lifecycle::core::object_opts_from_object_info(&exact[0]);
-    let events = rustfs_lifecycle::Evaluator::new(Arc::new(policy))
+    let events = Evaluator::new(Arc::new(policy))
         .eval(&[opts])
         .await
         .expect("evaluate pending purge");
-    assert_eq!(events[0].action, rustfs_lifecycle::IlmAction::NoneAction);
+    assert_eq!(events[0].action, IlmAction::NoneAction);
 }
 
 #[tokio::test]
