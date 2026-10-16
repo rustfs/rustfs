@@ -331,15 +331,23 @@ async fn multipart_case() {
         ..options()
     };
     unsupported(store.new_multipart_upload(artifact, &object, &opts).await);
-    // Seed actual legacy staging through the pool API, below the newly gated store entrypoint.
+    // Seed actual legacy staging while holding the lifecycle owner required by the pool API.
+    let lifecycle = store
+        .acquire_bucket_lifecycle_read_lock(artifact)
+        .await
+        .expect("legacy upload lifecycle owner");
+    let mut staging_opts = opts.clone();
+    staging_opts.add_bucket_lifecycle_lock_guard(&lifecycle);
     let upload = store.pools[0]
-        .new_multipart_upload(artifact, &object, &opts)
+        .new_multipart_upload(artifact, &object, &staging_opts)
         .await
         .expect("real legacy upload staging");
     let part = store.pools[0]
-        .put_object_part(artifact, &object, &upload.upload_id, 1, &mut body(), &opts)
+        .put_object_part(artifact, &object, &upload.upload_id, 1, &mut body(), &staging_opts)
         .await
         .expect("real legacy staged part");
+    drop(staging_opts);
+    drop(lifecycle);
     let parts = vec![CompletePart {
         part_num: part.part_num,
         etag: part.etag.clone(),
@@ -500,6 +508,173 @@ async fn recreation_case() {
             "ARTIFACT_WRITE_INCARNATION: {error}"
         );
     }
+    shutdown.cancel();
+    assert!(ctx.wait_for_detached_mutations(Duration::from_secs(30)).await);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_write_entrypoint_lifecycle_fences_require_real_matching_owners() {
+    run_large_stack_async_test("artifact-entrypoint-lifecycle-owner", lifecycle_owner_case);
+}
+
+async fn lifecycle_owner_case() {
+    let root = tempfile::tempdir().expect("lifecycle owner fixture directory");
+    let (ctx, store, shutdown) =
+        without_storage_class_env(build_isolated_test_store(root.path(), "artifact-lifecycle-owner", &[4])).await;
+    metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let ordinary = "artifact-lifecycle-ordinary";
+    let artifact = "artifact-lifecycle-dedicated";
+    bucket(&store, ordinary, false).await;
+    bucket(&store, artifact, true).await;
+    let object = object_key();
+    for name in [ordinary, artifact] {
+        store
+            .put_object(name, &object, &mut body(), &options())
+            .await
+            .expect("initial real object");
+    }
+    let before = snapshot(&store, ordinary, &object).await;
+    let artifact_before = snapshot(&store, artifact, &object).await;
+    let unrelated = store
+        .new_ns_lock(ordinary, "unrelated-object")
+        .await
+        .expect("unrelated namespace");
+    let unrelated_owner = unrelated
+        .get_read_lock(Duration::from_secs(30))
+        .await
+        .expect("live unrelated owner");
+    let mut foreign_fence = options();
+    foreign_fence.add_bucket_lifecycle_lock_guard(&unrelated_owner);
+    let lifecycle = store
+        .acquire_bucket_lifecycle_read_lock(ordinary)
+        .await
+        .expect("real lifecycle owner");
+    let mut released_fence = options();
+    released_fence.add_bucket_lifecycle_lock_guard(&lifecycle);
+    let borrowed_snapshot = store
+        .object_lock_config_snapshot_under_lifecycle_fence(
+            ordinary,
+            released_fence
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .expect("borrowed lifecycle fence"),
+        )
+        .await
+        .expect("real snapshot retaining only its metadata lock");
+    drop(lifecycle);
+    let mut snapshot_without_owner = options();
+    borrowed_snapshot.add_lock_fences(&mut snapshot_without_owner);
+    snapshot_without_owner.object_lock_config_snapshot = Some(borrowed_snapshot);
+
+    for opts in [foreign_fence, released_fence, snapshot_without_owner] {
+        let mut source = copy_info(&store, ordinary, &object).await;
+        for result in [
+            store
+                .put_object(
+                    ordinary,
+                    &object,
+                    &mut body(),
+                    &ObjectOptions {
+                        replication_request: true,
+                        ..opts.clone()
+                    },
+                )
+                .await
+                .map(|_| ()),
+            store
+                .copy_object(ordinary, &object, ordinary, &object, &mut source, &options(), &opts)
+                .await
+                .map(|_| ()),
+            store
+                .put_object_tags(ordinary, &object, "owner=fake", &opts)
+                .await
+                .map(|_| ()),
+            store.put_object_metadata(ordinary, &object, &opts).await.map(|_| ()),
+            store.clone().restore_transitioned_object(ordinary, &object, &opts).await,
+            store.new_multipart_upload(ordinary, &object, &opts).await.map(|_| ()),
+        ] {
+            let error = result.expect_err("a fence without its matching lifecycle owner cannot authorize a write");
+            assert!(
+                error.to_string().contains("write requires an owned bucket lifecycle fence"),
+                "ARTIFACT_WRITE_LIFECYCLE_OWNER: {error}"
+            );
+        }
+        let error = store
+            .put_object(artifact, &object, &mut body(), &opts)
+            .await
+            .expect_err("ordinary artifact PUT also requires the lifecycle owner");
+        assert!(
+            error.to_string().contains("write requires an owned bucket lifecycle fence"),
+            "ARTIFACT_WRITE_LIFECYCLE_OWNER: {error}"
+        );
+        assert_eq!(
+            snapshot(&store, ordinary, &object).await,
+            before,
+            "ARTIFACT_WRITE_LIFECYCLE_OWNER: ordinary metadata unchanged"
+        );
+        assert_eq!(
+            snapshot(&store, artifact, &object).await,
+            artifact_before,
+            "ARTIFACT_WRITE_LIFECYCLE_OWNER: artifact versions unchanged"
+        );
+    }
+    drop(unrelated_owner);
+    assert!(
+        store
+            .list_multipart_uploads(ordinary, &object, None, None, None, 100)
+            .await
+            .expect("inspect rejected multipart creation")
+            .uploads
+            .is_empty()
+    );
+
+    let owned_snapshot = store
+        .object_lock_config_snapshot(ordinary)
+        .await
+        .expect("real lifecycle-owning snapshot");
+    let mut owned = options();
+    owned_snapshot.add_lock_fences(&mut owned);
+    owned.object_lock_config_snapshot = Some(owned_snapshot.clone());
+    let lifecycle_namespace = store
+        .new_ns_lock(ordinary, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
+        .await
+        .expect("actual bucket deletion namespace");
+    assert!(
+        lifecycle_namespace.get_write_lock(Duration::from_millis(100)).await.is_err(),
+        "matching snapshot actually blocks the bucket deletion lock"
+    );
+    store
+        .put_object_tags(ordinary, &object, "owner=real", &owned)
+        .await
+        .expect("matching owned snapshot permits ordinary tags");
+    let upload = store
+        .new_multipart_upload(ordinary, &object, &owned)
+        .await
+        .expect("matching owned snapshot permits ordinary multipart creation");
+    store
+        .abort_multipart_upload(ordinary, &object, &upload.upload_id, &owned)
+        .await
+        .expect("clean up supported multipart upload");
+    drop(owned);
+    drop(owned_snapshot);
+    let artifact_snapshot = store
+        .object_lock_config_snapshot(artifact)
+        .await
+        .expect("artifact lifecycle-owning snapshot");
+    let mut owned = options();
+    artifact_snapshot.add_lock_fences(&mut owned);
+    owned.object_lock_config_snapshot = Some(artifact_snapshot);
+    store
+        .put_object(artifact, &object, &mut body(), &owned)
+        .await
+        .expect("matching owned snapshot permits ordinary artifact PUT");
+    assert_ne!(
+        snapshot(&store, artifact, &object).await,
+        artifact_before,
+        "supported artifact PUT publishes a new version"
+    );
+    drop(owned);
     shutdown.cancel();
     assert!(ctx.wait_for_detached_mutations(Duration::from_secs(30)).await);
 }
