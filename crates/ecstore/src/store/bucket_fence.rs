@@ -154,10 +154,23 @@ pub struct BucketIncarnationFenceGuard {
     inner: Option<NamespaceLockGuard>,
     registry: Arc<BucketFenceRegistry>,
     bucket: String,
+    incarnation: Uuid,
     token: u64,
 }
 
 impl BucketIncarnationFenceGuard {
+    pub(crate) fn matches(&self, store: &super::ECStore, bucket: &str, incarnation: Uuid) -> bool {
+        Arc::ptr_eq(&self.registry, &store.bucket_fence_registry)
+            && self.bucket == bucket
+            && self.incarnation == incarnation
+            && !self.is_lock_lost()
+    }
+
+    pub(crate) fn attach_owner(self: &Arc<Self>, opts: &mut crate::object_api::ObjectOptions) {
+        self.attach_to_object_options(opts);
+        opts.bucket_incarnation_fence = Some(Arc::clone(self));
+    }
+
     /// Propagate lifecycle lock loss into the storage commit checks.
     /// The caller still owns this guard until the complete write tail drains.
     pub fn attach_to_object_options(&self, opts: &mut crate::object_api::ObjectOptions) {
@@ -203,11 +216,12 @@ impl FencePieces {
         self.inner.is_lock_lost()
     }
 
-    pub(super) fn into_guard(self, bucket: &str, token: u64) -> BucketIncarnationFenceGuard {
+    pub(super) fn into_guard(self, bucket: &str, token: u64, incarnation: Uuid) -> BucketIncarnationFenceGuard {
         BucketIncarnationFenceGuard {
             inner: Some(self.inner),
             registry: self.registry,
             bucket: bucket.to_string(),
+            incarnation,
             token,
         }
     }
@@ -367,7 +381,7 @@ mod tests {
             inner,
         };
         let registration = pieces.enter("b");
-        let fence = pieces.into_guard("b", registration.token);
+        let fence = pieces.into_guard("b", registration.token, uuid(1));
         let mut opts = crate::object_api::ObjectOptions::default();
         fence.attach_to_object_options(&mut opts);
         let inherited = opts

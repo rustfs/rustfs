@@ -3513,6 +3513,14 @@ impl SetDisks {
         let protect_write = opts.shard_integrity_write_enabled();
         let source_bucket_incarnation_id =
             crate::bucket::artifact::ArtifactPutTarget::validate_for_put(&self.ctx, bucket, object, opts).await?;
+        if source_bucket_incarnation_id.is_some()
+            && !write_context.acquires_namespace()
+            && publication_fence.is_none()
+            && opts.bucket_incarnation_fence.is_none()
+            && opts.object_lock_config_snapshot.is_none()
+        {
+            return Err(Error::other("borrowed PUT requires an owned bucket lifecycle fence"));
+        }
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
@@ -3538,7 +3546,7 @@ impl SetDisks {
         let mut decommission_object_lock_guard = None;
         let mut decommission_target_lock_covered = false;
         let mut decommission_capacity_guard = None;
-        let mut bucket_lifecycle_guard = None;
+        let mut bucket_lifecycle_guard = opts.bucket_incarnation_fence.clone();
         let mut publication_commit_guard: Option<RemoteTuplePublicationCommitGuard> = None;
 
         // This pre-body check is advisory fast-fail only: the authoritative
@@ -4068,15 +4076,16 @@ impl SetDisks {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = source_bucket_incarnation_id
-                    && opts.bucket_lifecycle_lock_fence.is_none()
+                    && bucket_lifecycle_guard.is_none()
+                    && opts.object_lock_config_snapshot.is_none()
                     && artifact_put_guard.is_none()
                 {
-                    bucket_lifecycle_guard = Some(
+                    bucket_lifecycle_guard = Some(Arc::new(
                         metadata_sys::object_store_in(&self.ctx)
                             .await?
                             .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
-                    );
+                    ));
                 }
                 if let Some(fence) = publication_fence.take() {
                     publication_commit_guard = Some(fence.into_commit_guard(self.pool_index, bucket, object).await?);
@@ -4407,6 +4416,7 @@ impl SetDisks {
             let commit_publication_guard = publication_commit_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
             let commit_artifact_put_guard = artifact_put_guard.take();
+            let commit_lifecycle_snapshot = opts.object_lock_config_snapshot.clone();
             let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
             // A scanner publication scope owns the movement permit until the
@@ -4451,6 +4461,7 @@ impl SetDisks {
                 let mut _publication_guard = commit_publication_guard;
                 let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let mut _artifact_put_guard = commit_artifact_put_guard;
+                let mut _lifecycle_snapshot = commit_lifecycle_snapshot;
                 let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
@@ -4655,10 +4666,12 @@ impl SetDisks {
                         // Disk workers and rollback retain this owner even if
                         // the rename coordinator itself fails or is cancelled.
                         let namespace_owner = commit_set.ctx.begin_namespace_commit();
-                        match _artifact_put_guard.clone() {
-                            Some(artifact_owner) => Arc::new((namespace_owner, artifact_owner)) as Arc<dyn Send + Sync>,
-                            None => namespace_owner as Arc<dyn Send + Sync>,
-                        }
+                        Arc::new((
+                            namespace_owner,
+                            _artifact_put_guard.clone(),
+                            _bucket_lifecycle_guard.clone(),
+                            _lifecycle_snapshot.clone(),
+                        )) as Arc<dyn Send + Sync>
                     })),
                 )
                 .await;
@@ -4699,6 +4712,7 @@ impl SetDisks {
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
                         let artifact_put_guard = _artifact_put_guard.take();
+                        let lifecycle_snapshot = _lifecycle_snapshot.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
                         let decommission_capacity_guard = _decommission_capacity_guard.take();
                         let cleanup_bucket = commit_bucket.clone();
@@ -4721,6 +4735,7 @@ impl SetDisks {
                                 publication_guard,
                                 bucket_lifecycle_guard,
                                 artifact_put_guard,
+                                lifecycle_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -4743,6 +4758,7 @@ impl SetDisks {
                                 publication_guard,
                                 bucket_lifecycle_guard,
                                 artifact_put_guard,
+                                lifecycle_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -4750,7 +4766,6 @@ impl SetDisks {
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
-                                drop(bucket_lifecycle_guard);
                                 cleanup_set
                                     .cleanup_rename_tail(
                                         targets,
@@ -4772,6 +4787,8 @@ impl SetDisks {
                                 drop(decommission_object_lock_guard);
                                 drop(decommission_capacity_guard);
                                 drop(artifact_put_guard);
+                                drop(bucket_lifecycle_guard);
+                                drop(lifecycle_snapshot);
                             },
                             |request| async move { heal_set.submit_rename_tail_heal(request).await },
                         ));
@@ -10182,6 +10199,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             ropts.no_lock = false;
             ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
             ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
+            ropts.bucket_incarnation_fence = opts.bucket_incarnation_fence.clone();
             ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
             ropts.object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
             ropts.decommission_capacity_admission = opts.decommission_capacity_admission.clone();
@@ -10326,6 +10344,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     version_id: oi.version_id.map(|version| version.to_string()),
                     expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                     bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
+                    bucket_incarnation_fence: opts.bucket_incarnation_fence.clone(),
                     user_defined: restore_commit_metadata,
                     no_lock: false,
                     decommission_capacity_admission: opts.decommission_capacity_admission.clone(),

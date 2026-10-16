@@ -1010,6 +1010,9 @@ pub struct ObjectOptions {
     /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
+    /// Actual generation owner retained by storage commits and their physical tails.
+    #[doc(hidden)]
+    pub bucket_incarnation_fence: Option<Arc<crate::store::BucketIncarnationFenceGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the

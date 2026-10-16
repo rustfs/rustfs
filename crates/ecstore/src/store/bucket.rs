@@ -586,7 +586,7 @@ impl ECStore {
             pieces.abandon(bucket, registration.token);
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        Ok(pieces.into_guard(bucket, registration.token))
+        Ok(pieces.into_guard(bucket, registration.token, expected))
     }
 
     /// Hold this guard through recursive-delete authorization and mutation so

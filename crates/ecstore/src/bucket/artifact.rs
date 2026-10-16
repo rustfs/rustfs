@@ -78,6 +78,8 @@ impl ArtifactPutTarget {
         {
             return Err(Error::BucketNotFound(bucket.to_owned()));
         }
+        let store = metadata_sys::object_store_in(ctx).await?;
+        store.validate_write_lifecycle_owner(bucket, metadata.bucket_incarnation_id, opts)?;
         match (Self::from_metadata(&metadata, object)?, opts.artifact_put_target.as_deref()) {
             (None, None) => {}
             (Some(expected), Some(actual)) if expected.record == actual.record && expected.object == actual.object => {}
@@ -107,7 +109,12 @@ impl ArtifactPutTarget {
         // A destructive PUT already owns the lifecycle and metadata guards in
         // its Object Lock snapshot. Retain that owner rather than queueing a
         // recursive read behind a writer that is waiting for this PUT.
-        let (lifecycle, snapshot) = if opts.bucket_lifecycle_lock_fence.is_some() {
+        let (lifecycle, snapshot) = if let Some(owner) = opts.bucket_incarnation_fence.as_ref() {
+            if !owner.matches(&store, bucket, self.record.incarnation_id) {
+                return Err(Error::other("artifact PUT requires an owned lifecycle fence"));
+            }
+            (Some(Arc::clone(owner)), opts.object_lock_config_snapshot.clone())
+        } else if opts.bucket_lifecycle_lock_fence.is_some() {
             let snapshot = opts
                 .object_lock_config_snapshot
                 .as_ref()
@@ -116,11 +123,11 @@ impl ArtifactPutTarget {
             (None, Some(Arc::clone(snapshot)))
         } else {
             (
-                Some(
+                Some(Arc::new(
                     store
                         .acquire_bucket_incarnation_fence(bucket, self.record.incarnation_id)
                         .await?,
-                ),
+                )),
                 None,
             )
         };
@@ -148,7 +155,7 @@ impl ArtifactPutTarget {
 
 pub(crate) struct ArtifactPutGuard {
     attempt: WriteCommitGuard,
-    lifecycle: Option<BucketIncarnationFenceGuard>,
+    lifecycle: Option<Arc<BucketIncarnationFenceGuard>>,
     _snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
     lifecycle_fence: Option<NamespaceLockFence>,
 }
@@ -156,7 +163,7 @@ pub(crate) struct ArtifactPutGuard {
 impl ArtifactPutGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.attempt.is_lock_lost()
-            || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost)
+            || self.lifecycle.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || self.lifecycle_fence.as_ref().is_some_and(NamespaceLockFence::is_lock_lost)
     }
 }
@@ -174,7 +181,9 @@ pub(crate) struct ArtifactRepairScope {
 
 impl ArtifactRepairScope {
     pub(crate) fn check(&self) -> Result<()> {
-        if self.attempt.is_lock_lost() || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost) {
+        if self.attempt.as_ref().is_some_and(WriteCommitGuard::is_lock_lost)
+            || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost)
+        {
             return Err(Error::other("artifact repair fence was lost"));
         }
         if let Some(scope) = &self.bucket_heal {
@@ -301,6 +310,27 @@ async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
 }
 
 impl ECStore {
+    pub(crate) fn validate_write_lifecycle_owner(&self, bucket: &str, incarnation: Uuid, opts: &ObjectOptions) -> Result<()> {
+        let invalid = || Error::other("write requires an owned bucket lifecycle fence");
+        if let Some(owner) = &opts.bucket_incarnation_fence {
+            if !owner.matches(self, bucket, incarnation)
+                || opts
+                    .object_lock_config_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.is_valid_for_destructive_put(self.id, bucket, incarnation))
+            {
+                return Err(invalid());
+            }
+        } else if let Some(snapshot) = &opts.object_lock_config_snapshot {
+            if !snapshot.owns_bucket_lifecycle_fence(self.id, bucket, incarnation) {
+                return Err(invalid());
+            }
+        } else if opts.bucket_lifecycle_lock_fence.is_some() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn bind_artifact_write_metadata(
         &self,
         bucket: &str,
@@ -320,13 +350,12 @@ impl ECStore {
         opts.expected_bucket_incarnation_id = Some(metadata.bucket_incarnation_id);
         // A loss signal cannot authorize skipping the downstream generation lock.
         // Keep a matching owner in opts, including for ordinary PUT and Copy.
+        self.validate_write_lifecycle_owner(bucket, metadata.bucket_incarnation_id, opts)?;
+        if let Some(owner) = opts.bucket_incarnation_fence.clone() {
+            owner.attach_owner(opts);
+        }
         if let Some(snapshot) = opts.object_lock_config_snapshot.clone() {
-            if !snapshot.owns_bucket_lifecycle_fence(self.id, bucket, metadata.bucket_incarnation_id) {
-                return Err(Error::other("write requires an owned bucket lifecycle fence"));
-            }
             snapshot.add_lock_fences(opts);
-        } else if opts.bucket_lifecycle_lock_fence.is_some() {
-            return Err(Error::other("write requires an owned bucket lifecycle fence"));
         }
         Ok(Some(metadata))
     }
@@ -335,7 +364,7 @@ impl ECStore {
         &self,
         bucket: &str,
         opts: &ObjectOptions,
-    ) -> Result<(ObjectOptions, Option<rustfs_lock::NamespaceLockGuard>)> {
+    ) -> Result<(ObjectOptions, Option<Arc<BucketIncarnationFenceGuard>>)> {
         let mut opts = opts.clone();
         let Some(metadata) = self.bind_artifact_write_metadata(bucket, &mut opts).await? else {
             return Ok((opts, None));
@@ -343,13 +372,16 @@ impl ECStore {
         reject_unsupported_artifact_write(&metadata)?;
         // Lifecycle read -> metadata transaction read -> downstream object lock.
         // Binding above verified and retained any supplied snapshot's actual owner.
-        let guard = if opts.object_lock_config_snapshot.is_some() {
+        let guard = if opts.object_lock_config_snapshot.is_some() || opts.bucket_incarnation_fence.is_some() {
             None
         } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+            Some(Arc::new(
+                self.acquire_bucket_incarnation_fence(bucket, metadata.bucket_incarnation_id)
+                    .await?,
+            ))
         };
         if let Some(guard) = guard.as_ref() {
-            opts.add_bucket_lifecycle_lock_guard(guard);
+            guard.attach_owner(&mut opts);
         }
         let current = metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
         if opts.expected_bucket_incarnation_id != Some(current) {

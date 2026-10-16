@@ -4524,21 +4524,15 @@ impl ECStore {
         let _bucket_lifecycle_guard = if is_meta_bucketname(dst_bucket) || dst_opts.bucket_lifecycle_lock_fence.is_some() {
             None
         } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(dst_bucket).await?)
-        };
-        let current_bucket_incarnation_id = if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
-            dst_opts.add_bucket_lifecycle_lock_guard(guard);
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, dst_bucket, &dst_opts).await?;
-            if dst_opts
+            let incarnation = dst_opts
                 .expected_bucket_incarnation_id
-                .is_some_and(|expected| expected != current_incarnation_id)
-            {
-                return Err(StorageError::BucketNotFound(dst_bucket.to_string()));
-            }
-            Some(current_incarnation_id)
-        } else {
-            dst_opts.expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("copy is missing its bucket incarnation"))?;
+            Some(Arc::new(self.acquire_bucket_incarnation_fence(dst_bucket, incarnation).await?))
         };
+        if let Some(owner) = &_bucket_lifecycle_guard {
+            owner.attach_owner(&mut dst_opts);
+        }
+        let current_bucket_incarnation_id = dst_opts.expected_bucket_incarnation_id;
         if dst_opts
             .bucket_lifecycle_lock_fence
             .as_ref()
@@ -4648,6 +4642,7 @@ impl ECStore {
                     namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
                     write_lock_context: dst_opts.write_lock_context.clone(),
                     bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+                    bucket_incarnation_fence: dst_opts.bucket_incarnation_fence.clone(),
                     object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                     quota_admission: dst_opts.quota_admission,
                     ..Default::default()
@@ -4693,6 +4688,7 @@ impl ECStore {
                         namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
                         write_lock_context: dst_opts.write_lock_context.clone(),
                         bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+                        bucket_incarnation_fence: dst_opts.bucket_incarnation_fence.clone(),
                         object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                         quota_admission: dst_opts.quota_admission,
                         ..Default::default()
@@ -4748,6 +4744,7 @@ impl ECStore {
             namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
             write_lock_context: dst_opts.write_lock_context.clone(),
             bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+            bucket_incarnation_fence: dst_opts.bucket_incarnation_fence.clone(),
             object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             quota_admission: dst_opts.quota_admission,
             ..Default::default()

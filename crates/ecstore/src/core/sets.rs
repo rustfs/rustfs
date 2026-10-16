@@ -800,6 +800,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
             quota_admission: dst_opts.quota_admission,
+            expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+            bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+            bucket_incarnation_fence: dst_opts.bucket_incarnation_fence.clone(),
+            object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             ..Default::default()
         };
 
