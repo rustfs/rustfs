@@ -50,6 +50,25 @@ This storage-library creation capability does not expose an S3 creation header
 or establish a permanently sealed attempt. An artifact prefix alone does not
 prevent later PUT, multipart completion, copy, replication, or restore writes.
 
+`ECStore::seal_artifact_attempt_puts` in `crates/ecstore/src/bucket/artifact.rs`
+provides a narrower storage-library operation for ordinary owned ECStore PUTs.
+The record binds the bucket incarnation and full attempt prefix. Only a missing
+record permits a PUT; a matching record rejects it, and malformed records or
+failed reads also reject it. Repeating the seal verifies the same identity.
+
+The PUT commit path takes locks in this order: bucket lifecycle, attempt record,
+then target object. Same-attempt commits are serialized; uploading a body does
+not hold the attempt lock. The actual commit and rename-tail owner retains the
+attempt guard after a quorum response or cancellation of the request waiter.
+The seal takes the same attempt lock and persists its record with all metadata
+writes drained before returning. Thus it waits for admitted ordinary PUTs and
+prevents later ordinary PUT publication, including after a restart.
+
+This operation does not yet prove that every write path is sealed. Borrowed-lock
+writes, multipart completion, copy, replication, data movement, repair, and
+restore require separate enforcement and verification. Runner must not consume
+this PUT-only operation as a permanent all-writes seal.
+
 Before Runner can rely on a seal, storage must fence every supported write path
 for the exact bucket incarnation and attempt namespace, retain the fence through
 commit and any remaining physical writes, and durably record the seal. Unsupported
@@ -70,7 +89,14 @@ updates, metadata replacement, and versioning rejection. Run:
 ```sh
 cargo test --locked -p rustfs-storage-api --lib artifact
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
 ```
 
-These checks establish bucket identity and versioning only. They do not certify
-attempt sealing, backup retention, or safe artifact deletion.
+`crates/ecstore/src/store/init/tests/artifact_put_seal_tests.rs` pauses real
+rename work to check the PUT barrier, including a cancelled request waiter, and
+compares on-disk object metadata after rejected writes. It also checks restart,
+record corruption, generation mismatch, and ordinary bucket behavior.
+
+These checks establish bucket identity, versioning, and ordinary PUT sealing.
+They do not certify all-writes sealing, backup retention, or safe artifact
+deletion.
