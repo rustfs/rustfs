@@ -87,10 +87,24 @@ that retains the actual lock owner. A standalone lock-loss signal or a snapshot
 without that owner is rejected; internal callers must supply the owned snapshot
 or let the entry point acquire its own lifecycle lock.
 
-This operation does not yet prove that every write path is sealed. Direct
-lower-level writes, repair, remote physical completion, and a controlled external
-seal interface still require enforcement and verification. Runner must not
-consume this PUT-only operation as a permanent all-writes seal.
+Lower-level SetDisks PUTs also resolve authoritative bucket metadata and require
+a matching managed target for an artifact object. Missing metadata authority is
+an error, not evidence that a bucket is ordinary. Internal callers borrowing a
+lifecycle fence must retain its actual owner through physical publication.
+
+Object repair takes the same attempt lock before capacity and object locks.
+Its local rename and metadata-replacement workers retain the lifecycle and
+attempt owners until the physical mutation completes, even if the async waiter
+is cancelled or times out. Repair of an existing version remains allowed after
+PUT sealing; it does not reopen logical publication. Ordinary-bucket repair also
+retains lifecycle ownership to prevent publication into a recreated bucket.
+
+This operation does not yet prove that every write path is permanently sealed.
+Remote physical completion and a controlled external seal interface still
+require enforcement and verification. Before deleting an artifact, GC also
+needs a durable retirement decision checked by repair: a PUT seal alone must not
+allow repair to recreate a deleted version from surviving shards. Runner must
+not consume this PUT-only operation as a permanent all-writes seal.
 
 Before Runner can rely on a seal, storage must fence every supported write path
 for the exact bucket incarnation and attempt namespace, retain the fence through
@@ -114,6 +128,7 @@ cargo test --locked -p rustfs-storage-api --lib artifact
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_write_entrypoint -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_repair -- --test-threads=1
 ```
 
 `crates/ecstore/src/store/init/tests/artifact_put_seal_tests.rs` pauses real
@@ -125,6 +140,12 @@ record corruption, generation mismatch, and ordinary bucket behavior.
 unsupported entry points against real four-disk state, ordinary-bucket success
 controls, cleanup of preexisting multipart uploads, and deletion/recreation
 between request classification and publication.
+
+`crates/ecstore/src/store/init/tests/artifact_repair_tests.rs` exercises direct
+PUT admission, sealed-version repair and stale-incarnation rejection on four
+real disks. Physical rename and metadata-replacement pauses test that cancellation
+and disk-wrapper timeouts cannot release the attempt barrier before publication
+finishes.
 
 These checks establish bucket identity, versioning, and ordinary PUT sealing.
 They do not certify all-writes sealing, backup retention, or safe artifact
