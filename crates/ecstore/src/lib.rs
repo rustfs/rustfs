@@ -56,7 +56,7 @@ mod storage_api_contracts;
 mod store;
 
 pub use disk::with_background_disk_io;
-pub use store::PoolMetaWriteGateStatus;
+pub use store::{BucketIncarnationFenceGuard, PoolMetaWriteGateStatus};
 
 // pub mod checksum;
 mod event;

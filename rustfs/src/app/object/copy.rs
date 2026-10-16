@@ -114,7 +114,7 @@ where
 pub(crate) async fn acquire_copy_bucket_lifecycle_lock(
     store: &ECStore,
     bucket: &str,
-) -> S3Result<Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>> {
+) -> S3Result<Arc<rustfs_ecstore::BucketIncarnationFenceGuard>> {
     let expected = store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?;
     store
         .acquire_bucket_incarnation_fence(bucket, expected)
@@ -128,8 +128,8 @@ pub(crate) async fn acquire_copy_bucket_lifecycle_locks(
     source_bucket: &str,
     destination_bucket: &str,
 ) -> S3Result<(
-    Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>,
-    Option<Arc<rustfs_ecstore::store::BucketIncarnationFenceGuard>>,
+    Arc<rustfs_ecstore::BucketIncarnationFenceGuard>,
+    Option<Arc<rustfs_ecstore::BucketIncarnationFenceGuard>>,
 )> {
     if source_bucket == destination_bucket {
         return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
