@@ -1426,7 +1426,7 @@ pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
-    observational_snapshot_published: bool,
+    usage_update_emitted: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1444,7 +1444,7 @@ impl ScannerCycleResult {
             status,
             publication_epoch: None,
             activity_digest: None,
-            observational_snapshot_published: false,
+            usage_update_emitted: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
@@ -1477,14 +1477,14 @@ impl ScannerCycleResult {
         self.activity_digest
     }
 
-    pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {
+    pub(crate) fn with_usage_update_emitted(mut self, emitted: bool) -> Self {
         self.publication_expectation = None;
-        self.observational_snapshot_published = published;
+        self.usage_update_emitted = emitted;
         self
     }
 
-    pub(crate) fn has_observational_snapshot(&self) -> bool {
-        self.observational_snapshot_published
+    pub(crate) fn has_usage_update(&self) -> bool {
+        self.usage_update_emitted
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {

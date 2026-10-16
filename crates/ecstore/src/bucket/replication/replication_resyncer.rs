@@ -354,8 +354,9 @@ fn replica_etag_verification_enabled() -> bool {
 /// plaintext MD5 (that path has its own HEAD-back audit), and a managed-SSE
 /// (SSE-S3 / SSE-KMS) source stores a keyed fingerprint, or a legacy plaintext
 /// MD5, that the ETag of the target's re-encrypted replica can neither confirm
-/// nor refute. The checksum header on the replication PUT stays the integrity
-/// check for those objects.
+/// nor refute. A managed-SSE source forwards no checksum either
+/// (`replication_put_object_options`), so its replica has no post-PUT
+/// content audit.
 fn verify_single_part_replica(
     object_info: &ObjectInfo,
     response: &RemotePutObjectResponse,

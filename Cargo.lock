@@ -9893,6 +9893,7 @@ dependencies = [
  "rustfs-rio",
  "rustfs-rio-v2",
  "rustfs-s3-client",
+ "rustfs-s3-ops",
  "rustfs-s3-types",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",

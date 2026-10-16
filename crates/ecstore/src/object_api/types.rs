@@ -1015,6 +1015,9 @@ pub struct ObjectOptions {
     /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
+    /// Retains the actual lifecycle guard for an owned multipart commit. A
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive.
+    pub bucket_lifecycle_lock_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
@@ -1175,6 +1178,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("conditional_delete_generations", &self.conditional_delete_generations.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_owner", &self.bucket_lifecycle_lock_owner.is_some())
             .field("replication_request", &self.replication_request)
             .field("proxy_request", &self.proxy_request)
             .field("proxy_header_set", &self.proxy_header_set)

@@ -2656,7 +2656,10 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .unwrap_or("unknown");
         let peer_addr = req
             .extensions()
-            .get::<RemoteAddr>()
+            .get::<Option<RemoteAddr>>()
+            .copied()
+            .flatten()
+            .or_else(|| req.extensions().get::<RemoteAddr>().copied())
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
@@ -2672,25 +2675,41 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             failure_reason,
         );
-        error!(
-            event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
-            component = LOG_COMPONENT_SERVER,
-            subsystem = LOG_SUBSYSTEM_HTTP,
-            failure_reason,
-            rpc_path,
-            rpc_service,
-            rpc_method,
-            expected_audience = %audience,
-            peer_addr = %peer_addr,
-            replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
-            error = %e,
-            "RPC signature verification failed"
-        );
         if failure_reason == "stale_boot_epoch" {
             // The signature is valid, but the peer restarted before this request. Reject it
             // before execution and let the client retry after its authenticated epoch refresh.
+            warn!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "retryable_rejection",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC boot epoch changed; request rejected for retry"
+            );
             Status::unavailable("RPC boot epoch changed")
         } else {
+            error!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "rejected",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC signature verification failed"
+            );
             Status::unauthenticated("No valid auth token")
         }
     })?;
@@ -4430,14 +4449,14 @@ mod tests {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
         let audience = "127.0.0.1:9000";
-        let path = "/node_service.NodeService/ReadVersion";
+        let path = "/node_service.NodeService/ReadAll";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
         let proof = storage::tonic_boot_epoch_response_headers(audience, challenge).expect("signed epoch proof");
         let epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, &proof).expect("authenticated epoch");
         let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
         let signed_headers = |audience: &str, epoch| {
-            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadVersion", None)
+            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
                 .expect("method-bound signature");
             let replay = storage::gen_tonic_replay_scope_headers(
                 audience,
@@ -4450,34 +4469,198 @@ mod tests {
             headers.extend(replay);
             headers
         };
-        let request = |headers: HeaderMap| {
+        let request = |headers: HeaderMap, peer: Option<SocketAddr>| {
             let mut request = Request::new(());
             request.metadata_mut().as_mut().extend(headers);
             request.extensions_mut().insert(RpcRequestTarget {
                 uri: format!("http://{audience}{path}").parse().expect("RPC URI"),
                 method: Method::POST,
             });
+            // The connection stack stores this optional wrapper, not a bare RemoteAddr.
+            request.extensions_mut().insert(peer.map(RemoteAddr));
             request
         };
-
+        let log_file = tempfile::NamedTempFile::new().expect("create RPC auth log capture");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_max_level(Level::TRACE)
+            .with_writer(Arc::new(log_file.reopen().expect("open RPC auth log writer")))
+            .finish();
+        let peer: SocketAddr = "192.0.2.10:51000".parse().expect("test peer address");
         let stale = signed_headers(audience, stale_epoch);
-        let error = check_auth(request(stale.clone())).expect_err("a stale epoch must still reject the request");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert_eq!(error.message(), "RPC boot epoch changed");
+        tracing::subscriber::with_default(subscriber, || {
+            let error = check_auth(request(stale.clone(), Some(peer))).expect_err("a stale epoch must still reject the request");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(error.message(), "RPC boot epoch changed");
+            let mut forged = stale.clone();
+            forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
+            let error = check_auth(request(forged, Some(peer))).expect_err("a forged stale-epoch signature must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch), Some(peer)))
+                .expect_err("a stale epoch must not hide an audience mismatch");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
 
-        let mut forged = stale;
-        forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
-        let error = check_auth(request(forged)).expect_err("a forged stale-epoch signature must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-        let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch)))
-            .expect_err("a stale epoch must not hide an audience mismatch");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-
-        let current = signed_headers(audience, epoch);
-        assert!(check_auth(request(current.clone())).is_ok(), "a fresh authenticated scope must succeed");
-        let error = check_auth(request(current)).expect_err("a same-epoch nonce replay must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let current = signed_headers(audience, epoch);
+            assert!(
+                check_auth(request(current.clone(), Some(peer))).is_ok(),
+                "a fresh authenticated scope must succeed"
+            );
+            let error = check_auth(request(current, Some(peer))).expect_err("a same-epoch nonce replay must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error =
+                check_auth(request(stale.clone(), None)).expect_err("a missing peer address must not affect authentication");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+        });
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+        let logs = std::fs::read_to_string(log_file.path()).expect("read RPC auth logs");
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON log event"))
+            .filter(|event| event["fields"]["event"] == EVENT_RPC_SIGNATURE_VERIFICATION_FAILED)
+            .collect();
+        assert_eq!(events.len(), 5, "each authentication rejection must retain its diagnostic event");
+        let stale_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] == "stale_boot_epoch")
+            .collect();
+        assert_eq!(stale_events.len(), 2);
+        for event in &stale_events {
+            assert_eq!(event["level"], "WARN");
+            assert_eq!(event["fields"]["result"], "retryable_rejection");
+            assert_eq!(event["fields"]["rpc_method"], "ReadAll");
+        }
+        assert_eq!(stale_events[0]["fields"]["peer_addr"], peer.to_string());
+        assert_eq!(stale_events[1]["fields"]["peer_addr"], "unknown");
+        for event in events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] != "stale_boot_epoch")
+        {
+            assert_eq!(event["level"], "ERROR");
+            assert_eq!(event["fields"]["result"], "rejected");
+            assert_eq!(event["fields"]["peer_addr"], peer.to_string());
+        }
+        assert!(!logs.contains("rpc-http-test-secret"), "logs must not expose the RPC secret");
+        for header in ["x-rustfs-signature", "x-rustfs-rpc-signature-v2", "x-rustfs-rpc-signature-v3"] {
+            if let Some(signature) = stale.get(header) {
+                assert!(
+                    !logs.contains(signature.to_str().expect("ASCII signature")),
+                    "logs must not expose {header}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_read_all_recovers_after_stale_boot_epoch() {
+        use storage::DiskAPI;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES", Some("1")),
+                ("RUSTFS_INTERNODE_PREWARM", Some("false")),
+            ],
+            async {
+                let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ReadAll epoch recovery peer");
+                let addr = listener.local_addr().expect("ReadAll recovery address");
+                let audience = addr.to_string();
+                let previous_node_name = rustfs_common::get_global_local_node_name().await;
+                rustfs_common::set_global_local_node_name(&audience).await;
+                let challenge = uuid::Uuid::new_v4();
+                let proof = storage::tonic_boot_epoch_response_headers(&audience, challenge).expect("current epoch proof");
+                let epoch = storage::verify_tonic_boot_epoch_response(&audience, challenge, &proof).expect("current epoch");
+                let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
+                let admitted = Arc::new(AtomicUsize::new(0));
+                let admitted_by_server = Arc::clone(&admitted);
+                let node = InterceptedService::new(NodeServiceServer::new(make_server()), move |request: Request<()>| {
+                    let request = check_auth(request)?;
+                    assert!(
+                        request.extensions().get::<Option<RemoteAddr>>().copied().flatten().is_some(),
+                        "production auth must receive the connection's optional peer address"
+                    );
+                    admitted_by_server.fetch_add(1, Ordering::SeqCst);
+                    Ok(request)
+                });
+                let scopes = Arc::new(Mutex::new(Vec::new()));
+                let observed_scopes = Arc::clone(&scopes);
+                let service = ServiceBuilder::new()
+                    .map_request(move |mut request: HttpRequest<hyper::body::Incoming>| {
+                        assert_eq!(request.uri().path(), "/node_service.NodeService/ReadAll");
+                        let mut scopes = observed_scopes.lock().expect("captured replay scopes");
+                        if scopes.is_empty() {
+                            assert!(
+                                !request.headers().contains_key("x-rustfs-rpc-boot-epoch"),
+                                "the fresh peer must start without a cached epoch"
+                            );
+                            // Inject a correctly signed stale scope at the transport boundary.
+                            // The retry must learn its scope from the real server response proof.
+                            let replay = storage::gen_tonic_replay_scope_headers(
+                                &audience,
+                                request.uri().path(),
+                                request.headers()["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                                request.headers()["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                                stale_epoch,
+                            )
+                            .expect("signed stale scope");
+                            request.headers_mut().extend(replay);
+                        }
+                        let parse_uuid = |name: &str| {
+                            uuid::Uuid::parse_str(request.headers()[name].to_str().expect("UUID header"))
+                                .expect("valid replay scope UUID")
+                        };
+                        scopes.push((parse_uuid("x-rustfs-rpc-boot-epoch"), parse_uuid("x-rustfs-rpc-replay-nonce")));
+                        request
+                    })
+                    .service(RpcRequestPathService::new(Routes::new(node).prepare()));
+                let server = tokio::spawn(async move {
+                    let (socket, peer) = listener.accept().await.expect("accept ReadAll recovery connection");
+                    let service = ServiceBuilder::new()
+                        .layer(AddExtensionLayer::new(Some(RemoteAddr(peer))))
+                        .service(service);
+                    ConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                        .await
+                        .expect("serve ReadAll recovery connection");
+                });
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{addr}/missing-read-all-disk").as_str()).expect("ReadAll remote endpoint");
+                endpoint.is_local = false;
+                let disk = storage::new_disk(
+                    &endpoint,
+                    &storage::DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("production remote disk client");
+                let result = tokio::time::timeout(Duration::from_secs(10), disk.read_all("bucket", "object")).await;
+                server.abort();
+                let _ = server.await;
+                rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+                let error = result
+                    .expect("bounded ReadAll retry must complete")
+                    .expect_err("missing disk must remain an error");
+                assert_eq!(
+                    error.to_string(),
+                    "io error io error cannot find disk",
+                    "the retry must reach the real ReadAll missing-disk handler"
+                );
+                let scopes = scopes.lock().expect("captured replay scopes");
+                assert_eq!(scopes.len(), 2, "stale epoch recovery must use one bounded retry");
+                assert_eq!(scopes[0].0, stale_epoch);
+                assert_eq!(scopes[1].0, epoch, "the retry must use the authenticated response epoch");
+                assert_ne!(scopes[0].1, scopes[1].1, "the retry must carry a fresh replay nonce");
+                assert_eq!(admitted.load(Ordering::SeqCst), 1, "the stale request must not reach the handler");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
