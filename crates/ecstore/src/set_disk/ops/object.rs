@@ -10830,17 +10830,44 @@ mod object_encryption_resolver_wiring_tests {
 
 #[cfg(test)]
 pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
-    //! Shared hermetic `SetDisks` construction for the ops tests below: the
-    //! `SetDisks` under test is built directly on formatted local disks (same
-    //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
-    //! global local-disk registry, lock clients, or ECStore instance is
-    //! touched, and each test owns its temp workspace.
+    //! Same-disk storage fixtures with an isolated metadata authority. The
+    //! fixture keeps the real ECStore alive because its metadata cache holds
+    //! only a weak reference back to the store.
 
     use super::*;
     use crate::store::init_format::save_format_file;
     use rustfs_lock::client::LockClient;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
+
+    pub(in crate::set_disk::ops) struct HermeticSetFixture {
+        dirs: Vec<TempDir>,
+        _store: Arc<crate::store::ECStore>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    impl std::ops::Deref for HermeticSetFixture {
+        type Target = [TempDir];
+
+        fn deref(&self) -> &Self::Target {
+            &self.dirs
+        }
+    }
+
+    impl<'a> IntoIterator for &'a HermeticSetFixture {
+        type Item = &'a TempDir;
+        type IntoIter = std::slice::Iter<'a, TempDir>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            self.dirs.iter()
+        }
+    }
+
+    impl Drop for HermeticSetFixture {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
 
     async fn make_formatted_local_disk_for_pool(
         disk_idx: usize,
@@ -10873,7 +10900,9 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         (dir, endpoint, disk)
     }
 
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks(
+        disk_count: usize,
+    ) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, disk_count / 2).await
     }
 
@@ -10881,7 +10910,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    ) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_with_lockers(disk_count, pool_index, default_parity_count, Vec::new()).await
     }
 
@@ -10894,7 +10923,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     /// for tests that never touch context-resolved services registered on the
     /// ambient context (tier config manager, expiry state, ...), because the
     /// isolated context starts every one of those cells fresh.
-    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
     }
 
@@ -10904,7 +10933,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    ) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
         let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         isolated_ctx
             .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
@@ -10917,15 +10946,11 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         pool_index: usize,
         default_parity_count: usize,
         lockers: Vec<Arc<dyn LockClient>>,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
-        hermetic_set_disks_with_lockers_and_ctx(
-            disk_count,
-            pool_index,
-            default_parity_count,
-            lockers,
-            crate::runtime::instance::bootstrap_ctx(),
-        )
-        .await
+    ) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        ctx.set_test_tier_config_mgr(runtime_sources::global_tier_config_mgr());
+        hermetic_set_disks_with_lockers_and_ctx(disk_count, pool_index, default_parity_count, lockers, ctx).await
     }
 
     pub(in crate::set_disk::ops) async fn hermetic_set_disks_with_lockers_and_ctx(
@@ -10934,7 +10959,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         default_parity_count: usize,
         lockers: Vec<Arc<dyn LockClient>>,
         instance_ctx: Arc<crate::runtime::instance::InstanceContext>,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    ) -> (HermeticSetFixture, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -10957,14 +10982,62 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             default_parity_count,
             0,
             pool_index,
-            endpoints,
-            format,
+            endpoints.clone(),
+            format.clone(),
             lockers,
-            instance_ctx,
+            Arc::clone(&instance_ctx),
         )
         .await;
 
-        (temp_dirs, disk_stores, set_disks)
+        let pool_endpoints = crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: disk_count,
+            endpoints: crate::layout::endpoints::Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        };
+        instance_ctx.set_endpoints(crate::layout::endpoints::EndpointServerPools::from(vec![pool_endpoints.clone()]));
+        let pool = crate::core::sets::Sets::from_test_set(
+            Arc::clone(&set_disks),
+            pool_endpoints,
+            format,
+            pool_index,
+            default_parity_count,
+            Arc::clone(&instance_ctx),
+        );
+        let store = Arc::new(crate::store::ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::from([(pool_index, disk_stores.iter().cloned().map(Some).collect())]),
+            pools: vec![pool],
+            peer_sys: crate::cluster::rpc::S3PeerSys {
+                clients: Vec::new(),
+                pools_count: 1,
+            },
+            pool_meta: RwLock::new(crate::core::pools::PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::default(),
+            ctx: Arc::clone(&instance_ctx),
+            bucket_fence_registry: Arc::default(),
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        instance_ctx
+            .init_background_cancel_token(shutdown.clone())
+            .expect("fixture shutdown token is unique");
+        let mut metadata = crate::bucket::metadata_sys::BucketMetadataSys::new(Arc::clone(&store));
+        metadata.init(Vec::new()).await;
+        instance_ctx.init_bucket_metadata_sys(Arc::new(RwLock::new(metadata)));
+        (
+            HermeticSetFixture {
+                dirs: temp_dirs,
+                _store: store,
+                shutdown,
+            },
+            disk_stores,
+            set_disks,
+        )
     }
 }
 
@@ -16410,24 +16483,33 @@ mod transition_upload_integrity_tests {
     use std::sync::atomic::AtomicUsize;
 
     struct SetupTypeGuard {
+        ctx: Arc<crate::runtime::instance::InstanceContext>,
         previous: SetupType,
     }
 
     impl SetupTypeGuard {
-        async fn switch_to(next: SetupType) -> Self {
-            let previous = runtime_sources::current_setup_type().await;
-            runtime_sources::set_setup_type(next).await;
-            Self { previous }
+        async fn switch_to(ctx: &Arc<crate::runtime::instance::InstanceContext>, next: SetupType) -> Self {
+            let previous = if ctx.is_dist_erasure().await {
+                SetupType::DistErasure
+            } else {
+                SetupType::Erasure
+            };
+            ctx.update_erasure_type(next).await;
+            Self {
+                ctx: Arc::clone(ctx),
+                previous,
+            }
         }
     }
 
     impl Drop for SetupTypeGuard {
         fn drop(&mut self) {
             let previous = self.previous.clone();
+            let ctx = Arc::clone(&self.ctx);
             let handle = tokio::runtime::Handle::current();
             std::thread::spawn(move || {
                 handle.block_on(async {
-                    runtime_sources::set_setup_type(previous).await;
+                    ctx.update_erasure_type(previous).await;
                 });
             })
             .join()
@@ -16648,7 +16730,7 @@ mod transition_upload_integrity_tests {
         )
         .await;
         tokio::time::pause();
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = RestoreFinalizeBarrier::install(bucket, object);
         let finalize_set = Arc::clone(&set_disks);
         let finalize = tokio::spawn(async move {
@@ -17397,7 +17479,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("source versions should be readable")
             .expect("source versions should exist");
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
 
         let cleanup_set = Arc::clone(&set_disks);
@@ -17459,7 +17541,7 @@ mod transition_upload_integrity_tests {
             .expect("source versions should be readable")
             .expect("source versions should exist");
 
-        let distributed_setup = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let distributed_setup = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let bucket_guard = set_disks
             .new_ns_lock(bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
             .await
@@ -17467,7 +17549,7 @@ mod transition_upload_integrity_tests {
             .get_read_lock(get_lock_acquire_timeout())
             .await
             .expect("acquire bucket lifecycle read lock");
-        let local_cleanup_setup = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let local_cleanup_setup = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::Erasure).await;
         let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
 
         let cleanup_set = Arc::clone(&set_disks);
@@ -17550,7 +17632,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let mut opts = transition_options(&original, tier_name);
         opts.no_lock = false;
 
@@ -17612,7 +17694,7 @@ mod transition_upload_integrity_tests {
         tokio::time::pause();
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let mut opts = transition_options(&original, tier_name);
         opts.no_lock = false;
         let barrier = TransitionCommitBarrier::install_before_lock_lost_check(bucket, object);
@@ -18079,7 +18161,7 @@ mod transition_upload_integrity_tests {
         .await;
         tokio::time::pause();
 
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = ObjectTaggingCommitBarrier::install(bucket, object);
         let tagging_set = Arc::clone(&set_disks);
         let tagging = tokio::spawn(async move {

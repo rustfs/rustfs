@@ -3562,7 +3562,7 @@ mod heal_result_report_tests {
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
-        hermetic_set_disks_for_pool_with_default_parity_isolated, hermetic_set_disks_isolated,
+        HermeticSetFixture, hermetic_set_disks_for_pool_with_default_parity_isolated, hermetic_set_disks_isolated,
     };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
@@ -3959,12 +3959,9 @@ mod heal_result_report_tests {
         bucket: &str,
         object: &str,
         data_dirs: &[(Uuid, usize)],
-    ) -> (Vec<TempDir>, Arc<SetDisks>, Vec<Option<DiskStore>>) {
-        let mut temp_dirs = Vec::new();
-        let mut endpoints = Vec::new();
-        let mut disks = Vec::new();
-        for disk_index in 0..4 {
-            let (temp_dir, endpoint, disk) = real_disk().await;
+    ) -> (HermeticSetFixture, Arc<SetDisks>, Vec<Option<DiskStore>>) {
+        let (fixture, disks, set) = hermetic_set_disks_isolated(4).await;
+        for (disk_index, (temp_dir, disk)) in fixture.iter().zip(&disks).enumerate() {
             disk.make_volume(bucket).await.expect("test bucket should be created");
             for (data_dir, shard_count) in data_dirs {
                 if disk_index >= *shard_count {
@@ -3978,13 +3975,8 @@ mod heal_result_report_tests {
                     .await
                     .expect("test data shard should be written");
             }
-            temp_dirs.push(temp_dir);
-            endpoints.push(endpoint);
-            disks.push(Some(disk));
         }
-
-        let set = set_disks_with(disks.clone(), endpoints, 2).await;
-        (temp_dirs, set, disks)
+        (fixture, set, disks.into_iter().map(Some).collect())
     }
 
     async fn seed_meta_regen_test_metadata(
@@ -4006,7 +3998,7 @@ mod heal_result_report_tests {
         bucket: &str,
         object: &str,
         mod_time: OffsetDateTime,
-    ) -> (Vec<TempDir>, Arc<SetDisks>, Vec<Option<DiskStore>>) {
+    ) -> (HermeticSetFixture, Arc<SetDisks>, Vec<Option<DiskStore>>) {
         let (temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[]).await;
         let mut metadata = meta_regen_test_fileinfo(object, Uuid::nil(), mod_time.unix_timestamp(), 0);
         metadata.data_dir = None;
@@ -4016,48 +4008,13 @@ mod heal_result_report_tests {
         (temp_dirs, set, disks)
     }
 
-    async fn formatted_single_disk_no_parity_set() -> (TempDir, Arc<SetDisks>) {
-        let format = FormatV3::new(1, 1);
-        let dir = tempfile::tempdir().expect("tempdir should be created");
-        let mut endpoint =
-            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(0);
-
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .expect("disk should be created");
-
-        let mut disk_format = format.clone();
-        disk_format.erasure.this = format.erasure.sets[0][0];
-        save_format_file(&Some(disk.clone()), &Some(disk_format))
-            .await
-            .expect("format should be saved");
-
-        let set = SetDisks::new(
-            "test-owner".to_string(),
-            Arc::new(RwLock::new(vec![Some(disk)])),
-            1,
-            0,
-            0,
-            0,
-            vec![endpoint],
-            format,
-            vec![],
-        )
-        .await;
+    async fn formatted_single_disk_no_parity_set() -> (HermeticSetFixture, Arc<SetDisks>) {
+        let (fixture, _, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(1, 0, 0).await;
         set.set_test_storage_class_config(
             storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[1])
                 .expect("test storage class should resolve for one local drive"),
         );
-        (dir, set)
+        (fixture, set)
     }
 
     async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
@@ -6761,7 +6718,7 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     async fn heal_no_parity_bitrot_reports_unrecoverable_integrity_failure() {
-        let (dir, set) = formatted_single_disk_no_parity_set().await;
+        let (dirs, set) = formatted_single_disk_no_parity_set().await;
         let bucket = "bucket-no-parity-bitrot";
         let object = "bad-object.bin";
         let payload = (0..(BLOCK_SIZE_V2 + 17)).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
@@ -6785,7 +6742,12 @@ mod heal_result_report_tests {
         let fi = snapshot.fi();
         assert_eq!(fi.erasure.parity_blocks, 0);
         let data_dir = fi.data_dir.expect("non-inline object should have a data directory");
-        let part_path = dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1");
+        let part_path = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
         let mut part = tokio::fs::read(&part_path).await.expect("part should be readable");
         part[0] ^= 0xff;
         tokio::fs::write(&part_path, part)

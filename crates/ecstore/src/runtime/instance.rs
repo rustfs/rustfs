@@ -623,6 +623,14 @@ impl InstanceContext {
         self.tier_config_mgr.get_or_init(TierConfigMgr::new).clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_tier_config_mgr(&self, manager: Arc<RwLock<TierConfigMgr>>) {
+        assert!(
+            self.tier_config_mgr.set(manager).is_ok(),
+            "test tier manager must be installed before use"
+        );
+    }
+
     /// This instance's event notifier, materializing it on first access.
     /// Shared for the lifetime of the instance.
     pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {

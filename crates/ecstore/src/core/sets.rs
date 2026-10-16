@@ -99,6 +99,33 @@ pub struct Sets {
     ctx: Arc<InstanceContext>,
 }
 
+#[cfg(test)]
+impl Sets {
+    pub(crate) fn from_test_set(
+        set: Arc<SetDisks>,
+        endpoints: PoolEndpoints,
+        format: FormatV3,
+        pool_idx: usize,
+        parity_count: usize,
+        ctx: Arc<InstanceContext>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id: format.id,
+            disk_set: vec![set],
+            pool_idx,
+            set_count: 1,
+            set_drive_count: endpoints.drives_per_set,
+            endpoints,
+            format,
+            parity_count,
+            default_parity_count: parity_count,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+            ctx,
+        })
+    }
+}
+
 impl Drop for Sets {
     fn drop(&mut self) {
         if let Some(exit_signal) = self.exit_signal.take() {

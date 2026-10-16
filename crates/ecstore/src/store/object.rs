@@ -29,8 +29,8 @@ use crate::bucket::lifecycle::{
     },
 };
 use crate::bucket::metadata_sys::{
-    acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_for_options_in,
-    get_cached_bucket_incarnation_id_in, get_object_lock_config_and_incarnation_from_disk_in,
+    acquire_bucket_metadata_transaction_read_lock_in, get_cached_bucket_incarnation_id_in,
+    get_object_lock_config_and_incarnation_from_disk_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,

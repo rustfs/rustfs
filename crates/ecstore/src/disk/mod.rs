@@ -875,27 +875,6 @@ impl Disk {
         }
     }
 
-    pub(crate) async fn rename_data_borrowed_with_fence(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        fi: &FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-        scanner_publication_lease_token: Option<Uuid>,
-    ) -> Result<RenameDataResp> {
-        self.rename_data_borrowed_with_fence_and_guard(
-            src_volume,
-            src_path,
-            fi,
-            dst_volume,
-            dst_path,
-            scanner_publication_lease_token,
-            None,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn rename_data_borrowed_with_fence_and_guard(
         &self,
