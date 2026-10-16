@@ -51,10 +51,17 @@ or establish a permanently sealed attempt. An artifact prefix alone does not
 prevent later PUT, multipart completion, copy, replication, or restore writes.
 
 `ECStore::seal_artifact_attempt_puts` in `crates/ecstore/src/bucket/artifact.rs`
-provides a narrower storage-library operation for ordinary owned ECStore PUTs.
+provides a narrower storage-library operation for ordinary owned ECStore PUTs
+on stores using local disks only.
 The record binds the bucket incarnation and full attempt prefix. Only a missing
 record permits a PUT; a matching record rejects it, and malformed records or
 failed reads also reject it. Repeating the seal verifies the same identity.
+
+Distributed or remote-disk configurations reject artifact PUTs and this seal
+operation. A remote RPC timeout does not prove that its physical write stopped;
+the current ownership chain only retains local disk workers. Remote completion
+confirmation is required before this capability can be enabled there. Ordinary
+buckets retain their existing behavior.
 
 The PUT commit path takes locks in this order: bucket lifecycle, attempt record,
 then target object. Same-attempt commits are serialized; uploading a body does
