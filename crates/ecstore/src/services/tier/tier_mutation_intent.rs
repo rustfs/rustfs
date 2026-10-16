@@ -700,9 +700,25 @@ async fn advance_tier_mutation_intent_record_idempotent_at_prefix<S>(
 where
     S: EcstoreObjectIO,
 {
+    let mut original_intent: Option<TierMutationIntent> = None;
     for attempt in 0..TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS {
         let (mut intent, current_etag) =
-            load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
+            match load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await {
+                Ok(current) => current,
+                Err(Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+                    if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        if let Some(original) = &original_intent {
+            if !intent.same_identity_as(original) {
+                return Err(Error::PreconditionFailed);
+            }
+        } else {
+            original_intent = Some(intent.clone());
+        }
         let advanced = intent
             .advance_idempotent(next, committed_config_etag.clone())
             .map_err(tier_mutation_intent_store_error)?;
@@ -713,7 +729,15 @@ where
             Ok(()) => return Ok((intent, true)),
             Err(Error::PreconditionFailed) => {
                 let (mut current, _) =
-                    load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
+                    match load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await {
+                        Ok(current) => current,
+                        Err(Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+                            if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
                 if !current.same_identity_as(&intent) {
                     return Err(Error::PreconditionFailed);
                 }
@@ -727,6 +751,11 @@ where
                     return Err(Error::PreconditionFailed);
                 }
                 return Ok((current, false));
+            }
+            Err(Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+                if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS =>
+            {
+                continue;
             }
             Err(err) => return Err(err),
         }

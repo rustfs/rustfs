@@ -23326,6 +23326,418 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_commit_reloads_after_save_and_load_lock_timeouts() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create contended tier commit store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-commit-contention", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let (candidate_digest, config_etag) = {
+            let tier_config_mgr = store.tier_config_mgr();
+            let manager = tier_config_mgr.read().await;
+            let candidate_digest = tier_config_candidate_digest(&manager).expect("peer commit candidate digest should build");
+            manager
+                .save_tiering_config(store.clone())
+                .await
+                .expect("peer commit config fixture should persist");
+            let config_info = store
+                .get_object_info(
+                    RUSTFS_META_BUCKET,
+                    &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("peer commit config fixture should load");
+            (candidate_digest, config_info.etag.expect("peer commit config should carry an ETag"))
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.old_config_etag = Some(config_etag.clone());
+        let prepared = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &intent.encode().expect("prepare intent should encode"),
+        )
+        .await
+        .expect("prepare should persist the peer intent before commit contention");
+        assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        assert!(prepared.applied);
+        let mut committed = intent.clone();
+        committed
+            .advance(TierMutationIntentState::Committed, Some(config_etag.clone()))
+            .expect("matching intent should advance to committed");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let commit_store = store.clone();
+        let commit_etag = config_etag.clone();
+        let mut commit = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                commit_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                commit_etag.as_bytes(),
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        // The competing publisher already owns the namespace. Bypass only its
+        // recursive acquisition and drain the durable tail before releasing it.
+        com::save_config_with_opts(
+            store.clone(),
+            &object,
+            committed.encode().expect("winning committed intent should encode"),
+            &ObjectOptions {
+                no_lock: true,
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("competing publisher should persist the matching committed intent under its lock");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        tokio::select! {
+            result = &mut commit => panic!(
+                "Commit must retry the contended save and load before completing; observed {} lock timeouts: {result:?}",
+                timeouts.load(Ordering::Relaxed) - before,
+            ),
+            result = tokio::time::timeout(Duration::from_secs(30), async {
+                while timeouts.load(Ordering::Relaxed) - before < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("the save and subsequent load should each exhaust their lock wait"),
+        }
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        drop(owner);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), commit)
+            .await
+            .expect("third commit round should complete after the competing publisher releases its lock")
+            .expect("commit task should join")
+            .expect("third commit round should reload the matching durable committed intent");
+        assert_eq!(outcome.state, TierMutationPeerState::Committed);
+        assert!(
+            !outcome.applied,
+            "the retry must reuse the winning committed record rather than rewrite it"
+        );
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("winning committed record should remain readable"),
+            committed,
+            "the retry must preserve the full intent identity, candidate digest and committed config ETag",
+        );
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("committed tier config metadata should remain readable");
+        assert_eq!(config_info.etag.as_deref(), Some(config_etag.as_str()));
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 2);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_commit_preserves_lock_timeout_after_three_rounds() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create exhausted tier commit store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-commit-exhaustion", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let (candidate_digest, config_etag) = {
+            let tier_config_mgr = store.tier_config_mgr();
+            let manager = tier_config_mgr.read().await;
+            let candidate_digest = tier_config_candidate_digest(&manager).expect("peer commit candidate digest should build");
+            manager
+                .save_tiering_config(store.clone())
+                .await
+                .expect("peer commit config fixture should persist");
+            let config_info = store
+                .get_object_info(
+                    RUSTFS_META_BUCKET,
+                    &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("peer commit config fixture should load");
+            (candidate_digest, config_info.etag.expect("peer commit config should carry an ETag"))
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.old_config_etag = Some(config_etag.clone());
+        let prepared = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &intent.encode().expect("prepare intent should encode"),
+        )
+        .await
+        .expect("prepare should persist the peer intent before commit contention");
+        assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        assert!(prepared.applied);
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let commit_store = store.clone();
+        let commit_etag = config_etag.clone();
+        let commit = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                commit_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                commit_etag.as_bytes(),
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let lock_timeout = crate::set_disk::get_lock_acquire_timeout();
+        let owner = namespace
+            .get_write_lock(lock_timeout)
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        let error = tokio::time::timeout(Duration::from_secs(30), commit)
+            .await
+            .expect("three contended commit rounds should exhaust the bounded budget")
+            .expect("commit task should join")
+            .expect_err("Commit must fail while the competing publisher keeps the namespace");
+        match error {
+            TierMutationPeerError::Store(Error::Lock(rustfs_lock::LockError::Timeout { resource, timeout })) => {
+                assert_eq!(resource, key.to_string());
+                assert_eq!(timeout, lock_timeout);
+            }
+            other => panic!("Commit must preserve the final typed lock timeout: {other:?}"),
+        }
+        let observed_timeouts = timeouts.load(Ordering::Relaxed) - before;
+        drop(owner);
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("failed commit must leave the prepared intent readable"),
+            intent,
+            "exhausted contention must preserve the full prepared identity, candidate digest and config ETag",
+        );
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("tier config metadata should remain readable after exhausted contention");
+        assert_eq!(config_info.etag.as_deref(), Some(config_etag.as_str()));
+        assert_eq!(observed_timeouts, 3, "save and load must share three rounds");
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 3);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_commit_rejects_replaced_identity_after_lock_timeout() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = tempfile::tempdir().expect("create conflicting tier commit store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-commit-identity-conflict", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let (candidate_digest, config_etag) = {
+            let tier_config_mgr = store.tier_config_mgr();
+            let manager = tier_config_mgr.read().await;
+            let candidate_digest = tier_config_candidate_digest(&manager).expect("peer commit candidate digest should build");
+            manager
+                .save_tiering_config(store.clone())
+                .await
+                .expect("peer commit config fixture should persist");
+            let config_info = store
+                .get_object_info(
+                    RUSTFS_META_BUCKET,
+                    &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("peer commit config fixture should load");
+            (candidate_digest, config_info.etag.expect("peer commit config should carry an ETag"))
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.old_config_etag = Some(config_etag.clone());
+        let prepared = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &intent.encode().expect("prepare intent should encode"),
+        )
+        .await
+        .expect("prepare should persist the peer intent before commit contention");
+        assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        assert!(prepared.applied);
+        let mut replacement = intent.clone();
+        replacement.expires_at_unix_nanos = replacement
+            .expires_at_unix_nanos
+            .checked_sub(1)
+            .expect("replacement expiry should fit i64");
+        replacement
+            .advance(TierMutationIntentState::Committed, Some(config_etag.clone()))
+            .expect("conflicting identity should still form a valid committed record");
+        assert!(!replacement.same_identity_as(&intent));
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("intent record object should resolve");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let commit_store = store.clone();
+        let commit_etag = config_etag.clone();
+        let commit = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                commit_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                commit_etag.as_bytes(),
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        let namespace = store.pools[0].disk_set[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, &object)
+            .await
+            .expect("intent record namespace should resolve");
+        let owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("competing publisher should hold the intent namespace");
+        // The publisher owns the namespace, so only its recursive acquisition
+        // is bypassed while the conflicting record reaches durable completion.
+        com::save_config_with_opts(
+            store.clone(),
+            &object,
+            replacement.encode().expect("conflicting committed intent should encode"),
+            &ObjectOptions {
+                no_lock: true,
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("competing publisher should persist the conflicting intent under its lock");
+        let manager = ctx
+            .lock_manager()
+            .as_fast_lock_manager()
+            .expect("fixture should use real locks");
+        let key = rustfs_lock::fast_lock::types::ObjectKey {
+            bucket: Arc::from(RUSTFS_META_BUCKET),
+            object: Arc::from(object.as_str()),
+            version: None,
+        };
+        let timeouts = &manager.get_shard(&key).metrics().timeouts;
+        let before = timeouts.load(Ordering::Relaxed);
+        barrier.release_and_wait_until_namespace_pending().await;
+        drop(barrier);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while timeouts.load(Ordering::Relaxed) == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the conditional save should exhaust its lock wait before ownership is released");
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 1);
+        drop(owner);
+        let error = tokio::time::timeout(Duration::from_secs(30), commit)
+            .await
+            .expect("commit should finish after the conflicting publisher releases its lock")
+            .expect("commit task should join")
+            .expect_err("commit must reject the identity replaced during its lock timeout");
+        assert_eq!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id)
+                .await
+                .expect("conflicting committed record should remain readable"),
+            replacement,
+            "rejected commit must not rewrite the competing identity",
+        );
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("tier config metadata should remain readable after rejecting the conflict");
+        assert_eq!(config_info.etag.as_deref(), Some(config_etag.as_str()));
+        assert_eq!(timeouts.load(Ordering::Relaxed) - before, 1);
+        assert!(
+            matches!(error, TierMutationPeerError::Store(Error::PreconditionFailed)),
+            "post-timeout reload must reject the replaced identity with PreconditionFailed: {error:?}"
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn tier_mutation_abort_tombstone_rejects_delayed_prepare() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =

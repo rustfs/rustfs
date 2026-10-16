@@ -10332,6 +10332,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intent_advance_retries_cas_conflict_reload_lock_timeout() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(39);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let committed = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+        let committed_bytes = committed.encode().expect("committed intent fixture should encode");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        let winning_etag = format!("etag-{}", store.next_etag.load(Ordering::SeqCst) + 1);
+        store.rewrite_on_next_if_match(object.clone(), committed_bytes.clone()).await;
+        *store.read_timeout_after_if_match_race.lock().await = Some(object.clone());
+
+        let (observed, applied) = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect("CAS conflict reload should retry its typed lock timeout");
+
+        assert!(!applied);
+        assert_eq!(observed, committed);
+        assert!(store.read_timeout_after_if_match_race.lock().await.is_none());
+        assert_eq!(
+            store.objects.lock().await.get(&object).cloned(),
+            Some((committed_bytes, winning_etag)),
+            "retry must preserve the complete winning record and its object ETag"
+        );
+    }
+
+    #[tokio::test]
     async fn intent_advance_reconciles_matching_commit_after_final_cas_race() {
         let store = Arc::new(CasConfigStore::default());
         let mutation_id = uuid::Uuid::from_u128(37);
@@ -14802,6 +14838,7 @@ mod tests {
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
+        read_timeout_after_if_match_race: tokio::sync::Mutex<Option<String>>,
         next_etag: AtomicUsize,
         content_derived_etags: AtomicBool,
         fail_put: AtomicBool,
@@ -14827,6 +14864,7 @@ mod tests {
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
                 if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                read_timeout_after_if_match_race: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 content_derived_etags: AtomicBool::new(false),
                 fail_put: AtomicBool::new(false),
@@ -14984,6 +15022,19 @@ mod tests {
                 crate::api::diagnostic::current_read_version_entry_source(),
                 rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
             ));
+            {
+                // The queued rewrite keeps the initial read successful. Only
+                // the first target read after that CAS race consumes the fault.
+                let race_completed = self.if_match_race_rewrite.lock().await.is_empty();
+                let mut timeout = self.read_timeout_after_if_match_race.lock().await;
+                if race_completed && timeout.as_deref() == Some(object) {
+                    timeout.take();
+                    return Err(Error::Lock(rustfs_lock::LockError::Timeout {
+                        resource: format!("{bucket}/{object}@latest"),
+                        timeout: std::time::Duration::from_secs(5),
+                    }));
+                }
+            }
             let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
             let (data, etag) = if object == legacy_config_path {
                 let state = self.legacy_state.lock().await;
