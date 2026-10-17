@@ -112,6 +112,7 @@ mod admin;
 
 pub struct ErasureSetHealer {
     admin_task: Option<super::task::HealTask>,
+    unresolved_delete_recovery: bool,
     storage: Arc<dyn HealStorageAPI>,
     progress: Arc<RwLock<HealProgress>>,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -386,6 +387,7 @@ impl ErasureSetHealer {
     ) -> Self {
         Self {
             admin_task: None,
+            unresolved_delete_recovery: false,
             storage,
             progress,
             cancel_token,
@@ -403,6 +405,11 @@ impl ErasureSetHealer {
 
     pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
         self.mainline_pacer = pacer;
+        self
+    }
+
+    pub(crate) fn with_unresolved_delete_recovery(mut self, unresolved: bool) -> Self {
+        self.unresolved_delete_recovery = unresolved;
         self
     }
 
@@ -644,6 +651,22 @@ impl ErasureSetHealer {
             };
 
             let state = resume_manager.get_state().await;
+            if state.delete_recovery_rescan_pending
+                && state.completed_buckets.is_empty()
+                && state.resume_cursor.is_none()
+                && state.processed_objects == 0
+                && state.successful_objects == 0
+                && state.failed_objects == 0
+                && state.skipped_objects == 0
+                && state.skipped_new_versions == 0
+                && state.skipped_ilm_expired == 0
+                && state.processed_bytes == 0
+            {
+                // Resume is published before its companion checkpoint reset.
+                // Finish that rewind after a crash before clearing the obligation.
+                checkpoint_manager.reset_after_delete_recovery().await?;
+                resume_manager.set_delete_recovery_rescan_pending(false).await?;
+            }
             if self.admin_task.is_none()
                 && (state.retry_count > 0 || state.dangling_delete_retry_not_before.is_some())
                 && state.completed_buckets.is_empty()
@@ -706,6 +729,9 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
+        if self.unresolved_delete_recovery && !self.heal_opts.dry_run {
+            resume_manager.set_delete_recovery_rescan_pending(true).await?;
+        }
         // 1. get current state
         let state = resume_manager.get_state().await;
         if self.replacement_task_id.is_some()
@@ -812,13 +838,27 @@ impl ErasureSetHealer {
             resume_manager.mark_counter_unknown().await?;
         }
         let mut failed_buckets = 0u64;
+        let mut unresolved_delete_recovery = self.unresolved_delete_recovery;
 
         // 4. process remaining buckets
-        for (bucket_idx, bucket) in buckets.iter().enumerate().skip(current_bucket_index) {
-            // check if completed
-            if state.completed_buckets.contains(bucket) {
-                checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
-                current_object_index = 0;
+        let first_bucket_index = if self.admin_task.is_some() { 0 } else { current_bucket_index };
+        for (bucket_idx, bucket) in buckets.iter().enumerate().skip(first_bucket_index) {
+            if bucket_idx < current_bucket_index || state.completed_buckets.contains(bucket) {
+                // Object progress does not certify hidden delete transactions.
+                // Retry recovery in the admitted incarnation without replaying
+                // payload work already acknowledged by the ordinary cursor.
+                if self.admin_task.is_some() {
+                    let incarnation = self.admin_bucket_incarnation(checkpoint_manager, bucket).await?;
+                    let unresolved = self.heal_admin_bucket_delete_recovery(bucket, incarnation).await?;
+                    if unresolved && !self.heal_opts.dry_run {
+                        resume_manager.set_delete_recovery_rescan_pending(true).await?;
+                    }
+                    unresolved_delete_recovery |= unresolved;
+                }
+                if bucket_idx >= current_bucket_index {
+                    checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
+                    current_object_index = 0;
+                }
                 continue;
             }
 
@@ -843,7 +883,7 @@ impl ErasureSetHealer {
                 .await;
 
             if matches!(bucket_result, Err(Error::TaskCancelled | Error::TaskTimeout)) {
-                return bucket_result;
+                return bucket_result.map(|_| ());
             }
 
             // update progress
@@ -899,7 +939,8 @@ impl ErasureSetHealer {
 
             // process bucket result
             match bucket_result {
-                Ok(_) => {
+                Ok(unresolved) => {
+                    unresolved_delete_recovery |= unresolved;
                     resume_manager.complete_bucket(bucket).await?;
                     checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
                     debug!(
@@ -970,8 +1011,24 @@ impl ErasureSetHealer {
             .await?;
         }
 
+        if !unresolved_delete_recovery && resume_manager.get_state().await.delete_recovery_rescan_pending {
+            // Recovery can publish formerly hidden objects, including when a
+            // background worker settled and collected its proof before this
+            // retry. Aggregate counters only support a whole-set rewind.
+            resume_manager.restart_scan_after_delete_recovery().await?;
+            checkpoint_manager.reset_after_delete_recovery().await?;
+            resume_manager.set_delete_recovery_rescan_pending(false).await?;
+            return Err(Error::transient_skip("Delete recovery settled; ordinary coverage must be rescanned"));
+        }
+
         if self.admin_task.is_some() {
-            return Ok(());
+            return if unresolved_delete_recovery {
+                Err(Error::transient_skip(
+                    "Delete recovery remains unresolved after ordinary erasure-set heal",
+                ))
+            } else {
+                Ok(())
+            };
         }
 
         // 5. finalize. Only declare the set healed when nothing failed AND
@@ -1079,6 +1136,12 @@ impl ErasureSetHealer {
             return Err(Error::other(format!(
                 "Erasure set heal exhausted retries with {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped"
             )));
+        }
+
+        if unresolved_delete_recovery {
+            return Err(Error::transient_skip(
+                "Delete recovery remains unresolved after ordinary erasure-set heal",
+            ));
         }
 
         // No failures — ordinary heals are complete now. Replacement heals
@@ -1353,7 +1416,40 @@ impl ErasureSetHealer {
         Ok(())
     }
 
-    /// heal single bucket with resume
+    async fn heal_admin_bucket_delete_recovery(&self, bucket: &str, incarnation: Option<uuid::Uuid>) -> Result<bool> {
+        let Some(task) = &self.admin_task else {
+            return Ok(false);
+        };
+        let bucket_opts = HealOpts {
+            recursive: false,
+            remove: false,
+            ..self.heal_opts
+        };
+        let result = match incarnation {
+            Some(expected) => {
+                self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
+                self.storage
+                    .heal_bucket_at_incarnation(bucket, expected, &bucket_opts)
+                    .await?
+            }
+            None => self.storage.heal_bucket(bucket, &bucket_opts).await?,
+        };
+        task.record_result_item(result).await;
+        // Recovery retains the checkpoint's admitted incarnation, and the
+        // publication bucket must exist before adopting survivor delete proof.
+        if let Some(result) = self
+            .storage
+            .recover_delete_transactions(bucket, None, incarnation, &self.heal_opts)
+            .await?
+        {
+            let unresolved = result.delete_recovery.is_some_and(|status| status.has_unresolved());
+            task.record_result_item(result).await;
+            return Ok(unresolved);
+        }
+        Ok(false)
+    }
+
+    /// Heal one bucket's ordinary objects and report unresolved delete recovery separately.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
@@ -1369,7 +1465,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
         started_at_secs: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_BUCKET_STATE,
@@ -1384,31 +1480,9 @@ impl ErasureSetHealer {
         );
 
         let incarnation = self.admin_bucket_incarnation(checkpoint_manager, bucket).await?;
-        if let Some(task) = &self.admin_task {
-            let bucket_opts = HealOpts {
-                recursive: false,
-                remove: false,
-                ..self.heal_opts
-            };
-            let result = match incarnation {
-                Some(expected) => {
-                    self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
-                    self.storage
-                        .heal_bucket_at_incarnation(bucket, expected, &bucket_opts)
-                        .await?
-                }
-                None => self.storage.heal_bucket(bucket, &bucket_opts).await?,
-            };
-            task.record_result_item(result).await;
-            // Keep recovery in the checkpoint's admitted incarnation and repair
-            // the publication bucket before adopting a survivor's delete proof.
-            if let Some(result) = self
-                .storage
-                .recover_delete_transactions(bucket, None, incarnation, &self.heal_opts)
-                .await?
-            {
-                task.record_result_item(result).await;
-            }
+        let unresolved_delete_recovery = self.heal_admin_bucket_delete_recovery(bucket, incarnation).await?;
+        if unresolved_delete_recovery && !self.heal_opts.dry_run {
+            resume_manager.set_delete_recovery_rescan_pending(true).await?;
         }
 
         // 1. get bucket info
@@ -1425,7 +1499,7 @@ impl ErasureSetHealer {
                     state = "missing",
                     "Erasure set bucket heal skipped because bucket is missing"
                 );
-                return Ok(());
+                return Ok(unresolved_delete_recovery);
             }
         };
 
@@ -1946,7 +2020,7 @@ impl ErasureSetHealer {
             previous_page_last = page_last;
         }
 
-        Ok(())
+        Ok(unresolved_delete_recovery)
     }
 
     /// initialize progress tracking
@@ -2818,7 +2892,7 @@ mod resume_loop_tests {
                 state.start_time,
             )
             .await;
-        (processed, successful, failed, skipped, result)
+        (processed, successful, failed, skipped, result.map(|_| ()))
     }
 
     #[tokio::test]
@@ -3886,6 +3960,112 @@ mod resume_loop_tests {
             env.storage.calls().contains(&("down".to_string(), Some("v1".to_string()))),
             "the transient version must be attempted before being skipped"
         );
+    }
+
+    #[tokio::test]
+    async fn unresolved_delete_recovery_rechecks_coverage_only_after_settlement() {
+        let mut env = make_env().await;
+        env.healer.unresolved_delete_recovery = true;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("healthy", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let error = env
+            .healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("unresolved recovery cannot publish set completion");
+        assert!(matches!(error, Error::TransientSkip { .. }));
+        assert_eq!(env.storage.calls(), [("healthy".to_owned(), None)]);
+        assert!(!env.resume.get_state().await.completed);
+        assert!(CheckpointManager::has_checkpoint(&env.healer.disk, &env.task_id).await);
+        env.healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("pending-only retries remain unresolved");
+        assert_eq!(
+            env.storage.calls(),
+            [("healthy".to_owned(), None)],
+            "pending-only retries do not repeat payload scans"
+        );
+
+        env.healer.unresolved_delete_recovery = false;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("healthy", None, false), item("restored", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("settlement invalidates coverage even if another worker already collected the transaction");
+        assert_eq!(env.storage.calls(), [("healthy".to_owned(), None)]);
+        assert_eq!(
+            env.resume.get_state().await.retry_count,
+            0,
+            "coverage invalidation does not spend failure retries"
+        );
+        env.healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("fresh coverage includes the restored object");
+        assert!(env.resume.get_state().await.completed);
+        assert_eq!(env.storage.calls().iter().filter(|(object, _)| object == "restored").count(), 1);
+        assert_eq!(env.resume.get_state().await.processed_objects, 2);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_coverage_rewind_survives_interrupted_checkpoint_reset() {
+        let mut env = make_env().await;
+        env.healer.unresolved_delete_recovery = true;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("healthy", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("create overlapping coverage");
+        assert_eq!(env.checkpoint.get_checkpoint().await.current_bucket_index, 1);
+        env.resume
+            .restart_scan_after_delete_recovery()
+            .await
+            .expect("publish rewind before its companion checkpoint");
+
+        let (resume, checkpoint) = env
+            .healer
+            .initialize_resume_state(&env.task_id, "pool_0_set_0", &["b".to_owned()])
+            .await
+            .expect("restart must finish the interrupted checkpoint rewind");
+        assert!(!resume.get_state().await.delete_recovery_rescan_pending);
+        assert_eq!(checkpoint.get_checkpoint().await.current_bucket_index, 0);
+        env.healer.unresolved_delete_recovery = false;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("healthy", None, false), item("restored", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.healer
+            .execute_heal_with_resume(&["b".to_owned()], "pool_0_set_0", &resume, &checkpoint)
+            .await
+            .expect("restarted coverage must visit newly visible objects");
+        assert!(resume.get_state().await.completed);
+        assert_eq!(env.storage.calls().iter().filter(|(object, _)| object == "restored").count(), 1);
     }
 
     #[tokio::test]

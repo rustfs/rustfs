@@ -26,6 +26,42 @@ pub struct ReplacementExecutionLease {
 // file while it is held would allow a second owner to lock a different inode.
 const EXECUTION_LOCK_FILE: &str = ".rustfs-replacement.lock";
 
+/// A compatibility retry may only admit a disk that has not received data.
+/// The caller retains the mount descriptor and the replacement executor lease.
+pub(crate) async fn is_blank_target(root: PathBuf) -> Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let mut directories = vec![(root, 0usize)];
+        let mut entries_left = 64usize;
+        while let Some((directory, depth)) = directories.pop() {
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let Some(remaining) = entries_left.checked_sub(1) else {
+                    return Ok(false);
+                };
+                entries_left = remaining;
+                let kind = entry.file_type()?;
+                let name = entry.file_name();
+                if depth == 0 && name == EXECUTION_LOCK_FILE && kind.is_file() {
+                    if entry.metadata()?.len() != 0 {
+                        return Ok(false);
+                    }
+                } else if depth == 1 && name == crate::disk::HEALING_MARKER_PATH && kind.is_file() {
+                    if entry.metadata()?.len() > 256 {
+                        return Ok(false);
+                    }
+                } else if kind.is_dir() && depth < 4 && (depth > 0 || name == crate::disk::RUSTFS_META_BUCKET) {
+                    directories.push((entry.path(), depth + 1));
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(DiskError::from)?
+}
+
 pub(super) async fn acquire(root: PathBuf) -> Result<Arc<ReplacementExecutionLease>> {
     #[cfg(unix)]
     {
@@ -55,6 +91,53 @@ pub(super) async fn acquire(root: PathBuf) -> Result<Arc<ReplacementExecutionLea
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blank_target_probe_rejects_data_symlinks_and_excessive_inventory() {
+        let temp = tempfile::TempDir::new().expect("blank target root");
+        let root = temp.path();
+        let _lease = acquire(root.to_path_buf()).await.expect("replacement execution lease");
+        let metadata = root.join(crate::disk::RUSTFS_META_BUCKET);
+        std::fs::create_dir_all(metadata.join("tmp")).expect("empty system directories");
+        std::fs::write(metadata.join(crate::disk::HEALING_MARKER_PATH), b"owner").expect("healing marker");
+        assert!(
+            is_blank_target(root.to_path_buf())
+                .await
+                .expect("blank target with control files")
+        );
+
+        for path in [
+            root.join("user-bucket"),
+            metadata.join("tmp").join("payload"),
+            metadata.join("format.json"),
+        ] {
+            std::fs::write(&path, b"data").expect("residual content");
+            assert!(!is_blank_target(root.to_path_buf()).await.expect("inspect residual content"));
+            std::fs::remove_file(path).expect("remove residual fixture");
+        }
+        std::fs::create_dir(root.join("user-bucket")).expect("even an empty user bucket is not a fresh target");
+        assert!(!is_blank_target(root.to_path_buf()).await.expect("inspect user bucket"));
+        std::fs::remove_dir(root.join("user-bucket")).expect("remove bucket fixture");
+        std::os::unix::fs::symlink(root, metadata.join("cycle")).expect("symlink fixture");
+        assert!(
+            !is_blank_target(root.to_path_buf())
+                .await
+                .expect("reject symlink without following it")
+        );
+        std::fs::remove_file(metadata.join("cycle")).expect("remove symlink fixture");
+        std::fs::create_dir_all(metadata.join("a/b/c/d")).expect("excessive depth");
+        assert!(!is_blank_target(root.to_path_buf()).await.expect("bounded directory depth"));
+        std::fs::remove_dir_all(metadata.join("a")).expect("remove deep fixture");
+        std::fs::remove_file(metadata.join(crate::disk::HEALING_MARKER_PATH)).expect("remove marker fixture");
+        std::fs::remove_dir(metadata.join("tmp")).expect("remove empty fixture directory");
+        for index in 0..62 {
+            std::fs::create_dir(metadata.join(index.to_string())).expect("bounded empty directories");
+        }
+        assert!(is_blank_target(root.to_path_buf()).await.expect("exact inventory limit"));
+        std::fs::create_dir(metadata.join("extra")).expect("one over inventory limit");
+        assert!(!is_blank_target(root.to_path_buf()).await.expect("bounded inventory"));
+        assert!(is_blank_target(root.join("missing")).await.is_err(), "missing root is not a blank disk");
+    }
 
     #[tokio::test]
     async fn replacement_execution_lease_excludes_independent_openers() {

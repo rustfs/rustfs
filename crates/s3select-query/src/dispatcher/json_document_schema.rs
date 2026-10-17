@@ -430,7 +430,7 @@ mod tests {
 
     const TEST_SCHEMA_LIMIT: usize = 4 * 1024 * 1024;
 
-    fn assert_matches_arrow(input: &[u8]) {
+    fn assert_matches_arrow(input: &[u8]) -> Schema {
         let records = input.iter().filter(|byte| **byte == b'\n').count();
         let (expected, expected_records) = arrow_infer_json_schema(io::BufReader::new(input), Some(records))
             .expect("Arrow should infer the compatibility fixture");
@@ -438,6 +438,33 @@ mod tests {
             .expect("streaming inference should accept the compatibility fixture");
         assert_eq!(actual_records, expected_records);
         assert_eq!(actual, expected);
+        actual
+    }
+
+    #[test]
+    fn inference_preserves_first_seen_field_order_for_nested_objects() {
+        let schema = assert_matches_arrow(
+            br#"{"z":1,"nested":{"z":true,"a":"first"}}
+{"a":2,"nested":{"m":3}}
+"#,
+        );
+        let expected = Schema::new(vec![
+            Field::new("z", DataType::Int64, true),
+            Field::new(
+                "nested",
+                DataType::Struct(
+                    vec![
+                        Field::new("z", DataType::Boolean, true),
+                        Field::new("a", DataType::Utf8, true),
+                        Field::new("m", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new("a", DataType::Int64, true),
+        ]);
+        assert_eq!(schema, expected);
     }
 
     #[test]

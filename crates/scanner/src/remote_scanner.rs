@@ -318,3 +318,60 @@ fn try_admit_remote_scanner_key(disk_key: String) -> Result<RemoteScannerAdmissi
     let permit = semaphore.try_acquire_owned().map_err(|_| ScannerError::RemoteDiskBusy)?;
     Ok(RemoteScannerAdmission { _permit: permit })
 }
+
+/// The bucket walkers of one local disk hold its scanner admission jointly:
+/// the first walker to start a bucket acquires the per-disk permit and the
+/// last one to finish releases it. A peer's remote request therefore still
+/// observes one scan session per physical disk however many walkers the
+/// coordinator runs on it.
+///
+/// Lock order: the share state is taken before `REMOTE_SCANNER_ADMISSION`,
+/// and neither is held across an await.
+pub(crate) struct LocalDiskAdmissionShare {
+    state: Mutex<LocalDiskAdmissionState>,
+}
+
+#[derive(Default)]
+struct LocalDiskAdmissionState {
+    admission: Option<RemoteScannerAdmission>,
+    holders: usize,
+}
+
+/// One walker's stake in a [`LocalDiskAdmissionShare`].
+pub(crate) struct LocalDiskAdmissionHold {
+    share: Arc<LocalDiskAdmissionShare>,
+}
+
+impl LocalDiskAdmissionShare {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(LocalDiskAdmissionState::default()),
+        })
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, disk: &Disk) -> Result<LocalDiskAdmissionHold, ScannerError> {
+        self.acquire_with(|| try_admit_remote_scanner(disk))
+    }
+
+    fn acquire_with(
+        self: &Arc<Self>,
+        admit: impl FnOnce() -> Result<RemoteScannerAdmission, ScannerError>,
+    ) -> Result<LocalDiskAdmissionHold, ScannerError> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.admission.is_none() {
+            state.admission = Some(admit()?);
+        }
+        state.holders = state.holders.saturating_add(1);
+        Ok(LocalDiskAdmissionHold { share: Arc::clone(self) })
+    }
+}
+
+impl Drop for LocalDiskAdmissionHold {
+    fn drop(&mut self) {
+        let mut state = self.share.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.holders = state.holders.saturating_sub(1);
+        if state.holders == 0 {
+            state.admission = None;
+        }
+    }
+}

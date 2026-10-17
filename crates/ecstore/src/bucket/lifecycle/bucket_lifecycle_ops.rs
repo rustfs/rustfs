@@ -2461,7 +2461,13 @@ fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<Join
         return None;
     }
     Some(tokio::spawn(async move {
-        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+        let maintenance = run_recovery_disposition_maintenance_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let maintenance = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::RecoveryDispositionMaintenance,
+            maintenance,
+        );
+        maintenance.await;
     }))
 }
 
@@ -3344,7 +3350,13 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_tier_delete_journal_recovery_loop(api, cancel_token).await;
+        let recovery = run_tier_delete_journal_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 
@@ -3363,7 +3375,13 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_transition_transaction_recovery_loop(api, cancel_token).await;
+        let recovery = run_transition_transaction_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 
@@ -3948,44 +3966,28 @@ pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo,
         return;
     };
 
-    let mut marker = None;
-    let mut version_marker = None;
-    let mut object_infos = Vec::new();
-
-    loop {
-        let page = match api
-            .clone()
-            .list_object_versions_for_lifecycle(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
-            .await
-        {
-            Ok(page) => page,
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_EVALUATION_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    bucket = %oi.bucket,
-                    object = %oi.name,
-                    error = %err,
-                    reason = "list_versions_failed",
-                    "Failed to load lifecycle version group"
-                );
-                return;
-            }
-        };
-
-        object_infos.extend(page.objects.into_iter().filter(|object| object.name == oi.name));
-
-        if !page.is_truncated {
-            break;
+    let object_infos = match api
+        .get_object_versions_for_lifecycle(&oi.bucket, &oi.name, opts, configs.bucket_incarnation_id)
+        .await
+    {
+        Ok(objects) => objects,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                result = "failed",
+                bucket = %oi.bucket,
+                object = %oi.name,
+                error = %err,
+                reason = "read_versions_failed",
+                "Failed to load lifecycle version group"
+            );
+            return;
         }
-
-        marker = page.next_marker;
-        version_marker = page.next_version_idmarker;
-    }
-
+    };
     if object_infos.is_empty() {
-        object_infos.push(oi.clone());
+        return;
     }
 
     let object_opts = object_infos
@@ -13201,6 +13203,81 @@ mod tests {
         let event = eval_action_from_lifecycle(&lc, Some(&lock_config), &object).await;
 
         assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_exact_immediate_expiry_preserves_guards_and_skips_stale_writes() {
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-exact-expiry-{}", Uuid::new_v4().simple());
+        let object = "object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let oi = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(b"payload".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("create object before configuring expiry");
+
+        // Exercise persisted legacy immediate rules without relaxing the S3
+        // validator, which correctly rejects newly submitted Expiration.Days=0.
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata")).clone();
+        let mut lifecycle = latest_expiration_lifecycle();
+        lifecycle.rules[0].expiration.as_mut().expect("expiration rule").days = Some(0);
+        metadata.lifecycle_config_xml = crate::bucket::utils::serialize(&lifecycle).expect("encode legacy policy");
+        metadata.lifecycle_config = Some(lifecycle);
+        sys.persist_and_set(metadata).await.expect("persist legacy policy");
+
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, 4).await;
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(state.read().await.stats.pending_tasks(), 1, "exact reads must preserve immediate expiry");
+
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, 4).await;
+        for path in &paths {
+            let metadata_path = path.join(&bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE);
+            let mut meta = rustfs_filemeta::FileMeta::load(&fs::read(&metadata_path).await.expect("read object metadata"))
+                .expect("decode object metadata");
+            let mut version = meta
+                .get_all_file_info_versions(&bucket, object, true)
+                .expect("version group")
+                .versions
+                .remove(0);
+            version.metadata.insert("x-amz-object-lock-legal-hold".into(), "ON".into());
+            meta.add_version(version).expect("persist legal hold");
+            fs::write(metadata_path, meta.marshal_msg().expect("encode held metadata"))
+                .await
+                .expect("write legal hold");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(
+            state.read().await.stats.pending_tasks(),
+            0,
+            "use current lock metadata, not the stale write result"
+        );
+
+        for path in &paths {
+            fs::write(path.join(&bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE), b"corrupt")
+                .await
+                .expect("inject corrupt metadata");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(state.read().await.stats.pending_tasks(), 0, "read failure must never enqueue expiry");
+        for path in &paths {
+            fs::remove_dir_all(path.join(&bucket).join(object))
+                .await
+                .expect("simulate concurrent object removal");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(
+            state.read().await.stats.pending_tasks(),
+            0,
+            "confirmed absence must not fall back to the old ObjectInfo"
+        );
     }
 
     #[tokio::test]

@@ -141,6 +141,15 @@ pub(crate) use rustfs_lifecycle::{
 };
 use rustfs_storage_api as storage_contracts;
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, observe_read_version_context_boundary, with_read_version_entry,
+    };
+}
+
 #[cfg(test)]
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 

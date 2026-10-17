@@ -125,9 +125,8 @@ async fn pause_prepared_pool_read_before_refetch(object: &str) {
 #[cfg(test)]
 use support::resolve_latest_object_info_candidates;
 use support::{
-    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
-    rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates_with_pool_state,
-    resolve_rebalance_delete_from_all_pools_result, resolve_rebalance_delete_from_all_pools_results,
+    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, pool_lookup_not_found_error, rebalance_disk_set_lookup_error,
+    resolve_latest_object_info_candidates_with_pool_state, resolve_rebalance_delete_from_all_pools_results,
     resolve_store_rebalance_pool_meta_reload_result, validate_prepared_pool_refetch_identity,
 };
 
@@ -996,42 +995,27 @@ impl ECStore {
 
         let mut results = Vec::with_capacity(errs.len());
 
-        for pe in errs.iter() {
-            if let Some(err) = &pe.err
-                && err == &StorageError::ErasureWriteQuorum
-            {
-                if let Some(idx) = pe.index {
-                    results.push(RebalanceDeletePoolResult {
-                        pool_idx: idx,
-                        result: Err(StorageError::ErasureWriteQuorum),
-                    });
-                }
+        for pe in &errs {
+            let Some(idx) = pe.index else { continue };
+            if pe.err.as_ref() == Some(&StorageError::ErasureWriteQuorum) {
+                results.push(Err(StorageError::ErasureWriteQuorum));
                 continue;
             }
-
-            if let Some(idx) = pe.index {
-                let pool = self.pools[idx].clone();
-                results.push(RebalanceDeletePoolResult {
-                    pool_idx: idx,
-                    result: self
-                        .run_external_decommission_capacity_object_delete(
-                            idx,
-                            bucket,
-                            object,
-                            object,
-                            opts.clone(),
-                            |opts| async move { pool.delete_object(bucket, object, opts).await },
-                        )
-                        .await,
-                });
-            }
+            let pool = self.pools[idx].clone();
+            results.push(
+                self.run_external_decommission_capacity_object_delete(
+                    idx,
+                    bucket,
+                    object,
+                    object,
+                    opts.clone(),
+                    |opts| async move { pool.delete_object(bucket, object, opts).await },
+                )
+                .await,
+            );
         }
 
-        resolve_rebalance_delete_from_all_pools_result(
-            resolve_rebalance_delete_from_all_pools_results(results, bucket, object),
-            bucket,
-            object,
-        )
+        resolve_rebalance_delete_from_all_pools_results(results, bucket, object)
     }
 
     /// Peer reload entry: refreshes in-memory pool metadata from the shared
@@ -2461,55 +2445,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_passthrough_ok() {
-        let info = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            ..Default::default()
-        };
-
-        let resolved = resolve_rebalance_delete_from_all_pools_result(Ok(info.clone()), "bucket", "object")
-            .expect("successful rebalance delete should pass through");
-
-        assert_eq!(resolved.bucket, info.bucket);
-        assert_eq!(resolved.name, info.name);
-    }
-
-    #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_wraps_object_context() {
-        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::SlowDown), "bucket", "object")
-            .expect_err("failed rebalance delete should be wrapped");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("failed to delete rebalance source object bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
-    }
-
-    #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_later_pool_error() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::SlowDown),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::SlowDown),
             ],
             "bucket",
             "object",
         )
         .expect_err("non-ignorable errors from later pools must not be hidden");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+        assert_eq!(err, Error::SlowDown);
     }
 
     #[test]
@@ -2522,14 +2472,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(info.clone()),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
+                Ok(info.clone()),
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
             ],
             "bucket",
             "object",
@@ -2550,14 +2494,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Ok(info.clone()),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Ok(info.clone()),
             ],
             "bucket",
             "object",
@@ -2572,50 +2510,35 @@ mod tests {
     fn resolve_rebalance_delete_from_all_pools_results_fails_when_all_results_are_ignored_errors() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
             ],
             "bucket",
             "object",
         )
         .expect_err("all ignored errors without any successful delete should still fail");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains("Version not found"), "{rendered}");
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
     }
 
     #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_write_quorum_even_with_success() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ErasureWriteQuorum),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::ErasureWriteQuorum),
             ],
             "bucket",
             "object",
         )
         .expect_err("write quorum failures must fail the aggregate delete");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::ErasureWriteQuorum.to_string()), "{rendered}");
+        assert_eq!(err, Error::ErasureWriteQuorum);
     }
 
     #[test]

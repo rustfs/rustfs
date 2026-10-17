@@ -24,6 +24,15 @@ pub(crate) fn EndpointServerPools(
     crate::storage::storage_api::EndpointServerPools::from(pools)
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod diagnostic {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_read_version_entry_source;
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+    };
+}
+
 /// S3 wire types for app-layer modules, funneled here so new files stay off
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {

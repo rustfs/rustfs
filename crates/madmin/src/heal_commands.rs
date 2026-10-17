@@ -34,6 +34,20 @@ pub struct Infos {
 /// enum's crate).
 const DRIVE_STATE_OK: &str = "ok";
 
+/// Unresolved delete recovery work, independent of ordinary object healing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRecoveryStatus {
+    pub pending: usize,
+    pub blocked: usize,
+    pub failed: usize,
+}
+
+impl DeleteRecoveryStatus {
+    pub fn has_unresolved(&self) -> bool {
+        self.pending != 0 || self.blocked != 0 || self.failed != 0
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
     /// Only the coordinator's authenticated full scan may set this. Transported
@@ -70,6 +84,8 @@ pub struct HealResultItem {
     pub resolved_version_id: Option<[u8; 16]>,
     #[serde(rename = "detail")]
     pub detail: String,
+    #[serde(default, rename = "deleteRecovery", skip_serializing_if = "Option::is_none")]
+    pub delete_recovery: Option<DeleteRecoveryStatus>,
     #[serde(rename = "parityBlocks")]
     pub parity_blocks: usize,
     #[serde(rename = "dataBlocks")]
@@ -117,6 +133,38 @@ impl HealResultItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_recovery_status_preserves_partial_results_and_legacy_shape() {
+        let legacy = serde_json::to_value(HealResultItem::default()).expect("serialize legacy result");
+        assert!(legacy.get("deleteRecovery").is_none());
+        let decoded: HealResultItem = serde_json::from_value(legacy).expect("decode result without recovery status");
+        assert!(decoded.delete_recovery.is_none());
+        for status in [
+            DeleteRecoveryStatus {
+                pending: 1,
+                ..Default::default()
+            },
+            DeleteRecoveryStatus {
+                blocked: 1,
+                ..Default::default()
+            },
+            DeleteRecoveryStatus {
+                failed: 1,
+                ..Default::default()
+            },
+        ] {
+            let item = HealResultItem {
+                delete_recovery: Some(status),
+                ..Default::default()
+            };
+            let wire = serde_json::to_value(item).expect("serialize recovery status");
+            let decoded: HealResultItem = serde_json::from_value(wire).expect("decode recovery status");
+            assert_eq!(decoded.delete_recovery, Some(status));
+            assert!(status.has_unresolved());
+        }
+        assert!(!DeleteRecoveryStatus::default().has_unresolved());
+    }
 
     #[test]
     fn resolved_heal_version_is_not_wire_proof() {
