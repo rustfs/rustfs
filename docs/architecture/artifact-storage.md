@@ -99,6 +99,23 @@ is cancelled or times out. Repair of an existing version remains allowed after
 PUT sealing; it does not reopen logical publication. Ordinary-bucket repair also
 retains lifecycle ownership to prevent publication into a recreated bucket.
 
+`ECStore::seal_artifact_attempt_repairs` separately closes repair admission for
+the entire attempt, including existing versions and minority metadata repair.
+It requires an ordinary PUT seal first. Under lifecycle, attempt, then repair
+record locks, it drains admitted physical repair workers before persisting an
+immutable record bound to the incarnation and full attempt prefix. New repair
+requests reject a matching record; corrupt, mismatched, or unreadable records
+also fail closed. Retrying confirms the same identity, including after restart.
+Existing bytes remain readable while sufficient healthy shards remain. Other
+attempts retain their repair behavior.
+
+Repair sealing is irreversible through this API and reduces recoverability:
+do not apply it automatically to successful outputs that still need repair.
+It is a local repair fact, not an all-writers or deletion authorization. Do not
+downgrade to a binary that ignores repair seals after using this operation.
+Restoring pre-seal storage can rewind the decision and requires reconciliation
+before relying on the seal again; records must not expire by age.
+
 `ECStore::retire_artifact_object_version` disables repair of one exact version
 inside an already sealed attempt. It requires the current bucket incarnation,
 an object strictly inside the attempt prefix, and a non-null version. Retirement
@@ -146,7 +163,7 @@ cargo test --locked -p rustfs-storage-api --lib artifact
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_write_entrypoint -- --test-threads=1
-cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_repair -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_repair_tests -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_retirement -- --test-threads=1
 ```
 
@@ -176,14 +193,16 @@ unretired-version repair. Physical syscall pauses cover both cancelled repair
 workers and cancelled retirement publication. Retirement leaves GET available
 and never supplies evidence that the version is physically absent.
 
-These checks establish bucket identity, versioning, ordinary PUT sealing, and
-exact-version repair retirement.
+These checks establish bucket identity, versioning, ordinary PUT sealing,
+attempt repair sealing, and exact-version repair retirement. Repair-seal tests
+also cover restart, corrupt records, other-attempt isolation, and cancelled
+rename/metadata workers whose physical writes must drain before confirmation.
 They do not certify all-writes sealing, backup retention, or safe artifact
 deletion.
 
 ## Controller API
 
-The admin router exposes four SigV4-authenticated POST operations:
+The admin router exposes five SigV4-authenticated POST operations:
 
 - `/rustfs/admin/v3/plugin-artifacts/buckets`, requiring
   `admin:CreatePluginArtifactBucket` on the bucket ARN.
@@ -191,6 +210,8 @@ The admin router exposes four SigV4-authenticated POST operations:
   `admin:GetPluginArtifactBucket` on the bucket ARN.
 - `/rustfs/admin/v3/plugin-artifacts/seal-attempt`, requiring
   `admin:SealPluginArtifactAttempt` on the attempt namespace.
+- `/rustfs/admin/v3/plugin-artifacts/seal-repairs`, requiring
+  `admin:SealPluginArtifactRepairs` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
   `admin:RetirePluginArtifactVersion` on the exact logical object key.
 
@@ -200,7 +221,7 @@ initial profile requires built-in IAM; external authorization plugins cannot
 establish its explicit local Resource contract. No separate signer map is used.
 The controller grant is independent of an execution delegation's expiration.
 
-Seal request:
+Both seal operations use this request:
 
 ```json
 {
@@ -220,7 +241,8 @@ The storage call has a 30-second caller deadline.
 
 IAM uses the existing S3 resource grammar, including its path normalization:
 the namespace's trailing slash is removed during matching. An exact attempt
-controller policy can therefore use these two statements:
+controller policy can therefore use these statements (grant repair sealing
+separately only to the component making that irreversible decision):
 
 ```json
 {
@@ -229,6 +251,11 @@ controller policy can therefore use these two statements:
     {
       "Effect": "Allow",
       "Action": "admin:SealPluginArtifactAttempt",
+      "Resource": "arn:aws:s3:::artifacts/out/61/8694133a-8a38-4911-b2cc-614556a852a9/301c4039-9739-4a70-a88f-6d83cf721509"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "admin:SealPluginArtifactRepairs",
       "Resource": "arn:aws:s3:::artifacts/out/61/8694133a-8a38-4911-b2cc-614556a852a9/301c4039-9739-4a70-a88f-6d83cf721509"
     },
     {
@@ -247,7 +274,8 @@ its containing attempt. IAM scopes the logical key, not individual versions;
 exact bucket generation and version identity are validated by storage.
 
 Only a completed storage operation returns HTTP 200 with `Cache-Control: no-store`.
-Seal returns `version`, `target`, and `ordinary_put_sealed: true`. Retirement
+PUT seal returns `version`, `target`, and `ordinary_put_sealed: true`. Repair seal
+returns `version`, `target`, and `attempt_repairs_sealed: true`. Retirement
 returns `version`, `target`, `object`, `version_id`, and
 `exact_version_repair_retired: true`. These are idempotent confirmations of
 specific storage facts. They do not attest that all writers are sealed, that
