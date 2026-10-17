@@ -2229,4 +2229,80 @@ mod tests {
             .await
             .expect("no stale old body or receipts remain");
     }
+
+    #[tokio::test]
+    async fn heal_mrf_inline_overwrite_does_not_strand_rollback_backup() {
+        use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
+        use crate::disk::local::inline_metadata_rollback_dir;
+        use crate::object_api::ShardIntegrityWriteMode;
+        use rustfs_filemeta::FileMeta;
+        use rustfs_heal_contracts::heal_channel::{HealScanMode, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL};
+
+        let bucket = "heal-inline-rollback-reclaim";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        let synthetic = inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
+        let object = "object";
+        let child_object = format!("{object}/{synthetic}");
+
+        for (key, body) in [(&child_object[..], &b"child"[..]), (object, b"inline-gen-1")] {
+            let mut reader = PutObjReader::from_vec(body.to_vec());
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("put initial inline object");
+        }
+
+        let set = &store.pools[0].disk_set[0];
+        set.disks.write().await[3] = None;
+        let mut reader = PutObjReader::from_vec(b"inline-gen-2-updated".to_vec());
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("put degraded inline overwrite");
+        set.disks.write().await[3] = Some(disks[3].clone());
+
+        let heal_opts = HealOpts {
+            scan_mode: HealScanMode::Normal,
+            ..Default::default()
+        };
+        let first = store
+            .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+            .await
+            .expect("first MRF repair");
+        assert!(first.error.is_none(), "first MRF repair error: {:?}", first.error);
+        assert_eq!(first.item.drives_healed(), Some(1));
+        assert!(!first.item.repair_verified);
+        assert_eq!(first.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+
+        let disk3_child_dir = dirs[3].path().join(bucket).join(object).join(synthetic.to_string());
+        assert!(!disk3_child_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+        assert!(disk3_child_dir.join(STORAGE_FORMAT_FILE).exists());
+
+        let second = store
+            .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+            .await
+            .expect("follow-up MRF check must not fail with SlowDown");
+        assert!(second.error.is_none(), "second MRF check error: {:?}", second.error);
+        assert_eq!(second.item.drives_healed(), Some(0));
+        assert_eq!(second.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+    }
 }
