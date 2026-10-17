@@ -67,6 +67,14 @@ pub(crate) struct AbsenceProofRequest<'a> {
     pub allow_unversioned: bool,
 }
 
+fn heal_rollback_backup_dir(response: &disk::RenameDataResp) -> Option<Uuid> {
+    // A dedicated cleanup directory identifies a current response whose absent
+    // rollback is intentional. Older peers report only old_data_dir.
+    response
+        .rollback_data_dir
+        .or_else(|| response.old_data_dir.filter(|_| response.cleanup_data_dir.is_none()))
+}
+
 fn is_unavailable_heal_rpc(error: &DiskError) -> bool {
     let DiskError::Io(error) = error else {
         return false;
@@ -1946,8 +1954,7 @@ impl SetDisks {
                                         // Heal can reuse a live data directory, and a synthetic
                                         // rollback directory can also contain a child key.
                                         // Retire only this publication's backup while fenced.
-                                        if let Some(rollback_dir) =
-                                            rename_response.rollback_data_dir.or(rename_response.old_data_dir)
+                                        if let Some(rollback_dir) = heal_rollback_backup_dir(&rename_response)
                                             && bucket_heal_scope.as_ref().is_none_or(|scope| scope.check().is_ok())
                                             && commit_fence.is_none_or(|check| check())
                                             && !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -3772,7 +3779,7 @@ mod heal_result_report_tests {
         HealWriterFailures, ReadRepairCommitFingerprint, ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
         is_retryable_heal_writer_error,
     };
-    use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
+    use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope, heal_rollback_backup_dir};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
@@ -5492,6 +5499,111 @@ mod heal_result_report_tests {
         }
     }
 
+    #[test]
+    fn heal_rollback_backup_selection_preserves_legacy_peer_semantics() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        for (old, rollback, cleanup, expected) in [
+            (None, None, None, None),
+            (Some(a), None, Some(a), None),
+            (Some(a), Some(a), Some(a), Some(a)),
+            (Some(a), Some(b), Some(a), Some(b)),
+            (Some(a), None, None, Some(a)),
+        ] {
+            let response = crate::disk::RenameDataResp {
+                old_data_dir: old,
+                rollback_data_dir: rollback,
+                cleanup_data_dir: cleanup,
+                ..Default::default()
+            };
+            assert_eq!(heal_rollback_backup_dir(&response), expected);
+        }
+        let legacy: crate::disk::RenameDataResp =
+            serde_json::from_str(r#"{"old_data_dir":"00000000-0000-0000-0000-000000000001","sign":null}"#)
+                .expect("older peer response without rollback or cleanup fields");
+        assert_eq!(heal_rollback_backup_dir(&legacy), Some(a));
+    }
+
+    #[tokio::test]
+    async fn non_inline_heal_preserves_backup_after_publication_fence_loss() {
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-non-inline-fence";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume");
+        }
+        let options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x11; 1024 * 1024]), &options)
+            .await
+            .expect("seed external generation");
+        let old = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("old target");
+        assert!(old.data.is_none());
+        let old_dir = old.data_dir.expect("external old data directory");
+        let metadata_path = dirs[0].path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let old_metadata = tokio::fs::read(&metadata_path).await.expect("save stale metadata");
+        let payload = vec![0x22; 1024 * 1024];
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
+            .await
+            .expect("write external current generation");
+        let current = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("current target");
+        assert!(current.data.is_none());
+        let part = format!("{object}/{}/part.1", current.data_dir.expect("current external directory"));
+        let expected_shard = disks[0].read_all(bucket, &part).await.expect("current encoded shard");
+        tokio::fs::write(&metadata_path, old_metadata)
+            .await
+            .expect("restore stale metadata");
+        let backup = metadata_path
+            .parent()
+            .expect("object directory")
+            .join(old_dir.to_string())
+            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+        let can_commit = || !backup.exists();
+        let opts = HealOpts {
+            no_lock: true,
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (_, error) = set
+            .heal_object_with_explicit_version_regen(
+                bucket,
+                object,
+                "",
+                ExplicitVersionHeal {
+                    opts: &opts,
+                    allow_regeneration: true,
+                    preserve_unrepairable: false,
+                    commit_fence: Some(&can_commit),
+                    namespace_owner: None,
+                    retirement: None,
+                },
+                &mut None,
+            )
+            .await
+            .expect("report committed external repair");
+        assert!(
+            error.is_none(),
+            "post-publication fence loss must preserve the committed target: {error:?}"
+        );
+        assert!(backup.exists(), "lost fence must retain the actual rollback witness");
+        assert_eq!(disks[0].read_all(bucket, &part).await.expect("repaired physical shard"), expected_shard);
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &options)
+            .await
+            .expect("committed object remains readable");
+        let mut body = Vec::new();
+        tokio::io::copy(&mut reader, &mut body).await.expect("complete repaired GET");
+        assert_eq!(body, payload);
+    }
+
     #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_heal_backup_cleanup_retains_key_owner_until_unlink_finishes() {
@@ -5509,19 +5621,24 @@ mod heal_result_report_tests {
                 no_lock: true,
                 ..Default::default()
             };
-            set.put_object(&bucket, object, &mut PutObjReader::from_vec(vec![0x11; 592]), &options)
+            set.put_object(&bucket, object, &mut PutObjReader::from_vec(vec![0x11; 1024 * 1024]), &options)
                 .await
                 .expect("write old generation on every disk");
             let metadata_path = dirs[0].path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
             let old_metadata = tokio::fs::read(&metadata_path).await.expect("save stale replica");
-            let payload = vec![0x22; 592];
+            let old = disks[0]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read old non-inline target");
+            assert!(old.data.is_none(), "cancellation fixture must use non-inline publication");
+            let rollback_dir = old.data_dir.expect("old external data directory");
+            let payload = vec![0x22; 1024 * 1024];
             set.put_object(&bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
                 .await
                 .expect("write current generation on every disk");
             tokio::fs::write(&metadata_path, old_metadata)
                 .await
                 .expect("restore stale target");
-            let rollback_dir = crate::disk::local::inline_metadata_rollback_dir(Uuid::nil(), &rustfs_filemeta::FileMeta::new());
             let backup_path = disks[0]
                 .get_object_path_for_io_if_local(
                     &bucket,
@@ -5705,39 +5822,6 @@ mod heal_result_report_tests {
         let (healthy, error) = set.heal_object(bucket, object, "", &opts).await.expect("repeat repair");
         assert!(error.is_none(), "repeat repair error: {error:?}");
         assert_eq!(healthy.drives_healed(), Some(0));
-
-        tokio::fs::write(&metadata_path, &old_metadata)
-            .await
-            .expect("restore stale replica for fence probe");
-        // The fence is valid up to publication, then fails before backup removal.
-        let can_commit = || !backup_path.exists();
-        let (_, error) = set
-            .heal_object_with_explicit_version_regen(
-                bucket,
-                object,
-                "",
-                ExplicitVersionHeal {
-                    opts: &opts,
-                    allow_regeneration: true,
-                    preserve_unrepairable: false,
-                    commit_fence: Some(&can_commit),
-                    namespace_owner: None,
-                    retirement: None,
-                },
-                &mut None,
-            )
-            .await
-            .expect("report committed repair after fence loss");
-        assert!(
-            error.is_none(),
-            "post-publication fence loss must not undo the committed target: {error:?}"
-        );
-        assert!(backup_path.exists(), "a lost fence must preserve the rollback evidence");
-        let repaired = disks[0]
-            .read_version("", bucket, object, "", &read_options)
-            .await
-            .expect("committed target survives skipped cleanup");
-        assert_eq!(repaired.data, expected.data);
     }
 
     #[tokio::test]

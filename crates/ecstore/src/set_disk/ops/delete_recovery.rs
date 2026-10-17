@@ -2229,4 +2229,123 @@ mod tests {
             .await
             .expect("no stale old body or receipts remain");
     }
+
+    #[tokio::test]
+    async fn heal_mrf_inline_overwrite_does_not_strand_rollback_backup() {
+        use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
+        use crate::disk::local::inline_metadata_rollback_dir;
+        use crate::object_api::ShardIntegrityWriteMode;
+        use rustfs_filemeta::FileMeta;
+        use rustfs_heal_contracts::heal_channel::{HealScanMode, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL};
+
+        for incoming_inline in [true, false] {
+            let bucket = if incoming_inline {
+                "heal-inline-rollback"
+            } else {
+                "heal-inline-to-external-rollback"
+            };
+            let (dirs, store, disks) = fixture(bucket).await;
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+            let synthetic = inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
+            let object = "object";
+            let child = format!("{object}/{synthetic}");
+            let child_body = b"child bytes must survive parent repair".to_vec();
+            let write_options = ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            for (key, body) in [(child.as_str(), child_body.as_slice()), (object, b"inline-gen-1".as_slice())] {
+                store
+                    .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &write_options)
+                    .await
+                    .expect("seed initial inline objects");
+            }
+            let read_options = ReadOptions {
+                read_data: true,
+                ..Default::default()
+            };
+            let old_child = disks[3]
+                .read_version("", bucket, &child, "", &read_options)
+                .await
+                .expect("physical child before repair");
+            let set = &store.pools[0].disk_set[0];
+            set.disks.write().await[3] = None;
+            let payload = if incoming_inline {
+                b"inline-gen-2-updated".to_vec()
+            } else {
+                vec![0x53; 1024 * 1024]
+            };
+            store
+                .put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_options)
+                .await
+                .expect("degraded overwrite with a real stale target");
+            set.disks.write().await[3] = Some(disks[3].clone());
+            let donor = disks[0]
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("current donor generation");
+            assert_eq!(donor.data.is_some(), incoming_inline, "fixture must use the intended commit branch");
+            let heal_opts = HealOpts {
+                scan_mode: HealScanMode::Normal,
+                ..Default::default()
+            };
+            let first = store
+                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+                .await
+                .expect("first MRF repair");
+            assert!(first.error.is_none(), "first MRF repair: {:?}", first.error);
+            assert_eq!(first.item.drives_healed(), Some(1));
+            assert!(!first.item.repair_verified);
+            assert_eq!(first.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+            let target = disks[3]
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("repaired target generation");
+            assert_eq!(target.mod_time, donor.mod_time);
+            assert_eq!(target.data_dir, donor.data_dir);
+            assert_eq!(target.size, donor.size);
+            assert_eq!(target.version_id, donor.version_id);
+            let child_after = disks[3]
+                .read_version("", bucket, &child, "", &read_options)
+                .await
+                .expect("physical child survives parent cleanup");
+            assert_eq!(child_after.data, old_child.data);
+            assert!(child_after.data.is_some(), "child fixture must carry its physical inline bytes");
+            let child_dir = dirs[3].path().join(bucket).join(object).join(synthetic.to_string());
+            assert!(!child_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+            assert!(child_dir.join(STORAGE_FORMAT_FILE).exists());
+            let second = store
+                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+                .await
+                .expect("follow-up MRF check must not return SlowDown");
+            assert!(second.error.is_none(), "second MRF check: {:?}", second.error);
+            assert_eq!(second.item.drives_healed(), Some(0));
+            assert_eq!(second.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+
+            // EC2+2: force the repaired shard to participate in the exact read quorum.
+            let inventory = set.disks.read().await.clone();
+            *set.disks.write().await = vec![None, None, Some(disks[2].clone()), Some(disks[3].clone())];
+            for (key, expected) in [(object, payload), (child.as_str(), child_body)] {
+                let mut reader = set
+                    .get_object_reader(
+                        bucket,
+                        key,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            suppress_read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("exact-quorum GET using repaired target");
+                let mut body = Vec::new();
+                reader.read_to_end(&mut body).await.expect("read complete parent/child body");
+                assert_eq!(body, expected, "exact-quorum body for {key}");
+            }
+            *set.disks.write().await = inventory;
+        }
+    }
 }
