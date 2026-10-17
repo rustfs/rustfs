@@ -18665,7 +18665,8 @@ mod tests {
         let expiry_policy = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
             .await
             .unwrap()
-            .lifecycle;
+            .lifecycle
+            .map(Into::into);
         let bucket_incarnation_id = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
 
         let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
@@ -19364,7 +19365,8 @@ mod tests {
         let expiry_policy = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
             .await
             .unwrap()
-            .lifecycle;
+            .lifecycle
+            .map(Into::into);
         let applied = crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
             store.clone(),
             &old_object,
@@ -21011,7 +21013,8 @@ mod tests {
                         expiry_policy: crate::bucket::lifecycle::get_expiry_configs(&store, bucket)
                             .await
                             .unwrap()
-                            .lifecycle,
+                            .lifecycle
+                            .map(Into::into),
                         ..Default::default()
                     };
                     let legacy_applied =

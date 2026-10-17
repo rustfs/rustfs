@@ -5297,7 +5297,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_deref()).await?;
+                get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_ref()).await?;
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
@@ -5963,7 +5963,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                match get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_deref()).await {
+                match get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_ref()).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };

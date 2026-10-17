@@ -143,7 +143,7 @@ impl Evaluator {
         }
         for event in &mut events {
             if event.requires_expiry_policy() {
-                event.expiry_policy = Some(Arc::clone(&self.policy));
+                event.expiry_policy = Some(Arc::clone(&self.policy).into());
             }
         }
         events
@@ -233,8 +233,17 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(event.action, IlmAction::DeleteAction);
-        assert!(Arc::ptr_eq(event.expiry_policy.as_ref().unwrap(), &policy));
-        assert_eq!(policy.eval(&object).await.expiry_policy.as_deref(), Some(policy.as_ref()));
+        assert_eq!(Arc::strong_count(&policy), 2, "the event should share the evaluated policy");
+        assert!(event.expiry_policy.as_ref().unwrap().matches_configuration(Some(&policy)));
+        assert!(
+            policy
+                .eval(&object)
+                .await
+                .expiry_policy
+                .as_ref()
+                .unwrap()
+                .matches_configuration(Some(&policy))
+        );
         assert!(!format!("{event:?}").contains("BucketLifecycleConfiguration"));
     }
 

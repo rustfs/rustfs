@@ -673,7 +673,7 @@ mod serial_tests {
                 .expect("load expiration policy")
                 .lifecycle_config
                 .clone()
-                .map(Arc::new),
+                .map(|configuration| Arc::new(configuration).into()),
             ..Default::default()
         };
         let bucket_incarnation_id = ecstore

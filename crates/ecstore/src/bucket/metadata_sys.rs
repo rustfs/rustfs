@@ -1378,7 +1378,7 @@ pub(crate) async fn get_delete_config_from_disk_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
-    expiry_policy: Option<&BucketLifecycleConfiguration>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
@@ -1402,7 +1402,7 @@ pub(crate) async fn get_delete_config_from_disk_in(
             if let Some(expected) = expiry_policy {
                 let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
                     .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
-                if current != Some(expected) {
+                if !expected.matches_configuration(current) {
                     return Err(Error::PreconditionFailed);
                 }
             }

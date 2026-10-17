@@ -650,7 +650,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         // survive. Count-dependent actions wait for the complete-group evaluator.
         let mut event = self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await;
         if event.requires_expiry_policy() {
-            event.expiry_policy = Some(Arc::new(self.clone()));
+            event.expiry_policy = Some(Arc::new(self.clone()).into());
         }
         event
     }
@@ -995,7 +995,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             newer_noncurrent_versions: retained,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
-                            expiry_policy: Some(Arc::clone(&self)),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     } else {
                         Event {
@@ -1006,7 +1006,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             newer_noncurrent_versions: 0,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
-                            expiry_policy: Some(Arc::clone(&self)),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     };
                 }
@@ -1298,6 +1298,26 @@ fn ilm_action_priority_rank(action: &IlmAction) -> u8 {
     }
 }
 
+/// Immutable policy identity carried from lifecycle evaluation to deletion.
+/// Consumers can compare authoritative metadata without exposing the policy's
+/// wire representation in storage operation options. Clones share the policy.
+#[derive(Clone)]
+pub struct ExpiryPolicySnapshot {
+    configuration: Arc<BucketLifecycleConfiguration>,
+}
+
+impl From<Arc<BucketLifecycleConfiguration>> for ExpiryPolicySnapshot {
+    fn from(configuration: Arc<BucketLifecycleConfiguration>) -> Self {
+        Self { configuration }
+    }
+}
+
+impl ExpiryPolicySnapshot {
+    pub fn matches_configuration(&self, current: Option<&BucketLifecycleConfiguration>) -> bool {
+        current == Some(self.configuration.as_ref())
+    }
+}
+
 #[derive(Clone)]
 pub struct Event {
     pub action: IlmAction,
@@ -1308,7 +1328,7 @@ pub struct Event {
     pub storage_class: String,
     /// In-memory policy that authorized logical expiration. Execution must
     /// compare it with authoritative bucket metadata under the transaction lock.
-    pub expiry_policy: Option<Arc<BucketLifecycleConfiguration>>,
+    pub expiry_policy: Option<ExpiryPolicySnapshot>,
 }
 
 impl Event {

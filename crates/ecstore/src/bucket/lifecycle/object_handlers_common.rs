@@ -108,7 +108,7 @@ pub async fn delete_object_versions(
         let mut delete_options = ObjectOptions {
             delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
-            lifecycle_expiry_policy: Some(Arc::clone(&expiry_policy)),
+            lifecycle_expiry_policy: Some(expiry_policy.clone()),
             ..Default::default()
         };
         delete_options.add_namespace_lock_guard(&publication_guard);

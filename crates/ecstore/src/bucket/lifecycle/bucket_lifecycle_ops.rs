@@ -12933,7 +12933,7 @@ mod tests {
             &targets,
             lifecycle::Event {
                 action: IlmAction::DeleteVersionAction,
-                expiry_policy: Some(expiry_policy),
+                expiry_policy: Some(expiry_policy.into()),
                 ..Default::default()
             },
             incarnation,
@@ -13430,7 +13430,7 @@ mod tests {
         let mut expiry = tokio::spawn(async move {
             let event = crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAction,
-                expiry_policy: Some(expiry_policy),
+                expiry_policy: Some(expiry_policy.into()),
                 ..Default::default()
             };
             let bucket_incarnation_id = expiry_store
@@ -13545,7 +13545,7 @@ mod tests {
             queued.size = 1;
             let event = lifecycle::Event {
                 action: IlmAction::DeleteAction,
-                expiry_policy: Some(install_test_expiry_policy(&ecstore, &bucket).await),
+                expiry_policy: Some(install_test_expiry_policy(&ecstore, &bucket).await.into()),
                 ..Default::default()
             };
             let incarnation = ecstore
@@ -13682,7 +13682,7 @@ mod tests {
                 std::slice::from_ref(&target),
                 lifecycle::Event {
                     action: IlmAction::DeleteVersionAction,
-                    expiry_policy: Some(expiry_policy),
+                    expiry_policy: Some(expiry_policy.into()),
                     ..Default::default()
                 },
                 incarnation,
@@ -13840,7 +13840,7 @@ mod tests {
         let queued_event = crate::bucket::lifecycle::lifecycle::Event {
             action: IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "delete-marker-history".to_string(),
-            expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle,
+            expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle.map(Into::into),
             ..Default::default()
         };
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(30).into_bytes())
@@ -13958,7 +13958,7 @@ mod tests {
             &crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAllVersionsAction,
                 rule_id: "delete-all-versions".to_string(),
-                expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle,
+                expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle.map(Into::into),
                 ..Default::default()
             },
             &LcEventSrc::Scanner,
