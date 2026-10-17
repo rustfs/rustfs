@@ -179,3 +179,85 @@ These checks establish bucket identity, versioning, ordinary PUT sealing, and
 exact-version repair retirement.
 They do not certify all-writes sealing, backup retention, or safe artifact
 deletion.
+
+## Controller API
+
+The admin router exposes two SigV4-authenticated POST operations:
+
+- `/rustfs/admin/v3/plugin-artifacts/seal-attempt`, requiring
+  `admin:SealPluginArtifactAttempt` on the attempt namespace.
+- `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
+  `admin:RetirePluginArtifactVersion` on the exact logical object key.
+
+Both require a permanent, non-root original IAM user and an installed request
+server context. Temporary credentials and service accounts are rejected. The
+initial profile requires built-in IAM; external authorization plugins cannot
+establish its explicit local Resource contract. No separate signer map is used.
+The controller grant is independent of an execution delegation's expiration.
+
+Seal request:
+
+```json
+{
+  "version": 1,
+  "target": {
+    "bucket": "artifacts",
+    "bucket_incarnation": "bdbf4d55-7ae3-42f1-a8ea-88cb2836d35d",
+    "attempt_prefix": "out/61/8694133a-8a38-4911-b2cc-614556a852a9/301c4039-9739-4a70-a88f-6d83cf721509/"
+  }
+}
+```
+
+Retirement uses the same fields plus `object` (the complete logical key below
+that attempt) and `version_id` (a non-nil UUID). Unknown fields are rejected at
+both levels. Bodies are limited to 16 KiB and a 10-second read deadline.
+The storage call has a 30-second caller deadline.
+
+IAM uses the existing S3 resource grammar, including its path normalization:
+the namespace's trailing slash is removed during matching. An exact attempt
+controller policy can therefore use these two statements:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "admin:SealPluginArtifactAttempt",
+      "Resource": "arn:aws:s3:::artifacts/out/61/8694133a-8a38-4911-b2cc-614556a852a9/301c4039-9739-4a70-a88f-6d83cf721509"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "admin:RetirePluginArtifactVersion",
+      "Resource": "arn:aws:s3:::artifacts/out/61/8694133a-8a38-4911-b2cc-614556a852a9/301c4039-9739-4a70-a88f-6d83cf721509/*"
+    }
+  ]
+}
+```
+
+An Allow with neither Resource nor NotResource does not grant either new action.
+Explicit unscoped Deny, including `admin:*`, remains effective. Existing admin
+and table/KMS action semantics are unchanged. A single-object grant cannot seal
+its containing attempt. IAM scopes the logical key, not individual versions;
+exact bucket generation and version identity are validated by storage.
+
+Only a completed storage operation returns HTTP 200 with `Cache-Control: no-store`.
+Seal returns `version`, `target`, and `ordinary_put_sealed: true`. Retirement
+returns `version`, `target`, `object`, `version_id`, and
+`exact_version_repair_retired: true`. These are idempotent confirmations of
+specific storage facts. They do not attest that all writers are sealed, that
+data was deleted, or that GC is permitted.
+
+Malformed requests return InvalidRequest; authentication/resource denial returns
+AccessDenied. All storage failures and caller deadlines return a sanitized
+ServiceUnavailable response: `artifact operation unconfirmed; retry the same identity`.
+This deliberately does not reveal internal record paths or distinguish durable
+record corruption from unavailable storage. It also does not mean the operation
+was rolled back: the cancellation-safe storage transaction may still complete.
+Retry the identical target to obtain confirmation; operators must investigate
+persistent failures. Current distributed-topology rejection is retained.
+
+This interface does not create dedicated buckets or change STS vending. Existing
+vending still requires input and output to share the delegation's bucket;
+cross-bucket output credentials need a separate change. GC remains disabled
+until the remaining storage and backup/PITR requirements are satisfied.

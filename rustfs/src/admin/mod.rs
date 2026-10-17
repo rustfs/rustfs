@@ -67,6 +67,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     sts::register_admin_auth_route(r)?;
     handlers::plugin_delegation::register_plugin_delegation_route(r)?;
     handlers::plugin_attempt::register_plugin_attempt_route(r)?;
+    handlers::plugin_artifact::register_plugin_artifact_routes(r)?;
 
     account::register_account_route(r)?;
     mfa::register_mfa_route(r)?;

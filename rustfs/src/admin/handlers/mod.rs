@@ -227,4 +227,5 @@ mod tests {
 
 pub mod plugin_delegation;
 
+pub mod plugin_artifact;
 pub mod plugin_attempt;

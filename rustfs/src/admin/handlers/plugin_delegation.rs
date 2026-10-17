@@ -74,6 +74,14 @@ pub(super) async fn owner(
     req: &S3Request<Body>,
     action: AdminAction,
 ) -> S3Result<(std::sync::Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>, String)> {
+    owner_for_resource(req, action, AdminResourceScope::bucket_object("", "")).await
+}
+
+pub(super) async fn owner_for_resource(
+    req: &S3Request<Body>,
+    action: AdminAction,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<(std::sync::Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>, String)> {
     let signed = req
         .credentials
         .as_ref()
@@ -98,7 +106,7 @@ pub(super) async fn owner(
         false,
         Action::AdminAction(action),
         req.extensions.get::<Option<RemoteAddr>>().and_then(|a| a.map(|a| a.0)),
-        AdminResourceScope::bucket_object("", ""),
+        resource,
     )
     .await?;
     Ok((iam, credentials.access_key))
