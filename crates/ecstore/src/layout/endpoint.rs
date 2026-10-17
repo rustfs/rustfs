@@ -101,23 +101,30 @@ impl TryFrom<&str> for Endpoint {
                 let path = Path::new(&path).absolutize()?;
 
                 #[cfg(windows)]
-                let path = if has_leading_slash_windows_drive(&path) {
+                let path = match strip_windows_drive_url_path(&path) {
                     // Url::path() exposes file-like Windows paths as `/C:/...`.
                     // Strip only that synthetic leading slash; plain URL paths
                     // such as `/export1` must stay URL paths, not become
                     // relative paths under the current drive.
-                    Path::new(&path[1..]).absolutize()?.to_string_lossy().into_owned()
-                } else {
-                    path
+                    Some(drive_path) => Path::new(drive_path).absolutize()?.to_string_lossy().into_owned(),
+                    None => path,
                 };
                 #[cfg(windows)]
                 let path = Path::new(&path);
 
                 debug!("endpoint try_from: path={}", path.display());
 
-                if path.parent().is_none() || path.as_os_str().is_empty() {
+                // A Windows drive root such as `C:\` has no parent, but it is
+                // accepted for parity with the path-style `C:\` endpoint.
+                #[cfg(windows)]
+                let is_root = path.parent().is_none() && !is_windows_drive_root(path);
+                #[cfg(not(windows))]
+                let is_root = path.parent().is_none();
+                if is_root || path.as_os_str().is_empty() {
                     return Err(Error::other("empty or root path is not supported in URL endpoint"));
                 }
+                #[cfg(windows)]
+                reject_windows_unc_path(path)?;
 
                 match path.to_str() {
                     Some(v) => url.set_path(v),
@@ -230,20 +237,63 @@ impl Endpoint {
                 std::borrow::Cow::Borrowed(path)
             }
         };
+        // Url::path() always starts with `/`, so every scheme stores a Windows
+        // drive path as `/C:/...`. Restore the drive path for `file` and
+        // `http(s)` endpoints alike; Windows would otherwise resolve `/C:/data`
+        // as an invalid `C:` component under the current drive.
         #[cfg(windows)]
-        if self.url.scheme() == "file" {
-            let stripped: &str = decoded.strip_prefix('/').unwrap_or(&decoded);
-            debug!("get_file_path windows: path={}", stripped);
-            return stripped.to_string();
+        if let Some(drive_path) = strip_windows_drive_url_path(&decoded) {
+            debug!("get_file_path windows: path={}", drive_path);
+            return drive_path.to_string();
         }
         decoded.into_owned()
     }
 }
 
-#[cfg(windows)]
-fn has_leading_slash_windows_drive(path: &str) -> bool {
+/// Returns `C:/...` for a URL path shaped like `/C:/...`, otherwise `None`.
+///
+/// The separator after the colon is required: `/C:foo` is a plain URL path,
+/// and `/export1` must never be reinterpreted as a drive path.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn strip_windows_drive_url_path(path: &str) -> Option<&str> {
     let bytes = path.as_bytes();
-    bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/'
+    if bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/' {
+        Some(&path[1..])
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_drive_root(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && matches!(components.next(), Some(Component::RootDir))
+        && components.next().is_none()
+}
+
+/// UNC shares are rejected instead of supported: `Url::from_file_path` turns
+/// `\\nas\share\d1` into `file://nas/share/d1`, so the share server would be
+/// read as the endpoint host and the share name dropped from the drive path,
+/// and a network share does not provide the local-volume semantics (atomic
+/// rename, fsync, volume identity) that erasure-coded drives rely on.
+#[cfg(windows)]
+fn reject_windows_unc_path(path: &Path) -> Result<()> {
+    use std::path::{Component, Prefix};
+
+    if let Some(Component::Prefix(prefix)) = path.components().next()
+        && matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    {
+        return Err(Error::other(
+            "UNC network share paths are not supported as drive endpoints; use a local volume path such as \
+D:\\rustfs\\data1, or http://host:9000/D:/rustfs/data1 for URL endpoints",
+        ));
+    }
+    Ok(())
 }
 
 /// parse a file path into a URL.
@@ -260,6 +310,9 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
         Ok(path) => path,
         Err(err) => return Err(Error::other(format!("absolute path failed: {err}"))),
     };
+
+    #[cfg(windows)]
+    reject_windows_unc_path(&file_path)?;
 
     match Url::from_file_path(file_path) {
         Ok(url) => Ok(url),
@@ -538,17 +591,110 @@ mod test {
         assert_eq!(url_endpoint.get_file_path(), "/path/to/data");
     }
 
+    #[test]
+    fn strip_windows_drive_url_path_requires_drive_separator() {
+        assert_eq!(strip_windows_drive_url_path("/C:/data1"), Some("C:/data1"));
+        assert_eq!(strip_windows_drive_url_path("/d:/rustfs/data1"), Some("d:/rustfs/data1"));
+        assert_eq!(strip_windows_drive_url_path("/C:/"), Some("C:/"));
+        assert_eq!(strip_windows_drive_url_path("/C:foo"), None);
+        assert_eq!(strip_windows_drive_url_path("/C:"), None);
+        assert_eq!(strip_windows_drive_url_path("/export1"), None);
+        assert_eq!(strip_windows_drive_url_path("/1:/data"), None);
+        assert_eq!(strip_windows_drive_url_path("C:/data1"), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn url_endpoint_drive_shaped_path_stays_a_url_path_off_windows() {
+        let endpoint = Endpoint::try_from("http://host:9000/C:/data1").unwrap();
+        assert_eq!(endpoint.get_file_path(), "/C:/data1");
+    }
+
     #[cfg(windows)]
     #[test]
-    fn test_windows_url_drive_path_requires_separator_after_colon() {
-        let drive_path_endpoint = Endpoint::try_from("http://host/C:/data").unwrap();
-        assert_eq!(drive_path_endpoint.get_type(), EndpointType::Url);
-        assert!(has_leading_slash_windows_drive(Url::parse("http://host/C:/data").unwrap().path()));
+    fn windows_url_endpoint_file_path_restores_drive_path() {
+        for (arg, expected) in [
+            ("http://host:9000/C:/data1", "C:/data1"),
+            ("https://host:9000/d:/rustfs/data4", "d:/rustfs/data4"),
+            ("http://host:9000/C:\\data1", "C:/data1"),
+            ("http://host:9000/C:/rustfs/../data1", "C:/data1"),
+            ("http://host:9000/C:/Program%20Files/rustfs", "C:/Program Files/rustfs"),
+        ] {
+            let endpoint = Endpoint::try_from(arg).unwrap_or_else(|err| panic!("{arg}: {err}"));
+            assert_eq!(endpoint.get_type(), EndpointType::Url, "{arg}");
+            assert_eq!(endpoint.get_file_path(), expected, "{arg}");
+            assert!(Path::new(&endpoint.get_file_path()).is_absolute(), "{arg}");
+        }
+    }
 
-        let url_path_endpoint = Endpoint::try_from("http://host/C:foo").unwrap();
-        assert_eq!(url_path_endpoint.get_type(), EndpointType::Url);
-        assert!(!has_leading_slash_windows_drive(Url::parse("http://host/C:foo").unwrap().path()));
-        assert_eq!(url_path_endpoint.get_file_path(), "/C:foo");
+    #[cfg(windows)]
+    #[test]
+    fn windows_url_endpoint_keeps_url_identity_after_drive_path_parse() {
+        let endpoint = Endpoint::try_from("http://host:9000/C:/data1").unwrap();
+        assert_eq!(endpoint.url.as_str(), "http://host:9000/C:/data1");
+        assert_eq!(endpoint.to_string(), "http://host:9000/C:/data1");
+        assert_eq!(endpoint.host_port(), "host:9000");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_url_endpoint_keeps_plain_url_paths() {
+        for (arg, expected) in [("http://host:9000/export1", "/export1"), ("http://host:9000/C:foo", "/C:foo")] {
+            let endpoint = Endpoint::try_from(arg).unwrap();
+            assert_eq!(endpoint.get_type(), EndpointType::Url, "{arg}");
+            assert_eq!(endpoint.get_file_path(), expected, "{arg}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_url_and_path_endpoints_share_drive_file_path() {
+        let path_endpoint = Endpoint::try_from("C:\\rustfs\\data1").unwrap();
+        let url_endpoint = Endpoint::try_from("http://host:9000/C:/rustfs/data1").unwrap();
+        let verbatim_endpoint = Endpoint::try_from("\\\\?\\C:\\rustfs\\data1").unwrap();
+
+        assert_eq!(path_endpoint.get_type(), EndpointType::Path);
+        assert_eq!(path_endpoint.get_file_path(), "C:/rustfs/data1");
+        assert_eq!(url_endpoint.get_file_path(), path_endpoint.get_file_path());
+        assert_eq!(verbatim_endpoint.get_file_path(), path_endpoint.get_file_path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_url_endpoint_resolves_existing_drive_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let drive_path = dir.path().to_string_lossy().replace('\\', "/");
+        let endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).unwrap();
+
+        let file_path = endpoint.get_file_path();
+        assert_eq!(Path::new(&file_path), dir.path());
+        rustfs_utils::canonicalize(&file_path)
+            .unwrap_or_else(|err| panic!("URL endpoint path '{file_path}' must resolve to the temp directory: {err}"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_root_endpoints_are_accepted_in_both_forms() {
+        let path_endpoint = Endpoint::try_from("D:\\").unwrap();
+        assert_eq!(path_endpoint.get_file_path(), "D:/");
+
+        let url_endpoint = Endpoint::try_from("http://host:9000/D:/").unwrap();
+        assert_eq!(url_endpoint.get_type(), EndpointType::Url);
+        assert_eq!(url_endpoint.get_file_path(), "D:/");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_endpoints_are_rejected() {
+        for arg in [
+            "\\\\nas\\share\\d1",
+            "//nas/share/d1",
+            "\\\\?\\UNC\\nas\\share\\d1",
+            "http://host:9000//nas/share/d1",
+        ] {
+            let err = Endpoint::try_from(arg).expect_err(arg);
+            assert!(err.to_string().contains("UNC network share paths are not supported"), "{arg}: {err}");
+        }
     }
 
     #[test]

@@ -25300,6 +25300,22 @@ mod test {
         assert!(debug.contains("endpoint"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_local_disk_opens_url_style_drive_endpoint() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let drive_path = dir.path().to_string_lossy().replace('\\', "/");
+        let endpoint =
+            Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).expect("URL endpoint should parse");
+        assert_eq!(Path::new(&endpoint.get_file_path()), dir.path());
+
+        LocalDisk::new(&endpoint, false)
+            .await
+            .expect("a URL-style drive endpoint must open as a local disk");
+    }
+
     #[tokio::test]
     async fn std_backend_truncate_append_stream_and_full_read_restore_bytes() {
         use tempfile::tempdir;
