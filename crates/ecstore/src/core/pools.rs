@@ -6799,6 +6799,66 @@ async fn execute_pool_meta_object_cas<S>(
 where
     S: EcstoreObjectIO,
 {
+    if object != POOL_META_IDENTITY_NAME {
+        return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
+    }
+    // Keep the exact identity owned by this transaction. A quorum read alone
+    // cannot discharge repair responsibility for a missing disk replica.
+    let identity = data;
+    let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
+    for delay_secs in [1, 2, 4] {
+        if !outcome.source.as_deref().is_some_and(|err| {
+            matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+        }) {
+            break;
+        }
+        // The caller's transaction arm remains live across reconnect waits,
+        // verification and repair. Cancellation must retain its sticky gate.
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        let repair_options = async {
+            fence.ensure_held()?;
+            let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
+            if current != identity {
+                return Err(Error::PreconditionFailed);
+            }
+            let token = info
+                .etag
+                .filter(|etag| !etag.trim().is_empty())
+                .map(PoolMetaCasToken::Existing)
+                .unwrap_or(PoolMetaCasToken::Unsafe);
+            pool_meta_cas_options(object, &token, fence)
+        }
+        .await;
+        outcome = match repair_options {
+            Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
+            Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
+        };
+        // A rejected repair cannot turn the preceding committed write into a
+        // harmless CAS conflict that the outer loop could accept on readback.
+        outcome.may_have_mutated = true;
+        outcome.result = outcome.result.map_err(|err| {
+            let original = outcome.source.get_or_insert_with(|| Arc::new(err));
+            Error::other(pool_metadata_error(
+                crate::error::PoolMetadataFailure::TransactionUnknown,
+                phase,
+                Some(Arc::clone(original)),
+            ))
+        });
+    }
+    outcome
+}
+
+async fn execute_pool_meta_object_cas_once<S>(
+    pool: Arc<S>,
+    object: &str,
+    data: Vec<u8>,
+    opts: ObjectOptions,
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+) -> PoolMetaCasWriteOutcome
+where
+    S: EcstoreObjectIO,
+{
     // A bounded phase can wait for another replica before this write is polled.
     if let Err(err) = fence.ensure_held() {
         return PoolMetaCasWriteOutcome::not_dispatched(err);
@@ -24308,6 +24368,307 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IdentityRepairFault {
+        Healthy,
+        Once,
+        Always,
+        Changed,
+        Unreadable,
+        TypedReadFailure,
+        MissingEtag,
+        EmptyEtag,
+        Reject,
+        Unknown,
+        BlockBackoff,
+        BlockRead,
+        BlockWrite,
+    }
+
+    #[derive(Debug)]
+    struct IdentityRepairStorage {
+        inner: PartialPoolMetaWriteStorage,
+        fault: IdentityRepairFault,
+        writes: AtomicUsize,
+        reads: AtomicUsize,
+        blocked: tokio::sync::Notify,
+    }
+
+    impl IdentityRepairStorage {
+        fn new(fault: IdentityRepairFault) -> Arc<Self> {
+            Arc::new(Self {
+                inner: PartialPoolMetaWriteStorage::default(),
+                fault,
+                writes: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
+                blocked: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for IdentityRepairStorage {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = crate::object_api::PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<HTTPRangeSpec>,
+            headers: http::HeaderMap,
+            opts: &ObjectOptions,
+        ) -> std::result::Result<Self::GetObjectReader, Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fault == IdentityRepairFault::Unreadable {
+                return Err(Error::ErasureReadQuorum);
+            }
+            if self.fault == IdentityRepairFault::TypedReadFailure {
+                return Err(Error::other(super::pool_metadata_error(
+                    crate::error::PoolMetadataFailure::ReadUnavailable,
+                    "identity_repair_read",
+                    Some(Arc::new(Error::ErasureReadQuorum)),
+                )));
+            }
+            if self.fault == IdentityRepairFault::BlockRead {
+                self.blocked.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let mut reader = self.inner.get_object_reader(bucket, object, range, headers, opts).await?;
+            match self.fault {
+                IdentityRepairFault::Changed => {
+                    reader.stream = Box::new(Cursor::new(b"other-identity".to_vec()));
+                    reader.object_info.size = 14;
+                }
+                IdentityRepairFault::MissingEtag => reader.object_info.etag = None,
+                IdentityRepairFault::EmptyEtag => reader.object_info.etag = Some(" ".to_owned()),
+                _ => {}
+            }
+            Ok(reader)
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &ObjectOptions,
+        ) -> std::result::Result<ObjectInfo, Error> {
+            let attempt = self.writes.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair);
+            assert!(opts.max_parity && opts.no_lock);
+            if attempt > 0 {
+                assert_eq!(
+                    opts.http_preconditions
+                        .as_ref()
+                        .and_then(HTTPPreconditions::if_none_match_value),
+                    None
+                );
+                assert_eq!(
+                    opts.http_preconditions.as_ref().and_then(HTTPPreconditions::if_match_value),
+                    self.inner
+                        .identity
+                        .lock()
+                        .expect("identity lock")
+                        .as_ref()
+                        .map(|(_, etag)| etag.as_str()),
+                    "repair must use the observed post-commit CAS token",
+                );
+                if self.fault == IdentityRepairFault::Reject {
+                    return Err(Error::PreconditionFailed);
+                }
+                if self.fault == IdentityRepairFault::BlockWrite {
+                    self.blocked.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+            let info = self.inner.put_object(bucket, object, data, opts).await?;
+            if self.fault == IdentityRepairFault::Unknown {
+                return Err(Error::Timeout);
+            }
+            if self.fault != IdentityRepairFault::Healthy && (attempt == 0 || self.fault == IdentityRepairFault::Always) {
+                if self.fault == IdentityRepairFault::BlockBackoff {
+                    self.blocked.notify_one();
+                }
+                return Err(Error::other(crate::set_disk::SystemMetadataRepairRequired));
+            }
+            Ok(info)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_identity_owner_repair_preserves_cas_and_fail_closed_boundaries() {
+        for (fault, object, expected_writes, expected_reads, succeeds) in [
+            (IdentityRepairFault::Healthy, POOL_META_IDENTITY_NAME, 1, 0, true),
+            (IdentityRepairFault::Once, POOL_META_IDENTITY_NAME, 2, 1, true),
+            (IdentityRepairFault::Always, POOL_META_IDENTITY_NAME, 4, 3, false),
+            (IdentityRepairFault::Changed, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::Unreadable, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::TypedReadFailure, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::MissingEtag, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::EmptyEtag, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::Reject, POOL_META_IDENTITY_NAME, 2, 1, false),
+            (IdentityRepairFault::Unknown, POOL_META_IDENTITY_NAME, 1, 0, false),
+            (IdentityRepairFault::Once, POOL_META_NAME, 1, 0, false),
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = super::PoolMetaWriteState::default();
+            let mut transaction = state.arm_transaction();
+            let started = tokio::time::Instant::now();
+            let result = save_pool_meta_object_cas(
+                pool.clone(),
+                object,
+                b"owned-identity".to_vec(),
+                &PoolMetaCasToken::Missing,
+                &PoolMetaPersistenceFence::OfflineRecovery,
+                "identity_cas",
+                &mut transaction,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{fault:?}: {result:?}");
+            let original_source = result
+                .as_ref()
+                .err()
+                .and_then(|err| err.pool_metadata_failure())
+                .and_then(|failure| failure.source.clone());
+            if fault == IdentityRepairFault::TypedReadFailure {
+                assert_eq!(
+                    original_source
+                        .as_ref()
+                        .expect("read failure source")
+                        .pool_metadata_failure()
+                        .expect("retain the original read context")
+                        .kind,
+                    crate::error::PoolMetadataFailure::ReadUnavailable
+                );
+            }
+            if succeeds {
+                transaction.disarm();
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("failed repair")
+                        .pool_metadata_failure()
+                        .expect("typed uncertainty")
+                        .kind,
+                    crate::error::PoolMetadataFailure::TransactionUnknown,
+                    "{fault:?}"
+                );
+            }
+            drop(transaction);
+            let status = state.ensure_write_safe("after repair");
+            assert_eq!(status.is_ok(), succeeds, "{fault:?}");
+            if let Err(blocked) = status {
+                let source = blocked
+                    .pool_metadata_failure()
+                    .expect("blocked transaction context")
+                    .source
+                    .as_ref()
+                    .expect("blocked transaction source");
+                assert!(
+                    Arc::ptr_eq(source, original_source.as_ref().expect("caller failure source")),
+                    "caller and latch must retain the same original cause: {fault:?}"
+                );
+            }
+            assert_eq!(pool.writes.load(Ordering::SeqCst), expected_writes, "{fault:?}");
+            assert_eq!(pool.reads.load(Ordering::SeqCst), expected_reads, "{fault:?}");
+            if fault == IdentityRepairFault::Always {
+                assert_eq!(started.elapsed(), StdDuration::from_secs(7), "repair backoff must be bounded");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_identity_owner_repair_cancellation_keeps_the_transaction_armed() {
+        for fault in [
+            IdentityRepairFault::BlockBackoff,
+            IdentityRepairFault::BlockRead,
+            IdentityRepairFault::BlockWrite,
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = Arc::new(tokio::sync::Mutex::new(super::PoolMetaWriteState::default()));
+            let task = tokio::spawn({
+                let pool = pool.clone();
+                let state = state.clone();
+                async move {
+                    let state = state.lock().await;
+                    let mut transaction = state.arm_transaction();
+                    save_pool_meta_object_cas(
+                        pool,
+                        POOL_META_IDENTITY_NAME,
+                        b"owned-identity".to_vec(),
+                        &PoolMetaCasToken::Missing,
+                        &PoolMetaPersistenceFence::OfflineRecovery,
+                        "identity_cas",
+                        &mut transaction,
+                    )
+                    .await
+                }
+            });
+            pool.blocked.notified().await;
+            task.abort();
+            assert!(task.await.expect_err("cancelled repair").is_cancelled());
+            let state = state.lock().await;
+            let error = state
+                .ensure_write_safe("cancelled repair")
+                .expect_err("partial identity remains blocked");
+            assert_eq!(error.pool_metadata_failure().expect("typed uncertainty").phase, "identity_cas");
+            assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+            assert!(pool.inner.identity.lock().expect("identity lock").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_identity_owner_repair_stops_after_fence_loss() {
+        let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let lock = NamespaceLock::with_clients_and_quorum("identity-repair-fence".to_string(), vec![client], 1);
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "identity-repair-owner",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1))
+        .with_ttl(StdDuration::from_millis(50))
+        .with_refresh_interval(StdDuration::from_millis(50));
+        let owner = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("acquire fence")
+                .expect("available fence"),
+        );
+        let fence = PoolMetaPersistenceFence::Owned(owner.clone());
+        let pool = IdentityRepairStorage::new(IdentityRepairFault::Once);
+        let state = super::PoolMetaWriteState::default();
+        let mut transaction = state.arm_transaction();
+        let error = save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            &PoolMetaCasToken::Missing,
+            &fence,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("expired owner must not repair");
+        assert!(owner.is_lock_lost());
+        assert_eq!(
+            error.pool_metadata_failure().expect("typed uncertainty").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        assert_eq!(pool.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.reads.load(Ordering::SeqCst), 0);
+        drop(transaction);
+        state
+            .ensure_write_safe("lost repair fence")
+            .expect_err("lost fence retains the write gate");
     }
 
     #[test]
