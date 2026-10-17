@@ -889,6 +889,12 @@ impl Drop for ScannerDefaultCycleGuard {
 
 #[derive(Debug, Default)]
 struct MemoryConfigStore {
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    write_entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    pending_diagnostic_write: AtomicBool,
     objects: Mutex<HashMap<String, Vec<u8>>>,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
@@ -943,6 +949,11 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         _h: http::HeaderMap,
         _opts: &ObjectOptions,
     ) -> EcstoreResult<GetObjectReader> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        self.entry_sources
+            .lock()
+            .await
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
         if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
@@ -989,6 +1000,16 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> EcstoreResult<ObjectInfo> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        {
+            self.write_entry_sources
+                .lock()
+                .await
+                .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
+            if self.pending_diagnostic_write.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+        }
         let mut buf = Vec::new();
         data.stream.read_to_end(&mut buf).await?;
         let key = memory_config_key(bucket, object);
@@ -1907,6 +1928,140 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
         ..Default::default()
     };
     assert!(encode_scanner_cycle_state(&exhausted, 7).is_err());
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+#[serial]
+async fn diagnostic_scanner_config_writes_preserve_origin_for_both_helpers_and_cancellation() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for shared in [false, true] {
+            for case in ["success", "error", "cancelled"] {
+                let store = Arc::new(MemoryConfigStore::default());
+                let path = "buckets/diagnostic/write-state";
+                let key = memory_config_key(RUSTFS_META_BUCKET, path);
+                if case == "error" {
+                    store.fail_put_number.lock().await.insert(key.clone(), 1);
+                }
+                store.pending_diagnostic_write.store(case == "cancelled", Ordering::Relaxed);
+                let write = async {
+                    let operation = async {
+                        let preconditions = crate::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        };
+                        if shared {
+                            crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                                store.clone(),
+                                path,
+                                bytes::Bytes::from_static(b"state"),
+                                None,
+                                preconditions,
+                                None,
+                                None,
+                            )
+                            .await
+                        } else {
+                            crate::save_config_with_preconditions(store.clone(), path, b"state".to_vec(), preconditions).await
+                        }
+                    };
+                    let result = tokio::time::timeout(Duration::from_secs(1), operation).await;
+                    match case {
+                        "success" => assert!(result.expect("write completes").is_ok()),
+                        "error" => assert!(result.expect("error completes").is_err()),
+                        _ => assert!(result.is_err(), "pending write is cancelled"),
+                    }
+                };
+                match earlier {
+                    Some(source) => with_read_version_entry(source, write).await,
+                    None => write.await,
+                }
+                assert_eq!(
+                    *store.write_entry_sources.lock().await,
+                    vec![Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerConfigWrite))]
+                );
+                assert_eq!(current_read_version_entry_source(), None, "scope restores: {case}");
+                let stored = store.objects.lock().await.get(&key).cloned();
+                assert_eq!(stored, (case == "success").then(|| b"state".to_vec()), "write result preserved: {case}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+#[serial]
+async fn diagnostic_cycle_state_load_preserves_entry_for_results_and_cancellation() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for case in ["missing", "valid", "error", "cancelled"] {
+            let store = Arc::new(MemoryConfigStore::default());
+            let marker = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+            let state = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+            if case == "valid" {
+                let cycle = CurrentCycle {
+                    next: 9,
+                    ..Default::default()
+                };
+                store
+                    .objects
+                    .lock()
+                    .await
+                    .insert(state.clone(), encode_scanner_cycle_state(&cycle, 3).expect("cycle fixture"));
+                store.revisions.lock().await.insert(state, 7);
+            } else if case == "error" {
+                store
+                    .read_errors
+                    .lock()
+                    .await
+                    .insert(marker.clone(), EcstoreError::ErasureReadQuorum);
+            } else if case == "cancelled" {
+                store.delayed_gets.lock().await.insert(marker, Duration::from_secs(1));
+            }
+            let load = async {
+                if case == "cancelled" {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(1), load_scanner_cycle_state_for_startup(store.clone()))
+                            .await
+                            .is_err()
+                    );
+                    return;
+                }
+                let result = load_scanner_cycle_state_for_startup(store.clone()).await;
+                match (case, result) {
+                    ("missing", ScannerCycleStateStartup::Ready { .. }) => {}
+                    (
+                        "valid",
+                        ScannerCycleStateStartup::Ready {
+                            cycle, leader_epoch: 3, ..
+                        },
+                    ) => assert_eq!(cycle.next, 9),
+                    ("error", ScannerCycleStateStartup::Transient(_)) => {}
+                    _ => panic!("unexpected cycle load outcome: {case}"),
+                }
+            };
+            match earlier {
+                Some(source) => with_read_version_entry(source, load).await,
+                None => load.await,
+            }
+            let observed = store.entry_sources.lock().await;
+            assert!(!observed.is_empty(), "load must enter a reader: {case}");
+            assert!(
+                observed
+                    .iter()
+                    .all(|source| *source == Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerCycleStateRead))),
+                "all readers preserve the original source: {case}"
+            );
+            assert_eq!(current_read_version_entry_source(), None, "scope restores for all outcomes: {case}");
+        }
+    }
 }
 
 #[tokio::test]

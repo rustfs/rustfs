@@ -1368,6 +1368,18 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_
     bucket: &str,
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    get_delete_config_from_disk_in(ctx, bucket, guard, None).await
+}
+
+/// Validate queued expiration against the same fresh metadata used for Object
+/// Lock admission. The caller holds the transaction read lock through commit,
+/// so a successful lifecycle update cannot be followed by an old-policy delete.
+pub(crate) async fn get_delete_config_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
+) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
@@ -1387,6 +1399,13 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if let Some(expected) = expiry_policy {
+                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
+                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
+                if !expected.matches_configuration(current) {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
             let object_lock_config_updated_at = metadata.object_lock_config_updated_at;
             Ok((
                 object_lock_config_state_from_authoritative_metadata(&metadata)?,

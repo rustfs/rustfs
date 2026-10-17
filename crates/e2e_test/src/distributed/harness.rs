@@ -860,10 +860,12 @@ pub(crate) async fn start_rebalance(cluster: &RustFSTestClusterEnvironment) -> T
         if status.is_success() {
             break response;
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
-            && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
+        // The init stage answers 503 + Retry-After while the cluster capability
+        // proof is still missing; older binaries surfaced the same condition as
+        // a 500 carrying the proof marker.
+        let waiting_for_readiness = status == StatusCode::SERVICE_UNAVAILABLE
+            || (status == StatusCode::INTERNAL_SERVER_ERROR && response.contains("requires a live fleet capability proof"));
+        if waiting_for_readiness && Instant::now() < deadline {
             sleep(Duration::from_secs(1)).await;
             continue;
         }

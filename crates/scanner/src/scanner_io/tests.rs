@@ -4736,3 +4736,173 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
         clear_dirty_usage_buckets_for_tests();
     }
 }
+
+pub(super) struct CoordinatorBucketScanProbe {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    hold: Duration,
+}
+
+static COORDINATOR_BUCKET_SCAN_PROBE: std::sync::Mutex<Option<Arc<CoordinatorBucketScanProbe>>> = std::sync::Mutex::new(None);
+
+/// Called by the coordinator walker loop once a bucket scan is admitted on
+/// its disk. The hook is absent from non-test builds and a no-op until a test
+/// installs a probe; the probe then holds the walker so overlapping
+/// admissions become observable as a peak.
+pub(super) async fn observe_coordinator_bucket_scan_admitted(_bucket: &str) {
+    let probe = COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(probe) = probe else { return };
+    let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+    probe.peak.fetch_max(active, Ordering::SeqCst);
+    tokio::time::sleep(probe.hold).await;
+    probe.active.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn install_coordinator_bucket_scan_probe(hold: Duration) -> Arc<CoordinatorBucketScanProbe> {
+    let probe = Arc::new(CoordinatorBucketScanProbe {
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        hold,
+    });
+    *COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe.clone());
+    probe
+}
+
+fn clear_coordinator_bucket_scan_probe() {
+    *COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[test]
+fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
+    let server_epoch = Uuid::from_u128(7);
+    let workers = vec![
+        ("local-a", NamespaceScannerWorkerMode::Coordinator),
+        ("local-b", NamespaceScannerWorkerMode::Coordinator),
+        ("legacy-peer", NamespaceScannerWorkerMode::Coordinator),
+        ("v4-peer", NamespaceScannerWorkerMode::RemoteV4(server_epoch)),
+    ];
+    let is_local = |disk: &&str| disk.starts_with("local");
+
+    let walkers = namespace_scanner_walkers(workers.clone(), 3, is_local);
+    assert_eq!(walkers.len(), 2 * 3 + 2, "two local disks fan out, both remote disks keep one walker");
+    let local_a: Vec<_> = walkers.iter().filter(|walker| walker.disk == "local-a").collect();
+    assert_eq!(local_a.len(), 3);
+    let share = local_a[0]
+        .local_admission
+        .as_ref()
+        .expect("local walkers carry an admission share");
+    assert!(
+        local_a
+            .iter()
+            .all(|walker| walker.local_admission.as_ref().is_some_and(|other| Arc::ptr_eq(other, share))),
+        "walkers of one disk share one admission"
+    );
+    let local_b = walkers
+        .iter()
+        .find(|walker| walker.disk == "local-b")
+        .expect("local-b walker");
+    assert!(
+        !Arc::ptr_eq(local_b.local_admission.as_ref().expect("local-b share"), share),
+        "each disk owns its own admission share"
+    );
+    assert!(
+        walkers
+            .iter()
+            .filter(|walker| !is_local(&walker.disk))
+            .all(|walker| walker.local_admission.is_none()),
+        "remote disks admit through the peer, not a local share"
+    );
+    assert_eq!(
+        walkers
+            .iter()
+            .filter(|walker| walker.mode == NamespaceScannerWorkerMode::RemoteV4(server_epoch))
+            .count(),
+        1
+    );
+    // The walker count, not the disk count, is the available work the
+    // configured cap applies to; the disk count stays the floor.
+    assert_eq!(scanner_concurrency_limit(0, walkers.len()), 8);
+    assert_eq!(scanner_concurrency_limit(4, walkers.len()), 4);
+    for factor in [0, 1] {
+        let walkers = namespace_scanner_walkers(workers.clone(), factor, is_local);
+        assert_eq!(walkers.len(), workers.len(), "factor {factor} keeps one walker per disk");
+        assert_eq!(scanner_concurrency_limit(0, walkers.len()), workers.len());
+    }
+}
+
+async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let (updates, _receiver) = mpsc::channel(8);
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                ctx,
+                budget,
+                updates,
+                want_cycle: cycle,
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                resolved_scope_observer: None,
+                service_cohort: None,
+            },
+        ),
+    )
+    .await
+    .expect("cycle should finish within the test deadline")
+    .expect("cycle should succeed")
+    .status
+}
+
+#[tokio::test]
+#[serial]
+async fn walkers_per_disk_lets_one_disk_walk_two_buckets_concurrently() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    for bucket in ["walk-a", "walk-b"] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = ScannerPutObjReader::from_vec(b"object".to_vec());
+        store
+            .put_object(bucket, "object", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("object should persist");
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    // The probe holds every admitted bucket scan long enough that two walkers
+    // on the one disk must overlap; a single walker cannot overlap with itself.
+    let hold = Duration::from_millis(750);
+    for (cycle, factor, expected_peak) in [(1, "1", 1), (2, "2", 2)] {
+        let probe = install_coordinator_bucket_scan_probe(hold);
+        let status = temp_env::async_with_vars([(ENV_SCANNER_WALKERS_PER_DISK, Some(factor))], async {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            run_full_cycle(&store, cycle).await
+        })
+        .await;
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        clear_coordinator_bucket_scan_probe();
+        assert_eq!(status, ScannerCycleStatus::Complete, "walkers_per_disk={factor}");
+        assert_eq!(
+            probe.peak.load(Ordering::SeqCst),
+            expected_peak,
+            "walkers_per_disk={factor}: concurrent bucket scans admitted on the single disk"
+        );
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0, "every admitted scan left the probe");
+    }
+}

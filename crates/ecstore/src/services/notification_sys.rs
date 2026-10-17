@@ -546,6 +546,17 @@ pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProof
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(CrossPoolFenceFleetProofToken)
 }
 
+/// Startup layout identity remains available when peers or the live fleet proof are unavailable.
+pub fn configured_fleet_topology_fingerprint() -> Option<&'static str> {
+    let state = cross_pool_fence_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.topology_conflict {
+        return None;
+    }
+    REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().map(String::as_str)
+}
+
 pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToken) -> bool {
     fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
 }
@@ -970,8 +981,8 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct CrossPoolFenceFleetProofGuard {
+#[cfg(any(test, feature = "test-util"))]
+pub struct CrossPoolFenceFleetProofGuard {
     previous_proof: Option<FleetCapabilityProof>,
     previous_topology_conflict: bool,
     previous_journal_proof: Option<FleetCapabilityProof>,
@@ -980,7 +991,7 @@ pub(crate) struct CrossPoolFenceFleetProofGuard {
     previous_decommission_topology_conflict: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for CrossPoolFenceFleetProofGuard {
     fn drop(&mut self) {
         let mut state = cross_pool_fence_fleet_proof_slot()
@@ -1020,8 +1031,19 @@ impl Drop for CrossPoolFenceFleetProofGuard {
 
 /// Temporarily revoke the test proof so activation paths can exercise their
 /// fail-closed behavior without changing the process-wide topology binding.
+#[cfg(any(test, feature = "test-util"))]
+pub fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    revoke_cross_pool_fence_fleet_proof_for_test(true)
+}
+
+/// Simulate peer unavailability while retaining the configured topology identity.
 #[cfg(test)]
-pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+pub(crate) fn without_live_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    revoke_cross_pool_fence_fleet_proof_for_test(false)
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn revoke_cross_pool_fence_fleet_proof_for_test(topology_conflict: bool) -> CrossPoolFenceFleetProofGuard {
     let mut state = cross_pool_fence_fleet_proof_slot()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1045,21 +1067,21 @@ pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceF
             state.draining_generation = Some(proof.generation);
         }
     }
-    state.topology_conflict = true;
+    state.topology_conflict |= topology_conflict;
     if let Some(proof) = journal_state.proof.take() {
         proof.generation.revoke();
         if !proof.generation.is_drained() {
             journal_state.draining_generation = Some(proof.generation);
         }
     }
-    journal_state.topology_conflict = true;
+    journal_state.topology_conflict |= topology_conflict;
     if let Some(proof) = decommission_state.proof.take() {
         proof.generation.revoke();
         if !proof.generation.is_drained() {
             decommission_state.draining_generation = Some(proof.generation);
         }
     }
-    decommission_state.topology_conflict = true;
+    decommission_state.topology_conflict |= topology_conflict;
     guard
 }
 

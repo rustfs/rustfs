@@ -270,9 +270,9 @@ for within-cycle reuse.
 
 ## Pacing and worker concurrency
 
-Today the number of bucket walkers per erasure set equals the number of
-disks in the set, capped by `max_concurrent_disk_scans`, and
-`scanner_concurrency_limit` takes the minimum of the configured value and the
+Before phase 3 the number of bucket walkers per erasure set equalled the
+number of disks in the set, capped by `max_concurrent_disk_scans`, and
+`scanner_concurrency_limit` took the minimum of the configured value and the
 disk count. Buckets queue on one channel per set and each walker takes one
 bucket at a time; inside a bucket the folder walk is sequential and
 `DynamicSleeper` sleeps after every object for the work time multiplied by
@@ -290,7 +290,14 @@ resource ceiling. The scanner adopts the same shape:
   count multiplied by a per-disk walker factor. The factor defaults from disk
   type: 1 for rotational media, higher for flash, where xl.meta decode is CPU
   bound and there is no seek penalty. Disk count stays the floor so
-  distributed deployments keep at least today's parallelism.
+  distributed deployments keep at least today's parallelism. Shipped as
+  `scanner.walkers_per_disk` (`RUSTFS_SCANNER_WALKERS_PER_DISK`, `1` through
+  `16`): each local coordinator disk gets that many walkers, which share one
+  per-disk scanner admission so a peer still sees one scan session per
+  physical disk; remote disks keep one walker. The default is `1` everywhere
+  until a local disk can report its media type
+  (`rustfs_utils::os::Info::rotational` is never populated today); the flash
+  default above `1` remains the intent.
 - **Throttle**: the `DynamicSleeper` factor is the pacer's output, not a
   fixed preset. `ScannerSpeed` presets remain as operator overrides and as
   the initial value. Foreground workload backoff in `sleeper.rs` remains the
@@ -315,7 +322,7 @@ not tuning advice.
 | Pacer raises walkers and lowers sleep | CPU and I/O ceilings are absolute. Foreground admission backoff cannot be undercut. Walker count never exceeds the ceiling-derived maximum even when the target is missed. |
 | Faster convergence discovers heal and replication work sooner | Heal admission keeps its queue bounds and `queue_full` and `dropped` accounting in `crates/scanner/src/scanner_folder/ledger.rs`; replication MRF keeps its pending cap. Convergence speed does not change retry intervals. Discovered work is swept lazily under those bounds, in the sense of a lazy sweeper: discovery and execution are decoupled. |
 | Guardrail vetoes publication | A veto is attributed to a field and localised to a peer where the field allows it; only movement and topology defer the whole cycle. Deferred retries use the capped superseded backoff. A probe failure on one peer never costs more than that peer's dirtied buckets. |
-| One bucket walk may be large | Inside a bucket, the walk takes a per-prefix quantum: a prefix that exhausts it checkpoints and yields to the next prefix or bucket, and resumes under the existing cursor and page-index fences. No single prefix may consume the whole cycle budget. The walker's own bookkeeping must stay linear in entries per prefix; `RawEnumerationProgress::record_entry` in `crates/scanner/src/scanner_folder.rs` copies the accumulated entry list on every entry today and is a prerequisite fix for pacing. |
+| One bucket walk may be large | Inside a bucket, the walk takes a per-prefix quantum: a prefix that exhausts it checkpoints and yields to the next prefix or bucket, and resumes under the existing cursor and page-index fences. No single prefix may consume the whole cycle budget. The walker's own bookkeeping must stay linear in entries per prefix. `RawEnumerationProgress::record_entry` in `crates/scanner/src/scanner_folder.rs` once re-normalized the accumulated entry list on every entry (rustfs#8113: 8,000 entries cost about 40 s); since #8114 the page writer hashes each entry once when its page commits, and a regression test pins 20,000 entries in one prefix to that cost so pacing cannot be built on a quadratic walker. |
 
 ## What stays fail-closed
 
@@ -468,10 +475,12 @@ modes.
    a hundred thousand entries no longer starves the buckets after it; a
    multi-node deployment with one peer's probe failing publishes every bucket
    that peer did not dirty.
-3. **Pacer and walker concurrency.** Fix the quadratic entry bookkeeping in
-   `RawEnumerationProgress::record_entry` first, then decouple walker count
-   from disk count and drive the throttle from the pacing target under CPU
-   and I/O ceilings. Oracle: on a single flash disk the same namespace
+3. **Pacer and walker concurrency.** Pin the entry bookkeeping in
+   `RawEnumerationProgress::record_entry` to linear cost first (the
+   clone-per-entry itself was removed by #8114; the regression test and the
+   in-place page writer are this phase's groundwork), then decouple walker
+   count from disk count (`walkers_per_disk`, shipped) and drive the throttle
+   from the pacing target under CPU and I/O ceilings (open). Oracle: on a single flash disk the same namespace
    converges in a fraction of today's cycle time with scanner CPU under the
    ceiling; on rotational media the default factor keeps today's I/O
    profile; a foreground write load at the admission threshold still backs

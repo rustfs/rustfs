@@ -30,6 +30,7 @@ harness = false
 
 [features]
 default = []
+diagnostic-read-version-caller = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

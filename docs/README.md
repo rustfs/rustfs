@@ -31,6 +31,9 @@ For legacy protection assessment and bounded protected copies, see [Object integ
 For encrypted listing compatibility and older stored fingerprints, see
 [Encrypted object ETags](operations/encrypted-etags.md).
 
+For durable hard quota accounting, node-outage behavior, and fence protocol
+upgrades, see [Durable hard quotas](operations/durable-quota-reservation-v2.md).
+
 Operational runbooks live under [`operations/`](operations/). Replication
 operators should start with:
 

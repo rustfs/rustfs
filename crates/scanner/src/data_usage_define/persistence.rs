@@ -370,6 +370,17 @@ impl DataUsageCache {
             }
         };
 
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let load_fut = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+            crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::DataUsageCacheRead,
+            async {
+                crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                    crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCacheLoad,
+                );
+                load_fut.await
+            },
+        );
+
         match timeout(timeout_duration, load_fut).await {
             Ok(Ok((Some(cache), revision, _))) => Ok(DataUsageCacheLoadAttempt::Loaded {
                 cache: Box::new(cache),

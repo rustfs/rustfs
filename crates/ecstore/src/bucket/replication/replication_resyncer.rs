@@ -36,9 +36,9 @@ use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
     delete_replication_creates_marker, delete_replication_target_version_id, heal_uses_delete_replication_path,
     is_object_lock_denied_delete, is_retryable_delete_replication_head_error, is_version_delete_replication,
-    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
-    replication_multipart_part_plan, replication_single_put_size_error, resync_existing_delete_replication_info,
-    should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
+    replicate_delete_outcome, replication_multipart_complete_actual_size, replication_multipart_part_plan,
+    replication_single_put_size_error, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
+    single_part_replica_etag_mismatch,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -60,14 +60,15 @@ use super::replication_storage_boundary::{
 use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
 use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::replication_target_boundary::{
-    ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
-    RemotePutObjectResponse, ReplicaLocation, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability,
-    SsecPassthroughGate, TargetClient, VersionIdentityCapability, is_replication_target_offline_error,
-    replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
-    replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
-    replication_put_object_header_size, replication_put_object_options, replication_source_etag_is_comparable,
-    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
-    ssec_passthrough_gate, version_identity_capability_from_put, version_identity_drifted,
+    ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, EncryptedReplicaShape, HeadObjectSdkError, PutObjectOptions,
+    PutObjectPartOptions, RemotePutObjectResponse, ReplicaCandidates, ReplicaEvidence, ReplicaIdentity, ReplicaLocation,
+    ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
+    VersionIdentityCapability, is_replication_target_offline_error, replication_action_for_target_head,
+    replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
+    replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
+    replication_put_object_options, replication_source_etag_is_comparable, replication_target_head_is_newer_null_version,
+    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
+    version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -354,8 +355,9 @@ fn replica_etag_verification_enabled() -> bool {
 /// plaintext MD5 (that path has its own HEAD-back audit), and a managed-SSE
 /// (SSE-S3 / SSE-KMS) source stores a keyed fingerprint, or a legacy plaintext
 /// MD5, that the ETag of the target's re-encrypted replica can neither confirm
-/// nor refute. The checksum header on the replication PUT stays the integrity
-/// check for those objects.
+/// nor refute. A managed-SSE source forwards no checksum either
+/// (`replication_put_object_options`), so its replica has no post-PUT
+/// content audit.
 fn verify_single_part_replica(
     object_info: &ObjectInfo,
     response: &RemotePutObjectResponse,
@@ -489,6 +491,7 @@ async fn head_object_fallback(
         Ok(head) => Ok(Some(LocatedReplica {
             version_id: head.version_id.clone(),
             head,
+            by: LocatedBy::CurrentVersion,
         })),
         Err(e) if head_object_not_found(&e) => Ok(None),
         Err(e) => Err(e),
@@ -502,6 +505,63 @@ async fn head_object_fallback(
 struct LocatedReplica {
     head: HeadObjectOutput,
     version_id: Option<String>,
+    by: LocatedBy,
+}
+
+/// How [`replica_head_fallback`] reached a replica, which decides what may
+/// confirm it (see [`located_replica_matches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocatedBy {
+    /// The target version the source ledger recorded for this version.
+    Ledger,
+    /// The one candidate content identity left (`ListObjectVersions`).
+    ContentIdentity,
+    /// Whatever version is current under the key (AWS-style fallback):
+    /// nothing ties it to this source version but an ETag match.
+    CurrentVersion,
+}
+
+/// How this source version recognises its replica on a target. `None` when
+/// the source carries nothing to compare (no ETag on a plaintext source).
+fn replica_identity(object_info: &ObjectInfo) -> Option<ReplicaIdentity<'_>> {
+    let etag = object_info.etag.as_deref().filter(|etag| !etag.trim().is_empty());
+    if replication_source_etag_is_comparable(&object_info.user_defined) {
+        return etag.map(ReplicaIdentity::Etag);
+    }
+    // Same byte count the replication PUT sends: SSE-C passes the stored
+    // ciphertext through, managed SSE sends the decrypted plaintext.
+    let size = if replication_object_is_ssec_encrypted(&object_info.user_defined) {
+        object_info.size
+    } else {
+        object_info.get_actual_size().ok()?
+    };
+    match object_info.mod_time {
+        Some(mod_time) if size >= 0 => Some(ReplicaIdentity::Encrypted {
+            etag,
+            shape: EncryptedReplicaShape {
+                size,
+                not_before_secs: mod_time.unix_timestamp(),
+            },
+        }),
+        _ => etag.map(ReplicaIdentity::Etag),
+    }
+}
+
+/// Whether a replica reached through [`replica_head_fallback`] holds this
+/// source version. An ETag match always does. For an encrypted source on a
+/// target that computes its own ETag, the shape does too — but only for a
+/// replica the ledger or content identity singled out, never for whichever
+/// version happens to be current. A plaintext source still needs its ETag.
+fn located_replica_matches(identity: Option<&ReplicaIdentity<'_>>, located: &LocatedReplica) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    let head = &located.head;
+    match identity.evidence(head.e_tag(), head.content_length(), head.last_modified()) {
+        Some(ReplicaEvidence::Etag) => true,
+        Some(ReplicaEvidence::Shape) => located.by != LocatedBy::CurrentVersion,
+        None => false,
+    }
 }
 
 fn head_object_not_found(err: &HeadObjectSdkError) -> bool {
@@ -583,15 +643,20 @@ fn ledger_target_version_id(user_defined: &HashMap<String, String>, arn: &str) -
 /// Second look at a replica whose version-addressed HEAD failed, for the two
 /// target shapes where that failure is not a verdict on the replica:
 ///
-/// - AWS-style 400/403 (the RustFS uuid is rejected as malformed): HEAD the
-///   current version without a version id; callers compare ETags.
+/// - AWS-style 400/403 (the RustFS uuid is rejected as malformed) and
 /// - 404 on a target that mints its own version ids (the Wasabi shape,
-///   rustfs/backlog#2340): the source id never existed there. HEAD the id
-///   the source ledger recorded for this target when it has one; otherwise,
-///   once the target is known to mint ids, locate the replica by exact key
-///   and ETag through ListObjectVersions and HEAD the id the target assigned.
-///   Without this, every heal, MRF retry and existing-object resync re-drive
-///   PUTs the object again and mints one more target version.
+///   rustfs/backlog#2340): the source id never existed there.
+///
+/// Both HEAD the id the source ledger recorded for this target first. Without
+/// one, the AWS shape HEADs the current version without a version id
+/// (callers compare ETags); the Wasabi shape, once the target is known to
+/// mint ids, locates the replica by exact key and content identity through
+/// ListObjectVersions and HEADs the id the target assigned. An encrypted
+/// source takes that listing on the AWS shape too: its ETag never matches a
+/// target-computed one (docs/operations/encrypted-etags.md), so only a unique
+/// shape match can stand in for it. Without this, every heal, MRF retry and
+/// existing-object resync re-drive PUTs the object again and mints one more
+/// target version.
 ///
 /// `content_identity` is the sibling-ledger view used to disown candidates
 /// other source versions already claim; `None` disables content identity
@@ -608,7 +673,7 @@ struct ReplicaSource<'a> {
     bucket: &'a str,
     object: &'a str,
     version_id: Option<Uuid>,
-    etag: Option<&'a str>,
+    identity: Option<ReplicaIdentity<'a>>,
     ledger_version_id: Option<&'a str>,
 }
 
@@ -622,13 +687,11 @@ async fn replica_head_fallback(
         bucket: source_bucket,
         object,
         version_id: source_version_id,
-        etag: source_etag,
+        identity,
         ledger_version_id,
     } = source;
-    if is_version_id_format_mismatch(err) {
-        return Some(head_object_fallback(tgt_client, object).await);
-    }
-    if !head_object_not_found(err) {
+    let format_mismatch = is_version_id_format_mismatch(err);
+    if !format_mismatch && !head_object_not_found(err) {
         return None;
     }
     if let Some(ledger_version_id) = ledger_version_id {
@@ -640,24 +703,45 @@ async fn replica_head_fallback(
                 return Some(Ok(Some(LocatedReplica {
                     head,
                     version_id: Some(ledger_version_id.to_string()),
+                    by: LocatedBy::Ledger,
                 })));
             }
             // The recorded version is gone: fall through to content identity
             // before concluding that the replica is missing.
-            Err(e) if head_object_not_found(&e) => {}
+            Err(e) if head_object_not_found(&e) || is_version_id_format_mismatch(&e) => {}
             Err(e) => return Some(Err(e)),
         }
     }
-    if !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
+    let encrypted = matches!(identity, Some(ReplicaIdentity::Encrypted { .. }));
+    if format_mismatch {
+        if !(encrypted && content_identity.is_some()) {
+            return Some(head_object_fallback(tgt_client, object).await);
+        }
+    } else if !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
         return None;
     }
     let siblings = content_identity?;
-    let etag = source_etag.filter(|etag| !etag.trim().is_empty())?;
-    Some(match tgt_client.replica_candidates_by_etag(&tgt_client.bucket, object, etag).await {
+    let identity = identity?;
+    let candidates = match tgt_client.replica_candidates(&tgt_client.bucket, object, &identity).await {
+        Ok(candidates) => Ok(candidates),
+        // A target that refused the version-addressed HEAD (a bodiless 403
+        // can be a permission denial) may refuse the listing too: keep the
+        // current-version fallback, which re-PUTs, instead of stalling.
+        Err(_) if format_mismatch => return Some(head_object_fallback(tgt_client, object).await),
+        Err(list_err) => Err(list_err),
+    };
+    Some(match candidates {
         Ok(candidates) => {
-            let location =
+            let (location, evidence) =
                 disowned_replica_location(siblings, &tgt_client.arn, source_bucket, object, source_version_id, candidates).await;
-            match location.any_version_id() {
+            // Several same-ETag versions all hold the source bytes, so any of
+            // them proves the replica exists. Several same-shape versions do
+            // not: re-PUT rather than adopt the wrong generation.
+            let assigned_version_id = match (&location, evidence) {
+                (ReplicaLocation::Ambiguous { .. }, ReplicaEvidence::Shape) => None,
+                _ => location.any_version_id(),
+            };
+            match assigned_version_id {
                 Some(assigned_version_id) => {
                     debug!(
                         event = EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED,
@@ -668,6 +752,7 @@ async fn replica_head_fallback(
                         arn = %tgt_client.arn,
                         assigned_version_id = %assigned_version_id,
                         ambiguous = matches!(location, ReplicaLocation::Ambiguous { .. }),
+                        evidence = ?evidence,
                         "Located replica by content identity on a target that mints its own version ids"
                     );
                     match head_object_for_worker(tgt_client, &tgt_client.bucket, object, Some(assigned_version_id.to_string()))
@@ -676,6 +761,7 @@ async fn replica_head_fallback(
                         Ok(head) => Ok(Some(LocatedReplica {
                             head,
                             version_id: Some(assigned_version_id.to_string()),
+                            by: LocatedBy::ContentIdentity,
                         })),
                         // The located version disappeared between LIST and HEAD.
                         Err(e) if head_object_not_found(&e) => Ok(None),
@@ -698,16 +784,15 @@ async fn disowned_replica_location(
     source_bucket: &str,
     object: &str,
     source_version_id: Option<Uuid>,
-    mut candidates: Vec<String>,
-) -> ReplicaLocation {
+    candidates: ReplicaCandidates,
+) -> (ReplicaLocation, ReplicaEvidence) {
     if candidates.is_empty() {
-        return ReplicaLocation::Missing;
+        return (ReplicaLocation::Missing, ReplicaEvidence::Etag);
     }
     let claimed = siblings
         .claimed_target_versions(source_bucket, object, source_version_id, arn)
         .await;
-    candidates.retain(|candidate| !claimed.contains(candidate));
-    ReplicaLocation::from_matches(candidates)
+    candidates.locate(&claimed)
 }
 
 /// The id the target assigned to a located replica when it is not the source
@@ -1854,10 +1939,14 @@ fn spawn_resync_walk_task<S: ReplicationStorage>(
 
 /// Classify the target HEAD verification result for one resynced object,
 /// updating the per-object status counters and returning the accounted size
-/// together with any verification error.
+/// together with any verification error. `source` is the source version as
+/// stored after the resync replicated it (its ledger and encryption decide
+/// how the replica is recognised); without it the queued ETag is all there
+/// is to go on.
 async fn verify_resync_head_result(
     head_result: std::result::Result<HeadObjectOutput, HeadObjectSdkError>,
     roi: &ReplicateObjectInfo,
+    source: Option<&ObjectInfo>,
     st: &mut TargetReplicationResyncStatus,
     target_client: &Arc<TargetClient>,
 ) -> (i64, Option<HeadObjectSdkError>) {
@@ -1899,14 +1988,23 @@ async fn verify_resync_head_result(
             // A version-addressed HEAD is not the last word on every target:
             // re-verify through the fallback before counting a well-replicated
             // object as failed (see `replica_head_fallback`).
+            let ledger_version_id = source.and_then(|info| ledger_target_version_id(&info.user_defined, &target_client.arn));
+            let identity = match source {
+                Some(info) => replica_identity(info),
+                None => roi
+                    .etag
+                    .as_deref()
+                    .filter(|etag| !etag.trim().is_empty())
+                    .map(ReplicaIdentity::Etag),
+            };
             match replica_head_fallback(
                 target_client.as_ref(),
                 ReplicaSource {
                     bucket: &roi.bucket,
                     object: &roi.name,
                     version_id: roi.version_id,
-                    etag: roi.etag.as_deref(),
-                    ledger_version_id: None,
+                    identity,
+                    ledger_version_id: ledger_version_id.as_deref(),
                 },
                 Some(&NoSiblingLedger),
                 &err,
@@ -1929,6 +2027,24 @@ async fn verify_resync_head_result(
             }
         }
     }
+}
+
+/// The resynced source version as stored now, ledger included, for the
+/// verification fallback. `None` when it cannot be read.
+async fn resync_source_object_info<S: ReplicationStorage>(storage: &Arc<S>, roi: &ReplicateObjectInfo) -> Option<ObjectInfo> {
+    storage
+        .get_object_info(
+            &roi.bucket,
+            &roi.name,
+            &ObjectOptions {
+                version_id: roi.version_id.map(|version_id| version_id.to_string()),
+                versioned: ReplicationVersioningStore::prefix_enabled(&roi.bucket, &roi.name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(&roi.bucket, &roi.name).await,
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
 }
 
 /// Replicate one existing object (or delete marker / version purge) to the
@@ -1965,7 +2081,12 @@ async fn resync_worker_process_object<S: ReplicationStorage>(
         roi.version_id.map(|v| v.to_string()),
     )
     .await;
-    let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, target_client).await;
+    let source = if head_result.is_err() && !roi.delete_marker {
+        resync_source_object_info(storage, &roi).await
+    } else {
+        None
+    };
+    let (size, err) = verify_resync_head_result(head_result, &roi, source.as_ref(), &mut st, target_client).await;
 
     if err.is_some() {
         debug!(
@@ -2306,6 +2427,51 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         dobj.delete_object.version_id
     };
 
+    let dsc = match parse_replicate_decision(
+        &bucket,
+        &dobj
+            .delete_object
+            .replication_state
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default(),
+    ) {
+        Ok(dsc) => dsc,
+        Err(err) => {
+            debug!(
+                event = EVENT_REPLICATION_DELETE_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                arn = %dobj.target_arn,
+                error = %err,
+                reason = "replicate_decision_parse_failed",
+                "Failed to parse replicate decision"
+            );
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return false;
+        }
+    };
+    let target_arns = dobj.admitted_target_arns();
+    if !dsc.replicate_any() && target_arns.is_empty() {
+        // Batch expiry can return an empty state after removing the source.
+        // It owes no remote work or local writeback. Persisted target admission
+        // must still be honored even when the live configuration is gone.
+        return true;
+    }
+
     if dobj.delete_object.delete_marker
         && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
     {
@@ -2392,43 +2558,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         }
     }
 
-    let dsc = match parse_replicate_decision(
-        &bucket,
-        &dobj
-            .delete_object
-            .replication_state
-            .as_ref()
-            .map(|v| v.replicate_decision_str.clone())
-            .unwrap_or_default(),
-    ) {
-        Ok(dsc) => dsc,
-        Err(err) => {
-            debug!(
-                event = EVENT_REPLICATION_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                arn = %dobj.target_arn,
-                error = %err,
-                reason = "replicate_decision_parse_failed",
-                "Failed to parse replicate decision"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: dobj.delete_object.object_name.clone(),
-                    version_id,
-                    delete_marker: dobj.delete_object.delete_marker,
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return false;
-        }
-    };
     let ns_lock = match storage
         .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
         .await
@@ -2508,7 +2637,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     let mut join_set = JoinSet::new();
 
     // Process each target
-    let target_arns = dobj.admitted_target_arns();
     let expected_targets = dsc
         .targets_map
         .values()
@@ -3362,6 +3490,9 @@ fn abandoned_purge_target_info(bucket: &str, dobj: &DeletedObjectReplicationInfo
 /// to resolve the replica on a target that mints its own version ids.
 struct VersionPurgeSource {
     etag: Option<String>,
+    /// Encrypted sources: what identifies the replica when the target
+    /// computes its own ETag (see [`replica_identity`]).
+    encrypted_shape: Option<EncryptedReplicaShape>,
     ledger: HashMap<String, String>,
     ledger_corrupt: bool,
     /// Target versions other generations of the key claim, per target ARN:
@@ -3407,8 +3538,13 @@ async fn version_purge_source<S: ReplicationStorage>(
             claimed_by_siblings.insert(target.arn.clone(), claimed);
         }
     }
+    let encrypted_shape = match replica_identity(&info) {
+        Some(ReplicaIdentity::Encrypted { shape, .. }) => Some(shape),
+        _ => None,
+    };
     Some(VersionPurgeSource {
         etag: info.etag,
+        encrypted_shape,
         ledger,
         ledger_corrupt,
         claimed_by_siblings,
@@ -3426,7 +3562,8 @@ enum PurgeReplicaResolution {
     /// goal is already met there.
     Absent,
     /// Refuse: no ledger entry and more than one target version carries the
-    /// source ETag, so any pick could destroy a live generation.
+    /// source ETag (or, for an encrypted source on a target that computes its
+    /// own ETag, its shape), so any pick could destroy a live generation.
     Ambiguous,
     /// Refuse: the persisted ledger is inconsistent.
     LedgerCorrupt,
@@ -3454,15 +3591,19 @@ async fn resolve_purge_replica(
     if !force_lookup && !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
         return PurgeReplicaResolution::SourceVersion;
     }
-    let Some(etag) = source.etag.as_deref().filter(|etag| !etag.trim().is_empty()) else {
-        return PurgeReplicaResolution::SourceVersion;
+    let etag = source.etag.as_deref().filter(|etag| !etag.trim().is_empty());
+    let identity = match (source.encrypted_shape, etag) {
+        (Some(shape), etag) => ReplicaIdentity::Encrypted { etag, shape },
+        (None, Some(etag)) => ReplicaIdentity::Etag(etag),
+        (None, None) => return PurgeReplicaResolution::SourceVersion,
     };
-    match tgt_client.replica_candidates_by_etag(&tgt_client.bucket, object, etag).await {
-        Ok(mut candidates) => {
-            if let Some(claimed) = source.claimed_by_siblings.get(&tgt_client.arn) {
-                candidates.retain(|candidate| !claimed.contains(candidate));
-            }
-            match ReplicaLocation::from_matches(candidates) {
+    match tgt_client.replica_candidates(&tgt_client.bucket, object, &identity).await {
+        Ok(candidates) => {
+            let no_claims = HashSet::new();
+            let claimed = source.claimed_by_siblings.get(&tgt_client.arn).unwrap_or(&no_claims);
+            // Several shape matches stay ambiguous here: a purge never picks
+            // one to delete.
+            match candidates.locate(claimed).0 {
                 ReplicaLocation::Unique(assigned) => PurgeReplicaResolution::Resolved(assigned),
                 ReplicaLocation::Missing => PurgeReplicaResolution::Absent,
                 ReplicaLocation::Ambiguous { .. } => PurgeReplicaResolution::Ambiguous,
@@ -4516,13 +4657,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 // generation with the same bytes would be mistaken for one.
                 // Only the ledger (a lost response of this very version) and
                 // the AWS-style format fallback apply here.
+                let identity = replica_identity(&object_info);
                 if let Some(fallback) = replica_head_fallback(
                     &tgt_client,
                     ReplicaSource {
                         bucket: &bucket,
                         object: &object,
                         version_id: self.version_id,
-                        etag: object_info.etag.as_deref(),
+                        identity,
                         ledger_version_id: ledger_version_id.as_deref(),
                     },
                     None,
@@ -4531,9 +4673,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 .await
                 {
                     match fallback {
-                        Ok(Some(located))
-                            if replication_etags_match(object_info.etag.as_deref(), located.head.e_tag.as_deref()) =>
-                        {
+                        Ok(Some(located)) if located_replica_matches(identity.as_ref(), &located) => {
                             if ssec_audit_required
                                 && !settle_ssec_passthrough_evidence(&located.head, &tgt_client, &bucket, &object, &mut rinfo)
                                     .await
@@ -5181,13 +5321,14 @@ async fn resolve_replicate_all_action(
         }
         Err(e) => {
             let ledger_version_id = ledger_target_version_id(&object_info.user_defined, &tgt_client.arn);
+            let identity = replica_identity(&object_info);
             if let Some(fallback) = replica_head_fallback(
                 tgt_client,
                 ReplicaSource {
                     bucket,
                     object,
                     version_id: roi.version_id,
-                    etag: object_info.etag.as_deref(),
+                    identity,
                     ledger_version_id: ledger_version_id.as_deref(),
                 },
                 Some(siblings),
@@ -5198,20 +5339,20 @@ async fn resolve_replicate_all_action(
                 match fallback {
                     Ok(Some(located)) => {
                         let oi = &located.head;
-                        let etags_match = replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref());
-                        if require_existing_target && !etags_match {
+                        let replica_matches = located_replica_matches(identity.as_ref(), &located);
+                        if require_existing_target && !replica_matches {
                             rinfo.error = Some("replica metadata target does not contain matching object data".to_string());
                             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                             return None;
                         }
-                        if etags_match
+                        if replica_matches
                             && ssec_audit_required
                             && !settle_ssec_passthrough_evidence(oi, tgt_client, bucket, object, rinfo).await
                         {
                             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                             return None;
                         }
-                        if etags_match && let Some(assigned) = drifted_replica_version_id(&located, roi.version_id) {
+                        if replica_matches && let Some(assigned) = drifted_replica_version_id(&located, roi.version_id) {
                             // The replica lives under an id the target minted:
                             // record it (the ledger every later mutation
                             // resolves through) and apply metadata in place —
@@ -5244,7 +5385,7 @@ async fn resolve_replicate_all_action(
                             // records the sync without running the PUT.
                             replication_action = ReplicationAction::None;
                         } else {
-                            replication_action = if etags_match {
+                            replication_action = if replica_matches {
                                 ReplicationAction::None
                             } else {
                                 ReplicationAction::All
@@ -6654,11 +6795,359 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_none(), "{err:?}");
         assert_eq!((size, st.replicated_count, st.failed_count), (4, 1, 0));
         server.join().expect("test HTTP server should finish");
+    }
+
+    /// What a target that computes its own ETag (AWS S3) reports for the
+    /// replica of an encrypted source: the MD5 of the plaintext it received,
+    /// never the source's encrypted-ETag fingerprint ([`DRIFTED_ETAG`] here).
+    const COMPUTED_REPLICA_ETAG: &str = "0f0e0d0c0b0a09080706050403020100";
+    /// The replica's write time on the scripted targets below.
+    const REPLICA_WRITTEN: &str = "2026-09-06T10:00:00.000Z";
+    const REPLICA_WRITTEN_HTTP: &str = "Sun, 06 Sep 2026 10:00:00 GMT";
+
+    /// An SSE-S3 source version: 4 plaintext bytes, stored as ciphertext, its
+    /// ETag a keyed fingerprint, written at `written` (unix seconds).
+    fn encrypted_roi_and_object(written: i64) -> (ReplicateObjectInfo, ObjectInfo) {
+        let (roi, mut object_info) = drifted_roi_and_object();
+        object_info.size = 36;
+        object_info.actual_size = 4;
+        object_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(written).expect("valid timestamp"));
+        object_info.user_defined = HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]).into();
+        (roi, object_info)
+    }
+
+    fn replica_written_secs() -> i64 {
+        OffsetDateTime::parse(REPLICA_WRITTEN, &Rfc3339)
+            .expect("valid replica time")
+            .unix_timestamp()
+    }
+
+    fn computed_etag_versions_response(versions: &[(&str, i64)]) -> String {
+        let versions = versions
+            .iter()
+            .enumerate()
+            .map(|(index, (version_id, size))| {
+                format!(
+                    "<Version><Key>object</Key><VersionId>{version_id}</VersionId><IsLatest>{}</IsLatest><LastModified>{REPLICA_WRITTEN}</LastModified><ETag>&quot;{COMPUTED_REPLICA_ETAG}&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Version>",
+                    index == 0
+                )
+            })
+            .collect::<String>();
+        xml_response(
+            "200 OK",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>target-bucket</Name><Prefix>object</Prefix><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{versions}</ListVersionsResult>"
+            ),
+        )
+    }
+
+    fn computed_etag_head_response(version_id: &str, size: i64) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nETag: \"{COMPUTED_REPLICA_ETAG}\"\r\nContent-Length: {size}\r\nx-amz-version-id: {version_id}\r\nLast-Modified: {REPLICA_WRITTEN_HTTP}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// A Wasabi/AWS-shaped target that computes its own ETags: 404 on the
+    /// source uuid, the listed versions, and a HEAD for any listed id.
+    fn spawn_computed_etag_target(
+        requests: usize,
+        versions: &'static [(&'static str, i64)],
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        spawn_scripted_target_server(requests, move |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                return computed_etag_versions_response(versions);
+            }
+            if line.starts_with("HEAD ")
+                && let Some((version_id, size)) = versions
+                    .iter()
+                    .find(|(version_id, _)| line.contains(&format!("versionId={version_id}")))
+            {
+                return computed_etag_head_response(version_id, *size);
+            }
+            if line.starts_with("HEAD ") {
+                return empty_response("404 Not Found");
+            }
+            empty_response("500 Unexpected")
+        })
+    }
+
+    async fn resolve_heal_action(
+        target: &Arc<TargetClient>,
+        roi: &ReplicateObjectInfo,
+        object_info: ObjectInfo,
+        rinfo: &mut ReplicatedTargetInfo,
+    ) -> Option<(ReplicationAction, ObjectInfo)> {
+        resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
+                roi,
+                tgt_client: target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            rinfo,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_locates_encrypted_replica_by_shape_on_target_that_computes_own_etags() {
+        static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
+        let (endpoint, server) = spawn_computed_etag_target(3, VERSIONS);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::None, _))),
+            "an encrypted replica located by its shape must not be re-driven: {action:?}"
+        );
+        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+        assert_eq!(rinfo.target_version_id.as_deref(), Some(DRIFTED_ASSIGNED_VERSION_ID));
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 3, "HEAD by source id, ListObjectVersions, HEAD by assigned id: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_does_not_adopt_an_encrypted_replica_of_another_size_or_an_older_write() {
+        // Size differs from the 4 plaintext bytes.
+        static OTHER_SIZE: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 36)];
+        let (endpoint, server) = spawn_computed_etag_target(2, OTHER_SIZE);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+        assert!(matches!(action, Some((ReplicationAction::All, _))), "{action:?}");
+        server.join().expect("test HTTP server should finish");
+
+        // Same size, but written before the source version existed.
+        static SAME_SIZE: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
+        let (endpoint, server) = spawn_computed_etag_target(2, SAME_SIZE);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() + 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+        assert!(matches!(action, Some((ReplicationAction::All, _))), "{action:?}");
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_does_not_pick_among_several_encrypted_shape_matches() {
+        static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4), ("another-minted-id", 4)];
+        let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::All, _))),
+            "two same-shape versions are not evidence of either: {action:?}"
+        );
+        assert!(rinfo.target_version_id.is_none(), "{:?}", rinfo.target_version_id);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "HEAD by source id, ListObjectVersions, no HEAD of a guess: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_keeps_exact_etag_identity_for_plaintext_sources() {
+        // A same-size replica whose ETag differs is not this plaintext
+        // version's replica: the shape criterion is for encrypted sources only.
+        static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
+        let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, mut object_info) = drifted_roi_and_object();
+        object_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(replica_written_secs() - 1).expect("valid timestamp"));
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))), "{action:?}");
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_never_adopts_an_unversioned_null_version_by_shape() {
+        // An unversioned target's `null` version holds whatever generation
+        // was written last; a same-size newer generation must not be claimed.
+        static VERSIONS: &[(&str, i64)] = &[("null", 4)];
+        let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))), "{action:?}");
+        assert!(rinfo.target_version_id.is_none(), "{:?}", rinfo.target_version_id);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "HEAD by source id, ListObjectVersions, nothing adopted: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn encrypted_lookup_keeps_the_current_version_fallback_when_listing_is_denied() {
+        // A bodiless 403 on the version-addressed HEAD may be a permission
+        // denial; the same credentials then refuse ListObjectVersions. The
+        // object must still be re-driven, as before content identity existed.
+        let (endpoint, server) = spawn_scripted_target_server(3, |line| {
+            let listing = line.starts_with("GET ") && line.contains("versions");
+            let version_addressed_head = line.starts_with("HEAD ") && line.contains("versionId=");
+            if listing || version_addressed_head {
+                empty_response("403 Forbidden")
+            } else if line.starts_with("HEAD ") {
+                computed_etag_head_response(DRIFTED_ASSIGNED_VERSION_ID, 4)
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::All, _))),
+            "a denied listing must fall back to the re-PUT, not stall: {action:?}"
+        );
+        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(
+            seen.len(),
+            3,
+            "HEAD by source id, ListObjectVersions, HEAD of the current version: {seen:?}"
+        );
+        assert!(seen[2].starts_with("HEAD ") && !seen[2].contains("versionId="), "{}", seen[2]);
+    }
+
+    #[tokio::test]
+    async fn encrypted_ledger_replica_converges_on_an_aws_style_target() {
+        // AWS rejects the RustFS uuid as malformed (400). The ledger names the
+        // replica; its computed ETag cannot confirm it, its shape does.
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("HEAD ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                computed_etag_head_response(DRIFTED_ASSIGNED_VERSION_ID, 4)
+            } else if line.starts_with("HEAD ") {
+                empty_response("400 Bad Request")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        let (roi, mut object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut user_defined = (*object_info.user_defined).clone();
+        insert_str(
+            &mut user_defined,
+            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{}", target.arn),
+            DRIFTED_ASSIGNED_VERSION_ID.to_string(),
+        );
+        object_info.user_defined = Arc::new(user_defined);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
+
+        assert!(matches!(action, Some((ReplicationAction::None, _))), "{action:?}");
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "HEAD by source id, HEAD by the ledger id: {seen:?}");
+        assert!(seen[1].contains(DRIFTED_ASSIGNED_VERSION_ID), "{}", seen[1]);
+    }
+
+    #[tokio::test]
+    async fn resync_verification_counts_encrypted_replica_by_shape() {
+        static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
+        let (endpoint, server) = spawn_computed_etag_target(3, VERSIONS);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (_, err) = verify_resync_head_result(head_result, &roi, Some(&object_info), &mut st, &target).await;
+
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((st.replicated_count, st.failed_count), (1, 0));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    fn encrypted_purge_source() -> Arc<VersionPurgeSource> {
+        let (_, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
+        let Some(ReplicaIdentity::Encrypted { shape, .. }) = replica_identity(&object_info) else {
+            panic!("an SSE-S3 source must be identified by its shape");
+        };
+        Arc::new(VersionPurgeSource {
+            etag: object_info.etag,
+            encrypted_shape: Some(shape),
+            ledger: HashMap::new(),
+            ledger_corrupt: false,
+            claimed_by_siblings: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn encrypted_version_purge_without_ledger_deletes_the_unique_shape_match() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                computed_etag_versions_response(&[(DRIFTED_ASSIGNED_VERSION_ID, 4)])
+            } else if line.starts_with("DELETE ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(encrypted_purge_source())).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "ListObjectVersions, then DELETE by the located id: {seen:?}");
+        assert!(
+            seen[1].starts_with("DELETE ") && seen[1].contains(DRIFTED_ASSIGNED_VERSION_ID),
+            "{}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_version_purge_refuses_several_shape_matches() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                computed_etag_versions_response(&[(DRIFTED_ASSIGNED_VERSION_ID, 4), ("another-minted-id", 4)])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(encrypted_purge_source())).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Failed);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "no DELETE of a guessed replica: {seen:?}");
     }
 
     fn delete_marker_roi() -> ReplicateObjectInfo {
@@ -6885,7 +7374,7 @@ mod tests {
             None,
             "the fixture must reproduce the codeless 405 the SDK yields for a bodiless HEAD"
         );
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_none(), "{err:?}");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 1, 0));
@@ -6912,7 +7401,7 @@ mod tests {
 
             let head_result =
                 head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-            let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+            let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
             assert!(err.is_some(), "a 405 must not count as a completed purge ({status:?})");
             assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1), "{status:?}");
@@ -6930,7 +7419,7 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_none(), "{err:?}");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 1, 0));
@@ -6947,7 +7436,7 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_some(), "a 503 must not count as a propagated delete marker");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
@@ -6973,7 +7462,7 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_none(), "{err:?}");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 1, 0));
@@ -6998,7 +7487,7 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_some(), "a live latest version must not verify the marker");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
@@ -7016,7 +7505,7 @@ mod tests {
 
         let head_result =
             head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
-        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, None, &mut st, &target).await;
 
         assert!(err.is_some(), "a 403 must not count as a propagated delete marker");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
@@ -7133,6 +7622,7 @@ mod tests {
     fn purge_source(ledger: &[(&str, &str)]) -> Arc<VersionPurgeSource> {
         Arc::new(VersionPurgeSource {
             etag: Some(DRIFTED_ETAG.to_string()),
+            encrypted_shape: None,
             ledger: ledger
                 .iter()
                 .map(|(arn, version_id)| (arn.to_string(), version_id.to_string()))
@@ -7337,6 +7827,7 @@ mod tests {
         let dobj = version_purge_dobj(&target.arn);
         let source = Arc::new(VersionPurgeSource {
             etag: Some(DRIFTED_ETAG.to_string()),
+            encrypted_shape: None,
             ledger: HashMap::new(),
             ledger_corrupt: false,
             claimed_by_siblings: HashMap::from([(target.arn.clone(), HashSet::from([DRIFTED_ASSIGNED_VERSION_ID.to_string()]))]),
@@ -7424,6 +7915,7 @@ mod tests {
         let dobj = version_purge_dobj(&target.arn);
         let source = Arc::new(VersionPurgeSource {
             etag: Some(DRIFTED_ETAG.to_string()),
+            encrypted_shape: None,
             ledger: HashMap::new(),
             ledger_corrupt: true,
             claimed_by_siblings: HashMap::new(),

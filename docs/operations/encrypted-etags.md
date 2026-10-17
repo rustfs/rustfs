@@ -31,9 +31,36 @@ Bucket and site replication forward the stored ETag on `x-rustfs-source-etag`
 reports the fingerprint for the replica; a target that computes its own ETag
 (AWS S3 and most compatible stores) reports the MD5 of the plaintext it
 received, which never equals the fingerprint. The post-PUT replica ETag audit
-therefore skips encrypted sources, and the checksum header on the replication
-PUT remains their integrity check. See
+therefore skips encrypted sources. Managed-SSE sources forward no checksum on
+the replication PUT either, so a target that transforms their payload is not
+detected. See
 `docs/operations/replication-outbound-transport.md`.
+
+The same mismatch affects finding an existing replica on a target that mints
+its own version ids (AWS S3, Wasabi), which a heal, MRF retry or
+existing-object resync does before writing again:
+
+- A replica recorded in the source's target-version ledger is addressed by
+  that id, on a 404 and on an AWS-style 400 for the source id alike. For an
+  encrypted source the replica counts when its size matches the bytes
+  replication sent (plaintext for SSE-S3 / SSE-KMS, ciphertext for SSE-C) and
+  it was written no earlier than the source version.
+- Without a ledger entry (for example a PUT whose response was lost), the
+  replica is located through `ListObjectVersions` by the same size and
+  write-time rule, after removing versions that other generations of the key
+  already claim. Only a single remaining match is adopted and recorded in the
+  ledger. Several matches are never resolved by picking one: convergence writes
+  the replica again, and a version purge is refused with the usual backoff.
+  The `null` version of an unversioned target is never matched this way, and
+  a target that refuses the listing keeps the earlier current-version check,
+  which writes the replica again.
+- Plaintext sources keep exact ETag identity. A target that adopts the source
+  ETag still matches encrypted sources by ETag first.
+
+Two same-size generations of a key whose own ledgers were both lost can still
+be confused, and a version purge with no ledger and no shape match reports the
+replica as already gone. Delete a leftover replica on the target by hand if a
+`replication-check` VersionFidelity report shows one.
 
 ## Existing data and migration
 

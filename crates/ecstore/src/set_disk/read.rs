@@ -519,6 +519,10 @@ impl SetDisks {
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
         let opts = *opts;
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let api_operation = rustfs_io_metrics::get_stage_metrics_enabled()
+            .then(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context)
+            .flatten();
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -530,8 +534,28 @@ impl SetDisks {
                     let object = object.clone();
                     let version_id = version_id.clone();
                     let task_opts = opts;
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    #[allow(clippy::redundant_locals)]
+                    let api_operation = api_operation;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
+                    async move {
+                        let read_version =
+                            async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await };
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        let read_version = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+                            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::SetDiskRead,
+                            read_version,
+                        );
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        if let Some(api_operation) = api_operation {
+                            rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), read_version)
+                                .await
+                        } else {
+                            read_version.await
+                        }
+                        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                        read_version.await
+                    }
                 })
             })
             .collect();
@@ -711,34 +735,45 @@ impl SetDisks {
         let allow_read_version_coalescing = purpose == MetadataReadPurpose::GetObjectReader
             && !crate::bucket::utils::is_meta_bucketname(bucket)
             && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
-        let metadata_read_result = if allow_read_version_coalescing {
-            Self::read_metadata_for_get_object(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await
-        } else {
-            Self::read_metadata_observed(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                false,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await
+        let metadata_read = async {
+            if allow_read_version_coalescing {
+                Self::read_metadata_for_get_object(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            } else {
+                Self::read_metadata_observed(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    false,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            }
         };
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let metadata_read_result = crate::cluster::rpc::runtime_sources::with_read_version_caller_and_entry_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::Object,
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectRead,
+            metadata_read,
+        )
+        .await;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let metadata_read_result = metadata_read.await;
         let metadata_read = match metadata_read_result {
             Ok(metadata_read) => metadata_read,
             Err(err) => {
@@ -2706,6 +2741,7 @@ mod metadata_cache_tests {
     use super::*;
     use crate::set_disk::core::io_primitives::disk_call_counters;
     use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
+    use rustfs_utils::path::object_name_disk_identity;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -4061,6 +4097,63 @@ mod metadata_cache_tests {
             "per-key invalidation must physically remove the retired generation"
         );
         assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
+    }
+
+    async fn cache_valid_test_fileinfo(set: &SetDisks, object: &str) {
+        let fi = valid_test_fileinfo(object);
+        let generation = set.get_object_metadata_cache_generation("bucket", object);
+        set.cache_get_object_fileinfo(
+            ("bucket", object),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
+        assert!(set.cached_get_object_fileinfo("bucket", object).await.is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn metadata_cache_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a\\b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_some(),
+            "off Windows `a\\b` is a different object and must not retire `a/b`"
+        );
+        assert!(set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_metadata_cache_shares_backslash_and_slash_spellings() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a/b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_some(),
+            "both spellings address the same xl.meta and must share one cache entry"
+        );
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_none(),
+            "a mutation through `a\\b` must retire metadata cached for `a/b`"
+        );
+
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+        set.invalidate_get_object_metadata_cache("bucket", "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none(),
+            "a mutation through `a/b` must retire metadata cached for `a\\b`"
+        );
     }
 
     #[tokio::test]

@@ -786,6 +786,50 @@ fn admission_rejects_busy_disk_before_replay_state_changes() {
 }
 
 #[test]
+fn local_disk_admission_share_holds_one_permit_until_the_last_walker_leaves() {
+    let key = format!("test-disk-{}", Uuid::new_v4());
+    let share = LocalDiskAdmissionShare::new();
+    let first = share
+        .acquire_with(|| try_admit_remote_scanner_key(key.clone()))
+        .expect("first walker acquires the disk permit");
+    let second = share
+        .acquire_with(|| try_admit_remote_scanner_key(key.clone()))
+        .expect("second walker shares the held permit");
+    assert!(
+        matches!(try_admit_remote_scanner_key(key.clone()), Err(ScannerError::RemoteDiskBusy)),
+        "a remote request sees one busy disk while any walker is active"
+    );
+    drop(first);
+    assert!(
+        matches!(try_admit_remote_scanner_key(key.clone()), Err(ScannerError::RemoteDiskBusy)),
+        "the permit is released by the last holder, not the first"
+    );
+    drop(second);
+    assert!(try_admit_remote_scanner_key(key).is_ok(), "no walker left: the disk is free again");
+}
+
+#[test]
+fn local_disk_admission_share_retries_after_a_rejected_admission() {
+    let key = format!("test-disk-{}", Uuid::new_v4());
+    let share = LocalDiskAdmissionShare::new();
+    let remote = try_admit_remote_scanner_key(key.clone()).expect("remote request occupies the disk");
+    assert!(
+        matches!(
+            share.acquire_with(|| try_admit_remote_scanner_key(key.clone())),
+            Err(ScannerError::RemoteDiskBusy)
+        ),
+        "walkers do not pre-empt an active remote session"
+    );
+    drop(remote);
+    let hold = share
+        .acquire_with(|| try_admit_remote_scanner_key(key.clone()))
+        .expect("a rejected attempt leaves the share empty for a later retry");
+    assert!(matches!(try_admit_remote_scanner_key(key.clone()), Err(ScannerError::RemoteDiskBusy)));
+    drop(hold);
+    assert!(try_admit_remote_scanner_key(key).is_ok());
+}
+
+#[test]
 fn replay_cache_requires_contiguous_sequence_per_disk_session() {
     let session_id = Uuid::new_v4();
     let mut cache = RemoteScannerReplayCache::default();

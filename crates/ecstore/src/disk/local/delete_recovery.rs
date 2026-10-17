@@ -19,6 +19,152 @@ struct DiscoverySession {
     touched: Instant,
 }
 
+impl DiscoverySession {
+    /// Consume one bounded step, returning ownership only when traversal remains.
+    fn advance(mut self, limit: u32) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>)> {
+        if self.frames.is_empty() {
+            match std::fs::read_dir(&self.root) {
+                Ok(entries) => self.frames.push((String::new(), entries)),
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    return Ok((Vec::new(), None));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut transactions = BTreeSet::new();
+        let mut visited = 0usize;
+        while !self.frames.is_empty()
+            && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
+            && visited < 4096
+        {
+            let (parent, entries) = self
+                .frames
+                .last_mut()
+                .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidData))?;
+            let entry = match entries.next() {
+                Some(entry) => entry?,
+                None => {
+                    self.frames.pop();
+                    continue;
+                }
+            };
+            visited += 1;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
+            if !safe_path(&name, false) || name.contains('/') {
+                return Err(std::io::Error::from(ErrorKind::InvalidData));
+            }
+            let relative = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            let path = self.root.join(&relative);
+            reject_local_disk_symlink_components(&self.root, &path).map_err(std::io::Error::from)?;
+            let kind = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if !kind.is_dir() && !kind.is_file() {
+                return Err(std::io::Error::from(ErrorKind::InvalidData));
+            }
+            if kind.is_file() {
+                let bound = match self.object.as_deref() {
+                    Some(object) if !parent.is_empty() && !parent.contains('/') => Some((object, parent.as_str())),
+                    Some(_) => None,
+                    None => parent.rsplit_once('/'),
+                };
+                if let Some((object, id)) = bound {
+                    let transaction =
+                        if [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name.as_str()) {
+                            Uuid::parse_str(id).ok().filter(|id| !id.is_nil())
+                        } else {
+                            [
+                                DELETE_DATA_DIR_MARKER_PREFIX,
+                                RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+                                RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+                            ]
+                            .iter()
+                            .find_map(|prefix| delete_transaction_marker_id(&name, prefix))
+                        };
+                    if let Some(transaction) = transaction {
+                        let physical = match self.object.as_ref() {
+                            Some(_) => self.root.clone(),
+                            None => self.root.join(object),
+                        };
+                        if name == STORAGE_FORMAT_FILE_BACKUP
+                            && live_write_backup(&physical, transaction).map_err(std::io::Error::from)?
+                        {
+                            continue;
+                        }
+                        let proof_root = physical.join(transaction.to_string());
+                        let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
+                        let receipt =
+                            regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
+                        // Only a fully bound journal can name a logical
+                        // key. Other records remain discoverable by their
+                        // physical key for canonical inspection to reject.
+                        let record = match prepared {
+                            Some(bytes) => serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).ok(),
+                            None => receipt
+                                .filter(|bytes| !bytes.is_empty())
+                                .and_then(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).ok())
+                                .map(|receipt| receipt.journal),
+                        };
+                        let logical = record
+                            .filter(|journal| {
+                                journal.protocol_version == DELETE_RECOVERY_PROTOCOL_VERSION
+                                    && journal.volume == self.volume
+                                    && journal.transaction == transaction
+                                    && safe_path(&journal.object, false)
+                                    && match self.object.as_ref() {
+                                        Some(scope) => scope == &journal.object,
+                                        None => build_local_disk_object_path(&self.root, "", &journal.object).1 == physical,
+                                    }
+                            })
+                            .map_or_else(|| object.to_owned(), |journal| journal.object);
+                        transactions.insert((logical, transaction));
+                    }
+                }
+            } else {
+                if self.object.is_some() && (!parent.is_empty() || !Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil())) {
+                    continue;
+                }
+                // A valid 1024-byte key can exceed 256 one-byte path
+                // components; allow its transaction/data directories too.
+                if self.frames.len() >= 1024 {
+                    return Err(std::io::Error::from(ErrorKind::InvalidData));
+                }
+                self.frames.push((relative, std::fs::read_dir(path)?));
+            }
+        }
+
+        let transactions = transactions
+            .into_iter()
+            .map(|(object, transaction)| DeleteTransactionId { object, transaction })
+            .collect();
+        let next = (!self.frames.is_empty()).then_some(self);
+        Ok((transactions, next))
+    }
+
+    async fn has_evidence(mut self, disk: &LocalDisk, path: &Path) -> Result<bool> {
+        loop {
+            let (transactions, next) = disk.advance_delete_discovery(path, self, 1).await?;
+            if !transactions.is_empty() {
+                return Ok(true);
+            }
+            let Some(mut next) = next else {
+                return Ok(false);
+            };
+            next.touched = Instant::now();
+            self = next;
+        }
+    }
+}
+
 static DISCOVERY_SESSIONS: std::sync::LazyLock<ParkingLotMutex<HashMap<Uuid, DiscoverySession>>> =
     std::sync::LazyLock::new(|| ParkingLotMutex::new(HashMap::new()));
 
@@ -173,7 +319,12 @@ fn live_write_backup(root: &Path, transaction: Uuid) -> Result<bool> {
     let Some(backup) = regular_metadata_bytes(&rollback.join(STORAGE_FORMAT_FILE_BACKUP))? else {
         return Ok(false);
     };
-    live_write_backup_matches(&FileMeta::load(&current)?, &FileMeta::load(&backup)?, transaction)
+    // Corrupt decoded metadata cannot prove that this is a live write backup.
+    // Keep it discoverable; filesystem and structural errors above still fail.
+    match (|| live_write_backup_matches(&FileMeta::load(&current)?, &FileMeta::load(&backup)?, transaction))() {
+        Err(DiskError::FileCorrupt) => Ok(false),
+        result => result,
+    }
 }
 
 fn live_write_backup_matches(current: &FileMeta, backup: &FileMeta, transaction: Uuid) -> Result<bool> {
@@ -522,13 +673,15 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
         .as_deref()
         .filter(|bytes| !bytes.is_empty())
         .map(serde_json::from_slice)
-        .transpose()?;
+        .transpose()
+        .map_err(|_| DiskError::FileCorrupt)?;
     let committed = receipt.is_some();
     let finished = regular_marker(&rollback.join(FINISHED))? || receipt.as_ref().is_some_and(|receipt| receipt.finished);
     let journal: Option<DeleteRecoveryJournal> = prepared
         .as_deref()
         .map(serde_json::from_slice)
-        .transpose()?
+        .transpose()
+        .map_err(|_| DiskError::FileCorrupt)?
         .or_else(|| receipt.as_ref().map(|receipt| receipt.journal.clone()));
     if receipt
         .as_ref()
@@ -834,10 +987,15 @@ impl LocalDisk {
                     let receipt = regular_bytes(&entry.path().join(DELETE_QUORUM_COMMITTED_FILE))?;
                     let mut records = Vec::new();
                     if let Some(bytes) = prepared {
-                        records.push(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes)?);
+                        records
+                            .push(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).map_err(|_| DiskError::FileCorrupt)?);
                     }
                     if let Some(bytes) = receipt.filter(|bytes| !bytes.is_empty()) {
-                        records.push(serde_json::from_slice::<CommitReceipt>(&bytes)?.journal);
+                        records.push(
+                            serde_json::from_slice::<CommitReceipt>(&bytes)
+                                .map_err(|_| DiskError::FileCorrupt)?
+                                .journal,
+                        );
                     }
                     for record in records {
                         if record.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
@@ -860,6 +1018,107 @@ impl LocalDisk {
         .await
         .map_err(to_file_error)?
     }
+    /// Local maintenance may pause a page behind recovery backpressure. It
+    /// retains only its own bounded set of cursors; remote callers still have
+    /// the ordinary idle deadline and every resumed page rechecks mount identity.
+    pub(crate) fn renew_delete_recovery_cursor(&self, volume: &str, cursor: &DeleteRecoveryCursor) -> bool {
+        let mut sessions = DISCOVERY_SESSIONS.lock();
+        let Some(session) = sessions.get_mut(&cursor.token) else {
+            return false;
+        };
+        if session.disk_root != self.io_root()
+            || session.volume != volume
+            || session.object.is_some()
+            || session.touched.elapsed() > Duration::from_secs(300)
+        {
+            return false;
+        }
+        session.touched = Instant::now();
+        true
+    }
+
+    fn delete_discovery_path(&self, volume: &str, object: Option<&str>) -> Result<PathBuf> {
+        if !safe_path(volume, false) || volume.contains('/') || object.is_some_and(|object| !safe_path(object, false)) {
+            return Err(DiskError::InvalidPath);
+        }
+        match object {
+            Some(object) => self.io_get_object_path(volume, object),
+            None => self.io_get_bucket_path(volume),
+        }
+    }
+
+    fn new_delete_discovery_session(&self, volume: &str, object: Option<&str>, path: &Path) -> Result<DiscoverySession> {
+        #[cfg(target_os = "linux")]
+        let (mount, root) = {
+            use std::os::fd::AsRawFd;
+            let mount = self.mount_lease.try_clone().map_err(to_file_error)?;
+            let root = PathBuf::from(format!("/proc/self/fd/{}/.", mount.as_raw_fd())).join(volume);
+            let root = match object {
+                Some(object) => root.join(object),
+                None => root,
+            };
+            let _ = path;
+            (mount, root)
+        };
+        #[cfg(windows)]
+        let (mount, root) = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            };
+            let mount = std::fs::OpenOptions::new()
+                .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(self.io_root())
+                .map_err(to_file_error)?;
+            (mount, path.to_owned())
+        };
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
+        let (mount, root) = (std::fs::File::open(self.io_root()).map_err(to_file_error)?, path.to_owned());
+        Ok(DiscoverySession {
+            disk_root: self.io_root().to_path_buf(),
+            volume: volume.to_owned(),
+            object: object.map(str::to_owned),
+            root,
+            _mount: mount,
+            frames: Vec::new(),
+            touched: Instant::now(),
+        })
+    }
+
+    fn validate_delete_discovery_owner(&self, session: &DiscoverySession) -> Result<()> {
+        if session.disk_root != self.io_root() || session.touched.elapsed() > Duration::from_secs(300) {
+            return Err(DiskError::InvalidPath);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let before = session._mount.metadata().map_err(to_file_error)?;
+            #[cfg(target_os = "linux")]
+            let current = self.mount_lease.metadata().map_err(to_file_error)?;
+            #[cfg(not(target_os = "linux"))]
+            let current = std::fs::metadata(self.io_root()).map_err(to_file_error)?;
+            if before.dev() != current.dev() || before.ino() != current.ino() {
+                return Err(DiskError::InvalidPath);
+            }
+        }
+        Ok(())
+    }
+
+    async fn advance_delete_discovery(
+        &self,
+        path: &Path,
+        session: DiscoverySession,
+        limit: u32,
+    ) -> Result<(Vec<DeleteTransactionId>, Option<DiscoverySession>)> {
+        let lease = os::acquire_namespace_mutation_lease_with_owner(path, None).await;
+        self.validate_delete_discovery_owner(&session)?;
+        os::run_blocking_namespace_operation(lease, move || session.advance(limit))
+            .await
+            .map_err(|error| to_file_error(error).into())
+    }
+
     pub(super) async fn delete_recovery_discover(
         &self,
         volume: &str,
@@ -867,237 +1126,44 @@ impl LocalDisk {
         cursor: Option<DeleteRecoveryCursor>,
         limit: u32,
     ) -> Result<DeleteRecoveryPage> {
-        if !(1..=256).contains(&limit)
-            || !safe_path(volume, false)
-            || volume.contains('/')
-            || object.is_some_and(|object| !safe_path(object, false))
-        {
+        if !(1..=256).contains(&limit) {
             return Err(DiskError::InvalidPath);
         }
-        let bucket_path = match object {
-            Some(object) => self.io_get_object_path(volume, object)?,
-            None => self.io_get_bucket_path(volume)?,
-        };
-        let disk_root = self.io_root().to_path_buf();
-        let (token, mut session) = if let Some(cursor) = cursor {
+        let path = self.delete_discovery_path(volume, object)?;
+        let (token, session) = if let Some(cursor) = cursor {
             let session = DISCOVERY_SESSIONS
                 .lock()
                 .remove(&cursor.token)
                 .ok_or(DiskError::FileNotFound)?;
-            if session.disk_root != disk_root
-                || session.volume != volume
-                || session.object.as_deref() != object
-                || session.touched.elapsed() > Duration::from_secs(300)
-            {
+            if session.volume != volume || session.object.as_deref() != object {
                 return Err(DiskError::InvalidPath);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let before = session._mount.metadata().map_err(to_file_error)?;
-                #[cfg(target_os = "linux")]
-                let current = self.mount_lease.metadata().map_err(to_file_error)?;
-                #[cfg(not(target_os = "linux"))]
-                let current = std::fs::metadata(self.io_root()).map_err(to_file_error)?;
-                if before.dev() != current.dev() || before.ino() != current.ino() {
-                    return Err(DiskError::InvalidPath);
-                }
             }
             (cursor.token, session)
         } else {
-            #[cfg(target_os = "linux")]
-            let (mount, root) = {
-                use std::os::fd::AsRawFd;
-                let mount = self.mount_lease.try_clone().map_err(to_file_error)?;
-                let root = PathBuf::from(format!("/proc/self/fd/{}/.", mount.as_raw_fd())).join(volume);
-                let root = match object {
-                    Some(object) => root.join(object),
-                    None => root,
-                };
-                (mount, root)
-            };
-            #[cfg(windows)]
-            let (mount, root) = {
-                use std::os::windows::fs::OpenOptionsExt;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-                };
-                // Match the existing publication-root directory open contract.
-                let mount = std::fs::OpenOptions::new()
-                    .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                    .open(self.io_root())
-                    .map_err(to_file_error)?;
-                (mount, bucket_path.clone())
-            };
-            #[cfg(all(not(target_os = "linux"), not(windows)))]
-            let (mount, root) = (std::fs::File::open(self.io_root()).map_err(to_file_error)?, bucket_path.clone());
-            (
-                Uuid::new_v4(),
-                DiscoverySession {
-                    disk_root,
-                    volume: volume.to_owned(),
-                    object: object.map(str::to_owned),
-                    root,
-                    _mount: mount,
-                    frames: Vec::new(),
-                    touched: Instant::now(),
-                },
-            )
+            (Uuid::new_v4(), self.new_delete_discovery_session(volume, object, &path)?)
         };
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&bucket_path, None).await;
-        os::run_blocking_namespace_operation(lease, move || {
-            if session.frames.is_empty() {
-                match std::fs::read_dir(&session.root) {
-                    Ok(entries) => session.frames.push((String::new(), entries)),
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
-                        return Ok(DeleteRecoveryPage {
-                            transactions: Vec::new(),
-                            next: None,
-                        });
-                    }
-                    Err(err) => return Err(err),
-                }
+        let (transactions, session) = self.advance_delete_discovery(&path, session, limit).await?;
+        let next = if let Some(mut session) = session {
+            session.touched = Instant::now();
+            let mut sessions = DISCOVERY_SESSIONS.lock();
+            sessions.retain(|_, session| session.touched.elapsed() <= Duration::from_secs(300));
+            if sessions.len() >= 128 {
+                return Err(DiskError::Io(std::io::Error::from(ErrorKind::WouldBlock)));
             }
-            let mut transactions = BTreeSet::new();
-            let mut visited = 0usize;
-            while !session.frames.is_empty()
-                && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
-                && visited < 4096
-            {
-                let (parent, entries) = session
-                    .frames
-                    .last_mut()
-                    .ok_or_else(|| std::io::Error::from(ErrorKind::InvalidData))?;
-                let entry = match entries.next() {
-                    Some(entry) => entry?,
-                    None => {
-                        session.frames.pop();
-                        continue;
-                    }
-                };
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
-                if !safe_path(&name, false) || name.contains('/') {
-                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                }
-                let relative = if parent.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{parent}/{name}")
-                };
-                let path = session.root.join(&relative);
-                reject_local_disk_symlink_components(&session.root, &path).map_err(std::io::Error::from)?;
-                let kind = match std::fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
-                };
-                if !kind.is_dir() && !kind.is_file() {
-                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                }
-                visited += 1;
-                if kind.is_file() {
-                    let bound = match session.object.as_deref() {
-                        Some(object) if !parent.is_empty() && !parent.contains('/') => Some((object, parent.as_str())),
-                        Some(_) => None,
-                        None => parent.rsplit_once('/'),
-                    };
-                    if let Some((object, id)) = bound {
-                        let transaction =
-                            if [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name.as_str()) {
-                                Uuid::parse_str(id).ok().filter(|id| !id.is_nil())
-                            } else {
-                                [
-                                    DELETE_DATA_DIR_MARKER_PREFIX,
-                                    RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
-                                    RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
-                                ]
-                                .iter()
-                                .find_map(|prefix| delete_transaction_marker_id(&name, prefix))
-                            };
-                        if let Some(transaction) = transaction {
-                            let physical = match session.object.as_ref() {
-                                Some(_) => session.root.clone(),
-                                None => session.root.join(object),
-                            };
-                            if name == STORAGE_FORMAT_FILE_BACKUP
-                                && live_write_backup(&physical, transaction).map_err(std::io::Error::from)?
-                            {
-                                continue;
-                            }
-                            let proof_root = physical.join(transaction.to_string());
-                            let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
-                            let receipt =
-                                regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
-                            let record = match prepared {
-                                Some(bytes) => {
-                                    Some(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).map_err(std::io::Error::other)?)
-                                }
-                                None => receipt
-                                    .filter(|bytes| !bytes.is_empty())
-                                    .map(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).map(|receipt| receipt.journal))
-                                    .transpose()
-                                    .map_err(std::io::Error::other)?,
-                            };
-                            let logical = if let Some(journal) = record {
-                                let bound_path = match session.object.as_ref() {
-                                    Some(scope) if scope == &journal.object => physical.clone(),
-                                    Some(_) => return Err(std::io::Error::from(ErrorKind::InvalidData)),
-                                    None => build_local_disk_object_path(&session.root, "", &journal.object).1,
-                                };
-                                if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
-                                    || journal.volume != session.volume
-                                    || journal.transaction != transaction
-                                    || !safe_path(&journal.object, false)
-                                    || bound_path != physical
-                                {
-                                    return Err(std::io::Error::from(ErrorKind::InvalidData));
-                                }
-                                journal.object
-                            } else {
-                                object.to_owned()
-                            };
-                            transactions.insert((logical, transaction));
-                        }
-                    }
-                } else {
-                    if session.object.is_some() && (!parent.is_empty() || !Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil())) {
-                        continue;
-                    }
-                    // A valid 1024-byte key can exceed 256 one-byte path
-                    // components; allow its transaction/data directories too.
-                    if session.frames.len() >= 1024 {
-                        return Err(std::io::Error::from(ErrorKind::InvalidData));
-                    }
-                    session.frames.push((relative, std::fs::read_dir(path)?));
-                }
-            }
-            let next = if session.frames.is_empty() {
-                None
-            } else {
-                session.touched = Instant::now();
-                let mut sessions = DISCOVERY_SESSIONS.lock();
-                sessions.retain(|_, session| session.touched.elapsed() <= Duration::from_secs(300));
-                if sessions.len() >= 128 {
-                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                }
-                sessions.insert(token, session);
-                Some(DeleteRecoveryCursor { token })
-            };
-            Ok(DeleteRecoveryPage {
-                transactions: transactions
-                    .into_iter()
-                    .map(|(object, transaction)| DeleteTransactionId { object, transaction })
-                    .collect(),
-                next,
-            })
-        })
-        .await
-        .map_err(|err| to_file_error(err).into())
+            sessions.insert(token, session);
+            Some(DeleteRecoveryCursor { token })
+        } else {
+            None
+        };
+        Ok(DeleteRecoveryPage { transactions, next })
+    }
+
+    /// Existence probes retain their traversal privately, including across cancellation.
+    pub(super) async fn delete_recovery_has_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        let path = self.delete_discovery_path(volume, Some(object))?;
+        self.new_delete_discovery_session(volume, Some(object), &path)?
+            .has_evidence(self, &path)
+            .await
     }
 
     pub(super) async fn delete_recovery_inspect(
@@ -1244,26 +1310,14 @@ impl LocalDisk {
         for version in &plan.versions {
             original_versions.push(generation(version.into_fileinfo(volume, object, true)?)?);
         }
-        let mut data_dirs = Vec::with_capacity(requests.len());
-        for request in requests {
-            if original.is_none() {
+        let data_dirs = if original.is_none() {
+            for request in requests {
                 plan.add_version(request.clone())?;
-                continue;
             }
-            match plan.delete_version(request) {
-                Ok(Some(dir)) => {
-                    let _ = plan.data.remove(vec![request.version_id.unwrap_or_default(), dir]);
-                    data_dirs.push(dir);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    let err: DiskError = err.into();
-                    if request.deleted || (err != DiskError::FileVersionNotFound && err != DiskError::FileNotFound) {
-                        return Err(err);
-                    }
-                }
-            }
-        }
+            Vec::new()
+        } else {
+            plan.delete_versions(requests)?.into_iter().flatten().collect::<Vec<_>>()
+        };
         if data_dirs.iter().any(|dir| *dir == transaction || dir.is_nil()) {
             return Err(DiskError::FileCorrupt);
         }
@@ -2619,6 +2673,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_batch_inline_matches_sequential_and_survives_settlement() {
+        for commit in [false, true] {
+            let (_temp, disk, _, _) = fixture().await;
+            let mut original = FileMeta::new();
+            let mut requests = Vec::new();
+            for id in 1_u128..=64 {
+                let mut info = test_file_info(
+                    "object",
+                    Uuid::from_u128(id),
+                    Some(Uuid::from_u128(1000 + id)),
+                    Some(Bytes::from(vec![u8::try_from(id).expect("small id"); 9 * 1024])),
+                );
+                info.set_inline_data();
+                original.add_version(info).expect("seed inline version");
+                if id <= 48 {
+                    requests.push(FileInfo {
+                        name: "object".into(),
+                        version_id: Some(Uuid::from_u128(id)),
+                        ..Default::default()
+                    });
+                }
+            }
+            let original_bytes = original.marshal_msg().expect("encode original");
+            let meta_path = disk.io_get_object_path("recovery", "object/xl.meta").expect("metadata path");
+            fs::write(&meta_path, &original_bytes).await.expect("persist version chain");
+            let mut expected = original;
+            for request in &requests {
+                if let Some(dir) = expected.delete_version(request).expect("sequential delete") {
+                    expected
+                        .data
+                        .remove(vec![request.version_id.expect("explicit version"), dir])
+                        .expect("sequential inline removal");
+                }
+            }
+            let transaction = Uuid::new_v4();
+            let errors = disk
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![FileInfoVersions {
+                        name: "object".into(),
+                        volume: "recovery".into(),
+                        versions: requests,
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(errors, vec![None]);
+            let applied = disk.read_all("recovery", "object/xl.meta").await.expect("applied metadata");
+            assert_eq!(applied.as_ref(), expected.marshal_msg().expect("expected metadata"));
+            let target = disk
+                .read_all("recovery", &format!("object/{transaction}/{TARGET}"))
+                .await
+                .expect("prepared target");
+            assert_eq!(applied, target, "publication must use the exact prepared target");
+            let current = FileMeta::load(&applied).expect("load survivors");
+            assert_eq!(current.versions.len(), 16);
+            for id in 49_u128..=64 {
+                let fi = current
+                    .into_fileinfo("recovery", "object", &Uuid::from_u128(id).to_string(), true, false, true)
+                    .expect("surviving version");
+                assert_eq!(
+                    fi.data.expect("surviving inline body").as_ref(),
+                    vec![u8::try_from(id).expect("small id"); 9 * 1024]
+                );
+            }
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect prepared batch");
+            if commit {
+                let committed = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        observed.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("publish commit");
+                let finished = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        committed.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("finish cleanup");
+                assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+                assert_eq!(fs::read(&meta_path).await.expect("committed survivors"), applied.as_ref());
+            } else {
+                let restored = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        observed.fingerprint,
+                        DeleteRecoveryAction::Rollback,
+                    )
+                    .await
+                    .expect("rollback batch");
+                assert_eq!(restored.state, DeleteRecoveryState::Absent);
+                assert_eq!(fs::read(&meta_path).await.expect("restored metadata"), original_bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_metadata_updates_publish_exact_prepared_target_bytes() {
         for batch in [false, true] {
             for transition in [false, true] {
@@ -3026,6 +3194,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_reclaims_legacy_reservation_after_commit_and_snapshot_release() {
+        for batch in [false, true] {
+            for snapshot in [false, true] {
+                let (temp, disk, _, _) = fixture().await;
+                let data_dir = Uuid::new_v4();
+                let transaction = Uuid::new_v4();
+                let root = disk.io_get_object_path("recovery", "object").expect("object path");
+                let data = root.join(data_dir.to_string());
+                fs::create_dir(&data).await.expect("external data directory");
+                fs::write(data.join("part.1"), b"x").await.expect("external payload");
+                let reservation = data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4()));
+                fs::write(&reservation, []).await.expect("interrupted legacy reservation");
+                fs::write(
+                    root.join(STORAGE_FORMAT_FILE),
+                    test_meta(test_file_info("object", Uuid::nil(), Some(data_dir), None)),
+                )
+                .await
+                .expect("live metadata still owns reserved data");
+                let path = format!("object/{data_dir}");
+                let lease = if snapshot {
+                    Some(disk.acquire_snapshot_lease("recovery", &path).await.expect("active reader"))
+                } else {
+                    None
+                };
+                let options = DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                };
+                if batch {
+                    let errors = disk
+                        .delete_versions_recoverable(
+                            "recovery",
+                            vec![FileInfoVersions {
+                                name: "object".into(),
+                                volume: "recovery".into(),
+                                versions: vec![request()],
+                                ..Default::default()
+                            }],
+                            options,
+                        )
+                        .await;
+                    assert_eq!(errors, vec![None]);
+                } else {
+                    disk.delete_version_recoverable("recovery", "object", request(), false, options)
+                        .await
+                        .expect("apply single delete");
+                }
+                let applied = disk
+                    .inspect_delete_transaction("recovery", "object", transaction)
+                    .await
+                    .expect("applied");
+                let committed = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        applied.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("publish certified decision");
+                let finish = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        committed.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await;
+                if let Some(lease) = lease {
+                    assert_eq!(finish.expect_err("snapshot retains payload"), DiskError::DiskOngoingReq);
+                    assert_eq!(fs::read(data.join("part.1")).await.expect("snapshot payload"), b"x");
+                    assert!(reservation.is_file());
+                    disk.release_snapshot_lease("recovery", &path, lease)
+                        .await
+                        .expect("release replays safe cleanup");
+                } else {
+                    assert_eq!(
+                        finish.expect("old reservation must not block commit").state,
+                        DeleteRecoveryState::CommitFinished
+                    );
+                }
+                assert!(!data.exists(), "batch={batch}, snapshot={snapshot}");
+                drop(disk);
+                let endpoint = Endpoint::try_from(temp.path().to_str().expect("UTF-8 disk path")).expect("endpoint");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("reopen after cleanup");
+                let observed = disk
+                    .inspect_delete_transaction("recovery", "object", transaction)
+                    .await
+                    .expect("replay inspection");
+                let finished = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        observed.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("idempotent finish after restart");
+                disk.settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .expect("finalize converged transaction");
+                assert!(!root.exists(), "committed deletion leaves no physical residue");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_legacy_reservation_never_authorizes_unrelated_data() {
+        for shape in [
+            "no-proof",
+            "foreign-commit",
+            "nil",
+            "invalid",
+            "directory",
+            "child",
+            "metadata",
+        ] {
+            let (_temp, disk, _, _) = fixture().await;
+            let transaction = Uuid::new_v4();
+            let data_dir = Uuid::new_v4();
+            let path = format!("object/{data_dir}");
+            let data = disk.io_get_object_path("recovery", &path).expect("data path");
+            fs::create_dir(&data).await.expect("data directory");
+            fs::write(data.join("part.1"), b"preserve").await.expect("payload");
+            let old = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4());
+            fs::write(data.join(&old), []).await.expect("old reservation");
+            if shape != "no-proof" {
+                fs::write(data.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}")), [])
+                    .await
+                    .expect("current proof");
+            }
+            match shape {
+                "foreign-commit" => fs::write(data.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4())), [])
+                    .await
+                    .expect("foreign proof"),
+                "nil" => fs::write(data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::nil())), [])
+                    .await
+                    .expect("nil reservation"),
+                "invalid" => fs::write(data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}invalid")), [])
+                    .await
+                    .expect("malformed reservation"),
+                "directory" => {
+                    fs::remove_file(data.join(&old)).await.expect("replace marker");
+                    fs::create_dir(data.join(&old)).await.expect("marker is not a regular file");
+                }
+                "child" => fs::create_dir(data.join("child")).await.expect("UUID-prefix descendant"),
+                "metadata" => fs::write(data.join(STORAGE_FORMAT_FILE), b"child metadata")
+                    .await
+                    .expect("UUID-prefix object"),
+                _ => {}
+            }
+            let error = disk
+                .delete_unleased(
+                    "recovery",
+                    &path,
+                    &DeleteOptions {
+                        recursive: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("unproven or non-regular entries must prevent all cleanup");
+            assert_eq!(error, DiskError::FileCorrupt, "shape={shape}");
+            assert_eq!(
+                fs::read(data.join("part.1")).await.expect("payload survives"),
+                b"preserve",
+                "shape={shape}"
+            );
+            assert!(data.join(old).exists(), "reservation survives failed preflight");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_legacy_reservation_rejects_symlink() {
+        let (temp, disk, _, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        let path = format!("object/{}", Uuid::new_v4());
+        let data = disk.io_get_object_path("recovery", &path).expect("data path");
+        fs::create_dir(&data).await.expect("data directory");
+        let external = temp.path().join("external");
+        fs::write(&external, b"external").await.expect("external payload");
+        fs::write(data.join("part.1"), b"preserve").await.expect("payload");
+        fs::write(data.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}")), [])
+            .await
+            .expect("current proof");
+        std::os::unix::fs::symlink(
+            &external,
+            data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4())),
+        )
+        .expect("symlink reservation");
+        assert_eq!(
+            disk.delete_unleased(
+                "recovery",
+                &path,
+                &DeleteOptions {
+                    recursive: true,
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect_err("non-regular reservation must fail closed"),
+            DiskError::FileCorrupt
+        );
+        assert_eq!(fs::read(data.join("part.1")).await.expect("payload survives"), b"preserve");
+        assert_eq!(fs::read(external).await.expect("symlink target survives"), b"external");
+    }
+
+    #[tokio::test]
     async fn delete_recovery_fingerprint_rejects_new_generation() {
         let (_temp, disk, mut info, _original) = fixture().await;
         let transaction = Uuid::new_v4();
@@ -3241,6 +3629,431 @@ mod tests {
         assert_eq!(witness.deleted_versions, authority.deleted_versions);
         assert_eq!(witness.bucket_incarnation, authority.bucket_incarnation);
         assert!(witness.original_digest.is_none() && witness.target_digest.is_none() && witness.data_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_raw_discovery_keeps_malformed_records_and_later_keys() {
+        let (temp, disk, _, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        apply(&disk, transaction).await;
+        let bad = temp
+            .path()
+            .join("recovery/object")
+            .join(transaction.to_string())
+            .join(PREPARED);
+        fs::write(&bad, b"{invalid journal").await.expect("corrupt prepared record");
+        let legacy = Uuid::new_v4();
+        let later = temp.path().join("recovery/later").join(legacy.to_string());
+        fs::create_dir_all(&later).await.expect("another hidden key");
+        fs::write(later.join(STORAGE_FORMAT_FILE_BACKUP), b"legacy backup")
+            .await
+            .expect("later transaction");
+        let mut cursor = None;
+        let mut found = BTreeSet::new();
+        loop {
+            let page = disk
+                .discover_delete_transactions("recovery", None, cursor, 1)
+                .await
+                .expect("bounded discovery continues");
+            found.extend(page.transactions.into_iter().map(|id| (id.object, id.transaction)));
+            cursor = page.next;
+            if let Some(cursor) = cursor.as_ref() {
+                assert!(!disk.renew_delete_recovery_cursor("different-bucket", cursor));
+                assert!(disk.renew_delete_recovery_cursor("recovery", cursor));
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(found.contains(&("object".to_owned(), transaction)));
+        assert!(found.contains(&("later".to_owned(), legacy)));
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect_err("inspection still rejects corruption"),
+            DiskError::FileCorrupt
+        );
+        assert_eq!(fs::read(bad).await.expect("corrupt evidence retained"), b"{invalid journal");
+        assert_eq!(
+            fs::read(later.join(STORAGE_FORMAT_FILE_BACKUP))
+                .await
+                .expect("legacy evidence retained"),
+            b"legacy backup"
+        );
+    }
+
+    async fn prepare_discovery_key(
+        disk: &LocalDisk,
+        object: &str,
+        transaction: Uuid,
+        metadata: &[u8],
+    ) -> DeleteRecoveryInspection {
+        let root = disk.io_get_object_path("recovery", object).expect("discovery fixture path");
+        fs::create_dir_all(&root).await.expect("discovery fixture directory");
+        fs::write(root.join(STORAGE_FORMAT_FILE), metadata)
+            .await
+            .expect("discovery fixture metadata");
+        let mut request = request();
+        request.name = object.to_owned();
+        disk.delete_version_recoverable(
+            "recovery",
+            object,
+            request,
+            false,
+            DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prepare discoverable transaction");
+        disk.inspect_delete_transaction("recovery", object, transaction)
+            .await
+            .expect("healthy prepared transaction")
+    }
+
+    async fn discover_all_keys(disk: &LocalDisk, object: Option<&str>) -> BTreeSet<(String, Uuid)> {
+        let mut cursor = None;
+        let mut found = BTreeSet::new();
+        for _ in 0..64 {
+            let page = disk
+                .discover_delete_transactions("recovery", object, cursor, 1)
+                .await
+                .expect("record corruption must not stop bounded discovery");
+            found.extend(page.transactions.into_iter().map(|id| (id.object, id.transaction)));
+            cursor = page.next;
+            if cursor.is_none() {
+                return found;
+            }
+        }
+        panic!("discovery did not finish the small fixture within its page bound");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_raw_discovery_isolates_corrupt_record_bindings() {
+        for record_name in [PREPARED, DELETE_QUORUM_COMMITTED_FILE] {
+            for damage in ["protocol", "volume", "transaction", "object", "unsafe_object", "invalid_json"] {
+                let (temp, disk, _, original) = fixture().await;
+                let transaction = Uuid::new_v4();
+                let prepared = apply(&disk, transaction).await;
+                let root = temp.path().join("recovery/object").join(transaction.to_string());
+                if record_name == DELETE_QUORUM_COMMITTED_FILE {
+                    disk.settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        prepared.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("write receipt fixture");
+                    fs::remove_file(root.join(PREPARED))
+                        .await
+                        .expect("discover the receipt without its prepared journal");
+                }
+                let later = Uuid::new_v4();
+                let later_before = prepare_discovery_key(&disk, "later", later, &original).await;
+                let path = root.join(record_name);
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).await.expect("original record")).expect("valid fixture record");
+                let journal = if record_name == PREPARED {
+                    &mut record
+                } else {
+                    record.get_mut("journal").expect("receipt journal")
+                };
+                match damage {
+                    "protocol" => journal["protocol_version"] = serde_json::json!(DELETE_RECOVERY_PROTOCOL_VERSION + 1),
+                    "volume" => journal["volume"] = serde_json::json!("another-bucket"),
+                    "transaction" => journal["transaction"] = serde_json::json!(Uuid::new_v4()),
+                    "object" => journal["object"] = serde_json::json!("another-key"),
+                    "unsafe_object" => journal["object"] = serde_json::json!("../another-key"),
+                    "invalid_json" => {}
+                    _ => unreachable!("fixture damage is exhaustive"),
+                }
+                let bytes = if damage == "invalid_json" {
+                    b"{invalid record".to_vec()
+                } else {
+                    serde_json::to_vec(&record).expect("encode damaged record")
+                };
+                fs::write(&path, &bytes).await.expect("write corrupt record");
+
+                let found = discover_all_keys(&disk, None).await;
+                assert_eq!(
+                    found,
+                    BTreeSet::from([("object".to_owned(), transaction), ("later".to_owned(), later)]),
+                    "{record_name}: {damage}"
+                );
+                assert_eq!(
+                    discover_all_keys(&disk, Some("object")).await,
+                    BTreeSet::from([("object".to_owned(), transaction)])
+                );
+                assert_eq!(
+                    disk.inspect_delete_transaction("recovery", "object", transaction)
+                        .await
+                        .expect_err("canonical inspection must reject corrupt record bindings"),
+                    DiskError::FileCorrupt,
+                    "{record_name}: {damage}"
+                );
+                assert_eq!(fs::read(path).await.expect("retained corrupt evidence"), bytes);
+                assert_eq!(
+                    disk.inspect_delete_transaction("recovery", "later", later)
+                        .await
+                        .expect("later transaction remains healthy")
+                        .fingerprint,
+                    later_before.fingerprint,
+                    "discovery does not mutate a later healthy transaction"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_raw_discovery_keeps_corrupt_write_backups() {
+        for corrupt_current in [false, true] {
+            let (temp, disk, _, original) = fixture().await;
+            let transaction = Uuid::new_v4();
+            let root = temp.path().join("recovery/object");
+            let backup = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::create_dir_all(backup.parent().expect("rollback directory"))
+                .await
+                .expect("rollback directory");
+            fs::write(&backup, &original).await.expect("valid write backup");
+            let damaged = if corrupt_current {
+                root.join(STORAGE_FORMAT_FILE)
+            } else {
+                backup
+            };
+            fs::write(&damaged, b"corrupt metadata")
+                .await
+                .expect("record-local metadata corruption");
+            let later = Uuid::new_v4();
+            prepare_discovery_key(&disk, "later", later, &original).await;
+
+            assert!(!live_write_backup(&root, transaction).expect("corrupt decoded metadata is not a proven live backup"));
+            assert_eq!(
+                discover_all_keys(&disk, None).await,
+                BTreeSet::from([("object".to_owned(), transaction), ("later".to_owned(), later)])
+            );
+            assert_eq!(
+                disk.inspect_delete_transaction("recovery", "object", transaction)
+                    .await
+                    .expect_err("inspection rejects corrupt backup metadata"),
+                DiskError::FileCorrupt
+            );
+            assert_eq!(fs::read(damaged).await.expect("corrupt metadata remains untouched"), b"corrupt metadata");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_raw_discovery_preserves_bound_directory_keys_and_exact_scope() {
+        let (_temp, disk, _, original) = fixture().await;
+        let directory_transaction = Uuid::new_v4();
+        prepare_discovery_key(&disk, "directory/", directory_transaction, &original).await;
+        let literal_transaction = Uuid::new_v4();
+        prepare_discovery_key(&disk, "literal__XLDIR__", literal_transaction, &original).await;
+
+        assert_eq!(
+            discover_all_keys(&disk, None).await,
+            BTreeSet::from([
+                ("directory/".to_owned(), directory_transaction),
+                ("literal__XLDIR__".to_owned(), literal_transaction),
+            ])
+        );
+        assert_eq!(
+            discover_all_keys(&disk, Some("directory/")).await,
+            BTreeSet::from([("directory/".to_owned(), directory_transaction)])
+        );
+        assert_eq!(
+            discover_all_keys(&disk, Some("directory")).await,
+            BTreeSet::from([("directory".to_owned(), directory_transaction)]),
+            "a journal cannot redirect an exact object scope to a trailing-slash alias"
+        );
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "directory", directory_transaction)
+                .await
+                .expect_err("the alternate scope is not journal authority"),
+            DiskError::FileCorrupt
+        );
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "directory/", directory_transaction)
+                .await
+                .expect("the bound trailing-slash object remains valid")
+                .state,
+            DeleteRecoveryState::NewPrepared
+        );
+
+        let literal_record = disk
+            .io_get_object_path("recovery", "literal__XLDIR__")
+            .expect("literal key path")
+            .join(literal_transaction.to_string())
+            .join(PREPARED);
+        let mut record: DeleteRecoveryJournal =
+            serde_json::from_slice(&fs::read(&literal_record).await.expect("literal journal")).expect("valid literal journal");
+        record.object = "literal/".to_owned();
+        let damaged = serde_json::to_vec(&record).expect("encode invalid literal binding");
+        fs::write(&literal_record, &damaged)
+            .await
+            .expect("inject invalid literal binding");
+        let found = discover_all_keys(&disk, None).await;
+        assert!(found.contains(&("literal__XLDIR__".to_owned(), literal_transaction)));
+        assert!(
+            !found.contains(&("literal/".to_owned(), literal_transaction)),
+            "physical suffixes are never decoded into authority"
+        );
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "literal__XLDIR__", literal_transaction)
+                .await
+                .expect_err("the physical fallback cannot certify an invalid logical binding"),
+            DiskError::FileCorrupt
+        );
+        assert_eq!(fs::read(literal_record).await.expect("retained invalid literal binding"), damaged);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_raw_discovery_keeps_structural_backup_errors_fatal() {
+        let (temp, disk, _, original) = fixture().await;
+        let transaction = Uuid::new_v4();
+        let root = temp.path().join("recovery/object");
+        let rollback = root.join(transaction.to_string());
+        fs::create_dir_all(&rollback).await.expect("backup directory");
+        fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), &original)
+            .await
+            .expect("valid backup metadata");
+        let outside = tempfile::tempdir().expect("external target");
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"external bytes").await.expect("external sentinel");
+        std::os::unix::fs::symlink(&sentinel, rollback.join(TARGET)).expect("structurally invalid delete target");
+
+        assert!(
+            live_write_backup(&root, transaction).is_err(),
+            "only decoded record corruption is isolated"
+        );
+        assert!(
+            disk.discover_delete_transactions("recovery", Some("object"), None, 128)
+                .await
+                .is_err(),
+            "a structural error must terminate discovery"
+        );
+        assert_eq!(fs::read(sentinel).await.expect("unchanged external sentinel"), b"external bytes");
+        assert_eq!(
+            fs::read(rollback.join(STORAGE_FORMAT_FILE_BACKUP))
+                .await
+                .expect("unchanged backup"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_evidence_probes_do_not_register_public_cursors() {
+        let (_temp, disk, _, _) = fixture().await;
+        apply(&disk, Uuid::new_v4()).await;
+        for _ in 0..256 {
+            assert!(
+                disk.delete_recovery_has_evidence("recovery", "object")
+                    .await
+                    .expect("positive private probe")
+            );
+        }
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "early positive probes must not consume any public cursor slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_evidence_probe_advances_empty_bounded_pages() {
+        let (_temp, disk, _, _) = fixture().await;
+        let path = disk.delete_discovery_path("recovery", Some("object")).expect("probe scope");
+        let filler_id = Uuid::new_v4().to_string();
+        let filler = path.join(&filler_id);
+        fs::create_dir_all(&filler).await.expect("non-evidence directory");
+        for index in 0..5000 {
+            fs::write(filler.join(format!("part-{index:04}")), [])
+                .await
+                .expect("non-evidence entry");
+        }
+        let session = disk
+            .new_delete_discovery_session("recovery", Some("object"), &path)
+            .expect("private session");
+        let (first, next) = disk
+            .advance_delete_discovery(&path, session, 1)
+            .await
+            .expect("bounded first step");
+        assert!(first.is_empty());
+        assert!(next.is_some(), "an empty 4096-entry step must retain real continuation state");
+        drop(next);
+        assert!(
+            !disk
+                .delete_recovery_has_evidence("recovery", "object")
+                .await
+                .expect("negative probe reaches EOF")
+        );
+
+        let transaction = Uuid::new_v4();
+        let proof = path.join(transaction.to_string());
+        fs::create_dir_all(&proof).await.expect("later evidence directory");
+        fs::write(proof.join(PREPARED), b"{invalid journal")
+            .await
+            .expect("discoverable record-local corruption");
+        let mut session = disk
+            .new_delete_discovery_session("recovery", Some("object"), &path)
+            .expect("private late-evidence session");
+        // Seed a valid DFS continuation so this assertion is independent of
+        // filesystem directory ordering: the large empty frame runs first.
+        session.frames = vec![
+            (transaction.to_string(), std::fs::read_dir(&proof).expect("later evidence frame")),
+            (filler_id, std::fs::read_dir(&filler).expect("empty intermediate frame")),
+        ];
+        assert!(
+            session
+                .has_evidence(&disk, &path)
+                .await
+                .expect("late evidence survives an empty intermediate page")
+        );
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "private continuation never enters the public cursor table"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_cancelled_evidence_probe_drops_private_session() {
+        let (_temp, disk, _, _) = fixture().await;
+        apply(&disk, Uuid::new_v4()).await;
+        let path = disk.delete_discovery_path("recovery", Some("object")).expect("probe scope");
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&path, None).await;
+        let mut probe = Box::pin(disk.delete_recovery_has_evidence("recovery", "object"));
+        assert!(
+            futures::poll!(probe.as_mut()).is_pending(),
+            "the private session waits for the held namespace lease"
+        );
+        drop(probe);
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root()),
+            "cancelling before a page runs must not retain a global cursor"
+        );
+        drop(lease);
+        assert!(
+            disk.delete_recovery_has_evidence("recovery", "object")
+                .await
+                .expect("later probes remain live")
+        );
+        assert!(
+            DISCOVERY_SESSIONS
+                .lock()
+                .values()
+                .all(|session| session.disk_root != disk.io_root())
+        );
     }
 
     #[tokio::test]

@@ -2369,11 +2369,14 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_usage_update()
+    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
+        "saved_bucket_progress"
+    } else if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        ) {
+        )
+    {
         "activity_unverified_observation"
     } else {
         "incomplete_coverage"
@@ -3888,6 +3891,16 @@ fn scanner_cycle_completion_outcome_for_result(
 ) -> ScannerCycleOutcome {
     let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
     let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
+    if scan_cycle_result.status == ScannerCycleStatus::Incomplete
+        && scan_cycle_result.has_partial_bucket_progress()
+        && !scan_cycle_result.has_usage_update()
+        && !has_failed_dirty_usage
+        && usage_persist_outcome == DataUsagePersistOutcome::NoUpdate
+    {
+        // No root was submitted: retain dirty usage and advance only the
+        // fenced partial-cycle state. A fresh sweep still has to certify usage.
+        return ScannerCycleOutcome::Partial;
+    }
     if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
