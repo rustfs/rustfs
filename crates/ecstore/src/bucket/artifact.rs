@@ -301,10 +301,17 @@ pub(crate) async fn with_artifact_repair_scope<T>(
         bucket_heal,
     });
     scope.check()?;
-    // A seal freezes logical publication, not repair of an existing version.
-    // Still validate any persisted record; unreadable or mismatched records fail closed.
+    // Ordinary PUT sealing permits repair. A separate repair seal closes admission
+    // under the same attempt owner retained by every physical repair tail.
     if let (Some(record), Some(attempt)) = (&scope.artifact, &scope.attempt) {
-        record.exists(store, attempt).await?;
+        record.exists(Arc::clone(&store), attempt).await?;
+        let repair_seal = ArtifactRepairSealRecord::new(record);
+        let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &repair_seal.path()).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+        if repair_seal.exists(store, &guard).await? {
+            return Err(Error::other("artifact attempt repairs are sealed"));
+        }
+        scope.check()?;
     }
     ARTIFACT_REPAIR_SCOPE
         .scope(Arc::clone(&scope), async move {
@@ -538,6 +545,50 @@ pub(crate) fn artifact_put_seal_record_path(bucket: &str, incarnation: Uuid, att
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ArtifactRepairSealRecord {
+    format_version: u8,
+    bucket: String,
+    incarnation_id: Uuid,
+    base_prefix: String,
+    attempt_prefix: String,
+}
+
+impl ArtifactRepairSealRecord {
+    fn new(attempt: &PutSealRecord) -> Self {
+        Self {
+            format_version: 1,
+            bucket: attempt.bucket.clone(),
+            incarnation_id: attempt.incarnation_id,
+            base_prefix: attempt.base_prefix.clone(),
+            attempt_prefix: attempt.attempt_prefix.clone(),
+        }
+    }
+
+    fn path(&self) -> String {
+        artifact_repair_seal_record_path(&self.bucket, self.incarnation_id, &self.attempt_prefix)
+    }
+
+    async fn exists(&self, store: Arc<ECStore>, guard: &WriteCommitGuard) -> Result<bool> {
+        let bytes = match read_config_observation_no_lock(store, &self.path(), 16 * 1024, guard).await {
+            Ok((bytes, _)) => bytes,
+            Err(Error::ConfigNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let actual: Self = serde_json::from_slice(&bytes)?;
+        if actual != *self {
+            return Err(Error::other("artifact repair seal identity mismatch"));
+        }
+        Ok(true)
+    }
+}
+
+pub(crate) fn artifact_repair_seal_record_path(bucket: &str, incarnation: Uuid, attempt_prefix: &str) -> String {
+    let digest = hex_simd::encode_to_string(Sha256::digest(attempt_prefix.as_bytes()), hex_simd::AsciiCase::Lower);
+    format!("{BUCKET_META_PREFIX}/{bucket}/artifact-repair-seals/{incarnation}/{digest}.json")
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactVersionRetirementRecord {
     format_version: u8,
     bucket: String,
@@ -630,6 +681,49 @@ fn attempt_prefix<'a>(base_prefix: &str, object: &'a str) -> Result<&'a str> {
 }
 
 impl ECStore {
+    /// Seal local repair admission for one ordinary-PUT-sealed artifact attempt.
+    /// This neither deletes versions nor proves all writers or GC eligibility.
+    pub async fn seal_artifact_attempt_repairs(
+        self: Arc<Self>,
+        bucket: &str,
+        expected_incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> Result<()> {
+        require_local_put_seal_topology(&self).await?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("artifact repair sealing requires namespace locking"));
+        }
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation {
+            return Err(Error::other("artifact repair seal bucket incarnation mismatch"));
+        }
+        let seal = PutSealRecord::new(&metadata, attempt_prefix)?;
+        let record = ArtifactRepairSealRecord::new(&seal);
+        let lifecycle = self.acquire_bucket_incarnation_fence(bucket, expected_incarnation).await?;
+        let store = Arc::clone(&self);
+        // Lifecycle -> attempt -> repair seal record. Acquiring the attempt waits
+        // for physical repair owners, including tails whose waiter was cancelled.
+        // The spawned transaction retains these owners until persistence drains.
+        with_config_object_write_lock(self, seal.path(), move |attempt| async move {
+            if lifecycle.is_lock_lost() || attempt.is_lock_lost() {
+                return Err(Error::other("artifact repair seal fence was lost"));
+            }
+            if !seal.exists(Arc::clone(&store), &attempt).await? {
+                return Err(Error::other("artifact repair sealing requires a sealed attempt"));
+            }
+            let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &record.path()).await?;
+            let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+            if !record.exists(Arc::clone(&store), &guard).await? {
+                save_config_no_lock(store, &record.path(), serde_json::to_vec(&record)?, &guard).await?;
+            }
+            if lifecycle.is_lock_lost() || attempt.is_lock_lost() || guard.is_lock_lost() {
+                return Err(Error::other("artifact repair seal fence was lost"));
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     /// Persist repair retirement for one exact version in a sealed attempt.
     /// This does not delete the version or authorize garbage collection.
     pub async fn retire_artifact_object_version(
