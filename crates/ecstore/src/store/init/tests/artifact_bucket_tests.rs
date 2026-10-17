@@ -540,7 +540,7 @@ async fn artifact_bucket_create_observation_rejects_corrupt_authority() {
         object_api::{ObjectOptions, WriteCompletion},
     };
     let root = tempfile::tempdir().expect("creation observation faults");
-    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let (mut ctx, mut store, mut shutdown) = open_store(root.path()).await;
     let bucket = "artifact-create-corruption";
     let incarnation = store
         .clone()
@@ -570,9 +570,14 @@ async fn artifact_bucket_create_observation_rejects_corrupt_authority() {
         );
         sys.read().await.set_for_test(bucket.into(), Arc::new(original.clone())).await;
     }
-    for (file, corrupt) in [
-        (BUCKET_METADATA_FILE, b"corrupt metadata".to_vec()),
-        (BUCKET_INCARNATION_FILE, Uuid::nil().as_bytes().to_vec()),
+    drop(sys);
+    for (file, corrupt, expected_error) in [
+        (BUCKET_METADATA_FILE, b"corrupt metadata".to_vec(), "read_bucket_metadata: format invalid"),
+        (
+            BUCKET_INCARNATION_FILE,
+            Uuid::nil().as_bytes().to_vec(),
+            "persisted bucket incarnation is nil",
+        ),
     ] {
         let path = format!("{BUCKET_META_PREFIX}/{bucket}/{file}");
         let saved = read_config(store.clone(), &path).await.expect("real persisted record");
@@ -584,15 +589,27 @@ async fn artifact_bucket_create_observation_rejects_corrupt_authority() {
         save_config_with_opts(store.clone(), &path, corrupt, &opts)
             .await
             .expect("inject physical record fault");
-        sys.read().await.remove(bucket).await;
+        // Reopen with a fresh metadata authority so observation must read the
+        // actual damaged record, without a cached value or a negative entry.
+        drain_before_reopen(&store, &shutdown, bucket).await;
+        drop(store);
+        drop(ctx);
+        (ctx, store, shutdown) = open_store(root.path()).await;
+        let error = store
+            .observe_artifact_bucket_incarnation(bucket, PREFIX)
+            .await
+            .expect_err("physical corruption cannot produce a receipt");
         assert!(
-            store.observe_artifact_bucket_incarnation(bucket, PREFIX).await.is_err(),
-            "ARTIFACT_CREATE_CURRENT_GENERATION: corrupt physical authority {file}"
+            error.to_string().contains(expected_error),
+            "ARTIFACT_CREATE_CURRENT_GENERATION: corrupt physical authority {file}: {error}"
         );
         save_config_with_opts(store.clone(), &path, saved, &opts)
             .await
             .expect("restore physical record");
-        sys.read().await.remove(bucket).await;
+        drain_before_reopen(&store, &shutdown, bucket).await;
+        drop(store);
+        drop(ctx);
+        (ctx, store, shutdown) = open_store(root.path()).await;
         assert_eq!(
             store
                 .observe_artifact_bucket_incarnation(bucket, PREFIX)

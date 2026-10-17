@@ -314,9 +314,10 @@ phase, not an injected HTTP handler race.
 
 `artifact_bucket_create_observation_rejects_corrupt_authority` checks the
 observation's actual authoritative-cache path with damaged name, namespace and
-versioning data, plus physical metadata and nil-sidecar corruption after cache
-eviction. The authoritative snapshot may already be cached from a committed
-write; observation always holds the lifecycle read lock but does not acquire
+versioning data, plus physical metadata and nil-sidecar corruption through fresh
+store instances. The physical cases assert the specific disk parsing error, then
+restore the record and reopen again to verify the original identity. The
+authoritative snapshot may already be cached from a committed write; observation always holds the lifecycle read lock but does not acquire
 metadata and bucket locks on every cache hit. Removing its identity/versioning
 validation must fail `ARTIFACT_CREATE_CURRENT_GENERATION` at runtime.
 `artifact_bucket_create_requires_namespace_locking_before_creation` uses a
