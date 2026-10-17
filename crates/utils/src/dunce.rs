@@ -21,6 +21,7 @@ use std::ffi::OsStr;
 #[cfg(windows)]
 use std::path::{Component, Prefix};
 use std::{
+    borrow::Cow,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -104,6 +105,61 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 fn canonicalize_win(path: &Path) -> io::Result<PathBuf> {
     let real_path = fs::canonicalize(path)?;
     Ok(try_simplified(&real_path).map(PathBuf::from).unwrap_or(real_path))
+}
+
+/// Returns a form of `path` that Win32 file APIs accept beyond `MAX_PATH`.
+///
+/// `std::fs` adds the `\\?\` prefix internally, but crates that call Win32
+/// directly with the caller's path (for example `tempfile`'s `persist`, which
+/// uses `MoveFileExW`) fail with `ERROR_PATH_NOT_FOUND` once the path reaches
+/// 260 UTF-16 units, unless the process opted into long paths through both the
+/// `LongPathsEnabled` policy and an application manifest.
+///
+/// The path is first made absolute with `GetFullPathNameW` (via
+/// [`std::path::absolute`]), so separators, `.`/`..` and trailing dots or spaces
+/// are normalized exactly as a non-verbatim Win32 call would see them, and only
+/// then prefixed with `\\?\` (or `\\?\UNC\`). Verbatim and device paths are
+/// returned unchanged.
+///
+/// On non-Windows this is a no-op.
+pub fn extended_length_path(path: &Path) -> io::Result<Cow<'_, Path>> {
+    #[cfg(not(windows))]
+    {
+        Ok(Cow::Borrowed(path))
+    }
+    #[cfg(windows)]
+    {
+        extended_length_path_win(path).map(Cow::Owned)
+    }
+}
+
+#[cfg(windows)]
+fn extended_length_path_win(path: &Path) -> io::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+
+    let absolute = std::path::absolute(path)?;
+    let unc = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => false,
+            Prefix::UNC(..) => true,
+            // Verbatim and `\\.\` device paths already bypass Win32 normalization.
+            _ => return Ok(absolute),
+        },
+        _ => return Ok(absolute),
+    };
+    let wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    let (prefix, rest) = if unc {
+        // `\\server\share\x` becomes `\\?\UNC\server\share\x`.
+        (r"\\?\UNC", &wide[1..])
+    } else {
+        (r"\\?\", &wide[..])
+    };
+    let mut extended = prefix.encode_utf16().collect::<Vec<_>>();
+    extended.extend_from_slice(rest);
+    Ok(PathBuf::from(OsString::from_wide(&extended)))
 }
 
 /// Returns `true` if the path is relative or starts with a disk prefix (like "C:").
@@ -388,6 +444,34 @@ mod tests {
         assert_eq!(simplified(Path::new(r"C:\Windows")), Path::new(r"C:\Windows"));
         assert_eq!(simplified(Path::new(r"\\server\share")), Path::new(r"\\server\share"));
         assert_eq!(simplified(Path::new(r"\\.\C:\Windows")), Path::new(r"\\.\C:\Windows"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn extended_length_path_prefixes_normalized_windows_paths() {
+        assert_eq!(
+            &*extended_length_path(Path::new(r"C:/data/./bucket/../bucket/object")).unwrap(),
+            Path::new(r"\\?\C:\data\bucket\object")
+        );
+        assert_eq!(
+            &*extended_length_path(Path::new(r"\\server\share\data\object")).unwrap(),
+            Path::new(r"\\?\UNC\server\share\data\object")
+        );
+        for unchanged in [r"\\?\C:\data\object", r"\\?\UNC\server\share\object", r"\\.\C:\data"] {
+            assert_eq!(&*extended_length_path(Path::new(unchanged)).unwrap(), Path::new(unchanged));
+        }
+
+        let long = format!(r"C:\data\{}\xl.meta.bkp", "a".repeat(300));
+        let extended = extended_length_path(Path::new(&long)).unwrap();
+        assert_eq!(&*extended, Path::new(&format!(r"\\?\{long}")));
+        assert_eq!(simplified(&extended), &*extended, "a long path must stay verbatim");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn extended_length_path_is_a_noop_off_windows() {
+        let path = Path::new("/data/./bucket/object");
+        assert!(matches!(extended_length_path(path).unwrap(), Cow::Borrowed(p) if p == path));
     }
 
     #[test]

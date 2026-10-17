@@ -81,6 +81,159 @@ async fn persisted_state(store: &Arc<ECStore>) -> Vec<(Option<Vec<u8>>, DataUsag
     state
 }
 
+async fn seed_transient_cycle_read_failure() -> ScannerCycleRecoveryStatus {
+    let store = Arc::new(MemoryConfigStore::default());
+    let error = EcstoreError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), DATA_USAGE_BLOOM_NAME_PATH.clone());
+    let expected_error = format!("Scanner error: failed to inspect scanner cycle state: {error}");
+    store
+        .read_errors
+        .lock()
+        .await
+        .insert(memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str()), error);
+    let ScannerCycleStateStartup::Transient(error) = load_scanner_cycle_state_for_startup(store).await else {
+        panic!("a quorum outage must produce transient cycle recovery");
+    };
+    assert_eq!(error.to_string(), expected_error);
+    let status = scanner_cycle_recovery_status();
+    assert_eq!(status.state, "transient");
+    assert!(status.retryable);
+    assert_eq!(status.classification, None);
+    status
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
+    temp_env::async_with_vars([("RUSTFS_LOCK_ACQUIRE_TIMEOUT", Some("1"))], async {
+        let (_dir, store) = setup_scanner_cycle_store().await;
+        seed_cleanup(&store, "cleanup-pending").await;
+        let before = persisted_state(&store).await;
+        let lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+            .await
+            .expect("leader lock");
+        let guard = lock
+            .get_write_lock_quiet(Duration::from_secs(1))
+            .await
+            .expect("hold live leader");
+        let transient = seed_transient_cycle_read_failure().await;
+        assert!(!record_scanner_cycle_recovery_retry(MAX_SCANNER_CYCLE_RECOVERY_RETRIES));
+        let paused = scanner_cycle_recovery_status();
+        assert_eq!(paused.state, "paused");
+        let mut cases = vec![(transient, true), (paused, true)];
+        for (state, classification, retryable) in [
+            ("recovery-required", None, false),
+            ("blocked", None, false),
+            ("blocked", Some("corrupt"), false),
+            ("cleanup-pending", None, true),
+            ("cleanup-pending", Some("corrupt"), true),
+            ("usage_floor_load_failed", Some("usage_floor_load_failed"), true),
+            ("usage_floor_recovery_pending", Some("legacy_empty_usage_floor"), true),
+            ("paused", Some("usage_floor_load_failed"), false),
+            ("cache_cycle_ahead", Some("cache_cycle_ahead"), true),
+        ] {
+            cases.push((
+                ScannerCycleRecoveryStatus {
+                    state: state.to_string(),
+                    classification: classification.map(str::to_string),
+                    retry_count: 5,
+                    max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
+                    retryable,
+                    reason: Some("preserve recovery state".to_string()),
+                    ..Default::default()
+                },
+                false,
+            ));
+        }
+        for (status, clear) in cases {
+            let expected = serde_json::to_value(&status).expect("expected recovery status");
+            publish_scanner_cleanup_status(status, None).expect("seed local recovery status");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run_data_scanner_with_maintenance_state(
+                    CancellationToken::new(),
+                    store.clone(),
+                    ScannerMaintenanceFeatures::default(),
+                    None,
+                ),
+            )
+            .await
+            .expect("contended scanner iteration must finish")
+            .expect("lock contention is a normal follower outcome");
+            assert_eq!(scanner_cycle_schedule_status().execution_role, "follower");
+            let actual = scanner_cycle_recovery_status();
+            if clear {
+                assert_eq!(actual.state, "healthy", "stale follower recovery: {expected}");
+                assert_eq!(actual.retry_count, 0);
+                assert!(!actual.retryable);
+            } else {
+                assert_eq!(serde_json::to_value(actual).expect("actual recovery status"), expected);
+            }
+            assert!(!guard.is_lock_lost(), "follower must not revoke the leader");
+            assert_eq!(persisted_state(&store).await, before, "follower must not rewrite durable recovery state");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
+    temp_env::async_with_vars(
+        [
+            ("RUSTFS_LOCK_ACQUIRE_TIMEOUT", Some("1")),
+            (ENV_SCANNER_START_DELAY_SECS, Some("0")),
+            (ENV_SCANNER_CYCLE, Some("1")),
+        ],
+        async {
+            let (_dir, store) = setup_scanner_cycle_store().await;
+            seed_cleanup(&store, "cleanup-pending").await;
+            let before = persisted_state(&store).await;
+            let lock = store
+                .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+                .await
+                .expect("leader lock");
+            let guard = lock
+                .get_write_lock_quiet(Duration::from_secs(1))
+                .await
+                .expect("hold live leader");
+            for attempt in 1..=MAX_SCANNER_CYCLE_RECOVERY_RETRIES {
+                seed_transient_cycle_read_failure().await;
+                assert_eq!(record_scanner_cycle_recovery_retry(attempt), attempt < MAX_SCANNER_CYCLE_RECOVERY_RETRIES);
+            }
+            assert_eq!(scanner_cycle_recovery_status().state, "paused");
+            assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
+            let ctx = CancellationToken::new();
+            let _cancel_on_drop = ctx.clone().drop_guard();
+            init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+            assert!(crate::scanner_runtime_initialized());
+            let recovered = tokio::time::timeout(Duration::from_secs(30), async {
+                while scanner_cycle_recovery_status().state != "healthy" {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            ctx.cancel();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while crate::scanner_runtime_initialized() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled scanner supervisor must stop");
+            recovered.expect("follower must recover without another five-minute pause or process restart");
+            assert_eq!(scanner_cycle_schedule_status().execution_role, "follower");
+            let status = scanner_cycle_recovery_status();
+            assert_eq!(status.retry_count, 0);
+            assert!(!status.retryable);
+            assert!(!guard.is_lock_lost(), "supervisor must not revoke the leader");
+            assert_eq!(persisted_state(&store).await, before, "supervisor must leave durable recovery untouched");
+        },
+    )
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 async fn run_disabled_startup(ctx: CancellationToken, store: Arc<ECStore>) {
     let initialized_before = crate::scanner_runtime_initialized();
     let cleanup = init_scanner_with_recovery(ctx, store, false).await;

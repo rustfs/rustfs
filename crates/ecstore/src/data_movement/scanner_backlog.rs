@@ -110,19 +110,17 @@ async fn read_replica(set: Arc<SetDisks>) -> Result<ScannerPauseBacklogRetiremen
         set_index: set.set_index,
         data: None,
     };
-    let reader = match set
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            SCANNER_PAUSE_BACKLOG_PATH,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = set.get_object_reader(RUSTFS_META_BUCKET, SCANNER_PAUSE_BACKLOG_PATH, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ScannerBacklogRead,
+        read,
+    );
+    let reader = match read.await {
         Ok(reader) => reader,
         Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
             return Ok(ScannerPauseBacklogRetirementRead { replica, etag: None });

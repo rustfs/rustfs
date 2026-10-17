@@ -6,29 +6,20 @@ name: Gateway Integration Sync
 # Merges `main` into the long-lived `gateway/integration` branch every weekday
 # so the s3s -> gateway migration (rustfs/backlog#2734, task T0.1 in #2736)
 # never accumulates merge debt. A clean merge lands as a `--no-ff` merge commit
-# pushed straight to the branch. A conflicting merge is aborted and surfaced as
-# a pull request from `sync/<source>-<date>`, whose head is the un-merged
-# source commit, so the conflict is resolved the same day, in review, with no
-# other change riding along. The run itself stays green in that case: the pull
-# request is the signal. Any other failure (push rejected, pull request not
-# created) fails the run and, on the schedule, files the shared failure issue.
+# pushed straight to the branch. A conflicting merge is aborted and fails the
+# run after its summary records the source and target SHAs, run URL, and exact
+# conflicting paths. It creates no sync branch or pull request. Resolve the
+# merge in an isolated worktree based on the latest target, preserve the
+# two-parent merge commit, and push only after the required checks pass and the
+# target still matches the merge's first parent. If the target moves, restart
+# from its new head.
 #
-# Resolving a conflict pull request: merge `origin/gateway/integration` into
-# the sync branch, resolve, push, get the review. Land it with a fast-forward
-# push of the resolved merge commit to `gateway/integration`, not with the
-# squash button: a squash drops the merge ancestry and the same hunks conflict
-# again on the next run.
-#
-# Write scope: only `gateway/integration` and `sync/*` are ever pushed, and
-# both push targets below are literal refs. The pushes use a one-hour
-# installation token of the organisation's own GitHub App (contents: write)
-# because that app is the only non-admin bypass actor of the
+# Write scope: only `gateway/integration` is ever pushed. The push uses a
+# one-hour installation token of the organisation's GitHub App (contents:
+# write) because that app is the only non-admin bypass actor of the
 # `gateway/integration` ruleset; GITHUB_TOKEN cannot be a ruleset bypass actor,
-# so it cannot push through the required reviews and checks. The conflict pull
-# request is opened with FLAKE_UPDATE_TOKEN, the PAT that already opens the
-# weekly flake.lock pull requests, because this repository keeps "Allow GitHub
-# Actions to create and approve pull requests" switched off. GITHUB_TOKEN is
-# therefore read-only here.
+# so it cannot push through the required reviews and checks. GITHUB_TOKEN is
+# read-only here.
 #
 # `schedule` fires only from the default branch, so the cron is live once this
 # file exists on `main`. `workflow_dispatch` runs from any ref that carries the
@@ -94,6 +85,7 @@ jobs:
         id: merge
         env:
           SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if ! [[ "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
@@ -119,13 +111,25 @@ jobs:
             fi
             exit 0
           fi
-          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
-          git merge --abort
-          if [[ ! -s "$RUNNER_TEMP/conflicts.txt" ]]; then
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [[ -z "$conflicts" ]]; then
+            git merge --abort || true
             echo "::error::git merge failed without reporting conflicting paths; this is not a conflict"
             exit 1
           fi
-          echo "result=conflict" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Gateway integration sync stopped on conflicts"
+            echo
+            echo "- Run: ${RUN_URL}"
+            echo "- Source: \`${SOURCE_REF}\` at ${source_sha}"
+            echo "- Target: \`${TARGET_BRANCH}\` at ${target_sha}"
+            echo
+            echo "Conflicting files:"
+            printf '%s\n' "$conflicts" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git merge --abort
+          echo "::error::${SOURCE_REF} cannot be merged cleanly into ${TARGET_BRANCH}; no branch or pull request was created"
+          exit 1
 
       - name: Push the merge commit
         if: steps.merge.outputs.result == 'merged'
@@ -137,50 +141,12 @@ jobs:
           git push origin HEAD:refs/heads/gateway/integration
           echo "Merged \`${SOURCE_REF}\` (${SOURCE_SHA}) into \`${TARGET_BRANCH}\` as $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Open the conflict pull request
-        if: steps.merge.outputs.result == 'conflict'
-        env:
-          GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
-          SOURCE_REF: ${{ steps.merge.outputs.source_ref }}
-          SOURCE_SHA: ${{ steps.merge.outputs.source_sha }}
-          TARGET_SHA: ${{ steps.merge.outputs.target_sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          date_utc=$(date -u +%Y-%m-%d)
-          sync_branch="sync/${SOURCE_REF//\//-}-${date_utc}"
-          git push origin "refs/remotes/origin/${SOURCE_REF}:refs/heads/${sync_branch}"
-          {
-            echo "The scheduled merge of \`${SOURCE_REF}\` into \`${TARGET_BRANCH}\` stopped on conflicts and was aborted; \`${TARGET_BRANCH}\` is unchanged."
-            echo
-            echo "This branch is the un-merged \`${SOURCE_REF}\` head. Merge \`origin/${TARGET_BRANCH}\` into it, resolve the files below, push, and get the review. Land the resolved merge commit with a fast-forward push to \`${TARGET_BRANCH}\`; a squash merge drops the merge ancestry and the same hunks conflict again on the next run. Do not include any change that is not conflict resolution."
-            echo
-            echo "- Run: ${RUN_URL}"
-            echo "- Source: \`${SOURCE_REF}\` at ${SOURCE_SHA}"
-            echo "- Target: \`${TARGET_BRANCH}\` at ${TARGET_SHA}"
-            echo
-            echo "## Conflicting files"
-            echo
-            echo "Output of \`git diff --name-only --diff-filter=U\` captured before \`git merge --abort\`:"
-            echo
-            sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt"
-          } > "$RUNNER_TEMP/pr-body.md"
-          title="sync: merge ${SOURCE_REF} ${date_utc} (conflicts)"
-          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$TARGET_BRANCH" --head "$sync_branch" --state open --json number --jq '.[0].number // empty')
-          if [[ -n "$existing" ]]; then
-            gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
-            pr_url=$(gh pr view "$existing" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
-          else
-            pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$TARGET_BRANCH" --head "$sync_branch" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md")
-          fi
-          echo "Conflicts in \`${SOURCE_REF}\` -> \`${TARGET_BRANCH}\`; pull request: ${pr_url}" >> "$GITHUB_STEP_SUMMARY"
-
   alert-on-failure:
     name: Alert on scheduled failure
     needs: [sync]
     # Same ci-8 mechanism audit.yml and coverage.yml use: a scheduled run that
-    # could not push or could not open the conflict pull request must not stay
-    # visible only in the Actions tab.
+    # could not push or encountered merge conflicts must not stay visible only
+    # in the Actions tab.
     if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10

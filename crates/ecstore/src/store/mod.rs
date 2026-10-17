@@ -428,6 +428,7 @@ mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
+pub(crate) mod delete_recovery_runtime;
 mod heal;
 pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
@@ -1363,7 +1364,13 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
-        self.handle_get_object_reader(bucket, object, range, h, opts).await
+        let read = self.handle_get_object_reader(bucket, object, range, h, opts);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::StoreObjectReader,
+            read,
+        );
+        read.await
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {

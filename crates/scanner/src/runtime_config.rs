@@ -20,17 +20,17 @@ use rustfs_config::{
     DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
     DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS,
     DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS,
-    DEFAULT_SCANNER_SPEED, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
-    ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
-    ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
+    DEFAULT_SCANNER_SPEED, DEFAULT_SCANNER_WALKERS_PER_DISK, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS,
+    ENV_SCANNER_ALERT_EXCESS_FOLDERS, ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS,
+    ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
     ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_IDLE_MODE,
     ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
-    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS,
-    SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE,
-    SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
-    SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS,
-    SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
-    SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
+    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_WALKERS_PER_DISK, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE,
+    HEAL_SUB_SYS, MAX_SCANNER_WALKERS_PER_DISK, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE,
+    SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE,
+    SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE,
+    SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_START_DELAY,
+    SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK, SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
     server_config::{Config as ServerConfig, KVS},
 };
 use serde::Serialize;
@@ -53,6 +53,7 @@ const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START
 const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
 const MAX_SCANNER_DELAY_FACTOR: f64 = 10_000.0;
 const SCANNER_DELAY_RANGE_REASON: &str = "expected scanner delay between 0 and 10000";
+const SCANNER_WALKERS_PER_DISK_RANGE_REASON: &str = "expected walkers per disk between 1 and 16";
 
 static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
 static SCANNER_RUNTIME_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -96,6 +97,8 @@ pub(crate) struct ScannerRuntimeConfig {
     pub(crate) max_concurrent_set_scans_source: ScannerRuntimeConfigSource,
     pub(crate) max_concurrent_disk_scans: usize,
     pub(crate) max_concurrent_disk_scans_source: ScannerRuntimeConfigSource,
+    pub(crate) walkers_per_disk: usize,
+    pub(crate) walkers_per_disk_source: ScannerRuntimeConfigSource,
     pub(crate) yield_every_n_objects: u64,
     pub(crate) yield_every_n_objects_source: ScannerRuntimeConfigSource,
     pub(crate) alert_excess_versions: u64,
@@ -138,6 +141,8 @@ impl Default for ScannerRuntimeConfig {
             max_concurrent_set_scans_source: ScannerRuntimeConfigSource::Default,
             max_concurrent_disk_scans: DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS,
             max_concurrent_disk_scans_source: ScannerRuntimeConfigSource::Default,
+            walkers_per_disk: DEFAULT_SCANNER_WALKERS_PER_DISK,
+            walkers_per_disk_source: ScannerRuntimeConfigSource::Default,
             yield_every_n_objects: DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS,
             yield_every_n_objects_source: ScannerRuntimeConfigSource::Default,
             alert_excess_versions: DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS,
@@ -181,6 +186,7 @@ pub struct ScannerRuntimeConfigStatus {
     pub cache_save_timeout_seconds: ScannerRuntimeConfigValue<u64>,
     pub max_concurrent_set_scans: ScannerRuntimeConfigValue<usize>,
     pub max_concurrent_disk_scans: ScannerRuntimeConfigValue<usize>,
+    pub walkers_per_disk: ScannerRuntimeConfigValue<usize>,
     pub yield_every_n_objects: ScannerRuntimeConfigValue<u64>,
     pub alert_excess_versions: ScannerRuntimeConfigValue<u64>,
     pub alert_excess_version_size: ScannerRuntimeConfigValue<u64>,
@@ -392,6 +398,9 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
     validate_optional_config_u64(scanner_kvs, SCANNER_CACHE_SAVE_TIMEOUT, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)?;
     validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS)?;
     validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS)?;
+    if let Some(value) = config_value(scanner_kvs, SCANNER_WALKERS_PER_DISK, DEFAULT_SCANNER_WALKERS_PER_DISK) {
+        walkers_per_disk_from_count(SCANNER_WALKERS_PER_DISK, parse_config_usize(SCANNER_WALKERS_PER_DISK, value)?)?;
+    }
     validate_optional_config_u64(scanner_kvs, SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)?;
     validate_optional_config_u64(scanner_kvs, SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS)?;
     validate_optional_config_u64(scanner_kvs, SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE)?;
@@ -482,6 +491,39 @@ fn cycle_duration_from_secs(key: &'static str, secs: u64) -> Result<Option<Durat
         return Err(invalid_value(key, "<overflow>", "duration exceeds the timer range"));
     }
     Ok(Some(duration))
+}
+
+fn walkers_per_disk_from_count(key: &'static str, count: usize) -> Result<usize, ScannerRuntimeConfigError> {
+    if (1..=MAX_SCANNER_WALKERS_PER_DISK).contains(&count) {
+        Ok(count)
+    } else {
+        Err(invalid_value(key, count.to_string(), SCANNER_WALKERS_PER_DISK_RANGE_REASON))
+    }
+}
+
+fn lookup_walkers_per_disk(kvs: Option<&KVS>) -> Result<(usize, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
+    match rustfs_utils::get_env_parse_outcome::<usize>(ENV_SCANNER_WALKERS_PER_DISK) {
+        rustfs_utils::EnvParseOutcome::Parsed(count) => {
+            return walkers_per_disk_from_count(ENV_SCANNER_WALKERS_PER_DISK, count)
+                .map(|count| (count, ScannerRuntimeConfigSource::Env));
+        }
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            return Err(invalid_value(
+                ENV_SCANNER_WALKERS_PER_DISK,
+                "<invalid>",
+                "expected unsigned integer count",
+            ));
+        }
+        rustfs_utils::EnvParseOutcome::Absent => {}
+    }
+
+    if let Some(value) = config_value(kvs, SCANNER_WALKERS_PER_DISK, DEFAULT_SCANNER_WALKERS_PER_DISK) {
+        let count = parse_config_usize(SCANNER_WALKERS_PER_DISK, value)?;
+        return walkers_per_disk_from_count(SCANNER_WALKERS_PER_DISK, count)
+            .map(|count| (count, ScannerRuntimeConfigSource::Config));
+    }
+
+    Ok((DEFAULT_SCANNER_WALKERS_PER_DISK, ScannerRuntimeConfigSource::Default))
 }
 
 fn lookup_start_delay(kvs: Option<&KVS>) -> Result<(Option<Duration>, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
@@ -639,6 +681,7 @@ pub(crate) fn lookup_scanner_runtime_config(
         ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
         DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS,
     )?;
+    let (walkers_per_disk, walkers_per_disk_source) = lookup_walkers_per_disk(scanner_kvs)?;
     let (yield_every_n_objects, yield_every_n_objects_source) = lookup_u64(
         scanner_kvs,
         SCANNER_YIELD_EVERY_N_OBJECTS,
@@ -689,6 +732,8 @@ pub(crate) fn lookup_scanner_runtime_config(
         max_concurrent_set_scans_source,
         max_concurrent_disk_scans,
         max_concurrent_disk_scans_source,
+        walkers_per_disk,
+        walkers_per_disk_source,
         yield_every_n_objects,
         yield_every_n_objects_source,
         alert_excess_versions,
@@ -825,6 +870,10 @@ pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
             value: config.max_concurrent_disk_scans,
             source: config.max_concurrent_disk_scans_source,
         },
+        walkers_per_disk: ScannerRuntimeConfigValue {
+            value: config.walkers_per_disk,
+            source: config.walkers_per_disk_source,
+        },
         yield_every_n_objects: ScannerRuntimeConfigValue {
             value: config.yield_every_n_objects,
             source: config.yield_every_n_objects_source,
@@ -872,6 +921,10 @@ pub(crate) fn scanner_max_concurrent_disk_scans_configured() -> usize {
     current_scanner_runtime_config().max_concurrent_disk_scans
 }
 
+pub(crate) fn scanner_walkers_per_disk_configured() -> usize {
+    current_scanner_runtime_config().walkers_per_disk
+}
+
 pub(crate) fn scanner_alert_excess_versions() -> u64 {
     current_scanner_runtime_config().alert_excess_versions
 }
@@ -892,9 +945,10 @@ mod tests {
     use rustfs_config::{
         DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
         ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
-        ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE,
-        SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
-        SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
+        ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_WALKERS_PER_DISK, HEAL_BITROT_CYCLE, HEAL_SUB_SYS,
+        SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES,
+        SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS,
+        SCANNER_WALKERS_PER_DISK, ScannerSpeed,
     };
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1148,6 +1202,65 @@ mod tests {
             assert_eq!(resolved.delay, ScannerSpeed::Slow.sleep_factor());
             assert_eq!(resolved.delay_source, ScannerRuntimeConfigSource::Env);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_walkers_per_disk_defaults_to_one_walker() {
+        let config = server_config_with_scanner(&[]);
+
+        with_var_unset(ENV_SCANNER_WALKERS_PER_DISK, || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+
+            assert_eq!(resolved.walkers_per_disk, 1);
+            assert_eq!(resolved.walkers_per_disk_source, ScannerRuntimeConfigSource::Default);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_walkers_per_disk_accepts_persisted_range_and_rejects_zero_or_excess() {
+        with_var_unset(ENV_SCANNER_WALKERS_PER_DISK, || {
+            for (value, expected) in [("1", 1), ("4", 4), ("16", 16)] {
+                let config = server_config_with_scanner(&[(SCANNER_WALKERS_PER_DISK, value)]);
+                validate_scanner_runtime_config(&config).expect("walkers per disk inside the range should validate");
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+                assert_eq!(resolved.walkers_per_disk, expected, "persisted {value}");
+                let expected_source = if expected == 1 {
+                    ScannerRuntimeConfigSource::Default
+                } else {
+                    ScannerRuntimeConfigSource::Config
+                };
+                assert_eq!(resolved.walkers_per_disk_source, expected_source, "persisted {value}");
+            }
+            for value in ["0", "17", "-1", "many"] {
+                let config = server_config_with_scanner(&[(SCANNER_WALKERS_PER_DISK, value)]);
+                let err = validate_scanner_runtime_config(&config).expect_err("walkers per disk outside the range must fail");
+                assert!(err.to_string().contains("walkers_per_disk"), "persisted {value}: {err}");
+                assert!(
+                    lookup_scanner_runtime_config(Some(&config)).is_err(),
+                    "persisted {value} must not resolve into a runtime config"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_walkers_per_disk_env_overrides_and_is_range_checked() {
+        let config = server_config_with_scanner(&[(SCANNER_WALKERS_PER_DISK, "2")]);
+
+        with_var(ENV_SCANNER_WALKERS_PER_DISK, Some("3"), || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+            assert_eq!(resolved.walkers_per_disk, 3);
+            assert_eq!(resolved.walkers_per_disk_source, ScannerRuntimeConfigSource::Env);
+        });
+        for value in ["0", "17", "x"] {
+            with_var(ENV_SCANNER_WALKERS_PER_DISK, Some(value), || {
+                let err = lookup_scanner_runtime_config(Some(&config)).expect_err("env walkers per disk is range checked");
+                assert!(err.to_string().contains(ENV_SCANNER_WALKERS_PER_DISK), "env {value}: {err}");
+            });
+        }
     }
 
     #[test]

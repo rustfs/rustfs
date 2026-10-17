@@ -132,7 +132,7 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 }
 
 impl HealTask {
-    async fn recover_bucket_delete_transactions(&self, bucket: &str, opts: &HealOpts) -> Result<()> {
+    async fn recover_bucket_delete_transactions(&self, bucket: &str, opts: &HealOpts) -> Result<bool> {
         if let Some(result) = self
             .await_with_control(
                 self.storage
@@ -140,9 +140,11 @@ impl HealTask {
             )
             .await?
         {
+            let unresolved = result.delete_recovery.is_some_and(|status| status.has_unresolved());
             self.record_result_item(result).await;
+            return Ok(unresolved);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
@@ -241,8 +243,8 @@ impl HealTask {
         };
         // Removal must settle survivor journals before deleting an empty
         // replica's publication directory; repair must establish it first.
-        if heal_opts.remove {
-            self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
+        if heal_opts.remove && self.recover_bucket_delete_transactions(bucket, &recovery_opts).await? {
+            return Err(Error::transient_skip("Delete recovery must resolve before bucket removal"));
         }
         let heal_result = match self.bucket_incarnation_id {
             Some(expected) => {
@@ -269,12 +271,14 @@ impl HealTask {
                 );
                 self.record_result_item(result).await;
 
-                if !heal_opts.remove {
-                    self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
-                }
+                let unresolved_delete_recovery =
+                    !heal_opts.remove && self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
 
                 if self.options.recursive {
                     self.heal_bucket_objects(bucket, "").await?;
+                }
+                if unresolved_delete_recovery {
+                    return Err(Error::transient_skip("Delete recovery remains unresolved after ordinary bucket heal"));
                 }
 
                 if !self.options.recursive {
@@ -563,6 +567,7 @@ impl HealTask {
             set: self.options.set_index,
             ..Default::default()
         };
+        let mut unresolved_delete_recovery = false;
         if let Some(result) = self
             .await_with_control(self.storage.recover_delete_prefix_transactions(
                 bucket,
@@ -572,10 +577,15 @@ impl HealTask {
             ))
             .await?
         {
+            unresolved_delete_recovery = result.delete_recovery.is_some_and(|status| status.has_unresolved());
             self.record_result_item(result).await;
         }
 
-        self.heal_bucket_objects(bucket, prefix).await
+        self.heal_bucket_objects(bucket, prefix).await?;
+        if unresolved_delete_recovery {
+            return Err(Error::transient_skip("Delete recovery remains unresolved after ordinary prefix heal"));
+        }
+        Ok(())
     }
 
     #[hotpath::measure]
