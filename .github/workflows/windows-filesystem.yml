@@ -21,11 +21,14 @@ on:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/set_disk/ops/locking.rs"
+      - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
+      - "crates/utils/src/path.rs"
       - "rustfs/build.rs"
       - "rustfs/Cargo.toml"
       - "rustfs/src/main.rs"
@@ -41,11 +44,14 @@ on:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/set_disk/ops/locking.rs"
+      - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
+      - "crates/utils/src/path.rs"
       - "rustfs/build.rs"
       - "rustfs/Cargo.toml"
       - "rustfs/src/main.rs"
@@ -97,9 +103,9 @@ jobs:
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
 
-      - name: Test extended-length path conversion
+      - name: Test Windows path conversion
         shell: pwsh
-        run: cargo test -p rustfs-utils --no-default-features --features path --lib extended_length_path -- --nocapture
+        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
 
       - name: Test Windows volume and disk-space probes
         shell: pwsh

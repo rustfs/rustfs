@@ -28,6 +28,7 @@ use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
 use crate::runtime::sources as runtime_sources;
 use rand::prelude::SliceRandom;
+use rustfs_utils::path::object_name_disk_identity;
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -63,9 +64,12 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
             NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
         };
 
+        // Lock the file the disk resolves, not the spelling: on Windows `a\b`
+        // and `a/b` share one xl.meta, so they must share one lock. The key is
+        // folded by the requesting node only; lock servers compare it verbatim.
         let resource = ObjectKey {
             bucket: Arc::from(bucket),
-            object: Arc::from(object),
+            object: Arc::from(object_name_disk_identity(object).as_ref()),
             version: None,
         };
 

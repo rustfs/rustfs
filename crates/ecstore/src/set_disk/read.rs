@@ -2741,6 +2741,7 @@ mod metadata_cache_tests {
     use super::*;
     use crate::set_disk::core::io_primitives::disk_call_counters;
     use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
+    use rustfs_utils::path::object_name_disk_identity;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -4096,6 +4097,63 @@ mod metadata_cache_tests {
             "per-key invalidation must physically remove the retired generation"
         );
         assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
+    }
+
+    async fn cache_valid_test_fileinfo(set: &SetDisks, object: &str) {
+        let fi = valid_test_fileinfo(object);
+        let generation = set.get_object_metadata_cache_generation("bucket", object);
+        set.cache_get_object_fileinfo(
+            ("bucket", object),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
+        assert!(set.cached_get_object_fileinfo("bucket", object).await.is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn metadata_cache_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a\\b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_some(),
+            "off Windows `a\\b` is a different object and must not retire `a/b`"
+        );
+        assert!(set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_metadata_cache_shares_backslash_and_slash_spellings() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a/b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_some(),
+            "both spellings address the same xl.meta and must share one cache entry"
+        );
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_none(),
+            "a mutation through `a\\b` must retire metadata cached for `a/b`"
+        );
+
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+        set.invalidate_get_object_metadata_cache("bucket", "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none(),
+            "a mutation through `a/b` must retire metadata cached for `a\\b`"
+        );
     }
 
     #[tokio::test]
