@@ -58,10 +58,32 @@ record permits a PUT; a matching record rejects it, and malformed records or
 failed reads also reject it. Repeating the seal verifies the same identity.
 
 Distributed or remote-disk configurations reject artifact PUTs and this seal
-operation. A remote RPC timeout does not prove that its physical write stopped;
-the current ownership chain only retains local disk workers. Remote completion
-confirmation is required before this capability can be enabled there. Ordinary
-buckets retain their existing behavior.
+operation. Receiver-side fencing is implemented, but the full distributed
+admission boundary is not yet enabled. In particular, classification of a legacy
+RPC as an ordinary-bucket write must remain valid through physical completion,
+including cancellation and bucket deletion/recreation. A remote timeout, quorum
+response or expired lock lease cannot prove that a physical writer stopped.
+
+Each managed PUT now carries its metadata-derived identity into the physical
+local disk writer. On Unix, a descriptor-pinned directory under
+`.rustfs-artifact-put-seals/<identity digest>/` contains two permanent lock inodes
+and a closing marker. The stable digest binds bucket name, incarnation and full
+attempt prefix. The admission lock serializes checking the marker with obtaining
+a shared active-write lease. Both the mutation and its blocking filesystem
+workers retain that lease. Sealing durably writes the marker and syncs all parent
+entries before waiting for an exclusive active-write lock. Cancellation during
+this wait loses only the confirmation; subsequent admission remains denied.
+These files must not be deleted, replaced or omitted during disk restoration.
+Non-Unix platforms reject this disk-fence operation.
+
+The dedicated `ArtifactRenameData` and `SealArtifactAttemptPuts` RPCs require
+body-bound authentication and a ready listener-owned storage instance. Their
+receivers validate the bucket incarnation; seal requests also bind the expected
+physical disk UUID. Seal response proofs cover the complete request, actual disk
+identity and outcome. Old peers cannot be used through a legacy-method fallback.
+The coordinator requires every configured disk, including offline slots, and
+rejects missing or mismatched identities. These receiver mechanisms alone do
+not authorize enabling distributed artifact buckets or garbage collection.
 
 The PUT commit path takes locks in this order: bucket lifecycle, attempt record,
 then target object. Same-attempt commits are serialized; uploading a body does

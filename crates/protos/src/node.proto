@@ -328,7 +328,8 @@ message RenameDataRequest {
   // legacy rename request body; a non-empty token is checked at the target's
   // rename linearization point.
   bytes scanner_publication_lease_token = 8;
-  // Required by RenameDataAtIncarnation; never accepted by legacy RenameData.
+  // Required by RenameDataAtIncarnation and ArtifactRenameData; never accepted
+  // by legacy RenameData. ArtifactRenameData also requires an empty scanner token.
   bytes bucket_incarnation_id = 9;
 }
 
@@ -337,6 +338,25 @@ message RenameDataResponse {
   string rename_data_resp = 2;
   optional Error error = 3;
   bytes rename_data_resp_bin = 4;
+}
+
+// Receiver derives the managed prefix from authoritative bucket metadata.
+message SealArtifactAttemptPutsRequest {
+  string disk = 1;
+  string bucket = 2;
+  bytes bucket_incarnation_id = 3;
+  string attempt_prefix = 4;
+  // Required non-nil UUID of the physical disk admitted by the caller.
+  bytes expected_disk_id = 5;
+}
+
+message SealArtifactAttemptPutsResponse {
+  bool success = 1;
+  optional Error error = 2;
+  // Authenticates the complete canonical request and every response field below.
+  bytes response_proof = 3;
+  // Required actual physical disk UUID; must match request.expected_disk_id.
+  bytes disk_id = 4;
 }
 
 message MakeVolumesRequest {
@@ -1236,6 +1256,8 @@ service NodeService {
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc ArtifactRenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc SealArtifactAttemptPuts(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only

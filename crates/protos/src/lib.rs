@@ -1021,6 +1021,52 @@ pub fn canonical_rename_data_request_body(
     Ok(body.finish())
 }
 
+/// Artifact publication has its own mandatory body-bound RPC domain. The
+/// receiver validates the incarnation and rejects scanner tokens before writing.
+pub fn canonical_artifact_rename_data_request_body(
+    request: &proto_gen::node_service::RenameDataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-artifact-rename-data-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.scanner_publication_lease_token)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_seal_artifact_attempt_puts_request_body(
+    request: &proto_gen::node_service::SealArtifactAttemptPutsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-seal-artifact-attempt-puts-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.bucket)?;
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    body.push_str(&request.attempt_prefix)?;
+    body.push_bytes(&request.expected_disk_id)?;
+    Ok(body.finish())
+}
+
+/// The proof covers the exact request and actual disk identity, so another
+/// disk, incarnation or attempt cannot reuse a successful seal acknowledgement.
+pub fn canonical_seal_artifact_attempt_puts_response_body(
+    request: &proto_gen::node_service::SealArtifactAttemptPutsRequest,
+    response: &proto_gen::node_service::SealArtifactAttemptPutsResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-seal-artifact-attempt-puts-response-v1\0");
+    body.push_bytes(&canonical_seal_artifact_attempt_puts_request_body(request)?)?;
+    body.push_bool(response.success);
+    body.push_bool(response.error.is_some());
+    body.push_u32(response.error.as_ref().map_or(0, |error| error.code));
+    body.push_str(response.error.as_ref().map_or("", |error| error.error_info.as_str()))?;
+    body.push_bytes(&response.disk_id)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_version_request_body(
     request: &proto_gen::node_service::DeleteVersionRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1334,6 +1380,192 @@ mod disk_mutation_canonical_tests {
         assert_ne!(
             canonical_rename_data_request_body(&shifted_left).unwrap(),
             canonical_rename_data_request_body(&shifted_right).unwrap(),
+        );
+    }
+
+    #[test]
+    fn artifact_rename_data_canonical_body_binds_every_field() {
+        let baseline = RenameDataRequest {
+            disk: "disk-a".into(),
+            src_volume: "tmp".into(),
+            src_path: "staged".into(),
+            dst_volume: "artifacts".into(),
+            dst_path: "outputs/tenant/run/attempt/image".into(),
+            file_info: "{}".into(),
+            file_info_bin: vec![0x80].into(),
+            bucket_incarnation_id: vec![1; 16].into(),
+            ..Default::default()
+        };
+        let mut bodies = vec![canonical_artifact_rename_data_request_body(&baseline).expect("artifact request")];
+        for mutate in [
+            |r: &mut RenameDataRequest| r.disk = "disk-b".into(),
+            |r: &mut RenameDataRequest| r.src_volume = "other-tmp".into(),
+            |r: &mut RenameDataRequest| r.src_path = "other-stage".into(),
+            |r: &mut RenameDataRequest| r.dst_volume = "other-artifacts".into(),
+            |r: &mut RenameDataRequest| r.dst_path = "other-attempt/image".into(),
+            |r: &mut RenameDataRequest| r.file_info = "[]".into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81].into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![2; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![3; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_artifact_rename_data_request_body(&request).expect("changed artifact request"));
+        }
+        assert_all_distinct(&bodies);
+        assert_ne!(bodies[0], canonical_rename_data_request_body(&baseline).expect("legacy request"));
+        let left = RenameDataRequest {
+            src_volume: "ab".into(),
+            src_path: "c".into(),
+            ..baseline.clone()
+        };
+        let right = RenameDataRequest {
+            src_volume: "a".into(),
+            src_path: "bc".into(),
+            ..baseline
+        };
+        assert_ne!(
+            canonical_artifact_rename_data_request_body(&left).expect("left fields"),
+            canonical_artifact_rename_data_request_body(&right).expect("right fields")
+        );
+    }
+
+    fn seal_request() -> proto_gen::node_service::SealArtifactAttemptPutsRequest {
+        proto_gen::node_service::SealArtifactAttemptPutsRequest {
+            disk: "disk-a".into(),
+            bucket: "artifacts".into(),
+            bucket_incarnation_id: vec![1; 16].into(),
+            attempt_prefix: "outputs/tenant/run/attempt".into(),
+            expected_disk_id: vec![2; 16].into(),
+        }
+    }
+
+    #[test]
+    fn artifact_put_seal_canonical_body_binds_every_request_field_and_response_scope() {
+        use proto_gen::node_service::{SealArtifactAttemptPutsRequest, SealArtifactAttemptPutsResponse};
+        let baseline = seal_request();
+        let response = SealArtifactAttemptPutsResponse {
+            success: true,
+            disk_id: baseline.expected_disk_id.clone(),
+            ..Default::default()
+        };
+        let mut requests = vec![canonical_seal_artifact_attempt_puts_request_body(&baseline).expect("seal request")];
+        let mut responses =
+            vec![canonical_seal_artifact_attempt_puts_response_body(&baseline, &response).expect("seal response")];
+        for mutate in [
+            |r: &mut SealArtifactAttemptPutsRequest| r.disk = "disk-b".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.bucket = "other-bucket".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.bucket_incarnation_id = vec![3; 16].into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.bucket_incarnation_id = Vec::new().into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.attempt_prefix = "outputs/tenant/run/other".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.expected_disk_id = vec![4; 16].into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.expected_disk_id = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            requests.push(canonical_seal_artifact_attempt_puts_request_body(&request).expect("changed seal request"));
+            responses.push(
+                canonical_seal_artifact_attempt_puts_response_body(&request, &response).expect("changed seal response scope"),
+            );
+        }
+        assert_all_distinct(&requests);
+        assert_all_distinct(&responses);
+        assert_ne!(requests[0], responses[0], "request and response domains must differ");
+        let left = SealArtifactAttemptPutsRequest {
+            disk: "ab".into(),
+            bucket: "c".into(),
+            ..baseline.clone()
+        };
+        let right = SealArtifactAttemptPutsRequest {
+            disk: "a".into(),
+            bucket: "bc".into(),
+            ..baseline
+        };
+        assert_ne!(
+            canonical_seal_artifact_attempt_puts_request_body(&left).expect("left fields"),
+            canonical_seal_artifact_attempt_puts_request_body(&right).expect("right fields")
+        );
+    }
+
+    #[test]
+    fn artifact_put_seal_canonical_response_binds_every_semantic_field() {
+        use proto_gen::node_service::{Error, SealArtifactAttemptPutsResponse};
+        let request = seal_request();
+        let baseline = SealArtifactAttemptPutsResponse {
+            success: true,
+            error: Some(Error {
+                code: 1,
+                error_info: "sealed".into(),
+            }),
+            disk_id: request.expected_disk_id.clone(),
+            ..Default::default()
+        };
+        let mut bodies = vec![canonical_seal_artifact_attempt_puts_response_body(&request, &baseline).expect("seal response")];
+        for mutate in [
+            |r: &mut SealArtifactAttemptPutsResponse| r.success = false,
+            |r: &mut SealArtifactAttemptPutsResponse| r.error = None,
+            |r: &mut SealArtifactAttemptPutsResponse| {
+                r.error = Some(Error {
+                    code: 2,
+                    error_info: "sealed".into(),
+                })
+            },
+            |r: &mut SealArtifactAttemptPutsResponse| {
+                r.error = Some(Error {
+                    code: 1,
+                    error_info: "other error".into(),
+                })
+            },
+            |r: &mut SealArtifactAttemptPutsResponse| r.disk_id = vec![3; 16].into(),
+            |r: &mut SealArtifactAttemptPutsResponse| r.disk_id = Vec::new().into(),
+        ] {
+            let mut response = baseline.clone();
+            mutate(&mut response);
+            bodies.push(canonical_seal_artifact_attempt_puts_response_body(&request, &response).expect("changed seal response"));
+        }
+        assert_all_distinct(&bodies);
+        let absent = SealArtifactAttemptPutsResponse {
+            error: None,
+            ..baseline.clone()
+        };
+        let empty = SealArtifactAttemptPutsResponse {
+            error: Some(Error::default()),
+            ..absent.clone()
+        };
+        assert_ne!(
+            canonical_seal_artifact_attempt_puts_response_body(&request, &absent).expect("absent error"),
+            canonical_seal_artifact_attempt_puts_response_body(&request, &empty).expect("present empty error")
+        );
+        let left = SealArtifactAttemptPutsResponse {
+            error: Some(Error {
+                code: 1,
+                error_info: "ab".into(),
+            }),
+            disk_id: b"c".to_vec().into(),
+            ..baseline.clone()
+        };
+        let right = SealArtifactAttemptPutsResponse {
+            error: Some(Error {
+                code: 1,
+                error_info: "a".into(),
+            }),
+            disk_id: b"bc".to_vec().into(),
+            ..baseline.clone()
+        };
+        assert_ne!(
+            canonical_seal_artifact_attempt_puts_response_body(&request, &left).expect("left response fields"),
+            canonical_seal_artifact_attempt_puts_response_body(&request, &right).expect("right response fields")
+        );
+        let signed = SealArtifactAttemptPutsResponse {
+            response_proof: vec![9; 32].into(),
+            ..baseline.clone()
+        };
+        assert_eq!(
+            canonical_seal_artifact_attempt_puts_response_body(&request, &signed).expect("proof exclusion"),
+            bodies[0],
+            "proof must not authenticate itself"
         );
     }
 

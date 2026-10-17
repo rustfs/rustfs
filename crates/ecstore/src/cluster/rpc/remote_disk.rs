@@ -2123,6 +2123,51 @@ fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
 }
 
 impl RemoteDisk {
+    pub(crate) async fn seal_artifact_puts(
+        &self,
+        expected_disk: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> Result<()> {
+        use rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest;
+        self.execute_with_timeout_for_op(
+            "seal_artifact_puts",
+            || async {
+                let body = SealArtifactAttemptPutsRequest {
+                    disk: self.endpoint.to_string(),
+                    bucket: bucket.to_owned(),
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                    attempt_prefix: attempt_prefix.to_owned(),
+                    expected_disk_id: expected_disk.as_bytes().to_vec().into(),
+                };
+                let canonical = rustfs_protos::canonical_seal_artifact_attempt_puts_request_body(&body)
+                    .map_err(|_| Error::other("artifact seal request is too large"))?;
+                let mut request = Request::new(body.clone());
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                let response = self
+                    .get_client()
+                    .await?
+                    .seal_artifact_attempt_puts(request)
+                    .await?
+                    .into_inner();
+                let canonical = rustfs_protos::canonical_seal_artifact_attempt_puts_response_body(&body, &response)
+                    .map_err(|_| Error::other("artifact seal response is too large"))?;
+                crate::cluster::rpc::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+                    .map_err(|_| Error::other("artifact seal response proof is invalid"))?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                if response.error.is_some() || Uuid::from_slice(&response.disk_id).ok() != Some(expected_disk) {
+                    return Err(Error::other("artifact seal response disk identity mismatch"));
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn rename_data_borrowed(
         &self,
@@ -2132,7 +2177,7 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None, None)
             .await
     }
 
@@ -2145,6 +2190,7 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
         scanner_publication_lease_token: Option<Uuid>,
+        artifact_incarnation: Option<Uuid>,
     ) -> Result<RenameDataResp> {
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
@@ -2167,8 +2213,11 @@ impl RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
-                    bucket_incarnation_id: crate::store::bucket_heal_scope_for_object(dst_volume, dst_path)
-                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                    bucket_incarnation_id: artifact_incarnation
+                        .or_else(|| {
+                            crate::store::bucket_heal_scope_for_object(dst_volume, dst_path).map(|scope| scope.incarnation)
+                        })
+                        .map(|incarnation| incarnation.as_bytes().to_vec().into())
                         .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
@@ -2181,7 +2230,11 @@ impl RemoteDisk {
                         .map(|token| token.as_bytes().to_vec().into())
                         .unwrap_or_default(),
                 });
-                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                let canonical_body = if artifact_incarnation.is_some() {
+                    rustfs_protos::canonical_artifact_rename_data_request_body(request.get_ref())
+                } else {
+                    rustfs_protos::canonical_rename_data_request_body(request.get_ref())
+                };
                 let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
                 if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
@@ -2191,7 +2244,9 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
                 }
 
-                let response = if incarnation_bound {
+                let response = if artifact_incarnation.is_some() {
+                    client.artifact_rename_data(request).await?
+                } else if incarnation_bound {
                     // Older peers return Unimplemented before mutation; never downgrade.
                     client.rename_data_at_incarnation(request).await?
                 } else {

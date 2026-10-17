@@ -551,6 +551,7 @@ impl LocalDiskWrapper {
         guards: super::RenameDataGuards,
     ) -> super::RenameDataObservation {
         let super::RenameDataGuards {
+            artifact_put: _,
             external_guard,
             namespace_owner,
             ..
@@ -1464,6 +1465,14 @@ pub struct LocalDiskWrapper {
 }
 
 impl LocalDiskWrapper {
+    pub async fn acquire_artifact_put_lease(&self, key: [u8; 32]) -> Result<Arc<super::local::ArtifactPutLease>> {
+        self.disk.acquire_artifact_put_lease(key).await
+    }
+
+    pub async fn seal_artifact_puts(&self, key: [u8; 32]) -> Result<()> {
+        self.disk.seal_artifact_puts(key).await
+    }
+
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
         let admission = DiskIoAdmission::new(disk.endpoint().to_string());

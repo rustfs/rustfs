@@ -4660,6 +4660,7 @@ impl SetDisks {
                         write_quorum,
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
+                    .with_artifact_put(_artifact_put_guard.as_ref().map(|guard| guard.identity))
                     .with_publication_scope(commit_scanner_publication_scope.clone())
                     .with_rollback_receipt(commit_rollback_receipt.clone())
                     .with_namespace_commit_guard((!is_meta_bucketname(&commit_bucket)).then(|| {

@@ -434,7 +434,8 @@ pub struct RenameDataRequest {
     /// rename linearization point.
     #[prost(bytes = "bytes", tag = "8")]
     pub scanner_publication_lease_token: ::prost::bytes::Bytes,
-    /// Required by RenameDataAtIncarnation; never accepted by legacy RenameData.
+    /// Required by RenameDataAtIncarnation and ArtifactRenameData; never accepted
+    /// by legacy RenameData. ArtifactRenameData also requires an empty scanner token.
     #[prost(bytes = "bytes", tag = "9")]
     pub bucket_incarnation_id: ::prost::bytes::Bytes,
 }
@@ -448,6 +449,34 @@ pub struct RenameDataResponse {
     pub error: ::core::option::Option<Error>,
     #[prost(bytes = "bytes", tag = "4")]
     pub rename_data_resp_bin: ::prost::bytes::Bytes,
+}
+/// Receiver derives the managed prefix from authoritative bucket metadata.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SealArtifactAttemptPutsRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "4")]
+    pub attempt_prefix: ::prost::alloc::string::String,
+    /// Required non-nil UUID of the physical disk admitted by the caller.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub expected_disk_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SealArtifactAttemptPutsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+    /// Authenticates the complete canonical request and every response field below.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
+    /// Required actual physical disk UUID; must match request.expected_disk_id.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub disk_id: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MakeVolumesRequest {
@@ -2338,6 +2367,36 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "RenameDataAtIncarnation"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn artifact_rename_data(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ArtifactRenameData");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ArtifactRenameData"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn seal_artifact_attempt_puts(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SealArtifactAttemptPutsRequest>,
+        ) -> std::result::Result<tonic::Response<super::SealArtifactAttemptPutsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/SealArtifactAttemptPuts");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "SealArtifactAttemptPuts"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn make_volumes(
             &mut self,
             request: impl tonic::IntoRequest<super::MakeVolumesRequest>,
@@ -3544,6 +3603,14 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::RenameDataRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
+        async fn artifact_rename_data(
+            &self,
+            request: tonic::Request<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
+        async fn seal_artifact_attempt_puts(
+            &self,
+            request: tonic::Request<super::SealArtifactAttemptPutsRequest>,
+        ) -> std::result::Result<tonic::Response<super::SealArtifactAttemptPutsResponse>, tonic::Status>;
         async fn make_volumes(
             &self,
             request: tonic::Request<super::MakeVolumesRequest>,
@@ -4707,6 +4774,62 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RenameDataAtIncarnationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ArtifactRenameData" => {
+                    #[allow(non_camel_case_types)]
+                    struct ArtifactRenameDataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenameDataRequest> for ArtifactRenameDataSvc<T> {
+                        type Response = super::RenameDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RenameDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::artifact_rename_data(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ArtifactRenameDataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/SealArtifactAttemptPuts" => {
+                    #[allow(non_camel_case_types)]
+                    struct SealArtifactAttemptPutsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::SealArtifactAttemptPutsRequest> for SealArtifactAttemptPutsSvc<T> {
+                        type Response = super::SealArtifactAttemptPutsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::SealArtifactAttemptPutsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::seal_artifact_attempt_puts(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SealArtifactAttemptPutsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

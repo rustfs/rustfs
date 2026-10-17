@@ -139,6 +139,7 @@ impl ArtifactPutTarget {
         let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &path).await?;
         let attempt = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
         let guard = ArtifactPutGuard {
+            identity: self.record.identity(),
             attempt,
             lifecycle,
             _snapshot: snapshot,
@@ -157,7 +158,15 @@ impl ArtifactPutTarget {
     }
 }
 
+/// Internal, metadata-derived identity carried to each physical disk writer.
+#[derive(Clone, Copy)]
+pub(crate) struct ArtifactPutIdentity {
+    pub(crate) incarnation: Uuid,
+    pub(crate) receiver_key: [u8; 32],
+}
+
 pub(crate) struct ArtifactPutGuard {
+    pub(crate) identity: ArtifactPutIdentity,
     attempt: WriteCommitGuard,
     lifecycle: Option<Arc<BucketIncarnationFenceGuard>>,
     _snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
@@ -344,6 +353,47 @@ async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
 }
 
 impl ECStore {
+    /// Legacy disk RPCs cannot publish into a managed artifact namespace.
+    pub async fn reject_legacy_artifact_mutation(&self, bucket: &str) -> crate::disk::error::Result<()> {
+        use crate::disk::error::DiskError;
+        if super::utils::has_bad_path_component(bucket) {
+            return Err(DiskError::FileAccessDenied);
+        }
+        if super::utils::is_meta_bucketname(bucket) {
+            return Ok(());
+        }
+        // Receiver classification must not migrate a legacy incarnation or
+        // reacquire the bucket namespace lock held by a DeleteBucket caller.
+        let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        if !persisted || metadata.artifact_base_prefix.is_some() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn artifact_receiver_identity(
+        &self,
+        bucket: &str,
+        expected: Uuid,
+        object: &str,
+        seal: bool,
+    ) -> Result<ArtifactPutIdentity> {
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if expected.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected {
+            return Err(Error::other("artifact receiver bucket incarnation mismatch"));
+        }
+        if seal {
+            Ok(PutSealRecord::new(&metadata, object)?.identity())
+        } else {
+            Ok(ArtifactPutTarget::from_metadata(&metadata, object)?
+                .ok_or_else(|| Error::other("artifact receiver requires a managed bucket"))?
+                .record
+                .identity())
+        }
+    }
+
     /// Create a dedicated versioned bucket and observe its current incarnation.
     /// A successful receipt does not assert that this request created that generation.
     pub async fn make_artifact_bucket(self: Arc<Self>, bucket: &str, base_prefix: &str) -> Result<Uuid> {
@@ -500,6 +550,21 @@ pub(crate) fn reject_unsupported_artifact_write(metadata: &BucketMetadata) -> Re
 }
 
 impl PutSealRecord {
+    fn identity(&self) -> ArtifactPutIdentity {
+        // Stable disk key, independent of JSON field order and seal serialization.
+        let mut digest = Sha256::new();
+        digest.update(b"rustfs-artifact-put-receiver-v1\0");
+        digest.update((self.bucket.len() as u64).to_be_bytes());
+        digest.update(self.bucket.as_bytes());
+        digest.update(self.incarnation_id.as_bytes());
+        digest.update((self.attempt_prefix.len() as u64).to_be_bytes());
+        digest.update(self.attempt_prefix.as_bytes());
+        ArtifactPutIdentity {
+            incarnation: self.incarnation_id,
+            receiver_key: digest.finalize().into(),
+        }
+    }
+
     fn new(metadata: &BucketMetadata, attempt_prefix: &str) -> Result<Self> {
         let base_prefix = metadata
             .artifact_base_prefix
@@ -771,6 +836,52 @@ impl ECStore {
 }
 
 impl ECStore {
+    async fn close_artifact_receivers(&self, record: &PutSealRecord) -> Result<()> {
+        use crate::disk::{Disk, DiskAPI as _};
+        use std::collections::BTreeMap;
+        let mut disks = BTreeMap::new();
+        // Enumerate configured slots, including offline disks. Quorum is not
+        // enough: every possible late receiver must durably close this attempt.
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                for disk in set.disk_inventory().await {
+                    let disk = disk.ok_or_else(|| Error::other("artifact seal requires every configured disk"))?;
+                    if disks.insert(disk.endpoint().to_string(), disk).is_some() {
+                        return Err(Error::other("artifact seal disk topology is ambiguous"));
+                    }
+                }
+            }
+        }
+        let configured: std::collections::BTreeSet<_> = self
+            .pools
+            .iter()
+            .flat_map(|pool| pool.endpoints.endpoints.as_ref().iter().map(ToString::to_string))
+            .collect();
+        if configured.is_empty() || disks.keys().cloned().collect::<std::collections::BTreeSet<_>>() != configured {
+            return Err(Error::other("artifact seal configured disk topology mismatch"));
+        }
+        let key = record.identity().receiver_key;
+        futures::future::try_join_all(disks.into_values().map(|disk| {
+            Box::pin(async move {
+                let expected = disk
+                    .get_disk_id()
+                    .await
+                    .map_err(Error::other)?
+                    .filter(|id| !id.is_nil())
+                    .ok_or_else(|| Error::other("artifact seal disk identity is unavailable"))?;
+                match disk.as_ref() {
+                    Disk::Local(local) => local.seal_artifact_puts(key).await.map_err(Error::other),
+                    Disk::Remote(remote) => remote
+                        .seal_artifact_puts(expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
+                        .await
+                        .map_err(Error::other),
+                }
+            })
+        }))
+        .await?;
+        Ok(())
+    }
+
     /// Seal ordinary ECStore PUTs for one artifact attempt. This does not seal
     /// CopyObject, multipart completion, replication, restore or repair paths.
     pub async fn seal_artifact_attempt_puts(
@@ -779,32 +890,38 @@ impl ECStore {
         expected_incarnation: Uuid,
         attempt_prefix: &str,
     ) -> Result<()> {
-        require_local_put_seal_topology(&self).await?;
-        if self.ctx.lock_manager().is_disabled() {
-            return Err(Error::other("artifact PUT sealing requires namespace locking"));
-        }
-        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
-        if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation {
-            return Err(Error::other("artifact PUT seal bucket incarnation mismatch"));
-        }
-        let record = PutSealRecord::new(&metadata, attempt_prefix)?;
-        let lifecycle = self.acquire_bucket_incarnation_fence(bucket, expected_incarnation).await?;
-        let store = Arc::clone(&self);
-        // The config transaction owns the closure and lifecycle guard even if
-        // its request waiter is cancelled. Its save drains the physical tail.
-        with_config_object_write_lock(Arc::clone(&self), record.path(), move |guard| async move {
-            if lifecycle.is_lock_lost() || guard.is_lock_lost() {
-                return Err(Error::other("artifact PUT seal fence was lost"));
+        // Keep the transaction and receiver fan-out out of caller future layouts.
+        Box::pin(async move {
+            require_local_put_seal_topology(&self).await?;
+            if self.ctx.lock_manager().is_disabled() {
+                return Err(Error::other("artifact PUT sealing requires namespace locking"));
             }
-            if !record.exists(Arc::clone(&store), &guard).await? {
-                save_config_no_lock(store, &record.path(), serde_json::to_vec(&record)?, &guard).await?;
+            let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+            if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation
+            {
+                return Err(Error::other("artifact PUT seal bucket incarnation mismatch"));
             }
-            if lifecycle.is_lock_lost() || guard.is_lock_lost() {
-                return Err(Error::other("artifact PUT seal fence was lost"));
-            }
-            Ok(())
+            let record = PutSealRecord::new(&metadata, attempt_prefix)?;
+            let lifecycle = self.acquire_bucket_incarnation_fence(bucket, expected_incarnation).await?;
+            let store = Arc::clone(&self);
+            // The config transaction owns the closure and lifecycle guard even if
+            // its request waiter is cancelled. Its save drains the physical tail.
+            with_config_object_write_lock(Arc::clone(&self), record.path(), move |guard| async move {
+                if lifecycle.is_lock_lost() || guard.is_lock_lost() {
+                    return Err(Error::other("artifact PUT seal fence was lost"));
+                }
+                if !record.exists(Arc::clone(&store), &guard).await? {
+                    save_config_no_lock(Arc::clone(&store), &record.path(), serde_json::to_vec(&record)?, &guard).await?;
+                }
+                Box::pin(store.close_artifact_receivers(&record)).await?;
+                if lifecycle.is_lock_lost() || guard.is_lock_lost() {
+                    return Err(Error::other("artifact PUT seal fence was lost"));
+                }
+                Ok(())
+            })
+            .await?
         })
-        .await?
+        .await
     }
 }
 

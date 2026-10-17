@@ -2769,6 +2769,7 @@ async fn record_rename_rollback_outcomes(
 /// quorum and optional scanner lease map together avoids widening either
 /// fanout helper's argument list while preserving the fence semantics.
 pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
+    artifact_put: Option<crate::bucket::artifact::ArtifactPutIdentity>,
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
@@ -2782,12 +2783,21 @@ impl<'a> RenameDataFenceOptions<'a> {
         scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
     ) -> Self {
         Self {
+            artifact_put: None,
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: None,
             namespace_commit_guard: None,
             rollback_receipt: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_artifact_put(
+        mut self,
+        identity: Option<crate::bucket::artifact::ArtifactPutIdentity>,
+    ) -> Self {
+        self.artifact_put = identity;
+        self
     }
 
     pub(in crate::set_disk) fn with_rollback_receipt(mut self, receipt: RenameRollbackReceipt) -> Self {
@@ -3165,6 +3175,7 @@ impl SetDisks {
         fence_options: RenameDataFenceOptions<'_>,
     ) -> disk::error::Result<RenameDataCommit> {
         let RenameDataFenceOptions {
+            artifact_put,
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: _scanner_publication_commit_scope,
@@ -3253,6 +3264,7 @@ impl SetDisks {
                                     &dst_bucket,
                                     &dst_object,
                                     crate::disk::RenameDataGuards {
+                                        artifact_put,
                                         scanner_publication_lease_token,
                                         namespace_owner: namespace_commit_guard.clone(),
                                         ..Default::default()
@@ -3539,6 +3551,7 @@ impl SetDisks {
             .await;
         }
         let RenameDataFenceOptions {
+            artifact_put,
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope,
@@ -3654,6 +3667,7 @@ impl SetDisks {
                                     &dst_bucket,
                                     &dst_object,
                                     crate::disk::RenameDataGuards {
+                                        artifact_put,
                                         scanner_publication_lease_token,
                                         namespace_owner: namespace_commit_guard.clone(),
                                         ..Default::default()

@@ -33,6 +33,11 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    /// Resolve only this listener's active local registry; never an ambient store.
+    pub async fn local_mutation_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        local_mutation_disk(&self.ctx, disk_ref).await
+    }
+
     pub fn new(ctx: Arc<InstanceContext>) -> Self {
         Self { ctx }
     }
@@ -80,6 +85,90 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn local_mutation_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        local_mutation_disk(&self.ctx, disk_ref).await
+    }
+
+    /// Admit an artifact publication on the receiving instance, retaining its
+    /// own lifecycle and disk lease after the originating RPC is cancelled.
+    pub async fn rename_local_artifact_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        expected: Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        if source.0 != crate::disk::RUSTFS_META_TMP_BUCKET
+            || fi.version_id.is_none_or(|version| version.is_nil())
+            || fi.deleted
+            || self.ctx.lock_manager().is_disabled()
+        {
+            return Err(DiskError::FileAccessDenied);
+        }
+        // Receiver lifecycle read -> local admission -> physical disk mutation.
+        // Never reacquire the coordinator's distributed attempt write lock.
+        let lifecycle = Arc::new(
+            self.acquire_bucket_incarnation_fence(destination.0, expected)
+                .await
+                .map_err(|_| DiskError::FileAccessDenied)?,
+        );
+        let identity = self
+            .artifact_receiver_identity(destination.0, expected, destination.1, false)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        if lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        rename_local_data_with_ctx(
+            &self.ctx,
+            disk_ref,
+            source,
+            fi,
+            destination,
+            RenameDataGuards {
+                artifact_put: Some(identity),
+                external_guard: Some(lifecycle),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// A receiver acknowledgment means this exact disk has durably closed the
+    /// attempt and drained physical owners. An interrupted waiter proves neither.
+    pub async fn seal_local_artifact_puts(
+        &self,
+        disk_ref: &str,
+        expected_disk: Uuid,
+        bucket: &str,
+        expected_incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> DiskResult<Uuid> {
+        if expected_disk.is_nil() || self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let lifecycle = self
+            .acquire_bucket_incarnation_fence(bucket, expected_incarnation)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let identity = self
+            .artifact_receiver_identity(bucket, expected_incarnation, attempt_prefix, true)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let Disk::Local(local) = disk.as_ref() else { return Err(DiskError::DiskNotFound) };
+        local.seal_artifact_puts(identity.receiver_key).await?;
+        if lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        Ok(expected_disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,
@@ -249,6 +338,7 @@ impl ECStore {
                 scanner_publication_lease_token: scanner_token,
                 external_guard,
                 namespace_owner: None,
+                ..Default::default()
             },
         )
         .await
@@ -264,6 +354,12 @@ impl ECStore {
     ) -> DiskResult<()> {
         undo_local_write_with_ctx(&self.ctx, disk_ref, volume, path, fi, opts).await
     }
+}
+
+async fn local_mutation_disk(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<DiskStore> {
+    let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
+    admit_local_disk(ctx, &disk, id, false).await?;
+    Ok(disk)
 }
 
 // The optional ID is a cold lookup to cache only after final admission.

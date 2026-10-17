@@ -16,6 +16,7 @@ pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
 use self::commit::lock_rename_commit_directories;
 
+mod artifact_lease;
 mod commit;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
@@ -36,6 +37,7 @@ mod uring_read_chunks;
 #[cfg(any(target_os = "linux", test))]
 #[path = "uring_result_budget.rs"]
 mod uring_result_budget;
+pub use artifact_lease::ArtifactPutLease;
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -5493,6 +5495,16 @@ impl LocalDisk {
             .replacement_mount_lease_root()
             .ok_or_else(|| DiskError::other("replacement mount lease is no longer valid"))?;
         replacement_lease::acquire(root).await
+    }
+
+    pub async fn acquire_artifact_put_lease(self: &Arc<Self>, key: [u8; 32]) -> Result<Arc<ArtifactPutLease>> {
+        let root = artifact_lease::pinned_root(Arc::clone(self)).await?;
+        artifact_lease::acquire(root, key).await
+    }
+
+    pub async fn seal_artifact_puts(self: &Arc<Self>, key: [u8; 32]) -> Result<()> {
+        let root = artifact_lease::pinned_root(Arc::clone(self)).await?;
+        artifact_lease::seal(root, key).await
     }
 
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {

@@ -65,6 +65,27 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    pub(crate) async fn find_mutation_disk(&self, disk_ref: &str) -> Option<super::DiskStore> {
+        match self {
+            Self::Ready(store) => store.local_mutation_disk(disk_ref).await.ok(),
+            Self::Bootstrap(target) => target.local_mutation_disk(disk_ref).await.ok(),
+            Self::Unbound => None,
+        }
+    }
+
+    pub(crate) async fn reject_legacy_artifact_mutation(&self, volume: &str) -> Result<(), Status> {
+        use crate::storage::storage_api::ecstore_bucket::utils::{has_bad_path_component, is_meta_bucketname};
+        let allowed = match self {
+            Self::Ready(store) => store.reject_legacy_artifact_mutation(volume).await.is_ok(),
+            Self::Bootstrap(_) | Self::Unbound => !has_bad_path_component(volume) && is_meta_bucketname(volume),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("legacy artifact mutation is not permitted"))
+        }
+    }
+
     async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -135,9 +156,9 @@ fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Res
     }
 }
 
-struct DecodedRpcPayload<T> {
-    value: T,
-    from_msgpack: bool,
+pub(super) struct DecodedRpcPayload<T> {
+    pub(super) value: T,
+    pub(super) from_msgpack: bool,
 }
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(
@@ -360,14 +381,14 @@ fn encode_batch_read_version_response_payloads(
     Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
 }
 
-fn decode_rename_data_request_file_info(
+pub(super) fn decode_rename_data_request_file_info(
     binary: &[u8],
     json: &str,
 ) -> std::result::Result<DecodedRpcPayload<FileInfo>, DiskError> {
     decode_msgpack_or_json_with_source(binary, json, "FileInfo")
 }
 
-fn encode_rename_data_response_payloads(
+pub(super) fn encode_rename_data_response_payloads(
     rename_data_resp: &RenameDataResp,
     request_decoded_from_msgpack: bool,
 ) -> std::result::Result<(String, Vec<u8>), DiskError> {
@@ -498,7 +519,11 @@ impl NodeService {
             "delete_volume",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            // Volume deletion cannot publish an artifact version. It follows
+            // the coordinator's lifecycle-write path, including metadata-less
+            // legacy buckets; object publication admission does not apply.
             match disk.delete_volume(&request.volume, request.force).await {
                 Ok(_) => Ok(Response::new(DeleteVolumeResponse {
                     success: true,
@@ -687,7 +712,9 @@ impl NodeService {
             "delete_versions",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let mut versions = Vec::with_capacity(request.versions.len());
             for (index, version) in request.versions.iter().enumerate() {
                 let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
@@ -762,6 +789,7 @@ impl NodeService {
             return Err(Status::invalid_argument("retired marker deletion requires a non-nil bucket incarnation"));
         }
         let request = request.into_inner();
+        let target = self.local_mutation_target();
         let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
             Ok(file_info) => file_info,
             Err(err) => {
@@ -798,11 +826,12 @@ impl NodeService {
             ));
         }
         let result = if !request.bucket_incarnation_id.is_empty() {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let expected = Uuid::from_slice(&request.bucket_incarnation_id)
                 .ok()
                 .filter(|id| !id.is_nil())
                 .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
-            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            let LocalMutationTarget::Ready(store) = target else {
                 return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
             };
             store
@@ -816,15 +845,16 @@ impl NodeService {
                 )
                 .await
         } else if opts.undo_write {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             if request.force_del_marker {
                 Err(DiskError::other("undo_write cannot force a delete marker"))
             } else {
-                let target = self.local_mutation_target();
                 target
                     .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
                     .await
             }
-        } else if let Some(disk) = self.find_disk(&request.disk).await {
+        } else if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
                 .await
         } else {
@@ -1046,12 +1076,14 @@ impl NodeService {
             "write_metadata",
         )?;
         let request = request.into_inner();
+        let target = self.local_mutation_target();
         if !request.bucket_incarnation_id.is_empty() {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let expected = Uuid::from_slice(&request.bucket_incarnation_id)
                 .ok()
                 .filter(|id| !id.is_nil())
                 .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
-            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            let LocalMutationTarget::Ready(store) = target else {
                 return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
             };
             let value = decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo")
@@ -1064,7 +1096,8 @@ impl NodeService {
                 error: result.err().map(Into::into),
             }));
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -1102,7 +1135,9 @@ impl NodeService {
             "update_metadata",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -1178,7 +1213,9 @@ impl NodeService {
             "delete_paths",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             match disk.delete_paths(&request.volume, &request.paths).await {
                 Ok(_) => Ok(Response::new(DeletePathsResponse {
                     success: true,
@@ -1392,6 +1429,8 @@ impl NodeService {
             Some(token)
         };
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
+        target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+        target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
         #[cfg(feature = "e2e-test-hooks")]
         let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
         let result = target
@@ -1473,7 +1512,10 @@ impl NodeService {
             "rename_file",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
             let result = if request.durable {
                 disk.rename_file_durable(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
                     .await
@@ -1512,7 +1554,10 @@ impl NodeService {
             "rename_part",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
             match disk
                 .rename_part(
                     &request.src_volume,
@@ -1550,7 +1595,10 @@ impl NodeService {
             "prepare_part_transaction",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
             match disk
                 .prepare_part_transaction(
                     &request.src_volume,
@@ -1588,7 +1636,9 @@ impl NodeService {
             "settle_part_transaction",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let action = if request.rollback {
                 PartTransactionAction::Rollback
             } else {
@@ -1763,7 +1813,9 @@ impl NodeService {
         }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
+        let target = self.local_mutation_target();
         if !request.bucket_incarnation_id.is_empty() {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             if !request.scanner_publication_lease_token.is_empty() {
                 return Err(Status::invalid_argument("heal incarnation and scanner lease cannot be combined"));
             }
@@ -1771,7 +1823,7 @@ impl NodeService {
                 .ok()
                 .filter(|id| !id.is_nil())
                 .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
-            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            let LocalMutationTarget::Ready(store) = target else {
                 return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
             };
             let value = serde_json::from_str::<DeleteOptions>(&request.options)
@@ -1784,7 +1836,8 @@ impl NodeService {
                 error: result.err().map(Into::into),
             }));
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
                 Ok(options) => options,
                 Err(err) => {
@@ -1857,6 +1910,7 @@ impl NodeService {
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_write_all_request_body(request.get_ref()), "write_all")?;
         let request = request.into_inner();
+        let target = self.local_mutation_target();
         let data_len = request.data.len();
         let metrics = runtime_sources::current_internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
@@ -1868,7 +1922,8 @@ impl NodeService {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             data_len,
         );
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             match disk.write_all(&request.volume, &request.path, request.data).await {
                 Ok(_) => Ok(Response::new(WriteAllResponse {
                     success: true,
@@ -1904,6 +1959,7 @@ impl NodeService {
             "compare_and_update_file",
         )?;
         let request = request.into_inner();
+        let target = self.local_mutation_target();
         let data_len = request
             .expected
             .as_ref()
@@ -1919,7 +1975,8 @@ impl NodeService {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             data_len,
         );
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
             match disk
                 .compare_and_update_file(&request.volume, &request.path, request.expected, request.replacement)
                 .await
@@ -2551,6 +2608,151 @@ mod tests {
                     .expect("msgpack batch read version response should decode");
                 assert_eq!(decoded.path, responses[0].path);
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_artifact_tests {
+    use super::*;
+    use crate::storage::storage_api::set_tonic_canonical_body_digest;
+    use rustfs_iam::store::{
+        Store as _,
+        object::{IAM_CONFIG_PREFIX, ObjectStore},
+    };
+    use rustfs_kms::KmsServiceManager;
+    use std::sync::Arc;
+
+    fn mark_v2_authenticated<T>(request: &mut Request<T>) {
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid v2 metadata"));
+    }
+
+    fn write_request(disk: &str, volume: &str, path: &str) -> Request<WriteAllRequest> {
+        let mut request = Request::new(WriteAllRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            data: Bytes::from_static(b"legacy receiver bytes"),
+        });
+        let body = rustfs_protos::canonical_write_all_request_body(request.get_ref()).expect("canonical write");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("write digest");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_artifact_receiver_rejects_managed_but_persists_ordinary_and_internal_writes() {
+        let root = tempfile::tempdir().expect("receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("legacy-ordinary", false).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("legacy-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        ObjectStore::new(env.ecstore.clone())
+            .save_iam_config(serde_json::json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("IAM format");
+        let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("fixture IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            env.ecstore.clone(),
+            iam,
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = super::super::make_server_for_context(Some(context));
+        let disk = env.disk_paths[0].to_string_lossy().into_owned();
+        let denied = service
+            .handle_write_all(write_request(&disk, "legacy-managed", "blocked"))
+            .await
+            .expect_err("legacy managed write denied");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied, "ARTIFACT_LEGACY_RPC_ADMISSION");
+        assert!(!env.disk_paths[0].join("legacy-managed/blocked").exists(), "ARTIFACT_LEGACY_RPC_NO_WRITE");
+        let ordinary = service
+            .handle_write_all(write_request(&disk, "legacy-ordinary", "permitted"))
+            .await
+            .expect("ordinary receiver")
+            .into_inner();
+        assert!(ordinary.success, "ARTIFACT_LEGACY_RPC_ORDINARY_COMPAT");
+        assert_eq!(
+            tokio::fs::read(env.disk_paths[0].join("legacy-ordinary/permitted"))
+                .await
+                .expect("ordinary bytes"),
+            b"legacy receiver bytes"
+        );
+        let internal = service
+            .handle_write_all(write_request(&disk, ".rustfs.sys", "legacy-source"))
+            .await
+            .expect("internal receiver")
+            .into_inner();
+        assert!(internal.success, "ARTIFACT_LEGACY_RPC_INTERNAL_COMPAT");
+        let mut rename = Request::new(RenameFileRequest {
+            disk,
+            src_volume: ".rustfs.sys".into(),
+            src_path: "legacy-source".into(),
+            dst_volume: "legacy-managed".into(),
+            dst_path: "renamed".into(),
+            durable: false,
+        });
+        let body = rustfs_protos::canonical_rename_file_request_body(rename.get_ref()).expect("canonical rename");
+        set_tonic_canonical_body_digest(&mut rename, &body).expect("rename digest");
+        mark_v2_authenticated(&mut rename);
+        let denied = service
+            .handle_rename_file(rename)
+            .await
+            .expect_err("internal staging cannot bypass managed admission");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied, "ARTIFACT_LEGACY_RENAME_ADMISSION");
+        assert!(
+            !env.disk_paths[0].join("legacy-managed/renamed").exists(),
+            "ARTIFACT_LEGACY_RENAME_NO_WRITE"
+        );
+        assert_eq!(
+            tokio::fs::read(env.disk_paths[0].join(".rustfs.sys/legacy-source"))
+                .await
+                .expect("staged source remains"),
+            b"legacy receiver bytes"
+        );
+        // Deleting an empty legacy volume does not publish a version and must
+        // not require a metadata migration under the caller's namespace lock.
+        tokio::fs::create_dir(env.disk_paths[0].join("legacy-empty"))
+            .await
+            .expect("old empty volume");
+        let mut deletion = Request::new(DeleteVolumeRequest {
+            disk: env.disk_paths[0].to_string_lossy().into_owned(),
+            volume: "legacy-empty".into(),
+            force: false,
+        });
+        let canonical = rustfs_protos::canonical_delete_volume_request_body(deletion.get_ref()).expect("canonical delete");
+        set_tonic_canonical_body_digest(&mut deletion, &canonical).expect("delete digest");
+        mark_v2_authenticated(&mut deletion);
+        assert!(
+            service
+                .handle_delete_volume(deletion)
+                .await
+                .expect("legacy deletion")
+                .into_inner()
+                .success,
+            "ARTIFACT_LEGACY_METADATALESS_VOLUME_DELETE"
+        );
+        assert!(!env.disk_paths[0].join("legacy-empty").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_artifact_unbound_receiver_only_allows_canonical_internal_volumes() {
+        let target = LocalMutationTarget::Unbound;
+        assert!(target.reject_legacy_artifact_mutation(".rustfs.sys/tmp").await.is_ok());
+        assert!(target.reject_legacy_artifact_mutation("legacy-ordinary").await.is_err());
+        assert!(
+            target
+                .reject_legacy_artifact_mutation(".rustfs.sys/../legacy-managed")
+                .await
+                .is_err()
         );
     }
 }

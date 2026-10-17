@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::node_service::LocalMutationTarget;
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
+use crate::storage::storage_api::ServerContextSlot;
 use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
     PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
@@ -253,11 +255,32 @@ macro_rules! log_internode_put_file_stage_failure {
 #[derive(Clone)]
 pub struct InternodeRpcService<S> {
     inner: S,
+    server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
 impl<S> InternodeRpcService<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self { inner, server_ctx: None }
+    }
+
+    pub fn with_server_context(inner: S, server_ctx: Arc<ServerContextSlot>) -> Self {
+        Self {
+            inner,
+            server_ctx: Some(server_ctx),
+        }
+    }
+
+    fn mutation_target(&self) -> LocalMutationTarget {
+        match self.server_ctx.as_ref() {
+            Some(slot) => match slot.installed_object_store() {
+                Some(store) => LocalMutationTarget::Ready(store),
+                None => slot
+                    .bootstrap_target()
+                    .map(LocalMutationTarget::Bootstrap)
+                    .unwrap_or(LocalMutationTarget::Unbound),
+            },
+            None => LocalMutationTarget::Unbound,
+        }
     }
 }
 
@@ -405,7 +428,8 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        Box::pin(async move { Ok(handle_internode_rpc(req).await) })
+        let target = self.mutation_target();
+        Box::pin(async move { Ok(handle_internode_rpc(req, target).await) })
     }
 }
 
@@ -413,7 +437,7 @@ fn is_internode_rpc_path(path: &str) -> bool {
     path.starts_with(RPC_PREFIX)
 }
 
-async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
+async fn handle_internode_rpc(req: Request<Incoming>, target: LocalMutationTarget) -> Response<Body> {
     let operation = internode_http_operation(req.uri().path());
     let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
@@ -450,8 +474,8 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
             Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
             Err(response) => *response,
         },
-        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
-        (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
+        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false, target).await,
+        (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true, target).await,
         _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
     };
 
@@ -1440,7 +1464,7 @@ where
     }
 }
 
-async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response<Body> {
+async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: LocalMutationTarget) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let url = req.uri().to_string();
@@ -1492,7 +1516,11 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
         return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
     }
 
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    if target.reject_legacy_artifact_mutation(&query.volume).await.is_err() {
+        return response_with_status(StatusCode::FORBIDDEN, "legacy artifact mutation is not permitted");
+    }
+
+    let Some(disk) = target.find_mutation_disk(&query.disk).await else {
         log_internode_rpc_response_failure!(
             StatusCode::BAD_REQUEST,
             &path,
@@ -1802,6 +1830,25 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn unbound_http_put_receiver_only_allows_internal_staging() {
+        let service = super::InternodeRpcService::new(());
+        let target = service.mutation_target();
+        assert!(matches!(target, super::LocalMutationTarget::Unbound));
+        assert!(target.reject_legacy_artifact_mutation(".rustfs.sys/tmp").await.is_ok());
+        assert!(
+            target.find_mutation_disk("/unbound-http-target").await.is_none(),
+            "internal volume admission must not give an unbound receiver a mutation disk"
+        );
+        assert!(target.reject_legacy_artifact_mutation("ordinary-bucket").await.is_err());
+        assert!(
+            target
+                .reject_legacy_artifact_mutation(".rustfs.sys/../managed-bucket")
+                .await
+                .is_err()
+        );
+    }
     use super::{
         DEFAULT_READ_BUFFER_SIZE, DiskError, InternodeRpcService, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER,
         LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY,
@@ -1911,8 +1958,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("test server should accept a connection");
             let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+            let slot = super::ServerContextSlot::with_instance_context(crate::storage::storage_api::new_instance_ctx());
             server_http1::Builder::new()
-                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(InternodeRpcService::new(fallback)))
+                .serve_connection(
+                    TokioIo::new(socket),
+                    TowerToHyperService::new(InternodeRpcService::with_server_context(fallback, slot)),
+                )
                 .await
                 .expect("test connection should complete");
         });
@@ -1985,7 +2036,7 @@ mod tests {
         ] {
             let nonce = uuid::Uuid::new_v4();
             let mut uri = format!(
-                "{PUT_FILE_AUTH_STREAM_PATH}?disk=definitely-missing&volume=bucket&path=object&append=false&size=0&put_file_auth=digest-trailer-v1&put_file_nonce={nonce}"
+                "{PUT_FILE_AUTH_STREAM_PATH}?disk=definitely-missing&volume=.rustfs.sys%2Ftmp&path=object&append=false&size=0&put_file_auth=digest-trailer-v1&put_file_nonce={nonce}"
             );
             if let Some(server_epoch) = server_epoch {
                 uri.push_str(&format!("&put_file_server_epoch={server_epoch}"));

@@ -861,6 +861,8 @@ mod tests {
     mod artifact_bucket_tests;
     #[cfg(feature = "test-util")]
     mod artifact_put_seal_tests;
+    #[cfg(all(feature = "test-util", unix))]
+    mod artifact_receiver_tests;
     #[cfg(feature = "test-util")]
     mod artifact_repair_tests;
     #[cfg(feature = "test-util")]

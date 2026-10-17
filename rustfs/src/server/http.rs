@@ -2288,7 +2288,7 @@ fn process_connection(
         #[cfg(not(feature = "swift"))]
         let http_service = s3_service;
         let http_service = EarlyResponseBodyService::new(http_service, request_body_idle_timeout);
-        let http_service = InternodeRpcService::new(http_service);
+        let http_service = InternodeRpcService::with_server_context(http_service, server_ctx.clone());
 
         let external_service = hybrid(http_service.clone(), rpc_service.clone());
         let internode_service = hybrid(http_service, rpc_service);

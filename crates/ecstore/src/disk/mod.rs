@@ -89,6 +89,7 @@ use uuid::Uuid;
 /// Independent admission and physical ownership for one disk rename.
 #[derive(Default)]
 pub(crate) struct RenameDataGuards {
+    pub(crate) artifact_put: Option<crate::bucket::artifact::ArtifactPutIdentity>,
     pub(crate) scanner_publication_lease_token: Option<Uuid>,
     pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
     pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
@@ -852,10 +853,20 @@ impl Disk {
         fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
-        guards: RenameDataGuards,
+        mut guards: RenameDataGuards,
     ) -> RenameDataObservation {
         match self {
             Disk::Local(local_disk) => {
+                if let Some(identity) = guards.artifact_put.take() {
+                    let lease = match local_disk.acquire_artifact_put_lease(identity.receiver_key).await {
+                        Ok(lease) => lease,
+                        Err(error) => return RenameDataObservation::unknown(Err(error)),
+                    };
+                    // Keep the existing timeout policy; physical workers own the
+                    // receiver lease even after the caller's disk deadline.
+                    guards.namespace_owner =
+                        Some(Arc::new((guards.external_guard.clone(), guards.namespace_owner.take(), lease)));
+                }
                 local_disk
                     .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
                     .await
@@ -869,6 +880,7 @@ impl Disk {
                         dst_volume,
                         dst_path,
                         guards.scanner_publication_lease_token,
+                        guards.artifact_put.map(|identity| identity.incarnation),
                     )
                     .await,
             ),
@@ -901,6 +913,7 @@ impl Disk {
                         dst_volume,
                         dst_path,
                         scanner_publication_lease_token,
+                        None,
                     )
                     .await
             }

@@ -580,6 +580,7 @@ fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> StorageR
     Ok(())
 }
 
+mod artifact;
 mod bucket;
 mod disk;
 mod event;
@@ -593,7 +594,7 @@ pub struct NodeService {
     server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
-enum LocalMutationTarget {
+pub(crate) enum LocalMutationTarget {
     Ready(Arc<ECStore>),
     Bootstrap(BootstrapLocalTarget),
     Unbound,
@@ -1698,6 +1699,17 @@ impl Node for NodeService {
 
         let out_stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream)))
+    }
+
+    async fn artifact_rename_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_artifact_rename_data(request).await
+    }
+
+    async fn seal_artifact_attempt_puts(
+        &self,
+        request: Request<SealArtifactAttemptPutsRequest>,
+    ) -> Result<Response<SealArtifactAttemptPutsResponse>, Status> {
+        self.handle_seal_artifact_attempt_puts(request).await
     }
 
     async fn rename_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
@@ -3097,7 +3109,9 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 24] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 26] = [
+        "artifactrenamedata",
+        "sealartifactattemptputs",
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
@@ -4396,6 +4410,9 @@ mod tests {
     async fn every_mutating_handler_enforces_its_body_digest() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
+        // Canonical internal volumes keep storage admission independent of
+        // this test's authentication-only fixture and missing target disk.
+        let internal_volume = crate::storage::storage_api::ecstore_disk::RUSTFS_META_BUCKET;
         let mut covered_methods = HashSet::new();
 
         macro_rules! assert_gated {
@@ -4437,14 +4454,39 @@ mod tests {
         }
 
         assert_gated!(
+            artifact_rename_data,
+            RenameDataRequest {
+                bucket_incarnation_id: Uuid::new_v4().as_bytes().to_vec().into(),
+                disk: disk.clone(),
+                src_volume: internal_volume.into(),
+                src_path: "sp".into(),
+                dst_volume: internal_volume.into(),
+                dst_path: "dp".into(),
+                file_info_bin: vec![0x80].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_artifact_rename_data_request_body
+        );
+        assert_gated!(
+            seal_artifact_attempt_puts,
+            rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest {
+                disk: disk.clone(),
+                bucket: internal_volume.into(),
+                bucket_incarnation_id: Uuid::new_v4().as_bytes().to_vec().into(),
+                attempt_prefix: "attempt/".into(),
+                expected_disk_id: Uuid::new_v4().as_bytes().to_vec().into(),
+            },
+            rustfs_protos::canonical_seal_artifact_attempt_puts_request_body
+        );
+        assert_gated!(
             rename_data,
             RenameDataRequest {
                 bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
-                src_volume: "src".into(),
+                src_volume: internal_volume.into(),
                 src_path: "sp".into(),
                 file_info: "{}".into(),
-                dst_volume: "dst".into(),
+                dst_volume: internal_volume.into(),
                 dst_path: "dp".into(),
                 file_info_bin: vec![0x80].into(),
                 scanner_publication_lease_token: Vec::new().into(),
@@ -4456,7 +4498,7 @@ mod tests {
             DeleteVersionRequest {
                 bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 file_info: "{}".into(),
                 force_del_marker: false,
@@ -4470,6 +4512,8 @@ mod tests {
             rename_data_at_incarnation,
             RenameDataRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
+                src_volume: internal_volume.into(),
+                dst_volume: internal_volume.into(),
                 ..Default::default()
             },
             rustfs_protos::canonical_rename_data_request_body
@@ -4478,6 +4522,7 @@ mod tests {
             delete_version_at_incarnation,
             DeleteVersionRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
+                volume: internal_volume.into(),
                 ..Default::default()
             },
             rustfs_protos::canonical_delete_version_request_body
@@ -4487,7 +4532,7 @@ mod tests {
             DeleteVersionRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 file_info: "{}".into(),
                 force_del_marker: false,
@@ -4501,6 +4546,7 @@ mod tests {
             write_metadata_at_incarnation,
             WriteMetadataRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
+                volume: internal_volume.into(),
                 ..Default::default()
             },
             rustfs_protos::canonical_write_metadata_request_body
@@ -4509,6 +4555,7 @@ mod tests {
             delete_at_incarnation,
             DeleteRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
+                volume: internal_volume.into(),
                 ..Default::default()
             },
             rustfs_protos::canonical_delete_request_body
@@ -4517,7 +4564,7 @@ mod tests {
             delete_versions,
             DeleteVersionsRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 versions: vec!["a".into()],
                 opts: "{}".into(),
                 versions_bin: vec![vec![0x80].into()],
@@ -4530,7 +4577,7 @@ mod tests {
             WriteMetadataRequest {
                 bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 file_info: "{}".into(),
                 file_info_bin: vec![0x80].into(),
@@ -4541,7 +4588,7 @@ mod tests {
             update_metadata,
             UpdateMetadataRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 file_info: "{}".into(),
                 opts: "{}".into(),
@@ -4554,7 +4601,7 @@ mod tests {
             write_all,
             WriteAllRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 data: vec![0x01, 0x02].into(),
             },
@@ -4564,7 +4611,7 @@ mod tests {
             compare_and_update_file,
             CompareAndUpdateFileRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 expected: Some(vec![0x01].into()),
                 replacement: Some(vec![0x02].into()),
@@ -4576,7 +4623,7 @@ mod tests {
             DeleteRequest {
                 bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 options: "{}".into(),
                 scanner_publication_lease_token: Vec::new().into(),
@@ -4587,7 +4634,7 @@ mod tests {
             acquire_snapshot_lease,
             SnapshotLeaseRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 ttl_ms: 60_000,
             },
@@ -4597,7 +4644,7 @@ mod tests {
             renew_snapshot_lease,
             SnapshotLeaseRenewRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 token: vec![1; 16].into(),
                 ttl_ms: 60_000,
@@ -4608,7 +4655,7 @@ mod tests {
             release_snapshot_lease,
             SnapshotLeaseReleaseRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 path: "p".into(),
                 token: vec![1; 16].into(),
             },
@@ -4618,7 +4665,7 @@ mod tests {
             delete_paths,
             DeletePathsRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 paths: vec!["a".into()],
             },
             rustfs_protos::canonical_delete_paths_request_body
@@ -4628,9 +4675,9 @@ mod tests {
             RenameFileRequest {
                 durable: false,
                 disk: disk.clone(),
-                src_volume: "src".into(),
+                src_volume: internal_volume.into(),
                 src_path: "sp".into(),
-                dst_volume: "dst".into(),
+                dst_volume: internal_volume.into(),
                 dst_path: "dp".into(),
             },
             rustfs_protos::canonical_rename_file_request_body
@@ -4639,9 +4686,9 @@ mod tests {
             rename_part,
             RenamePartRequest {
                 disk: disk.clone(),
-                src_volume: "src".into(),
+                src_volume: internal_volume.into(),
                 src_path: "sp".into(),
-                dst_volume: "dst".into(),
+                dst_volume: internal_volume.into(),
                 dst_path: "dp".into(),
                 meta: vec![0x03].into(),
             },
@@ -4651,9 +4698,9 @@ mod tests {
             prepare_part_transaction,
             PreparePartTransactionRequest {
                 disk: disk.clone(),
-                src_volume: "src".into(),
+                src_volume: internal_volume.into(),
                 src_path: "sp".into(),
-                dst_volume: "dst".into(),
+                dst_volume: internal_volume.into(),
                 dst_path: "dp".into(),
                 meta: vec![0x04].into(),
             },
@@ -4663,7 +4710,7 @@ mod tests {
             settle_part_transaction,
             SettlePartTransactionRequest {
                 disk: disk.clone(),
-                volume: "dst".into(),
+                volume: internal_volume.into(),
                 path: "dp".into(),
                 rollback: true,
             },
@@ -4673,7 +4720,7 @@ mod tests {
             delete_volume,
             DeleteVolumeRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
                 force: true,
             },
             rustfs_protos::canonical_delete_volume_request_body
@@ -4682,7 +4729,7 @@ mod tests {
             make_volume,
             MakeVolumeRequest {
                 disk: disk.clone(),
-                volume: "v".into(),
+                volume: internal_volume.into(),
             },
             rustfs_protos::canonical_make_volume_request_body
         );
@@ -4690,7 +4737,7 @@ mod tests {
             make_volumes,
             MakeVolumesRequest {
                 disk,
-                volumes: vec!["v".into()],
+                volumes: vec![internal_volume.into()],
             },
             rustfs_protos::canonical_make_volumes_request_body
         );
@@ -4699,6 +4746,61 @@ mod tests {
         assert_eq!(
             covered_methods, expected_methods,
             "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_mutation_handlers_require_v2_body_digest() {
+        let service = make_server();
+        macro_rules! assert_requires_v2_body {
+            ($method:ident, $message:expr, $canonical:path) => {{
+                let message = $message;
+                for version in [None, Some("1")] {
+                    let mut request = Request::new(message.clone());
+                    let body = $canonical(request.get_ref()).expect("canonical artifact body");
+                    set_tonic_canonical_body_digest(&mut request, &body).expect("artifact body digest");
+                    if let Some(version) = version {
+                        request
+                            .metadata_mut()
+                            .insert("x-rustfs-rpc-auth-version", version.parse().expect("auth version"));
+                    }
+                    assert_eq!(
+                        service
+                            .$method(request)
+                            .await
+                            .expect_err("artifact RPC requires v2")
+                            .code(),
+                        tonic::Code::PermissionDenied,
+                    );
+                }
+                for digest in [None, Some("UNSIGNED-PAYLOAD")] {
+                    let mut request = Request::new(message.clone());
+                    mark_v2_authenticated(&mut request);
+                    if let Some(digest) = digest {
+                        request
+                            .metadata_mut()
+                            .insert("x-rustfs-content-sha256", digest.parse().expect("digest metadata"));
+                    }
+                    assert_eq!(
+                        service
+                            .$method(request)
+                            .await
+                            .expect_err("artifact RPC requires a signed body")
+                            .code(),
+                        tonic::Code::PermissionDenied,
+                    );
+                }
+            }};
+        }
+        assert_requires_v2_body!(
+            artifact_rename_data,
+            RenameDataRequest::default(),
+            rustfs_protos::canonical_artifact_rename_data_request_body
+        );
+        assert_requires_v2_body!(
+            seal_artifact_attempt_puts,
+            rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest::default(),
+            rustfs_protos::canonical_seal_artifact_attempt_puts_request_body
         );
     }
 
@@ -6315,7 +6417,10 @@ mod tests {
         }];
         fi.data = Some(Bytes::from_static(b"target-rpc-inline"));
         fi.set_inline_data();
-        disk.make_volume("target-rpc").await.expect("target volume");
+        // Only Ready mutation fixtures need user-bucket authority. Keep the
+        // shared fixture's bootstrap/global-isolation setup unchanged.
+        crate::storage::storage_api::init_bucket_metadata_sys(fixture.env.ecstore.clone(), Vec::new()).await;
+        fixture.env.make_bucket("target-rpc", false).await;
         disk.write_metadata("target-rpc", "target-rpc", "staged", fi.clone())
             .await
             .expect("stage real inline body");
@@ -6455,10 +6560,8 @@ mod tests {
         let result = service
             .rename_data(target_rename_request(&disk, &fi))
             .await
-            .expect("handler reply")
-            .into_inner();
-        assert!(!result.success);
-        assert!(result.error.is_some());
+            .expect_err("unbound ordinary-bucket mutation must fail at admission");
+        assert_eq!(result.code(), tonic::Code::PermissionDenied);
         assert_eq!(
             tokio::fs::read(disk.path().join("target-rpc/staged/xl.meta"))
                 .await
@@ -6513,6 +6616,8 @@ mod tests {
         };
 
         let fixture = target_rpc_fixture().await;
+        crate::storage::storage_api::init_bucket_metadata_sys(fixture.env.ecstore.clone(), Vec::new()).await;
+        fixture.env.make_bucket("delete-quorum-rpc", true).await;
         let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind DELETE target");
         let addr = listener.local_addr().expect("target address");
@@ -6577,7 +6682,6 @@ mod tests {
         original.set_inline_data();
         let mut before = Vec::new();
         for disk in &local_disks {
-            disk.make_volume(bucket).await.expect("create target bucket");
             disk.write_metadata(bucket, bucket, object, original.clone())
                 .await
                 .expect("seed existing version");
@@ -6847,11 +6951,14 @@ mod tests {
     async fn rename_data_same_uuid_uses_captured_instance_instead_of_global_disk() {
         use crate::storage::storage_api::{
             ECStore,
+            contract::bucket::{BucketOperations as _, MakeBucketOptions},
             ecstore_disk::{DiskAPI, RUSTFS_META_BUCKET, ReadOptions},
             init_local_disks_with_instance_ctx, new_instance_ctx, read_config_no_lock,
         };
         use rustfs_filemeta::{FileInfo, ObjectPartInfo};
         use tokio_util::sync::CancellationToken;
+
+        const VOLUME: &str = "namespace-target-context";
 
         async fn build_store(root: &std::path::Path) -> Arc<ECStore> {
             let mut endpoints = Vec::new();
@@ -6880,9 +6987,11 @@ mod tests {
             // unrelated background recovery is cancelled for this process.
             let shutdown = CancellationToken::new();
             shutdown.cancel();
-            ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("local address"), pools, shutdown, instance)
+            let store = ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("local address"), pools, shutdown, instance)
                 .await
-                .expect("initialize isolated ECStore")
+                .expect("initialize isolated ECStore");
+            crate::storage::storage_api::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            store
         }
 
         async fn context(store: &Arc<ECStore>) -> Arc<crate::runtime_sources::AppContext> {
@@ -6950,6 +7059,12 @@ mod tests {
             let root_b = tempfile::tempdir().expect("instance B directory");
             let root_a = tempfile::tempdir().expect("instance A directory");
             let store_b = build_store(root_b.path()).await;
+            store_b
+                .make_bucket(VOLUME, &MakeBucketOptions::default())
+                .await
+                .expect("create ordinary bucket with authoritative metadata before copying B");
+            let incarnation = store_b.bucket_incarnation_id_from_disk(VOLUME).await.expect("B bucket authority");
+            assert!(!incarnation.is_nil());
             let context_b = context(&store_b).await;
             let published = crate::runtime_sources::publish_test_app_context(context_b.clone());
             assert!(Arc::ptr_eq(&published, &context_b), "B must win the process AppContext publication");
@@ -6979,11 +7094,23 @@ mod tests {
                     Some(bytes) => tokio::fs::write(target, bytes).await.expect("copy complete internal file"),
                 }
             }
+            // Copy the empty user-bucket namespace with its internal metadata.
+            // Otherwise A would see an orphaned generation, not the same bucket.
+            for index in 0..4 {
+                tokio::fs::create_dir_all(root_a.path().join(format!("disk{index}")).join(VOLUME))
+                    .await
+                    .expect("copy empty ordinary bucket namespace to A");
+            }
             assert_eq!(internal_snapshot(root_a.path()).await, snapshot, "A must receive the complete physical snapshot");
             assert_eq!(internal_snapshot(root_b.path()).await, snapshot, "B's source snapshot must remain unchanged");
             assert!(!store_b.scanner_data_usage_publication_blocked().await);
             assert_eq!(store_b.scanner_namespace_mutation_generation(), snapshot_generation);
             let store_a = build_store(root_a.path()).await;
+            assert_eq!(
+                store_a.bucket_incarnation_id_from_disk(VOLUME).await.expect("A copied bucket authority"),
+                incarnation,
+                "both isolated instances must classify the same ordinary bucket generation"
+            );
             assert_eq!(
                 read_config_no_lock(store_a.clone(), "pool.bin").await.expect("read A's restarted pool metadata"),
                 pool_config,
@@ -7014,7 +7141,7 @@ mod tests {
                 .expect("global UUID lookup must resolve B before the request");
             assert!(Arc::ptr_eq(&global_disk, &disk_b));
 
-            let volume = "namespace-target-context";
+            let volume = VOLUME;
             let object = "destination";
             let staging = "staged";
             let version = Uuid::new_v4();
@@ -7025,7 +7152,6 @@ mod tests {
                 (&disk_a, Bytes::from_static(b"old-body-A")),
                 (&disk_b, Bytes::from_static(b"old-body-B")),
             ] {
-                disk.make_volume(volume).await.expect("create destination volume");
                 disk.write_metadata(volume, volume, object, file_info(object, version, old_body.clone()))
                     .await
                     .expect("write real old object metadata and inline body");
