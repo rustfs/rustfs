@@ -26,6 +26,8 @@ on:
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
+      - "crates/utils/src/os/**"
+      - "crates/utils/Cargo.toml"
       - "crates/utils/src/path.rs"
       - "rustfs/build.rs"
       - "rustfs/Cargo.toml"
@@ -47,6 +49,8 @@ on:
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
+      - "crates/utils/src/os/**"
+      - "crates/utils/Cargo.toml"
       - "crates/utils/src/path.rs"
       - "rustfs/build.rs"
       - "rustfs/Cargo.toml"
@@ -102,6 +106,23 @@ jobs:
       - name: Test Windows path conversion
         shell: pwsh
         run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
+
+      - name: Test Windows volume and disk-space probes
+        shell: pwsh
+        run: |
+          # Map a drive letter to the temp drive's administrative share so the
+          # remote-volume probe also covers mapped network drives.
+          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
+          net use R: "\\localhost\$drive`$" /persistent:no
+          if ($LASTEXITCODE -eq 0) {
+            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
+          } else {
+            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
+          }
+          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
+          $status = $LASTEXITCODE
+          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
+          exit $status
 
       - name: Test Windows handle guards
         shell: pwsh
