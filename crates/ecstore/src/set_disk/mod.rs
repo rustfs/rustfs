@@ -893,6 +893,8 @@ pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
 #[cfg(test)]
+pub(crate) use ops::object::hermetic_set_disks_support::{HermeticSetFixture, hermetic_set_disks_for_pool_with_default_parity};
+#[cfg(test)]
 pub(crate) use ops::object::{DeleteCleanupBarrier, DeleteObjectCommitBarrier};
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};

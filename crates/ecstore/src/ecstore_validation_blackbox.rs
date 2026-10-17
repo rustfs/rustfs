@@ -157,17 +157,8 @@ async fn refresh_loss_lock_client_keeps_rejection_observable_for_late_waiters() 
 pub(crate) async fn make_local_set_disks(
     drive_count: usize,
     parity_count: usize,
-) -> (
-    crate::set_disk::ops::object::hermetic_set_disks_support::HermeticSetFixture,
-    Arc<SetDisks>,
-) {
-    let (fixture, _, set) =
-        crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity(
-            drive_count,
-            0,
-            parity_count,
-        )
-        .await;
+) -> (crate::set_disk::HermeticSetFixture, Arc<SetDisks>) {
+    let (fixture, _, set) = crate::set_disk::hermetic_set_disks_for_pool_with_default_parity(drive_count, 0, parity_count).await;
     (fixture, set)
 }
 
