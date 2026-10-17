@@ -99,12 +99,27 @@ is cancelled or times out. Repair of an existing version remains allowed after
 PUT sealing; it does not reopen logical publication. Ordinary-bucket repair also
 retains lifecycle ownership to prevent publication into a recreated bucket.
 
-This operation does not yet prove that every write path is permanently sealed.
+`ECStore::retire_artifact_object_version` disables repair of one exact version
+inside an already sealed attempt. It requires the current bucket incarnation,
+an object strictly inside the attempt prefix, and a non-null version. Retirement
+does not delete data: existing bytes remain readable, and other versions remain
+repairable. Directory objects use the same canonical identity as storage.
+
+Retirement takes lifecycle, attempt, then record locks. It waits for earlier
+physical repair publishers, including workers whose callers were cancelled.
+The record transaction retains its owners after request cancellation; retrying
+the same identity confirms the durable outcome. An immutable record binds the
+bucket incarnation, attempt, object, and version. Unreadable, corrupt, or
+mismatched records fail closed. Normal repair and minority metadata regeneration
+check the selected version before publication, including when the caller asks
+for the latest version. Refusal is not a physical absence proof.
+
+These operations do not yet prove that every write path is permanently sealed.
 Remote physical completion and a controlled external seal interface still
-require enforcement and verification. Before deleting an artifact, GC also
-needs a durable retirement decision checked by repair: a PUT seal alone must not
-allow repair to recreate a deleted version from surviving shards. Runner must
-not consume this PUT-only operation as a permanent all-writes seal.
+require enforcement and verification. Runner must not consume PUT sealing or
+version retirement alone as permanent all-writes authority. Retirement records
+must not expire by age; restoring storage from before a retirement can rewind
+that decision and requires a separate recovery contract.
 
 Before Runner can rely on a seal, storage must fence every supported write path
 for the exact bucket incarnation and attempt namespace, retain the fence through
@@ -131,6 +146,7 @@ cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_write_entrypoint -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_repair -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_retirement -- --test-threads=1
 ```
 
 `crates/ecstore/src/store/init/tests/artifact_put_seal_tests.rs` pauses real
@@ -152,6 +168,14 @@ deliberately has no timeout. The metadata case uses public SetDisks repair to
 trigger real disk-wrapper timeouts, checks per-disk timeout counters, and verifies
 that the physical publishers still retain the attempt barrier.
 
-These checks establish bucket identity, versioning, and ordinary PUT sealing.
+`crates/ecstore/src/store/init/tests/artifact_retirement_tests.rs` uses real
+four-disk storage to check exact-version and latest repair refusal, minority
+metadata regeneration, restart, record corruption, directory normalization, and
+unretired-version repair. Physical syscall pauses cover both cancelled repair
+workers and cancelled retirement publication. Retirement leaves GET available
+and never supplies evidence that the version is physically absent.
+
+These checks establish bucket identity, versioning, ordinary PUT sealing, and
+exact-version repair retirement.
 They do not certify all-writes sealing, backup retention, or safe artifact
 deletion.

@@ -864,6 +864,8 @@ mod tests {
     #[cfg(feature = "test-util")]
     mod artifact_repair_tests;
     #[cfg(feature = "test-util")]
+    mod artifact_retirement_tests;
+    #[cfg(feature = "test-util")]
     mod artifact_write_entrypoint_tests;
 
     use super::{
