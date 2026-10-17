@@ -5819,8 +5819,9 @@ impl LocalDisk {
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
                     Ok((info, is_root_disk)) => {
-                        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref())
-                        {
+                        let physical_device_ids = match win32_volume_path(&root).and_then(|volume_path| {
+                            rustfs_utils::os::get_physical_device_ids(volume_path.to_string_lossy().as_ref())
+                        }) {
                             Ok(ids) => ids,
                             Err(err) => {
                                 warn!(
@@ -12477,13 +12478,28 @@ async fn wait_for_startup_cleanup_signal(
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
+/// The disk root stays non-verbatim for `/`-joined IO, but the Win32 volume
+/// APIs behind `rustfs_utils::os` only accept a path past the legacy limit in
+/// extended-length form. Shorter roots are passed unchanged so the volume
+/// identities those APIs report keep their conventional `C:\` form.
+fn win32_volume_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    // CreateDirectoryW's 248-unit limit, the lowest of the legacy path limits.
+    const LEGACY_MAX_PATH: usize = 248;
+    if path.to_string_lossy().encode_utf16().count() < LEGACY_MAX_PATH {
+        return Ok(std::borrow::Cow::Borrowed(path));
+    }
+    rustfs_utils::extended_length_path(path)
+}
+
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path).inspect_err(|err| {
-        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
-    })?;
+    let disk_info = win32_volume_path(Path::new(&drive_path))
+        .and_then(|volume_path| get_info(&volume_path))
+        .inspect_err(|err| {
+            log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+        })?;
     let root_drive = if let Some(root_disk_threshold) = runtime_sources::root_disk_threshold_for_erasure_disk().await {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
@@ -19443,6 +19459,61 @@ mod test {
                 "{object}: backup should hold the pre-delete metadata"
             );
         }
+    }
+
+    /// Opens a disk at `root` and drives metadata and data reads and writes
+    /// through it: they extend the root by joining `/`-separated relative paths
+    /// as strings, so they all depend on the root staying non-verbatim.
+    async fn assert_local_disk_serves_objects_at(root: &Path) {
+        let endpoint = Endpoint::try_from(root.to_str().expect("disk root should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        assert!(
+            !disk.root.to_string_lossy().starts_with(r"\\?\"),
+            "the disk root must not be verbatim: {:?}",
+            disk.root
+        );
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("41414141-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("42424242-1111-2222-3333-444444444444").expect("data dir should parse");
+        let fi = test_file_info(object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+        let meta = test_meta(fi);
+        disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::from(meta.clone()))
+            .await
+            .expect("metadata should be written below the disk root");
+        let raw = disk
+            .read_xl(bucket, object, true)
+            .await
+            .expect("metadata should be read back");
+        assert_eq!(raw.buf, meta);
+
+        let payload = Bytes::from_static(b"part payload");
+        disk.write_all(bucket, "dir/other/part.1", payload.clone())
+            .await
+            .expect("data should be written below the disk root");
+        assert_eq!(
+            disk.read_all(bucket, "dir/other/part.1")
+                .await
+                .expect("data should be read back"),
+            payload
+        );
+    }
+
+    // A disk root past MAX_PATH resolved to `\\?\C:\...`, where `/` is not a
+    // separator, so the first `/`-joined metadata read (pool.bin.identity)
+    // failed with ERROR_INVALID_NAME and startup never completed.
+    #[tokio::test]
+    async fn windows_and_unix_local_disk_root_beyond_max_path_serves_objects() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut root = dir.path().to_path_buf();
+        while root.to_str().expect("temp dir should be utf8").encode_utf16().count() <= 270 {
+            root.push("r".repeat(100));
+        }
+        fs::create_dir_all(&root).await.expect("long disk root should be created");
+
+        assert_local_disk_serves_objects_at(&root).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

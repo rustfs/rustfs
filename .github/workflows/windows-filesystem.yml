@@ -93,9 +93,9 @@ jobs:
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
 
-      - name: Test extended-length path conversion
+      - name: Test Windows path conversion
         shell: pwsh
-        run: cargo test -p rustfs-utils --no-default-features --features path --lib extended_length_path -- --nocapture
+        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
 
       - name: Test Windows handle guards
         shell: pwsh

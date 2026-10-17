@@ -4048,7 +4048,10 @@ fn windows_final_path_with_flags(handle: &winapi_util::Handle, flags: u32) -> io
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows final path length exceeds usize"))?,
     );
     let path = PathBuf::from(OsString::from_wide(&buffer));
-    Ok(rustfs_utils::simplified(&path).to_path_buf())
+    // Keep the root in the non-verbatim form: callers extend it by joining
+    // `/`-separated relative paths, which a verbatim (`\\?\`) root would
+    // turn into ERROR_INVALID_NAME for UNC shares and roots past MAX_PATH.
+    Ok(rustfs_utils::non_verbatim(&path).into_owned())
 }
 
 #[cfg(windows)]
