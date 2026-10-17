@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Persistent attempt fences for ordinary ECStore PUTs. Other publication
-//! paths do not yet participate; these records are not authority for GC.
+//! Persistent artifact attempt fences and exact-version repair retirement.
+//! These records do not authorize object deletion or establish GC eligibility.
 
 use super::{metadata::BucketMetadata, metadata_sys};
 use crate::config::com::{read_config_observation_no_lock, save_config_no_lock, with_config_object_write_lock};
@@ -171,7 +171,8 @@ impl ArtifactPutGuard {
 /// One object repair owns the same attempt barrier as ordinary publication.
 /// The disk mutation lease retains this owner after an async waiter is dropped.
 pub(crate) struct ArtifactRepairScope {
-    store_id: Uuid,
+    store: Arc<ECStore>,
+    artifact: Option<PutSealRecord>,
     bucket: String,
     object: String,
     attempt: Option<WriteCommitGuard>,
@@ -188,6 +189,27 @@ impl ArtifactRepairScope {
         }
         if let Some(scope) = &self.bucket_heal {
             scope.check().map_err(Error::from)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_version(&self, version: Option<Uuid>) -> Result<()> {
+        self.check()?;
+        let Some(attempt) = &self.artifact else {
+            return Ok(());
+        };
+        let version = version
+            .filter(|version| !version.is_nil())
+            .ok_or_else(|| Error::other("artifact repair requires an exact version"))?;
+        let record = ArtifactVersionRetirementRecord::new(attempt, &self.object, version)?;
+        // The attempt owner excludes retirement throughout repair, including its
+        // physical tail. Each selected version still needs its own record check.
+        let lock = self.store.new_ns_lock(RUSTFS_META_BUCKET, &record.path()).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+        let retired = record.exists(Arc::clone(&self.store), &guard).await?;
+        self.check()?;
+        if retired {
+            return Err(Error::other("artifact object version is retired"));
         }
         Ok(())
     }
@@ -224,7 +246,7 @@ pub(crate) async fn with_artifact_repair_scope<T>(
     }
     let store = metadata_sys::object_store_in(ctx).await?;
     if let Some(scope) = artifact_repair_scope(bucket, object) {
-        if scope.store_id != store.id {
+        if scope.store.id != store.id {
             return Err(Error::other("artifact repair owner belongs to another store"));
         }
         scope.check()?;
@@ -266,7 +288,8 @@ pub(crate) async fn with_artifact_repair_scope<T>(
         None
     };
     let scope = Arc::new(ArtifactRepairScope {
-        store_id: store.id,
+        store: Arc::clone(&store),
+        artifact: record,
         bucket: bucket.to_owned(),
         object: rustfs_utils::path::encode_dir_object(object),
         attempt,
@@ -276,7 +299,7 @@ pub(crate) async fn with_artifact_repair_scope<T>(
     scope.check()?;
     // A seal freezes logical publication, not repair of an existing version.
     // Still validate any persisted record; unreadable or mismatched records fail closed.
-    if let (Some(record), Some(attempt)) = (&record, &scope.attempt) {
+    if let (Some(record), Some(attempt)) = (&scope.artifact, &scope.attempt) {
         record.exists(store, attempt).await?;
     }
     ARTIFACT_REPAIR_SCOPE
@@ -449,6 +472,74 @@ pub(crate) fn artifact_put_seal_record_path(bucket: &str, incarnation: Uuid, att
     format!("{BUCKET_META_PREFIX}/{bucket}/artifact-put-seals/{incarnation}/{digest}.json")
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactVersionRetirementRecord {
+    format_version: u8,
+    bucket: String,
+    incarnation_id: Uuid,
+    base_prefix: String,
+    attempt_prefix: String,
+    object: String,
+    version_id: Uuid,
+}
+
+impl ArtifactVersionRetirementRecord {
+    fn new(attempt: &PutSealRecord, object: &str, version_id: Uuid) -> Result<Self> {
+        if version_id.is_nil()
+            || object.len() <= attempt.attempt_prefix.len()
+            || attempt_prefix(&attempt.base_prefix, object)? != attempt.attempt_prefix
+        {
+            return Err(Error::other("invalid artifact version retirement target"));
+        }
+        Ok(Self {
+            format_version: 1,
+            bucket: attempt.bucket.clone(),
+            incarnation_id: attempt.incarnation_id,
+            base_prefix: attempt.base_prefix.clone(),
+            attempt_prefix: attempt.attempt_prefix.clone(),
+            object: rustfs_utils::path::encode_dir_object(object),
+            version_id,
+        })
+    }
+
+    fn path(&self) -> String {
+        artifact_version_retirement_record_path(
+            &self.bucket,
+            self.incarnation_id,
+            &self.attempt_prefix,
+            &self.object,
+            self.version_id,
+        )
+    }
+
+    async fn exists(&self, store: Arc<ECStore>, guard: &WriteCommitGuard) -> Result<bool> {
+        let bytes = match read_config_observation_no_lock(store, &self.path(), 16 * 1024, guard).await {
+            Ok((bytes, _)) => bytes,
+            Err(Error::ConfigNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let actual: Self = serde_json::from_slice(&bytes)?;
+        if actual != *self {
+            return Err(Error::other("artifact version retirement identity mismatch"));
+        }
+        Ok(true)
+    }
+}
+
+pub(crate) fn artifact_version_retirement_record_path(
+    bucket: &str,
+    incarnation: Uuid,
+    attempt_prefix: &str,
+    object: &str,
+    version: Uuid,
+) -> String {
+    let attempt = hex_simd::encode_to_string(Sha256::digest(attempt_prefix.as_bytes()), hex_simd::AsciiCase::Lower);
+    let object = rustfs_utils::path::encode_dir_object(object);
+    let object = hex_simd::encode_to_string(Sha256::digest(object.as_bytes()), hex_simd::AsciiCase::Lower);
+    format!("{BUCKET_META_PREFIX}/{bucket}/artifact-version-retirements/{incarnation}/{attempt}/{object}/{version}.json")
+}
+
 fn attempt_prefix<'a>(base_prefix: &str, object: &'a str) -> Result<&'a str> {
     let invalid = || Error::other("invalid artifact attempt prefix");
     let suffix = object.strip_prefix(base_prefix).ok_or_else(invalid)?;
@@ -472,6 +563,53 @@ fn attempt_prefix<'a>(base_prefix: &str, object: &'a str) -> Result<&'a str> {
         }
     }
     Ok(&object[..base_prefix.len() + tenant.len() + run.len() + attempt.len() + 3])
+}
+
+impl ECStore {
+    /// Persist repair retirement for one exact version in a sealed attempt.
+    /// This does not delete the version or authorize garbage collection.
+    pub async fn retire_artifact_object_version(
+        self: Arc<Self>,
+        bucket: &str,
+        expected_incarnation: Uuid,
+        attempt_prefix: &str,
+        object: &str,
+        version: Uuid,
+    ) -> Result<()> {
+        require_local_put_seal_topology(&self).await?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("artifact version retirement requires namespace locking"));
+        }
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation {
+            return Err(Error::other("artifact version retirement bucket incarnation mismatch"));
+        }
+        let seal = PutSealRecord::new(&metadata, attempt_prefix)?;
+        // Validate logical membership before applying the storage directory encoding.
+        let record = ArtifactVersionRetirementRecord::new(&seal, object, version)?;
+        let lifecycle = self.acquire_bucket_incarnation_fence(bucket, expected_incarnation).await?;
+        let store = Arc::clone(&self);
+        // Lifecycle -> attempt -> retirement record. The spawned transaction
+        // retains both outer owners when the request waiter is cancelled.
+        with_config_object_write_lock(self, seal.path(), move |attempt| async move {
+            if lifecycle.is_lock_lost() || attempt.is_lock_lost() {
+                return Err(Error::other("artifact version retirement fence was lost"));
+            }
+            if !seal.exists(Arc::clone(&store), &attempt).await? {
+                return Err(Error::other("artifact version retirement requires a sealed attempt"));
+            }
+            let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &record.path()).await?;
+            let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+            if !record.exists(Arc::clone(&store), &guard).await? {
+                save_config_no_lock(store, &record.path(), serde_json::to_vec(&record)?, &guard).await?;
+            }
+            if lifecycle.is_lock_lost() || attempt.is_lock_lost() || guard.is_lock_lost() {
+                return Err(Error::other("artifact version retirement fence was lost"));
+            }
+            Ok(())
+        })
+        .await?
+    }
 }
 
 impl ECStore {

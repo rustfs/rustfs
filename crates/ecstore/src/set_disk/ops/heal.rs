@@ -1033,6 +1033,9 @@ impl SetDisks {
                 let filter_by_etag = quorum_etag.is_some();
                 match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
                     Ok(mut latest_meta) => {
+                        if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(bucket, object) {
+                            scope.check_version(latest_meta.version_id).await.map_err(DiskError::other)?;
+                        }
                         Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
                         let protected =
                             !latest_meta.parts.is_empty() && latest_meta.parts.iter().all(|part| part.integrity.is_some());
@@ -2394,6 +2397,9 @@ impl SetDisks {
             return Ok(false);
         }
 
+        if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(bucket, object) {
+            scope.check_version(candidate.version_id).await.map_err(DiskError::other)?;
+        }
         let mut available = 0usize;
         for disk in disks {
             let Some(disk) = disk else {
