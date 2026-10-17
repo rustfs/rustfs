@@ -756,6 +756,9 @@ async fn blackbox_range_read_restores_exact_slice_with_one_offline_disk() {
 #[tokio::test]
 async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_metadata() {
     let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+    let store = crate::bucket::metadata_sys::object_store_in(set_disks.instance_ctx())
+        .await
+        .expect("fixture metadata authority should belong to this set");
     let bucket = "bb-delete-marker-read-negative";
     let object = "object.bin";
     let opts = ObjectOptions {
@@ -765,13 +768,26 @@ async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_
         ..Default::default()
     };
 
-    set_disks
+    store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("bucket should be created");
     let mut reader = PutObjReader::from_vec(b"body hidden by delete marker".to_vec());
     set_disks
-        .put_object(bucket, object, &mut reader, &opts)
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                object_lock_config_snapshot: Some(
+                    store
+                        .object_lock_config_snapshot(bucket)
+                        .await
+                        .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                ),
+                ..opts.clone()
+            },
+        )
         .await
         .expect("object should be written before delete marker");
 

@@ -10455,7 +10455,9 @@ mod tests {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
         let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
-        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let store =
+            Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
         let bucket = "select-snapshot-latest-delete-marker";
         let object = "versioned-object.bin";
         let versioned_opts = ObjectOptions {
@@ -10465,20 +10467,50 @@ mod tests {
             ..Default::default()
         };
 
-        for set_disks in [&first_set, &second_set] {
-            set_disks
-                .make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("bucket should be created");
-        }
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned bucket should be created in both pools");
         let mut older_reader = PutObjReader::from_vec(b"older visible generation".to_vec());
         first_set
-            .put_object(bucket, object, &mut older_reader, &versioned_opts)
+            .put_object(
+                bucket,
+                object,
+                &mut older_reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..versioned_opts.clone()
+                },
+            )
             .await
             .expect("older versioned object should be written");
         let mut put_reader = PutObjReader::from_vec(b"hidden generation".to_vec());
         second_set
-            .put_object(bucket, object, &mut put_reader, &versioned_opts)
+            .put_object(
+                bucket,
+                object,
+                &mut put_reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..versioned_opts.clone()
+                },
+            )
             .await
             .expect("versioned object should be written");
         let marker = second_set
@@ -10933,7 +10965,9 @@ mod tests {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
         let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
-        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let store =
+            Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
         let bucket = "prepared-reader-latest-delete-marker";
         let object = "versioned-object.bin";
         let versioned_opts = ObjectOptions {
@@ -10943,20 +10977,50 @@ mod tests {
             ..Default::default()
         };
 
-        for set_disks in [&first_set, &second_set] {
-            set_disks
-                .make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("bucket should be created");
-        }
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned bucket should be created in both pools");
         let mut older_reader = PutObjReader::from_vec(b"older visible generation".to_vec());
         first_set
-            .put_object(bucket, object, &mut older_reader, &versioned_opts)
+            .put_object(
+                bucket,
+                object,
+                &mut older_reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..versioned_opts.clone()
+                },
+            )
             .await
             .expect("older object should be written");
         let mut hidden_reader = PutObjReader::from_vec(b"hidden generation".to_vec());
         second_set
-            .put_object(bucket, object, &mut hidden_reader, &versioned_opts)
+            .put_object(
+                bucket,
+                object,
+                &mut hidden_reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..versioned_opts.clone()
+                },
+            )
             .await
             .expect("newer object should be written");
         let marker = second_set

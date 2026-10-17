@@ -15994,7 +15994,14 @@ mod tests {
 
     #[tokio::test]
     async fn set_level_versioned_delete_marker_hides_object_without_corrupting_version_metadata() {
-        let set_disks = make_local_bucket_test_set_disks_with_drive_count(4).await;
+        let (_fixture, _, set_disks) = hermetic_set_disks_for_pool_with_default_parity(4, 0, 2).await;
+        set_disks.set_test_storage_class_config(
+            storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[4])
+                .expect("test storage class should resolve for the local drive count"),
+        );
+        let store = crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("fixture metadata authority should belong to this set");
         let bucket = "bucket-versioned-delete";
         let object = "object.txt";
         let opts = ObjectOptions {
@@ -16003,13 +16010,26 @@ mod tests {
             ..Default::default()
         };
 
-        set_disks
+        store
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
         let mut reader = PutObjReader::from_vec(b"versioned object body".to_vec());
         let written = set_disks
-            .put_object(bucket, object, &mut reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..opts.clone()
+                },
+            )
             .await
             .expect("versioned object should be written");
         assert!(written.version_id.is_some());
@@ -16298,7 +16318,14 @@ mod tests {
     /// `BucketNotEmpty` for a bucket the client has already emptied.
     #[tokio::test]
     async fn set_level_explicit_null_version_delete_purges_the_null_delete_marker() {
-        let set_disks = make_local_bucket_test_set_disks().await;
+        let (_fixture, _, set_disks) = hermetic_set_disks_for_pool_with_default_parity(2, 0, 1).await;
+        set_disks.set_test_storage_class_config(
+            storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[2])
+                .expect("test storage class should resolve for the local drive count"),
+        );
+        let store = crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("fixture metadata authority should belong to this set");
         let bucket = "bucket-null-marker-purge";
         let object = "object.txt";
         // The delete path reads versioned/suspended from the bucket-config
@@ -16320,13 +16347,26 @@ mod tests {
             ..Default::default()
         };
 
-        set_disks
+        store
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
         let mut reader = PutObjReader::from_vec(b"suspended version body".to_vec());
         set_disks
-            .put_object(bucket, object, &mut reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..opts.clone()
+                },
+            )
             .await
             .expect("suspended-version object should be written");
 
@@ -16351,7 +16391,20 @@ mod tests {
 
         let mut replacement_reader = PutObjReader::from_vec(b"replacement suspended version body".to_vec());
         set_disks
-            .put_object(bucket, object, &mut replacement_reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut replacement_reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..opts.clone()
+                },
+            )
             .await
             .expect("a suspended-version PUT should replace the first null marker");
         let replacement_marker = set_disks
@@ -16411,7 +16464,14 @@ mod tests {
 
     #[tokio::test]
     async fn set_level_version_suspended_delete_creates_null_delete_marker() {
-        let set_disks = make_local_bucket_test_set_disks().await;
+        let (_fixture, _, set_disks) = hermetic_set_disks_for_pool_with_default_parity(2, 0, 1).await;
+        set_disks.set_test_storage_class_config(
+            storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[2])
+                .expect("test storage class should resolve for the local drive count"),
+        );
+        let store = crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("fixture metadata authority should belong to this set");
         let bucket = "bucket-version-suspended-delete";
         let object = "object.txt";
         let opts = ObjectOptions {
@@ -16421,13 +16481,26 @@ mod tests {
             ..Default::default()
         };
 
-        set_disks
+        store
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
         let mut reader = PutObjReader::from_vec(b"suspended version body".to_vec());
         set_disks
-            .put_object(bucket, object, &mut reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..opts.clone()
+                },
+            )
             .await
             .expect("suspended-version object should be written");
 

@@ -11075,6 +11075,7 @@ pub(crate) mod hermetic_set_disks_support {
 mod replication_quota_safety_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use std::io::Cursor;
 
     #[tokio::test]
@@ -11198,11 +11199,15 @@ mod replication_quota_safety_tests {
 
     #[tokio::test]
     async fn suspended_delete_marker_does_not_return_body_accounting() {
-        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let (_temp_dirs, _disks, set_disks) = hermetic_set_disks(4).await;
+        let store = crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("fixture metadata authority should belong to this set");
         let bucket = "suspended-delete-accounting";
-        for disk in &disks {
-            disk.make_volume(bucket).await.expect("bucket volume should be created");
-        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
 
         let mut user_defined = HashMap::new();
         insert_str(
@@ -11229,7 +11234,20 @@ mod replication_quota_safety_tests {
             ..Default::default()
         };
         set_disks
-            .put_object(bucket, "object", &mut reader, &suspended_opts)
+            .put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(
+                        store
+                            .object_lock_config_snapshot(bucket)
+                            .await
+                            .expect("PUT fixture should own the bucket lifecycle and Object Lock snapshot"),
+                    ),
+                    ..suspended_opts.clone()
+                },
+            )
             .await
             .expect("compressed object should be written");
 
