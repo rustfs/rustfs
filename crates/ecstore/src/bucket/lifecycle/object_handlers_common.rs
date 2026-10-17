@@ -33,12 +33,16 @@ pub async fn delete_object_versions(
     api: &Arc<ECStore>,
     bucket: &str,
     to_del: &[ObjectToDelete],
-    _lc_event: lifecycle::Event,
+    lc_event: lifecycle::Event,
     bucket_incarnation_id: Uuid,
 ) -> usize {
     if to_del.is_empty() {
         return 0;
     }
+
+    let Some(expiry_policy) = lc_event.expiry_policy else {
+        return to_del.len();
+    };
 
     if to_del.iter().any(|target| {
         target.version_id.is_none()
@@ -104,6 +108,7 @@ pub async fn delete_object_versions(
         let mut delete_options = ObjectOptions {
             delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+            lifecycle_expiry_policy: Some(expiry_policy.clone()),
             ..Default::default()
         };
         delete_options.add_namespace_lock_guard(&publication_guard);
