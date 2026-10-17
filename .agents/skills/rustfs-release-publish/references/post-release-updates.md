@@ -1,6 +1,43 @@
-# Post-release Milestone, Installation, and Website Updates
+# Post-release Security Advisory, Milestone, Installation, and Website Updates
 
 Read only after the final non-preview tag has passed Phase 6. Tag creation or a green binary build alone is insufficient: the release assets, source archive, container images, Helm package, and applicable latest channels must be available. Preview tags never enter this phase.
+
+## Security Advisories
+
+Reconcile advisories after every completed final release, including Console-only
+releases. Read-only preparation may start earlier; do not claim an unpublished
+artifact is an available fix.
+
+1. Fetch every page of the repository's live Security Advisories, including
+   triage, draft, published, and closed states. A permission error or partial
+   response blocks reconciliation; it does not mean there are no advisories.
+   Keep unpublished advisory details in private task artifacts, never in a
+   public PR, release note, or issue.
+2. For each potentially relevant advisory, map its fix to the exact published
+   tag and verify the regression evidence. Main-branch reachability, a merged
+   private fix, or a green build alone does not prove the shipped version is
+   fixed. Check cherry-picked equivalents and reverted fixes explicitly. For
+   embedded Console or dependency fixes, verify the shipped component version.
+3. Determine the first available fixed release and affected version ranges from
+   evidence. Preserve an earlier correct patched version; do not relabel all
+   fixes as the current release. An unchanged server baseline such as a
+   Console-only release requires checking the earlier server release as well.
+   Leave unresolved reports and fixes absent from the tag pending; do not close
+   them merely because a release shipped.
+4. Prepare any necessary corrections to package identity, affected ranges,
+   patched versions, fix/release links, and advisory text. Preserve unrelated
+   fields, credit, CVE identifiers, and disclosure coordination. Apply updates
+   only within existing user authorization; read back the result to verify it.
+   Publishing a draft, requesting a CVE, or closing a report is a separate
+   action: require explicit authorization for the concrete advisories and
+   respect any embargo. Release-tag approval alone does not authorize those
+   actions. Prepare the exact proposed changes before asking for missing
+   authorization.
+5. Record each relevant advisory's URL, current state, fix evidence, first fixed
+   version, action taken or proposed, and remaining blocker in private task
+   artifacts. Report advisory follow-up separately from artifact publication.
+   A successful release with unresolved advisory work is not complete follow-up;
+   retain that work for the release monitor or a concrete user decision.
 
 ## Version milestones
 
