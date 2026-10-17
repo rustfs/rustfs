@@ -20,7 +20,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest,
+    LegacyMetadataWrite, LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
+    verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
@@ -130,6 +131,19 @@ impl LocalMutationTarget {
                     .rename_local_data(disk_ref, source, fi, destination, scanner_token)
                     .await
             }
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn begin_legacy_local_undo_write(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        path: &str,
+    ) -> Result<LegacyMetadataWrite, DiskError> {
+        match self {
+            Self::Ready(store) => store.begin_legacy_local_undo_write(disk_ref, volume, path).await,
+            Self::Bootstrap(target) => target.begin_legacy_local_undo_write(disk_ref, volume, path).await,
             Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
         }
     }
@@ -861,13 +875,25 @@ impl NodeService {
                 )
                 .await
         } else if opts.undo_write {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
             if request.force_del_marker {
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
                 Err(DiskError::other("undo_write cannot force a delete marker"))
-            } else {
+            } else if opts.undo_delete {
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
                 target
                     .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
                     .await
+            } else {
+                match target
+                    .begin_legacy_local_undo_write(&request.disk, &request.volume, &request.path)
+                    .await
+                {
+                    Ok(write) => {
+                        target.reject_legacy_artifact_mutation(&request.volume).await?;
+                        write.undo_write(file_info, opts).await
+                    }
+                    Err(err) => Err(err),
+                }
             }
         } else if let Some(disk) = target.find_mutation_disk(&request.disk).await {
             target.reject_legacy_artifact_mutation(&request.volume).await?;
@@ -3327,6 +3353,273 @@ mod legacy_artifact_tests {
                 !env.disk_paths[0].join(volume).exists(),
                 "retained authority cannot revive a missing volume or object"
             );
+        }
+    }
+
+    fn signed_legacy_undo_request(
+        disk: &str,
+        volume: &str,
+        path: &str,
+        fi: &FileInfo,
+        opts: &DeleteOptions,
+        msgpack: bool,
+    ) -> Request<DeleteVersionRequest> {
+        let mut request = Request::new(DeleteVersionRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            file_info: if msgpack {
+                "invalid JSON must not be decoded".to_owned()
+            } else {
+                serde_json::to_string(fi).expect("JSON FI")
+            },
+            opts: if msgpack {
+                "invalid JSON must not be decoded".to_owned()
+            } else {
+                serde_json::to_string(opts).expect("JSON undo options")
+            },
+            file_info_bin: if msgpack {
+                encode_file_info_msgpack(fi).expect("msgpack FI").into()
+            } else {
+                Bytes::new()
+            },
+            opts_bin: if msgpack {
+                encode_msgpack(opts, "DeleteOptions").expect("msgpack undo options").into()
+            } else {
+                Bytes::new()
+            },
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).expect("canonical undo body");
+        sign_legacy_rpc_request(&mut request, &body, "DeleteVersion");
+        request
+    }
+
+    async fn authenticated_legacy_undo(
+        service: &NodeService,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        verify_legacy_rpc_request(&request, "DeleteVersion")?;
+        service.handle_delete_version(request, false).await
+    }
+
+    async fn stage_legacy_undo(
+        disk: &ecstore_disk::DiskStore,
+        volume: &str,
+        path: &str,
+        case: &str,
+    ) -> (FileInfo, DeleteOptions, Option<(FileInfo, Vec<u8>)>) {
+        let mut incoming = inline_rename_file_info(path);
+        let previous = if case == "fresh" {
+            None
+        } else {
+            let mut previous = incoming.clone();
+            if case == "remaining" {
+                previous.version_id = Some(Uuid::new_v4());
+            }
+            ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, path, previous.clone())
+                .await
+                .expect("original real inline version");
+            let bytes = tokio::fs::read(
+                ecstore_disk::DiskAPI::path(disk.as_ref())
+                    .join(volume)
+                    .join(path)
+                    .join("xl.meta"),
+            )
+            .await
+            .expect("original metadata bytes");
+            Some((previous, bytes))
+        };
+        let body = b"complete new rollback payload";
+        incoming.data = Some(Bytes::from_static(body));
+        incoming.size = i64::try_from(body.len()).expect("incoming size");
+        incoming.parts[0].size = body.len();
+        incoming.parts[0].actual_size = incoming.size;
+        incoming.validate_for_metadata_read().expect("valid new inline version");
+        let source = format!("undo-stage/{}", Uuid::new_v4());
+        ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", ".rustfs.sys/tmp", &source, incoming.clone())
+            .await
+            .expect("real staged inline metadata");
+        let committed =
+            ecstore_disk::DiskAPI::rename_data(disk.as_ref(), ".rustfs.sys/tmp", &source, incoming.clone(), volume, path)
+                .await
+                .expect("real RenameData publication before undo");
+        assert_eq!(committed.rollback_data_dir.is_some(), case == "backup");
+        let actual = disk
+            .read_version(
+                volume,
+                volume,
+                path,
+                &incoming.version_id.expect("new version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("new version really published");
+        assert_eq!(actual.data, incoming.data);
+        assert_eq!(actual.version_id, incoming.version_id);
+        let opts = DeleteOptions {
+            undo_write: true,
+            old_data_dir: committed.rollback_data_dir,
+            ..Default::default()
+        };
+        (incoming, opts, previous)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_undo_write_receiver_preserves_rollback_versions_and_rejects_managed() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-undo-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("undo receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("undo-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("undo-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("listener local disk");
+        for msgpack in [false, true] {
+            for volume in ["undo-ordinary", ".rustfs.sys", "undo-managed"] {
+                for case in ["backup", "remaining", "fresh"] {
+                    let path = if volume == "undo-managed" {
+                        format!("outputs/74656e616e74/{}/{}/{case}-{msgpack}", Uuid::new_v4(), Uuid::new_v4())
+                    } else {
+                        format!("undo/{case}-{msgpack}")
+                    };
+                    let (incoming, opts, previous) = stage_legacy_undo(&disk, volume, &path, case).await;
+                    let physical = env.disk_paths[0].join(volume).join(&path).join("xl.meta");
+                    let before = tokio::fs::read(&physical).await.expect("published metadata");
+                    let backup = opts.old_data_dir.map(|id| {
+                        physical
+                            .parent()
+                            .expect("object directory")
+                            .join(id.to_string())
+                            .join("xl.meta.bkp")
+                    });
+                    let result = authenticated_legacy_undo(
+                        &service,
+                        signed_legacy_undo_request(&disk_ref, volume, &path, &incoming, &opts, msgpack),
+                    )
+                    .await;
+                    if volume == "undo-managed" {
+                        assert_eq!(result.expect_err("managed undo must reject").code(), tonic::Code::PermissionDenied);
+                        assert_eq!(tokio::fs::read(&physical).await.expect("managed metadata retained"), before);
+                        if let Some(backup) = backup {
+                            assert_eq!(
+                                tokio::fs::read(backup).await.expect("managed rollback backup retained"),
+                                previous.as_ref().expect("previous version").1
+                            );
+                        }
+                        continue;
+                    }
+                    let response = result.expect("signed undo response").into_inner();
+                    assert!(response.success, "volume={volume}, case={case}, msgpack={msgpack}: {:?}", response.error);
+                    assert!(response.error.is_none());
+                    assert_eq!(response.raw_file_info, "null");
+                    if let Some((previous, previous_bytes)) = previous {
+                        let actual = disk
+                            .read_version(
+                                volume,
+                                volume,
+                                &path,
+                                &previous.version_id.expect("previous version").to_string(),
+                                &ReadOptions {
+                                    read_data: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("read retained or restored version");
+                        assert_eq!(actual.version_id, previous.version_id);
+                        assert_eq!(actual.data, previous.data);
+                        assert_eq!(actual.size, previous.size);
+                        if case == "backup" {
+                            assert_eq!(tokio::fs::read(&physical).await.expect("restored metadata"), previous_bytes);
+                            assert!(!backup.expect("real backup").exists(), "restoration must consume backup");
+                        }
+                    }
+                    if case != "backup" {
+                        let missing = disk
+                            .read_version(
+                                volume,
+                                volume,
+                                &path,
+                                &incoming.version_id.expect("removed version").to_string(),
+                                &ReadOptions {
+                                    read_data: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect_err("rolled-back version must disappear");
+                        assert_eq!(missing, DiskError::FileVersionNotFound);
+                    }
+                    if case == "fresh" {
+                        assert!(!physical.exists(), "fresh rollback removes final metadata");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_undo_write_receiver_rejects_missing_volume_with_retained_metadata() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-undo-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing undo receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for msgpack in [false, true] {
+            for case in ["backup", "remaining", "fresh"] {
+                let volume = format!("undo-missing-{case}-{msgpack}");
+                env.make_bucket(&volume, true).await;
+                let path = "nested/object";
+                let (incoming, opts, _) = stage_legacy_undo(&disk, &volume, path, case).await;
+                let incarnation = env
+                    .ecstore
+                    .bucket_incarnation_id(&volume)
+                    .await
+                    .expect("authoritative incarnation");
+                disk.delete_volume(&volume, true)
+                    .await
+                    .expect("remove only receiving physical volume");
+                assert_eq!(env.ecstore.bucket_incarnation_id(&volume).await.expect("retained metadata"), incarnation);
+                target
+                    .reject_legacy_artifact_mutation(&volume)
+                    .await
+                    .expect("ordinary metadata still classifies");
+                let response = authenticated_legacy_undo(
+                    &service,
+                    signed_legacy_undo_request(&disk_ref, &volume, path, &incoming, &opts, msgpack),
+                )
+                .await
+                .expect("missing volume response")
+                .into_inner();
+                assert!(!response.success);
+                assert_eq!(DiskError::from(response.error.expect("missing-volume error")), DiskError::VolumeNotFound);
+                assert!(
+                    !env.disk_paths[0].join(&volume).exists(),
+                    "retained metadata must not recreate volume or object"
+                );
+            }
         }
     }
 

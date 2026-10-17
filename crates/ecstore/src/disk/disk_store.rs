@@ -1549,6 +1549,29 @@ impl std::fmt::Debug for LegacyMetadataWrite {
 }
 
 impl LegacyMetadataWrite {
+    pub async fn undo_write(self, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
+        if !opts.undo_write || opts.undo_delete {
+            return Err(DiskError::MethodNotAllowed);
+        }
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk.track_disk_health_mutation(
+                "delete_version",
+                DiskMetricMutation::Delete,
+                || async {
+                    Box::pin(
+                        self.disk
+                            .disk
+                            .undo_write_prepared(&self.volume, &self.path, fi, opts, self.publication.clone()),
+                    )
+                    .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+
     pub async fn update_metadata(self, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if opts.transition_reconcile.is_some() {
             return Err(DiskError::MethodNotAllowed);
@@ -1668,10 +1691,30 @@ impl LocalDiskWrapper {
     }
 
     pub(in crate::disk) async fn begin_legacy_metadata_write(&self, volume: &str, path: &str) -> Result<LegacyMetadataWrite> {
+        self.prepare_legacy_metadata_write(volume, path, None, false).await
+    }
+
+    pub(in crate::disk) async fn begin_legacy_metadata_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyMetadataWrite> {
+        self.prepare_legacy_metadata_write(volume, path, namespace_owner, true).await
+    }
+
+    async fn prepare_legacy_metadata_write(
+        &self,
+        volume: &str,
+        path: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        undo_write: bool,
+    ) -> Result<LegacyMetadataWrite> {
         let permit = self.io_admission.foreground();
         let publication = tokio::time::timeout(
             get_max_timeout_duration(),
-            self.disk.begin_legacy_metadata_write(volume, path, permit.clone()),
+            self.disk
+                .begin_legacy_metadata_write(volume, path, permit.clone(), namespace_owner, undo_write),
         )
         .await
         .map_err(|_| DiskError::Timeout)??;

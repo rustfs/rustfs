@@ -2461,8 +2461,18 @@ pub(crate) async fn rename_all_ignore_missing_source_with_owner(
     publication_root: &PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    let src_file_path = src_file_path.as_ref();
     let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
+    rename_all_ignore_missing_source_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
+}
+
+pub(in crate::disk) async fn rename_all_ignore_missing_source_with_lease(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    lease: Arc<NamespaceMutationLease>,
+) -> Result<()> {
+    let src_file_path = src_file_path.as_ref();
     match reliable_rename_inner_with_lease(
         src_file_path.to_path_buf(),
         dst_file_path.as_ref().to_path_buf(),

@@ -248,6 +248,21 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn begin_legacy_metadata_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyMetadataWrite> {
+        match self {
+            Self::Local(disk) => {
+                disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
     pub(crate) async fn begin_legacy_rename_data(
         &self,
         source: (&str, &str),

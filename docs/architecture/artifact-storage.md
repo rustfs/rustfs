@@ -58,6 +58,10 @@ captured instance owner; staging, publication and source restoration keep that
 ownership through physical completion even after cancellation. Internal staging
 retains on-demand directory creation. Preparation and execution have finite
 deadlines, and scanner/incarnation-bound requests retain their existing paths.
+Ordinary `UndoWrite` prepares metadata admission on that same captured instance
+before classification. Backup restoration, remaining-version rewrites and fresh
+version rollback retain the admission through physical completion. This does not
+cover `undo_delete` or incarnation-bound deletion.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

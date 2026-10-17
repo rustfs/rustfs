@@ -15,7 +15,7 @@
 use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
-use crate::disk::{DeleteOptions, Disk, LegacyRenameData, RenameDataGuards, RenameDataResp};
+use crate::disk::{DeleteOptions, Disk, LegacyMetadataWrite, LegacyRenameData, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error};
@@ -72,6 +72,16 @@ impl BootstrapLocalTarget {
         validate_bootstrap_volume(source.0)?;
         validate_bootstrap_volume(destination.0)?;
         rename_local_data_with_ctx(&self.ctx, disk_ref, source, fi, destination, RenameDataGuards::default()).await
+    }
+
+    pub async fn begin_legacy_local_undo_write(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        path: &str,
+    ) -> DiskResult<LegacyMetadataWrite> {
+        validate_bootstrap_volume(volume)?;
+        begin_legacy_local_undo_write_with_ctx(&self.ctx, disk_ref, volume, path).await
     }
 
     pub async fn undo_local_write(
@@ -366,6 +376,15 @@ impl ECStore {
         .await
     }
 
+    pub async fn begin_legacy_local_undo_write(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        path: &str,
+    ) -> DiskResult<LegacyMetadataWrite> {
+        begin_legacy_local_undo_write_with_ctx(&self.ctx, disk_ref, volume, path).await
+    }
+
     pub async fn undo_local_write(
         &self,
         disk_ref: &str,
@@ -473,6 +492,18 @@ async fn rename_local_data_with_ctx(
         .result;
     drop(owner);
     result
+}
+
+async fn begin_legacy_local_undo_write_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+    path: &str,
+) -> DiskResult<LegacyMetadataWrite> {
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume)).await?;
+    disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+        .await
 }
 
 async fn undo_local_write_with_ctx(
@@ -812,6 +843,283 @@ mod tests {
         tokio::fs::read(dir.join(object).join(crate::disk::STORAGE_FORMAT_FILE))
             .await
             .expect("seeded metadata bytes")
+    }
+
+    #[tokio::test]
+    async fn legacy_undo_target_keeps_same_uuid_disk_after_registry_replacement() {
+        for warm in [false, true] {
+            let ctx_a = Arc::new(InstanceContext::new());
+            let ctx_b = Arc::new(InstanceContext::new());
+            let root_a = tempfile::tempdir().expect("undo A root");
+            let root_b = tempfile::tempdir().expect("undo B root");
+            let id = Uuid::new_v4();
+            let disk_a = target_disk(&ctx_a, root_a.path(), id).await;
+            let disk_b = target_disk(&ctx_b, root_b.path(), id).await;
+            if warm {
+                assert!(record_local_disk_id_if_active(&ctx_a, &disk_a, id).await);
+                assert!(record_local_disk_id_if_active(&ctx_b, &disk_b, id).await);
+            }
+            let version = Uuid::new_v4();
+            let previous_a = target_file_info("object", version, b"complete old A payload");
+            let previous_b = target_file_info("object", version, b"complete old B payload");
+            let a_before = seed_target(&disk_a, "undo-target", "object", previous_a.clone()).await;
+            seed_target(&disk_b, "undo-target", "object", previous_b).await;
+            let incoming = target_file_info("object", version, b"complete new rollback payload");
+            let mut backups = Vec::new();
+            for disk in [&disk_a, &disk_b] {
+                seed_target(disk, ".rustfs.sys/tmp", "staged", incoming.clone()).await;
+                let commit = disk
+                    .rename_data(".rustfs.sys/tmp", "staged", incoming.clone(), "undo-target", "object")
+                    .await
+                    .expect("real overwrite creates backup");
+                backups.push(commit.rollback_data_dir.expect("rollback backup"));
+            }
+            let b_meta = root_b.path().join("undo-target/object/xl.meta");
+            let b_before = tokio::fs::read(&b_meta).await.expect("B committed metadata");
+            let b_backup = root_b
+                .path()
+                .join("undo-target/object")
+                .join(backups[1].to_string())
+                .join("xl.meta.bkp");
+            let b_backup_before = tokio::fs::read(&b_backup).await.expect("B rollback backup");
+            let store = super::super::tests::build_store_with_ctx(ctx_a.clone());
+            let generation = ctx_a.namespace_commit_generation();
+            let token = store
+                .begin_legacy_local_undo_write(&id.to_string(), "undo-target", "object")
+                .await
+                .expect("capture A through real UUID lookup");
+            assert!(ctx_a.namespace_commits_pending());
+            assert!(!ctx_b.namespace_commits_pending());
+            {
+                let map = ctx_a.local_disk_map();
+                let mut active = map.write().await;
+                active.clear();
+                active.insert(disk_b.endpoint().to_string(), Some(disk_b.clone()));
+            }
+            ctx_a
+                .local_disk_id_map()
+                .write()
+                .await
+                .insert(id, disk_b.endpoint().to_string());
+            let (replacement, _) = local_disk_candidate(&ctx_a, &id.to_string())
+                .await
+                .expect("later lookup resolves B");
+            assert!(Arc::ptr_eq(&replacement, &disk_b));
+            token
+                .undo_write(
+                    incoming,
+                    DeleteOptions {
+                        undo_write: true,
+                        old_data_dir: Some(backups[0]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("admitted undo remains on captured A");
+            assert_eq!(
+                tokio::fs::read(root_a.path().join("undo-target/object/xl.meta"))
+                    .await
+                    .expect("restored A metadata"),
+                a_before
+            );
+            let actual = disk_a
+                .read_version(
+                    "undo-target",
+                    "undo-target",
+                    "object",
+                    &version.to_string(),
+                    &crate::disk::ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("A restored version");
+            assert_eq!(actual.version_id, Some(version));
+            assert_eq!(actual.data, previous_a.data);
+            assert_eq!(tokio::fs::read(&b_meta).await.expect("B unchanged metadata"), b_before);
+            assert_eq!(tokio::fs::read(&b_backup).await.expect("B unchanged backup"), b_backup_before);
+            assert!(!ctx_a.namespace_commits_pending());
+            assert_eq!(ctx_a.namespace_commit_generation(), generation + 2);
+            assert_eq!(ctx_b.namespace_commit_generation(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_undo_bootstrap_checks_raw_volumes_and_allows_internal_rollback() {
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("bootstrap undo root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let target = BootstrapLocalTarget::new(ctx.clone());
+        let fi = target_file_info("object", Uuid::new_v4(), b"unchanged ordinary payload");
+        let before = seed_target(&disk, "victim", "object", fi).await;
+        for volume in [
+            "victim",
+            ".rustfs.sys/../victim",
+            ".rustfs.sys/./tmp",
+            ".rustfs.sys/ .. /victim",
+            ".rustfs.sys\\..\\victim",
+            ".minio.sys/../victim",
+        ] {
+            assert_eq!(
+                target
+                    .begin_legacy_local_undo_write(&disk.endpoint().to_string(), volume, "object")
+                    .await
+                    .expect_err("bootstrap raw volume must reject before admission"),
+                DiskError::FileAccessDenied,
+                "{volume}"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(root.path().join("victim/object/xl.meta"))
+                .await
+                .expect("ordinary source unchanged"),
+            before
+        );
+        for volume in [".rustfs.sys/tmp", ".rustfs.sys/multipart", ".minio.sys/config"] {
+            let previous = target_file_info("object", Uuid::new_v4(), b"complete internal previous payload");
+            let before = seed_target(&disk, volume, "object", previous.clone()).await;
+            let incoming = target_file_info("object", previous.version_id.expect("version"), b"new internal overwritten payload");
+            seed_target(&disk, volume, "staged", incoming.clone()).await;
+            let commit = disk
+                .rename_data(volume, "staged", incoming.clone(), volume, "object")
+                .await
+                .expect("real internal overwrite");
+            target
+                .begin_legacy_local_undo_write(&disk.endpoint().to_string(), volume, "object")
+                .await
+                .expect("legitimate internal prepare")
+                .undo_write(
+                    incoming,
+                    DeleteOptions {
+                        undo_write: true,
+                        old_data_dir: Some(commit.rollback_data_dir.expect("internal rollback backup")),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("prepared internal undo");
+            assert_eq!(
+                tokio::fs::read(root.path().join(volume).join("object/xl.meta"))
+                    .await
+                    .expect("restored internal bytes"),
+                before
+            );
+            let actual = disk
+                .read_version(
+                    volume,
+                    volume,
+                    "object",
+                    &previous.version_id.expect("version").to_string(),
+                    &crate::disk::ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restored internal version");
+            assert_eq!(actual.version_id, previous.version_id);
+            assert_eq!(actual.data, previous.data);
+            assert_eq!(ctx.namespace_commit_generation(), 0);
+            assert!(!ctx.namespace_commits_pending());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_undo_target_cancellation_retains_instance_owner_until_restore_drains() {
+        use crate::disk::os::{self, prepared_publication_test_hooks as hooks};
+        use std::time::Duration;
+        let ctx = Arc::new(InstanceContext::new());
+        let sibling = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("physical undo owner root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let previous = target_file_info("object", Uuid::new_v4(), b"complete previous rollback payload");
+        let before = seed_target(&disk, "undo-owner", "object", previous.clone()).await;
+        let incoming = target_file_info("object", previous.version_id.expect("version"), b"complete overwritten payload");
+        seed_target(&disk, ".rustfs.sys/tmp", "staged", incoming.clone()).await;
+        let committed = disk
+            .rename_data(".rustfs.sys/tmp", "staged", incoming.clone(), "undo-owner", "object")
+            .await
+            .expect("real overwrite before cancellation");
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let generation = ctx.namespace_commit_generation();
+        let token = store
+            .begin_legacy_local_undo_write(&disk.endpoint().to_string(), "undo-owner", "object")
+            .await
+            .expect("prepare with captured instance owner");
+        let destination = disk
+            .get_object_path_for_io_if_local("undo-owner", "object/xl.meta")
+            .expect("local disk")
+            .expect("physical metadata key");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &destination, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let task = tokio::spawn(async move {
+            token
+                .undo_write(
+                    incoming,
+                    DeleteOptions {
+                        undo_write: true,
+                        old_data_dir: Some(committed.rollback_data_dir.expect("real backup")),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        let entered = tokio::time::timeout(Duration::from_secs(10), entered_rx).await;
+        task.abort();
+        let joined = task.await;
+        let pending = ctx.namespace_commits_pending();
+        let generation_while_paused = ctx.namespace_commit_generation();
+        let volume_held = os::disk_volume_mutation_lock(&disk.path(), "undo-owner")
+            .try_write_owned()
+            .is_err();
+        let sibling_untouched = !sibling.namespace_commits_pending() && sibling.namespace_commit_generation() == 0;
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(10), hooks::drain_namespace_key(&destination))
+            .await
+            .expect("physical restore releases final namespace");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical completion releases instance owner");
+        entered
+            .expect("bounded physical entry")
+            .expect("actual restore worker entered");
+        assert!(joined.expect_err("waiter cancellation acknowledged").is_cancelled());
+        assert!(pending, "cancelled waiter must not drop physical instance owner");
+        assert_eq!(generation_while_paused, generation + 1);
+        assert!(volume_held, "actual worker retains admitted volume READ");
+        assert!(sibling_untouched);
+        assert_eq!(ctx.namespace_commit_generation(), generation + 2);
+        assert_eq!(
+            tokio::fs::read(root.path().join("undo-owner/object/xl.meta"))
+                .await
+                .expect("physical restored metadata"),
+            before
+        );
+        let actual = disk
+            .read_version(
+                "undo-owner",
+                "undo-owner",
+                "object",
+                &previous.version_id.expect("version").to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read restored payload after real drain");
+        assert_eq!(actual.version_id, previous.version_id);
+        assert_eq!(actual.data, previous.data);
     }
 
     #[tokio::test]

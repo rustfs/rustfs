@@ -479,10 +479,10 @@ pub(crate) mod ecstore_data_usage {
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions,
-        DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, LegacyRenameData,
-        OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
-        validate_batch_read_version_item_count,
+        DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, LegacyMetadataWrite,
+        LegacyRenameData, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
@@ -737,6 +737,7 @@ pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
 pub(crate) type PartTransactionAction = ecstore_disk::PartTransactionAction;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type LegacyRenameData = ecstore_disk::LegacyRenameData;
+pub(crate) type LegacyMetadataWrite = ecstore_disk::LegacyMetadataWrite;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type StorageError = ecstore_error::StorageError;
